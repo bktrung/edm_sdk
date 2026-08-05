@@ -1,93 +1,84 @@
-# Event Driven Messaging SDK
+# F1 - Event-Driven Messaging SDK
 
+F1 is a single Go SDK that every service in the estate uses to publish and consume events. A
+service author writes handlers and event structs; F1 owns envelope construction, delivery
+guarantees, acknowledgement, retry ladders, dead-letter routing, poison-message containment,
+priority scheduling, zero-loss shutdown, and observability. The message broker is a pluggable
+driver, swapped by configuration.
 
+This file states what F1 must be true of. It is not a tour of the code, and it does not duplicate
+the design - see [Where the design lives](#where-the-design-lives) below for that.
 
-## Getting started
+## Guarantees
 
-To make it easy for you to get started with GitLab, here's a list of recommended next steps.
+Each of these is testable, and each is enforced by CI, not documentation:
 
-Already a pro? Just edit this README.md and make it your own. Want to make it easy? [Use the template at the bottom](#editing-this-readme)!
+- **At-least-once delivery, plus idempotent effects.** Transport redelivers during rolling
+  restarts - that is the guarantee, not a bug. A dedupe store keyed on `idempotency_key` makes the
+  *effect* apply exactly once. Measured as `f1_messages_lost_total == 0` and
+  `f1_duplicate_applied_total == 0`.
+- **Zero-loss graceful shutdown.** A drain protocol settles every in-flight message before the
+  process exits; nothing accepted is dropped on a rolling restart or `SIGTERM`.
+- **Automatic retry to a dead-letter queue.** Retryable failures move through a tiered backoff
+  ladder; exhausted or terminal failures dead-letter with a recorded reason - every message in a
+  DLQ has one.
+- **Starvation-free priority handling.** Low-priority messages have a bounded maximum wait under
+  sustained high-priority load; that bound is measured, not assumed.
+- **Poison-message safety.** A message that cannot be decoded, or a handler that panics, is
+  quarantined rather than retried forever or taken down with the process.
+- **Ordering, where declared.** Per-key ordering is available and preserved end to end when a
+  subscription asks for it. F1 does not offer or imply global ordering across partitions or queues.
+- **Non-leaking abstraction.** No broker-specific concept is visible in the handler-facing API.
+  Broker differences may appear in configuration; they never appear in business code.
+- **Capability declaration, no silent degradation.** F1 declares its limits under the connected
+  driver at runtime (`Client.Limits()`) and fails or degrades explicitly and observably when a
+  requested feature is unavailable under that driver.
+- **Broker agnostic.** Swapping the driver is a configuration and topology change with zero
+  business-code modification, demonstrated by a driver-flip test (`make swap-report`) and enforced
+  by an import-boundary lint (`make verify-agnostic`) that fails the build on a violation.
 
-## Add your files
+## Non-goals for v1
 
-* [Create](https://docs.gitlab.com/user/project/repository/web_editor/#create-a-file) or [upload](https://docs.gitlab.com/user/project/repository/web_editor/#upload-a-file) files
-* [Add files using the command line](https://docs.gitlab.com/topics/git/add_files/#add-files-to-a-git-repository) or push an existing Git repository with the following command:
+- Exactly-once *transport* (Kafka transactions). At-least-once transport plus idempotent effects is
+  the guarantee; see ADR-0003 in the design repository.
+- Global ordering across partitions/queues. Per-key ordering only.
+- Cross-region replication and DR topology. Owned by the platform team.
+- Request/reply over messaging. Use gRPC.
+- Schema registry integration. v1 uses JSON plus a versioned envelope; the codec port has hooks for
+  Avro/Protobuf, but no registry client ships in v1.
+- NATS JetStream / Pulsar drivers. The port is designed to accommodate them; neither is scheduled.
+- Multiple broker versions per broker. v1 targets one pinned, stable version of Kafka and one of
+  RabbitMQ; see ADR-0009.
+
+## Install
 
 ```
-cd existing_repo
-git remote add origin https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk.git
-git branch -M main
-git push -uf origin main
+go get fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk
 ```
 
-## Integrate with your tools
+The module path is the real repository path, not `github.com/za/f1` (see ADR-0014). The root
+package is `package f1`; since the module's last path element does not match the package name, the
+house style is an explicit import alias everywhere the root package is imported:
 
-* [Set up project integrations](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/settings/integrations)
+```go
+import f1 "fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk"
+```
 
-## Collaborate with your team
+Set `GOPRIVATE=fgit.zapps.vn` before the first `go get` of this module - it lives on an internal
+host, and without this the Go toolchain will try the public checksum database and proxy, which
+cannot see it.
 
-* [Invite team members and collaborators](https://docs.gitlab.com/user/project/members/)
-* [Create a new merge request](https://docs.gitlab.com/user/project/merge_requests/creating_merge_requests/)
-* [Automatically close issues from merge requests](https://docs.gitlab.com/user/project/issues/managing_issues/#closing-issues-automatically)
-* [Enable merge request approvals](https://docs.gitlab.com/user/project/merge_requests/approvals/)
-* [Set auto-merge](https://docs.gitlab.com/user/project/merge_requests/auto_merge/)
+## Where the design lives
 
-## Test and Deploy
+The requirements above are sourced from `REQUIREMENTS.md` and doc 00 in the design repository,
+which is where the actual design work happens - this repository is the implementation of it, not
+the other way around. Two documents are the exception and are duplicated here deliberately, because
+someone reading this code should not have to leave it to orient themselves:
 
-Use the built-in continuous integration in GitLab.
+- [`ARCHITECTURE.md`](ARCHITECTURE.md) - package layout, data flow, the import boundaries
+  `make verify-agnostic` enforces.
+- This README.
 
-* [Get started with GitLab CI/CD](https://docs.gitlab.com/ci/quick_start/)
-* [Analyze your code for known vulnerabilities with Static Application Security Testing (SAST)](https://docs.gitlab.com/user/application_security/sast/)
-* [Deploy to Kubernetes, Amazon EC2, or Amazon ECS using Auto Deploy](https://docs.gitlab.com/topics/autodevops/requirements/)
-* [Use pull-based deployments for improved Kubernetes management](https://docs.gitlab.com/user/clusters/agent/)
-* [Set up protected environments](https://docs.gitlab.com/ci/environments/protected_environments/)
-
-***
-
-# Editing this README
-
-When you're ready to make this README your own, just edit this file and use the handy template below (or feel free to structure it however you want - this is just a starting point!). Thanks to [makeareadme.com](https://www.makeareadme.com/) for this template.
-
-## Suggestions for a good README
-
-Every project is different, so consider which of these sections apply to yours. The sections used in the template are suggestions for most open source projects. Also keep in mind that while a README can be too long and detailed, too long is better than too short. If you think your README is too long, consider utilizing another form of documentation rather than cutting out information.
-
-## Name
-Choose a self-explaining name for your project.
-
-## Description
-Let people know what your project can do specifically. Provide context and add a link to any reference visitors might be unfamiliar with. A list of Features or a Background subsection can also be added here. If there are alternatives to your project, this is a good place to list differentiating factors.
-
-## Badges
-On some READMEs, you may see small images that convey metadata, such as whether or not all the tests are passing for the project. You can use Shields to add some to your README. Many services also have instructions for adding a badge.
-
-## Visuals
-Depending on what you are making, it can be a good idea to include screenshots or even a video (you'll frequently see GIFs rather than actual videos). Tools like ttygif can help, but check out Asciinema for a more sophisticated method.
-
-## Installation
-Within a particular ecosystem, there may be a common way of installing things, such as using Yarn, NuGet, or Homebrew. However, consider the possibility that whoever is reading your README is a novice and would like more guidance. Listing specific steps helps remove ambiguity and gets people to using your project as quickly as possible. If it only runs in a specific context like a particular programming language version or operating system or has dependencies that have to be installed manually, also add a Requirements subsection.
-
-## Usage
-Use examples liberally, and show the expected output if you can. It's helpful to have inline the smallest example of usage that you can demonstrate, while providing links to more sophisticated examples if they are too long to reasonably include in the README.
-
-## Support
-Tell people where they can go to for help. It can be any combination of an issue tracker, a chat room, an email address, etc.
-
-## Roadmap
-If you have ideas for releases in the future, it is a good idea to list them in the README.
-
-## Contributing
-State if you are open to contributions and what your requirements are for accepting them.
-
-For people who want to make changes to your project, it's helpful to have some documentation on how to get started. Perhaps there is a script that they should run or some environment variables that they need to set. Make these steps explicit. These instructions could also be useful to your future self.
-
-You can also document commands to lint the code or run tests. These steps help to ensure high code quality and reduce the likelihood that the changes inadvertently break something. Having instructions for running tests is especially helpful if it requires external setup, such as starting a Selenium server for testing in a browser.
-
-## Authors and acknowledgment
-Show your appreciation to those who have contributed to the project.
-
-## License
-For open source projects, say how it is licensed.
-
-## Project status
-If you have run out of energy or time for your project, put a note at the top of the README saying that development has slowed down or stopped completely. Someone may choose to fork your project or volunteer to step in as a maintainer or owner, allowing your project to keep going. You can also make an explicit request for maintainers.
+Everything else - the sixteen design documents, the ADRs, the capability matrix, and the build plan
+that orders the work in this repository task by task - lives in the design repository. Ask your
+lead for its remote if it is not already in your git remotes.
