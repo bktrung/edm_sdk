@@ -1,0 +1,23 @@
+# Build output
+/bin/
+/dist/
+*.exe
+*.test
+
+# Locally downloaded tool binaries (Makefile-managed, pinned by version)
+/.tools/
+
+# Coverage
+*.out
+coverage/
+coverage.html
+
+# Local env / secrets
+.env
+.env.*
+*.local.yaml
+
+# Editor / OS
+.DS_Store
+.idea/
+*.swp
