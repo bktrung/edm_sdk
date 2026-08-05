@@ -1,0 +1,95 @@
+{
+  "_generated": "GENERATED from docs/03-message-envelope-spec.md section 2.3 by mq-sdk-docs tools/apispec. Do not hand-edit: run `make check-api` in mq-sdk-docs. event-driven-messaging-sdk/testdata/envelope-attributes.json is a copy of this file and must stay byte-identical.",
+  "attributes": [
+    {
+      "attribute": "f1attempt",
+      "type": "int",
+      "setBy": "core"
+    },
+    {
+      "attribute": "f1causationid",
+      "type": "string",
+      "setBy": "core"
+    },
+    {
+      "attribute": "f1correlationid",
+      "type": "string",
+      "setBy": "producer"
+    },
+    {
+      "attribute": "f1deatherror",
+      "type": "string",
+      "setBy": "core"
+    },
+    {
+      "attribute": "f1deathreason",
+      "type": "enum (string)",
+      "setBy": "core",
+      "enum": [
+        "max_attempts",
+        "terminal",
+        "panic",
+        "decode",
+        "expired",
+        "poison",
+        "unmatched",
+        "dedupe_unavailable"
+      ]
+    },
+    {
+      "attribute": "f1deathtime",
+      "type": "RFC3339",
+      "setBy": "core"
+    },
+    {
+      "attribute": "f1deferrals",
+      "type": "int",
+      "setBy": "core"
+    },
+    {
+      "attribute": "f1duetime",
+      "type": "RFC3339",
+      "setBy": "core"
+    },
+    {
+      "attribute": "f1expiry",
+      "type": "RFC3339",
+      "setBy": "producer"
+    },
+    {
+      "attribute": "f1idempotencykey",
+      "type": "string",
+      "setBy": "producer or core"
+    },
+    {
+      "attribute": "f1maxattempts",
+      "type": "int",
+      "setBy": "producer (optional cap) or core (on first retry copy)"
+    },
+    {
+      "attribute": "f1originaldest",
+      "type": "string",
+      "setBy": "core"
+    },
+    {
+      "attribute": "f1partitionkey",
+      "type": "string",
+      "setBy": "producer"
+    },
+    {
+      "attribute": "f1priority",
+      "type": "enum (string)",
+      "setBy": "producer",
+      "enum": [
+        "high",
+        "normal",
+        "low"
+      ]
+    },
+    {
+      "attribute": "f1producer",
+      "type": "string",
+      "setBy": "core"
+    }
+  ]
+}

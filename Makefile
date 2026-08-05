@@ -10,7 +10,7 @@ GOLANGCI_LINT := $(CURDIR)/.tools/bin/golangci-lint
 
 export GOPRIVATE := fgit.zapps.vn
 
-.PHONY: build test-fast test test-chaos kpi lint verify-agnostic swap-report
+.PHONY: build test-fast test test-chaos kpi lint verify-agnostic swap-report check-fixture check-api-surface
 
 ## build: compile everything. CGO disabled, reproducible (-trimpath), version
 ## stamped via -ldflags -X. No cmd/ exists yet, so there is nothing for the
@@ -58,3 +58,31 @@ verify-agnostic: $(GOLANGCI_LINT)
 ## Not built yet.
 swap-report:
 	@echo "swap-report: lands with the migration work (doc 12 §7, plan/05-M5-migration.md)"
+
+## check-fixture: testdata/envelope-attributes.json and testdata/public-api.json
+## must both stay byte-identical to mq-sdk-docs' generated copies (F-P45 hole
+## 3, F-P46's BLK-10) - `make check-api`'s own `git diff --exit-code` there
+## only guards that repo's files, so nothing before this caught either drifting
+## apart. One target, not two: a second forgettable target is how the fixture
+## nearly drifted the first time. Skips, rather than failing, when mq-sdk-docs
+## is not checked out alongside this repo - that layout is a convenience for
+## local dev, not a CI guarantee this target should assume.
+check-fixture:
+	@if [ -d ../mq-sdk-docs/docs/generated ]; then \
+		diff -u ../mq-sdk-docs/docs/generated/envelope-attributes.json testdata/envelope-attributes.json && \
+		diff -u ../mq-sdk-docs/docs/generated/public-api.json testdata/public-api.json && \
+		echo "check-fixture: testdata/*.json match mq-sdk-docs"; \
+	else \
+		echo "check-fixture: skipped - ../mq-sdk-docs not checked out alongside this repo"; \
+	fi
+
+## check-api-surface: F-P46/BLK-10, the code-to-doc direction `make check-api`
+## itself cannot run, since it never reads this repo's code. Asserts package
+## f1's actual exported symbols are a SUBSET of testdata/public-api.json - not
+## equality, since most of that fixture is for later milestones and "declared
+## but not yet implemented" is expected before freeze. go doc granularity only
+## (types, funcs, methods, consts, vars) - struct fields are not covered here;
+## envelope-attributes.json already covers the wire attributes at that level.
+check-api-surface:
+	cd tools/apisurface && go build -o ../../.tools/bin/apisurface .
+	./.tools/bin/apisurface -fixture testdata/public-api.json
