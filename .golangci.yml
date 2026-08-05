@@ -18,10 +18,12 @@ linters:
     # import boundaries: core -> drivers, driver = stdlib-only,
     # a driver = stdlib + its own broker client only (doc 02 §1).
     - depguard
-    # Built-in defaults already ban fmt.Print*/print/println everywhere
-    # (doc 15 §3); no cmd/ exclusion path exists yet because cmd/ doesn't.
-    # The time.Now/Sleep/After/Tick clock rule (doc 11 §2) is added in
-    # M1-04, once internal/clock has code to exempt from it.
+    # forbidigo's forbid: list REPLACES its built-in defaults, it does not
+    # extend them (verified: unset it and fmt.Println passes silently) - so
+    # the fmt.Print*/print/println ban (doc 15 §3) is restated explicitly
+    # below, alongside the clock rule (doc 11 §2, doc 15 §7.4). No cmd/
+    # exclusion path exists yet because cmd/ doesn't. internal/clock is
+    # exempted from the clock patterns only (M1-04).
     - forbidigo
     # no hardcoded credentials, no weak rand where it matters
     - gosec
@@ -146,14 +148,48 @@ linters:
             - pkg: $all
               desc: "the in-memory driver has no broker client: stdlib plus the port only (doc 02 §1)"
 
-    # No custom patterns yet: forbidigo's own built-in defaults (fmt.Print*,
-    # print, println) already apply and are verified below. The clock
-    # patterns and their internal/clock exclusion land in M1-04 as a
-    # reviewable diff separate from this on-switch.
+    # forbid: replaces the built-in defaults (see the comment above), so the
+    # fmt.Print*/print/println ban is restated here explicitly (doc 15 §3),
+    # then every way to reach the wall clock outside internal/clock (doc 11
+    # §2, doc 15 §7.4) - not just the four convenience wrappers, but the
+    # NewTimer/NewTicker/AfterFunc/Since forms too, since those are what a
+    # developer reaches for once After/Tick are blocked.
+    forbidigo:
+      forbid:
+        - pattern: '^(fmt\.Print(|f|ln)|print|println)$'
+          msg: "use structured logging, not a print function (doc 15 §3)"
+        - pattern: '^time\.Now(\(\))?$'
+          msg: "use a clock.Clock's Now, not time.Now directly (doc 15 §7.4)"
+        - pattern: '^time\.Since(\(\))?$'
+          msg: "use a clock.Clock's Since, not time.Since directly (doc 15 §7.4)"
+        - pattern: '^time\.Sleep(\(\))?$'
+          msg: "use a clock.Clock's Sleep, not time.Sleep directly (doc 15 §7.4)"
+        - pattern: '^time\.After(\(\))?$'
+          msg: "use a clock.Clock's Timer, not time.After directly (doc 15 §7.4)"
+        - pattern: '^time\.Tick(\(\))?$'
+          msg: "use a clock.Clock's Ticker, not time.Tick directly (doc 15 §7.4)"
+        - pattern: '^time\.NewTimer(\(\))?$'
+          msg: "use a clock.Clock's Timer, not time.NewTimer directly (doc 15 §7.4)"
+        - pattern: '^time\.NewTicker(\(\))?$'
+          msg: "use a clock.Clock's Ticker, not time.NewTicker directly (doc 15 §7.4)"
+        - pattern: '^time\.AfterFunc(\(\))?$'
+          msg: "use a clock.Clock's Timer, not time.AfterFunc directly (doc 15 §7.4)"
 
   exclusions:
     presets:
       - std-error-handling
+    rules:
+      # Scoped to the clock patterns' own message text, not the whole path:
+      # internal/clock legitimately calls time.Now/NewTimer/NewTicker/etc (it
+      # is what they implement), but forbidigo's other rules - the
+      # fmt.Print*/print/println ban above - still apply inside this package,
+      # same as everywhere else (verified: 0 issues before and after this
+      # fix, since the package has no such calls; a probe fmt.Println here
+      # was caught pre-fix and stays caught).
+      - path: internal/clock/
+        linters:
+          - forbidigo
+        text: "doc 15 §7.4"
 
 formatters:
   enable:
