@@ -1,0 +1,165 @@
+version: "2"
+
+# Pinned in Makefile and CI at the same version - a mismatch here is the
+# "green locally, red in CI" trap (SETUP-04, SETUP-06).
+
+run:
+  timeout: 5m
+
+linters:
+  default: none
+  enable:
+    # correctness baseline (doc 15 §3)
+    - govet
+    - staticcheck
+    - errcheck
+    # naming, package comments, exported-symbol docs
+    - revive
+    # import boundaries: core -> drivers, driver = stdlib-only,
+    # a driver = stdlib + its own broker client only (doc 02 §1).
+    - depguard
+    # Built-in defaults already ban fmt.Print*/print/println everywhere
+    # (doc 15 §3); no cmd/ exclusion path exists yet because cmd/ doesn't.
+    # The time.Now/Sleep/After/Tick clock rule (doc 11 §2) is added in
+    # M1-04, once internal/clock has code to exempt from it.
+    - forbidigo
+    # no hardcoded credentials, no weak rand where it matters
+    - gosec
+    # errors.Is/As instead of type assertions and == on wrapped errors
+    - errorlint
+    # contexts actually propagated
+    - contextcheck
+    # store/postgres hygiene
+    - sqlclosecheck
+    - rowserrcheck
+    # a bare //nolint fails; //nolint:<linter> // <reason> passes (doc 15 §3).
+    - nolintlint
+
+  settings:
+    revive:
+      rules:
+        - name: exported
+          disabled: false
+        - name: package-comments
+          disabled: false
+
+    nolintlint:
+      require-explanation: true
+      require-specific: true
+      allow-unused: false
+
+    # The three import boundaries from doc 02 §1. Rules for drivers/kafka
+    # and drivers/rabbitmq are written by module path now, before either
+    # package exists, so the guard is armed before M2 adds franz-go rather
+    # than after (SETUP-05).
+    depguard:
+      rules:
+        core:
+          files:
+            - "**/*.go"
+            - "!**/driver/**"
+            - "!**/drivers/**"
+            - "!**/cmd/**"
+          deny:
+            - pkg: fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/drivers
+              desc: "core must not import drivers (doc 02 §1) - the core never knows which broker is wired"
+            - pkg: github.com/twmb/franz-go
+              desc: "core must not import a broker client directly (doc 02 §1) - only drivers/kafka may"
+            - pkg: github.com/rabbitmq/amqp091-go
+              desc: "core must not import a broker client directly (doc 02 §1) - only drivers/rabbitmq may"
+
+        driver-port:
+          files:
+            - "**/driver/**"
+            - "!**/driver/conformance/**"
+          allow:
+            - $gostd
+          deny:
+            - pkg: $all
+              desc: "driver (the port) is stdlib-only (doc 02 §2) - a third-party import belongs in a driver implementation, not the port"
+
+        # The shared conformance suite (doc 02 §2, doc 04 §6) sits under driver/
+        # but is a test suite, not the port: it imports the port it exercises
+        # plus testify (doc 15 §1.1). It must never import a driver - the suite
+        # is what every driver is measured against, so it cannot know any.
+        driver-conformance:
+          files:
+            - "**/driver/conformance/**"
+          allow:
+            - $gostd
+            - fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/driver
+            - github.com/stretchr/testify
+          deny:
+            - pkg: fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/drivers
+              desc: "the conformance suite never imports a driver (doc 04 §6) - it is the measure, not a consumer"
+            - pkg: $all
+              desc: "the conformance suite imports the port and testify only (doc 04 §6)"
+
+        # cmd/ is this module's composition root: its binaries register drivers
+        # by blank import exactly as an application does (doc 02 §2). That is
+        # the one place "core must not import drivers" does not apply - but
+        # reaching a broker client directly still never does.
+        cmd:
+          files:
+            - "**/cmd/**"
+          deny:
+            - pkg: github.com/twmb/franz-go
+              desc: "cmd registers drivers by blank import; it never speaks to a broker client directly (doc 02 §1)"
+            - pkg: github.com/rabbitmq/amqp091-go
+              desc: "cmd registers drivers by blank import; it never speaks to a broker client directly (doc 02 §1)"
+
+        drivers-kafka:
+          files:
+            - "**/drivers/kafka/**"
+          allow:
+            - $gostd
+            - github.com/twmb/franz-go
+            - fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/driver
+          deny:
+            - pkg: fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/drivers
+              desc: "a driver never imports another driver (doc 02 §1) - depguard matches prefixes, so allowing the port would otherwise allow every sibling under drivers/"
+            - pkg: $all
+              desc: "a driver imports stdlib plus its own broker client only (doc 02 §1)"
+
+        drivers-rabbitmq:
+          files:
+            - "**/drivers/rabbitmq/**"
+          allow:
+            - $gostd
+            - github.com/rabbitmq/amqp091-go
+            - fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/driver
+          deny:
+            - pkg: fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/drivers
+              desc: "a driver never imports another driver (doc 02 §1) - depguard matches prefixes, so allowing the port would otherwise allow every sibling under drivers/"
+            - pkg: $all
+              desc: "a driver imports stdlib plus its own broker client only (doc 02 §1)"
+
+        drivers-inmem:
+          files:
+            - "**/drivers/inmem/**"
+          allow:
+            - $gostd
+            - fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/driver
+          deny:
+            - pkg: fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/drivers
+              desc: "a driver never imports another driver (doc 02 §1) - depguard matches prefixes, so allowing the port would otherwise allow every sibling under drivers/"
+            - pkg: $all
+              desc: "the in-memory driver has no broker client: stdlib plus the port only (doc 02 §1)"
+
+    # No custom patterns yet: forbidigo's own built-in defaults (fmt.Print*,
+    # print, println) already apply and are verified below. The clock
+    # patterns and their internal/clock exclusion land in M1-04 as a
+    # reviewable diff separate from this on-switch.
+
+  exclusions:
+    presets:
+      - std-error-handling
+
+formatters:
+  enable:
+    - gofumpt
+    - goimports
+  settings:
+    goimports:
+      local-prefixes:
+        - fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk
