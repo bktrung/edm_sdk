@@ -9,7 +9,9 @@ GOLANGCI_LINT := $(CURDIR)/.tools/bin/golangci-lint
 
 export GOPRIVATE := fgit.zapps.vn
 
-.PHONY: build test-fast test test-chaos kpi lint verify-agnostic swap-report check-fixture check-api-surface
+APISURFACE := $(CURDIR)/.tools/bin/apisurface
+
+.PHONY: build test-fast test test-chaos kpi lint verify-agnostic swap-report check-fixture check-api-surface check-api-surface-codec
 
 ## build: compile all packages with reproducible build flags.
 build:
@@ -50,9 +52,15 @@ swap-report:
 ## check-fixture: validate the local fixtures used by tests and tooling.
 check-fixture:
 	go test ./...
-	$(MAKE) check-api-surface
+	$(MAKE) check-api-surface check-api-surface-codec
 
-## check-api-surface: verify exported symbols against the public API fixture.
-check-api-surface:
+## check-api-surface: verify exported symbols against the f1 public API fixture.
+check-api-surface: $(APISURFACE)
+	$(APISURFACE) -package f1 -fixture testdata/public-api.json
+
+## check-api-surface-codec: verify exported symbols against the codec public API fixture.
+check-api-surface-codec: $(APISURFACE)
+	$(APISURFACE) -package codec -fixture testdata/public-api-codec.json
+
+$(APISURFACE): tools/apisurface/main.go tools/apisurface/go.mod
 	cd tools/apisurface && go build -o ../../.tools/bin/apisurface .
-	./.tools/bin/apisurface -fixture testdata/public-api.json

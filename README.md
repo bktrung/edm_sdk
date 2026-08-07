@@ -6,8 +6,9 @@ guarantees, acknowledgement, retry ladders, dead-letter routing, poison-message 
 priority scheduling, zero-loss shutdown, and observability. The message broker is a pluggable
 driver, swapped by configuration.
 
-This file states what F1 must be true of. It is not a tour of the code, and it does not duplicate
-the design - see [Where the design lives](#where-the-design-lives) below for that.
+This file states what must be true of F1: the guarantees it owes a service author, and the things it
+deliberately does not do. It is not a tour of the code - see
+[`ARCHITECTURE.md`](ARCHITECTURE.md) for that.
 
 ## Guarantees
 
