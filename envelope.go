@@ -7,14 +7,9 @@ import (
 	"time"
 )
 
-// Envelope is the wire format, CloudEvents 1.0-compatible with the f1
-// extension set (doc 03 §1). Attribute names below are the CANONICAL,
-// broker-agnostic namespace doc 03 §2 defines; a driver maps these onto its
-// own header namespace (Kafka's ce_ prefix, AMQP's cloudEvents: prefix -
-// doc 03 §3.1/§3.2). EncodeHeaders/DecodeHeaders operate at this canonical
-// level, not the broker-specific one.
+// Envelope contains the canonical message headers.
 type Envelope struct {
-	// CloudEvents core
+	// CloudEvents attributes.
 	SpecVersion     string
 	ID              string
 	Source          string
@@ -24,7 +19,7 @@ type Envelope struct {
 	Subject         string
 	DataSchema      string
 
-	// F1 extensions
+	// F1 attributes.
 	IdempotencyKey string
 	Priority       Priority // int in Go, string on the wire - see Priority.String
 	Attempt        int
@@ -38,72 +33,33 @@ type Envelope struct {
 	PartitionKey   string
 	Expiry         *time.Time
 
-	// DLQ only
+	// Dead-letter metadata.
 	DeathError  string
 	DeathReason DeathReason // string in Go and on the wire; zero value "" is "not dead-lettered"
 	DeathTime   *time.Time
 
-	// W3C trace context (doc 03 §2.4/§2.5). These are NOT f1 extensions and
-	// are NOT free-form: they ride every traced message and must survive
-	// every hop, so they get typed fields rather than living in Extensions.
-	// Giving them no home was F-P46 - decode had nowhere to put them but
-	// Extensions, which rule 4 below then rejected on the way back out, so a
-	// retry or DLQ copy of any traced message could not be built.
+	// Trace context is preserved separately from free-form extensions.
 	TraceParent string
 	TraceState  string
 
-	// Unrecognised reserved-prefix attributes received from the wire. These
-	// are kept separate from caller-written Extensions so a decoded envelope
-	// can always be re-encoded for retry or DLQ forwarding.
+	// Forwarded holds unknown reserved attributes received from the wire.
 	Forwarded map[string]string
 
-	// Free-form, propagated untouched. The "f1", "ce_" and "ce-" prefixes are
-	// reserved (doc 03 §2.3 opens "All prefixed f1" - the whole namespace is
-	// reserved, not the roster of attributes declared so far), as are every
-	// CloudEvents attribute and the two trace fields above, and RabbitMQ's
-	// own death-history headers (doc 03 §3.3 rule 3 - stripped on decode,
-	// never entered here). Reserved is enforced on encode, not merely
-	// documented (rule 4, F-P45/F-P46).
+	// Extensions holds user-defined attributes. Reserved names are rejected
+	// when the envelope is encoded.
 	Extensions map[string]string
 }
 
-// timeLayout is RFC3339Nano, not RFC3339: doc 03 says "RFC3339 UTC" for the
-// wire type, but Nano is what makes the round trip lossless for a producer
-// that stamped sub-second precision - Parse accepts a bare-second value just
-// as well, so nothing that already conforms to doc 03 §2 is rejected.
+// timeLayout preserves sub-second precision while accepting RFC3339 values.
 const timeLayout = time.RFC3339Nano
 
-// CoreMaxHeaderBytes is the core's own header cap (doc 03 §3.3). The
-// effective cap for a publish is min(CoreMaxHeaderBytes, the connected
-// driver's Capabilities.MaxHeaderBytes) - EncodeHeaders takes the driver
-// side of that min as a parameter, since the driver port (doc 04) does not
-// exist yet at this milestone (M1-05 depends on M1-04/M1-03c only).
+// CoreMaxHeaderBytes is the SDK's maximum encoded header size.
 const CoreMaxHeaderBytes = 8 * 1024
 
-// EncodeHeaders serialises e to its wire header form. driverMaxBytes is the
-// connected driver's declared limit; pass 0 (or anything >= CoreMaxHeaderBytes)
-// to apply only the core's own cap.
-//
-// Doc 03 §3.3's five rules: the cap applies here regardless of whether this
-// is a first-publish, retry or DLQ copy (rule 1 - this function does not
-// distinguish, so it is applied uniformly); over the cap, Extensions is
-// dropped first, then DeathError is truncated further, and encoding never
-// fails on SIZE (rule 2 - the DLQ is the one destination a copy that refuses
-// to shrink must still reach); broker-internal headers are handled on the
-// decode side, not here (rule 3, see DecodeHeaders); Forwarded is written first so canonical
-// attributes overwrite it (rule 5, see DecodeHeaders); an Extensions key that
-// collides with a canonical attribute, or begins with the reserved f1, ce_ or ce-
-// prefix, is rejected, not merged over it (rule 4, F-P45/F-P46) - unlike
-// rule 2, this is a first-publish programming error, not a DLQ copy that has
-// to reach its destination regardless.
-//
-// F-P45 also closes the encode side's other unguarded case: an invalid
-// Priority (Valid() false) is rejected with ErrInvalidPriority rather than
-// letting String()'s "invalid" reach the wire.
-//
-// F-P36: a root event (one with no CorrelationID set) gets f1correlationid
-// defaulted to the event's own id here, the same treatment f1idempotencykey
-// already gets - the field can then never be silently empty.
+// EncodeHeaders serializes e to canonical wire headers. driverMaxBytes is the
+// connected driver's limit; zero or a larger value uses CoreMaxHeaderBytes.
+// Oversized headers drop Extensions and then truncate DeathError. Invalid
+// priorities and reserved extension keys return errors.
 func (e Envelope) EncodeHeaders(driverMaxBytes int) (map[string]string, error) {
 	if !e.Priority.Valid() {
 		return nil, ErrInvalidPriority
@@ -145,7 +101,7 @@ func (e Envelope) EncodeHeaders(driverMaxBytes int) (map[string]string, error) {
 	if e.CorrelationID != "" {
 		h["f1correlationid"] = e.CorrelationID
 	} else {
-		h["f1correlationid"] = e.ID // F-P36: root default
+		h["f1correlationid"] = e.ID // Root events use their ID as the correlation ID.
 	}
 	setOpt(h, "f1causationid", e.CausationID)
 	setOpt(h, "f1producer", e.Producer)
@@ -196,13 +152,12 @@ func headerBytes(h map[string]string) int {
 	return n
 }
 
-// shrinkDeathError truncates f1deatherror until h fits limit, never failing:
-// a truncated error beats an absent message (doc 03 §3.3 rule 2).
+// shrinkDeathError trims f1deatherror until h fits limit.
 func shrinkDeathError(h map[string]string, limit int) {
 	for headerBytes(h) > limit {
 		v, ok := h["f1deatherror"]
 		if !ok || v == "" {
-			return // cannot shrink further; best effort
+			return // There is no remaining field to shrink.
 		}
 		over := headerBytes(h) - limit
 		cut := len(v) - over
@@ -213,22 +168,10 @@ func shrinkDeathError(h map[string]string, limit int) {
 	}
 }
 
-// DecodeHeaders parses the canonical wire header form back into an Envelope.
-// Everything not recognised falls into Extensions, except a broker-internal
-// key (x-death, x-first-death-*, see isBrokerReserved) - those are stripped,
-// never entered (doc 03 §3.3 rule 3); unrecognised reserved-prefix keys
-// go to Forwarded for round-trip preservation (rule 5): otherwise a message that
-// transited a broker backstop re-emits a flattened x-death table on every
-// subsequent hop and headers grow monotonically along the ladder.
-//
-// f1deathreason is preserved exactly as read, never validated -
-// TestDLQ_UnknownReasonSurvivesReplay pins this; see DeathReason.Valid's
-// godoc for why. f1priority is validated: an unrecognised value is an error,
-// since a lane this build cannot schedule must not be silently misrouted.
-//
-// traceparent/tracestate are read into their own fields (F-P46), never into
-// Extensions - see Envelope's own doc comment for why they need a home at
-// all.
+// DecodeHeaders parses canonical wire headers into an Envelope. Unknown
+// broker-internal headers are dropped, reserved-prefix headers are kept in
+// Forwarded, and other unknown headers are stored in Extensions. Priority is
+// validated; DeathReason is preserved as received.
 func DecodeHeaders(h map[string]string) (Envelope, error) {
 	var e Envelope
 	e.SpecVersion = h["specversion"]
@@ -300,7 +243,7 @@ func DecodeHeaders(h map[string]string) (Envelope, error) {
 			continue
 		}
 		if isBrokerReserved(k) {
-			continue // broker-internal, stripped (doc 03 §3.3 rule 3)
+			continue // Broker-internal headers are not propagated.
 		}
 		if isReservedExtensionKey(k) {
 			if e.Forwarded == nil {
@@ -317,22 +260,13 @@ func DecodeHeaders(h map[string]string) (Envelope, error) {
 	return e, nil
 }
 
-// isBrokerReserved names the specific broker-internal keys doc 03 §3.3 rule
-// 3 calls out (RabbitMQ's death-history headers) - NOT a blanket "x-"
-// prefix, which would also eat a legitimate user extension that happens to
-// start with "x-".
+// isBrokerReserved reports whether k is a broker death-history header.
 func isBrokerReserved(k string) bool {
 	return k == "x-death" || strings.HasPrefix(k, "x-first-death-")
 }
 
-// isReservedExtensionKey reports whether an Extensions key collides with a
-// canonical attribute (doc 03 §3.3 rule 4, as amended by F-P46): a match
-// against a known header name - which now includes traceparent/tracestate,
-// so a caller setting one by hand collides with the typed fields above - or
-// the reserved "f1", "ce_" or "ce-" PREFIX. A prefix, not a name list: doc 03 §2.3 opens
-// "All prefixed f1", so the whole namespace is reserved, not the roster of
-// attributes declared today - probed, f1bogus and ce_type both used to reach
-// the wire.
+// isReservedExtensionKey reports whether k is a known header or uses a
+// reserved extension prefix.
 func isReservedExtensionKey(k string) bool {
 	return knownHeaders[k] || strings.HasPrefix(k, "f1") || strings.HasPrefix(k, "ce_") || strings.HasPrefix(k, "ce-")
 }

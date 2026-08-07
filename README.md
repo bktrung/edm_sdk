@@ -40,7 +40,7 @@ Each of these is testable, and each is enforced by CI, not documentation:
 ## Non-goals for v1
 
 - Exactly-once *transport* (Kafka transactions). At-least-once transport plus idempotent effects is
-  the guarantee; see ADR-0003 in the design repository.
+  the guarantee.
 - Global ordering across partitions/queues. Per-key ordering only.
 - Cross-region replication and DR topology. Owned by the platform team.
 - Request/reply over messaging. Use gRPC.
@@ -48,17 +48,13 @@ Each of these is testable, and each is enforced by CI, not documentation:
   Avro/Protobuf, but no registry client ships in v1.
 - NATS JetStream / Pulsar drivers. The port is designed to accommodate them; neither is scheduled.
 - Multiple broker versions per broker. v1 targets one pinned, stable version of Kafka and one of
-  RabbitMQ; see ADR-0009.
+  RabbitMQ.
 
 ## Install
 
 ```
 go get fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk
 ```
-
-The module path is the real repository path, not `github.com/za/f1` (see ADR-0014). The root
-package is `package f1`; since the module's last path element does not match the package name, the
-house style is an explicit import alias everywhere the root package is imported:
 
 ```go
 import f1 "fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk"
@@ -68,17 +64,31 @@ Set `GOPRIVATE=fgit.zapps.vn` before the first `go get` of this module - it live
 host, and without this the Go toolchain will try the public checksum database and proxy, which
 cannot see it.
 
-## Where the design lives
+## Comment conventions
 
-The requirements above are sourced from `REQUIREMENTS.md` and doc 00 in the design repository,
-which is where the actual design work happens - this repository is the implementation of it, not
-the other way around. Two documents are the exception and are duplicated here deliberately, because
-someone reading this code should not have to leave it to orient themselves:
+Comments should help a reader understand the code without narrating obvious statements.
+
+- Prefer clear names, types, and structure over explanatory comments.
+- Keep package and exported Go documentation immediately before the declaration. Start with the
+  declared name and write a complete sentence.
+- Document observable contracts: purpose, inputs, outputs, zero values, errors, panics, concurrency,
+  and wire-format behavior when they are not obvious from the API.
+- Use inline comments for non-obvious intent, invariants, constraints, or trade-offs. Explain why
+  the code matters, not what the next line does.
+- Keep comments short, local, accurate, and maintained with the code. Remove stale history,
+  issue references, milestones, external design references, and commented-out code.
+- Preserve compiler and tool directives such as `//go:...` and `//nolint:...`; every suppression
+  must name its linter and explain its reason.
+- Run `gofmt` after changing Go comments. Wrap long comments for source readability; there is no
+  fixed line-length rule.
+
+Reference guides: [Go Doc Comments](https://go.dev/doc/comment), [Go Code Review Comments](https://go.dev/wiki/CodeReviewComments),
+and the [Google Go Style Guide](https://google.github.io/styleguide/go/guide.html).
+
+## Project documentation
+
+Start with these local documents:
 
 - [`ARCHITECTURE.md`](ARCHITECTURE.md) - package layout, data flow, the import boundaries
   `make verify-agnostic` enforces.
 - This README.
-
-Everything else - the sixteen design documents, the ADRs, the capability matrix, and the build plan
-that orders the work in this repository task by task - lives in the design repository. Ask your
-lead for its remote if it is not already in your git remotes.

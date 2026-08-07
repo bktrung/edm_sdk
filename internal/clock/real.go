@@ -5,32 +5,31 @@ import (
 	"time"
 )
 
-// Real is Clock backed by the standard library. Production code uses this;
-// tests use Fake instead (doc 15 §7.4).
+// Real is a Clock backed by the standard library.
 type Real struct{}
 
-// NewReal returns the standard-library-backed Clock.
+// NewReal returns a real-time Clock.
 func NewReal() Real { return Real{} }
 
-// Now returns the current wall-clock time.
+// Now returns the current time.
 func (Real) Now() time.Time { return time.Now() }
 
-// Since returns the time elapsed since t.
+// Since returns the elapsed time since t.
 func (Real) Since(t time.Time) time.Duration { return time.Since(t) }
 
-// Timer starts a real timer that fires once after d.
+// Timer returns a timer that fires once after d.
 func (Real) Timer(d time.Duration) Timer {
 	rt := time.NewTimer(d)
 	return Timer{C: rt.C, stop: rt.Stop}
 }
 
-// Ticker starts a real ticker that fires every d.
+// Ticker returns a ticker that fires every d.
 func (Real) Ticker(d time.Duration) Ticker {
 	rt := time.NewTicker(d)
 	return Ticker{C: rt.C, stop: rt.Stop}
 }
 
-// Sleep blocks for d, or until ctx is done, whichever comes first.
+// Sleep waits for d or until ctx is done.
 func (Real) Sleep(ctx context.Context, d time.Duration) error {
 	t := time.NewTimer(d)
 	defer t.Stop()

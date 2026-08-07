@@ -1,20 +1,5 @@
-// Command apisurface is M1-05c's other half of F-P46's structural finding
-// (BLK-10): mq-sdk-docs' tools/apispec can prove its own documents are
-// self-consistent, but it never reads this repo's code, so it is
-// structurally blind to a symbol that is public here and named in no
-// document - seven of them, on a milestone whose exit is "the public API is
-// frozen". This tool is the other direction: it lists package f1's actual
-// exported surface and asserts it is a SUBSET of mq-sdk-docs' generated
-// testdata/public-api.json. Subset, not equality - most of that fixture's
-// symbols are for later milestones, and "declared but not yet implemented"
-// is expected before freeze.
-//
-// Granularity matches mq-sdk-docs' extractSurface exactly: go doc level -
-// types, top-level funcs, methods (as "Type.Method"), consts, vars. Struct
-// fields are explicitly NOT covered here: envelope-attributes.json already
-// covers the wire attributes at that level, and extending this tool to
-// struct fields would just be a second, differently-shaped copy of that
-// check.
+// Command apisurface verifies that the root package's exported API is present
+// in the public API fixture.
 package main
 
 import (
@@ -70,11 +55,11 @@ func main() {
 	}
 
 	if len(undeclared) > 0 {
-		fmt.Fprintln(os.Stderr, "apisurface: package f1 exports symbols mq-sdk-docs does not declare:")
+		fmt.Fprintln(os.Stderr, "apisurface: package f1 exports symbols missing from the fixture:")
 		for _, s := range undeclared {
 			fmt.Fprintf(os.Stderr, "  %s\n", s)
 		}
-		fmt.Fprintln(os.Stderr, "apisurface: document them in mq-sdk-docs (docs/03 or docs/05), regenerate public-api.json with `make check-api`, then re-run `make check-fixture` here.")
+		fmt.Fprintln(os.Stderr, "apisurface: update public-api.json and rerun the fixture checks")
 		os.Exit(1)
 	}
 
@@ -102,11 +87,7 @@ func loadFixture(path string) ([]string, error) {
 	return fixture.Symbols, nil
 }
 
-// extractSurface lists every exported top-level name declared across pkg's
-// *.go files directly under moduleDir (test files excluded), methods
-// included as "Type.Method". This mirrors mq-sdk-docs' tools/apispec
-// extractSurface node-for-node, so the two tools agree on what "exported
-// surface" means.
+// extractSurface lists exported declarations and methods in pkg's Go files.
 func extractSurface(moduleDir, pkg string) ([]string, error) {
 	fset := token.NewFileSet()
 	pkgs, err := parser.ParseDir(fset, moduleDir, func(fi os.FileInfo) bool {

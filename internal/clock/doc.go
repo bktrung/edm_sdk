@@ -1,5 +1,2 @@
-// Package clock is the injectable time source every timing-dependent
-// component uses, so scheduling, backoff and drain logic are testable in
-// milliseconds instead of wall-clock time.
-// See docs/11-testing-and-acceptance.md.
+// Package clock provides real and manually advanced time sources.
 package clock

@@ -1,7 +1,6 @@
 version: "2"
 
-# Pinned in Makefile and CI at the same version - a mismatch here is the
-# "green locally, red in CI" trap (SETUP-04, SETUP-06).
+# Keep the linter version aligned with the Makefile and CI.
 
 run:
   timeout: 5m
@@ -9,32 +8,26 @@ run:
 linters:
   default: none
   enable:
-    # correctness baseline (doc 15 §3)
+    # Correctness checks.
     - govet
     - staticcheck
     - errcheck
-    # naming, package comments, exported-symbol docs
+    # Naming, package comments, and exported-symbol docs.
     - revive
-    # import boundaries: core -> drivers, driver = stdlib-only,
-    # a driver = stdlib + its own broker client only (doc 02 §1).
+    # Import boundaries between core, ports, and drivers.
     - depguard
-    # forbidigo's forbid: list REPLACES its built-in defaults, it does not
-    # extend them (verified: unset it and fmt.Println passes silently) - so
-    # the fmt.Print*/print/println ban (doc 15 §3) is restated explicitly
-    # below, alongside the clock rule (doc 11 §2, doc 15 §7.4). No cmd/
-    # exclusion path exists yet because cmd/ doesn't. internal/clock is
-    # exempted from the clock patterns only (M1-04).
+    # Forbidden APIs for logging and time access.
     - forbidigo
-    # no hardcoded credentials, no weak rand where it matters
+    # Credential and cryptography checks.
     - gosec
-    # errors.Is/As instead of type assertions and == on wrapped errors
+    # Wrapped error handling.
     - errorlint
-    # contexts actually propagated
+    # Context propagation.
     - contextcheck
-    # store/postgres hygiene
+    # Database resource handling.
     - sqlclosecheck
     - rowserrcheck
-    # a bare //nolint fails; //nolint:<linter> // <reason> passes (doc 15 §3).
+    # Require a specific linter and an explanation for every suppression.
     - nolintlint
 
   settings:
@@ -50,10 +43,7 @@ linters:
       require-specific: true
       allow-unused: false
 
-    # The three import boundaries from doc 02 §1. Rules for drivers/kafka
-    # and drivers/rabbitmq are written by module path now, before either
-    # package exists, so the guard is armed before M2 adds franz-go rather
-    # than after (SETUP-05).
+    # Keep package import boundaries explicit, including planned drivers.
     depguard:
       rules:
         core:
@@ -64,11 +54,11 @@ linters:
             - "!**/cmd/**"
           deny:
             - pkg: fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/drivers
-              desc: "core must not import drivers (doc 02 §1) - the core never knows which broker is wired"
+              desc: "core must not import drivers"
             - pkg: github.com/twmb/franz-go
-              desc: "core must not import a broker client directly (doc 02 §1) - only drivers/kafka may"
+              desc: "core must not import a broker client directly"
             - pkg: github.com/rabbitmq/amqp091-go
-              desc: "core must not import a broker client directly (doc 02 §1) - only drivers/rabbitmq may"
+              desc: "core must not import a broker client directly"
 
         driver-port:
           files:
@@ -78,12 +68,9 @@ linters:
             - $gostd
           deny:
             - pkg: $all
-              desc: "driver (the port) is stdlib-only (doc 02 §2) - a third-party import belongs in a driver implementation, not the port"
+              desc: "the driver port may import only the standard library"
 
-        # The shared conformance suite (doc 02 §2, doc 04 §6) sits under driver/
-        # but is a test suite, not the port: it imports the port it exercises
-        # plus testify (doc 15 §1.1). It must never import a driver - the suite
-        # is what every driver is measured against, so it cannot know any.
+        # The conformance suite tests the port and must not import a driver.
         driver-conformance:
           files:
             - "**/driver/conformance/**"
@@ -93,22 +80,19 @@ linters:
             - github.com/stretchr/testify
           deny:
             - pkg: fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/drivers
-              desc: "the conformance suite never imports a driver (doc 04 §6) - it is the measure, not a consumer"
+              desc: "the conformance suite must not import a driver"
             - pkg: $all
-              desc: "the conformance suite imports the port and testify only (doc 04 §6)"
+              desc: "the conformance suite may import only the port and testify"
 
-        # cmd/ is this module's composition root: its binaries register drivers
-        # by blank import exactly as an application does (doc 02 §2). That is
-        # the one place "core must not import drivers" does not apply - but
-        # reaching a broker client directly still never does.
+        # cmd/ registers drivers but must not import broker clients directly.
         cmd:
           files:
             - "**/cmd/**"
           deny:
             - pkg: github.com/twmb/franz-go
-              desc: "cmd registers drivers by blank import; it never speaks to a broker client directly (doc 02 §1)"
+              desc: "cmd registers drivers and must not import broker clients directly"
             - pkg: github.com/rabbitmq/amqp091-go
-              desc: "cmd registers drivers by blank import; it never speaks to a broker client directly (doc 02 §1)"
+              desc: "cmd registers drivers and must not import broker clients directly"
 
         drivers-kafka:
           files:
@@ -119,9 +103,9 @@ linters:
             - fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/driver
           deny:
             - pkg: fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/drivers
-              desc: "a driver never imports another driver (doc 02 §1) - depguard matches prefixes, so allowing the port would otherwise allow every sibling under drivers/"
+              desc: "a driver must not import another driver"
             - pkg: $all
-              desc: "a driver imports stdlib plus its own broker client only (doc 02 §1)"
+              desc: "a driver may import the standard library and its own broker client"
 
         drivers-rabbitmq:
           files:
@@ -132,9 +116,9 @@ linters:
             - fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/driver
           deny:
             - pkg: fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/drivers
-              desc: "a driver never imports another driver (doc 02 §1) - depguard matches prefixes, so allowing the port would otherwise allow every sibling under drivers/"
+              desc: "a driver must not import another driver"
             - pkg: $all
-              desc: "a driver imports stdlib plus its own broker client only (doc 02 §1)"
+              desc: "a driver may import the standard library and its own broker client"
 
         drivers-inmem:
           files:
@@ -144,52 +128,41 @@ linters:
             - fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/driver
           deny:
             - pkg: fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/drivers
-              desc: "a driver never imports another driver (doc 02 §1) - depguard matches prefixes, so allowing the port would otherwise allow every sibling under drivers/"
+              desc: "a driver must not import another driver"
             - pkg: $all
-              desc: "the in-memory driver has no broker client: stdlib plus the port only (doc 02 §1)"
+              desc: "the in-memory driver may import only the standard library and the port"
 
-    # forbid: replaces the built-in defaults (see the comment above), so the
-    # fmt.Print*/print/println ban is restated here explicitly (doc 15 §3),
-    # then every way to reach the wall clock outside internal/clock (doc 11
-    # §2, doc 15 §7.4) - not just the four convenience wrappers, but the
-    # NewTimer/NewTicker/AfterFunc/Since forms too, since those are what a
-    # developer reaches for once After/Tick are blocked.
+    # The forbidden list replaces the defaults, so list every blocked API.
     forbidigo:
       forbid:
         - pattern: '^(fmt\.Print(|f|ln)|print|println)$'
-          msg: "use structured logging, not a print function (doc 15 §3)"
+          msg: "use structured logging, not a print function"
         - pattern: '^time\.Now(\(\))?$'
-          msg: "use a clock.Clock's Now, not time.Now directly (doc 15 §7.4)"
+          msg: "use a clock.Clock's Now, not time.Now directly"
         - pattern: '^time\.Since(\(\))?$'
-          msg: "use a clock.Clock's Since, not time.Since directly (doc 15 §7.4)"
+          msg: "use a clock.Clock's Since, not time.Since directly"
         - pattern: '^time\.Sleep(\(\))?$'
-          msg: "use a clock.Clock's Sleep, not time.Sleep directly (doc 15 §7.4)"
+          msg: "use a clock.Clock's Sleep, not time.Sleep directly"
         - pattern: '^time\.After(\(\))?$'
-          msg: "use a clock.Clock's Timer, not time.After directly (doc 15 §7.4)"
+          msg: "use a clock.Clock's Timer, not time.After directly"
         - pattern: '^time\.Tick(\(\))?$'
-          msg: "use a clock.Clock's Ticker, not time.Tick directly (doc 15 §7.4)"
+          msg: "use a clock.Clock's Ticker, not time.Tick directly"
         - pattern: '^time\.NewTimer(\(\))?$'
-          msg: "use a clock.Clock's Timer, not time.NewTimer directly (doc 15 §7.4)"
+          msg: "use a clock.Clock's Timer, not time.NewTimer directly"
         - pattern: '^time\.NewTicker(\(\))?$'
-          msg: "use a clock.Clock's Ticker, not time.NewTicker directly (doc 15 §7.4)"
+          msg: "use a clock.Clock's Ticker, not time.NewTicker directly"
         - pattern: '^time\.AfterFunc(\(\))?$'
-          msg: "use a clock.Clock's Timer, not time.AfterFunc directly (doc 15 §7.4)"
+          msg: "use a clock.Clock's Timer, not time.AfterFunc directly"
 
   exclusions:
     presets:
       - std-error-handling
     rules:
-      # Scoped to the clock patterns' own message text, not the whole path:
-      # internal/clock legitimately calls time.Now/NewTimer/NewTicker/etc (it
-      # is what they implement), but forbidigo's other rules - the
-      # fmt.Print*/print/println ban above - still apply inside this package,
-      # same as everywhere else (verified: 0 issues before and after this
-      # fix, since the package has no such calls; a probe fmt.Println here
-      # was caught pre-fix and stays caught).
+      # Exempt only clock API diagnostics inside the clock implementation.
       - path: internal/clock/
         linters:
           - forbidigo
-        text: "doc 15 §7.4"
+        text: "use a clock.Clock's"
 
 formatters:
   enable:
