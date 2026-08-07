@@ -1,0 +1,11 @@
+{
+  "package": "codec",
+  "symbols": [
+    "Codec",
+    "JSON",
+    "JSON.ContentType",
+    "JSON.Decode",
+    "JSON.Encode",
+    "JSON.Name"
+  ]
+}

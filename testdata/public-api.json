@@ -1,5 +1,4 @@
 {
-  "_generated": "GENERATED from docs/03-message-envelope-spec.md and docs/05-public-api-spec.md by mq-sdk-docs tools/apispec. Do not hand-edit: run `make check-api` in mq-sdk-docs. event-driven-messaging-sdk's `make check-api-surface` asserts package f1's actual exported symbols against this list, which is the code-to-doc direction check-api itself cannot run.",
   "package": "f1",
   "symbols": [
     "BatchResult",

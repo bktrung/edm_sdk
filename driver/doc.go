@@ -1,4 +1,2 @@
-// Package driver is the port: the interfaces a broker driver must
-// implement, and nothing else. stdlib only.
-// See docs/04-driver-port-spec.md.
+// Package driver defines the interfaces implemented by broker drivers.
 package driver

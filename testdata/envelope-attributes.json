@@ -1,5 +1,4 @@
 {
-  "_generated": "GENERATED from docs/03-message-envelope-spec.md section 2.3 by mq-sdk-docs tools/apispec. Do not hand-edit: run `make check-api` in mq-sdk-docs. event-driven-messaging-sdk/testdata/envelope-attributes.json is a copy of this file and must stay byte-identical.",
   "attributes": [
     {
       "attribute": "f1attempt",

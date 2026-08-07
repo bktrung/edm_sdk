@@ -1,11 +1,4 @@
-# Every job's script is a single make invocation (doc 15 §12): "if a
-# workflow is not a make target, it does not exist." CI, onboarding and a
-# developer's shell all run the same entry points.
-#
-# golangci-lint's version is pinned exactly once, in the Makefile
-# (GOLANGCI_LINT_VERSION). lint/verify-agnostic self-install that pin into
-# .tools/bin, so CI runs the identical binary a developer runs locally -
-# there is nothing here to drift out of sync with the Makefile.
+# Jobs use the same Make targets as local development.
 
 image: golang:1.24.0
 
@@ -52,14 +45,10 @@ verify-agnostic:
   script:
     - make verify-agnostic
 
-# Per-package coverage thresholds (doc 11 §2) are added here as each
-# package appears; there is nothing to gate on yet (SETUP-06).
+# Add coverage thresholds as packages gain dedicated coverage requirements.
 
-# No new `// TENTATIVE` marker without a linked issue reference (doc 11 §7).
-# This is a diff check against the merge-request target branch, not a
-# repo-wide invariant, so it runs only on MR pipelines and is not a make
-# target - a developer never runs it standalone the way they'd run `make
-# lint`; it exists solely to look at the diff CI is given.
+# New `// TENTATIVE` markers must include an issue link.
+# This check runs only on merge-request diffs.
 tentative-check:
   stage: verify
   rules:

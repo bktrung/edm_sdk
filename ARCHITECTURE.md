@@ -1,8 +1,9 @@
 # Architecture
 
 What each package owns, how a message moves through them, and the import boundaries that keep it
-that way. Full rationale - why DWRR, why settle-last, what each ADR ruled - lives in the design
-repository and is linked, not retold.
+that way. This file describes structure, not the reasoning behind it: it tells you where code goes
+and what may import what, so that a change lands in the right package and the build catches it when
+it does not.
 
 ## Layers
 
@@ -18,24 +19,24 @@ drivers/kafka, drivers/rabbitmq, drivers/inmem
     -> their broker's client library
 ```
 
-The core never has a `switch driver.Name()`. A capability the core needs to branch on belongs in
-the capability model, not a type switch - see docs/04-driver-port-spec.md.
+The core never has a `switch driver.Name()`. A capability the core needs to branch on belongs in the
+capability model, not a type switch.
 
 ## Package tree
 
-| Package | Owns | Governing doc |
-|---|---|---|
-| `.` (`package f1`) | The public API surface: `Client`, `Publisher`, `Consumer`, `Handler`, `Event`, error taxonomy | docs/05-public-api-spec.md |
-| `driver/` (`package driver`) | The port: the interfaces a broker driver implements. Zero third-party imports | docs/04-driver-port-spec.md |
-| `drivers/inmem/` (`package inmem`) | Deterministic, race-free reference driver; the SDK's canonical test fake | docs/04-driver-port-spec.md |
-| `codec/` | Payload encode/decode behind a port. Public API, not `internal/` - a third party can implement its own codec | docs/03-message-envelope-spec.md |
-| `internal/clock/` | Injectable time source; all timing-dependent code goes through it | docs/11-testing-and-acceptance.md |
-| `internal/obs/` | Metric, trace and log emission, including the sampling loop | docs/10-observability-spec.md |
+| Package | Owns |
+|---|---|
+| `.` (`package f1`) | The public API surface: `Client`, `Publisher`, `Consumer`, `Handler`, `Event`, error taxonomy |
+| `driver/` (`package driver`) | The port: the interfaces a broker driver implements. Zero third-party imports |
+| `drivers/inmem/` (`package inmem`) | Deterministic, race-free reference driver; the SDK's canonical test fake |
+| `codec/` | Payload encode/decode behind a port. Public API, not `internal/` - a third party can implement its own codec |
+| `internal/clock/` | Injectable time source; all timing-dependent code goes through it |
+| `internal/obs/` | Metric, trace and log emission, including the sampling loop |
 
-Packages not yet created (`dedupe`, `outbox`, `internal/sched`, `internal/retry`,
-`internal/lifecycle`, `drivers/kafka`, `drivers/rabbitmq`, `store/`, `cmd/`) are the design
-repository's package layout, not this repository's yet - see docs/02-architecture-overview.md §2 for
-the full target tree and plan/ for the order they land in.
+`dedupe`, `outbox`, `internal/sched`, `internal/retry`, `internal/lifecycle`, `drivers/kafka`,
+`drivers/rabbitmq`, `store/` and `cmd/` are part of the target layout and are not created yet. Add
+one only when the code that lives in it arrives, so the tree never advertises a package a reader
+cannot open.
 
 ## Data flow
 
@@ -43,13 +44,15 @@ Publish: `f1.Publisher` resolves the logical topic to a physical destination, bu
 and hands it to `driver.Producer`; `Publish` returns only after the broker has durably
 acknowledged. Consume: a driver delivers into per-lane buffers, a DWRR scheduler picks the next
 message, a worker decodes it, checks the dedupe store, runs the handler, and settles - acking the
-original only after any retry or DLQ copy is confirmed, never before. Full sequence diagrams and the
-reasoning behind the ack ordering: docs/02-architecture-overview.md §3.
+original only after any retry or DLQ copy is confirmed, never before.
+
+That ack ordering is the zero-loss guarantee and it is not an implementation detail: a message is
+acked only once its retry or dead-letter copy is durable, so a crash at any point leaves the
+original redeliverable rather than lost.
 
 ## Import boundaries
 
-Three rules, all from docs/02-architecture-overview.md §1, all enforced by `depguard` and proven by
-`make verify-agnostic`:
+Three rules, enforced by `depguard` and proven by `make verify-agnostic`:
 
 - `internal/**` and the root package (`f1`) must not import `drivers/**`, or a broker client
   directly.

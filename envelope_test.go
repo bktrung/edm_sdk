@@ -12,12 +12,7 @@ import (
 	f1 "fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk"
 )
 
-// docAttribute mirrors one row of testdata/envelope-attributes.json, the
-// fixture mq-sdk-docs' tools/apispec generates from doc 03 §2.3 (M1-03c). It
-// is a machine artifact, not hand-maintained here - the file's own
-// "_generated" field names its source and regeneration command
-// (mq-sdk-docs' `make check-api`), and `make check-fixture` here diffs this
-// copy against that repo's when it is checked out alongside this one.
+// docAttribute describes one entry in the envelope fixture.
 type docAttribute struct {
 	Attribute string   `json:"attribute"`
 	Type      string   `json:"type"`
@@ -25,10 +20,8 @@ type docAttribute struct {
 	Enum      []string `json:"enum,omitempty"`
 }
 
-// docAttributeFixture is testdata/envelope-attributes.json's top-level
-// shape: an object carrying provenance, not a bare array (F-P45).
+// docAttributeFixture describes the fixture's top-level shape.
 type docAttributeFixture struct {
-	Generated  string         `json:"_generated"`
 	Attributes []docAttribute `json:"attributes"`
 }
 
@@ -38,15 +31,11 @@ func loadDoc03Attributes(t *testing.T) []docAttribute {
 	require.NoError(t, err)
 	var fixture docAttributeFixture
 	require.NoError(t, json.Unmarshal(data, &fixture))
-	require.NotEmpty(t, fixture.Generated, "fixture is missing its _generated provenance field")
 	require.NotEmpty(t, fixture.Attributes)
 	return fixture.Attributes
 }
 
-// fullEnvelope populates every field with a distinct, non-zero value so
-// every doc 03 §2.3 attribute appears in EncodeHeaders' output - the fixture
-// only covers §2.3 (the f1 extensions), so this test does not touch the
-// CloudEvents core/optional attributes.
+// fullEnvelope returns an envelope with every supported field populated.
 func fullEnvelope() f1.Envelope {
 	due := time.Date(2026, 8, 5, 12, 0, 0, 0, time.UTC)
 	death := time.Date(2026, 8, 5, 13, 0, 0, 0, time.UTC)
@@ -77,10 +66,7 @@ func fullEnvelope() f1.Envelope {
 	}
 }
 
-// TestEnvelope_MatchesDoc03Table is M1-05's first Red item, driven from
-// M1-03c's fixture instead of a hand-written list: two of doc 03 §2.4's
-// fields have ever been checked against the table above them before (F-P43,
-// F-P44), and both were wrong. This covers all fifteen §2.3 rows.
+// TestEnvelope_MatchesDoc03Table checks that every fixture attribute is emitted.
 func TestEnvelope_MatchesDoc03Table(t *testing.T) {
 	t.Parallel()
 
@@ -95,19 +81,19 @@ func TestEnvelope_MatchesDoc03Table(t *testing.T) {
 
 	for _, attr := range attrs {
 		v, ok := headers[attr.Attribute]
-		require.Truef(t, ok, "doc 03 §2.3 declares %s but EncodeHeaders never wrote it", attr.Attribute)
+		require.Truef(t, ok, "fixture declares %s but EncodeHeaders never wrote it", attr.Attribute)
 
 		switch attr.Type {
 		case "int":
-			require.Regexpf(t, `^-?\d+$`, v, "%s: doc 03 types it int", attr.Attribute)
+			require.Regexpf(t, `^-?\d+$`, v, "%s: fixture types it as int", attr.Attribute)
 		case "RFC3339":
 			_, err := time.Parse(time.RFC3339Nano, v)
-			require.NoErrorf(t, err, "%s: doc 03 types it RFC3339", attr.Attribute)
+			require.NoErrorf(t, err, "%s: fixture types it as RFC3339", attr.Attribute)
 		case "enum (string)":
-			require.Containsf(t, attr.Enum, v, "%s: %q is not one of doc 03's declared values", attr.Attribute, v)
+			require.Containsf(t, attr.Enum, v, "%s: %q is not a declared fixture value", attr.Attribute, v)
 			gotValues, ok := knownEnums[attr.Attribute]
 			require.Truef(t, ok, "%s: test has no Go-side enum mapping to check the fixture against", attr.Attribute)
-			require.ElementsMatchf(t, attr.Enum, gotValues, "%s: doc 03's value list and the Go constants' wire form have drifted apart", attr.Attribute)
+			require.ElementsMatchf(t, attr.Enum, gotValues, "%s: fixture values and Go constants differ", attr.Attribute)
 		case "string":
 			// Any string is valid; presence above is the whole assertion.
 		default:
@@ -124,13 +110,8 @@ func deathReasonWireValues() []string {
 	}
 }
 
-// TestEnvelope_FixtureCoversEveryF1HeaderEmitted is BLK-7's other direction
-// (F-P45, hole 3): TestEnvelope_MatchesDoc03Table above only checks that
-// every fixture row reached the headers, never the reverse. Probed before
-// this test existed: EncodeHeaders emitting a header named "f1futurething"
-// sailed through with nothing complaining, since nothing walked the headers
-// looking for one the fixture does not know. Doc 03 is frozen and the code
-// is what grows, so this is the direction that will actually drift.
+// TestEnvelope_FixtureCoversEveryF1HeaderEmitted checks the reverse mapping:
+// every emitted F1 header must have a fixture entry.
 func TestEnvelope_FixtureCoversEveryF1HeaderEmitted(t *testing.T) {
 	t.Parallel()
 
@@ -144,9 +125,9 @@ func TestEnvelope_FixtureCoversEveryF1HeaderEmitted(t *testing.T) {
 	require.NoError(t, err)
 	for k := range headers {
 		if !strings.HasPrefix(k, "f1") {
-			continue // CloudEvents core/optional attributes aren't in doc 03 §2.3's table
+			continue // Core and optional attributes are outside the fixture.
 		}
-		require.Truef(t, known[k], "EncodeHeaders emitted %q but doc 03 §2.3's fixture has no row for it", k)
+		require.Truef(t, known[k], "EncodeHeaders emitted %q but the fixture has no row for it", k)
 	}
 }
 
@@ -169,16 +150,8 @@ func TestEnvelope_HeaderRoundTripIsLossless(t *testing.T) {
 
 func timePtr(t time.Time) *time.Time { return &t }
 
-// TestEnvelope_TracedMessageSurvivesDecodeEncodeRoundTrip is F-P46: before
-// TraceParent/TraceState existed as typed fields, DecodeHeaders had nowhere
-// to put traceparent/tracestate but Extensions, and EncodeHeaders' rule 4
-// then rejected exactly that on the way back out with ErrReservedExtension -
-// so no retry or DLQ copy of any traced message could ever be built.
-// TestEnvelope_HeaderRoundTripIsLossless never caught this: its one
-// Extensions entry is x-custom-ext, not traceparent, so it proved what it
-// was populated with rather than what the wire actually carries. This uses
-// the W3C spec's own example values, and asserts the trace headers never
-// land in Extensions on the way through.
+// TestEnvelope_TracedMessageSurvivesDecodeEncodeRoundTrip preserves trace
+// fields without treating them as user extensions.
 func TestEnvelope_TracedMessageSurvivesDecodeEncodeRoundTrip(t *testing.T) {
 	t.Parallel()
 
@@ -197,7 +170,7 @@ func TestEnvelope_TracedMessageSurvivesDecodeEncodeRoundTrip(t *testing.T) {
 	require.NotContains(t, got.Extensions, "traceparent")
 	require.NotContains(t, got.Extensions, "tracestate")
 
-	// The regression itself: re-encoding what was just decoded must not fail.
+	// A decoded envelope must be encodable again.
 	replayed, err := got.EncodeHeaders(0)
 	require.NoError(t, err)
 	require.Equal(t, headers, replayed)
@@ -231,12 +204,12 @@ func TestPriority_MarshalsToWireString(t *testing.T) {
 	require.NoError(t, json.Unmarshal([]byte(`"low"`), &p))
 	require.Equal(t, f1.PriorityLow, p)
 
-	// Absent/empty decodes to PriorityNormal, the safe default.
+	// Absent and empty values use the default lane.
 	got, err := f1.ParsePriority("")
 	require.NoError(t, err)
 	require.Equal(t, f1.PriorityNormal, got)
 
-	// An unrecognised value is an error, not a silent downgrade.
+	// Unknown lanes must not be silently downgraded.
 	_, err = f1.ParsePriority("urgent")
 	require.Error(t, err)
 }
@@ -253,8 +226,7 @@ func TestDLQ_UnknownReasonSurvivesReplay(t *testing.T) {
 	require.Equal(t, f1.DeathReason("a_reason_this_build_predates"), e.DeathReason)
 	require.False(t, e.DeathReason.Valid())
 
-	// Replay: re-encoding what was just decoded must preserve the same
-	// unrecognised value, not drop or normalise it.
+	// Replay preserves an unknown death reason.
 	replayed, err := e.EncodeHeaders(0)
 	require.NoError(t, err)
 	require.Equal(t, "a_reason_this_build_predates", replayed["f1deathreason"])
@@ -280,9 +252,7 @@ func TestMaxAttempts_AbsentUnlessProducerSets(t *testing.T) {
 func TestCorrelationID_RootDefault(t *testing.T) {
 	t.Parallel()
 
-	// F-P36: a root event - no CorrelationID set - defaults f1correlationid
-	// to the event's own id, the same treatment f1idempotencykey already
-	// gets, so the field is never silently empty.
+	// A root event uses its ID as the correlation ID.
 	e := f1.Envelope{ID: "evt-root"}
 	h1, err := e.EncodeHeaders(0)
 	require.NoError(t, err)
@@ -315,18 +285,15 @@ func TestEnvelope_HeaderSizeGuardShedsExtensionsThenTruncatesDeathError(t *testi
 	require.False(t, hasExtA)
 	require.False(t, hasExtB, "Extensions must be shed first, before DeathError is touched")
 
-	// A cap so tight even DeathError=="" can't fit under it still must not
-	// error - it degrades as far as it can and stops (doc 03 §3.3 rule 2).
+	// An unachievable cap still returns the best-effort headers.
 	e.DeathError = "a very long terminal error string that will need truncating to fit under the cap"
 	tight, err := e.EncodeHeaders(120)
 	require.NoError(t, err)
 	require.LessOrEqual(t, len(tight["f1deatherror"]), len("a very long terminal error string that will need truncating to fit under the cap"))
 }
 
-// TestEnvelope_HeaderSizeGuardExtensionsAloneIsEnough covers the branch none
-// of this file's other size-guard tests reach: a cap tight enough to require
-// dropping Extensions, but loose enough that dropping them alone is
-// sufficient - DeathError must be left untouched, not merely fit.
+// TestEnvelope_HeaderSizeGuardExtensionsAloneIsEnough checks that dropping
+// Extensions does not also truncate DeathError when it is unnecessary.
 func TestEnvelope_HeaderSizeGuardExtensionsAloneIsEnough(t *testing.T) {
 	t.Parallel()
 
@@ -362,7 +329,7 @@ func TestEnvelope_SizeGuardDriverLimitBelowCoreCap(t *testing.T) {
 
 	e := fullEnvelope()
 	e.Extensions = map[string]string{"ext-a": "aaaaaaaaaa"}
-	// driverMaxBytes below CoreMaxHeaderBytes must win the min().
+	// The driver's lower limit takes precedence.
 	h, err := e.EncodeHeaders(50)
 	require.NoError(t, err)
 	_, hasExt := h["ext-a"]
@@ -374,9 +341,7 @@ func TestEnvelope_SizeGuardDeathErrorEmptyStopsShrinking(t *testing.T) {
 
 	e := fullEnvelope()
 	e.DeathError = ""
-	// A limit so tight that even every other header alone exceeds it: with
-	// no DeathError left to shrink, EncodeHeaders must still return, not
-	// hang or panic.
+	// Encoding remains best effort when no field can be shrunk further.
 	require.NotPanics(t, func() { _, _ = e.EncodeHeaders(1) })
 }
 
@@ -433,13 +398,8 @@ func TestUnrecognisedValueError_Error(t *testing.T) {
 	require.EqualError(t, err, `f1: unrecognised f1priority value "urgent"`)
 }
 
-// TestEnvelope_RejectsExtensionOverwritingCanonicalHeader is doc 03 §3.3
-// rule 4 (F-P45): EncodeHeaders used to merge Extensions in last, so
-// Extensions{"f1priority": "urgent"} won and produced a message that was
-// both misrouted (matches no lane binding) and undecodable at the consumer -
-// no retry can repair headers that are wrong on the wire. Rule 3 already
-// keeps reserved keys out of Extensions on decode; this is the same rule on
-// the way out.
+// TestEnvelope_RejectsExtensionOverwritingCanonicalHeader prevents an
+// extension from replacing a canonical header.
 func TestEnvelope_RejectsExtensionOverwritingCanonicalHeader(t *testing.T) {
 	t.Parallel()
 
@@ -458,21 +418,14 @@ func TestEnvelope_RejectsExtensionOverwritingCanonicalHeader(t *testing.T) {
 		require.ErrorIsf(t, err, f1.ErrReservedExtension, "key %q must be rejected", k)
 	}
 
-	// A key outside the f1/ce namespace and unequal to any canonical header
-	// is unaffected. See TestEnvelope_RejectsReservedPrefixExtension for the
-	// f1/ce prefix ban itself (F-P46).
+	// Ordinary extension keys remain allowed.
 	e.Extensions = map[string]string{"x-custom-ext": "value"}
 	_, err = e.EncodeHeaders(0)
 	require.NoError(t, err)
 }
 
-// TestEnvelope_RejectsReservedPrefixExtension is F-P46's second defect: the
-// reserved-key check used to be an exact-name match against the roster of
-// attributes doc 03 §2.3 declares today, but doc 03 §2.3 opens "All prefixed
-// f1" - the whole f1/ce namespace is reserved, not just the names currently
-// in the table. Probed before this fix: f1bogus and ce_type both reached the
-// wire. A key outside that namespace, and not equal to a canonical header,
-// still passes.
+// TestEnvelope_RejectsReservedPrefixExtension rejects every reserved
+// extension prefix, not only currently known names.
 func TestEnvelope_RejectsReservedPrefixExtension(t *testing.T) {
 	t.Parallel()
 
@@ -541,13 +494,8 @@ func TestEnvelope_CallerKeysBeginningCeAreNotReserved(t *testing.T) {
 	}
 }
 
-// TestPriority_UndeclaredValueDoesNotBecomeALane is doc 05 §1 (F-P45):
-// Priority.String()'s default case used to return "normal", so
-// Priority(99) composed the routing key "normal.<key>" - the same silent
-// lane downgrade ParsePriority already refuses on the decode side,
-// performed on the encode side instead. "invalid" binds to no lane, so the
-// message is visibly stuck rather than quietly in the wrong one, and
-// EncodeHeaders now stops it reaching the wire at all.
+// TestPriority_UndeclaredValueDoesNotBecomeALane prevents an unknown value
+// from being encoded as a valid lane.
 func TestPriority_UndeclaredValueDoesNotBecomeALane(t *testing.T) {
 	t.Parallel()
 

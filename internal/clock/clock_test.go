@@ -15,9 +15,7 @@ func TestFake_AdvanceFiresTimersInOrder(t *testing.T) {
 
 	fc := clock.NewFake(time.Unix(0, 0))
 
-	// Registered out of due-time order on purpose: t3 first, t1 last. If
-	// Advance fired in registration order instead of due-time order, t3
-	// would fire on the first Advance below and this test would fail.
+	// Register out of due-time order to verify firing uses due time.
 	t3 := fc.Timer(3 * time.Second)
 	t1 := fc.Timer(1 * time.Second)
 	t2 := fc.Timer(2 * time.Second)
@@ -48,10 +46,7 @@ func TestFake_SleepIsDeterministicUnderParallel(t *testing.T) {
 		}()
 	}
 
-	// BlockUntil proves every goroutine has registered as a waiter before
-	// Advance runs - without it there is no way to know a concurrently
-	// started Sleep has actually registered, which is exactly what would
-	// make this test racy instead of deterministic.
+	// Synchronize registration before advancing the clock.
 	fc.BlockUntil(n)
 	fc.Advance(time.Second)
 
@@ -105,9 +100,7 @@ func TestFake_TickerFiresOnEveryInterval(t *testing.T) {
 	fc := clock.NewFake(time.Unix(0, 0))
 	tk := fc.Ticker(time.Second)
 
-	// Three separate Advance calls, one interval each - this only stays
-	// green if the waiter is rescheduled (fake.go's due += interval) after
-	// every fire, not just the first.
+	// Each advance should reschedule the ticker.
 	for i := 0; i < 3; i++ {
 		fc.Advance(time.Second)
 		requireFired(t, tk.C)
@@ -120,17 +113,12 @@ func TestFake_TickerCatchesUpButDropsExtraTicks(t *testing.T) {
 	fc := clock.NewFake(time.Unix(0, 0))
 	tk := fc.Ticker(time.Second)
 
-	// One Advance spanning three intervals: the waiter fires three times
-	// internally (exercising the same rescheduling branch as the test
-	// above, but within a single Advance call), yet the channel is
-	// buffered(1), so only the last send lands - matching time.Ticker's own
-	// documented behaviour of dropping ticks a slow reader didn't consume.
+	// A long advance catches up the ticker, but the buffered channel keeps one tick.
 	fc.Advance(3 * time.Second)
 	requireFired(t, tk.C)
 	requireNotFired(t, tk.C)
 
-	// The waiter's due time must have caught up to "now", not fallen
-	// permanently behind - one more interval fires exactly once more.
+	// Catch-up should leave the next due time one interval ahead.
 	fc.Advance(time.Second)
 	requireFired(t, tk.C)
 }
@@ -156,8 +144,7 @@ func TestFake_SleepReturnsCtxErrorOnCancel(t *testing.T) {
 	cancel()
 	require.ErrorIs(t, <-errCh, context.Canceled)
 
-	// A cancelled Sleep must also unregister itself, or a long-lived Fake
-	// accumulates waiters that Advance keeps scanning.
+	// Cancellation must remove the waiter.
 	require.Zero(t, fc.NumWaiters())
 }
 
@@ -206,7 +193,7 @@ func TestReal_TimerFiresAndStops(t *testing.T) {
 		t.Fatal("timer did not fire")
 	}
 
-	// Fired already, so Stop must report false.
+	// A fired timer cannot be stopped.
 	require.False(t, tm.Stop())
 }
 
