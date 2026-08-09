@@ -126,17 +126,21 @@ linters:
           allow:
             - $gostd
             - fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/driver
+            - fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/clock
+            - github.com/stretchr/testify
           deny:
             - pkg: fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/drivers
               desc: "a driver must not import another driver"
             - pkg: $all
-              desc: "the in-memory driver may import only the standard library and the port"
+              desc: "the in-memory driver may import only the standard library, port, clock, and test assertions"
 
     # The forbidden list replaces the defaults, so list every blocked API.
     forbidigo:
       forbid:
         - pattern: '^(fmt\.Print(|f|ln)|print|println)$'
           msg: "use structured logging, not a print function"
+        - pattern: '^log\.(Print|Printf|Println|Fatal|Fatalf|Fatalln|Panic|Panicf|Panicln)$'
+          msg: "use structured logging through f1.WithLogger, not the standard library global logger"
         - pattern: '^time\.Now(\(\))?$'
           msg: "use a clock.Clock's Now, not time.Now directly"
         - pattern: '^time\.Since(\(\))?$'
