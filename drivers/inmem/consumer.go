@@ -3,6 +3,7 @@ package inmem
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/driver"
@@ -73,7 +74,7 @@ func (c *consumer) Stop(ctx context.Context) error {
 		return nil
 	}
 	if c.outstanding != 0 {
-		return classify("stop", driver.KindTransient, driver.ErrDrainTimeout)
+		return classify("stop", driver.KindFatal, fmt.Errorf("cannot stop with %d outstanding messages", c.outstanding))
 	}
 	c.stopped = true
 	for _, name := range c.destinations {

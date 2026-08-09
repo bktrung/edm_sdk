@@ -99,7 +99,12 @@ func (a *admin) Prune(ctx context.Context, names []string) ([]driver.PruneResult
 			continue
 		}
 		if len(item.messages) > 0 {
-			results = append(results, driver.PruneResult{Name: name, Reason: fmt.Sprintf("holds %d messages", len(item.messages))})
+			count := len(item.messages)
+			noun := "messages"
+			if count == 1 {
+				noun = "message"
+			}
+			results = append(results, driver.PruneResult{Name: name, Reason: fmt.Sprintf("holds %d %s", count, noun)})
 			continue
 		}
 		if len(item.consumers) > 0 {

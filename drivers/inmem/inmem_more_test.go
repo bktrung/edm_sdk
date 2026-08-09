@@ -151,7 +151,11 @@ func TestStopRejectsOutstandingUntilSettled(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, producer.Publish(ctx, driver.OutboundMessage{Destination: "orders", Body: []byte("outstanding")}))
 	message := receiveTest(t, consumer)
-	require.ErrorIs(t, consumer.Stop(ctx), driver.ErrDrainTimeout)
+	err = consumer.Stop(ctx)
+	kind, classified := driver.Classify(err)
+	require.True(t, classified)
+	require.Equal(t, driver.KindFatal, kind)
+	require.ErrorContains(t, err, "outstanding messages")
 	require.NoError(t, message.Settle.Ack(ctx))
 	closeTest(t, ctx, conn, producer, consumer)
 }
@@ -162,7 +166,7 @@ func TestPruneGuards(t *testing.T) {
 	require.NoError(t, producer.Publish(ctx, driver.OutboundMessage{Destination: "holds", Body: []byte("retained")}))
 	results, err := conn.Admin().Prune(ctx, []string{"holds"})
 	require.NoError(t, err)
-	require.Equal(t, "holds 1 messages", results[0].Reason)
+	require.Equal(t, "holds 1 message", results[0].Reason)
 
 	consumer, err := conn.Consumer(ctx, driver.ConsumerConfig{Destinations: []string{"attached"}, Effective: testCaps()})
 	require.NoError(t, err)
@@ -209,11 +213,15 @@ func TestKeyAffinityAcrossTwoConsumers(t *testing.T) {
 
 	var first, second driver.InboundMessage
 	var owner driver.Consumer
+	waitCtx, cancel := context.WithTimeout(ctx, time.Second)
+	defer cancel()
 	select {
 	case first = <-consumerA.Messages():
 		owner = consumerA
 	case first = <-consumerB.Messages():
 		owner = consumerB
+	case <-waitCtx.Done():
+		t.Fatal("timed out waiting for key-affinity delivery")
 	}
 	second = receiveTest(t, owner)
 	require.Equal(t, []byte("same"), first.Key)
@@ -229,11 +237,17 @@ func TestExclusiveConsumerRejectsSecondAttachment(t *testing.T) {
 	require.NoError(t, err)
 	_, err = conn.Consumer(ctx, driver.ConsumerConfig{Destinations: []string{"orders"}, Exclusive: true, Effective: testCaps()})
 	require.Error(t, err)
+	kind, classified := driver.Classify(err)
+	require.True(t, classified)
+	require.Equal(t, driver.KindFatal, kind)
 	require.NoError(t, consumer.Stop(ctx))
 
 	consumer, err = conn.Consumer(ctx, driver.ConsumerConfig{Destinations: []string{"orders"}, Exclusive: true, Effective: testCaps()})
 	require.NoError(t, err)
 	_, err = conn.Consumer(ctx, driver.ConsumerConfig{Destinations: []string{"orders"}, Effective: testCaps()})
 	require.Error(t, err)
+	kind, classified = driver.Classify(err)
+	require.True(t, classified)
+	require.Equal(t, driver.KindFatal, kind)
 	closeTest(t, ctx, conn, producer, consumer)
 }
