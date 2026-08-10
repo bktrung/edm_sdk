@@ -95,7 +95,6 @@ func loadFixture(path string) (string, []string, error) {
 	return fixture.Package, fixture.Symbols, nil
 }
 
-// extractSurface lists exported declarations and methods in pkg's Go files.
 func extractSurface(moduleDir, pkg string) ([]string, error) {
 	fset := token.NewFileSet()
 	packageDir := moduleDir

@@ -22,9 +22,9 @@ test-fast:
 	go test -race -short -coverprofile=coverage.out ./...
 	go tool cover -func=coverage.out | tail -1
 
-## test: run the full test suite when conformance and integration tests exist.
+## test: run the full test suite.
 test:
-	@echo "test: conformance and integration suites are not available yet"
+	go test -count=1 ./...
 
 ## test-chaos: run the chaos test matrix when it exists.
 test-chaos:

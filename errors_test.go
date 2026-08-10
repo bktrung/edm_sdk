@@ -40,11 +40,12 @@ func TestClassify_TableDriven(t *testing.T) {
 
 	base := errors.New("failure")
 	tests := map[string]struct {
-		err      error
-		terminal bool
-		dropped  bool
-		delay    time.Duration
-		hasDelay bool
+		err         error
+		terminal    bool
+		dropped     bool
+		unavailable bool
+		delay       time.Duration
+		hasDelay    bool
 	}{
 		"nil":         {},
 		"plain retry": {err: base},
@@ -52,14 +53,17 @@ func TestClassify_TableDriven(t *testing.T) {
 		"retry after": {
 			err: f1.RetryAfter(base, 5*time.Second), delay: 5 * time.Second, hasDelay: true,
 		},
-		"drop":             {err: f1.Drop(base), dropped: true},
-		"wrapped terminal": {err: fmt.Errorf("outer: %w", f1.Terminal(base)), terminal: true},
+		"drop":                {err: f1.Drop(base), dropped: true},
+		"unavailable":         {err: f1.Unavailable(base), unavailable: true},
+		"wrapped terminal":    {err: fmt.Errorf("outer: %w", f1.Terminal(base)), terminal: true},
+		"wrapped unavailable": {err: fmt.Errorf("outer: %w", f1.Unavailable(base)), unavailable: true},
 	}
 
 	for name, tt := range tests {
 		t.Run(name, func(t *testing.T) {
 			require.Equal(t, tt.terminal, f1.IsTerminal(tt.err))
 			require.Equal(t, tt.dropped, f1.IsDropped(tt.err))
+			require.Equal(t, tt.unavailable, f1.IsUnavailable(tt.err))
 			got, ok := f1.RetryDelay(tt.err)
 			require.Equal(t, tt.hasDelay, ok)
 			require.Equal(t, tt.delay, got)
@@ -91,10 +95,25 @@ func TestClassify_TerminalSurvivesAnOuterClassification(t *testing.T) {
 	require.False(t, f1.IsDropped(err))
 }
 
+func TestClassify_TerminalOutranksUnavailable(t *testing.T) {
+	t.Parallel()
+
+	base := errors.New("permanent failure")
+
+	err := f1.Unavailable(f1.Terminal(base))
+	require.True(t, f1.IsTerminal(err))
+	require.True(t, f1.IsUnavailable(err))
+
+	err = f1.Terminal(f1.Unavailable(base))
+	require.True(t, f1.IsTerminal(err))
+	require.False(t, f1.IsUnavailable(err))
+}
+
 func TestClassify_NilErrorStaysNil(t *testing.T) {
 	t.Parallel()
 
 	require.Nil(t, f1.Terminal(nil))
 	require.Nil(t, f1.RetryAfter(nil, time.Second))
 	require.Nil(t, f1.Drop(nil))
+	require.Nil(t, f1.Unavailable(nil))
 }

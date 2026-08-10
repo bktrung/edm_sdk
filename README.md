@@ -14,15 +14,19 @@ deliberately does not do. It is not a tour of the code - see
 
 Each of these is testable, and each is enforced by CI, not documentation:
 
-- **At-least-once delivery, plus idempotent effects.** Transport redelivers during rolling
-  restarts - that is the guarantee, not a bug. A dedupe store keyed on `idempotency_key` makes the
-  *effect* apply exactly once. Measured as `f1_messages_lost_total == 0` and
-  `f1_duplicate_applied_total == 0`.
+- **At-least-once delivery, with a stable message identity.** Transport redelivers during failures
+  and rolling restarts - that is the guarantee, not a bug. F1 generates an event id, uses it as the
+  idempotency key by default, and preserves that key across every retry, deferral, dead-letter and
+  redelivery copy of the same message. F1 does not deduplicate handler effects and keeps no store of
+  seen keys: a service reads `Event.IdempotencyKey()` and makes its own effect safe to apply twice.
+  Measured as `f1_messages_lost_total == 0`.
 - **Zero-loss graceful shutdown.** A drain protocol settles every in-flight message before the
   process exits; nothing accepted is dropped on a rolling restart or `SIGTERM`.
 - **Automatic retry to a dead-letter queue.** Retryable failures move through a tiered backoff
-  ladder; exhausted or terminal failures dead-letter with a recorded reason - every message in a
-  DLQ has one.
+  ladder; exhausted or terminal failures dead-letter with a recorded death reason and error. That
+  holds for every entry F1 itself writes. The broker-side backstop queue is a separate destination,
+  reached only when the broker's own delivery limit kills a message F1 never routed, and its entries
+  carry no F1 death reason by construction - a non-zero depth there is the alert, not the norm.
 - **Starvation-free priority handling.** Low-priority messages have a bounded maximum wait under
   sustained high-priority load; that bound is measured, not assumed.
 - **Poison-message safety.** A message that cannot be decoded, or a handler that panics, is
@@ -40,8 +44,13 @@ Each of these is testable, and each is enforced by CI, not documentation:
 
 ## Non-goals for v1
 
-- Exactly-once *transport* (Kafka transactions). At-least-once transport plus idempotent effects is
-  the guarantee.
+- Exactly-once *transport* (Kafka transactions), and exactly-once *effects*. At-least-once delivery
+  is the guarantee.
+- SDK-owned deduplication. F1 supplies a stable idempotency key; the application owns effect
+  deduplication and the store that would have to remember a key.
+- Transactional publish bound to a database transaction, and an outbox to carry it. F1 opens no
+  database, so the window between a local commit and a publish is named rather than closed, and it
+  is the application's to close.
 - Global ordering across partitions/queues. Per-key ordering only.
 - Cross-region replication and DR topology. Owned by the platform team.
 - Request/reply over messaging. Use gRPC.

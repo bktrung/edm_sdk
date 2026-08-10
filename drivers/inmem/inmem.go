@@ -16,6 +16,13 @@ import (
 // source used by connections; a nil clock uses the real clock.
 type Driver struct{ Clock clock.Clock }
 
+const (
+	// These limits exercise the driver's limit-reporting and enforcement paths;
+	// they are deliberately independent of the in-memory store's capacity.
+	maxMessageBytes = 1 << 20
+	maxHeaderBytes  = 64 << 10
+)
+
 var _ driver.Driver = Driver{}
 
 // New returns a driver using c for all time-dependent behavior.
@@ -34,6 +41,8 @@ func (Driver) Capabilities() driver.Capabilities {
 		NativeDeliveryCount: true,
 		ConsumerScaling:     driver.ScalingFree,
 		LagQueryable:        true,
+		MaxMessageBytes:     maxMessageBytes,
+		MaxHeaderBytes:      maxHeaderBytes,
 	}
 }
 
@@ -146,6 +155,7 @@ func (c *conn) Consumer(ctx context.Context, cfg driver.ConsumerConfig) (driver.
 		messages:     make(chan driver.InboundMessage, capacity),
 		errs:         make(chan error, 1),
 		paused:       make(map[string]bool),
+		unsettled:    make(map[string]int),
 	}
 	for _, name := range cfg.Destinations {
 		c.destinations[name].consumers[cs] = struct{}{}
@@ -262,6 +272,7 @@ destinationLoop:
 			select {
 			case cs.messages <- inbound:
 				cs.outstanding++
+				cs.unsettled[dest.spec.Name]++
 				dest.messages = dest.messages[1:]
 			default:
 				continue destinationLoop

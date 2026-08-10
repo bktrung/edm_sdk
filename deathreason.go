@@ -4,7 +4,8 @@ package f1
 type DeathReason string
 
 const (
-	// ReasonUnspecified is the zero value for live or legacy DLQ messages.
+	// ReasonUnspecified is the empty value for live messages and DLQ messages
+	// without an SDK-recorded death reason.
 	ReasonUnspecified DeathReason = ""
 
 	// ReasonMaxAttempts means the retry limit was exhausted.
@@ -21,8 +22,8 @@ const (
 	ReasonPoison DeathReason = "poison"
 	// ReasonUnmatched means no handler matched the event type.
 	ReasonUnmatched DeathReason = "unmatched"
-	// ReasonDedupeUnavailable means the deduplication store exceeded its deferral bound.
-	ReasonDedupeUnavailable DeathReason = "dedupe_unavailable"
+	// ReasonDependencyUnavailable means the deferral limit was exceeded.
+	ReasonDependencyUnavailable DeathReason = "dependency_unavailable"
 )
 
 // String returns the wire value of r.
@@ -32,7 +33,7 @@ func (r DeathReason) String() string { return string(r) }
 func (r DeathReason) Valid() bool {
 	switch r {
 	case ReasonMaxAttempts, ReasonTerminal, ReasonPanic, ReasonDecode,
-		ReasonExpired, ReasonPoison, ReasonUnmatched, ReasonDedupeUnavailable:
+		ReasonExpired, ReasonPoison, ReasonUnmatched, ReasonDependencyUnavailable:
 		return true
 	default:
 		return false

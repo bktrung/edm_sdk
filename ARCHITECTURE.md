@@ -12,7 +12,7 @@ One-way dependency, application at the top:
 ```
 application code (service-owned handlers)
     -> package f1            public API: Client, Publisher, Consumer, Handler, Event
-        -> internal/*        core: codec, dispatch, sched, retry, dedupe, lifecycle, obs
+        -> internal/*        core: codec, dispatch, sched, retry, lifecycle, obs
             -> driver        the port: interfaces only, stdlib only
 drivers/kafka, drivers/rabbitmq, drivers/inmem
     -> driver                implement the port
@@ -33,22 +33,28 @@ capability model, not a type switch.
 | `internal/clock/` | Injectable time source; all timing-dependent code goes through it |
 | `internal/obs/` | Metric, trace and log emission, including the sampling loop |
 
-`dedupe`, `outbox`, `internal/sched`, `internal/retry`, `internal/lifecycle`, `drivers/kafka`,
-`drivers/rabbitmq`, `store/` and `cmd/` are part of the target layout and are not created yet. Add
-one only when the code that lives in it arrives, so the tree never advertises a package a reader
-cannot open.
+`internal/dispatch`, `internal/sched`, `internal/retry`, `internal/lifecycle`, `drivers/kafka`,
+`drivers/rabbitmq` and `cmd/` are part of the target layout and are not created yet. Add one only
+when the code that lives in it arrives, so the tree never advertises a package a reader cannot open.
+
+There is no `dedupe`, no `outbox` and no `store/`, and none of them is pending: **the SDK opens no
+database.** That single absence is what keeps a schema to migrate, a connection pool to size and a
+preflight check to run out of every service that adopts F1. A package for any of the three is a
+scope change, not a missing file.
 
 ## Data flow
 
 Publish: `f1.Publisher` resolves the logical topic to a physical destination, builds the envelope,
 and hands it to `driver.Producer`; `Publish` returns only after the broker has durably
 acknowledged. Consume: a driver delivers into per-lane buffers, a DWRR scheduler picks the next
-message, a worker decodes it, checks the dedupe store, runs the handler, and settles - acking the
-original only after any retry or DLQ copy is confirmed, never before.
+message, a worker decodes it, runs the handler, and settles - acking the original only after any
+retry or DLQ copy is confirmed, never before.
 
 That ack ordering is the zero-loss guarantee and it is not an implementation detail: a message is
 acked only once its retry or dead-letter copy is durable, so a crash at any point leaves the
-original redeliverable rather than lost.
+original redeliverable rather than lost. The cost is paid in duplicates: a crash between "copy
+confirmed" and "original acked" redelivers a message whose effect already landed. Loss is prevented
+structurally here; duplication is left for the handler to absorb through `Event.IdempotencyKey()`.
 
 ## Import boundaries
 

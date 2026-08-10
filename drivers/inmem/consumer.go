@@ -19,6 +19,7 @@ type consumer struct {
 	draining     bool
 	stopped      bool
 	outstanding  int
+	unsettled    map[string]int
 }
 
 var _ driver.Consumer = (*consumer)(nil)
@@ -27,11 +28,6 @@ func (c *consumer) Messages() <-chan driver.InboundMessage { return c.messages }
 func (c *consumer) Errors() <-chan error                   { return c.errs }
 
 func (c *consumer) Pause(destinations ...string) error {
-	return c.setPaused(destinations, true)
-}
-
-// Quiesce has the same visible state as Pause in this driver.
-func (c *consumer) Quiesce(destinations ...string) error {
 	return c.setPaused(destinations, true)
 }
 
@@ -156,6 +152,10 @@ func (s *settler) settle(ctx context.Context, opt driver.NackOptions, nack bool)
 	s.settled = true
 	if s.consumer.outstanding > 0 {
 		s.consumer.outstanding--
+	}
+	name := s.message.message.Destination
+	if s.consumer.unsettled[name] > 0 {
+		s.consumer.unsettled[name]--
 	}
 	if nack && opt.Requeue {
 		s.message.deliveryCount++

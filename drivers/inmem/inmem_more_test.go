@@ -175,8 +175,7 @@ func TestPruneGuards(t *testing.T) {
 	require.Equal(t, "consumer attached", results[0].Reason)
 	require.NoError(t, consumer.Stop(ctx))
 
-	// Inmem has no auxiliary lane, so an empty destination can be deleted after
-	// the other guards pass.
+	// Inmem has no auxiliary destinations to delete.
 	results, err = conn.Admin().Prune(ctx, []string{"empty"})
 	require.NoError(t, err)
 	require.True(t, results[0].Deleted)

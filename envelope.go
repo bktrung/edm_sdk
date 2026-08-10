@@ -21,7 +21,7 @@ type Envelope struct {
 
 	// F1 attributes.
 	IdempotencyKey string
-	Priority       Priority // int in Go, string on the wire - see Priority.String
+	Priority       Priority // encoded as a string on the wire
 	Attempt        int
 	MaxAttempts    int // absent unless producer-capped or stamped on a retry copy
 	Deferrals      int
@@ -35,7 +35,7 @@ type Envelope struct {
 
 	// Dead-letter metadata.
 	DeathError  string
-	DeathReason DeathReason // string in Go and on the wire; zero value "" is "not dead-lettered"
+	DeathReason DeathReason // empty when live or no SDK-recorded reason
 	DeathTime   *time.Time
 
 	// Trace context is preserved separately from free-form extensions.
