@@ -29,18 +29,19 @@ var groupManifest = []manifestEntry{
 
 // pendingGroups lists groups without registered runners.
 var pendingGroups = []string{
-	"publish", "consume", "settle", "ordering", "deferred",
+	"consume", "settle", "ordering", "deferred",
 	"drain", "rebalance", "failure", "topology", "capability", "lag",
 }
 
 type groupContext struct {
-	t       *testing.T
-	ctx     context.Context
-	conn    driver.Conn
-	inspect Inspect
-	profile Profile
-	vector  BehaviorVector
-	checks  int
+	t         *testing.T
+	ctx       context.Context
+	conn      driver.Conn
+	inspect   Inspect
+	profile   Profile
+	effective driver.Capabilities
+	vector    BehaviorVector
+	checks    int
 }
 
 type groupRunner func(*groupContext)

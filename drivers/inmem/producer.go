@@ -3,6 +3,7 @@ package inmem
 import (
 	"context"
 	"errors"
+	"fmt"
 
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/driver"
 )
@@ -29,6 +30,14 @@ func (p *producer) Publish(ctx context.Context, messages ...driver.OutboundMessa
 	}
 	failed := make(map[int]error)
 	for i, message := range messages {
+		if p.cfg.Effective.MaxMessageBytes > 0 && len(message.Body) > p.cfg.Effective.MaxMessageBytes {
+			failed[i] = classify("publish", driver.KindTooLarge, fmt.Errorf("message body exceeds MaxMessageBytes (%d)", p.cfg.Effective.MaxMessageBytes))
+			continue
+		}
+		if p.cfg.Effective.MaxHeaderBytes > 0 && headerBytes(message.Headers) > p.cfg.Effective.MaxHeaderBytes {
+			failed[i] = classify("publish", driver.KindTooLarge, fmt.Errorf("message headers exceed MaxHeaderBytes (%d)", p.cfg.Effective.MaxHeaderBytes))
+			continue
+		}
 		dest, ok := p.conn.destinations[message.Destination]
 		if !ok {
 			failed[i] = classify("publish", driver.KindNotFound, driver.ErrDestinationMissing)
@@ -46,6 +55,14 @@ func (p *producer) Publish(ctx context.Context, messages ...driver.OutboundMessa
 		return &driver.PublishError{Failed: failed}
 	}
 	return nil
+}
+
+func headerBytes(headers []driver.Header) int {
+	total := 0
+	for _, header := range headers {
+		total += len(header.Key) + len(header.Value)
+	}
+	return total
 }
 
 func (p *producer) Flush(ctx context.Context) error {

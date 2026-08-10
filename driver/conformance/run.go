@@ -168,7 +168,7 @@ func runProfile(
 		groupOK := t.Run(entry.name, func(groupTest *testing.T) {
 			groupResult = &groupContext{
 				t: groupTest, ctx: ctx, conn: conn, inspect: inspect,
-				profile: profile,
+				profile: profile, effective: effective,
 			}
 			runner(groupResult)
 		})
