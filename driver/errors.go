@@ -55,10 +55,8 @@ type ClassifiedError interface {
 	Retryable() bool
 }
 
-// Error is the port's ClassifiedError implementation.
-//
-// Drivers may use Error, but any error satisfying ClassifiedError may cross
-// the port. Error must not acquire a logger or emit logs.
+// Error is the standard ClassifiedError implementation. Drivers may return
+// any ClassifiedError; Error does not log.
 type Error struct {
 	// Driver names the driver so the core can name it in diagnostics.
 	Driver string
@@ -91,9 +89,8 @@ func (e *Error) Retryable() bool {
 	return e.K == KindTransient
 }
 
-// Classify returns err's classification and whether err carries one.
-//
-// An unclassified error returns KindTransient and false. Classify does not log.
+// Classify returns err's kind and whether it implements ClassifiedError.
+// Unclassified errors return KindTransient and false; Classify does not log.
 func Classify(err error) (Kind, bool) {
 	var classified ClassifiedError
 	if errors.As(err, &classified) {

@@ -44,9 +44,8 @@ type Route struct {
 type TopologySpec struct {
 	Exchanges    []ExchangeSpec
 	Destinations []DestinationSpec
-	// Scope lists prefixes owned by the core. Drivers use these prefixes when
-	// finding orphaned destinations. An empty Scope disables scanning, and the
-	// driver reports that through OrphanScanError.
+	// Scope lists prefixes the driver may scan for core-owned orphans. An empty
+	// Scope disables scanning and sets OrphanScanError.
 	Scope []string
 	// Effective is the capability set selected by the core. Drivers must
 	// branch on Effective, never on their own connection capability view.
@@ -68,10 +67,9 @@ type TopologyDiff struct {
 	CreatedDestinations []string
 	CreatedBindings     []string
 	Existing            []string
-	// Orphaned contains owned destinations that still exist on the broker but
-	// are absent from the current topology spec. Drivers include auxiliary
-	// message counts in the parent; if the parent is gone, report the auxiliary
-	// by name.
+	// Orphaned lists core-owned destinations that exist but are absent from the
+	// spec. Include auxiliary message counts in their parent; report an
+	// auxiliary by name when its parent is absent.
 	Orphaned []OrphanedDestination
 	// OrphanScanError explains why orphan scanning did not run. When non-empty,
 	// Orphaned is incomplete.

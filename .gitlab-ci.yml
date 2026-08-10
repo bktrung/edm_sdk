@@ -33,6 +33,12 @@ test-fast:
       - coverage.out
     expire_in: 1 week
 
+test:
+  stage: verify
+  extends: .go-cache
+  script:
+    - make test
+
 lint:
   stage: verify
   extends: .go-cache

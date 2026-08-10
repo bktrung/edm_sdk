@@ -32,7 +32,7 @@
         "expired",
         "poison",
         "unmatched",
-        "dedupe_unavailable"
+        "dependency_unavailable"
       ]
     },
     {

@@ -111,8 +111,7 @@ func (a *admin) Prune(ctx context.Context, names []string) ([]driver.PruneResult
 			results = append(results, driver.PruneResult{Name: name, Reason: "consumer attached"})
 			continue
 		}
-		// The in-memory driver has no auxiliary destinations, so an empty
-		// destination can be deleted after the other guards pass.
+		// This driver has no auxiliary destinations to delete.
 		delete(a.conn.destinations, name)
 		results = append(results, driver.PruneResult{Name: name, Deleted: true})
 	}

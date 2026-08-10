@@ -102,25 +102,15 @@ type Consumer interface {
 	// these; fatal ones trigger client shutdown.
 	Errors() <-chan error
 
-	// Pause stops delivery from destinations without leaving the consumer group
-	// or cancelling the broker consumer. A paused destination's accumulation
-	// must remain bounded by its prefetch share.
-	//
-	// Pause is only for bounded waits. Buffered messages remain unsettled; use
-	// Quiesce when the wait may be unbounded.
+	// Pause stops delivery without leaving the consumer group. Accumulation must
+	// remain within the destination's prefetch share; use deferral for outages.
 	Pause(destinations ...string) error
 
-	// Quiesce stops fetching and returns buffered, unemitted messages to the
-	// broker. Already delivered messages are unaffected. Use Quiesce for
-	// unbounded waits.
-	Quiesce(destinations ...string) error
-
-	// Resume restarts delivery after Pause or Quiesce.
+	// Resume restarts delivery after Pause.
 	Resume(destinations ...string) error
 
 	// Drain stops fetching new messages while keeping outstanding messages
-	// settleable. It returns immediately, and Messages yields nothing new after
-	// Drain.
+	// settleable. Messages yields nothing new after Drain returns.
 	Drain(ctx context.Context) error
 
 	// Stop performs final settlement and then closes Messages. It must not be

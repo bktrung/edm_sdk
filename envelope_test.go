@@ -12,7 +12,6 @@ import (
 	f1 "fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk"
 )
 
-// docAttribute describes one entry in the envelope fixture.
 type docAttribute struct {
 	Attribute string   `json:"attribute"`
 	Type      string   `json:"type"`
@@ -20,7 +19,6 @@ type docAttribute struct {
 	Enum      []string `json:"enum,omitempty"`
 }
 
-// docAttributeFixture describes the fixture's top-level shape.
 type docAttributeFixture struct {
 	Attributes []docAttribute `json:"attributes"`
 }
@@ -35,7 +33,6 @@ func loadDoc03Attributes(t *testing.T) []docAttribute {
 	return fixture.Attributes
 }
 
-// fullEnvelope returns an envelope with every supported field populated.
 func fullEnvelope() f1.Envelope {
 	due := time.Date(2026, 8, 5, 12, 0, 0, 0, time.UTC)
 	death := time.Date(2026, 8, 5, 13, 0, 0, 0, time.UTC)
@@ -66,7 +63,6 @@ func fullEnvelope() f1.Envelope {
 	}
 }
 
-// TestEnvelope_MatchesDoc03Table checks that every fixture attribute is emitted.
 func TestEnvelope_MatchesDoc03Table(t *testing.T) {
 	t.Parallel()
 
@@ -95,7 +91,6 @@ func TestEnvelope_MatchesDoc03Table(t *testing.T) {
 			require.Truef(t, ok, "%s: test has no Go-side enum mapping to check the fixture against", attr.Attribute)
 			require.ElementsMatchf(t, attr.Enum, gotValues, "%s: fixture values and Go constants differ", attr.Attribute)
 		case "string":
-			// Any string is valid; presence above is the whole assertion.
 		default:
 			t.Fatalf("%s: unrecognised fixture type %q - test needs updating", attr.Attribute, attr.Type)
 		}
@@ -106,12 +101,10 @@ func deathReasonWireValues() []string {
 	return []string{
 		f1.ReasonMaxAttempts.String(), f1.ReasonTerminal.String(), f1.ReasonPanic.String(),
 		f1.ReasonDecode.String(), f1.ReasonExpired.String(), f1.ReasonPoison.String(),
-		f1.ReasonUnmatched.String(), f1.ReasonDedupeUnavailable.String(),
+		f1.ReasonUnmatched.String(), f1.ReasonDependencyUnavailable.String(),
 	}
 }
 
-// TestEnvelope_FixtureCoversEveryF1HeaderEmitted checks the reverse mapping:
-// every emitted F1 header must have a fixture entry.
 func TestEnvelope_FixtureCoversEveryF1HeaderEmitted(t *testing.T) {
 	t.Parallel()
 
@@ -150,8 +143,6 @@ func TestEnvelope_HeaderRoundTripIsLossless(t *testing.T) {
 
 func timePtr(t time.Time) *time.Time { return &t }
 
-// TestEnvelope_TracedMessageSurvivesDecodeEncodeRoundTrip preserves trace
-// fields without treating them as user extensions.
 func TestEnvelope_TracedMessageSurvivesDecodeEncodeRoundTrip(t *testing.T) {
 	t.Parallel()
 
@@ -170,7 +161,6 @@ func TestEnvelope_TracedMessageSurvivesDecodeEncodeRoundTrip(t *testing.T) {
 	require.NotContains(t, got.Extensions, "traceparent")
 	require.NotContains(t, got.Extensions, "tracestate")
 
-	// A decoded envelope must be encodable again.
 	replayed, err := got.EncodeHeaders(0)
 	require.NoError(t, err)
 	require.Equal(t, headers, replayed)
@@ -204,12 +194,10 @@ func TestPriority_MarshalsToWireString(t *testing.T) {
 	require.NoError(t, json.Unmarshal([]byte(`"low"`), &p))
 	require.Equal(t, f1.PriorityLow, p)
 
-	// Absent and empty values use the default lane.
 	got, err := f1.ParsePriority("")
 	require.NoError(t, err)
 	require.Equal(t, f1.PriorityNormal, got)
 
-	// Unknown lanes must not be silently downgraded.
 	_, err = f1.ParsePriority("urgent")
 	require.Error(t, err)
 }
@@ -226,7 +214,6 @@ func TestDLQ_UnknownReasonSurvivesReplay(t *testing.T) {
 	require.Equal(t, f1.DeathReason("a_reason_this_build_predates"), e.DeathReason)
 	require.False(t, e.DeathReason.Valid())
 
-	// Replay preserves an unknown death reason.
 	replayed, err := e.EncodeHeaders(0)
 	require.NoError(t, err)
 	require.Equal(t, "a_reason_this_build_predates", replayed["f1deathreason"])
@@ -252,7 +239,6 @@ func TestMaxAttempts_AbsentUnlessProducerSets(t *testing.T) {
 func TestCorrelationID_RootDefault(t *testing.T) {
 	t.Parallel()
 
-	// A root event uses its ID as the correlation ID.
 	e := f1.Envelope{ID: "evt-root"}
 	h1, err := e.EncodeHeaders(0)
 	require.NoError(t, err)
@@ -292,8 +278,6 @@ func TestEnvelope_HeaderSizeGuardShedsExtensionsThenTruncatesDeathError(t *testi
 	require.LessOrEqual(t, len(tight["f1deatherror"]), len("a very long terminal error string that will need truncating to fit under the cap"))
 }
 
-// TestEnvelope_HeaderSizeGuardExtensionsAloneIsEnough checks that dropping
-// Extensions does not also truncate DeathError when it is unnecessary.
 func TestEnvelope_HeaderSizeGuardExtensionsAloneIsEnough(t *testing.T) {
 	t.Parallel()
 
@@ -329,7 +313,6 @@ func TestEnvelope_SizeGuardDriverLimitBelowCoreCap(t *testing.T) {
 
 	e := fullEnvelope()
 	e.Extensions = map[string]string{"ext-a": "aaaaaaaaaa"}
-	// The driver's lower limit takes precedence.
 	h, err := e.EncodeHeaders(50)
 	require.NoError(t, err)
 	_, hasExt := h["ext-a"]
@@ -341,7 +324,6 @@ func TestEnvelope_SizeGuardDeathErrorEmptyStopsShrinking(t *testing.T) {
 
 	e := fullEnvelope()
 	e.DeathError = ""
-	// Encoding remains best effort when no field can be shrunk further.
 	require.NotPanics(t, func() { _, _ = e.EncodeHeaders(1) })
 }
 
@@ -350,7 +332,7 @@ func TestDeathReason_ValidIsTrueForEachOfTheEightReasons(t *testing.T) {
 
 	for _, r := range []f1.DeathReason{
 		f1.ReasonMaxAttempts, f1.ReasonTerminal, f1.ReasonPanic, f1.ReasonDecode,
-		f1.ReasonExpired, f1.ReasonPoison, f1.ReasonUnmatched, f1.ReasonDedupeUnavailable,
+		f1.ReasonExpired, f1.ReasonPoison, f1.ReasonUnmatched, f1.ReasonDependencyUnavailable,
 	} {
 		require.True(t, r.Valid(), r)
 	}
@@ -398,8 +380,6 @@ func TestUnrecognisedValueError_Error(t *testing.T) {
 	require.EqualError(t, err, `f1: unrecognised f1priority value "urgent"`)
 }
 
-// TestEnvelope_RejectsExtensionOverwritingCanonicalHeader prevents an
-// extension from replacing a canonical header.
 func TestEnvelope_RejectsExtensionOverwritingCanonicalHeader(t *testing.T) {
 	t.Parallel()
 
@@ -418,14 +398,11 @@ func TestEnvelope_RejectsExtensionOverwritingCanonicalHeader(t *testing.T) {
 		require.ErrorIsf(t, err, f1.ErrReservedExtension, "key %q must be rejected", k)
 	}
 
-	// Ordinary extension keys remain allowed.
 	e.Extensions = map[string]string{"x-custom-ext": "value"}
 	_, err = e.EncodeHeaders(0)
 	require.NoError(t, err)
 }
 
-// TestEnvelope_RejectsReservedPrefixExtension rejects every reserved
-// extension prefix, not only currently known names.
 func TestEnvelope_RejectsReservedPrefixExtension(t *testing.T) {
 	t.Parallel()
 
@@ -494,8 +471,6 @@ func TestEnvelope_CallerKeysBeginningCeAreNotReserved(t *testing.T) {
 	}
 }
 
-// TestPriority_UndeclaredValueDoesNotBecomeALane prevents an unknown value
-// from being encoded as a valid lane.
 func TestPriority_UndeclaredValueDoesNotBecomeALane(t *testing.T) {
 	t.Parallel()
 
