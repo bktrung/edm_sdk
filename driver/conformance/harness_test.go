@@ -21,7 +21,11 @@ func TestRunRejectsInspectorFactoryError(t *testing.T) {
 }
 
 func TestRunRejectsShortRegisteredGroup(t *testing.T) {
-	assertRunFailure(t, "short-group", "manifest requires at least 2")
+	assertRunFailure(t, "short-group", "ran 1 checks; manifest declares 2")
+}
+
+func TestRunRejectsLongRegisteredGroup(t *testing.T) {
+	assertRunFailure(t, "long-group", "ran 2 checks; manifest declares 1")
 }
 
 func TestRunUsesOneConnectionAndInspector(t *testing.T) {
@@ -94,6 +98,15 @@ func TestRunFailureHelper(t *testing.T) {
 		groupRunners = map[string]groupRunner{}
 		registerGroup("publish", func(group *groupContext) {
 			group.Check("one registered check", func(*testing.T) {})
+		})
+		factory = runTestInspector
+	case "long-group":
+		groupManifest = []manifestEntry{{name: "publish", declared: 1}}
+		pendingGroups = nil
+		groupRunners = map[string]groupRunner{}
+		registerGroup("publish", func(group *groupContext) {
+			group.Check("declared check", func(*testing.T) {})
+			group.Check("undeclared check", func(*testing.T) {})
 		})
 		factory = runTestInspector
 	default:
@@ -290,15 +303,17 @@ func TestInspectorFactoryErrorFailsBeforeGroups(t *testing.T) {
 	}
 }
 
-func TestManifestRejectsShortGroup(t *testing.T) {
+func TestManifestRejectsCountDrift(t *testing.T) {
 	if err := validateGroupCount("publish", 14, 13); err == nil {
 		t.Fatal("short group passed the manifest count")
 	}
 	if err := validateGroupCount("publish", 14, 14); err != nil {
 		t.Fatalf("exact manifest count failed: %v", err)
 	}
-	if err := validateGroupCount("publish", 14, 15); err != nil {
-		t.Fatalf("larger group failed: %v", err)
+	// A group that outgrew its declared count has outgrown its specification,
+	// which is the same defect as falling short of it and needs the same fix.
+	if err := validateGroupCount("publish", 14, 15); err == nil {
+		t.Fatal("group larger than its declared count passed the manifest count")
 	}
 }
 

@@ -78,9 +78,15 @@ func registerGroup(name string, runner groupRunner) {
 	panic("conformance group missing from manifest: " + name)
 }
 
+// validateGroupCount requires the observed check count to equal the declared
+// one exactly, in both directions. The declared count is the length of the
+// group's specification, so a group that has grown past it has grown past the
+// specification too. Reconciling the two means re-reading the specification and
+// finding out which clause the extra check was serving, not moving the number
+// to whatever the group happens to run.
 func validateGroupCount(name string, declared, observed int) error {
-	if observed < declared {
-		return fmt.Errorf("conformance group %q ran %d checks; manifest requires at least %d", name, observed, declared)
+	if observed != declared {
+		return fmt.Errorf("conformance group %q ran %d checks; manifest declares %d", name, observed, declared)
 	}
 	return nil
 }
