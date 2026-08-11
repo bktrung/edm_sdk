@@ -96,36 +96,3 @@ func TestConformance(t *testing.T) {
 	}
 	t.Log(output.String())
 }
-
-type countingDriver struct {
-	Driver
-	opens *int
-}
-
-func (d *countingDriver) Open(ctx context.Context, cfg driver.Config) (driver.Conn, error) {
-	(*d.opens)++
-	return d.Driver.Open(ctx, cfg)
-}
-
-func TestRunUsesOneConnectionAndInspector(t *testing.T) {
-	opens := 0
-	inspectors := 0
-	driverUnderTest := &countingDriver{Driver: Driver{}, opens: &opens}
-	report := conformance.Run(t, conformance.Suite{
-		Driver: driverUnderTest,
-		Config: driver.Config{},
-		NewInspector: func(conn driver.Conn) (conformance.Inspect, error) {
-			inspectors++
-			return newInspector(conn)
-		},
-	})
-	if opens != 1 {
-		t.Fatalf("Run opened %d connections; want 1", opens)
-	}
-	if inspectors != 1 {
-		t.Fatalf("Run built %d inspectors; want 1", inspectors)
-	}
-	if len(report.Profiles) != 2 {
-		t.Fatalf("Run returned %d profile reports; want 2", len(report.Profiles))
-	}
-}

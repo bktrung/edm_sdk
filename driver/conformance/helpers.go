@@ -1,6 +1,7 @@
 package conformance
 
 import (
+	"context"
 	"fmt"
 	"testing"
 	"time"
@@ -10,7 +11,11 @@ import (
 
 const (
 	waitTimeout  = 5 * time.Second
-	waitInterval = 10 * time.Millisecond
+	waitInterval = 5 * time.Millisecond
+
+	// The stability window only needs to outlast the next dispatch, which is the mechanism
+	// that can violate the current empty-channel and upper-bound assertions.
+	stabilityWindow = 250 * time.Millisecond
 )
 
 func newProducer(t *testing.T, group *groupContext, destination string, config driver.ProducerConfig) driver.Producer {
@@ -106,8 +111,14 @@ func waitForStable(t *testing.T, group *groupContext, what string, condition fun
 
 func waitForUntil(t *testing.T, group *groupContext, what string, condition func() (bool, string), stable bool) {
 	t.Helper()
-	deadline := time.NewTimer(waitTimeout)
-	defer deadline.Stop()
+	timeout := waitTimeout
+	if stable {
+		timeout = stabilityWindow
+	}
+	deadline, cancel := context.WithTimeout(group.ctx, timeout)
+	defer cancel()
+	ticker := time.NewTicker(waitInterval) //nolint:forbidigo // conformance is stdlib-only and cannot import internal/clock
+	defer ticker.Stop()
 	var lastObservation string
 	for {
 		holds, observation := condition()
@@ -121,12 +132,12 @@ func waitForUntil(t *testing.T, group *groupContext, what string, condition func
 		}
 
 		select {
-		case <-deadline.C:
+		case <-deadline.Done():
 			if stable {
 				return
 			}
-			t.Fatalf("%s timed out after %s; last observation: %s", what, waitTimeout, lastObservation)
-		case <-time.After(waitInterval):
+			t.Fatalf("%s timed out after %s; last observation: %s", what, timeout, lastObservation)
+		case <-ticker.C:
 		}
 	}
 }

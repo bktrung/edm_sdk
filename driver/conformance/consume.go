@@ -407,15 +407,9 @@ func runConsume(group *groupContext) {
 		if kind, ok := driver.Classify(err); !ok || kind != driver.KindTransient {
 			t.Fatalf("Consumer() classification = (%v, %t), want transient", kind, ok)
 		}
-		if err := producer.Publish(group.ctx, driver.OutboundMessage{Destination: "consume.cancel-create", Body: []byte("after-cancel")}); err != nil {
-			t.Fatalf("Publish() after canceled Consumer() error = %v", err)
-		}
+		publishCount(t, group, producer, "consume.cancel-create", 3)
 		consumer := newConsumer(t, group, "consume.cancel-create", 1)
-		message := receiveMessage(t, group, consumer)
-		if string(message.Body) != "after-cancel" {
-			t.Fatalf("message after canceled Consumer() = %q, want %q", message.Body, "after-cancel")
-		}
-		ackMessage(t, group, message)
+		ackAll(t, group, consumer, 3)
 		group.vector.Add(BehaviorEvent{ID: "cancel-consumer", Outcome: "cancelled", FinalDestination: "consume.cancel-create"})
 	})
 

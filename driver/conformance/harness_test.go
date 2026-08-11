@@ -23,6 +23,38 @@ func TestRunRejectsInspectorFactoryError(t *testing.T) {
 func TestRunRejectsShortRegisteredGroup(t *testing.T) {
 	assertRunFailure(t, "short-group", "manifest requires at least 2")
 }
+func TestRunUsesOneConnectionAndInspector(t *testing.T) {
+	manifest := groupManifest
+	pending := pendingGroups
+	runners := groupRunners
+	groupManifest = nil
+	pendingGroups = nil
+	groupRunners = map[string]groupRunner{}
+	defer func() {
+		groupManifest = manifest
+		pendingGroups = pending
+		groupRunners = runners
+	}()
+
+	opens := 0
+	inspectors := 0
+	report := Run(t, Suite{
+		Driver: runTestDriver{opens: &opens},
+		NewInspector: func(conn driver.Conn) (Inspect, error) {
+			inspectors++
+			return runTestInspector(conn)
+		},
+	})
+	if opens != 1 {
+		t.Fatalf("Run opened %d connections; want 1", opens)
+	}
+	if inspectors != 1 {
+		t.Fatalf("Run built %d inspectors; want 1", inspectors)
+	}
+	if len(report.Profiles) != 2 {
+		t.Fatalf("Run returned %d profile reports; want 2", len(report.Profiles))
+	}
+}
 
 func assertRunFailure(t *testing.T, mode, want string) {
 	t.Helper()
@@ -71,11 +103,16 @@ func TestRunFailureHelper(t *testing.T) {
 	t.Fatal("Run returned after an expected failure")
 }
 
-type runTestDriver struct{}
+type runTestDriver struct {
+	opens *int
+}
 
 func (runTestDriver) Name() string                      { return "run-test" }
 func (runTestDriver) Capabilities() driver.Capabilities { return driver.Capabilities{} }
-func (runTestDriver) Open(context.Context, driver.Config) (driver.Conn, error) {
+func (d runTestDriver) Open(context.Context, driver.Config) (driver.Conn, error) {
+	if d.opens != nil {
+		(*d.opens)++
+	}
 	return &runTestConn{
 		queues:    make(map[string][]driver.OutboundMessage),
 		unsettled: make(map[string]int),
