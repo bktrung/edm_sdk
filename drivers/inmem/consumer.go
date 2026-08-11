@@ -18,6 +18,8 @@ type consumer struct {
 	paused       map[string]bool
 	draining     bool
 	stopped      bool
+	group        *groupState
+	startAfter   map[string]uint64
 	outstanding  int
 	unsettled    map[string]int
 }
@@ -52,7 +54,10 @@ func (c *consumer) setPaused(destinations []string, paused bool) error {
 	return nil
 }
 
-func (c *consumer) Drain(context.Context) error {
+func (c *consumer) Drain(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return classify("drain", driver.KindTransient, err)
+	}
 	c.conn.mu.Lock()
 	defer c.conn.mu.Unlock()
 	c.draining = true
@@ -162,6 +167,11 @@ func (s *settler) settle(ctx context.Context, opt driver.NackOptions, nack bool)
 		s.message.due = s.conn.clock.Now()
 		if dest, ok := s.conn.destinations[s.message.message.Destination]; ok {
 			dest.messages = append(dest.messages, s.message)
+		}
+	}
+	if s.consumer.group != nil && (!nack || !opt.Requeue) {
+		if s.message.sequence > s.consumer.group.positions[name] {
+			s.consumer.group.positions[name] = s.message.sequence
 		}
 	}
 	s.conn.dispatchLocked()

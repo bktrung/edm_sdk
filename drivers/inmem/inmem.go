@@ -61,6 +61,7 @@ func (d Driver) Open(ctx context.Context, _ driver.Config) (driver.Conn, error) 
 		info:         driver.BrokerInfo{Kind: "inmem", Version: "1"},
 		destinations: make(map[string]*destination),
 		consumers:    make(map[*consumer]struct{}),
+		groups:       make(map[string]*groupState),
 		wake:         make(chan struct{}, 1),
 		done:         make(chan struct{}),
 		pumpDone:     make(chan struct{}),
@@ -77,9 +78,11 @@ type conn struct {
 	info         driver.BrokerInfo
 	destinations map[string]*destination
 	consumers    map[*consumer]struct{}
+	groups       map[string]*groupState
 	producers    int
 	closed       bool
 	nextRef      atomic.Uint64
+	nextMessage  atomic.Uint64
 	wake         chan struct{}
 	done         chan struct{}
 	pumpDone     chan struct{}
@@ -97,9 +100,14 @@ type destination struct {
 	next      int
 }
 
+type groupState struct {
+	positions map[string]uint64
+}
+
 type queuedMessage struct {
 	message       driver.OutboundMessage
 	deliveryCount int
+	sequence      uint64
 	due           time.Time
 }
 
@@ -144,6 +152,27 @@ func (c *conn) Consumer(ctx context.Context, cfg driver.ConsumerConfig) (driver.
 			}
 		}
 	}
+	var group *groupState
+	startAfter := make(map[string]uint64, len(cfg.Destinations))
+	if cfg.Group != "" {
+		group = c.groups[cfg.Group]
+		if group == nil {
+			group = &groupState{positions: make(map[string]uint64, len(cfg.Destinations))}
+			c.groups[cfg.Group] = group
+			if cfg.StartAt == driver.StartLatest {
+				for _, name := range cfg.Destinations {
+					group.positions[name] = c.nextMessage.Load()
+				}
+			}
+		}
+		for _, name := range cfg.Destinations {
+			startAfter[name] = group.positions[name]
+		}
+	} else if cfg.StartAt == driver.StartLatest {
+		for _, name := range cfg.Destinations {
+			startAfter[name] = c.nextMessage.Load()
+		}
+	}
 	capacity := cfg.Prefetch
 	if capacity < 1 {
 		capacity = 1
@@ -156,6 +185,8 @@ func (c *conn) Consumer(ctx context.Context, cfg driver.ConsumerConfig) (driver.
 		errs:         make(chan error, 1),
 		paused:       make(map[string]bool),
 		unsettled:    make(map[string]int),
+		group:        group,
+		startAfter:   startAfter,
 	}
 	for _, name := range cfg.Destinations {
 		c.destinations[name].consumers[cs] = struct{}{}
@@ -260,22 +291,29 @@ destinationLoop:
 	for _, name := range c.destinationNamesLocked() {
 		dest := c.destinations[name]
 		for len(dest.messages) > 0 {
-			msg := dest.messages[0]
-			if !msg.due.IsZero() && now.Before(msg.due) {
+			delivered := false
+			for i, msg := range dest.messages {
+				if !msg.due.IsZero() && now.Before(msg.due) {
+					break
+				}
+				cs := dest.pickConsumer(msg)
+				if cs == nil {
+					continue
+				}
+				inbound := c.inboundLocked(cs, dest.spec.Name, msg)
+				select {
+				case cs.messages <- inbound:
+					cs.outstanding++
+					cs.unsettled[dest.spec.Name]++
+					dest.messages = append(dest.messages[:i], dest.messages[i+1:]...)
+					delivered = true
+				default:
+					continue destinationLoop
+				}
 				break
 			}
-			cs := dest.pickConsumer(msg.message.Key)
-			if cs == nil {
+			if !delivered {
 				break
-			}
-			inbound := c.inboundLocked(cs, dest.spec.Name, msg)
-			select {
-			case cs.messages <- inbound:
-				cs.outstanding++
-				cs.unsettled[dest.spec.Name]++
-				dest.messages = dest.messages[1:]
-			default:
-				continue destinationLoop
 			}
 		}
 	}
@@ -290,19 +328,21 @@ func (c *conn) destinationNamesLocked() []string {
 	return names
 }
 
-func (d *destination) pickConsumer(key []byte) *consumer {
+func (d *destination) pickConsumer(message *queuedMessage) *consumer {
 	eligible := make([]*consumer, 0, len(d.order))
 	for _, cs := range d.order {
-		if !cs.stopped && !cs.draining && !cs.paused[d.spec.Name] {
+		if !cs.stopped && !cs.draining && !cs.paused[d.spec.Name] &&
+			cs.canReceive(d.spec.Name) && cs.visible(message, d.spec.Name) {
 			eligible = append(eligible, cs)
 		}
 	}
 	if len(eligible) == 0 {
 		return nil
 	}
-	if len(key) != 0 {
-		if cs := d.affinity[string(key)]; cs != nil {
-			if !cs.stopped && !cs.draining && !cs.paused[d.spec.Name] {
+	if len(message.message.Key) != 0 {
+		if cs := d.affinity[string(message.message.Key)]; cs != nil {
+			if !cs.stopped && !cs.draining && !cs.paused[d.spec.Name] &&
+				cs.canReceive(d.spec.Name) && cs.visible(message, d.spec.Name) {
 				return cs
 			}
 			return nil
@@ -310,10 +350,28 @@ func (d *destination) pickConsumer(key []byte) *consumer {
 	}
 	cs := eligible[d.next%len(eligible)]
 	d.next++
-	if len(key) != 0 {
-		d.affinity[string(key)] = cs
+	if len(message.message.Key) != 0 {
+		d.affinity[string(message.message.Key)] = cs
 	}
 	return cs
+}
+
+func (c *consumer) canReceive(destination string) bool {
+	if c.cfg.Prefetch > 0 && c.outstanding >= c.cfg.Prefetch {
+		return false
+	}
+	limit, ok := c.cfg.PerDestination[destination]
+	if !ok {
+		limit = c.cfg.Prefetch
+	}
+	if limit < 1 {
+		limit = 1
+	}
+	return c.unsettled[destination] < limit
+}
+
+func (c *consumer) visible(message *queuedMessage, destination string) bool {
+	return message.sequence > c.startAfter[destination]
 }
 
 func (c *conn) inboundLocked(cs *consumer, destination string, msg *queuedMessage) driver.InboundMessage {

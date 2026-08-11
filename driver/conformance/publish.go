@@ -280,7 +280,6 @@ func runPublish(group *groupContext) {
 		}
 		group.vector.Add(BehaviorEvent{ID: "concurrent-publish", Outcome: "ok", FinalDestination: "publish.concurrent"})
 	})
-
 }
 
 func assertTooLargePublish(t *testing.T, err error, index int) {
