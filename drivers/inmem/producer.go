@@ -47,7 +47,11 @@ func (p *producer) Publish(ctx context.Context, messages ...driver.OutboundMessa
 		if due.IsZero() && dest.spec.Delay > 0 {
 			due = p.conn.clock.Now().Add(dest.spec.Delay)
 		}
-		dest.messages = append(dest.messages, &queuedMessage{message: cloneOutbound(message), due: due})
+		dest.messages = append(dest.messages, &queuedMessage{
+			message:  cloneOutbound(message),
+			sequence: p.conn.nextMessage.Add(1),
+			due:      due,
+		})
 	}
 	p.conn.dispatchLocked()
 	p.conn.signalWake()
