@@ -23,6 +23,7 @@ func TestRunRejectsInspectorFactoryError(t *testing.T) {
 func TestRunRejectsShortRegisteredGroup(t *testing.T) {
 	assertRunFailure(t, "short-group", "manifest requires at least 2")
 }
+
 func TestRunUsesOneConnectionAndInspector(t *testing.T) {
 	manifest := groupManifest
 	pending := pendingGroups

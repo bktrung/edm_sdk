@@ -239,8 +239,8 @@ func runTopology(group *groupContext) {
 		// Sharper case: the same prefix without a trailing separator must catch
 		// worker-v2.main too, proving the exclusion above comes from matching the
 		// plain string rather than from a driver that parses dot-separated
-		// components itself (ADR-0012 leaves boundary safety to the caller's
-		// trailing separator, not driver-side parsing).
+		// components itself. Boundary safety is the caller's, carried by the
+		// trailing separator in the scope entry.
 		unbounded, err := admin.EnsureTopology(group.ctx, driver.TopologySpec{
 			Destinations: []driver.DestinationSpec{{Name: inSpec}},
 			Scope:        []string{"topology.orphan.boundary.worker"},

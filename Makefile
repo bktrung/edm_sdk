@@ -11,7 +11,7 @@ export GOPRIVATE := fgit.zapps.vn
 
 APISURFACE := $(CURDIR)/.tools/bin/apisurface
 
-.PHONY: build test-fast test test-chaos kpi lint verify-agnostic swap-report check-fixture check-api-surface check-api-surface-codec check-api-surface-driver
+.PHONY: build test-fast test test-chaos kpi lint verify-agnostic verify-self-contained swap-report check-fixture check-api-surface check-api-surface-codec check-api-surface-driver
 
 ## build: compile all packages with reproducible build flags.
 build:
@@ -44,6 +44,16 @@ lint: $(GOLANGCI_LINT)
 ## verify-agnostic: check broker import boundaries with depguard.
 verify-agnostic: $(GOLANGCI_LINT)
 	$(GOLANGCI_LINT) run --enable-only depguard ./...
+
+## verify-self-contained: fail on citations no reader of this repository can resolve.
+# Design records live elsewhere. A reader here - a broker vendor, an auditor, a
+# future maintainer - cannot follow a decision or task identifier into a tree
+# they do not have, so an unresolvable citation is worse than none. State the
+# rule the citation stands for instead.
+verify-self-contained:
+	@! git grep -nIE '(ADR-[0-9]{4}|F-P[0-9]+|M1-[0-9]+)' -- . ':!Makefile' \
+	  || { echo "verify-self-contained: citation above cannot be resolved from this repository"; exit 1; }
+	@echo "verify-self-contained: 0 issues."
 
 ## swap-report: verify driver replacement when the migration suite exists.
 swap-report:
