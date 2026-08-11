@@ -29,7 +29,7 @@ var groupManifest = []manifestEntry{
 
 // pendingGroups lists groups without registered runners.
 var pendingGroups = []string{
-	"settle", "ordering", "deferred",
+	"ordering", "deferred",
 	"drain", "rebalance", "failure", "topology", "capability", "lag",
 }
 
