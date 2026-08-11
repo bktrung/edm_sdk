@@ -122,6 +122,9 @@ func waitForUntil(t *testing.T, group *groupContext, what string, condition func
 
 		select {
 		case <-deadline.C:
+			if stable {
+				return
+			}
 			t.Fatalf("%s timed out after %s; last observation: %s", what, waitTimeout, lastObservation)
 		case <-time.After(waitInterval):
 		}

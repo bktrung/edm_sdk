@@ -204,16 +204,16 @@ func runPublish(group *groupContext) {
 			Headers:     []driver.Header{{Key: "x", Value: []byte("original-value")}},
 			Body:        []byte("original-body"),
 		}
-		want := fmt.Sprintf("%s|%s|%s", message.Key, message.Headers[0].Value, message.Body)
+		want := fmt.Sprintf("%s|%s|%s", message.Key, headerByKey(t, message.Headers, "x").Value, message.Body)
 		if err := producer.Publish(group.ctx, message); err != nil {
 			t.Fatalf("Publish() error = %v", err)
 		}
 		message.Key[0] = 'X'
-		message.Headers[0].Value[0] = 'X'
+		headerByKey(t, message.Headers, "x").Value[0] = 'X'
 		message.Body[0] = 'X'
 		consumer := newConsumer(t, group, "publish.clone", 2)
 		got := receiveMessage(t, group, consumer)
-		actual := fmt.Sprintf("%s|%s|%s", got.Key, got.Headers[0].Value, got.Body)
+		actual := fmt.Sprintf("%s|%s|%s", got.Key, headerByKey(t, got.Headers, "x").Value, got.Body)
 		if actual != want {
 			t.Fatalf("published message = %q, want %q", actual, want)
 		}

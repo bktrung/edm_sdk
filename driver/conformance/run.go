@@ -175,6 +175,10 @@ func runProfile(
 		if !groupOK {
 			t.Fatalf("conformance group %s failed", entry.name)
 		}
+		if groupResult == nil {
+			t.Logf("conformance: group=%s filtered out, count not validated", entry.name)
+			continue
+		}
 		observed := groupResult.checks
 		if err := validateGroupCount(entry.name, entry.declared, observed); err != nil {
 			t.Fatalf("%v", err)

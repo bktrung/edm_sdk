@@ -96,15 +96,20 @@ func runConsume(group *groupContext) {
 		})
 		publishCount(t, group, producerA, "consume.prefetch-total-a", 4)
 		publishCount(t, group, producerB, "consume.prefetch-total-b", 4)
-		views := inspectDestinations(t, group, "consume.prefetch-total-a", "consume.prefetch-total-b")
-		if total := views[0].Unsettled + views[1].Unsettled; total != 4 {
-			t.Fatalf("unsettled = %d, want saturated Prefetch 4; views = %#v", total, views)
-		}
-		for _, view := range views {
-			if view.Unsettled > 2 {
-				t.Fatalf("per-destination unsettled = %d, want <= 2", view.Unsettled)
+		waitFor(t, group, "prefetch total to saturate", func() (bool, string) {
+			views := inspectDestinations(t, group, "consume.prefetch-total-a", "consume.prefetch-total-b")
+			total := views[0].Unsettled + views[1].Unsettled
+			return total == 4, fmt.Sprintf("unsettled total=%d; views=%#v", total, views)
+		})
+		waitForStable(t, group, "prefetch destination shares to stay within bounds", func() (bool, string) {
+			views := inspectDestinations(t, group, "consume.prefetch-total-a", "consume.prefetch-total-b")
+			for _, view := range views {
+				if view.Unsettled > 2 {
+					return false, fmt.Sprintf("unsettled by destination=%#v", views)
+				}
 			}
-		}
+			return true, fmt.Sprintf("unsettled by destination=%#v", views)
+		})
 		ackAll(t, group, consumer, 8)
 		group.vector.Add(BehaviorEvent{ID: "prefetch-total", Outcome: "ok", FinalDestination: "consume.prefetch-total"})
 	})
@@ -118,10 +123,11 @@ func runConsume(group *groupContext) {
 		})
 		publishCount(t, group, producerA, "consume.prefetch-share-a", 3)
 		publishCount(t, group, producerB, "consume.prefetch-share-b", 5)
-		views := inspectDestinations(t, group, "consume.prefetch-share-a", "consume.prefetch-share-b")
-		if views[0].Unsettled != 1 || views[1].Unsettled != 3 {
-			t.Fatalf("unsettled by destination = %d/%d, want saturated shares 1/3", views[0].Unsettled, views[1].Unsettled)
-		}
+		waitFor(t, group, "prefetch destination shares to saturate", func() (bool, string) {
+			views := inspectDestinations(t, group, "consume.prefetch-share-a", "consume.prefetch-share-b")
+			return views[0].Unsettled == 1 && views[1].Unsettled == 3,
+				fmt.Sprintf("unsettled by destination=%d/%d", views[0].Unsettled, views[1].Unsettled)
+		})
 		ackAll(t, group, consumer, 8)
 		group.vector.Add(BehaviorEvent{ID: "prefetch-share", Outcome: "ok", FinalDestination: "consume.prefetch-share"})
 	})
@@ -146,11 +152,17 @@ func runConsume(group *groupContext) {
 			t.Fatalf("received destination = %q, want b while a is paused", message.Destination)
 		}
 		ackMessage(t, group, message)
-		select {
-		case message := <-consumer.Messages():
-			t.Fatalf("paused destination delivered %q", message.Destination)
-		default:
-		}
+		waitForStable(t, group, "paused destination to remain empty", func() (bool, string) {
+			select {
+			case message, ok := <-consumer.Messages():
+				if !ok {
+					return false, "Messages channel closed"
+				}
+				return false, fmt.Sprintf("received paused destination %q", message.Destination)
+			default:
+				return true, "no paused message"
+			}
+		})
 		if err := consumer.Resume("consume.pause-a"); err != nil {
 			t.Fatalf("Resume(a) error = %v", err)
 		}
@@ -159,27 +171,44 @@ func runConsume(group *groupContext) {
 	})
 
 	group.Check("repeated pause is idempotent", func(t *testing.T) {
-		producer := newProducer(t, group, "consume.pause-repeat", driver.ProducerConfig{Effective: group.effective})
-		consumer := newConsumer(t, group, "consume.pause-repeat", 1)
-		if err := consumer.Pause("consume.pause-repeat"); err != nil {
+		producerA := newProducer(t, group, "consume.pause-repeat-a", driver.ProducerConfig{Effective: group.effective})
+		producerB := newProducer(t, group, "consume.pause-repeat-b", driver.ProducerConfig{Effective: group.effective})
+		consumer := newConsumerFor(t, group, driver.ConsumerConfig{
+			Destinations: []string{"consume.pause-repeat-a", "consume.pause-repeat-b"}, Prefetch: 2, Effective: group.effective,
+		})
+		if err := consumer.Pause("consume.pause-repeat-a"); err != nil {
 			t.Fatalf("first Pause() error = %v", err)
 		}
-		if err := consumer.Pause("consume.pause-repeat"); err != nil {
+		if err := consumer.Pause("consume.pause-repeat-a"); err != nil {
 			t.Fatalf("second Pause() error = %v", err)
 		}
-		if err := producer.Publish(group.ctx, driver.OutboundMessage{Destination: "consume.pause-repeat"}); err != nil {
-			t.Fatalf("Publish() error = %v", err)
+		if err := producerA.Publish(group.ctx, driver.OutboundMessage{Destination: "consume.pause-repeat-a"}); err != nil {
+			t.Fatalf("Publish(a) error = %v", err)
 		}
-		select {
-		case message := <-consumer.Messages():
+		if err := producerB.Publish(group.ctx, driver.OutboundMessage{Destination: "consume.pause-repeat-b"}); err != nil {
+			t.Fatalf("Publish(b) error = %v", err)
+		}
+		message := receiveMessage(t, group, consumer)
+		if message.Destination != "consume.pause-repeat-b" {
 			t.Fatalf("repeated Pause() allowed delivery of %q", message.Destination)
-		default:
 		}
-		if err := consumer.Resume("consume.pause-repeat"); err != nil {
+		ackMessage(t, group, message)
+		waitForStable(t, group, "repeatedly paused destination to remain empty", func() (bool, string) {
+			select {
+			case message, ok := <-consumer.Messages():
+				if !ok {
+					return false, "Messages channel closed"
+				}
+				return false, fmt.Sprintf("received paused destination %q", message.Destination)
+			default:
+				return true, "no paused message"
+			}
+		})
+		if err := consumer.Resume("consume.pause-repeat-a"); err != nil {
 			t.Fatalf("Resume() error = %v", err)
 		}
 		ackMessage(t, group, receiveMessage(t, group, consumer))
-		group.vector.Add(BehaviorEvent{ID: "pause-idempotent", Outcome: "ok", FinalDestination: "consume.pause-repeat"})
+		group.vector.Add(BehaviorEvent{ID: "pause-idempotent", Outcome: "ok", FinalDestination: "consume.pause-repeat-a,consume.pause-repeat-b"})
 	})
 
 	group.Check("resume delivers every message that arrived while paused", func(t *testing.T) {
@@ -205,16 +234,18 @@ func runConsume(group *groupContext) {
 		publishCount(t, group, producer, "consume.pause-bound", 2)
 		first := receiveMessage(t, group, consumer)
 		second := receiveMessage(t, group, consumer)
-		if view := inspectDestination(t, group, "consume.pause-bound"); view.Unsettled != 2 {
-			t.Fatalf("saturation precondition unsettled = %d, want 2", view.Unsettled)
-		}
+		waitFor(t, group, "prefetch saturation before pause", func() (bool, string) {
+			view := inspectDestination(t, group, "consume.pause-bound")
+			return view.Unsettled == 2, fmt.Sprintf("unsettled=%d", view.Unsettled)
+		})
 		if err := consumer.Pause("consume.pause-bound"); err != nil {
 			t.Fatalf("Pause() error = %v", err)
 		}
 		publishCount(t, group, producer, "consume.pause-bound", 5)
-		if view := inspectDestination(t, group, "consume.pause-bound"); view.Unsettled > 2 {
-			t.Fatalf("paused unsettled = %d, want <= prefetch share 2", view.Unsettled)
-		}
+		waitForStable(t, group, "paused unsettled to stay within prefetch share", func() (bool, string) {
+			view := inspectDestination(t, group, "consume.pause-bound")
+			return view.Unsettled <= 2, fmt.Sprintf("unsettled=%d", view.Unsettled)
+		})
 		if err := first.Settle.Ack(group.ctx); err != nil {
 			t.Fatalf("Ack(first) error = %v", err)
 		}
@@ -224,7 +255,7 @@ func runConsume(group *groupContext) {
 		group.vector.Add(BehaviorEvent{ID: "pause-bound", Outcome: "ok", FinalDestination: "consume.pause-bound"})
 	})
 
-	group.Check("errors remains open without a transient failure", func(t *testing.T) {
+	group.Check("errors remains open across lifecycle controls", func(t *testing.T) {
 		_ = newProducer(t, group, "consume.errors", driver.ProducerConfig{Effective: group.effective})
 		consumer := newConsumer(t, group, "consume.errors", 1)
 		select {
@@ -234,23 +265,66 @@ func runConsume(group *groupContext) {
 			}
 		default:
 		}
+		if err := consumer.Pause("consume.errors"); err != nil {
+			t.Fatalf("Pause() error = %v", err)
+		}
+		if err := consumer.Resume("consume.errors"); err != nil {
+			t.Fatalf("Resume() error = %v", err)
+		}
+		if err := consumer.Drain(group.ctx); err != nil {
+			t.Fatalf("Drain() error = %v", err)
+		}
+		select {
+		case _, ok := <-consumer.Errors():
+			if !ok {
+				t.Fatal("Errors() was closed after lifecycle controls")
+			}
+		default:
+		}
 		group.vector.Add(BehaviorEvent{ID: "errors-open", Outcome: "ok", FinalDestination: "consume.errors"})
 	})
 
 	group.Check("StartLatest excludes retained messages for a new group", func(t *testing.T) {
 		producer := newProducer(t, group, "consume.latest", driver.ProducerConfig{Effective: group.effective})
+		controlProducer := newProducer(t, group, "consume.latest-control", driver.ProducerConfig{Effective: group.effective})
 		if err := producer.Publish(group.ctx, driver.OutboundMessage{Destination: "consume.latest", Body: []byte("retained")}); err != nil {
 			t.Fatalf("Publish(retained) error = %v", err)
 		}
 		consumer := newConsumerFor(t, group, driver.ConsumerConfig{
-			Group: "consume-latest-new-" + group.profile.String(), Destinations: []string{"consume.latest"}, Prefetch: 1,
+			Group: "consume-latest-new-" + group.profile.String(), Destinations: []string{"consume.latest", "consume.latest-control"}, Prefetch: 2,
 			StartAt: driver.StartLatest, Effective: group.effective,
 		})
-		select {
-		case message := <-consumer.Messages():
-			t.Fatalf("StartLatest delivered retained body %q", message.Body)
-		default:
+		if err := controlProducer.Publish(group.ctx, driver.OutboundMessage{Destination: "consume.latest-control", Body: []byte("control")}); err != nil {
+			t.Fatalf("Publish(control) error = %v", err)
 		}
+		var control driver.InboundMessage
+		waitFor(t, group, "StartLatest control delivery", func() (bool, string) {
+			select {
+			case message, ok := <-consumer.Messages():
+				if !ok {
+					return false, "Messages channel closed"
+				}
+				control = message
+				return true, fmt.Sprintf("received destination=%q body=%q", message.Destination, message.Body)
+			default:
+				return false, "no control message"
+			}
+		})
+		if control.Destination != "consume.latest-control" {
+			t.Fatalf("StartLatest delivered retained destination %q before control", control.Destination)
+		}
+		ackMessage(t, group, control)
+		waitForStable(t, group, "StartLatest to exclude retained messages", func() (bool, string) {
+			select {
+			case message, ok := <-consumer.Messages():
+				if !ok {
+					return false, "Messages channel closed"
+				}
+				return false, fmt.Sprintf("received retained destination=%q body=%q", message.Destination, message.Body)
+			default:
+				return true, "no retained message"
+			}
+		})
 		if err := producer.Publish(group.ctx, driver.OutboundMessage{Destination: "consume.latest", Body: []byte("new")}); err != nil {
 			t.Fatalf("Publish(new) error = %v", err)
 		}
@@ -324,6 +398,7 @@ func runConsume(group *groupContext) {
 
 	group.Check("canceled consumer creation returns context cancellation", func(t *testing.T) {
 		ctx, cancel := context.WithCancel(group.ctx)
+		producer := newProducer(t, group, "consume.cancel-create", driver.ProducerConfig{Effective: group.effective})
 		cancel()
 		_, err := group.conn.Consumer(ctx, driver.ConsumerConfig{Destinations: []string{"consume.cancel-create"}})
 		if !errors.Is(err, context.Canceled) {
@@ -332,20 +407,34 @@ func runConsume(group *groupContext) {
 		if kind, ok := driver.Classify(err); !ok || kind != driver.KindTransient {
 			t.Fatalf("Consumer() classification = (%v, %t), want transient", kind, ok)
 		}
+		if err := producer.Publish(group.ctx, driver.OutboundMessage{Destination: "consume.cancel-create", Body: []byte("after-cancel")}); err != nil {
+			t.Fatalf("Publish() after canceled Consumer() error = %v", err)
+		}
+		consumer := newConsumer(t, group, "consume.cancel-create", 1)
+		message := receiveMessage(t, group, consumer)
+		if string(message.Body) != "after-cancel" {
+			t.Fatalf("message after canceled Consumer() = %q, want %q", message.Body, "after-cancel")
+		}
+		ackMessage(t, group, message)
 		group.vector.Add(BehaviorEvent{ID: "cancel-consumer", Outcome: "cancelled", FinalDestination: "consume.cancel-create"})
 	})
 
 	group.Check("canceled Drain returns without changing consumer state", func(t *testing.T) {
-		_ = newProducer(t, group, "consume.cancel-drain", driver.ProducerConfig{Effective: group.effective})
+		producer := newProducer(t, group, "consume.cancel-drain", driver.ProducerConfig{Effective: group.effective})
 		consumer := newConsumer(t, group, "consume.cancel-drain", 1)
 		ctx, cancel := context.WithCancel(group.ctx)
 		cancel()
 		if err := consumer.Drain(ctx); !errors.Is(err, context.Canceled) {
 			t.Fatalf("Drain() error = %v, want context.Canceled", err)
 		}
-		if err := consumer.Resume("consume.cancel-drain"); err != nil {
-			t.Fatalf("Resume() after canceled Drain error = %v", err)
+		if err := producer.Publish(group.ctx, driver.OutboundMessage{Destination: "consume.cancel-drain", Body: []byte("after-cancel")}); err != nil {
+			t.Fatalf("Publish() after canceled Drain() error = %v", err)
 		}
+		message := receiveMessage(t, group, consumer)
+		if string(message.Body) != "after-cancel" {
+			t.Fatalf("message after canceled Drain() = %q, want %q", message.Body, "after-cancel")
+		}
+		ackMessage(t, group, message)
 		group.vector.Add(BehaviorEvent{ID: "cancel-drain", Outcome: "cancelled", FinalDestination: "consume.cancel-drain"})
 	})
 
@@ -361,13 +450,21 @@ func runConsume(group *groupContext) {
 	})
 
 	group.Check("canceled Stop returns context cancellation", func(t *testing.T) {
-		_ = newProducer(t, group, "consume.cancel-stop", driver.ProducerConfig{Effective: group.effective})
+		producer := newProducer(t, group, "consume.cancel-stop", driver.ProducerConfig{Effective: group.effective})
 		consumer := newConsumer(t, group, "consume.cancel-stop", 1)
 		ctx, cancel := context.WithCancel(group.ctx)
 		cancel()
 		if err := consumer.Stop(ctx); !errors.Is(err, context.Canceled) {
 			t.Fatalf("Stop() error = %v, want context.Canceled", err)
 		}
+		if err := producer.Publish(group.ctx, driver.OutboundMessage{Destination: "consume.cancel-stop", Body: []byte("after-cancel")}); err != nil {
+			t.Fatalf("Publish() after canceled Stop() error = %v", err)
+		}
+		message := receiveMessage(t, group, consumer)
+		if string(message.Body) != "after-cancel" {
+			t.Fatalf("message after canceled Stop() = %q, want %q", message.Body, "after-cancel")
+		}
+		ackMessage(t, group, message)
 		group.vector.Add(BehaviorEvent{ID: "cancel-stop", Outcome: "cancelled", FinalDestination: "consume.cancel-stop"})
 	})
 }
