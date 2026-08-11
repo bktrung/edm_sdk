@@ -22,6 +22,12 @@ type consumer struct {
 	startAfter   map[string]uint64
 	outstanding  int
 	unsettled    map[string]int
+	unsettledKey map[deliveryKey]int
+}
+
+type deliveryKey struct {
+	destination string
+	key         string
 }
 
 var _ driver.Consumer = (*consumer)(nil)
@@ -67,6 +73,9 @@ func (c *consumer) Drain(ctx context.Context) error {
 
 func (c *consumer) Stop(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
+		if errors.Is(err, context.DeadlineExceeded) {
+			return classify("stop", driver.KindTransient, fmt.Errorf("%w: %w", driver.ErrDrainTimeout, err))
+		}
 		return classify("stop", driver.KindTransient, err)
 	}
 	c.conn.mu.Lock()
@@ -80,11 +89,6 @@ func (c *consumer) Stop(ctx context.Context) error {
 	c.stopped = true
 	for _, name := range c.destinations {
 		delete(c.conn.destinations[name].consumers, c)
-		for key, owner := range c.conn.destinations[name].affinity {
-			if owner == c {
-				delete(c.conn.destinations[name].affinity, key)
-			}
-		}
 		order := c.conn.destinations[name].order
 		for i, current := range order {
 			if current == c {
@@ -161,6 +165,18 @@ func (s *settler) settle(ctx context.Context, opt driver.NackOptions, nack bool)
 	name := s.message.message.Destination
 	if s.consumer.unsettled[name] > 0 {
 		s.consumer.unsettled[name]--
+	}
+	key := string(s.message.message.Key)
+	if key != "" {
+		deliveryKey := deliveryKey{destination: name, key: key}
+		if s.consumer.unsettledKey[deliveryKey] > 1 {
+			s.consumer.unsettledKey[deliveryKey]--
+		} else {
+			delete(s.consumer.unsettledKey, deliveryKey)
+			if dest, ok := s.conn.destinations[name]; ok && dest.affinity[key] == s.consumer {
+				delete(dest.affinity, key)
+			}
+		}
 	}
 	if nack && opt.Requeue {
 		s.message.deliveryCount++

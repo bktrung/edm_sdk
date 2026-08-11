@@ -185,6 +185,7 @@ func (c *conn) Consumer(ctx context.Context, cfg driver.ConsumerConfig) (driver.
 		errs:         make(chan error, 1),
 		paused:       make(map[string]bool),
 		unsettled:    make(map[string]int),
+		unsettledKey: make(map[deliveryKey]int),
 		group:        group,
 		startAfter:   startAfter,
 	}
@@ -305,6 +306,11 @@ destinationLoop:
 				case cs.messages <- inbound:
 					cs.outstanding++
 					cs.unsettled[dest.spec.Name]++
+					key := string(msg.message.Key)
+					if key != "" {
+						dest.affinity[key] = cs
+						cs.unsettledKey[deliveryKey{destination: dest.spec.Name, key: key}]++
+					}
 					dest.messages = append(dest.messages[:i], dest.messages[i+1:]...)
 					delivered = true
 				default:
@@ -350,9 +356,6 @@ func (d *destination) pickConsumer(message *queuedMessage) *consumer {
 	}
 	cs := eligible[d.next%len(eligible)]
 	d.next++
-	if len(message.message.Key) != 0 {
-		d.affinity[string(message.message.Key)] = cs
-	}
 	return cs
 }
 

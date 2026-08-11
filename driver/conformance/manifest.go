@@ -30,7 +30,7 @@ var groupManifest = []manifestEntry{
 // pendingGroups lists groups without registered runners.
 var pendingGroups = []string{
 	"ordering", "deferred",
-	"drain", "rebalance", "failure", "capability", "lag",
+	"failure", "capability", "lag",
 }
 
 type groupContext struct {
