@@ -184,6 +184,9 @@ func runTopology(group *groupContext) {
 		if err != nil {
 			t.Fatalf("EnsureTopology(scoped): %v", err)
 		}
+		if diff.OrphanScanError != "" {
+			t.Fatalf("OrphanScanError=%q, want empty", diff.OrphanScanError)
+		}
 		// Positive control: a destination genuinely in scope and dropped from
 		// the spec must be reported, proving the scan ran rather than
 		// returning an empty result unconditionally.
@@ -222,6 +225,9 @@ func runTopology(group *groupContext) {
 		if err != nil {
 			t.Fatalf("EnsureTopology(scoped): %v", err)
 		}
+		if diff.OrphanScanError != "" {
+			t.Fatalf("OrphanScanError=%q, want empty", diff.OrphanScanError)
+		}
 		// Positive control: proves the scan ran before trusting the negative
 		// claim below.
 		if _, ok := findOrphan(diff.Orphaned, droppedInScope); !ok {
@@ -230,25 +236,62 @@ func runTopology(group *groupContext) {
 		if _, ok := findOrphan(diff.Orphaned, continuation); ok {
 			t.Fatalf("Orphaned=%v, %q must not match the scope by same-token continuation", diff.Orphaned, continuation)
 		}
+		// Sharper case: the same prefix without a trailing separator must catch
+		// worker-v2.main too, proving the exclusion above comes from matching the
+		// plain string rather than from a driver that parses dot-separated
+		// components itself (ADR-0012 leaves boundary safety to the caller's
+		// trailing separator, not driver-side parsing).
+		unbounded, err := admin.EnsureTopology(group.ctx, driver.TopologySpec{
+			Destinations: []driver.DestinationSpec{{Name: inSpec}},
+			Scope:        []string{"topology.orphan.boundary.worker"},
+			Effective:    group.effective,
+		})
+		if err != nil {
+			t.Fatalf("EnsureTopology(unbounded scope): %v", err)
+		}
+		if _, ok := findOrphan(unbounded.Orphaned, continuation); !ok {
+			t.Fatalf("Orphaned=%v, want %q reported under a scope without a trailing separator", unbounded.Orphaned, continuation)
+		}
 		group.vector.Add(BehaviorEvent{ID: "topology-orphan-boundary", Outcome: "excluded", FinalDestination: continuation})
 	})
 
 	group.Check("EnsureTopology with an empty scope disables orphan scanning", func(t *testing.T) {
 		admin := group.conn.Admin()
-		name := "topology.orphan.noscan"
+		kept := "topology.orphan.noscan.kept"
+		dropped := "topology.orphan.noscan.dropped"
+		scope := []string{"topology.orphan.noscan."}
 		if _, err := admin.EnsureTopology(group.ctx, driver.TopologySpec{
-			Destinations: []driver.DestinationSpec{{Name: name}},
+			Destinations: []driver.DestinationSpec{{Name: kept}, {Name: dropped}},
+			Scope:        scope,
 			Effective:    group.effective,
 		}); err != nil {
 			t.Fatalf("EnsureTopology(seed): %v", err)
 		}
 		t.Cleanup(func() {
-			if _, err := admin.Purge(group.ctx, name); err != nil {
-				t.Errorf("purge destination %q: %v", name, err)
+			for _, name := range []string{kept, dropped} {
+				if _, err := admin.Purge(group.ctx, name); err != nil {
+					t.Errorf("purge destination %q: %v", name, err)
+				}
 			}
 		})
+		// Positive control: with a real scope, dropping "dropped" from the spec
+		// is reported, proving there is something a disabled scan could miss.
+		control, err := admin.EnsureTopology(group.ctx, driver.TopologySpec{
+			Destinations: []driver.DestinationSpec{{Name: kept}},
+			Scope:        scope,
+			Effective:    group.effective,
+		})
+		if err != nil {
+			t.Fatalf("EnsureTopology(scoped control): %v", err)
+		}
+		if _, ok := findOrphan(control.Orphaned, dropped); !ok {
+			t.Fatalf("Orphaned=%v, want %q (control: scope enabled)", control.Orphaned, dropped)
+		}
+		// Same call, empty Scope this time: the only thing that changed is
+		// whether scanning is enabled.
 		diff, err := admin.EnsureTopology(group.ctx, driver.TopologySpec{
-			Effective: group.effective,
+			Destinations: []driver.DestinationSpec{{Name: kept}},
+			Effective:    group.effective,
 		})
 		if err != nil {
 			t.Fatalf("EnsureTopology(no scope): %v", err)
@@ -259,7 +302,7 @@ func runTopology(group *groupContext) {
 		if len(diff.Orphaned) != 0 {
 			t.Fatalf("Orphaned=%v, want none reported when scanning is disabled", diff.Orphaned)
 		}
-		group.vector.Add(BehaviorEvent{ID: "topology-orphan-scan-disabled", Outcome: "skipped", FinalDestination: name})
+		group.vector.Add(BehaviorEvent{ID: "topology-orphan-scan-disabled", Outcome: "skipped", FinalDestination: dropped})
 	})
 
 	group.Check("EnsureTopology folds deferred messages into an orphaned destination's message count", func(t *testing.T) {
@@ -300,6 +343,9 @@ func runTopology(group *groupContext) {
 		if err != nil {
 			t.Fatalf("EnsureTopology(dropped): %v", err)
 		}
+		if diff.OrphanScanError != "" {
+			t.Fatalf("OrphanScanError=%q, want empty", diff.OrphanScanError)
+		}
 		orphan, ok := findOrphan(diff.Orphaned, dropped)
 		if !ok {
 			t.Fatalf("Orphaned=%v, want %q", diff.Orphaned, dropped)
@@ -329,23 +375,11 @@ func runTopology(group *groupContext) {
 		if err != nil {
 			t.Fatalf("DescribeTopology(%q): %v", name, err)
 		}
-		if state.Depth[name] != 3 {
-			t.Fatalf("Depth[%q]=%d, want 3 (ready + deferred)", name, state.Depth[name])
+		depth, ok := state.Depth[name]
+		if !ok || depth != 3 {
+			t.Fatalf("Depth[%q]=(%d,%t), want (3,true) (ready + deferred)", name, depth, ok)
 		}
 		group.vector.Add(BehaviorEvent{ID: "topology-describe-depth", Outcome: "counted", FinalDestination: name})
-	})
-
-	group.Check("DescribeTopology on an unknown destination returns a classified not-found error", func(t *testing.T) {
-		admin := group.conn.Admin()
-		name := "topology.describe.missing"
-		_, err := admin.DescribeTopology(group.ctx, []string{name})
-		if !errors.Is(err, driver.ErrDestinationMissing) {
-			t.Fatalf("DescribeTopology(%q) error=%v, want ErrDestinationMissing", name, err)
-		}
-		if kind, ok := driver.Classify(err); !ok || kind != driver.KindNotFound {
-			t.Fatalf("DescribeTopology(%q) classification=(%v,%t), want not_found", name, kind, ok)
-		}
-		group.vector.Add(BehaviorEvent{ID: "topology-describe-missing", Outcome: "not-found", FinalDestination: name})
 	})
 
 	group.Check("Prune refuses a destination that still holds ready messages", func(t *testing.T) {
@@ -380,11 +414,7 @@ func runTopology(group *groupContext) {
 		if !deleted.Deleted {
 			t.Fatalf("Prune(%q)=%+v, want deleted", eligible, deleted)
 		}
-		t.Cleanup(func() {
-			if _, err := admin.Purge(group.ctx, nonEmpty); err != nil {
-				t.Errorf("purge destination %q: %v", nonEmpty, err)
-			}
-		})
+		// newProducer already registered a Purge cleanup for nonEmpty.
 		group.vector.Add(BehaviorEvent{ID: "topology-prune-ready-guard", Outcome: "refused", FinalDestination: nonEmpty})
 	})
 
@@ -419,11 +449,7 @@ func runTopology(group *groupContext) {
 		if !deleted.Deleted {
 			t.Fatalf("Prune(%q)=%+v, want deleted", eligible, deleted)
 		}
-		t.Cleanup(func() {
-			if _, err := admin.Purge(group.ctx, parked); err != nil {
-				t.Errorf("purge destination %q: %v", parked, err)
-			}
-		})
+		// newProducer already registered a Purge cleanup for parked.
 		group.vector.Add(BehaviorEvent{ID: "topology-prune-park-guard", Outcome: "refused", FinalDestination: parked})
 	})
 
@@ -488,13 +514,17 @@ func runTopology(group *groupContext) {
 			t.Fatalf("Purge(%q)=%d, want 2", name, purged)
 		}
 		// The destination itself survives, empty: DescribeTopology still finds
-		// it rather than reporting it missing.
+		// it (present in the map) rather than reporting it missing (absent).
 		state, err := admin.DescribeTopology(group.ctx, []string{name})
 		if err != nil {
 			t.Fatalf("DescribeTopology(%q) after purge: %v", name, err)
 		}
-		if state.Depth[name] != 0 {
-			t.Fatalf("Depth[%q]=%d after purge, want 0", name, state.Depth[name])
+		depth, ok := state.Depth[name]
+		if !ok {
+			t.Fatalf("Depth[%q] absent after purge, want present with 0 (Purge keeps the destination)", name)
+		}
+		if depth != 0 {
+			t.Fatalf("Depth[%q]=%d after purge, want 0", name, depth)
 		}
 		// Positive control: the destination still accepts new publishes.
 		if err := producer.Publish(group.ctx, driver.OutboundMessage{Destination: name}); err != nil {
@@ -507,9 +537,10 @@ func runTopology(group *groupContext) {
 		group.vector.Add(BehaviorEvent{ID: "topology-purge", Outcome: "emptied", FinalDestination: name})
 	})
 
-	group.Check("cancelled context prevents topology admin calls", func(t *testing.T) {
+	group.Check("cancelled context prevents topology admin calls without a partial effect", func(t *testing.T) {
 		admin := group.conn.Admin()
 		name := "topology.cancel"
+		newName := "topology.cancel.new"
 		if _, err := admin.EnsureTopology(group.ctx, driver.TopologySpec{
 			Destinations: []driver.DestinationSpec{{Name: name}},
 			Effective:    group.effective,
@@ -521,10 +552,30 @@ func runTopology(group *groupContext) {
 				t.Errorf("purge destination %q: %v", name, err)
 			}
 		})
+		t.Cleanup(func() {
+			// Best effort: newName should never exist if the driver is correct,
+			// so a missing-destination error here is expected, not a failure.
+			_, _ = admin.Purge(group.ctx, newName)
+		})
+		// Seed a message so the cancelled Purge below has real state to leave
+		// behind: an already-empty destination cannot distinguish "refused"
+		// from "did nothing because there was nothing to do."
+		producer := newProducer(t, group, name, driver.ProducerConfig{Effective: group.effective})
+		if err := producer.Publish(group.ctx, driver.OutboundMessage{Destination: name}); err != nil {
+			t.Fatalf("Publish(%q): %v", name, err)
+		}
+		waitFor(t, group, "seeded message to land before the cancelled calls", func() (bool, string) {
+			view := inspectDestination(t, group, name)
+			return view.Ready == 1, fmt.Sprintf("view=%+v", view)
+		})
+
 		ctx, cancel := context.WithCancel(group.ctx)
 		cancel()
+		// newName is unseen by any earlier call: a driver that creates it and
+		// only afterward checks ctx.Err() would still leave it behind despite
+		// returning context.Canceled here.
 		if _, err := admin.EnsureTopology(ctx, driver.TopologySpec{
-			Destinations: []driver.DestinationSpec{{Name: name}},
+			Destinations: []driver.DestinationSpec{{Name: newName}},
 			Effective:    group.effective,
 		}); !errors.Is(err, context.Canceled) {
 			t.Fatalf("EnsureTopology() with cancelled ctx error=%v, want context.Canceled", err)
@@ -538,16 +589,27 @@ func runTopology(group *groupContext) {
 		if _, err := admin.Prune(ctx, []string{name}); !errors.Is(err, context.Canceled) {
 			t.Fatalf("Prune() with cancelled ctx error=%v, want context.Canceled", err)
 		}
-		// Positive control: the destination is unaffected and still readable
-		// with a live context, proving the cancelled calls above had no
-		// observable effect.
-		state, err := admin.DescribeTopology(group.ctx, []string{name})
-		if err != nil {
-			t.Fatalf("DescribeTopology(%q) after cancellation: %v", name, err)
+
+		// Positive control: newName must never have been created. This is also
+		// the group's coverage for DescribeTopology's classified not-found
+		// error, since observing "never created" needs exactly this lookup.
+		_, err := admin.DescribeTopology(group.ctx, []string{newName})
+		if !errors.Is(err, driver.ErrDestinationMissing) {
+			t.Fatalf("DescribeTopology(%q) error=%v, want ErrDestinationMissing", newName, err)
 		}
-		if state.Depth[name] != 0 {
-			t.Fatalf("Depth[%q]=%d after cancelled calls, want 0 (unaffected)", name, state.Depth[name])
+		if kind, ok := driver.Classify(err); !ok || kind != driver.KindNotFound {
+			t.Fatalf("DescribeTopology(%q) classification=(%v,%t), want not_found", newName, kind, ok)
 		}
+		// Positive control: name is unaffected by the cancelled Purge/Prune,
+		// proving neither ran to completion despite returning context.Canceled.
+		waitForStable(t, group, "name to stay unaffected by the cancelled calls", func() (bool, string) {
+			state, describeErr := admin.DescribeTopology(group.ctx, []string{name})
+			if describeErr != nil {
+				return false, fmt.Sprintf("DescribeTopology(%q): %v", name, describeErr)
+			}
+			depth, ok := state.Depth[name]
+			return ok && depth == 1, fmt.Sprintf("Depth[%q]=(%d,%t), want (1,true)", name, depth, ok)
+		})
 		group.vector.Add(BehaviorEvent{ID: "topology-cancel", Outcome: "cancelled", FinalDestination: name})
 	})
 }

@@ -163,7 +163,10 @@ func runSettle(group *groupContext) {
 		group.vector.Add(BehaviorEvent{ID: "ack-no-redelivery", Outcome: "ack", FinalDestination: "settle.ack-no-redelivery"})
 	})
 
-	group.Check("settlement attempted after the consumer has stopped fails without panicking", func(t *testing.T) {
+	group.Check("settling an already-acked message stays safe after a clean stop", func(t *testing.T) {
+		// A clean Stop requires zero outstanding messages, so this can only ever
+		// reach the message through its already-settled path; it does not exercise
+		// a stop-while-unsettled state (that needs Drain, from a different group).
 		producer := newProducer(t, group, "settle.after-stop", driver.ProducerConfig{Effective: group.effective})
 		consumer := newConsumer(t, group, "settle.after-stop", 1)
 		if err := producer.Publish(group.ctx, driver.OutboundMessage{Destination: "settle.after-stop"}); err != nil {
@@ -187,42 +190,43 @@ func runSettle(group *groupContext) {
 	})
 
 	group.Check("ack then ack is already settled", func(t *testing.T) {
-		assertDoubleSettlement(t, group, "settle.double-ack", func(message driver.InboundMessage) error {
-			if err := message.Settle.Ack(group.ctx); err != nil {
-				return err
-			}
-			return message.Settle.Ack(group.ctx)
-		})
+		assertDoubleSettlement(t, group, "settle.double-ack",
+			func(message driver.InboundMessage) error { return message.Settle.Ack(group.ctx) },
+			func(message driver.InboundMessage) error { return message.Settle.Ack(group.ctx) },
+			BrokerView{Ready: 0, Unsettled: 0})
 		group.vector.Add(BehaviorEvent{ID: "double-ack", Outcome: "already-settled", FinalDestination: "settle.double-ack"})
 	})
 
 	group.Check("ack then nack is already settled", func(t *testing.T) {
-		assertDoubleSettlement(t, group, "settle.ack-nack", func(message driver.InboundMessage) error {
-			if err := message.Settle.Ack(group.ctx); err != nil {
-				return err
-			}
-			return message.Settle.Nack(group.ctx, driver.NackOptions{Requeue: true})
-		})
+		assertDoubleSettlement(t, group, "settle.ack-nack",
+			func(message driver.InboundMessage) error { return message.Settle.Ack(group.ctx) },
+			func(message driver.InboundMessage) error {
+				return message.Settle.Nack(group.ctx, driver.NackOptions{Requeue: true})
+			},
+			BrokerView{Ready: 0, Unsettled: 0})
 		group.vector.Add(BehaviorEvent{ID: "ack-nack", Outcome: "already-settled", FinalDestination: "settle.ack-nack"})
 	})
 
 	group.Check("nack then ack is already settled", func(t *testing.T) {
-		assertDoubleSettlement(t, group, "settle.nack-ack", func(message driver.InboundMessage) error {
-			if err := message.Settle.Nack(group.ctx, driver.NackOptions{}); err != nil {
-				return err
-			}
-			return message.Settle.Ack(group.ctx)
-		})
+		assertDoubleSettlement(t, group, "settle.nack-ack",
+			func(message driver.InboundMessage) error { return message.Settle.Nack(group.ctx, driver.NackOptions{}) },
+			func(message driver.InboundMessage) error { return message.Settle.Ack(group.ctx) },
+			BrokerView{Ready: 0, Unsettled: 0})
 		group.vector.Add(BehaviorEvent{ID: "nack-ack", Outcome: "already-settled", FinalDestination: "settle.nack-ack"})
 	})
 
 	group.Check("nack then nack is already settled", func(t *testing.T) {
-		assertDoubleSettlement(t, group, "settle.double-nack", func(message driver.InboundMessage) error {
-			if err := message.Settle.Nack(group.ctx, driver.NackOptions{Requeue: true}); err != nil {
-				return err
-			}
-			return message.Settle.Nack(group.ctx, driver.NackOptions{Requeue: true})
-		})
+		// The first nack requeues onto the sole consumer, which still has a free
+		// prefetch slot: dispatch runs synchronously inside Nack, so by the time
+		// it returns the redelivered copy is already sitting unsettled, not Ready.
+		assertDoubleSettlement(t, group, "settle.double-nack",
+			func(message driver.InboundMessage) error {
+				return message.Settle.Nack(group.ctx, driver.NackOptions{Requeue: true})
+			},
+			func(message driver.InboundMessage) error {
+				return message.Settle.Nack(group.ctx, driver.NackOptions{Requeue: true})
+			},
+			BrokerView{Ready: 0, Unsettled: 1})
 		group.vector.Add(BehaviorEvent{ID: "double-nack", Outcome: "already-settled", FinalDestination: "settle.double-nack"})
 	})
 
@@ -352,10 +356,12 @@ func runSettle(group *groupContext) {
 		if err := message.Settle.Ack(ctx); !errors.Is(err, context.Canceled) {
 			t.Fatalf("Ack() error=%v, want context.Canceled", err)
 		}
-		waitFor(t, group, "cancelled ack to leave the message unsettled", func() (bool, string) {
+		waitForStable(t, group, "cancelled ack to leave the message unsettled", func() (bool, string) {
 			view := inspectDestination(t, group, "settle.cancel-ack")
 			return view.Unsettled == 1, fmt.Sprintf("view=%+v", view)
 		})
+		// Positive control: a live ack on the same message must still succeed,
+		// proving the cancelled call above did not settle it.
 		if err := message.Settle.Ack(group.ctx); err != nil {
 			t.Fatal(err)
 		}
@@ -374,10 +380,12 @@ func runSettle(group *groupContext) {
 		if err := message.Settle.Nack(ctx, driver.NackOptions{Requeue: true}); !errors.Is(err, context.Canceled) {
 			t.Fatalf("Nack() error=%v, want context.Canceled", err)
 		}
-		waitFor(t, group, "cancelled nack to leave the message unsettled", func() (bool, string) {
+		waitForStable(t, group, "cancelled nack to leave the message unsettled", func() (bool, string) {
 			view := inspectDestination(t, group, "settle.cancel-nack")
 			return view.Unsettled == 1, fmt.Sprintf("view=%+v", view)
 		})
+		// Positive control: a live nack on the same message must still succeed
+		// and redeliver, proving the cancelled call above did not settle it.
 		if err := message.Settle.Nack(group.ctx, driver.NackOptions{Requeue: true}); err != nil {
 			t.Fatal(err)
 		}
@@ -389,7 +397,12 @@ func runSettle(group *groupContext) {
 	})
 }
 
-func assertDoubleSettlement(t *testing.T, group *groupContext, destination string, settle func(driver.InboundMessage) error) {
+// assertDoubleSettlement publishes one message, settles it with first, then
+// asserts second is rejected as already-settled and that the rejected call
+// left the broker view exactly where first left it. wantAfterFirst is the
+// caller-known outcome of first alone (before second ever runs), so the
+// baseline can never absorb second's effect the way a post-hoc read would.
+func assertDoubleSettlement(t *testing.T, group *groupContext, destination string, first, second func(driver.InboundMessage) error, wantAfterFirst BrokerView) {
 	t.Helper()
 	producer := newProducer(t, group, destination, driver.ProducerConfig{Effective: group.effective})
 	consumer := newConsumer(t, group, destination, 1)
@@ -397,7 +410,14 @@ func assertDoubleSettlement(t *testing.T, group *groupContext, destination strin
 		t.Fatal(err)
 	}
 	message := receiveMessage(t, group, consumer)
-	err := settle(message)
+	if err := first(message); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, group, "first settlement to reach its expected view", func() (bool, string) {
+		got := inspectDestination(t, group, destination)
+		return got == wantAfterFirst, fmt.Sprintf("view=%+v, want=%+v", got, wantAfterFirst)
+	})
+	err := second(message)
 	if !errors.Is(err, driver.ErrAlreadySettled) {
 		t.Fatalf("second settlement error=%v, want ErrAlreadySettled", err)
 	}
@@ -409,19 +429,13 @@ func assertDoubleSettlement(t *testing.T, group *groupContext, destination strin
 	if !ok || classified.Retryable() {
 		t.Fatalf("second settlement retryable=%v, want false", ok && classified.Retryable())
 	}
-	// The first settlement's outcome, not emptiness, is the baseline: a
-	// requeuing first settle leaves the message live (possibly already
-	// redelivered, since dispatch runs synchronously inside settle), while an
-	// ack or a discard leaves the destination empty. Either way, the rejected
-	// second settlement must not move the view from whatever the first left it.
-	want := inspectDestination(t, group, destination)
 	waitForStable(t, group, "already-settled delivery to leave the broker view unchanged", func() (bool, string) {
 		got := inspectDestination(t, group, destination)
-		return got == want, fmt.Sprintf("view=%+v, want=%+v", got, want)
+		return got == wantAfterFirst, fmt.Sprintf("view=%+v, want=%+v", got, wantAfterFirst)
 	})
 	// A requeuing first settlement leaves a redelivered copy outstanding; drain
 	// and ack it so the consumer can stop cleanly at test end.
-	if want.Unsettled > 0 {
+	if wantAfterFirst.Unsettled > 0 {
 		redelivery := receiveMessage(t, group, consumer)
 		if err := redelivery.Settle.Ack(group.ctx); err != nil {
 			t.Fatal(err)
