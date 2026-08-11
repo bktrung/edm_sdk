@@ -1,11 +1,16 @@
 package conformance
 
 import (
-	"context"
+	"fmt"
 	"testing"
 	"time"
 
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/driver"
+)
+
+const (
+	waitTimeout  = 5 * time.Second
+	waitInterval = 10 * time.Millisecond
 )
 
 func newProducer(t *testing.T, group *groupContext, destination string, config driver.ProducerConfig) driver.Producer {
@@ -71,14 +76,55 @@ func inspectDestination(t *testing.T, group *groupContext, destination string) B
 
 func receiveMessage(t *testing.T, group *groupContext, consumer driver.Consumer) driver.InboundMessage {
 	t.Helper()
-	ctx, cancel := context.WithTimeout(group.ctx, 5*time.Second)
-	defer cancel()
-	select {
-	case message := <-consumer.Messages():
-		return message
-	case <-ctx.Done():
-		t.Fatal("timed out waiting for published message")
-		return driver.InboundMessage{}
+	var received driver.InboundMessage
+	waitFor(t, group, "published message", func() (bool, string) {
+		select {
+		case message, ok := <-consumer.Messages():
+			if !ok {
+				return false, "Messages channel closed"
+			}
+			received = message
+			return true, fmt.Sprintf("received destination=%q", message.Destination)
+		default:
+			return false, "no message"
+		}
+	})
+	return received
+}
+
+// waitFor retries condition until it holds or the deadline passes, and reports
+// the last observed value on failure.
+func waitFor(t *testing.T, group *groupContext, what string, condition func() (bool, string)) {
+	t.Helper()
+	waitForUntil(t, group, what, condition, false)
+}
+
+func waitForStable(t *testing.T, group *groupContext, what string, condition func() (bool, string)) {
+	t.Helper()
+	waitForUntil(t, group, what, condition, true)
+}
+
+func waitForUntil(t *testing.T, group *groupContext, what string, condition func() (bool, string), stable bool) {
+	t.Helper()
+	deadline := time.NewTimer(waitTimeout)
+	defer deadline.Stop()
+	var lastObservation string
+	for {
+		holds, observation := condition()
+		lastObservation = observation
+		if !holds {
+			if stable {
+				t.Fatalf("%s violated; last observation: %s", what, lastObservation)
+			}
+		} else if !stable {
+			return
+		}
+
+		select {
+		case <-deadline.C:
+			t.Fatalf("%s timed out after %s; last observation: %s", what, waitTimeout, lastObservation)
+		case <-time.After(waitInterval):
+		}
 	}
 }
 
