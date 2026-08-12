@@ -11,7 +11,7 @@ export GOPRIVATE := fgit.zapps.vn
 
 APISURFACE := $(CURDIR)/.tools/bin/apisurface
 
-.PHONY: build test-fast test test-chaos kpi lint verify-agnostic verify-self-contained check-cardinality swap-report check-fixture check-api-surface check-api-surface-codec check-api-surface-driver
+.PHONY: build test-fast test test-chaos kpi lint verify-agnostic verify-self-contained check-cardinality swap-report check-fixture check-api-surface check-api-surface-codec check-api-surface-driver check-api-surface-f1test
 
 ## build: compile all packages with reproducible build flags.
 build:
@@ -66,7 +66,7 @@ swap-report:
 ## check-fixture: validate the local fixtures used by tests and tooling.
 check-fixture:
 	go test ./...
-	$(MAKE) check-api-surface check-api-surface-codec check-api-surface-driver
+	$(MAKE) check-api-surface check-api-surface-codec check-api-surface-driver check-api-surface-f1test
 
 ## check-api-surface: verify exported symbols against the f1 public API fixture.
 check-api-surface: $(APISURFACE)
@@ -79,6 +79,10 @@ check-api-surface-codec: $(APISURFACE)
 ## check-api-surface-driver: verify exported driver symbols against the port fixture.
 check-api-surface-driver: $(APISURFACE)
 	$(APISURFACE) -package driver -fixture testdata/public-api-driver.json
+
+## check-api-surface-f1test: verify exported f1test symbols against its fixture.
+check-api-surface-f1test: $(APISURFACE)
+	$(APISURFACE) -package f1test -fixture testdata/public-api-f1test.json
 
 $(APISURFACE): tools/apisurface/main.go tools/apisurface/go.mod
 	cd tools/apisurface && go build -o ../../.tools/bin/apisurface .

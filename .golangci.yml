@@ -51,6 +51,7 @@ linters:
             - "**/*.go"
             - "!**/driver/**"
             - "!**/drivers/**"
+            - "!**/f1test/**"
             - "!**/cmd/**"
             - "!**/internal/obs/**"
           deny:
@@ -132,6 +133,20 @@ linters:
               desc: "cmd registers drivers and must not import broker clients directly"
             - pkg: github.com/rabbitmq/amqp091-go
               desc: "cmd registers drivers and must not import broker clients directly"
+
+        f1test:
+          files:
+            - "**/f1test/**"
+          allow:
+            - $gostd
+            - github.com/stretchr/testify
+            - fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk
+            - fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/driver
+            - fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/drivers/inmem
+            - fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/clock
+          deny:
+            - pkg: $all
+              desc: "f1test may import only the SDK, in-memory driver, clock, and test assertions"
 
         drivers-kafka:
           files:
