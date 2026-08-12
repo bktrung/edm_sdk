@@ -58,7 +58,25 @@ func newFaultInjector(raw driver.Conn) (conformance.FaultInjector, error) {
 			return err
 		}
 		if kind != conformance.FaultPublishFailure {
-			return errors.New("unsupported conformance fault")
+			switch kind {
+			case conformance.FaultConnectionDrop:
+				conn.mu.Lock()
+				conn.dropInFlightLocked("connection")
+				conn.mu.Unlock()
+				return nil
+			case conformance.FaultDeliveryFailure:
+				conn.mu.Lock()
+				conn.dropInFlightLocked("delivery")
+				conn.mu.Unlock()
+				return nil
+			case conformance.FaultFatalPublish:
+				conn.mu.Lock()
+				conn.failPublishFatal = true
+				conn.mu.Unlock()
+				return nil
+			default:
+				return errors.New("unsupported conformance fault")
+			}
 		}
 		conn.mu.Lock()
 		defer conn.mu.Unlock()

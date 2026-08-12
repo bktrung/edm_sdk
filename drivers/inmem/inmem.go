@@ -73,21 +73,22 @@ func (d Driver) Open(ctx context.Context, _ driver.Config) (driver.Conn, error) 
 type conn struct {
 	mu sync.Mutex
 
-	clock        clock.Clock
-	caps         driver.Capabilities
-	info         driver.BrokerInfo
-	destinations map[string]*destination
-	consumers    map[*consumer]struct{}
-	groups       map[string]*groupState
-	producers    int
-	closed       bool
-	failPublish  bool
-	nextRef      atomic.Uint64
-	nextMessage  atomic.Uint64
-	wake         chan struct{}
-	done         chan struct{}
-	pumpDone     chan struct{}
-	closeOnce    sync.Once
+	clock            clock.Clock
+	caps             driver.Capabilities
+	info             driver.BrokerInfo
+	destinations     map[string]*destination
+	consumers        map[*consumer]struct{}
+	groups           map[string]*groupState
+	producers        int
+	closed           bool
+	failPublish      bool
+	failPublishFatal bool
+	nextRef          atomic.Uint64
+	nextMessage      atomic.Uint64
+	wake             chan struct{}
+	done             chan struct{}
+	pumpDone         chan struct{}
+	closeOnce        sync.Once
 }
 
 var _ driver.Conn = (*conn)(nil)
@@ -315,36 +316,60 @@ func (c *conn) expireDeadlinesLocked() {
 			if now.Before(delivery.deliveredAt.Add(consumer.ackDeadline)) {
 				continue
 			}
-			delivery.mu.Lock()
-			delivery.settled = true
-			delivery.mu.Unlock()
-			delete(consumer.inflight, delivery)
-			if consumer.outstanding > 0 {
-				consumer.outstanding--
-			}
-			name := delivery.message.message.Destination
-			if consumer.unsettled[name] > 0 {
-				consumer.unsettled[name]--
-			}
-			key := string(delivery.message.message.Key)
-			if key != "" {
-				deliveryKey := deliveryKey{destination: name, key: key}
-				if consumer.unsettledKey[deliveryKey] > 1 {
-					consumer.unsettledKey[deliveryKey]--
-				} else {
-					delete(consumer.unsettledKey, deliveryKey)
-					if dest, ok := c.destinations[name]; ok && dest.affinity[key] == consumer {
-						delete(dest.affinity, key)
-					}
-				}
-			}
-			delivery.message.deliveryCount++
-			delivery.message.due = now
-			if dest, ok := c.destinations[name]; ok {
-				dest.messages = append([]*queuedMessage{delivery.message}, dest.messages...)
+			c.requeueDeliveryLocked(delivery, now)
+		}
+	}
+}
+
+func (c *conn) requeueDeliveryLocked(delivery *settler, now time.Time) {
+	delivery.mu.Lock()
+	if delivery.settled {
+		delivery.mu.Unlock()
+		return
+	}
+	delivery.settled = true
+	delivery.mu.Unlock()
+	consumer := delivery.consumer
+	delete(consumer.inflight, delivery)
+	if consumer.outstanding > 0 {
+		consumer.outstanding--
+	}
+	name := delivery.message.message.Destination
+	if consumer.unsettled[name] > 0 {
+		consumer.unsettled[name]--
+	}
+	key := string(delivery.message.message.Key)
+	if key != "" {
+		keyID := deliveryKey{destination: name, key: key}
+		if consumer.unsettledKey[keyID] > 1 {
+			consumer.unsettledKey[keyID]--
+		} else {
+			delete(consumer.unsettledKey, keyID)
+			if dest, ok := c.destinations[name]; ok && dest.affinity[key] == consumer {
+				delete(dest.affinity, key)
 			}
 		}
 	}
+	delivery.message.deliveryCount++
+	delivery.message.due = now
+	if dest, ok := c.destinations[name]; ok {
+		dest.messages = append([]*queuedMessage{delivery.message}, dest.messages...)
+	}
+}
+
+func (c *conn) dropInFlightLocked(op string) {
+	now := c.clock.Now()
+	for consumer := range c.consumers {
+		select {
+		case consumer.errs <- classify(op, driver.KindTransient, errors.New("injected connection fault")):
+		default:
+		}
+		for delivery := range consumer.inflight {
+			c.requeueDeliveryLocked(delivery, now)
+		}
+	}
+	c.dispatchLocked()
+	c.signalWake()
 }
 
 func (c *conn) dispatchLocked() {

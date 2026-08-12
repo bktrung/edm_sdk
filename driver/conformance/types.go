@@ -45,6 +45,13 @@ type FaultKind string
 const (
 	// FaultPublishFailure makes the next Publish fail with a transient error.
 	FaultPublishFailure FaultKind = "publish-failure"
+	// FaultConnectionDrop makes current deliveries transiently unavailable and
+	// emits a connection error without closing consumer channels.
+	FaultConnectionDrop FaultKind = "connection-drop"
+	// FaultDeliveryFailure returns current deliveries for redelivery.
+	FaultDeliveryFailure FaultKind = "delivery-failure"
+	// FaultFatalPublish makes the next Publish fail with a non-retryable error.
+	FaultFatalPublish FaultKind = "fatal-publish"
 )
 
 // FaultInjector applies one deterministic port-level fault to the suite connection.

@@ -3,6 +3,7 @@ package conformance
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"sort"
@@ -250,6 +251,117 @@ func validateFaultInjector(t *testing.T, ctx context.Context, conn driver.Conn, 
 	kind, classified := driver.Classify(err)
 	if err == nil || !classified || kind != driver.KindTransient {
 		t.Fatalf("conformance: fault injector %s was not observed as transient publish failure: %v", FaultPublishFailure, err)
+	}
+	for _, fault := range []FaultKind{FaultConnectionDrop, FaultDeliveryFailure} {
+		validateFaultRedelivery(t, ctx, conn, inject, fault)
+	}
+	const fatalDestination = "conformance.fault-fatal-probe"
+	if _, err := conn.Admin().EnsureTopology(ctx, driver.TopologySpec{Destinations: []driver.DestinationSpec{{Name: fatalDestination}}}); err != nil {
+		t.Fatalf("conformance: fatal fault topology: %v", err)
+	}
+	fatalProducer, err := conn.Producer(ctx, driver.ProducerConfig{Effective: conn.Capabilities()})
+	if err != nil {
+		t.Fatalf("conformance: fatal fault producer: %v", err)
+	}
+	defer func() {
+		if err := fatalProducer.Close(ctx); err != nil {
+			t.Errorf("conformance: fatal fault producer close: %v", err)
+		}
+		if _, err := conn.Admin().Purge(ctx, fatalDestination); err != nil {
+			t.Errorf("conformance: fatal fault purge: %v", err)
+		}
+	}()
+	if err := inject(ctx, FaultFatalPublish); err != nil {
+		t.Fatalf("conformance: inject %s: %v", FaultFatalPublish, err)
+	}
+	fatalErr := fatalProducer.Publish(ctx, driver.OutboundMessage{Destination: fatalDestination})
+	var fatalClassified driver.ClassifiedError
+	if fatalErr == nil || !errors.As(fatalErr, &fatalClassified) || fatalClassified.Kind() != driver.KindFatal || fatalClassified.Retryable() {
+		t.Fatalf("conformance: fault injector %s was not observed as fatal non-retryable publish failure: %v", FaultFatalPublish, fatalErr)
+	}
+}
+
+func validateFaultRedelivery(t *testing.T, ctx context.Context, conn driver.Conn, inject FaultInjector, fault FaultKind) {
+	t.Helper()
+	destination := "conformance.fault-" + string(fault)
+	if _, err := conn.Admin().EnsureTopology(ctx, driver.TopologySpec{Destinations: []driver.DestinationSpec{{Name: destination}}}); err != nil {
+		t.Fatalf("conformance: %s topology: %v", fault, err)
+	}
+	producer, err := conn.Producer(ctx, driver.ProducerConfig{Effective: conn.Capabilities()})
+	if err != nil {
+		t.Fatalf("conformance: %s producer: %v", fault, err)
+	}
+	consumer, err := conn.Consumer(ctx, driver.ConsumerConfig{
+		Destinations: []string{destination}, Prefetch: 1, Effective: conn.Capabilities(),
+	})
+	if err != nil {
+		_ = producer.Close(ctx)
+		t.Fatalf("conformance: %s consumer: %v", fault, err)
+	}
+	defer func() {
+		if err := consumer.Stop(ctx); err != nil {
+			t.Errorf("conformance: %s consumer stop: %v", fault, err)
+		}
+		if err := producer.Close(ctx); err != nil {
+			t.Errorf("conformance: %s producer close: %v", fault, err)
+		}
+		if _, err := conn.Admin().Purge(ctx, destination); err != nil {
+			t.Errorf("conformance: %s purge: %v", fault, err)
+		}
+	}()
+	if err := producer.Publish(ctx, driver.OutboundMessage{Destination: destination, Body: []byte("fault-probe")}); err != nil {
+		t.Fatalf("conformance: %s publish: %v", fault, err)
+	}
+	first := receiveFaultProbe(t, ctx, consumer, fault+" first delivery")
+	if err := inject(ctx, fault); err != nil {
+		t.Fatalf("conformance: inject %s: %v", fault, err)
+	}
+	faultErr := receiveFaultErrorProbe(t, ctx, consumer, fault+" error")
+	kind, classified := driver.Classify(faultErr)
+	if !classified || kind != driver.KindTransient {
+		t.Fatalf("conformance: %s error classification=(%v,%t), want transient", fault, kind, classified)
+	}
+	second := receiveFaultProbe(t, ctx, consumer, fault+" redelivery")
+	if string(second.Body) != string(first.Body) {
+		t.Fatalf("conformance: %s redelivery body=%q, want %q", fault, second.Body, first.Body)
+	}
+	if second.Settle == nil {
+		t.Fatalf("conformance: %s redelivery has nil settler", fault)
+	}
+	if err := second.Settle.Ack(ctx); err != nil {
+		t.Fatalf("conformance: %s redelivery ack: %v", fault, err)
+	}
+}
+
+func receiveFaultProbe(t *testing.T, ctx context.Context, consumer driver.Consumer, what FaultKind) driver.InboundMessage {
+	t.Helper()
+	receiveCtx, cancel := context.WithTimeout(ctx, waitTimeout)
+	defer cancel()
+	select {
+	case message, ok := <-consumer.Messages():
+		if !ok {
+			t.Fatalf("conformance: %s: Messages closed", what)
+		}
+		return message
+	case <-receiveCtx.Done():
+		t.Fatalf("conformance: %s: %v", what, receiveCtx.Err())
+		return driver.InboundMessage{}
+	}
+}
+
+func receiveFaultErrorProbe(t *testing.T, ctx context.Context, consumer driver.Consumer, what FaultKind) error {
+	t.Helper()
+	receiveCtx, cancel := context.WithTimeout(ctx, waitTimeout)
+	defer cancel()
+	select {
+	case err, ok := <-consumer.Errors():
+		if !ok {
+			t.Fatalf("conformance: %s: Errors closed", what)
+		}
+		return err
+	case <-receiveCtx.Done():
+		t.Fatalf("conformance: %s: %v", what, receiveCtx.Err())
+		return nil
 	}
 }
 

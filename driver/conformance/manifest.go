@@ -28,7 +28,7 @@ var groupManifest = []manifestEntry{
 }
 
 // pendingGroups lists groups without registered runners.
-var pendingGroups = []string{"failure", "capability"}
+var pendingGroups = []string{"capability"}
 
 type groupContext struct {
 	t          *testing.T
