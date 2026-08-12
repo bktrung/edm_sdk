@@ -3,6 +3,7 @@ package conformance
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/driver"
 )
@@ -49,12 +50,25 @@ const (
 // FaultInjector applies one deterministic port-level fault to the suite connection.
 type FaultInjector func(context.Context, FaultKind) error
 
+// DeadlineFixture creates consumers with a broker-side liveness deadline and
+// advances the fixture clock for deterministic pressure checks.
+type DeadlineFixture interface {
+	Consumer(context.Context, time.Duration, driver.ConsumerConfig) (driver.Consumer, error)
+	Now() time.Time
+	Advance(time.Duration)
+}
+
+// DeadlineFixtureFactory builds a deadline fixture on the suite connection.
+// The fixture is conformance-only; the frozen driver port remains unchanged.
+type DeadlineFixtureFactory func(driver.Conn) (DeadlineFixture, error)
+
 // Suite describes one driver conformance run. Run executes both profiles.
 type Suite struct {
-	Driver           driver.Driver
-	Config           driver.Config
-	NewInspector     InspectorFactory
-	NewFaultInjector func(driver.Conn) (FaultInjector, error)
+	Driver             driver.Driver
+	Config             driver.Config
+	NewInspector       InspectorFactory
+	NewFaultInjector   func(driver.Conn) (FaultInjector, error)
+	NewDeadlineFixture DeadlineFixtureFactory
 }
 
 // BehaviorEvent is one observable event in a behavior vector.
@@ -86,6 +100,13 @@ type GroupResult struct {
 	Declared int
 	Observed int
 	Status   string
+	Skipped  []CheckSkip
+}
+
+// CheckSkip records an explicitly fixture-gated check that did not run.
+type CheckSkip struct {
+	Name   string
+	Reason string
 }
 
 // CapabilityResult is one capability check in a report.

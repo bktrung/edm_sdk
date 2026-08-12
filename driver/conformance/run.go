@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"sort"
 	"testing"
 	"time"
 
@@ -47,6 +48,14 @@ func Run(t *testing.T, suite Suite) Report {
 		}
 		validateFaultInjector(t, ctx, conn, inject)
 	}
+	var deadline DeadlineFixture
+	if suite.NewDeadlineFixture != nil {
+		deadline, err = suite.NewDeadlineFixture(conn)
+		if err != nil {
+			t.Fatalf("conformance: NewDeadlineFixture: %v", err)
+		}
+		validateDeadlineFixture(t, ctx, conn, deadline)
+	}
 
 	report := Report{
 		Driver:  suite.Driver.Name(),
@@ -57,7 +66,7 @@ func Run(t *testing.T, suite Suite) Report {
 		profile := profile
 		var result ProfileReport
 		ok := t.Run(profile.String(), func(profileTest *testing.T) {
-			result = runProfile(profileTest, ctx, conn, inspect, profile, inject, &report)
+			result = runProfile(profileTest, ctx, conn, inspect, profile, inject, deadline, &report)
 		})
 		if !ok {
 			t.Fatalf("conformance: %s profile failed", profile)
@@ -86,6 +95,7 @@ func runProfile(
 	inspect Inspect,
 	profile Profile,
 	inject FaultInjector,
+	deadline DeadlineFixture,
 	report *Report,
 ) ProfileReport {
 	effective := effectiveCapabilities(conn.Capabilities(), profile)
@@ -185,6 +195,7 @@ func runProfile(
 				t: groupTest, ctx: ctx, conn: conn, inspect: inspect,
 				profile: profile, effective: effective, inject: inject, report: report,
 				checkNames: make(map[string]struct{}),
+				skips:      make(map[string]string), deadline: deadline,
 			}
 			runner(groupResult)
 		})
@@ -204,9 +215,16 @@ func runProfile(
 			t.Fatalf("%v", err)
 		}
 		result.Vector = append(result.Vector, groupResult.vector...)
-		result.Groups = append(result.Groups, GroupResult{
-			Name: entry.name, Declared: entry.declared, Observed: observed, Status: "passed",
-		})
+		status := "passed"
+		if len(groupResult.skips) != 0 {
+			status = "passed-with-skips"
+		}
+		skipped := make([]CheckSkip, 0, len(groupResult.skips))
+		for name, reason := range groupResult.skips {
+			skipped = append(skipped, CheckSkip{Name: name, Reason: reason})
+		}
+		sort.Slice(skipped, func(i, j int) bool { return skipped[i].Name < skipped[j].Name })
+		result.Groups = append(result.Groups, GroupResult{Name: entry.name, Declared: entry.declared, Observed: observed, Status: status, Skipped: skipped})
 	}
 	return result
 }
@@ -232,6 +250,85 @@ func validateFaultInjector(t *testing.T, ctx context.Context, conn driver.Conn, 
 	kind, classified := driver.Classify(err)
 	if err == nil || !classified || kind != driver.KindTransient {
 		t.Fatalf("conformance: fault injector %s was not observed as transient publish failure: %v", FaultPublishFailure, err)
+	}
+}
+
+func validateDeadlineFixture(t *testing.T, ctx context.Context, conn driver.Conn, fixture DeadlineFixture) {
+	t.Helper()
+	if fixture == nil {
+		t.Fatal("conformance: NewDeadlineFixture returned nil")
+	}
+	const destination = "conformance.deadline-probe"
+	if _, err := conn.Admin().EnsureTopology(ctx, driver.TopologySpec{
+		Destinations: []driver.DestinationSpec{{Name: destination}},
+	}); err != nil {
+		t.Fatalf("conformance: deadline fixture topology: %v", err)
+	}
+	producer, err := conn.Producer(ctx, driver.ProducerConfig{
+		RequireDurableAck: true,
+		Effective:         conn.Capabilities(),
+	})
+	if err != nil {
+		t.Fatalf("conformance: deadline fixture producer: %v", err)
+	}
+	consumer, err := fixture.Consumer(ctx, 10*time.Millisecond, driver.ConsumerConfig{
+		Destinations: []string{destination},
+		Prefetch:     1,
+		Effective:    conn.Capabilities(),
+	})
+	if err != nil {
+		_ = producer.Close(ctx)
+		t.Fatalf("conformance: deadline fixture consumer: %v", err)
+	}
+	cleanup := func() {
+		if err := consumer.Stop(ctx); err != nil {
+			t.Errorf("conformance: deadline fixture stop: %v", err)
+		}
+		if err := producer.Close(ctx); err != nil {
+			t.Errorf("conformance: deadline fixture close producer: %v", err)
+		}
+		if _, err := conn.Admin().Purge(ctx, destination); err != nil {
+			t.Errorf("conformance: deadline fixture purge: %v", err)
+		}
+	}
+	defer cleanup()
+
+	if err := producer.Publish(ctx, driver.OutboundMessage{
+		Destination: destination,
+		Body:        []byte("deadline-positive-control"),
+	}); err != nil {
+		t.Fatalf("conformance: deadline fixture publish: %v", err)
+	}
+	first := receiveDeadlineProbe(t, ctx, consumer, "first delivery")
+	fixture.Advance(20 * time.Millisecond)
+	second := receiveDeadlineProbe(t, ctx, consumer, "deadline redelivery")
+	if string(second.Body) != string(first.Body) {
+		t.Fatalf("conformance: deadline fixture redelivery body = %q, want %q", second.Body, first.Body)
+	}
+	if conn.Capabilities().NativeDeliveryCount && second.DeliveryCount <= first.DeliveryCount {
+		t.Fatalf("conformance: deadline fixture redelivery count = %d, first = %d", second.DeliveryCount, first.DeliveryCount)
+	}
+	if second.Settle == nil {
+		t.Fatal("conformance: deadline fixture redelivery has nil settler")
+	}
+	if err := second.Settle.Ack(ctx); err != nil {
+		t.Fatalf("conformance: deadline fixture ack: %v", err)
+	}
+}
+
+func receiveDeadlineProbe(t *testing.T, ctx context.Context, consumer driver.Consumer, what string) driver.InboundMessage {
+	t.Helper()
+	receiveCtx, cancel := context.WithTimeout(ctx, waitTimeout)
+	defer cancel()
+	select {
+	case message, ok := <-consumer.Messages():
+		if !ok {
+			t.Fatalf("conformance: deadline fixture %s: Messages closed", what)
+		}
+		return message
+	case <-receiveCtx.Done():
+		t.Fatalf("conformance: deadline fixture %s: %v", what, receiveCtx.Err())
+		return driver.InboundMessage{}
 	}
 }
 

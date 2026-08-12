@@ -9,6 +9,7 @@ import (
 
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/driver"
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/driver/conformance"
+	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/clock"
 )
 
 func newInspector(raw driver.Conn) (conformance.Inspect, error) {
@@ -66,6 +67,38 @@ func newFaultInjector(raw driver.Conn) (conformance.FaultInjector, error) {
 	}, nil
 }
 
+type deadlineFixture struct {
+	conn *conn
+	fake *clock.Fake
+}
+
+func newDeadlineFixture(raw driver.Conn) (conformance.DeadlineFixture, error) {
+	conn, ok := raw.(*conn)
+	if !ok {
+		return nil, errors.New("inmem conformance deadline fixture received a different connection")
+	}
+	fake, ok := conn.clock.(*clock.Fake)
+	if !ok {
+		return nil, errors.New("inmem conformance deadline fixture requires a fake clock")
+	}
+	return &deadlineFixture{conn: conn, fake: fake}, nil
+}
+
+func (f *deadlineFixture) Consumer(ctx context.Context, deadline time.Duration, cfg driver.ConsumerConfig) (driver.Consumer, error) {
+	return f.conn.newConsumer(ctx, cfg, deadline)
+}
+
+func (f *deadlineFixture) Now() time.Time { return f.fake.Now() }
+
+func (f *deadlineFixture) Advance(duration time.Duration) {
+	f.fake.Advance(duration)
+	f.conn.mu.Lock()
+	f.conn.expireDeadlinesLocked()
+	f.conn.dispatchLocked()
+	f.conn.signalWake()
+	f.conn.mu.Unlock()
+}
+
 func TestInspectorSeparatesDeferredMessages(t *testing.T) {
 	ctx := context.Background()
 	raw, err := (Driver{}).Open(ctx, driver.Config{})
@@ -105,11 +138,15 @@ func TestInspectorSeparatesDeferredMessages(t *testing.T) {
 
 func TestConformance(t *testing.T) {
 	var output bytes.Buffer
+	// The whole suite shares this fake clock so deferred checks can advance broker
+	// time deterministically; it starts at real time because receiveBefore waits on wall time.
+	fake := clock.NewFake(clock.NewReal().Now())
 	report := conformance.Run(t, conformance.Suite{
-		Driver:           Driver{},
-		Config:           driver.Config{},
-		NewInspector:     newInspector,
-		NewFaultInjector: newFaultInjector,
+		Driver:             Driver{Clock: fake},
+		Config:             driver.Config{},
+		NewInspector:       newInspector,
+		NewFaultInjector:   newFaultInjector,
+		NewDeadlineFixture: newDeadlineFixture,
 	})
 	if err := report.WriteMarkdown(&output); err != nil {
 		t.Fatal(err)

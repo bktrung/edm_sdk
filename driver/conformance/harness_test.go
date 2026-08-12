@@ -32,6 +32,10 @@ func TestRunRejectsDuplicateRegisteredCheckName(t *testing.T) {
 	assertRunFailure(t, "duplicate-group", "duplicate check name")
 }
 
+func TestRunRejectsUnrecordedSkippedCheck(t *testing.T) {
+	assertRunFailure(t, "unrecorded-group", "skipped without an explicit fixture record")
+}
+
 func TestRunUsesOneConnectionAndInspector(t *testing.T) {
 	manifest := groupManifest
 	pending := pendingGroups
@@ -120,6 +124,16 @@ func TestRunFailureHelper(t *testing.T) {
 		registerGroup("publish", func(group *groupContext) {
 			group.Check("same behavior", func(*testing.T) {})
 			group.Check("same behavior", func(*testing.T) {})
+		})
+		factory = runTestInspector
+	case "unrecorded-group":
+		groupManifest = []manifestEntry{{name: "publish", declared: 1}}
+		pendingGroups = nil
+		groupRunners = map[string]groupRunner{}
+		registerGroup("publish", func(group *groupContext) {
+			group.Check("unrecorded skip", func(checkTest *testing.T) {
+				checkTest.Skip("fixture pending")
+			})
 		})
 		factory = runTestInspector
 	default:
@@ -335,6 +349,19 @@ func TestSkippedCheckDoesNotSatisfyManifestCount(t *testing.T) {
 		checkTest.Skip("fixture pending")
 	}) {
 		t.Fatal("skipped check was not detected")
+	}
+}
+
+func TestRecordedFixtureSkipSatisfiesManifestCount(t *testing.T) {
+	group := &groupContext{t: t, skips: make(map[string]string)}
+	group.Check("fixture-gated", func(checkTest *testing.T) {
+		group.Skip(checkTest, "fixture-gated", "deadline fixture unavailable")
+	})
+	if group.checks != 1 {
+		t.Fatalf("recorded fixture skip counted %d checks; want 1", group.checks)
+	}
+	if group.skips["fixture-gated"] != "deadline fixture unavailable" {
+		t.Fatalf("recorded fixture skip = %#v", group.skips)
 	}
 }
 

@@ -28,7 +28,7 @@ var groupManifest = []manifestEntry{
 }
 
 // pendingGroups lists groups without registered runners.
-var pendingGroups = []string{"deferred", "failure", "capability"}
+var pendingGroups = []string{"failure", "capability"}
 
 type groupContext struct {
 	t          *testing.T
@@ -40,7 +40,9 @@ type groupContext struct {
 	vector     BehaviorVector
 	checks     int
 	checkNames map[string]struct{}
+	skips      map[string]string
 	inject     FaultInjector
+	deadline   DeadlineFixture
 	report     *Report
 }
 
@@ -62,10 +64,26 @@ func (g *groupContext) Check(name string, fn func(*testing.T)) {
 	}
 	g.checkNames[name] = struct{}{}
 	if runCheck(g.t, name, fn) {
-		g.t.Errorf("conformance check %q was skipped", name)
-		return
+		if _, recorded := g.skips[name]; recorded {
+			g.checks++
+			return
+		} else {
+			g.t.Errorf("conformance check %q was skipped without an explicit fixture record", name)
+			return
+		}
 	}
 	g.checks++
+}
+
+// Skip records a fixture-gated check before marking its subtest skipped. It
+// distinguishes an intentional unavailable-fixture result from t.Skip used
+// to pad a group while still satisfying its manifest count.
+func (g *groupContext) Skip(t *testing.T, name, reason string) {
+	if g.skips == nil {
+		g.skips = make(map[string]string)
+	}
+	g.skips[name] = reason
+	t.Skip(reason)
 }
 
 func runCheck(t *testing.T, name string, fn func(*testing.T)) (skipped bool) {

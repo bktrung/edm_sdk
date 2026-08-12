@@ -130,6 +130,10 @@ func (c *conn) Producer(ctx context.Context, cfg driver.ProducerConfig) (driver.
 }
 
 func (c *conn) Consumer(ctx context.Context, cfg driver.ConsumerConfig) (driver.Consumer, error) {
+	return c.newConsumer(ctx, cfg, 0)
+}
+
+func (c *conn) newConsumer(ctx context.Context, cfg driver.ConsumerConfig, ackDeadline time.Duration) (driver.Consumer, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, classify("consumer", driver.KindTransient, err)
 	}
@@ -189,6 +193,8 @@ func (c *conn) Consumer(ctx context.Context, cfg driver.ConsumerConfig) (driver.
 		unsettledKey: make(map[deliveryKey]int),
 		group:        group,
 		startAfter:   startAfter,
+		ackDeadline:  ackDeadline,
+		inflight:     make(map[*settler]struct{}),
 	}
 	for _, name := range cfg.Destinations {
 		c.destinations[name].consumers[cs] = struct{}{}
@@ -247,6 +253,7 @@ func (c *conn) pump() {
 			c.mu.Unlock()
 			return
 		}
+		c.expireDeadlinesLocked()
 		c.dispatchLocked()
 		next, ok := c.nextDueLocked()
 		c.mu.Unlock()
@@ -284,7 +291,60 @@ func (c *conn) nextDueLocked() (time.Time, bool) {
 			next = dest.messages[0].due
 		}
 	}
+	for consumer := range c.consumers {
+		if consumer.ackDeadline <= 0 {
+			continue
+		}
+		for delivery := range consumer.inflight {
+			due := delivery.deliveredAt.Add(consumer.ackDeadline)
+			if next.IsZero() || due.Before(next) {
+				next = due
+			}
+		}
+	}
 	return next, !next.IsZero()
+}
+
+func (c *conn) expireDeadlinesLocked() {
+	now := c.clock.Now()
+	for consumer := range c.consumers {
+		if consumer.ackDeadline <= 0 {
+			continue
+		}
+		for delivery := range consumer.inflight {
+			if now.Before(delivery.deliveredAt.Add(consumer.ackDeadline)) {
+				continue
+			}
+			delivery.mu.Lock()
+			delivery.settled = true
+			delivery.mu.Unlock()
+			delete(consumer.inflight, delivery)
+			if consumer.outstanding > 0 {
+				consumer.outstanding--
+			}
+			name := delivery.message.message.Destination
+			if consumer.unsettled[name] > 0 {
+				consumer.unsettled[name]--
+			}
+			key := string(delivery.message.message.Key)
+			if key != "" {
+				deliveryKey := deliveryKey{destination: name, key: key}
+				if consumer.unsettledKey[deliveryKey] > 1 {
+					consumer.unsettledKey[deliveryKey]--
+				} else {
+					delete(consumer.unsettledKey, deliveryKey)
+					if dest, ok := c.destinations[name]; ok && dest.affinity[key] == consumer {
+						delete(dest.affinity, key)
+					}
+				}
+			}
+			delivery.message.deliveryCount++
+			delivery.message.due = now
+			if dest, ok := c.destinations[name]; ok {
+				dest.messages = append([]*queuedMessage{delivery.message}, dest.messages...)
+			}
+		}
+	}
 }
 
 func (c *conn) dispatchLocked() {
@@ -302,11 +362,12 @@ destinationLoop:
 				if cs == nil {
 					continue
 				}
-				inbound := c.inboundLocked(cs, dest.spec.Name, msg)
+				inbound, delivery := c.inboundLocked(cs, dest.spec.Name, msg)
 				select {
 				case cs.messages <- inbound:
 					cs.outstanding++
 					cs.unsettled[dest.spec.Name]++
+					cs.inflight[delivery] = struct{}{}
 					key := string(msg.message.Key)
 					if key != "" {
 						dest.affinity[key] = cs
@@ -378,8 +439,9 @@ func (c *consumer) visible(message *queuedMessage, destination string) bool {
 	return message.sequence > c.startAfter[destination]
 }
 
-func (c *conn) inboundLocked(cs *consumer, destination string, msg *queuedMessage) driver.InboundMessage {
+func (c *conn) inboundLocked(cs *consumer, destination string, msg *queuedMessage) (driver.InboundMessage, *settler) {
 	c.nextRef.Add(1)
+	delivery := &settler{conn: c, consumer: cs, message: msg, deliveredAt: c.clock.Now()}
 	return driver.InboundMessage{
 		Destination:   destination,
 		Key:           cloneBytes(msg.message.Key),
@@ -388,8 +450,8 @@ func (c *conn) inboundLocked(cs *consumer, destination string, msg *queuedMessag
 		DeliveryCount: deliveryCount(cs.cfg.Effective, msg.deliveryCount),
 		ReceivedAt:    c.clock.Now(),
 		Ref:           driver.BrokerRef{Tag: c.nextRef.Load(), Raw: destination},
-		Settle:        &settler{conn: c, consumer: cs, message: msg},
-	}
+		Settle:        delivery,
+	}, delivery
 }
 
 func deliveryCount(caps driver.Capabilities, count int) int {
