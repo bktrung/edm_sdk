@@ -18,6 +18,7 @@ type Client struct {
 	limits         Limits
 	effective      driver.Capabilities
 	options        clientOptions
+	config         Config
 	source         string
 	producer       string
 	driver         string
@@ -89,6 +90,7 @@ func New(ctx context.Context, cfg Config, opts ...Option) (*Client, error) {
 		conn:      connection,
 		effective: effective,
 		options:   options,
+		config:    cfg,
 		source:    fmt.Sprintf("/%s/%s", cfg.Env, cfg.Service),
 		producer:  fmt.Sprintf("%s/unknown/%s", cfg.Service, cfg.InstanceID),
 		driver:    options.driver.Name(),

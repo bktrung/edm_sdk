@@ -1,0 +1,653 @@
+package f1
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"os"
+	"strconv"
+	"strings"
+	"time"
+	"unicode"
+)
+
+// Subscription declares one consumer group, its delivery policy, and the
+// handlers and lifecycle notifications attached to it.
+type Subscription struct {
+	Name            string
+	Topics          []string
+	Mode            Mode
+	Concurrency     int
+	Prefetch        int
+	Priorities      []Priority
+	Fairness        FairnessConfig
+	Retry           RetryConfig
+	MaxDeferrals    int
+	HandlerTimeout  time.Duration
+	UnmatchedPolicy UnmatchedPolicy
+	OnDeadLetter    func(context.Context, DeadLettered)
+	OnDiscarded     func(context.Context, Discarded)
+	Handlers        map[string]Handler
+}
+
+// HandlerFunc adapts a function to Handler.
+type HandlerFunc func(context.Context, *Event) error
+
+// Handle invokes f for the event.
+func (f HandlerFunc) Handle(ctx context.Context, event *Event) error {
+	return f(ctx, event)
+}
+
+// DeadLettered describes one message whose confirmed copy reached a DLQ.
+type DeadLettered struct {
+	Envelope    Envelope
+	Reason      DeathReason
+	Attempt     int
+	LastErr     error
+	Destination string
+}
+
+// Discarded describes one message acknowledged without applying its effect or
+// retaining a copy.
+type Discarded struct {
+	Envelope Envelope
+	Reason   DiscardReason
+	Err      error
+}
+
+// DiscardReason identifies why a message was acknowledged without a retained
+// copy.
+type DiscardReason string
+
+const (
+	// DiscardUnmatched means no handler matched the event type.
+	DiscardUnmatched DiscardReason = "unmatched"
+	// DiscardDropped means a handler explicitly dropped the event.
+	DiscardDropped DiscardReason = "dropped"
+)
+
+func discardUnmatched(envelope Envelope) Discarded {
+	return Discarded{Envelope: envelope, Reason: DiscardUnmatched}
+}
+
+// Runner owns a validated subscription. Message dispatch is attached by the
+// worker phase; construction and validation happen in Subscribe.
+type Runner struct {
+	client       *Client
+	subscription Subscription
+	config       SubscriptionConfig
+}
+
+const terminalNotificationTimeout = time.Second
+
+// notifyDeadLetter delivers a terminal notification outside the settlement
+// path. The callback receives a bounded context; a panic is isolated from the
+// worker and a callback that ignores its context cannot hold settlement.
+func notifyDeadLetter(parent context.Context, callback func(context.Context, DeadLettered), payload DeadLettered) {
+	if callback == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(parent, terminalNotificationTimeout)
+	go func() {
+		defer cancel()
+		defer func() { _ = recover() }()
+		callback(ctx, payload)
+	}()
+}
+
+// notifyDiscarded is the discard counterpart of notifyDeadLetter.
+func notifyDiscarded(parent context.Context, callback func(context.Context, Discarded), payload Discarded) {
+	if callback == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(parent, terminalNotificationTimeout)
+	go func() {
+		defer cancel()
+		defer func() { _ = recover() }()
+		callback(ctx, payload)
+	}()
+}
+
+// Run blocks until ctx is canceled. Worker dispatch is installed by the
+// consumer phase; validation still occurs eagerly in Subscribe.
+func (r *Runner) Run(ctx context.Context) error {
+	if r == nil {
+		return errors.New("f1: runner is nil")
+	}
+	<-ctx.Done()
+	return ctx.Err()
+}
+
+// Drain requests graceful runner shutdown. There is no active worker to drain
+// until Run is connected to the consumer phase.
+func (r *Runner) Drain(ctx context.Context) error {
+	if r == nil {
+		return errors.New("f1: runner is nil")
+	}
+	return ctx.Err()
+}
+
+// Subscribe validates sub after applying the subscription-specific config
+// precedence and returns a runner ready for the worker phase.
+func (c *Client) Subscribe(ctx context.Context, sub Subscription) (*Runner, error) {
+	if c == nil {
+		return nil, errors.New("f1: client is not connected")
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	c.mu.Lock()
+	if c.closed || c.conn == nil {
+		c.mu.Unlock()
+		return nil, errors.New("f1: client is closed")
+	}
+	if c.closing {
+		c.mu.Unlock()
+		return nil, errors.New("f1: client is closing")
+	}
+	c.mu.Unlock()
+
+	resolved, err := resolveSubscription(c, sub)
+	if err != nil {
+		return nil, err
+	}
+	if err := validateSubscription(c.config, sub.Name, resolved); err != nil {
+		return nil, err
+	}
+	if resolved.Mode == OrderedByKey && !c.effective.OrderedByKey {
+		return nil, fmt.Errorf("f1: subscriptions.%s ordered_by_key is unavailable under the connected driver", sub.Name)
+	}
+	c.mu.Lock()
+	if c.closed || c.conn == nil {
+		c.mu.Unlock()
+		return nil, errors.New("f1: client is closed")
+	}
+	if c.closing {
+		c.mu.Unlock()
+		return nil, errors.New("f1: client is closing")
+	}
+	c.mu.Unlock()
+	effective := sub
+	effective.Topics = append([]string(nil), resolved.Topics...)
+	effective.Mode = resolved.Mode
+	effective.Concurrency = resolved.Concurrency
+	effective.Prefetch = resolved.Prefetch
+	effective.Priorities = append([]Priority(nil), resolved.Priorities...)
+	effective.Fairness = cloneFairness(resolved.Fairness)
+	effective.Retry = cloneRetry(resolved.Retry)
+	effective.MaxDeferrals = resolved.MaxDeferrals
+	effective.HandlerTimeout = resolved.HandlerTimeout
+	effective.UnmatchedPolicy = resolved.UnmatchedPolicy
+	return &Runner{client: c, subscription: effective, config: resolved}, nil
+}
+
+func resolveSubscription(c *Client, sub Subscription) (SubscriptionConfig, error) {
+	defaults := defaultSubscription()
+	resolved := defaults
+	if loaded, ok := c.config.Subscriptions[sub.Name]; ok {
+		overlayLoadedSubscription(&resolved, loaded)
+	}
+	if err := applySubscriptionEnvironment(sub.Name, &resolved); err != nil {
+		return SubscriptionConfig{}, err
+	}
+	overlayExplicitSubscription(&resolved, sub)
+	if resolved.Prefetch == 0 {
+		resolved.Prefetch = c.config.Broker.DefaultPrefetch
+		if resolved.Prefetch == 0 {
+			resolved.Prefetch = defaultConfig().Broker.DefaultPrefetch
+		}
+	}
+	return resolved, nil
+}
+
+func overlayLoadedSubscription(dst *SubscriptionConfig, src SubscriptionConfig) {
+	p := src.presence
+	if p.Topics || len(src.Topics) > 0 {
+		dst.Topics = append([]string(nil), src.Topics...)
+	}
+	if p.Mode || src.Mode != Unordered {
+		dst.Mode = src.Mode
+	}
+	if p.Concurrency || src.Concurrency != 0 {
+		dst.Concurrency = src.Concurrency
+	}
+	if p.Prefetch {
+		dst.Prefetch = src.Prefetch
+	} else if src.Prefetch != 0 {
+		dst.Prefetch = src.Prefetch
+	}
+	if p.Priorities || len(src.Priorities) > 0 {
+		dst.Priorities = append([]Priority(nil), src.Priorities...)
+	}
+	if p.Fairness || !fairnessZero(src.Fairness) {
+		dst.Fairness = cloneFairness(src.Fairness)
+	}
+	if p.Retry || !retryZero(src.Retry) {
+		dst.Retry = cloneRetry(src.Retry)
+	}
+	if p.MaxDeferrals || src.MaxDeferrals != 0 {
+		dst.MaxDeferrals = src.MaxDeferrals
+	}
+	if p.HandlerTimeout || src.HandlerTimeout != 0 {
+		dst.HandlerTimeout = src.HandlerTimeout
+	}
+	if p.UnmatchedPolicy || src.UnmatchedPolicy != Ignore {
+		dst.UnmatchedPolicy = src.UnmatchedPolicy
+	}
+}
+
+func overlayExplicitSubscription(dst *SubscriptionConfig, src Subscription) {
+	if len(src.Topics) > 0 {
+		dst.Topics = append([]string(nil), src.Topics...)
+	}
+	if src.Mode != Unordered {
+		dst.Mode = src.Mode
+	}
+	if src.Concurrency != 0 {
+		dst.Concurrency = src.Concurrency
+	}
+	if src.Prefetch != 0 {
+		dst.Prefetch = src.Prefetch
+	}
+	if len(src.Priorities) > 0 {
+		dst.Priorities = append([]Priority(nil), src.Priorities...)
+	}
+	if !fairnessZero(src.Fairness) {
+		dst.Fairness = mergeFairness(dst.Fairness, src.Fairness)
+	}
+	if !retryZero(src.Retry) {
+		dst.Retry = mergeRetry(dst.Retry, src.Retry)
+	}
+	if src.MaxDeferrals != 0 {
+		dst.MaxDeferrals = src.MaxDeferrals
+	}
+	if src.HandlerTimeout != 0 {
+		dst.HandlerTimeout = src.HandlerTimeout
+	}
+	if src.UnmatchedPolicy != Ignore {
+		dst.UnmatchedPolicy = src.UnmatchedPolicy
+	}
+}
+
+func validateSubscription(cfg Config, name string, sub SubscriptionConfig) error {
+	if name == "" {
+		return errors.New("f1: subscription name must not be empty")
+	}
+	if len(sub.Topics) == 0 {
+		return fmt.Errorf("f1: subscriptions.%s.topics must not be empty", name)
+	}
+	for _, topic := range sub.Topics {
+		if strings.TrimSpace(topic) == "" {
+			return fmt.Errorf("f1: subscriptions.%s.topics must not contain an empty topic", name)
+		}
+	}
+	if sub.Concurrency < 1 || sub.Concurrency > 1024 {
+		return fmt.Errorf("f1: subscriptions.%s.concurrency must be between 1 and 1024", name)
+	}
+	if sub.Mode != Unordered && sub.Mode != OrderedByKey {
+		return fmt.Errorf("f1: subscriptions.%s.mode is unsupported", name)
+	}
+	if sub.Mode == OrderedByKey && sub.Concurrency > 1 {
+		return fmt.Errorf("f1: subscriptions.%s ordered_by_key requires concurrency 1 until key-affinity dispatch is available", name)
+	}
+	if sub.UnmatchedPolicy != Ignore && sub.UnmatchedPolicy != DeadLetter {
+		return fmt.Errorf("f1: subscriptions.%s.unmatchedPolicy is unsupported", name)
+	}
+	if len(sub.Priorities) == 0 {
+		return fmt.Errorf("f1: subscriptions.%s.priorities must not be empty", name)
+	}
+	seen := make(map[Priority]struct{}, len(sub.Priorities))
+	for _, priority := range sub.Priorities {
+		if !priority.Valid() {
+			return fmt.Errorf("f1: subscriptions.%s.priorities contains invalid priority %q", name, priority)
+		}
+		if _, ok := seen[priority]; ok {
+			return fmt.Errorf("f1: subscriptions.%s.priorities contains duplicate %s", name, priority)
+		}
+		seen[priority] = struct{}{}
+	}
+	if sub.Retry.MaxAttempts < 1 || sub.Retry.MaxAttempts > 20 {
+		return fmt.Errorf("f1: subscriptions.%s.retry.maxAttempts must be between 1 and 20", name)
+	}
+	if sub.Retry.Jitter < 0 || sub.Retry.Jitter > .5 {
+		return fmt.Errorf("f1: subscriptions.%s.retry.jitter must be between 0 and 0.5", name)
+	}
+	for i, tier := range sub.Retry.Tiers {
+		if tier <= 0 {
+			return fmt.Errorf("f1: subscriptions.%s.retry.tiers[%d] must be positive", name, i)
+		}
+	}
+	tiers := retryTiers(sub.Retry)
+	if sub.MaxDeferrals <= tiers {
+		return fmt.Errorf("f1: subscriptions.%s.maxDeferrals %d must exceed retry tiers %d", name, sub.MaxDeferrals, tiers)
+	}
+	lanes := len(sub.Topics) * len(sub.Priorities) * (1 + tiers)
+	if sub.Prefetch < lanes {
+		return fmt.Errorf("f1: subscriptions.%s.prefetch %d must be at least lane count %d (topics x priorities x (1 + retryTiers))", name, sub.Prefetch, lanes)
+	}
+	if sub.HandlerTimeout <= 0 {
+		return fmt.Errorf("f1: subscriptions.%s.handlerTimeout must be positive", name)
+	}
+	if cfg.Lifecycle.DrainTimeout != 0 && cfg.Lifecycle.DrainTimeout <= sub.HandlerTimeout {
+		return fmt.Errorf("f1: lifecycle.drainTimeout must exceed subscriptions.%s.handlerTimeout", name)
+	}
+	for priority, weight := range sub.Fairness.Weights {
+		if !priority.Valid() || weight < 1 {
+			return fmt.Errorf("f1: subscriptions.%s.fairness.weights.%s must be at least 1", name, priority)
+		}
+	}
+	for priority, budget := range sub.Fairness.Budgets {
+		if !priority.Valid() || budget < 0 {
+			return fmt.Errorf("f1: subscriptions.%s.fairness.budgets.%s must not be negative", name, priority)
+		}
+	}
+	if cfg.Broker.Driver == "rabbitmq" {
+		consumerTimeout, err := durationOption(cfg.Broker.DriverOptions, "rabbitmq.consumerTimeout", 90*time.Second)
+		if err != nil {
+			return err
+		}
+		if consumerTimeout < sub.HandlerTimeout*3 {
+			return fmt.Errorf("f1: broker.rabbitmq.consumerTimeout must be at least subscriptions.%s.handlerTimeout x 3", name)
+		}
+	}
+	return nil
+}
+
+func applySubscriptionEnvironment(name string, cfg *SubscriptionConfig) error {
+	prefix := subscriptionEnvPrefix(name)
+	if value, ok := lookupSubscriptionEnv(prefix, "topics"); ok {
+		cfg.Topics = splitEnvList(value)
+	}
+	if value, ok := lookupSubscriptionEnv(prefix, "mode"); ok {
+		mode, err := parseMode(value)
+		if err != nil {
+			return fmt.Errorf("f1: %s mode: %w", envKey(prefix, "mode"), err)
+		}
+		cfg.Mode = mode
+	}
+	if value, ok := lookupSubscriptionEnv(prefix, "concurrency"); ok {
+		parsed, err := strconv.Atoi(value)
+		if err != nil {
+			return fmt.Errorf("f1: %s concurrency: %w", envKey(prefix, "concurrency"), err)
+		}
+		cfg.Concurrency = parsed
+	}
+	if value, ok := lookupSubscriptionEnv(prefix, "prefetch"); ok {
+		parsed, err := strconv.Atoi(value)
+		if err != nil {
+			return fmt.Errorf("f1: %s prefetch: %w", envKey(prefix, "prefetch"), err)
+		}
+		cfg.Prefetch = parsed
+	}
+	if value, ok := lookupSubscriptionEnv(prefix, "priorities"); ok {
+		priorities := make([]Priority, 0)
+		for _, name := range splitEnvList(value) {
+			priority, err := ParsePriority(name)
+			if err != nil {
+				return fmt.Errorf("f1: %s priorities: %w", envKey(prefix, "priorities"), err)
+			}
+			priorities = append(priorities, priority)
+		}
+		cfg.Priorities = priorities
+	}
+	if value, ok := lookupSubscriptionEnv(prefix, "maxDeferrals"); ok {
+		parsed, err := strconv.Atoi(value)
+		if err != nil {
+			return fmt.Errorf("f1: %s maxDeferrals: %w", envKey(prefix, "maxDeferrals"), err)
+		}
+		cfg.MaxDeferrals = parsed
+	}
+	if value, ok := lookupSubscriptionEnv(prefix, "handlerTimeout"); ok {
+		parsed, err := time.ParseDuration(value)
+		if err != nil {
+			return fmt.Errorf("f1: %s handlerTimeout: %w", envKey(prefix, "handlerTimeout"), err)
+		}
+		cfg.HandlerTimeout = parsed
+	}
+	if value, ok := lookupSubscriptionEnv(prefix, "unmatchedPolicy"); ok {
+		policy, err := parseUnmatchedPolicy(value)
+		if err != nil {
+			return fmt.Errorf("f1: %s unmatchedPolicy: %w", envKey(prefix, "unmatchedPolicy"), err)
+		}
+		cfg.UnmatchedPolicy = policy
+	}
+	if value, ok := lookupSubscriptionEnv(prefix, "fairness.retryWeightDivisor"); ok {
+		parsed, err := strconv.Atoi(value)
+		if err != nil {
+			return fmt.Errorf("f1: %s: %w", envKey(prefix, "fairness.retryWeightDivisor"), err)
+		}
+		cfg.Fairness.RetryWeightDivisor = parsed
+	}
+	if value, ok := lookupSubscriptionEnv(prefix, "fairness.costModel"); ok {
+		cfg.Fairness.CostModel = value
+	}
+	if value, ok := lookupSubscriptionEnv(prefix, "fairness.prefetchFactor"); ok {
+		parsed, err := strconv.Atoi(value)
+		if err != nil {
+			return fmt.Errorf("f1: %s: %w", envKey(prefix, "fairness.prefetchFactor"), err)
+		}
+		cfg.Fairness.PrefetchFactor = parsed
+	}
+	if value, ok := lookupSubscriptionEnv(prefix, "fairness.agingEnabled"); ok {
+		parsed, err := strconv.ParseBool(value)
+		if err != nil {
+			return fmt.Errorf("f1: %s: %w", envKey(prefix, "fairness.agingEnabled"), err)
+		}
+		cfg.Fairness.AgingEnabled = parsed
+	}
+	for _, priority := range []Priority{PriorityHigh, PriorityNormal, PriorityLow} {
+		if value, ok := lookupSubscriptionEnv(prefix, "fairness.weights."+priority.String()); ok {
+			parsed, err := strconv.Atoi(value)
+			if err != nil {
+				return fmt.Errorf("f1: %s: %w", envKey(prefix, "fairness.weights."+priority.String()), err)
+			}
+			if cfg.Fairness.Weights == nil {
+				cfg.Fairness.Weights = make(map[Priority]int)
+			}
+			cfg.Fairness.Weights[priority] = parsed
+		}
+		if value, ok := lookupSubscriptionEnv(prefix, "fairness.budgets."+priority.String()); ok {
+			parsed, err := time.ParseDuration(value)
+			if err != nil {
+				return fmt.Errorf("f1: %s: %w", envKey(prefix, "fairness.budgets."+priority.String()), err)
+			}
+			if cfg.Fairness.Budgets == nil {
+				cfg.Fairness.Budgets = make(map[Priority]time.Duration)
+			}
+			cfg.Fairness.Budgets[priority] = parsed
+		}
+	}
+	if value, ok := lookupSubscriptionEnv(prefix, "retry.maxAttempts"); ok {
+		parsed, err := strconv.Atoi(value)
+		if err != nil {
+			return fmt.Errorf("f1: %s: %w", envKey(prefix, "retry.maxAttempts"), err)
+		}
+		cfg.Retry.MaxAttempts = parsed
+	}
+	if value, ok := lookupSubscriptionEnv(prefix, "retry.initialInterval"); ok {
+		parsed, err := time.ParseDuration(value)
+		if err != nil {
+			return fmt.Errorf("f1: %s: %w", envKey(prefix, "retry.initialInterval"), err)
+		}
+		cfg.Retry.InitialInterval = parsed
+	}
+	if value, ok := lookupSubscriptionEnv(prefix, "retry.multiplier"); ok {
+		parsed, err := strconv.ParseFloat(value, 64)
+		if err != nil {
+			return fmt.Errorf("f1: %s: %w", envKey(prefix, "retry.multiplier"), err)
+		}
+		cfg.Retry.Multiplier = parsed
+	}
+	if value, ok := lookupSubscriptionEnv(prefix, "retry.maxInterval"); ok {
+		parsed, err := time.ParseDuration(value)
+		if err != nil {
+			return fmt.Errorf("f1: %s: %w", envKey(prefix, "retry.maxInterval"), err)
+		}
+		cfg.Retry.MaxInterval = parsed
+	}
+	if value, ok := lookupSubscriptionEnv(prefix, "retry.jitter"); ok {
+		parsed, err := strconv.ParseFloat(value, 64)
+		if err != nil {
+			return fmt.Errorf("f1: %s: %w", envKey(prefix, "retry.jitter"), err)
+		}
+		cfg.Retry.Jitter = parsed
+	}
+	if value, ok := lookupSubscriptionEnv(prefix, "retry.tiers"); ok {
+		tiers := make([]time.Duration, 0)
+		for _, item := range splitEnvList(value) {
+			tier, err := time.ParseDuration(item)
+			if err != nil {
+				return fmt.Errorf("f1: %s retry.tiers: %w", envKey(prefix, "retry.tiers"), err)
+			}
+			tiers = append(tiers, tier)
+		}
+		cfg.Retry.Tiers = tiers
+	}
+	return nil
+}
+
+func subscriptionEnvPrefix(name string) string {
+	return "F1_SUBSCRIPTIONS_" + envToken(name) + "_"
+}
+
+func lookupSubscriptionEnv(prefix, key string) (string, bool) {
+	return os.LookupEnv(envKey(prefix, key))
+}
+
+func envKey(prefix, key string) string {
+	return prefix + envToken(key)
+}
+
+func envToken(value string) string {
+	var b strings.Builder
+	for i, r := range value {
+		if unicode.IsUpper(r) && i > 0 {
+			b.WriteByte('_')
+		}
+		if unicode.IsLetter(r) || unicode.IsDigit(r) {
+			b.WriteRune(unicode.ToUpper(r))
+		} else {
+			b.WriteByte('_')
+		}
+	}
+	return strings.Trim(b.String(), "_")
+}
+
+func splitEnvList(value string) []string {
+	if strings.TrimSpace(value) == "" {
+		return []string{}
+	}
+	parts := strings.Split(value, ",")
+	result := make([]string, 0, len(parts))
+	for _, part := range parts {
+		result = append(result, strings.TrimSpace(part))
+	}
+	return result
+}
+
+func parseMode(value string) (Mode, error) {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "unordered":
+		return Unordered, nil
+	case "orderedbykey", "ordered_by_key":
+		return OrderedByKey, nil
+	default:
+		return Unordered, fmt.Errorf("unsupported mode %q", value)
+	}
+}
+
+func parseUnmatchedPolicy(value string) (UnmatchedPolicy, error) {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "ignore":
+		return Ignore, nil
+	case "deadletter", "dead_letter":
+		return DeadLetter, nil
+	default:
+		return Ignore, fmt.Errorf("unsupported unmatched policy %q", value)
+	}
+}
+
+func cloneFairness(value FairnessConfig) FairnessConfig {
+	value.Weights = clonePriorityWeights(value.Weights)
+	value.Budgets = clonePriorityBudgets(value.Budgets)
+	return value
+}
+
+func cloneRetry(value RetryConfig) RetryConfig {
+	value.Tiers = append([]time.Duration(nil), value.Tiers...)
+	return value
+}
+
+func mergeFairness(base, override FairnessConfig) FairnessConfig {
+	if override.Weights != nil {
+		base.Weights = clonePriorityWeights(override.Weights)
+	}
+	if override.Budgets != nil {
+		base.Budgets = clonePriorityBudgets(override.Budgets)
+	}
+	if override.RetryWeightDivisor != 0 {
+		base.RetryWeightDivisor = override.RetryWeightDivisor
+	}
+	if override.CostModel != "" {
+		base.CostModel = override.CostModel
+	}
+	if override.PrefetchFactor != 0 {
+		base.PrefetchFactor = override.PrefetchFactor
+	}
+	if override.AgingEnabled {
+		base.AgingEnabled = true
+	}
+	return base
+}
+
+func mergeRetry(base, override RetryConfig) RetryConfig {
+	if override.MaxAttempts != 0 {
+		base.MaxAttempts = override.MaxAttempts
+	}
+	if override.InitialInterval != 0 {
+		base.InitialInterval = override.InitialInterval
+	}
+	if override.Multiplier != 0 {
+		base.Multiplier = override.Multiplier
+	}
+	if override.MaxInterval != 0 {
+		base.MaxInterval = override.MaxInterval
+	}
+	if override.Jitter != 0 {
+		base.Jitter = override.Jitter
+	}
+	if override.Tiers != nil {
+		base.Tiers = append([]time.Duration(nil), override.Tiers...)
+	}
+	return base
+}
+
+func fairnessZero(value FairnessConfig) bool {
+	return value.Weights == nil && value.Budgets == nil && value.RetryWeightDivisor == 0 && value.CostModel == "" && value.PrefetchFactor == 0 && !value.AgingEnabled
+}
+
+func retryZero(value RetryConfig) bool {
+	return value.MaxAttempts == 0 && value.InitialInterval == 0 && value.Multiplier == 0 && value.MaxInterval == 0 && value.Jitter == 0 && value.Tiers == nil
+}
+
+func clonePriorityWeights(value map[Priority]int) map[Priority]int {
+	if value == nil {
+		return nil
+	}
+	result := make(map[Priority]int, len(value))
+	for key, item := range value {
+		result[key] = item
+	}
+	return result
+}
+
+func clonePriorityBudgets(value map[Priority]time.Duration) map[Priority]time.Duration {
+	if value == nil {
+		return nil
+	}
+	result := make(map[Priority]time.Duration, len(value))
+	for key, item := range value {
+		result[key] = item
+	}
+	return result
+}

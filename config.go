@@ -165,6 +165,15 @@ type SubscriptionConfig struct {
 	MaxDeferrals    int             `yaml:"maxDeferrals"`
 	HandlerTimeout  time.Duration   `yaml:"handlerTimeout"`
 	UnmatchedPolicy UnmatchedPolicy `yaml:"unmatchedPolicy"`
+
+	presence subscriptionPresence
+}
+
+// subscriptionPresence records YAML keys whose explicit zero value must win
+// over a documented default during the later Go subscription merge.
+type subscriptionPresence struct {
+	Topics, Mode, Concurrency, Prefetch, Priorities                bool
+	Fairness, Retry, MaxDeferrals, HandlerTimeout, UnmatchedPolicy bool
 }
 
 // LoadConfig reads path, applies environment overrides, fills defaults, and
@@ -481,6 +490,7 @@ type rawSubscription struct {
 	MaxDeferrals    int           `yaml:"maxDeferrals"`
 	HandlerTimeout  time.Duration `yaml:"handlerTimeout"`
 	UnmatchedPolicy rawPolicy     `yaml:"unmatchedPolicy"`
+	presence        subscriptionPresence
 }
 
 func defaultSubscription() SubscriptionConfig {
@@ -500,6 +510,7 @@ func (y *rawSubscription) UnmarshalYAML(value *yaml.Node) error {
 	if err := value.Decode(&input); err != nil {
 		return err
 	}
+	input.presence = subscriptionPresenceFromNode(value)
 	*y = rawSubscription(input)
 	return nil
 }
@@ -513,7 +524,7 @@ func (y rawSubscription) config() (SubscriptionConfig, error) {
 	if err != nil {
 		return SubscriptionConfig{}, err
 	}
-	return SubscriptionConfig{Topics: y.Topics, Mode: Mode(y.Mode), Concurrency: y.Concurrency, Prefetch: y.Prefetch, Priorities: priorities, Fairness: fairness, Retry: RetryConfig(y.Retry), MaxDeferrals: y.MaxDeferrals, HandlerTimeout: y.HandlerTimeout, UnmatchedPolicy: UnmatchedPolicy(y.UnmatchedPolicy)}, nil
+	return SubscriptionConfig{Topics: y.Topics, Mode: Mode(y.Mode), Concurrency: y.Concurrency, Prefetch: y.Prefetch, Priorities: priorities, Fairness: fairness, Retry: RetryConfig(y.Retry), MaxDeferrals: y.MaxDeferrals, HandlerTimeout: y.HandlerTimeout, UnmatchedPolicy: UnmatchedPolicy(y.UnmatchedPolicy), presence: y.presence}, nil
 }
 
 func rawSubscriptionFromConfig(subscription SubscriptionConfig) rawSubscription {
@@ -529,7 +540,39 @@ func rawSubscriptionFromConfig(subscription SubscriptionConfig) rawSubscription 
 	for priority, budget := range subscription.Fairness.Budgets {
 		budgets[priority.String()] = budget
 	}
-	return rawSubscription{Topics: subscription.Topics, Mode: rawMode(subscription.Mode), Concurrency: subscription.Concurrency, Prefetch: subscription.Prefetch, Priorities: priorities, Fairness: rawFairness{Weights: weights, Budgets: budgets, RetryWeightDivisor: subscription.Fairness.RetryWeightDivisor, CostModel: subscription.Fairness.CostModel, PrefetchFactor: subscription.Fairness.PrefetchFactor, AgingEnabled: subscription.Fairness.AgingEnabled}, Retry: rawRetry(subscription.Retry), MaxDeferrals: subscription.MaxDeferrals, HandlerTimeout: subscription.HandlerTimeout, UnmatchedPolicy: rawPolicy(subscription.UnmatchedPolicy)}
+	return rawSubscription{Topics: subscription.Topics, Mode: rawMode(subscription.Mode), Concurrency: subscription.Concurrency, Prefetch: subscription.Prefetch, Priorities: priorities, Fairness: rawFairness{Weights: weights, Budgets: budgets, RetryWeightDivisor: subscription.Fairness.RetryWeightDivisor, CostModel: subscription.Fairness.CostModel, PrefetchFactor: subscription.Fairness.PrefetchFactor, AgingEnabled: subscription.Fairness.AgingEnabled}, Retry: rawRetry(subscription.Retry), MaxDeferrals: subscription.MaxDeferrals, HandlerTimeout: subscription.HandlerTimeout, UnmatchedPolicy: rawPolicy(subscription.UnmatchedPolicy), presence: subscription.presence}
+}
+
+func subscriptionPresenceFromNode(node *yaml.Node) subscriptionPresence {
+	var presence subscriptionPresence
+	if node == nil || node.Kind != yaml.MappingNode {
+		return presence
+	}
+	for i := 0; i < len(node.Content); i += 2 {
+		switch node.Content[i].Value {
+		case "topics":
+			presence.Topics = true
+		case "mode":
+			presence.Mode = true
+		case "concurrency":
+			presence.Concurrency = true
+		case "prefetch":
+			presence.Prefetch = true
+		case "priorities":
+			presence.Priorities = true
+		case "fairness":
+			presence.Fairness = true
+		case "retry":
+			presence.Retry = true
+		case "maxDeferrals":
+			presence.MaxDeferrals = true
+		case "handlerTimeout":
+			presence.HandlerTimeout = true
+		case "unmatchedPolicy":
+			presence.UnmatchedPolicy = true
+		}
+	}
+	return presence
 }
 
 type rawFairness struct {
