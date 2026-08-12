@@ -2,7 +2,9 @@ package f1
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"log/slog"
 	"sync"
 
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/codec"
@@ -12,13 +14,20 @@ import (
 
 // Client is an eagerly connected messaging client.
 type Client struct {
-	conn      driver.Conn
-	limits    Limits
-	effective driver.Capabilities
-	options   clientOptions
+	conn           driver.Conn
+	limits         Limits
+	effective      driver.Capabilities
+	options        clientOptions
+	source         string
+	producer       string
+	driver         string
+	producerHandle driver.Producer
 
-	mu     sync.Mutex
-	closed bool
+	mu              sync.Mutex
+	closed          bool
+	closing         bool
+	activePublishes int
+	publishIdle     chan struct{}
 }
 
 // Limits describes how the connected broker provides each SDK feature.
@@ -52,7 +61,7 @@ const (
 // Until subscription construction supplies Go-side defaults, cfg is expected
 // to come from LoadConfig; hand-built Config values are validated as supplied.
 func New(ctx context.Context, cfg Config, opts ...Option) (*Client, error) {
-	options := clientOptions{codec: codec.JSON{}, clock: clock.NewReal()}
+	options := clientOptions{codec: codec.JSON{}, clock: clock.NewReal(), logger: slog.Default()}
 	for _, option := range opts {
 		if option == nil {
 			return nil, fmt.Errorf("f1: nil option")
@@ -76,9 +85,55 @@ func New(ctx context.Context, cfg Config, opts ...Option) (*Client, error) {
 	if options.strictPortability {
 		effective = effective.Strict()
 	}
-	client := &Client{conn: connection, effective: effective, options: options}
+	client := &Client{
+		conn:      connection,
+		effective: effective,
+		options:   options,
+		source:    fmt.Sprintf("/%s/%s", cfg.Env, cfg.Service),
+		producer:  fmt.Sprintf("%s/unknown/%s", cfg.Service, cfg.InstanceID),
+		driver:    options.driver.Name(),
+	}
 	client.limits = limitsFor(options.driver.Name(), connection.BrokerInfo(), effective)
+	logCapabilities(client)
 	return client, nil
+}
+
+// Publisher returns a publisher using this client's connected driver and
+// configured codec. Publisher options are reserved for future per-publisher
+// controls and currently have no effect.
+func (c *Client) Publisher(_ ...PublisherOption) *Publisher {
+	return &Publisher{client: c}
+}
+
+func logCapabilities(c *Client) {
+	if c.options.logger == nil {
+		return
+	}
+	for _, feature := range c.limits.Features {
+		if feature.Mode == FeatureNative {
+			continue
+		}
+		attrs := []any{"driver", c.limits.Driver, "broker", c.limits.Broker, "feature", feature.Feature, "mode", featureModeString(feature.Mode)}
+		if feature.Detail != "" {
+			attrs = append(attrs, "detail", feature.Detail)
+		}
+		if feature.Mode == FeatureUnavailable {
+			c.options.logger.Warn("f1 capability unavailable", attrs...)
+		} else {
+			c.options.logger.Info("f1 capability emulated", attrs...)
+		}
+	}
+}
+
+func featureModeString(mode FeatureMode) string {
+	switch mode {
+	case FeatureNative:
+		return "native"
+	case FeatureEmulated:
+		return "emulated"
+	default:
+		return "unavailable"
+	}
 }
 
 // Health reports whether the connected broker is reachable.
@@ -95,6 +150,10 @@ func (c *Client) Health(ctx context.Context) error {
 		c.mu.Unlock()
 		return fmt.Errorf("f1: client is closed")
 	}
+	if c.closing {
+		c.mu.Unlock()
+		return fmt.Errorf("f1: client is closing")
+	}
 	conn := c.conn
 	c.mu.Unlock()
 	return conn.Ping(ctx)
@@ -110,23 +169,82 @@ func (c *Client) Limits() Limits {
 	return result
 }
 
-// Close releases the driver connection. It is safe to call repeatedly after a
-// successful close; resource-outstanding errors leave the Client open so the
-// caller can close its resources and retry.
+// Close flushes and releases the driver resources. It is safe to call
+// repeatedly after a successful close; flush or connection errors leave the
+// Client open so the caller can retry. A producer close error is returned
+// after the connection has still been released. A concurrent Close call
+// returns an error stating that shutdown is already in progress.
 func (c *Client) Close(ctx context.Context) error {
 	if c == nil {
 		return nil
 	}
 	c.mu.Lock()
-	defer c.mu.Unlock()
 	if c.closed {
+		c.mu.Unlock()
 		return nil
 	}
+	if c.closing {
+		c.mu.Unlock()
+		return fmt.Errorf("f1: client is closing")
+	}
+	c.closing = true
+	idle := c.publishIdle
+	c.mu.Unlock()
+	if idle != nil {
+		select {
+		case <-idle:
+		case <-ctx.Done():
+			c.mu.Lock()
+			c.closing = false
+			c.mu.Unlock()
+			return ctx.Err()
+		}
+	}
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.producerHandle != nil {
+		if err := c.producerHandle.Flush(ctx); err != nil {
+			c.closing = false
+			return err
+		}
+		producerCloseErr := c.producerHandle.Close(ctx)
+		c.producerHandle = nil
+		if producerCloseErr != nil && c.options.logger != nil {
+			c.options.logger.Warn("f1 producer close failed", "error", producerCloseErr)
+		}
+		if err := c.conn.Close(ctx); err != nil {
+			c.closing = false
+			return errors.Join(producerCloseErr, err)
+		}
+		c.closed = true
+		c.closing = false
+		return producerCloseErr
+	}
 	if err := c.conn.Close(ctx); err != nil {
+		c.closing = false
 		return err
 	}
 	c.closed = true
+	c.closing = false
 	return nil
+}
+
+func beginPublish(c *Client) {
+	c.activePublishes++
+	if c.activePublishes == 1 {
+		c.publishIdle = make(chan struct{})
+	}
+}
+
+func endPublish(c *Client) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.activePublishes--
+	if c.activePublishes == 0 {
+		close(c.publishIdle)
+		c.publishIdle = nil
+	}
 }
 
 func driverConfig(cfg Config) driver.Config {

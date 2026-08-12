@@ -17,6 +17,10 @@ import (
 // Option configures a Client during New.
 type Option func(*clientOptions) error
 
+// PublisherOption configures a Publisher. No per-publisher controls are
+// defined in this version; the type reserves the API extension point.
+type PublisherOption struct{}
+
 type clientOptions struct {
 	driver            driver.Driver
 	codec             codec.Codec
@@ -133,7 +137,9 @@ func WithErrorHandler(handler func(context.Context, *Event, error)) Option {
 
 // Event is the message view passed to a Handler.
 // Dispatch fills its data when subscriptions are introduced.
-type Event struct{}
+type Event struct {
+	envelope Envelope
+}
 
 // Handler processes one delivered Event.
 type Handler interface {
