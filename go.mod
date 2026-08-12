@@ -1,8 +1,8 @@
 module fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk
 
-go 1.24
+go 1.26
 
-toolchain go1.24.0
+toolchain go1.26.1
 
 require github.com/stretchr/testify v1.11.1
 
