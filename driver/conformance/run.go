@@ -39,6 +39,14 @@ func Run(t *testing.T, suite Suite) Report {
 	if validationErr := validateInspectorFactory(inspect, err); validationErr != nil {
 		t.Fatalf("conformance: NewInspector: %v", validationErr)
 	}
+	var inject FaultInjector
+	if suite.NewFaultInjector != nil {
+		inject, err = suite.NewFaultInjector(conn)
+		if err != nil {
+			t.Fatalf("conformance: NewFaultInjector: %v", err)
+		}
+		validateFaultInjector(t, ctx, conn, inject)
+	}
 
 	report := Report{
 		Driver:  suite.Driver.Name(),
@@ -49,7 +57,7 @@ func Run(t *testing.T, suite Suite) Report {
 		profile := profile
 		var result ProfileReport
 		ok := t.Run(profile.String(), func(profileTest *testing.T) {
-			result = runProfile(profileTest, ctx, conn, inspect, profile)
+			result = runProfile(profileTest, ctx, conn, inspect, profile, inject, &report)
 		})
 		if !ok {
 			t.Fatalf("conformance: %s profile failed", profile)
@@ -77,6 +85,8 @@ func runProfile(
 	conn driver.Conn,
 	inspect Inspect,
 	profile Profile,
+	inject FaultInjector,
+	report *Report,
 ) ProfileReport {
 	effective := effectiveCapabilities(conn.Capabilities(), profile)
 	destination := "conformance.inspect." + profile.String() + ".probe"
@@ -165,15 +175,25 @@ func runProfile(
 			continue
 		}
 		var groupResult *groupContext
+		groupSkipped := false
 		groupOK := t.Run(entry.name, func(groupTest *testing.T) {
+			if entry.name == "failure" && inject == nil {
+				groupSkipped = true
+				groupTest.Skip("conformance failure fixture is not configured")
+			}
 			groupResult = &groupContext{
 				t: groupTest, ctx: ctx, conn: conn, inspect: inspect,
-				profile: profile, effective: effective,
+				profile: profile, effective: effective, inject: inject, report: report,
+				checkNames: make(map[string]struct{}),
 			}
 			runner(groupResult)
 		})
 		if !groupOK {
 			t.Fatalf("conformance group %s failed", entry.name)
+		}
+		if groupSkipped {
+			result.Groups = append(result.Groups, GroupResult{Name: entry.name, Declared: entry.declared, Status: "skipped"})
+			continue
 		}
 		if groupResult == nil {
 			t.Logf("conformance: group=%s filtered out, count not validated", entry.name)
@@ -189,6 +209,30 @@ func runProfile(
 		})
 	}
 	return result
+}
+
+func validateFaultInjector(t *testing.T, ctx context.Context, conn driver.Conn, inject FaultInjector) {
+	t.Helper()
+	if inject == nil {
+		t.Fatal("conformance: NewFaultInjector returned nil")
+	}
+	const destination = "conformance.fault-probe"
+	if _, err := conn.Admin().EnsureTopology(ctx, driver.TopologySpec{Destinations: []driver.DestinationSpec{{Name: destination}}}); err != nil {
+		t.Fatalf("conformance: fault injector topology: %v", err)
+	}
+	producer, err := conn.Producer(ctx, driver.ProducerConfig{})
+	if err != nil {
+		t.Fatalf("conformance: fault injector producer: %v", err)
+	}
+	defer func() { _ = producer.Close(ctx) }()
+	if err := inject(ctx, FaultPublishFailure); err != nil {
+		t.Fatalf("conformance: inject %s: %v", FaultPublishFailure, err)
+	}
+	err = producer.Publish(ctx, driver.OutboundMessage{Destination: destination})
+	kind, classified := driver.Classify(err)
+	if err == nil || !classified || kind != driver.KindTransient {
+		t.Fatalf("conformance: fault injector %s was not observed as transient publish failure: %v", FaultPublishFailure, err)
+	}
 }
 
 func cleanupProfile(t *testing.T, ctx context.Context, producer driver.Producer, consumer driver.Consumer, messages ...driver.InboundMessage) {

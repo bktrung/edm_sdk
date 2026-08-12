@@ -28,25 +28,39 @@ var groupManifest = []manifestEntry{
 }
 
 // pendingGroups lists groups without registered runners.
-var pendingGroups = []string{
-	"ordering", "deferred",
-	"failure", "capability", "lag",
-}
+var pendingGroups = []string{"ordering", "deferred", "failure", "capability", "lag"}
 
 type groupContext struct {
-	t         *testing.T
-	ctx       context.Context
-	conn      driver.Conn
-	inspect   Inspect
-	profile   Profile
-	effective driver.Capabilities
-	vector    BehaviorVector
-	checks    int
+	t          *testing.T
+	ctx        context.Context
+	conn       driver.Conn
+	inspect    Inspect
+	profile    Profile
+	effective  driver.Capabilities
+	vector     BehaviorVector
+	checks     int
+	checkNames map[string]struct{}
+	inject     FaultInjector
+	report     *Report
+}
+
+func (g *groupContext) capability(capability, declared, status, evidence string) {
+	g.report.Capabilities = append(g.report.Capabilities, CapabilityResult{
+		Profile: g.profile, Capability: capability, Declared: declared, Status: status, Evidence: evidence,
+	})
 }
 
 type groupRunner func(*groupContext)
 
 func (g *groupContext) Check(name string, fn func(*testing.T)) {
+	if _, exists := g.checkNames[name]; exists {
+		g.t.Errorf("conformance group has duplicate check name %q", name)
+		return
+	}
+	if g.checkNames == nil {
+		g.checkNames = make(map[string]struct{})
+	}
+	g.checkNames[name] = struct{}{}
 	if runCheck(g.t, name, fn) {
 		g.t.Errorf("conformance check %q was skipped", name)
 		return

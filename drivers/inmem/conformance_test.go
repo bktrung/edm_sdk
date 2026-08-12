@@ -47,6 +47,25 @@ func newInspector(raw driver.Conn) (conformance.Inspect, error) {
 	}, nil
 }
 
+func newFaultInjector(raw driver.Conn) (conformance.FaultInjector, error) {
+	conn, ok := raw.(*conn)
+	if !ok {
+		return nil, errors.New("inmem conformance injector received a different connection")
+	}
+	return func(ctx context.Context, kind conformance.FaultKind) error {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if kind != conformance.FaultPublishFailure {
+			return errors.New("unsupported conformance fault")
+		}
+		conn.mu.Lock()
+		defer conn.mu.Unlock()
+		conn.failPublish = true
+		return nil
+	}, nil
+}
+
 func TestInspectorSeparatesDeferredMessages(t *testing.T) {
 	ctx := context.Background()
 	raw, err := (Driver{}).Open(ctx, driver.Config{})
@@ -87,9 +106,10 @@ func TestInspectorSeparatesDeferredMessages(t *testing.T) {
 func TestConformance(t *testing.T) {
 	var output bytes.Buffer
 	report := conformance.Run(t, conformance.Suite{
-		Driver:       Driver{},
-		Config:       driver.Config{},
-		NewInspector: newInspector,
+		Driver:           Driver{},
+		Config:           driver.Config{},
+		NewInspector:     newInspector,
+		NewFaultInjector: newFaultInjector,
 	})
 	if err := report.WriteMarkdown(&output); err != nil {
 		t.Fatal(err)

@@ -38,11 +38,23 @@ type Inspect func(ctx context.Context, destination string) (BrokerView, error)
 // InspectorFactory binds an inspector to the one connection owned by Run.
 type InspectorFactory func(driver.Conn) (Inspect, error)
 
+// FaultKind identifies a port-level condition a conformance fixture can inject.
+type FaultKind string
+
+const (
+	// FaultPublishFailure makes the next Publish fail with a transient error.
+	FaultPublishFailure FaultKind = "publish-failure"
+)
+
+// FaultInjector applies one deterministic port-level fault to the suite connection.
+type FaultInjector func(context.Context, FaultKind) error
+
 // Suite describes one driver conformance run. Run executes both profiles.
 type Suite struct {
-	Driver       driver.Driver
-	Config       driver.Config
-	NewInspector InspectorFactory
+	Driver           driver.Driver
+	Config           driver.Config
+	NewInspector     InspectorFactory
+	NewFaultInjector func(driver.Conn) (FaultInjector, error)
 }
 
 // BehaviorEvent is one observable event in a behavior vector.

@@ -28,6 +28,10 @@ func TestRunRejectsLongRegisteredGroup(t *testing.T) {
 	assertRunFailure(t, "long-group", "ran 2 checks; manifest declares 1")
 }
 
+func TestRunRejectsDuplicateRegisteredCheckName(t *testing.T) {
+	assertRunFailure(t, "duplicate-group", "duplicate check name")
+}
+
 func TestRunUsesOneConnectionAndInspector(t *testing.T) {
 	manifest := groupManifest
 	pending := pendingGroups
@@ -107,6 +111,15 @@ func TestRunFailureHelper(t *testing.T) {
 		registerGroup("publish", func(group *groupContext) {
 			group.Check("declared check", func(*testing.T) {})
 			group.Check("undeclared check", func(*testing.T) {})
+		})
+		factory = runTestInspector
+	case "duplicate-group":
+		groupManifest = []manifestEntry{{name: "publish", declared: 2}}
+		pendingGroups = nil
+		groupRunners = map[string]groupRunner{}
+		registerGroup("publish", func(group *groupContext) {
+			group.Check("same behavior", func(*testing.T) {})
+			group.Check("same behavior", func(*testing.T) {})
 		})
 		factory = runTestInspector
 	default:

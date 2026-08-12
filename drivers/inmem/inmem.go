@@ -81,6 +81,7 @@ type conn struct {
 	groups       map[string]*groupState
 	producers    int
 	closed       bool
+	failPublish  bool
 	nextRef      atomic.Uint64
 	nextMessage  atomic.Uint64
 	wake         chan struct{}

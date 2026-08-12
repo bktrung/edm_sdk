@@ -28,6 +28,10 @@ func (p *producer) Publish(ctx context.Context, messages ...driver.OutboundMessa
 	if p.conn.closed {
 		return classify("publish", driver.KindFatal, errors.New("connection closed"))
 	}
+	if p.conn.failPublish {
+		p.conn.failPublish = false
+		return classify("publish", driver.KindTransient, errors.New("injected publish failure"))
+	}
 	failed := make(map[int]error)
 	for i, message := range messages {
 		if p.cfg.Effective.MaxMessageBytes > 0 && len(message.Body) > p.cfg.Effective.MaxMessageBytes {
