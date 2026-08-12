@@ -25,7 +25,10 @@ func TestStrict_ZeroesEveryNegotiableCapability(t *testing.T) {
 	}).Strict()
 
 	value := reflect.ValueOf(got)
+	// Constraints survive the strict profile; capabilities do not. A field added
+	// here must be a fact about the broker that holds under either profile.
 	kept := map[string]bool{
+		"ConsumerScaling": true,
 		"MaxMessageBytes": true,
 		"MaxHeaderBytes":  true,
 	}
@@ -38,6 +41,21 @@ func TestStrict_ZeroesEveryNegotiableCapability(t *testing.T) {
 	}
 	if got.MaxMessageBytes != 100 || got.MaxHeaderBytes != 20 {
 		t.Fatalf("Strict() lost physical limits: %#v", got)
+	}
+}
+
+func TestStrict_PreservesConsumerScaling(t *testing.T) {
+	t.Parallel()
+
+	// ScalingPartitionBound is the zero value, so a Strict that dropped the
+	// field would not withdraw the declaration: it would silently replace a
+	// free-scaling broker with a partition-bound one carrying no partitions.
+	// Asserting the free case is what makes that substitution visible.
+	if got := (Capabilities{ConsumerScaling: ScalingFree}).Strict(); got.ConsumerScaling != ScalingFree {
+		t.Errorf("Strict() ConsumerScaling = %v, want %v", got.ConsumerScaling, ScalingFree)
+	}
+	if got := (Capabilities{ConsumerScaling: ScalingPartitionBound}).Strict(); got.ConsumerScaling != ScalingPartitionBound {
+		t.Errorf("Strict() ConsumerScaling = %v, want %v", got.ConsumerScaling, ScalingPartitionBound)
 	}
 }
 
