@@ -14,6 +14,7 @@ import (
 	"golang.org/x/sync/errgroup"
 
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/driver"
+	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/obs"
 )
 
 type delivery struct {
@@ -24,6 +25,33 @@ type delivery struct {
 type deliveryState struct {
 	attempted bool
 	settled   bool
+}
+
+type deliveryMetrics struct {
+	attemptDivergence obs.SampledGaugeSet
+}
+
+const deliveryPriorityLanes = 3
+
+func newDeliveryMetrics(topics []string) deliveryMetrics {
+	names := make([]string, len(topics))
+	for i, topic := range topics {
+		names[i] = topicFor(topic)
+	}
+	return deliveryMetrics{attemptDivergence: obs.NewSampledGaugeSet(names, deliveryPriorityLanes)}
+}
+
+func (m *deliveryMetrics) observeAttemptDivergence(eventType string, priority Priority, value uint64) {
+	if priority.Valid() {
+		m.attemptDivergence.Observe(topicFor(eventType), int(priority), value)
+	}
+}
+
+func (m *deliveryMetrics) sampleAttemptDivergence(topic string, priority Priority) uint64 {
+	if !priority.Valid() {
+		return 0
+	}
+	return m.attemptDivergence.Sample(topic, int(priority))
 }
 
 // Run starts the consumer, owns its fetcher and workers, and returns when the
@@ -435,6 +463,9 @@ func dispatchMessage(r *Runner, ctx context.Context, message driver.InboundMessa
 		envelope.Attempt = 1
 	}
 	*envelopeOut = envelope
+	// Record at receipt, before handler work or settlement: a failed settlement
+	// can cause the broker to redeliver this delivery.
+	recordAttemptDivergence(r, envelope.Type, envelope.Priority, envelope.Attempt, message.DeliveryCount)
 	if max := r.client.config.Codec.MaxBodyBytes; max > 0 && len(message.Body) > max {
 		return deadLetterAndSettle(r, ctx, message, envelope, ReasonDecode, fmt.Errorf("body exceeds codec.maxBodyBytes (%d)", max), state)
 	}
@@ -486,6 +517,19 @@ func dispatchMessage(r *Runner, ctx context.Context, message driver.InboundMessa
 		return deadLetterAndSettle(r, ctx, message, envelope, ReasonMaxAttempts, result.err, state)
 	}
 	return retryAndSettle(r, ctx, message, envelope, result.err, 0, true, state)
+}
+
+func recordAttemptDivergence(r *Runner, eventType string, priority Priority, attempt, deliveryCount int) {
+	if r == nil || deliveryCount < 0 {
+		return
+	}
+	var difference int
+	if attempt >= deliveryCount {
+		difference = attempt - deliveryCount
+	} else {
+		difference = deliveryCount - attempt
+	}
+	r.metrics.observeAttemptDivergence(eventType, priority, uint64(uint(difference)))
 }
 
 func stateFor(states []*deliveryState) *deliveryState {

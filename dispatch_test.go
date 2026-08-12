@@ -54,6 +54,86 @@ func TestOversizeBodyDeadLettersBeforeHandlerRuns(t *testing.T) {
 	}
 }
 
+func TestDispatchSamplesAttemptDivergenceBeforeSettlement(t *testing.T) {
+	producer := &dispatchProducer{}
+	conn := &dispatchConn{producer: producer}
+	client, err := New(context.Background(), testClientConfig(t), WithDriver(&dispatchDriver{conn: conn}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = client.Close(context.Background()) }()
+	runner := &Runner{client: client, subscription: Subscription{
+		Name:       "orders",
+		Topics:     []string{"orders.created", "payments.created"},
+		Priorities: []Priority{PriorityHigh, PriorityNormal},
+		Handlers: map[string]Handler{
+			"orders.created": HandlerFunc(func(context.Context, *Event) error { return nil }),
+		},
+	}, metrics: newDeliveryMetrics([]string{"orders.created", "payments.created"})}
+	settler := &dispatchSettler{onSettle: func() {
+		if got := runner.metrics.sampleAttemptDivergence("orders.created", PriorityHigh); got != 4 {
+			t.Errorf("sampled divergence at settlement = %d, want 4", got)
+		}
+	}}
+	envelope := Envelope{SpecVersion: "1.0", ID: "evt-sampled", Source: "/test/orders", Type: "orders.created", Priority: PriorityHigh, Attempt: 5}
+	headers, err := envelope.EncodeHeaders(CoreMaxHeaderBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	message := driver.InboundMessage{
+		Destination:   "f1.test.orders.created.normal",
+		Headers:       headerSlice(headers),
+		Body:          []byte(`{}`),
+		DeliveryCount: 1,
+		Settle:        settler,
+	}
+	abandoned := false
+	if !dispatchMessage(runner, context.Background(), message, &Envelope{}, &abandoned) {
+		t.Fatal("message was not settled")
+	}
+	if got := runner.metrics.sampleAttemptDivergence("orders.created", PriorityHigh); got != 0 {
+		t.Fatalf("sampled divergence after reset = %d, want 0", got)
+	}
+	if got := runner.metrics.sampleAttemptDivergence("payments.created", PriorityHigh); got != 0 {
+		t.Fatalf("unobserved lane divergence = %d, want 0", got)
+	}
+	noCount := message
+	noCount.DeliveryCount = -1
+	noCount.Settle = &dispatchSettler{}
+	if !dispatchMessage(runner, context.Background(), noCount, &Envelope{}, &abandoned) {
+		t.Fatal("message without delivery count was not settled")
+	}
+	if got := runner.metrics.sampleAttemptDivergence("orders.created", PriorityHigh); got != 0 {
+		t.Fatalf("unavailable delivery count divergence = %d, want 0", got)
+	}
+}
+
+func TestDeliveryMetricsKeepTopicAndPriorityLanesSeparate(t *testing.T) {
+	metrics := newDeliveryMetrics([]string{"payments.created", "orders.created"})
+	metrics.observeAttemptDivergence("orders.created", PriorityHigh, 4)
+	metrics.observeAttemptDivergence("orders.created", PriorityNormal, 2)
+	metrics.observeAttemptDivergence("payments.created", PriorityNormal, 7)
+
+	if got := metrics.sampleAttemptDivergence("orders.created", PriorityHigh); got != 4 {
+		t.Fatalf("orders high divergence = %d, want 4", got)
+	}
+	if got := metrics.sampleAttemptDivergence("orders.created", PriorityNormal); got != 2 {
+		t.Fatalf("orders normal divergence = %d, want 2", got)
+	}
+	if got := metrics.sampleAttemptDivergence("payments.created", PriorityNormal); got != 7 {
+		t.Fatalf("payments normal divergence = %d, want 7", got)
+	}
+}
+
+func TestDeliveryMetricObservationDoesNotAllocate(t *testing.T) {
+	metrics := newDeliveryMetrics([]string{"orders.created"})
+	if allocs := testing.AllocsPerRun(1000, func() {
+		metrics.observeAttemptDivergence("orders.created", PriorityHigh, 4)
+	}); allocs != 0 {
+		t.Fatalf("delivery metric observation allocations = %v, want 0", allocs)
+	}
+}
+
 func TestSettleLastNotificationRunsBeforeAck(t *testing.T) {
 	producer := &dispatchProducer{}
 	conn := &dispatchConn{producer: producer}

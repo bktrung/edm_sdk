@@ -176,6 +176,13 @@ func TestChain_UserMiddlewareCanClassifyUnavailable(t *testing.T) {
 	if len(producer.messages) != 1 || strings.Contains(producer.messages[0].Destination, ".dlq.") || !strings.Contains(producer.messages[0].Destination, ".retry.") {
 		t.Fatalf("successor destination = %q, want retry destination", producer.messages[0].Destination)
 	}
+	successor, err := DecodeHeaders(inboundHeaders(producer.messages[0].Headers))
+	if err != nil {
+		t.Fatalf("decode successor headers: %v", err)
+	}
+	if successor.Deferrals != 1 || successor.Attempt != 1 {
+		t.Fatalf("successor envelope = deferrals %d, attempt %d; want deferrals 1 and attempt 1", successor.Deferrals, successor.Attempt)
+	}
 }
 
 var errRawMiddleware = errors.New("raw handler error")

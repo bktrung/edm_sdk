@@ -95,6 +95,7 @@ type Runner struct {
 	finished              bool
 	runErr                error
 	inflight              *inflightRegistry
+	metrics               deliveryMetrics
 }
 
 const terminalNotificationTimeout = time.Second
@@ -208,7 +209,7 @@ func (c *Client) Subscribe(ctx context.Context, sub Subscription) (*Runner, erro
 	effective.HandlerTimeout = resolved.HandlerTimeout
 	effective.UnmatchedPolicy = resolved.UnmatchedPolicy
 	effective.Handlers = wrapHandlers(c.options.middleware, sub.Handlers)
-	runner := &Runner{client: c, subscription: effective, config: resolved}
+	runner := &Runner{client: c, subscription: effective, config: resolved, metrics: newDeliveryMetrics(effective.Topics)}
 	c.mu.Lock()
 	if c.closed || c.closing || c.conn == nil {
 		c.mu.Unlock()
