@@ -28,7 +28,7 @@ var groupManifest = []manifestEntry{
 }
 
 // pendingGroups lists groups without registered runners.
-var pendingGroups = []string{"ordering", "deferred", "failure", "capability", "lag"}
+var pendingGroups = []string{"ordering", "deferred", "failure", "capability"}
 
 type groupContext struct {
 	t          *testing.T
@@ -53,12 +53,12 @@ func (g *groupContext) capability(capability, declared, status, evidence string)
 type groupRunner func(*groupContext)
 
 func (g *groupContext) Check(name string, fn func(*testing.T)) {
+	if g.checkNames == nil {
+		g.checkNames = make(map[string]struct{})
+	}
 	if _, exists := g.checkNames[name]; exists {
 		g.t.Errorf("conformance group has duplicate check name %q", name)
 		return
-	}
-	if g.checkNames == nil {
-		g.checkNames = make(map[string]struct{})
 	}
 	g.checkNames[name] = struct{}{}
 	if runCheck(g.t, name, fn) {
