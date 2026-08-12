@@ -182,7 +182,7 @@ func (s *settler) settle(ctx context.Context, opt driver.NackOptions, nack bool)
 		s.message.deliveryCount++
 		s.message.due = s.conn.clock.Now()
 		if dest, ok := s.conn.destinations[s.message.message.Destination]; ok {
-			dest.messages = append(dest.messages, s.message)
+			dest.messages = append([]*queuedMessage{s.message}, dest.messages...)
 		}
 	}
 	if s.consumer.group != nil && (!nack || !opt.Requeue) {

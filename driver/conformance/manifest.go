@@ -17,18 +17,18 @@ var groupManifest = []manifestEntry{
 	{name: "publish", declared: 14},
 	{name: "consume", declared: 18},
 	{name: "settle", declared: 16},
-	{name: "ordering", declared: 9},
+	{name: "ordering", declared: 8},
 	{name: "deferred", declared: 9},
 	{name: "drain", declared: 12},
 	{name: "rebalance", declared: 11},
 	{name: "failure", declared: 15},
 	{name: "topology", declared: 15},
-	{name: "capability", declared: 24},
+	{name: "capability", declared: 25},
 	{name: "lag", declared: 5},
 }
 
 // pendingGroups lists groups without registered runners.
-var pendingGroups = []string{"ordering", "deferred", "failure", "capability"}
+var pendingGroups = []string{"deferred", "failure", "capability"}
 
 type groupContext struct {
 	t          *testing.T
