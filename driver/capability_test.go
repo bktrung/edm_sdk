@@ -27,6 +27,7 @@ func TestStrict_ZeroesEveryNegotiableCapability(t *testing.T) {
 	// here must be a fact about the broker that holds under either profile.
 	kept := map[string]bool{
 		"ConsumerScaling": true,
+		"OrderedByKey":    true,
 		"MaxMessageBytes": true,
 		"MaxHeaderBytes":  true,
 	}
@@ -54,6 +55,14 @@ func TestStrict_PreservesConsumerScaling(t *testing.T) {
 	}
 	if got := (Capabilities{ConsumerScaling: ScalingPartitionBound}).Strict(); got.ConsumerScaling != ScalingPartitionBound {
 		t.Errorf("Strict() ConsumerScaling = %v, want %v", got.ConsumerScaling, ScalingPartitionBound)
+	}
+}
+
+func TestStrict_PreservesOrderedByKey(t *testing.T) {
+	t.Parallel()
+
+	if got := (Capabilities{OrderedByKey: true}).Strict(); !got.OrderedByKey {
+		t.Error("Strict() removed OrderedByKey")
 	}
 }
 

@@ -68,7 +68,9 @@ func (s Scaling) String() string {
 // withdraw constraints, which are facts about the broker that hold whichever
 // profile the core selects. MaxMessageBytes and MaxHeaderBytes are constraints,
 // and so is ConsumerScaling: a broker whose consumers are bounded by partition
-// count stays bounded, and no core may declare otherwise.
+// count stays bounded, and no core may declare otherwise. OrderedByKey is
+// preserved because ordering is a semantic the core must keep in either
+// profile; strict selects the portable implementation, not an unordered one.
 //
 // ConsumerScaling is preserved rather than zeroed for a second reason. Its zero
 // value is ScalingPartitionBound, so zeroing it would not withdraw the
@@ -78,6 +80,7 @@ func (s Scaling) String() string {
 func (c Capabilities) Strict() Capabilities {
 	return Capabilities{
 		ConsumerScaling: c.ConsumerScaling,
+		OrderedByKey:    c.OrderedByKey,
 		MaxMessageBytes: c.MaxMessageBytes,
 		MaxHeaderBytes:  c.MaxHeaderBytes,
 	}
