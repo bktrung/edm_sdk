@@ -13,8 +13,12 @@ import (
 )
 
 // Driver is a stateless in-memory driver factory. Clock selects the time
-// source used by connections; a nil clock uses the real clock.
-type Driver struct{ Clock clock.Clock }
+// source used by connections; a nil clock uses the real clock. The minimal
+// capability mode is conformance-only and intentionally unexported.
+type Driver struct {
+	Clock   clock.Clock
+	minimal bool
+}
 
 const (
 	// These limits exercise the driver's limit-reporting and enforcement paths;
@@ -33,8 +37,8 @@ func (Driver) Name() string { return "inmem" }
 
 // Capabilities reports the behavior implemented by the in-memory driver. Native DLQ,
 // priority, transactions, and server-side filtering are intentionally false.
-func (Driver) Capabilities() driver.Capabilities {
-	return driver.Capabilities{
+func (d Driver) Capabilities() driver.Capabilities {
+	caps := driver.Capabilities{
 		PerMessageAck:       true,
 		OrderedByKey:        true,
 		NativeDelay:         true,
@@ -44,6 +48,18 @@ func (Driver) Capabilities() driver.Capabilities {
 		MaxMessageBytes:     maxMessageBytes,
 		MaxHeaderBytes:      maxHeaderBytes,
 	}
+	if d.minimal {
+		// This is the one deliberate non-native declaration: the capability
+		// suite needs to execute both sides of preserved declarations. The
+		// driver still implements the partition-bound behavior (one consumer
+		// is exercised), while the zero limits and denied ordering path are
+		// enforced from Effective exactly like the normal declaration.
+		caps.OrderedByKey = false
+		caps.ConsumerScaling = driver.ScalingPartitionBound
+		caps.MaxMessageBytes = 0
+		caps.MaxHeaderBytes = 0
+	}
+	return caps
 }
 
 // Open creates an isolated in-memory connection.

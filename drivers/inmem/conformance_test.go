@@ -159,15 +159,28 @@ func TestConformance(t *testing.T) {
 	// The whole suite shares this fake clock so deferred checks can advance broker
 	// time deterministically; it starts at real time because receiveBefore waits on wall time.
 	fake := clock.NewFake(clock.NewReal().Now())
-	report := conformance.Run(t, conformance.Suite{
-		Driver:             Driver{Clock: fake},
+	report := runConformance(t, Driver{Clock: fake})
+	if err := report.WriteMarkdown(&output); err != nil {
+		t.Fatal(err)
+	}
+	t.Log(output.String())
+}
+
+func TestConformanceMinimalCapabilities(t *testing.T) {
+	fake := clock.NewFake(clock.NewReal().Now())
+	// This named fixture only weakens native declarations and removes limits;
+	// ScalingPartitionBound is the one preserved declaration needed to execute
+	// that capability's branch, and the check uses one consumer accordingly.
+	runConformance(t, Driver{Clock: fake, minimal: true})
+}
+
+func runConformance(t *testing.T, candidate Driver) conformance.Report {
+	t.Helper()
+	return conformance.Run(t, conformance.Suite{
+		Driver:             candidate,
 		Config:             driver.Config{},
 		NewInspector:       newInspector,
 		NewFaultInjector:   newFaultInjector,
 		NewDeadlineFixture: newDeadlineFixture,
 	})
-	if err := report.WriteMarkdown(&output); err != nil {
-		t.Fatal(err)
-	}
-	t.Log(output.String())
 }
