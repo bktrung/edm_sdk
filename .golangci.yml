@@ -73,6 +73,22 @@ linters:
             - pkg: go.opentelemetry.io/otel/attribute
               desc: "OpenTelemetry attributes belong in internal/obs"
 
+        otel-boundary:
+          list-mode: lax
+          files:
+            - "**/*.go"
+            - "!**/internal/obs/**"
+          allow:
+            - go.opentelemetry.io/otel/metric
+            - go.opentelemetry.io/otel/trace
+          deny:
+            - pkg: go.opentelemetry.io/otel$
+              desc: "only internal/obs may use OpenTelemetry global providers"
+            - pkg: go.opentelemetry.io/otel/sdk
+              desc: "only internal/obs may use the OpenTelemetry SDK"
+            - pkg: go.opentelemetry.io/otel/semconv
+              desc: "only internal/obs may use OpenTelemetry semantic conventions"
+
         driver-port:
           files:
             - "**/driver/**"
