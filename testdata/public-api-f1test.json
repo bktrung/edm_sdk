@@ -1,0 +1,12 @@
+{
+  "package": "f1test",
+  "symbols": [
+    "Captured",
+    "Client",
+    "Client.Advance",
+    "Client.DLQ",
+    "Client.Deliver",
+    "Client.Published",
+    "NewClient"
+  ]
+}

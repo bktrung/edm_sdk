@@ -17,41 +17,73 @@ var groupManifest = []manifestEntry{
 	{name: "publish", declared: 14},
 	{name: "consume", declared: 18},
 	{name: "settle", declared: 16},
-	{name: "ordering", declared: 9},
+	{name: "ordering", declared: 8},
 	{name: "deferred", declared: 9},
 	{name: "drain", declared: 12},
 	{name: "rebalance", declared: 11},
 	{name: "failure", declared: 15},
 	{name: "topology", declared: 15},
-	{name: "capability", declared: 24},
+	{name: "capability", declared: 25},
 	{name: "lag", declared: 5},
 }
 
 // pendingGroups lists groups without registered runners.
-var pendingGroups = []string{
-	"ordering", "deferred",
-	"failure", "capability", "lag",
-}
+var pendingGroups []string
 
 type groupContext struct {
-	t         *testing.T
-	ctx       context.Context
-	conn      driver.Conn
-	inspect   Inspect
-	profile   Profile
-	effective driver.Capabilities
-	vector    BehaviorVector
-	checks    int
+	t          *testing.T
+	ctx        context.Context
+	conn       driver.Conn
+	inspect    Inspect
+	profile    Profile
+	effective  driver.Capabilities
+	vector     BehaviorVector
+	checks     int
+	checkNames map[string]struct{}
+	skips      map[string]string
+	inject     FaultInjector
+	deadline   DeadlineFixture
+	report     *Report
+}
+
+func (g *groupContext) capability(capability, declared, status, evidence string) {
+	g.report.Capabilities = append(g.report.Capabilities, CapabilityResult{
+		Profile: g.profile, Capability: capability, Declared: declared, Status: status, Evidence: evidence,
+	})
 }
 
 type groupRunner func(*groupContext)
 
 func (g *groupContext) Check(name string, fn func(*testing.T)) {
-	if runCheck(g.t, name, fn) {
-		g.t.Errorf("conformance check %q was skipped", name)
+	if g.checkNames == nil {
+		g.checkNames = make(map[string]struct{})
+	}
+	if _, exists := g.checkNames[name]; exists {
+		g.t.Errorf("conformance group has duplicate check name %q", name)
 		return
 	}
+	g.checkNames[name] = struct{}{}
+	if runCheck(g.t, name, fn) {
+		if _, recorded := g.skips[name]; recorded {
+			g.checks++
+			return
+		} else {
+			g.t.Errorf("conformance check %q was skipped without an explicit fixture record", name)
+			return
+		}
+	}
 	g.checks++
+}
+
+// Skip records a fixture-gated check before marking its subtest skipped. It
+// distinguishes an intentional unavailable-fixture result from t.Skip used
+// to pad a group while still satisfying its manifest count.
+func (g *groupContext) Skip(t *testing.T, name, reason string) {
+	if g.skips == nil {
+		g.skips = make(map[string]string)
+	}
+	g.skips[name] = reason
+	t.Skip(reason)
 }
 
 func runCheck(t *testing.T, name string, fn func(*testing.T)) (skipped bool) {

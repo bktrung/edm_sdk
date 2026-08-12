@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"time"
 
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/driver"
 )
@@ -23,6 +24,8 @@ type consumer struct {
 	outstanding  int
 	unsettled    map[string]int
 	unsettledKey map[deliveryKey]int
+	ackDeadline  time.Duration
+	inflight     map[*settler]struct{}
 }
 
 type deliveryKey struct {
@@ -132,11 +135,12 @@ func contains(values []string, want string) bool {
 }
 
 type settler struct {
-	mu       sync.Mutex
-	conn     *conn
-	consumer *consumer
-	message  *queuedMessage
-	settled  bool
+	mu          sync.Mutex
+	conn        *conn
+	consumer    *consumer
+	message     *queuedMessage
+	settled     bool
+	deliveredAt time.Time
 }
 
 var _ driver.Settler = (*settler)(nil)
@@ -151,14 +155,15 @@ func (s *settler) settle(ctx context.Context, opt driver.NackOptions, nack bool)
 	if err := ctx.Err(); err != nil {
 		return classify("settle", driver.KindTransient, err)
 	}
+	s.conn.mu.Lock()
+	defer s.conn.mu.Unlock()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.settled {
 		return classify("settle", driver.KindFatal, driver.ErrAlreadySettled)
 	}
-	s.conn.mu.Lock()
-	defer s.conn.mu.Unlock()
 	s.settled = true
+	delete(s.consumer.inflight, s)
 	if s.consumer.outstanding > 0 {
 		s.consumer.outstanding--
 	}
@@ -182,7 +187,7 @@ func (s *settler) settle(ctx context.Context, opt driver.NackOptions, nack bool)
 		s.message.deliveryCount++
 		s.message.due = s.conn.clock.Now()
 		if dest, ok := s.conn.destinations[s.message.message.Destination]; ok {
-			dest.messages = append(dest.messages, s.message)
+			dest.messages = append([]*queuedMessage{s.message}, dest.messages...)
 		}
 	}
 	if s.consumer.group != nil && (!nack || !opt.Requeue) {

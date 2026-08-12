@@ -13,8 +13,12 @@ import (
 )
 
 // Driver is a stateless in-memory driver factory. Clock selects the time
-// source used by connections; a nil clock uses the real clock.
-type Driver struct{ Clock clock.Clock }
+// source used by connections; a nil clock uses the real clock. The minimal
+// capability mode is conformance-only and intentionally unexported.
+type Driver struct {
+	Clock   clock.Clock
+	minimal bool
+}
 
 const (
 	// These limits exercise the driver's limit-reporting and enforcement paths;
@@ -33,8 +37,8 @@ func (Driver) Name() string { return "inmem" }
 
 // Capabilities reports the behavior implemented by the in-memory driver. Native DLQ,
 // priority, transactions, and server-side filtering are intentionally false.
-func (Driver) Capabilities() driver.Capabilities {
-	return driver.Capabilities{
+func (d Driver) Capabilities() driver.Capabilities {
+	caps := driver.Capabilities{
 		PerMessageAck:       true,
 		OrderedByKey:        true,
 		NativeDelay:         true,
@@ -44,6 +48,18 @@ func (Driver) Capabilities() driver.Capabilities {
 		MaxMessageBytes:     maxMessageBytes,
 		MaxHeaderBytes:      maxHeaderBytes,
 	}
+	if d.minimal {
+		// This is the one deliberate non-native declaration: the capability
+		// suite needs to execute both sides of preserved declarations. The
+		// driver still implements the partition-bound behavior (one consumer
+		// is exercised), while the zero limits and denied ordering path are
+		// enforced from Effective exactly like the normal declaration.
+		caps.OrderedByKey = false
+		caps.ConsumerScaling = driver.ScalingPartitionBound
+		caps.MaxMessageBytes = 0
+		caps.MaxHeaderBytes = 0
+	}
+	return caps
 }
 
 // Open creates an isolated in-memory connection.
@@ -73,20 +89,22 @@ func (d Driver) Open(ctx context.Context, _ driver.Config) (driver.Conn, error) 
 type conn struct {
 	mu sync.Mutex
 
-	clock        clock.Clock
-	caps         driver.Capabilities
-	info         driver.BrokerInfo
-	destinations map[string]*destination
-	consumers    map[*consumer]struct{}
-	groups       map[string]*groupState
-	producers    int
-	closed       bool
-	nextRef      atomic.Uint64
-	nextMessage  atomic.Uint64
-	wake         chan struct{}
-	done         chan struct{}
-	pumpDone     chan struct{}
-	closeOnce    sync.Once
+	clock            clock.Clock
+	caps             driver.Capabilities
+	info             driver.BrokerInfo
+	destinations     map[string]*destination
+	consumers        map[*consumer]struct{}
+	groups           map[string]*groupState
+	producers        int
+	closed           bool
+	failPublish      bool
+	failPublishFatal bool
+	nextRef          atomic.Uint64
+	nextMessage      atomic.Uint64
+	wake             chan struct{}
+	done             chan struct{}
+	pumpDone         chan struct{}
+	closeOnce        sync.Once
 }
 
 var _ driver.Conn = (*conn)(nil)
@@ -129,6 +147,10 @@ func (c *conn) Producer(ctx context.Context, cfg driver.ProducerConfig) (driver.
 }
 
 func (c *conn) Consumer(ctx context.Context, cfg driver.ConsumerConfig) (driver.Consumer, error) {
+	return c.newConsumer(ctx, cfg, 0)
+}
+
+func (c *conn) newConsumer(ctx context.Context, cfg driver.ConsumerConfig, ackDeadline time.Duration) (driver.Consumer, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, classify("consumer", driver.KindTransient, err)
 	}
@@ -188,6 +210,8 @@ func (c *conn) Consumer(ctx context.Context, cfg driver.ConsumerConfig) (driver.
 		unsettledKey: make(map[deliveryKey]int),
 		group:        group,
 		startAfter:   startAfter,
+		ackDeadline:  ackDeadline,
+		inflight:     make(map[*settler]struct{}),
 	}
 	for _, name := range cfg.Destinations {
 		c.destinations[name].consumers[cs] = struct{}{}
@@ -246,6 +270,7 @@ func (c *conn) pump() {
 			c.mu.Unlock()
 			return
 		}
+		c.expireDeadlinesLocked()
 		c.dispatchLocked()
 		next, ok := c.nextDueLocked()
 		c.mu.Unlock()
@@ -283,7 +308,84 @@ func (c *conn) nextDueLocked() (time.Time, bool) {
 			next = dest.messages[0].due
 		}
 	}
+	for consumer := range c.consumers {
+		if consumer.ackDeadline <= 0 {
+			continue
+		}
+		for delivery := range consumer.inflight {
+			due := delivery.deliveredAt.Add(consumer.ackDeadline)
+			if next.IsZero() || due.Before(next) {
+				next = due
+			}
+		}
+	}
 	return next, !next.IsZero()
+}
+
+func (c *conn) expireDeadlinesLocked() {
+	now := c.clock.Now()
+	for consumer := range c.consumers {
+		if consumer.ackDeadline <= 0 {
+			continue
+		}
+		for delivery := range consumer.inflight {
+			if now.Before(delivery.deliveredAt.Add(consumer.ackDeadline)) {
+				continue
+			}
+			c.requeueDeliveryLocked(delivery, now)
+		}
+	}
+}
+
+func (c *conn) requeueDeliveryLocked(delivery *settler, now time.Time) {
+	delivery.mu.Lock()
+	if delivery.settled {
+		delivery.mu.Unlock()
+		return
+	}
+	delivery.settled = true
+	delivery.mu.Unlock()
+	consumer := delivery.consumer
+	delete(consumer.inflight, delivery)
+	if consumer.outstanding > 0 {
+		consumer.outstanding--
+	}
+	name := delivery.message.message.Destination
+	if consumer.unsettled[name] > 0 {
+		consumer.unsettled[name]--
+	}
+	key := string(delivery.message.message.Key)
+	if key != "" {
+		keyID := deliveryKey{destination: name, key: key}
+		if consumer.unsettledKey[keyID] > 1 {
+			consumer.unsettledKey[keyID]--
+		} else {
+			delete(consumer.unsettledKey, keyID)
+			if dest, ok := c.destinations[name]; ok && dest.affinity[key] == consumer {
+				delete(dest.affinity, key)
+			}
+		}
+	}
+	delivery.message.deliveryCount++
+	delivery.message.due = now
+	if dest, ok := c.destinations[name]; ok {
+		dest.messages = append([]*queuedMessage{delivery.message}, dest.messages...)
+	}
+}
+
+func (c *conn) dropInFlightLocked(op string) {
+	now := c.clock.Now()
+	for consumer := range c.consumers {
+		select {
+		case consumer.errs <- classify(op, driver.KindTransient, errors.New("injected connection fault")):
+		default:
+		}
+		for delivery := range consumer.inflight {
+			c.requeueDeliveryLocked(delivery, now)
+		}
+	}
+	c.dispatchLocked()
+	c.signalWake()
 }
 
 func (c *conn) dispatchLocked() {
@@ -301,11 +403,12 @@ destinationLoop:
 				if cs == nil {
 					continue
 				}
-				inbound := c.inboundLocked(cs, dest.spec.Name, msg)
+				inbound, delivery := c.inboundLocked(cs, dest.spec.Name, msg)
 				select {
 				case cs.messages <- inbound:
 					cs.outstanding++
 					cs.unsettled[dest.spec.Name]++
+					cs.inflight[delivery] = struct{}{}
 					key := string(msg.message.Key)
 					if key != "" {
 						dest.affinity[key] = cs
@@ -377,8 +480,9 @@ func (c *consumer) visible(message *queuedMessage, destination string) bool {
 	return message.sequence > c.startAfter[destination]
 }
 
-func (c *conn) inboundLocked(cs *consumer, destination string, msg *queuedMessage) driver.InboundMessage {
+func (c *conn) inboundLocked(cs *consumer, destination string, msg *queuedMessage) (driver.InboundMessage, *settler) {
 	c.nextRef.Add(1)
+	delivery := &settler{conn: c, consumer: cs, message: msg, deliveredAt: c.clock.Now()}
 	return driver.InboundMessage{
 		Destination:   destination,
 		Key:           cloneBytes(msg.message.Key),
@@ -387,8 +491,8 @@ func (c *conn) inboundLocked(cs *consumer, destination string, msg *queuedMessag
 		DeliveryCount: deliveryCount(cs.cfg.Effective, msg.deliveryCount),
 		ReceivedAt:    c.clock.Now(),
 		Ref:           driver.BrokerRef{Tag: c.nextRef.Load(), Raw: destination},
-		Settle:        &settler{conn: c, consumer: cs, message: msg},
-	}
+		Settle:        delivery,
+	}, delivery
 }
 
 func deliveryCount(caps driver.Capabilities, count int) int {
