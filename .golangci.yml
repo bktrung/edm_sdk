@@ -52,6 +52,7 @@ linters:
             - "!**/driver/**"
             - "!**/drivers/**"
             - "!**/cmd/**"
+            - "!**/internal/obs/**"
           deny:
             - pkg: fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/drivers
               desc: "core must not import drivers"
@@ -59,6 +60,18 @@ linters:
               desc: "core must not import a broker client directly"
             - pkg: github.com/rabbitmq/amqp091-go
               desc: "core must not import a broker client directly"
+            # The metric and trace API modules are public type names used by
+            # the provider options. All implementation modules stay private.
+            - pkg: go.opentelemetry.io/otel$
+              desc: "OpenTelemetry global providers belong in internal/obs"
+            - pkg: go.opentelemetry.io/otel/sdk
+              desc: "OpenTelemetry SDK belongs in internal/obs"
+            - pkg: go.opentelemetry.io/otel/semconv
+              desc: "OpenTelemetry semantic conventions belong in internal/obs"
+            - pkg: go.opentelemetry.io/otel/exporters
+              desc: "OpenTelemetry exporters belong in internal/obs"
+            - pkg: go.opentelemetry.io/otel/attribute
+              desc: "OpenTelemetry attributes belong in internal/obs"
 
         driver-port:
           files:
@@ -83,6 +96,16 @@ linters:
               desc: "the conformance suite must not import a driver"
             - pkg: $all
               desc: "the conformance suite may import only the port and testify"
+
+        internal-obs:
+          files:
+            - "**/internal/obs/**"
+          allow:
+            - $gostd
+            - go.opentelemetry.io/otel
+          deny:
+            - pkg: $all
+              desc: "observability may import only the standard library and OpenTelemetry"
 
         # cmd/ registers drivers but must not import broker clients directly.
         cmd:

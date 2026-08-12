@@ -51,6 +51,12 @@ verify-agnostic:
   script:
     - make verify-agnostic
 
+cardinality:
+  stage: verify
+  extends: .go-cache
+  script:
+    - make check-cardinality
+
 # Add coverage thresholds as packages gain dedicated coverage requirements.
 
 # New `// TENTATIVE` markers must include an issue link.

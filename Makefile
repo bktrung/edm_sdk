@@ -11,7 +11,7 @@ export GOPRIVATE := fgit.zapps.vn
 
 APISURFACE := $(CURDIR)/.tools/bin/apisurface
 
-.PHONY: build test-fast test test-chaos kpi lint verify-agnostic verify-self-contained swap-report check-fixture check-api-surface check-api-surface-codec check-api-surface-driver
+.PHONY: build test-fast test test-chaos kpi lint verify-agnostic verify-self-contained check-cardinality swap-report check-fixture check-api-surface check-api-surface-codec check-api-surface-driver
 
 ## build: compile all packages with reproducible build flags.
 build:
@@ -44,6 +44,10 @@ lint: $(GOLANGCI_LINT)
 ## verify-agnostic: check broker import boundaries with depguard.
 verify-agnostic: $(GOLANGCI_LINT)
 	$(GOLANGCI_LINT) run --enable-only depguard ./...
+
+## check-cardinality: enforce the bounded metric label registry.
+check-cardinality:
+	go run ./tools/cardinality
 
 ## verify-self-contained: fail on citations no reader of this repository can resolve.
 # Design records live elsewhere. A reader here - a broker vendor, an auditor, a
