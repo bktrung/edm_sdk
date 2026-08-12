@@ -151,24 +151,37 @@ func TestTerminalNotificationsCannotBlockSettlement(t *testing.T) {
 	t.Parallel()
 	started := make(chan struct{})
 	release := make(chan struct{})
-	returned := make(chan struct{})
-	go func() {
-		notifyDiscarded(context.Background(), func(context.Context, Discarded) {
+	settled := make(chan struct{})
+	runner := &Runner{subscription: Subscription{
+		OnDiscarded: func(context.Context, Discarded) {
 			close(started)
 			<-release
-		}, Discarded{Reason: DiscardUnmatched})
-		close(returned)
+		},
+	}}
+	go func() {
+		runnerNotifyDiscarded(runner, context.Background(), Discarded{Reason: DiscardUnmatched})
+		close(settled)
 	}()
 	timer := clock.NewReal().Timer(100 * time.Millisecond)
 	defer timer.Stop()
 	select {
-	case <-returned:
+	case <-started:
 	case <-timer.C:
-		t.Fatal("notification blocked settlement")
+		t.Fatal("notification did not start")
 	}
-	<-started
+	select {
+	case <-settled:
+		t.Fatal("settlement ran before the notification returned")
+	case <-timer.C:
+	}
 	close(release)
-	notifyDeadLetter(context.Background(), func(context.Context, DeadLettered) { panic("notification panic") }, DeadLettered{Reason: ReasonTerminal})
+	select {
+	case <-settled:
+	case <-clock.NewReal().Timer(time.Second).C:
+		t.Fatal("notification did not release settlement")
+	}
+	runner.subscription.OnDeadLetter = func(context.Context, DeadLettered) { panic("notification panic") }
+	runnerNotifyDeadLetter(runner, context.Background(), DeadLettered{Reason: ReasonTerminal})
 }
 
 func testBrokerInfo() driver.BrokerInfo {

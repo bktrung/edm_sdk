@@ -29,6 +29,7 @@ type Client struct {
 	closing         bool
 	activePublishes int
 	publishIdle     chan struct{}
+	runners         map[*Runner]struct{}
 }
 
 // Limits describes how the connected broker provides each SDK feature.
@@ -94,6 +95,7 @@ func New(ctx context.Context, cfg Config, opts ...Option) (*Client, error) {
 		source:    fmt.Sprintf("/%s/%s", cfg.Env, cfg.Service),
 		producer:  fmt.Sprintf("%s/unknown/%s", cfg.Service, cfg.InstanceID),
 		driver:    options.driver.Name(),
+		runners:   make(map[*Runner]struct{}),
 	}
 	client.limits = limitsFor(options.driver.Name(), connection.BrokerInfo(), effective)
 	logCapabilities(client)
@@ -191,7 +193,19 @@ func (c *Client) Close(ctx context.Context) error {
 	}
 	c.closing = true
 	idle := c.publishIdle
+	runners := make([]*Runner, 0, len(c.runners))
+	for runner := range c.runners {
+		runners = append(runners, runner)
+	}
 	c.mu.Unlock()
+	for _, runner := range runners {
+		if err := runner.Drain(ctx); err != nil {
+			c.mu.Lock()
+			c.closing = false
+			c.mu.Unlock()
+			return err
+		}
+	}
 	if idle != nil {
 		select {
 		case <-idle:
@@ -230,6 +244,40 @@ func (c *Client) Close(ctx context.Context) error {
 	c.closed = true
 	c.closing = false
 	return nil
+}
+
+// publishMessages sends core-generated successor messages through the client's
+// shared producer. allowClosing is reserved for workers finishing a delivery
+// after Close has stopped admission of new application publishes.
+func publishMessages(c *Client, ctx context.Context, allowClosing bool, messages ...driver.OutboundMessage) error {
+	if len(messages) == 0 {
+		return nil
+	}
+	c.mu.Lock()
+	if c.closed || c.conn == nil || (!allowClosing && c.closing) {
+		c.mu.Unlock()
+		return errors.New("f1: client is closed")
+	}
+	producer := c.producerHandle
+	var err error
+	if producer == nil {
+		producer, err = c.conn.Producer(ctx, driver.ProducerConfig{RequireDurableAck: true, Effective: c.effective})
+		if err == nil && producer == nil {
+			err = errors.New("driver returned a nil producer")
+		}
+		if err == nil {
+			c.producerHandle = producer
+		}
+	}
+	if err == nil {
+		beginPublish(c)
+	}
+	c.mu.Unlock()
+	if err != nil {
+		return err
+	}
+	defer endPublish(c)
+	return producer.Publish(ctx, messages...)
 }
 
 func beginPublish(c *Client) {

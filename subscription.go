@@ -4,11 +4,17 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 	"unicode"
+
+	"golang.org/x/sync/errgroup"
+
+	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/driver"
 )
 
 // Subscription declares one consumer group, its delivery policy, and the
@@ -76,55 +82,86 @@ type Runner struct {
 	client       *Client
 	subscription Subscription
 	config       SubscriptionConfig
+	mu           sync.Mutex
+	consumer     driver.Consumer
+	group        *errgroup.Group
+	// asyncGroup owns handler and terminal-callback goroutines. finishRunner
+	// cancels their contexts but does not wait: a non-cooperative handler or
+	// callback cannot be force-stopped, and waiting would violate drain's bound.
+	asyncGroup            *errgroup.Group
+	runCtx                context.Context
+	handlerCtx            context.Context
+	handlerCancel         context.CancelFunc
+	handlerShutdownCtx    context.Context
+	handlerShutdownCancel context.CancelFunc
+	settleCtx             context.Context
+	settleCancel          context.CancelFunc
+	cancel                context.CancelFunc
+	done                  chan struct{}
+	started               bool
+	draining              bool
+	finished              bool
+	runErr                error
+	inflight              *inflightRegistry
 }
 
 const terminalNotificationTimeout = time.Second
 
-// notifyDeadLetter delivers a terminal notification outside the settlement
-// path. The callback receives a bounded context; a panic is isolated from the
-// worker and a callback that ignores its context cannot hold settlement.
-func notifyDeadLetter(parent context.Context, callback func(context.Context, DeadLettered), payload DeadLettered) {
+func runnerNotifyDeadLetter(r *Runner, parent context.Context, payload DeadLettered) {
+	if r == nil || r.subscription.OnDeadLetter == nil {
+		return
+	}
+	runnerNotify(r, parent, func(ctx context.Context) { r.subscription.OnDeadLetter(ctx, payload) }, "dead-letter")
+}
+
+func runnerNotifyDiscarded(r *Runner, parent context.Context, payload Discarded) {
+	if r == nil || r.subscription.OnDiscarded == nil {
+		return
+	}
+	runnerNotify(r, parent, func(ctx context.Context) { r.subscription.OnDiscarded(ctx, payload) }, "discarded")
+}
+
+func runnerNotify(r *Runner, parent context.Context, callback func(context.Context), kind string) {
+	r.mu.Lock()
+	group := r.asyncGroup
+	r.mu.Unlock()
+	if group == nil {
+		group = new(errgroup.Group)
+	}
+	if parent == nil {
+		return
+	}
+	notifyOwned(parent, callback, group, runnerLogger(r), kind)
+}
+
+func notifyOwned(parent context.Context, callback func(context.Context), group *errgroup.Group, logger *slog.Logger, kind string) {
 	if callback == nil {
 		return
 	}
-	ctx, cancel := context.WithTimeout(parent, terminalNotificationTimeout)
-	go func() {
-		defer cancel()
-		defer func() { _ = recover() }()
-		callback(ctx, payload)
-	}()
-}
-
-// notifyDiscarded is the discard counterpart of notifyDeadLetter.
-func notifyDiscarded(parent context.Context, callback func(context.Context, Discarded), payload Discarded) {
-	if callback == nil {
-		return
+	if group == nil {
+		group = new(errgroup.Group)
+	}
+	if logger == nil {
+		logger = slog.Default()
 	}
 	ctx, cancel := context.WithTimeout(parent, terminalNotificationTimeout)
-	go func() {
-		defer cancel()
-		defer func() { _ = recover() }()
-		callback(ctx, payload)
-	}()
-}
-
-// Run blocks until ctx is canceled. Worker dispatch is installed by the
-// consumer phase; validation still occurs eagerly in Subscribe.
-func (r *Runner) Run(ctx context.Context) error {
-	if r == nil {
-		return errors.New("f1: runner is nil")
+	defer cancel()
+	done := make(chan struct{})
+	group.Go(func() (err error) {
+		defer close(done)
+		defer func() {
+			if recovered := recover(); recovered != nil {
+				logger.Warn("f1 terminal notification panicked", "kind", kind, "panic", recovered)
+			}
+		}()
+		callback(ctx)
+		return nil
+	})
+	select {
+	case <-done:
+	case <-ctx.Done():
+		logger.Warn("f1 terminal notification timed out", "kind", kind, "timeout", terminalNotificationTimeout)
 	}
-	<-ctx.Done()
-	return ctx.Err()
-}
-
-// Drain requests graceful runner shutdown. There is no active worker to drain
-// until Run is connected to the consumer phase.
-func (r *Runner) Drain(ctx context.Context) error {
-	if r == nil {
-		return errors.New("f1: runner is nil")
-	}
-	return ctx.Err()
 }
 
 // Subscribe validates sub after applying the subscription-specific config
@@ -178,7 +215,15 @@ func (c *Client) Subscribe(ctx context.Context, sub Subscription) (*Runner, erro
 	effective.MaxDeferrals = resolved.MaxDeferrals
 	effective.HandlerTimeout = resolved.HandlerTimeout
 	effective.UnmatchedPolicy = resolved.UnmatchedPolicy
-	return &Runner{client: c, subscription: effective, config: resolved}, nil
+	runner := &Runner{client: c, subscription: effective, config: resolved}
+	c.mu.Lock()
+	if c.closed || c.closing || c.conn == nil {
+		c.mu.Unlock()
+		return nil, errors.New("f1: client is closing")
+	}
+	c.runners[runner] = struct{}{}
+	c.mu.Unlock()
+	return runner, nil
 }
 
 func resolveSubscription(c *Client, sub Subscription) (SubscriptionConfig, error) {

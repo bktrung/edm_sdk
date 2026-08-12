@@ -135,12 +135,6 @@ func WithErrorHandler(handler func(context.Context, *Event, error)) Option {
 	}
 }
 
-// Event is the message view passed to a Handler.
-// Dispatch fills its data when subscriptions are introduced.
-type Event struct {
-	envelope Envelope
-}
-
 // Handler processes one delivered Event.
 type Handler interface {
 	Handle(context.Context, *Event) error
