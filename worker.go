@@ -536,6 +536,11 @@ func invokeHandler(r *Runner, parent context.Context, handler Handler, event *Ev
 			}()
 			result.err = handler.Handle(handlerCtx, event)
 		}()
+		var panicErr *handlerPanicError
+		if errors.As(result.err, &panicErr) {
+			result.panic = panicErr
+			result.err = nil
+		}
 		done <- result
 		return nil
 	})

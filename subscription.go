@@ -36,14 +36,6 @@ type Subscription struct {
 	Handlers        map[string]Handler
 }
 
-// HandlerFunc adapts a function to Handler.
-type HandlerFunc func(context.Context, *Event) error
-
-// Handle invokes f for the event.
-func (f HandlerFunc) Handle(ctx context.Context, event *Event) error {
-	return f(ctx, event)
-}
-
 // DeadLettered describes one message whose confirmed copy reached a DLQ.
 type DeadLettered struct {
 	Envelope    Envelope
@@ -215,6 +207,7 @@ func (c *Client) Subscribe(ctx context.Context, sub Subscription) (*Runner, erro
 	effective.MaxDeferrals = resolved.MaxDeferrals
 	effective.HandlerTimeout = resolved.HandlerTimeout
 	effective.UnmatchedPolicy = resolved.UnmatchedPolicy
+	effective.Handlers = wrapHandlers(c.options.middleware, sub.Handlers)
 	runner := &Runner{client: c, subscription: effective, config: resolved}
 	c.mu.Lock()
 	if c.closed || c.closing || c.conn == nil {
@@ -224,6 +217,17 @@ func (c *Client) Subscribe(ctx context.Context, sub Subscription) (*Runner, erro
 	c.runners[runner] = struct{}{}
 	c.mu.Unlock()
 	return runner, nil
+}
+
+func wrapHandlers(middleware []Middleware, handlers map[string]Handler) map[string]Handler {
+	if handlers == nil {
+		return nil
+	}
+	wrapped := make(map[string]Handler, len(handlers))
+	for pattern, handler := range handlers {
+		wrapped[pattern] = buildHandlerChain(middleware, handler)
+	}
+	return wrapped
 }
 
 func resolveSubscription(c *Client, sub Subscription) (SubscriptionConfig, error) {

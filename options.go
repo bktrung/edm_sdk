@@ -135,14 +135,6 @@ func WithErrorHandler(handler func(context.Context, *Event, error)) Option {
 	}
 }
 
-// Handler processes one delivered Event.
-type Handler interface {
-	Handle(context.Context, *Event) error
-}
-
-// Middleware wraps a Handler in the Client's dispatch chain.
-type Middleware func(Handler) Handler
-
 func isNil(value any) bool {
 	if value == nil {
 		return true
