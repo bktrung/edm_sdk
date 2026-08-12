@@ -12,9 +12,7 @@ type Capabilities struct {
 	NativeDelay          bool         // broker-level delayed delivery support
 	NativeDeliveryCount  bool         // broker reports redelivery count
 	NativeDLQ            bool         // broker routes to a DLQ on limit
-	Transactions         bool         // broker transaction support
 	ConsumerScaling      Scaling      // PartitionBound | Free
-	ServerSideFilter     bool         // broker-side message filtering
 	MaxMessageBytes      int          // physical broker limit
 	MaxHeaderBytes       int          // physical broker limit
 	LagQueryable         bool         // broker exposes backlog
