@@ -34,12 +34,22 @@ func TestSubscriptionTopologyMatchesFanoutModes(t *testing.T) {
 	tests := []struct {
 		name         string
 		mode         driver.FanoutMode
+		nativeDLQ    bool
 		main         []string
 		wantExchange bool
 	}{
 		{
 			name: "consume",
 			mode: driver.FanoutAtConsume,
+			main: []string{
+				"f1.prod.order.created.high",
+				"f1.prod.order.created.normal",
+			},
+		},
+		{
+			name:      "consume_native_dlq",
+			mode:      driver.FanoutAtConsume,
+			nativeDLQ: true,
 			main: []string{
 				"f1.prod.order.created.high",
 				"f1.prod.order.created.normal",
@@ -54,12 +64,31 @@ func TestSubscriptionTopologyMatchesFanoutModes(t *testing.T) {
 			},
 			wantExchange: true,
 		},
+		{
+			name:      "publish_native_dlq",
+			mode:      driver.FanoutAtPublish,
+			nativeDLQ: true,
+			main: []string{
+				"f1.prod.order.created.order-worker.high",
+				"f1.prod.order.created.order-worker.normal",
+			},
+			wantExchange: true,
+		},
 	}
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			effective := driver.Capabilities{Fanout: test.mode}
+			effective := driver.Capabilities{Fanout: test.mode, NativeDLQ: test.nativeDLQ}
 			spec := subscriptionTopologySpecs(effective, source, sub)
+			// The backstop receives what the broker dead-lettered on its own
+			// delivery counter. A broker that cannot do that must not be asked
+			// to create the queue, or it creates one that can never fill.
+			wantLimit := 0
+			wantRoute := ""
+			if test.nativeDLQ {
+				wantLimit = 8
+				wantRoute = wantBackstop
+			}
 			wantSubscribed := append(append([]string(nil), test.main...), wantRetry...)
 			sort.Strings(wantSubscribed)
 			if got := subscriptionDestinations(effective, source, sub); !reflect.DeepEqual(got, wantSubscribed) {
@@ -67,19 +96,24 @@ func TestSubscriptionTopologyMatchesFanoutModes(t *testing.T) {
 			}
 
 			wantNames := append(append([]string(nil), test.main...), wantRetry...)
-			wantNames = append(wantNames, wantDLQ, wantBackstop, wantUnknownDLQ)
+			wantNames = append(wantNames, wantDLQ, wantUnknownDLQ)
+			if test.nativeDLQ {
+				wantNames = append(wantNames, wantBackstop)
+			}
 			sort.Strings(wantNames)
 			if got := destinationNames(spec.Destinations); !reflect.DeepEqual(got, wantNames) {
 				t.Fatalf("declared destinations = %v, want %v", got, wantNames)
 			}
 			for _, name := range test.main {
-				assertDestination(t, spec, name, driver.DestMain, wantBackstop, 8)
+				assertDestination(t, spec, name, driver.DestMain, wantRoute, wantLimit)
 			}
 			for _, name := range wantRetry {
-				assertDestination(t, spec, name, driver.DestRetry, wantBackstop, 8)
+				assertDestination(t, spec, name, driver.DestRetry, wantRoute, wantLimit)
 			}
 			assertDestination(t, spec, wantDLQ, driver.DestDLQ, "", 0)
-			assertDestination(t, spec, wantBackstop, driver.DestBackstopDLQ, "", 0)
+			if test.nativeDLQ {
+				assertDestination(t, spec, wantBackstop, driver.DestBackstopDLQ, "", 0)
+			}
 			assertDestination(t, spec, wantUnknownDLQ, driver.DestDLQ, "", 0)
 
 			if test.wantExchange {
