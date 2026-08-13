@@ -6,7 +6,6 @@
     "BrokerConfig",
     "Client",
     "Client.Close",
-    "Client.ensurePublisherTopology",
     "Client.Health",
     "Client.Limits",
     "Client.Publisher",

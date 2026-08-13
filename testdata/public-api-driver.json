@@ -64,19 +64,19 @@
     "SASLConfig",
     "Scaling",
     "Scaling.String",
-    "TopologyDeclare",
-    "TopologyNone",
-    "TopologyPolicy",
-    "TopologyVerify",
     "ScalingFree",
     "ScalingPartitionBound",
+    "TopologyDeclare",
+    "TopologyDiff",
+    "TopologyNone",
+    "TopologyPolicy",
+    "TopologySpec",
+    "TopologyState",
+    "TopologyVerify",
     "Settler",
     "StartEarliest",
     "StartLatest",
     "StartPosition",
-    "TLSConfig",
-    "TopologyDiff",
-    "TopologySpec",
-    "TopologyState"
+    "TLSConfig"
   ]
 }
