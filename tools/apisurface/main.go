@@ -131,7 +131,7 @@ func extractSurface(moduleDir, pkg string) ([]string, error) {
 				if star, ok := recv.(*ast.StarExpr); ok {
 					recv = star.X
 				}
-				if id, ok := recv.(*ast.Ident); ok && ast.IsExported(id.Name) {
+				if id, ok := recv.(*ast.Ident); ok && ast.IsExported(id.Name) && ast.IsExported(d.Name.Name) {
 					add(id.Name + "." + d.Name.Name)
 				}
 			case *ast.GenDecl:

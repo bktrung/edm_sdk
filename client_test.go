@@ -167,6 +167,7 @@ func testClientConfig(t *testing.T) Config {
 	if err != nil {
 		t.Fatal(err)
 	}
+	cfg.Topology.AutoCreate = true
 	return cfg
 }
 

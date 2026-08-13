@@ -57,7 +57,9 @@ func TestAckDeliveryMarksAttemptAfterCallReturns(t *testing.T) {
 	if state.settled {
 		t.Fatal("failed Ack was marked settled")
 	}
-	forgetSettlementOperation(state)
+	if state.operation != settlementOperationAck {
+		t.Fatal("failed Ack did not record itself, so the retry cannot know what to repeat")
+	}
 }
 
 // TestNackDeliveryMarksAttemptAfterCallReturns verifies failed nack calls leave an attempted unknown state.
@@ -86,5 +88,7 @@ func TestNackDeliveryMarksAttemptAfterCallReturns(t *testing.T) {
 	if state.settled {
 		t.Fatal("failed Nack was marked settled")
 	}
-	forgetSettlementOperation(state)
+	if state.operation != settlementOperationNack {
+		t.Fatal("failed Nack did not record itself, so the retry cannot know what to repeat")
+	}
 }

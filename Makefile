@@ -139,7 +139,14 @@ $(APISURFACE): tools/apisurface/main.go tools/apisurface/go.mod
 $(APIDIFF): tools/apidiff/go.mod tools/apidiff/go.sum
 	cd tools/apidiff && go build -o ../../.tools/bin/apidiff golang.org/x/exp/cmd/apidiff
 
-.PHONY: broker-up broker-down broker-smoke
+.PHONY: broker-up broker-down broker-smoke test-rabbitmq
+
+## test-rabbitmq: run the RabbitMQ driver suite against the fixture, starting it
+## first. F1_REQUIRE_RABBITMQ makes an unreachable broker a failure rather than a
+## skip, so this target never reports success for a suite that did not run. The
+## broker is left running for repeat runs; stop it with broker-down.
+test-rabbitmq: broker-up broker-smoke
+	F1_REQUIRE_RABBITMQ=1 go test -race -count=1 ./drivers/rabbitmq/...
 
 ## broker-up: start the pinned local RabbitMQ fixture.
 broker-up:

@@ -105,7 +105,42 @@ func New(ctx context.Context, cfg Config, opts ...Option) (*Client, error) {
 	}
 	client.limits = limitsFor(options.driver.Name(), connection.BrokerInfo(), effective)
 	logCapabilities(client)
+	if err := client.ensurePublisherTopology(ctx); err != nil {
+		closeErr := connection.Close(ctx)
+		metricsErr := metrics.Close()
+		return nil, errors.Join(err, closeErr, metricsErr)
+	}
 	return client, nil
+}
+
+func (c *Client) topologyPolicy() driver.TopologyPolicy {
+	if c.options.topologyPolicySet {
+		return c.options.topologyPolicy
+	}
+	if c.config.Topology.AutoCreate {
+		return driver.TopologyDeclare
+	}
+	if c.config.Topology.VerifyOnStart {
+		return driver.TopologyVerify
+	}
+	return driver.TopologyNone
+}
+
+func (c *Client) ensurePublisherTopology(ctx context.Context) error {
+	policy := c.topologyPolicy()
+	if !c.options.publishTopicsSet || policy == driver.TopologyNone {
+		return nil
+	}
+	admin := c.conn.Admin()
+	if admin == nil {
+		return errors.New("f1: publisher topology requires driver admin")
+	}
+	spec := publisherTopologySpec(c.effective, c.source, c.options.publishTopics, c.config.Topology.Priorities)
+	spec.Policy = policy
+	if _, err := admin.EnsureTopology(ctx, spec); err != nil {
+		return fmt.Errorf("f1: ensure publisher topology: %w", err)
+	}
+	return nil
 }
 
 // Publisher returns a publisher using this client's connected driver and

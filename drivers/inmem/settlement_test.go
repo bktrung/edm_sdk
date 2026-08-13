@@ -184,6 +184,7 @@ func newSettlementRunner(t *testing.T, handler func(context.Context, *f1.Event) 
 	cfg.Service = "settlement"
 	cfg.InstanceID = "settlement-test"
 	cfg.Broker.Driver = "inmem"
+	cfg.Topology.AutoCreate = true
 	cfg.Broker.DefaultPrefetch = 1
 	cfg.Lifecycle.DrainTimeout = 500 * time.Millisecond
 	cfg.Lifecycle.HandlerGrace = 499 * time.Millisecond

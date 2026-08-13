@@ -97,6 +97,7 @@ func newReconnectSettlementRunner(t *testing.T, d *reconnectDriver, handler func
 	t.Setenv("F1_BROKER_DRIVER", "inmem")
 	cfg, err := f1.LoadConfig("")
 	require.NoError(t, err)
+	cfg.Topology.AutoCreate = true
 	cfg.Broker.DefaultPrefetch = 1
 	cfg.Lifecycle.DrainTimeout = 500 * time.Millisecond
 	cfg.Lifecycle.HandlerGrace = 499 * time.Millisecond

@@ -46,11 +46,25 @@ type BindingSpec struct {
 	Destination string // destination name, from TopologySpec.Destinations
 }
 
+// TopologyPolicy selects how a driver handles the topology in a spec.
+type TopologyPolicy int
+
+const (
+	// TopologyDeclare creates missing topology and is the default.
+	TopologyDeclare TopologyPolicy = iota
+	// TopologyVerify checks that topology exists and creates nothing.
+	TopologyVerify
+	// TopologyNone assumes topology exists and makes no broker round trip.
+	TopologyNone
+)
+
 // TopologySpec is the declarative description of broker topology.
 type TopologySpec struct {
 	Exchanges    []ExchangeSpec
 	Destinations []DestinationSpec
 	Bindings     []BindingSpec
+	// Policy selects whether the driver creates, verifies, or skips topology.
+	Policy TopologyPolicy
 	// Scope lists prefixes the driver may scan for core-owned orphans. An empty
 	// Scope disables scanning and sets OrphanScanError.
 	Scope []string
