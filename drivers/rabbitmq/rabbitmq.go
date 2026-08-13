@@ -46,11 +46,11 @@ func (Driver) Capabilities() driver.Capabilities {
 func (Driver) Open(ctx context.Context, cfg driver.Config) (driver.Conn, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, classify("open", driver.KindTransient, err)
+	}
+
 	if err := validateSASL(cfg.SASL); err != nil {
 		return nil, classify("open", driver.KindFatal, err)
 	}
-	}
-
 	openCtx := ctx
 	if cfg.ConnectTimeout > 0 {
 		var cancel context.CancelFunc
@@ -93,7 +93,7 @@ type conn struct {
 	caps   driver.Capabilities
 	info   driver.BrokerInfo
 	closed bool
-	active map[any]struct{}
+	active map[*consumer]struct{}
 }
 
 var _ driver.Conn = (*conn)(nil)
@@ -103,7 +103,7 @@ func newConn(amqpConn *amqp.Connection, caps driver.Capabilities) *conn {
 		amqp:   amqpConn,
 		caps:   caps,
 		info:   brokerInfo(amqpConn),
-		active: make(map[any]struct{}),
+		active: make(map[*consumer]struct{}),
 	}
 }
 
@@ -122,14 +122,33 @@ func (c *conn) Producer(ctx context.Context, _ driver.ProducerConfig) (driver.Pr
 	return nil, classify("producer", driver.KindFatal, driver.ErrUnsupported)
 }
 
-func (c *conn) Consumer(ctx context.Context, _ driver.ConsumerConfig) (driver.Consumer, error) {
+func (c *conn) Consumer(ctx context.Context, cfg driver.ConsumerConfig) (driver.Consumer, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, classify("consumer", driver.KindTransient, err)
 	}
-	return nil, classify("consumer", driver.KindFatal, driver.ErrUnsupported)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.closed || c.amqp.IsClosed() {
+		return nil, classify("consumer", driver.KindTransient, amqp.ErrClosed)
+	}
+	if len(cfg.Destinations) == 0 {
+		return nil, classify("consumer", driver.KindFatal, errors.New("no destinations"))
+	}
+	consumer, err := newConsumer(c, cfg)
+	if err != nil {
+		return nil, err
+	}
+	c.active[consumer] = struct{}{}
+	return consumer, nil
 }
 
 func (c *conn) Admin() driver.Admin { return &admin{} }
+
+func (c *conn) removeConsumer(consumer *consumer) {
+	c.mu.Lock()
+	delete(c.active, consumer)
+	c.mu.Unlock()
+}
 
 func (c *conn) Ping(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
@@ -261,6 +280,17 @@ func makeAMQPConfig(cfg driver.Config) (amqp.Config, error) {
 	config.TLSClientConfig = tlsConfig
 	return config, nil
 }
+func validateSASL(settings *driver.SASLConfig) error {
+	if settings == nil {
+		return nil
+	}
+	switch strings.ToLower(settings.Mechanism) {
+	case "", "plain", "amqplain", "external":
+		return nil
+	default:
+		return fmt.Errorf("rabbitmq: unsupported SASL mechanism %q; supported mechanisms: PLAIN, AMQPLAIN, EXTERNAL, or empty", settings.Mechanism)
+	}
+}
 
 func tlsConfig(settings *driver.TLSConfig) (*tls.Config, error) {
 	config := &tls.Config{InsecureSkipVerify: settings.InsecureSkipVerify} //nolint:gosec // explicitly controlled by the driver config
@@ -285,18 +315,6 @@ func tlsConfig(settings *driver.TLSConfig) (*tls.Config, error) {
 	config.Certificates = []tls.Certificate{certificate}
 	return config, nil
 }
-func validateSASL(settings *driver.SASLConfig) error {
-	if settings == nil {
-		return nil
-	}
-	switch strings.ToLower(settings.Mechanism) {
-	case "", "plain", "amqplain", "external":
-		return nil
-	default:
-		return fmt.Errorf("rabbitmq: unsupported SASL mechanism %q; supported mechanisms: PLAIN, AMQPLAIN, EXTERNAL, or empty", settings.Mechanism)
-	}
-}
-
 
 func isTestEndpoint(endpoints []string) bool {
 	if len(endpoints) == 0 {
