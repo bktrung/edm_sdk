@@ -511,24 +511,20 @@ func (c *consumer) Lag(ctx context.Context) (map[string]int64, error) {
 	if !c.cfg.Effective.LagQueryable {
 		return nil, classify("lag", driver.KindFatal, driver.ErrUnsupported)
 	}
-	channel, err := c.conn.amqp.Channel()
-	if err != nil {
-		return nil, classifyAMQP("lag", driver.KindTransient, err)
-	}
-	defer channel.Close()
+	admin := &admin{conn: c.conn}
 	lag := make(map[string]int64, len(c.lanes))
 	for _, lane := range c.lanes {
 		if err := ctx.Err(); err != nil {
 			return nil, classify("lag", driver.KindTransient, err)
 		}
-		queue, err := channel.QueueInspect(lane.destination)
+		ready, err := admin.inspectQueue(ctx, lane.destination)
 		if err != nil {
 			if isNotFound(err) {
-				return nil, classify("lag", driver.KindNotFound, errors.Join(driver.ErrDestinationMissing, err))
+				return nil, classify("lag", driver.KindNotFound, errors.Join(driver.ErrDestinationMissing, fmt.Errorf("destination %q is missing", lane.destination)))
 			}
 			return nil, classifyAMQP("lag", driver.KindTransient, err)
 		}
-		lag[lane.destination] = int64(queue.Messages)
+		lag[lane.destination] = ready
 	}
 	return lag, nil
 }

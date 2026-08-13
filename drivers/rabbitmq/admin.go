@@ -279,7 +279,8 @@ func (a *admin) inspectQueue(ctx context.Context, name string) (int64, error) {
 	if !owned {
 		defer channel.Close()
 	}
-	queue, err := channel.QueueInspect(name)
+	durable, exclusive := !owned, owned
+	queue, err := channel.QueueDeclarePassive(name, durable, false, exclusive, false, nil)
 	if err != nil {
 		return 0, err
 	}

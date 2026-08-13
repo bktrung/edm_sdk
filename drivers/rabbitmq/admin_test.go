@@ -32,7 +32,6 @@ func TestRabbitMQAdminPruneRefusesNonEmptyParking(t *testing.T) {
 	}
 	if err := producer.Publish(ctx, driver.OutboundMessage{
 		Destination: destination,
-		DelayUntil:  time.Now().Add(time.Hour),
 		Body:        []byte("parked"),
 	}); err != nil {
 		_ = producer.Close(ctx)

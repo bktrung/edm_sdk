@@ -27,13 +27,9 @@ func rabbitInspector(raw driver.Conn) (conformance.Inspect, error) {
 		if err := ctx.Err(); err != nil {
 			return conformance.BrokerView{}, err
 		}
-		channel, err := conn.amqp.Channel()
+		admin := &admin{conn: conn}
+		ready, err := admin.inspectQueue(ctx, destination)
 		if err != nil {
-			return conformance.BrokerView{}, err
-		}
-		queue, err := channel.QueueInspect(destination)
-		if err != nil {
-			_ = channel.Close()
 			return conformance.BrokerView{}, errors.Join(driver.ErrDestinationMissing, err)
 		}
 		parked := 0
@@ -45,15 +41,13 @@ func rabbitInspector(raw driver.Conn) (conformance.Inspect, error) {
 		}
 		conn.mu.RUnlock()
 		if deferred {
-			park, parkErr := channel.QueueInspect(destination + ".park")
+			park, parkErr := admin.inspectQueue(ctx, destination+".park")
 			if parkErr == nil {
-				parked = park.Messages
+				parked = int(park)
 			} else if !isNotFound(parkErr) {
-				_ = channel.Close()
 				return conformance.BrokerView{}, parkErr
 			}
 		}
-		_ = channel.Close()
 		var unsettled int64
 		for _, item := range active {
 			item.mu.Lock()
@@ -70,7 +64,7 @@ func rabbitInspector(raw driver.Conn) (conformance.Inspect, error) {
 			item.mu.Unlock()
 		}
 		return conformance.BrokerView{
-			Ready:     int64(queue.Messages),
+			Ready:     ready,
 			Unsettled: unsettled,
 			Auxiliary: int64(parked),
 		}, nil
