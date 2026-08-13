@@ -16,9 +16,21 @@ func (a *admin) EnsureTopology(ctx context.Context, spec driver.TopologySpec) (d
 	if err := ctx.Err(); err != nil {
 		return driver.TopologyDiff{}, classify("ensure_topology", driver.KindTransient, err)
 	}
+	if spec.Policy == driver.TopologyNone {
+		return driver.TopologyDiff{}, nil
+	}
 	a.conn.mu.Lock()
 	defer a.conn.mu.Unlock()
 	var diff driver.TopologyDiff
+	if spec.Policy == driver.TopologyVerify {
+		for _, item := range spec.Destinations {
+			if _, ok := a.conn.destinations[item.Name]; !ok {
+				return diff, classify("ensure_topology", driver.KindNotFound, fmt.Errorf("%s: %w", item.Name, driver.ErrDestinationMissing))
+			}
+			diff.Existing = append(diff.Existing, item.Name)
+		}
+		return diff, nil
+	}
 	for _, item := range spec.Destinations {
 		if _, ok := a.conn.destinations[item.Name]; ok {
 			diff.Existing = append(diff.Existing, item.Name)

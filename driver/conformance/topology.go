@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -20,6 +21,7 @@ func init() {
 var farFuture = time.Date(2100, time.January, 1, 0, 0, 0, 0, time.UTC)
 
 func runTopology(group *groupContext) {
+	runTopologyPolicyChecks(group)
 	group.Check("EnsureTopology creates missing destinations", func(t *testing.T) {
 		admin := group.conn.Admin()
 		// Suffixed by profile: Run shares one Conn across both profile passes,
@@ -639,4 +641,75 @@ func findPruneResult(results []driver.PruneResult, name string) driver.PruneResu
 		}
 	}
 	return driver.PruneResult{}
+}
+func runTopologyPolicyChecks(group *groupContext) {
+	group.Check("TopologyVerify reports the first missing destination without creating", func(t *testing.T) {
+		admin := group.conn.Admin()
+		existing := "topology.verify.existing." + group.profile.String()
+		missing := "topology.verify.missing." + group.profile.String()
+		second := "topology.verify.second." + group.profile.String()
+		if _, err := admin.EnsureTopology(group.ctx, driver.TopologySpec{
+			Destinations: []driver.DestinationSpec{{Name: existing}},
+			Effective:    group.effective,
+		}); err != nil {
+			t.Fatalf("seed topology: %v", err)
+		}
+		t.Cleanup(func() {
+			if _, err := admin.Purge(group.ctx, existing); err != nil {
+				t.Errorf("purge %q: %v", existing, err)
+			}
+		})
+		_, err := admin.EnsureTopology(group.ctx, driver.TopologySpec{
+			Destinations: []driver.DestinationSpec{{Name: existing}, {Name: missing}, {Name: second}},
+			Policy:       driver.TopologyVerify,
+			Effective:    group.effective,
+		})
+		if err == nil {
+			t.Fatal("TopologyVerify returned nil for a missing destination")
+		}
+		if kind, ok := driver.Classify(err); !ok || kind != driver.KindNotFound {
+			t.Fatalf("TopologyVerify classification = %v,%t, want not_found,true", kind, ok)
+		}
+		if !strings.Contains(err.Error(), missing) || strings.Contains(err.Error(), second) {
+			t.Fatalf("TopologyVerify error = %q, want first missing %q only", err, missing)
+		}
+		if _, inspectErr := group.inspect(group.ctx, missing); inspectErr == nil {
+			t.Fatalf("TopologyVerify created %q", missing)
+		}
+		if _, inspectErr := group.inspect(group.ctx, second); inspectErr == nil {
+			t.Fatalf("TopologyVerify created %q", second)
+		}
+		group.vector.Add(BehaviorEvent{ID: "topology-verify-missing", Outcome: "not-found", FinalDestination: "topology.verify.missing"})
+	})
+
+	group.Check("TopologyNone leaves missing topology untouched", func(t *testing.T) {
+		admin := group.conn.Admin()
+		name := "topology.none." + group.profile.String()
+		diff, err := admin.EnsureTopology(group.ctx, driver.TopologySpec{
+			Destinations: []driver.DestinationSpec{{Name: name}},
+			Policy:       driver.TopologyNone,
+			Effective:    group.effective,
+		})
+		if err != nil {
+			t.Fatalf("TopologyNone: %v", err)
+		}
+		if len(diff.CreatedDestinations) != 0 || len(diff.Existing) != 0 || len(diff.Orphaned) != 0 {
+			t.Fatalf("TopologyNone diff = %+v, want empty", diff)
+		}
+		producer, err := group.conn.Producer(group.ctx, driver.ProducerConfig{Effective: group.effective})
+		if err != nil {
+			t.Fatalf("producer: %v", err)
+		}
+		t.Cleanup(func() {
+			if err := producer.Close(group.ctx); err != nil {
+				t.Errorf("close producer: %v", err)
+			}
+		})
+		if err := producer.Publish(group.ctx, driver.OutboundMessage{Destination: name}); err == nil {
+			t.Fatalf("Publish(%q) succeeded after TopologyNone", name)
+		} else if kind, ok := driver.Classify(err); !ok || kind != driver.KindNotFound {
+			t.Fatalf("Publish(%q) classification = %v,%t, want not_found,true", name, kind, ok)
+		}
+		group.vector.Add(BehaviorEvent{ID: "topology-none", Outcome: "untouched", FinalDestination: "topology.none"})
+	})
 }
