@@ -528,16 +528,37 @@ func processDelivery(r *Runner, ctx context.Context, item delivery) {
 	state := &deliveryState{}
 	var envelope Envelope
 	defer func() {
+		defer forgetSettlementOperation(state)
 		if recovered := recover(); recovered != nil {
 			err := fmt.Errorf("handler panic: %v\n%s", recovered, debug.Stack())
 			deadLetterAndSettle(r, ctx, item.message, envelope, ReasonPanic, err, state)
 		}
-		if !state.settled && !state.attempted && !abandoned {
+		if !state.settled && !state.attempted {
 			_ = nackDelivery(r, runnerSettlementContext(r, ctx), item.message, driver.NackOptions{Requeue: true}, state)
 		}
-		if state.settled {
-			r.inflight.Remove(item.id)
+		operation := settlementOperationFor(state)
+		if !state.settled {
+			switch operation {
+			case settlementOperationAck:
+				_ = ackDelivery(r, runnerSettlementContext(r, ctx), item.message, state)
+			case settlementOperationNack:
+				_ = nackDelivery(r, runnerSettlementContext(r, ctx), item.message, driver.NackOptions{Requeue: true}, state)
+			}
 		}
+		if !state.settled && operation == settlementOperationAck {
+			_ = nackDelivery(r, runnerSettlementContext(r, ctx), item.message, driver.NackOptions{Requeue: true}, state)
+		}
+		operation = settlementOperationFor(state)
+		outcome := settlementOutcomeUnknown
+		if abandoned {
+			outcome = settlementOutcomeAbandoned
+		} else if state.settled {
+			outcome = settlementOutcomeSettled
+			if operation == settlementOperationNack {
+				outcome = settlementOutcomeRequeued
+			}
+		}
+		r.inflight.RemoveAs(item.id, outcome)
 	}()
 	dispatchMessage(r, ctx, item.message, &envelope, &abandoned, state)
 }
