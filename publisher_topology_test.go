@@ -180,9 +180,10 @@ func (d *topologyTestDriver) Open(context.Context, driver.Config) (driver.Conn, 
 
 type topologyTestConn struct {
 	*testConn
-	admin    driver.Admin
-	producer driver.Producer
-	consumer driver.Consumer
+	admin          driver.Admin
+	producer       driver.Producer
+	consumer       driver.Consumer
+	consumerOpened chan struct{}
 }
 
 func (c *topologyTestConn) Admin() driver.Admin { return c.admin }
@@ -195,6 +196,12 @@ func (c *topologyTestConn) Producer(context.Context, driver.ProducerConfig) (dri
 }
 
 func (c *topologyTestConn) Consumer(context.Context, driver.ConsumerConfig) (driver.Consumer, error) {
+	if c.consumerOpened != nil {
+		select {
+		case c.consumerOpened <- struct{}{}:
+		default:
+		}
+	}
 	if c.consumer == nil {
 		return nil, errors.New("test consumer is not configured")
 	}
@@ -202,14 +209,21 @@ func (c *topologyTestConn) Consumer(context.Context, driver.ConsumerConfig) (dri
 }
 
 type topologyRecordingAdmin struct {
-	mu    sync.Mutex
-	specs []driver.TopologySpec
+	mu     sync.Mutex
+	specs  []driver.TopologySpec
+	called chan struct{}
 }
 
 func (a *topologyRecordingAdmin) EnsureTopology(_ context.Context, spec driver.TopologySpec) (driver.TopologyDiff, error) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	a.specs = append(a.specs, spec)
+	if a.called != nil {
+		select {
+		case a.called <- struct{}{}:
+		default:
+		}
+	}
 	return driver.TopologyDiff{}, nil
 }
 
@@ -223,4 +237,10 @@ func (*topologyRecordingAdmin) Purge(context.Context, string) (int64, error) {
 
 func (*topologyRecordingAdmin) Prune(context.Context, []string) ([]driver.PruneResult, error) {
 	return nil, driver.ErrUnsupported
+}
+
+func (a *topologyRecordingAdmin) snapshot() []driver.TopologySpec {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return append([]driver.TopologySpec(nil), a.specs...)
 }
