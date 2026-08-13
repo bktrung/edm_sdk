@@ -230,3 +230,89 @@ func TestDrainCancelsHandlerAfterGrace(t *testing.T) {
 		t.Fatal("handler cancellation was not called")
 	}
 }
+
+func TestDrainHandlesGraceBoundary(t *testing.T) {
+	var machine *Machine
+	if err := machine.Drain(context.Background(), Config{}, Hooks{}); err == nil {
+		t.Fatal("nil machine drain must fail")
+	}
+
+	fake := clock.NewFake(time.Unix(0, 0))
+	machine = New()
+	if err := machine.Transition(Ready); err != nil {
+		t.Fatal(err)
+	}
+	cancelled := make(chan struct{})
+	done := make(chan error, 1)
+	go func() {
+		done <- machine.Drain(context.Background(), Config{Clock: fake, DrainTimeout: 5 * time.Second, HandlerGrace: 5 * time.Second}, Hooks{
+			CancelHandler: func() { close(cancelled) },
+		})
+	}()
+	fake.BlockUntil(1)
+	select {
+	case <-cancelled:
+		t.Fatal("handler cancelled before the drain budget elapsed")
+	default:
+	}
+	fake.Advance(5 * time.Second)
+	if err := <-done; err != nil {
+		t.Fatalf("Drain() = %v", err)
+	}
+	select {
+	case <-cancelled:
+	default:
+		t.Fatal("handler was not cancelled at the drain budget")
+	}
+}
+
+func TestDrainReturnsHookAndParentErrors(t *testing.T) {
+	machine := New()
+	if err := machine.Transition(Ready); err != nil {
+		t.Fatal(err)
+	}
+	want := errors.New("flush failed before timeout")
+	if err := machine.Drain(context.Background(), Config{FlushTimeout: time.Hour}, Hooks{Flush: func(context.Context) error { return want }}); !errors.Is(err, want) {
+		t.Fatalf("Drain() error = %v, want %v", err, want)
+	}
+
+	machine = New()
+	if err := machine.Transition(Ready); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := machine.Drain(ctx, Config{DrainTimeout: time.Hour}, Hooks{Drain: func(ctx context.Context) error {
+		<-ctx.Done()
+		return ctx.Err()
+	}}); !errors.Is(err, context.Canceled) {
+		t.Fatalf("Drain() cancelled error = %v, want context canceled", err)
+	}
+	if machine.State() != Aborted {
+		t.Fatalf("cancelled drain state = %s, want aborted", machine.State())
+	}
+}
+
+func TestDrainAbortsWhenHandlerGraceContextIsCancelled(t *testing.T) {
+	fake := clock.NewFake(time.Unix(0, 0))
+	machine := New()
+	if err := machine.Transition(Ready); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		done <- machine.Drain(ctx, Config{Clock: fake, DrainTimeout: 5 * time.Second, HandlerGrace: 4 * time.Second}, Hooks{
+			CancelHandler: func() { t.Error("handler should not be cancelled after a parent cancellation") },
+		})
+	}()
+	fake.BlockUntil(1)
+	cancel()
+	if err := <-done; !errors.Is(err, context.Canceled) {
+		t.Fatalf("Drain() = %v, want context canceled", err)
+	}
+	if machine.State() != Aborted {
+		t.Fatalf("cancelled grace state = %s, want aborted", machine.State())
+	}
+}
