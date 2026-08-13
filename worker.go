@@ -27,6 +27,9 @@ type delivery struct {
 type deliveryState struct {
 	attempted bool
 	settled   bool
+	// operation records which settlement call was last made, so that a failed
+	// one can be retried in kind rather than guessed at.
+	operation settlementOperation
 }
 
 type deliveryMetrics struct {
@@ -528,7 +531,6 @@ func processDelivery(r *Runner, ctx context.Context, item delivery) {
 	state := &deliveryState{}
 	var envelope Envelope
 	defer func() {
-		defer forgetSettlementOperation(state)
 		if recovered := recover(); recovered != nil {
 			err := fmt.Errorf("handler panic: %v\n%s", recovered, debug.Stack())
 			deadLetterAndSettle(r, ctx, item.message, envelope, ReasonPanic, err, state)
@@ -536,7 +538,7 @@ func processDelivery(r *Runner, ctx context.Context, item delivery) {
 		if !state.settled && !state.attempted {
 			_ = nackDelivery(r, runnerSettlementContext(r, ctx), item.message, driver.NackOptions{Requeue: true}, state)
 		}
-		operation := settlementOperationFor(state)
+		operation := state.operation
 		if !state.settled {
 			switch operation {
 			case settlementOperationAck:
@@ -548,7 +550,7 @@ func processDelivery(r *Runner, ctx context.Context, item delivery) {
 		if !state.settled && operation == settlementOperationAck {
 			_ = nackDelivery(r, runnerSettlementContext(r, ctx), item.message, driver.NackOptions{Requeue: true}, state)
 		}
-		operation = settlementOperationFor(state)
+		operation = state.operation
 		outcome := settlementOutcomeUnknown
 		if abandoned {
 			outcome = settlementOutcomeAbandoned
@@ -744,9 +746,7 @@ func ackDelivery(_ *Runner, ctx context.Context, message driver.InboundMessage, 
 	if message.Settle == nil {
 		return false
 	}
-	if len(states) > 0 && states[0] != nil {
-		rememberSettlementOperation(state, settlementOperationAck)
-	}
+	state.operation = settlementOperationAck
 	err := message.Settle.Ack(ctx)
 	state.attempted = true
 	state.settled = err == nil
@@ -758,9 +758,7 @@ func nackDelivery(_ *Runner, ctx context.Context, message driver.InboundMessage,
 	if message.Settle == nil {
 		return errors.New("f1: delivered message has no settler")
 	}
-	if len(states) > 0 && states[0] != nil {
-		rememberSettlementOperation(state, settlementOperationNack)
-	}
+	state.operation = settlementOperationNack
 	err := message.Settle.Nack(ctx, options)
 	state.attempted = true
 	state.settled = err == nil

@@ -15,31 +15,6 @@ const (
 	settlementOperationNack
 )
 
-var settlementOperations sync.Map
-
-func rememberSettlementOperation(state *deliveryState, operation settlementOperation) {
-	if state != nil {
-		settlementOperations.Store(state, operation)
-	}
-}
-
-func settlementOperationFor(state *deliveryState) settlementOperation {
-	if state == nil {
-		return settlementOperationNone
-	}
-	operation, ok := settlementOperations.Load(state)
-	if !ok {
-		return settlementOperationNone
-	}
-	return operation.(settlementOperation)
-}
-
-func forgetSettlementOperation(state *deliveryState) {
-	if state != nil {
-		settlementOperations.Delete(state)
-	}
-}
-
 type settlementOutcome uint8
 
 const (
