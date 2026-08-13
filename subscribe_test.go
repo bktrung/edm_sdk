@@ -10,22 +10,25 @@ import (
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/clock"
 )
 
-func TestSubscribeRejectsOrderedByKeyWithConcurrency(t *testing.T) {
+func TestSubscribeAcceptsOrderedByKeyWithConcurrency(t *testing.T) {
 	t.Parallel()
-	conn := &testConn{caps: driver.Capabilities{OrderedByKey: true}, info: testBrokerInfo()}
+	conn := &testConn{caps: driver.Capabilities{}, info: testBrokerInfo()}
 	client, err := New(context.Background(), testClientConfig(t), WithDriver(&testDriver{conn: conn}))
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = client.Close(context.Background()) })
-	_, err = client.Subscribe(context.Background(), Subscription{
+	runner, err := client.Subscribe(context.Background(), Subscription{
 		Name:        "orders",
 		Topics:      []string{"orders.created"},
 		Mode:        OrderedByKey,
 		Concurrency: 2,
 	})
-	if err == nil || !strings.Contains(err.Error(), "ordered_by_key") || !strings.Contains(err.Error(), "concurrency 1") {
-		t.Fatalf("Subscribe() error = %v, want ordered_by_key/concurrency validation", err)
+	if err != nil {
+		t.Fatalf("Subscribe() error = %v, want ordered mode to be accepted", err)
+	}
+	if runner.config.Mode != OrderedByKey || runner.config.Concurrency != 2 {
+		t.Fatalf("resolved subscription = %#v, want ordered mode with concurrency 2", runner.config)
 	}
 }
 
