@@ -570,6 +570,7 @@ func runnerDeliveryIDs(r *Runner) []uint64 {
 	return append([]uint64(nil), r.deliveryIDs...)
 }
 
+//nolint:contextcheck // helper preserves the caller context while using an injected timer.
 func waitForClock(ctx context.Context, clk clock.Clock, delay time.Duration) error {
 	if ctx == nil {
 		ctx = context.Background()
@@ -593,6 +594,7 @@ func waitForClock(ctx context.Context, clk clock.Clock, delay time.Duration) err
 	}
 }
 
+//nolint:contextcheck // helper derives the phase context from the caller.
 func runWithClockTimeout(parent context.Context, clk clock.Clock, timeout time.Duration, fn func(context.Context) error) error {
 	if fn == nil {
 		return nil
