@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -12,6 +13,7 @@ import (
 
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/driver"
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/clock"
+	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/lifecycle"
 )
 
 func TestNewValidatesOptionsEagerly(t *testing.T) {
@@ -88,6 +90,95 @@ func TestHealthRejectsClosedClient(t *testing.T) {
 	}
 	if err := client.Health(context.Background()); err == nil || !strings.Contains(err.Error(), "closed") {
 		t.Fatalf("Health() error = %v, want closed-client error", err)
+	}
+}
+
+func TestCloseAppliesPreStopBeforeRunnerDrain(t *testing.T) {
+	cfg := testClientConfig(t)
+	cfg.Lifecycle.PreStopDelay = 5 * time.Second
+	fake := clock.NewFake(time.Unix(0, 0))
+	client, err := New(context.Background(), cfg, WithDriver(&testDriver{conn: &testConn{}}), WithClock(fake))
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan struct{})
+	runner := &Runner{
+		client:    client,
+		started:   true,
+		done:      done,
+		lifecycle: lifecycle.New(),
+		cancel:    func() { close(done) },
+	}
+	if err := runner.lifecycle.Transition(lifecycle.Ready); err != nil {
+		t.Fatal(err)
+	}
+	client.mu.Lock()
+	client.runners[runner] = struct{}{}
+	client.mu.Unlock()
+	closeDone := make(chan error, 1)
+	go func() { closeDone <- client.Close(context.Background()) }()
+	fake.BlockUntil(1)
+	if got := runner.lifecycle.State(); got != lifecycle.Ready {
+		t.Fatalf("runner state before pre-stop = %s, want ready", got)
+	}
+	fake.Advance(5 * time.Second)
+	if err := <-closeDone; err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+	if got := runner.lifecycle.State(); got != lifecycle.Draining {
+		t.Fatalf("runner state after pre-stop = %s, want draining", got)
+	}
+}
+
+func TestCloseDrainsAllRunnersAfterOneFails(t *testing.T) {
+	t.Parallel()
+	cfg := testClientConfig(t)
+	cfg.Lifecycle.PreStopDelay = 0
+	conn := &testConn{}
+	client, err := New(context.Background(), cfg, WithDriver(&testDriver{conn: conn}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	middleErr := errors.New("middle runner failed")
+	var drainCalls atomic.Int32
+	makeRunner := func(runErr error) *Runner {
+		done := make(chan struct{})
+		var cancelled atomic.Bool
+		return &Runner{
+			client:  client,
+			started: true,
+			done:    done,
+			runErr:  runErr,
+			cancel: func() {
+				drainCalls.Add(1)
+				if cancelled.CompareAndSwap(false, true) {
+					close(done)
+				}
+			},
+		}
+	}
+	first := makeRunner(nil)
+	middle := makeRunner(middleErr)
+	last := makeRunner(nil)
+	client.mu.Lock()
+	client.runners[first] = struct{}{}
+	client.runners[middle] = struct{}{}
+	client.runners[last] = struct{}{}
+	client.mu.Unlock()
+
+	err = client.Close(context.Background())
+	if !errors.Is(err, middleErr) {
+		t.Fatalf("Close() error = %v, want middle runner error", err)
+	}
+	if got, want := drainCalls.Load(), int32(3); got != want {
+		t.Fatalf("runner drain calls = %d, want %d", got, want)
+	}
+
+	middle.mu.Lock()
+	middle.runErr = nil
+	middle.mu.Unlock()
+	if err := client.Close(context.Background()); err != nil {
+		t.Fatalf("second Close() error = %v", err)
 	}
 }
 

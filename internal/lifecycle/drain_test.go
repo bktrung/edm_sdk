@@ -41,6 +41,83 @@ func TestDrainRunsPhasesInOrder(t *testing.T) {
 	}
 }
 
+func TestDrainKeepsReadyDuringPreStopAndBoundsFlushWithFakeClock(t *testing.T) {
+	fake := clock.NewFake(time.Unix(0, 0))
+	machine := New()
+	if err := machine.Transition(Ready); err != nil {
+		t.Fatal(err)
+	}
+	flushStarted := make(chan struct{})
+	done := make(chan error, 1)
+	go func() {
+		done <- machine.Drain(context.Background(), Config{
+			Clock:        fake,
+			PreStopDelay: 5 * time.Second,
+			FlushTimeout: 7 * time.Second,
+		}, Hooks{
+			Drain: func(context.Context) error {
+				if machine.State() != Draining {
+					return errors.New("drain hook ran outside draining state")
+				}
+				return nil
+			},
+			WaitSettled: func(context.Context) error {
+				if machine.State() != Settling {
+					return errors.New("settle hook ran outside settling state")
+				}
+				return nil
+			},
+			Flush: func(ctx context.Context) error {
+				if machine.State() != Flushing {
+					return errors.New("flush hook ran outside flushing state")
+				}
+				close(flushStarted)
+				<-ctx.Done()
+				return ctx.Err()
+			},
+		})
+	}()
+	fake.BlockUntil(1)
+	if got := machine.State(); got != Ready {
+		t.Fatalf("state during pre-stop = %s, want ready", got)
+	}
+	fake.Advance(5 * time.Second)
+	<-flushStarted
+	fake.BlockUntil(1)
+	fake.Advance(7 * time.Second)
+	if err := <-done; !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Drain() error = %v, want deadline exceeded", err)
+	}
+	if got := machine.State(); got != Aborted {
+		t.Fatalf("state after flush deadline = %s, want aborted", got)
+	}
+}
+
+func TestDrainBoundsCloseWithFakeClock(t *testing.T) {
+	fake := clock.NewFake(time.Unix(0, 0))
+	machine := New()
+	if err := machine.Transition(Ready); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() {
+		done <- machine.Drain(context.Background(), Config{Clock: fake, CloseTimeout: 11 * time.Second}, Hooks{
+			Close: func(ctx context.Context) error {
+				<-ctx.Done()
+				return ctx.Err()
+			},
+		})
+	}()
+	fake.BlockUntil(1)
+	fake.Advance(11 * time.Second)
+	if err := <-done; !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Drain() error = %v, want deadline exceeded", err)
+	}
+	if got := machine.State(); got != Aborted {
+		t.Fatalf("state after close deadline = %s, want aborted", got)
+	}
+}
+
 func TestDrainAbortsOnDeadline(t *testing.T) {
 	machine := New()
 	if err := machine.Transition(Ready); err != nil {
