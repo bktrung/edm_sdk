@@ -41,3 +41,13 @@ const Exported = 1
 		t.Fatalf("surface = %v, want %v", got, want)
 	}
 }
+
+func TestSurfaceDifferencesReportFixtureOnlySymbols(t *testing.T) {
+	missing, stale := surfaceDifferences([]string{"Present", "New"}, []string{"Present", "Stale"})
+	if !reflect.DeepEqual(missing, []string{"New"}) {
+		t.Fatalf("missing = %v, want [New]", missing)
+	}
+	if !reflect.DeepEqual(stale, []string{"Stale"}) {
+		t.Fatalf("stale = %v, want [Stale]", stale)
+	}
+}

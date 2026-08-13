@@ -66,17 +66,17 @@
     "Scaling.String",
     "ScalingFree",
     "ScalingPartitionBound",
+    "Settler",
+    "StartEarliest",
+    "StartLatest",
+    "StartPosition",
+    "TLSConfig",
     "TopologyDeclare",
     "TopologyDiff",
     "TopologyNone",
     "TopologyPolicy",
     "TopologySpec",
     "TopologyState",
-    "TopologyVerify",
-    "Settler",
-    "StartEarliest",
-    "StartLatest",
-    "StartPosition",
-    "TLSConfig"
+    "TopologyVerify"
   ]
 }

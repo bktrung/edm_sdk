@@ -49,23 +49,20 @@ func main() {
 		fail("fixture %s declares package %q, requested %q", fixturePath, fixturePackage, packageName)
 	}
 
-	known := make(map[string]bool, len(declared))
-	for _, s := range declared {
-		known[s] = true
-	}
-
-	var undeclared []string
-	for _, s := range actual {
-		if !known[s] {
-			undeclared = append(undeclared, s)
-		}
-	}
-
-	if len(undeclared) > 0 {
+	missingFromFixture, staleFixture := surfaceDifferences(actual, declared)
+	if len(missingFromFixture) > 0 {
 		fmt.Fprintf(os.Stderr, "apisurface: package %s exports symbols missing from the fixture:\n", packageName)
-		for _, s := range undeclared {
+		for _, s := range missingFromFixture {
 			fmt.Fprintf(os.Stderr, "  %s\n", s)
 		}
+	}
+	if len(staleFixture) > 0 {
+		fmt.Fprintf(os.Stderr, "apisurface: fixture for package %s declares symbols not exported by the package:\n", packageName)
+		for _, s := range staleFixture {
+			fmt.Fprintf(os.Stderr, "  %s\n", s)
+		}
+	}
+	if len(missingFromFixture) > 0 || len(staleFixture) > 0 {
 		fmt.Fprintf(os.Stderr, "apisurface: update the fixture for package %s and rerun the fixture checks\n", packageName)
 		os.Exit(1)
 	}
@@ -93,6 +90,30 @@ func loadFixture(path string) (string, []string, error) {
 		return "", nil, err
 	}
 	return fixture.Package, fixture.Symbols, nil
+}
+
+func surfaceDifferences(actual, declared []string) (missingFromFixture, staleFixture []string) {
+	actualSet := make(map[string]bool, len(actual))
+	for _, symbol := range actual {
+		actualSet[symbol] = true
+	}
+	declaredSet := make(map[string]bool, len(declared))
+	for _, symbol := range declared {
+		declaredSet[symbol] = true
+	}
+	for symbol := range actualSet {
+		if !declaredSet[symbol] {
+			missingFromFixture = append(missingFromFixture, symbol)
+		}
+	}
+	for symbol := range declaredSet {
+		if !actualSet[symbol] {
+			staleFixture = append(staleFixture, symbol)
+		}
+	}
+	sort.Strings(missingFromFixture)
+	sort.Strings(staleFixture)
+	return missingFromFixture, staleFixture
 }
 
 func extractSurface(moduleDir, pkg string) ([]string, error) {
