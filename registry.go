@@ -7,6 +7,56 @@ import (
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/driver"
 )
 
+type settlementOperation uint8
+
+const (
+	settlementOperationNone settlementOperation = iota
+	settlementOperationAck
+	settlementOperationNack
+)
+
+var settlementOperations sync.Map
+
+func rememberSettlementOperation(state *deliveryState, operation settlementOperation) {
+	if state != nil {
+		settlementOperations.Store(state, operation)
+	}
+}
+
+func settlementOperationFor(state *deliveryState) settlementOperation {
+	if state == nil {
+		return settlementOperationNone
+	}
+	operation, ok := settlementOperations.Load(state)
+	if !ok {
+		return settlementOperationNone
+	}
+	return operation.(settlementOperation)
+}
+
+func forgetSettlementOperation(state *deliveryState) {
+	if state != nil {
+		settlementOperations.Delete(state)
+	}
+}
+
+type settlementOutcome uint8
+
+const (
+	settlementOutcomeSettled settlementOutcome = iota
+	settlementOutcomeRequeued
+	settlementOutcomeUnknown
+	settlementOutcomeAbandoned
+)
+
+type settlementCounts struct {
+	received  uint64
+	settled   uint64
+	requeued  uint64
+	unknown   uint64
+	abandoned uint64
+}
+
 // inflightRegistry tracks broker deliveries from the moment the fetcher accepts
 // them until the worker has completed settlement. The mutex protects both the
 // map and the zero-transition channel; callers never hold it while doing
@@ -18,6 +68,7 @@ type inflightRegistry struct {
 	items map[uint64]driver.InboundMessage
 	next  uint64
 	zero  chan struct{}
+	count settlementCounts
 }
 
 func newInflightRegistry() *inflightRegistry {
@@ -38,6 +89,7 @@ func (r *inflightRegistry) Add(message driver.InboundMessage) uint64 {
 	if len(r.items) == 0 {
 		r.zero = make(chan struct{})
 	}
+	r.count.received++
 	id := r.next
 	r.items[id] = message
 	return id
@@ -45,15 +97,35 @@ func (r *inflightRegistry) Add(message driver.InboundMessage) uint64 {
 
 // Remove deregisters a delivery after its settlement call has returned.
 func (r *inflightRegistry) Remove(id uint64) {
+	r.RemoveAs(id, settlementOutcomeSettled)
+}
+
+func (r *inflightRegistry) RemoveAs(id uint64, outcome settlementOutcome) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if _, ok := r.items[id]; !ok {
 		return
 	}
 	delete(r.items, id)
+	switch outcome {
+	case settlementOutcomeSettled:
+		r.count.settled++
+	case settlementOutcomeRequeued:
+		r.count.requeued++
+	case settlementOutcomeUnknown:
+		r.count.unknown++
+	case settlementOutcomeAbandoned:
+		r.count.abandoned++
+	}
 	if len(r.items) == 0 {
 		close(r.zero)
 	}
+}
+
+func (r *inflightRegistry) Counts() settlementCounts {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.count
 }
 
 // Len returns the number of deliveries that have not completed settlement.
