@@ -74,6 +74,42 @@ Set `GOPRIVATE=fgit.zapps.vn` before the first `go get` of this module - it live
 host, and without this the Go toolchain will try the public checksum database and proxy, which
 cannot see it.
 
+## Quickstart with RabbitMQ
+
+This repository includes two separate services that use the public SDK API against the local
+RabbitMQ fixture. They share `examples/config.yaml`; change the broker endpoint there when using a
+real broker. The development config sets `topology.autoCreate: true` so the publisher can declare
+its entry point. Production should provision topology separately and leave auto-creation disabled.
+
+From a clean checkout:
+
+```sh
+make broker-up
+make broker-smoke
+go build -o /tmp/f1-quickstart-publisher ./examples/publisher
+go build -o /tmp/f1-quickstart-consumer ./examples/consumer
+```
+
+In terminal 1, start the publisher. It declares its publish entry point and waits for the consumer:
+
+```sh
+/tmp/f1-quickstart-publisher --config examples/config.yaml --wait
+```
+
+In terminal 2, start the consumer:
+
+```sh
+/tmp/f1-quickstart-consumer --config examples/config.yaml
+```
+
+When the consumer prints `consumer ready; waiting for messages`, press Enter in terminal 1. The
+publisher prints its message ID and the consumer prints `handled message: hello from publisher`.
+Press Ctrl-C in terminal 2, then stop the broker:
+
+```sh
+make broker-down
+```
+
 ## Comment conventions
 
 Comments should help a reader understand the code without narrating obvious statements.
