@@ -30,13 +30,14 @@ func (Driver) Name() string { return "rabbitmq" }
 func (Driver) Capabilities() driver.Capabilities {
 	return driver.Capabilities{
 		PerMessageAck:        true,
-		OrderedByKey:         true,
+		OrderedByKey:         false,
 		NativePriority:       driver.PriorityStrict,
 		NativePriorityLevels: 32,
 		NativeDelay:          false,
 		NativeDeliveryCount:  true,
 		NativeDLQ:            true,
 		ConsumerScaling:      driver.ScalingFree,
+		Fanout:               driver.FanoutAtPublish,
 	}
 }
 
@@ -45,6 +46,9 @@ func (Driver) Capabilities() driver.Capabilities {
 func (Driver) Open(ctx context.Context, cfg driver.Config) (driver.Conn, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, classify("open", driver.KindTransient, err)
+	if err := validateSASL(cfg.SASL); err != nil {
+		return nil, classify("open", driver.KindFatal, err)
+	}
 	}
 
 	openCtx := ctx
@@ -229,13 +233,19 @@ func makeAMQPConfig(cfg driver.Config) (amqp.Config, error) {
 	}
 	if cfg.SASL != nil {
 		switch strings.ToLower(cfg.SASL.Mechanism) {
-		case "", "plain":
+		case "":
+		case "plain":
 			config.SASL = []amqp.Authentication{&amqp.PlainAuth{
 				Username: cfg.SASL.Username,
 				Password: cfg.SASL.Password,
 			}}
-		default:
-			return config, fmt.Errorf("rabbitmq: unsupported SASL mechanism %q", cfg.SASL.Mechanism)
+		case "amqplain":
+			config.SASL = []amqp.Authentication{&amqp.AMQPlainAuth{
+				Username: cfg.SASL.Username,
+				Password: cfg.SASL.Password,
+			}}
+		case "external":
+			config.SASL = []amqp.Authentication{&amqp.ExternalAuth{}}
 		}
 	}
 	if cfg.TLS == nil || !cfg.TLS.Enabled {
@@ -275,6 +285,18 @@ func tlsConfig(settings *driver.TLSConfig) (*tls.Config, error) {
 	config.Certificates = []tls.Certificate{certificate}
 	return config, nil
 }
+func validateSASL(settings *driver.SASLConfig) error {
+	if settings == nil {
+		return nil
+	}
+	switch strings.ToLower(settings.Mechanism) {
+	case "", "plain", "amqplain", "external":
+		return nil
+	default:
+		return fmt.Errorf("rabbitmq: unsupported SASL mechanism %q; supported mechanisms: PLAIN, AMQPLAIN, EXTERNAL, or empty", settings.Mechanism)
+	}
+}
+
 
 func isTestEndpoint(endpoints []string) bool {
 	if len(endpoints) == 0 {
