@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 
 	amqp "github.com/rabbitmq/amqp091-go"
 
@@ -16,6 +17,12 @@ type bindingKey struct {
 }
 
 func (a *admin) ensureTopology(ctx context.Context, spec driver.TopologySpec) (driver.TopologyDiff, error) {
+	if spec.Policy == driver.TopologyNone {
+		return driver.TopologyDiff{}, nil
+	}
+	if spec.Policy == driver.TopologyVerify {
+		return a.verifyTopology(ctx, spec)
+	}
 	a.conn.topologyMu.Lock()
 	defer a.conn.topologyMu.Unlock()
 
@@ -127,7 +134,122 @@ func (a *admin) ensureTopology(ctx context.Context, spec driver.TopologySpec) (d
 		a.conn.mu.Unlock()
 		diff.CreatedBindings = append(diff.CreatedBindings, binding.Destination)
 	}
+	a.scanOrphans(ctx, spec, &diff)
 	return diff, nil
+}
+
+func (a *admin) verifyTopology(ctx context.Context, spec driver.TopologySpec) (driver.TopologyDiff, error) {
+	a.conn.topologyMu.Lock()
+	defer a.conn.topologyMu.Unlock()
+	var diff driver.TopologyDiff
+	for _, exchange := range spec.Exchanges {
+		if err := ctx.Err(); err != nil {
+			return driver.TopologyDiff{}, classify("ensure_topology", driver.KindTransient, err)
+		}
+		if err := validateExchange(exchange); err != nil {
+			return driver.TopologyDiff{}, classify("ensure_topology", driver.KindFatal, err)
+		}
+		exists, err := a.exchangeExists(ctx, exchange)
+		if err != nil {
+			return driver.TopologyDiff{}, err
+		}
+		if !exists {
+			return driver.TopologyDiff{}, classify("ensure_topology", driver.KindNotFound, fmt.Errorf("exchange %q is missing: %w", exchange.Name, driver.ErrDestinationMissing))
+		}
+		diff.Existing = append(diff.Existing, exchange.Name)
+		a.conn.mu.Lock()
+		a.conn.exchanges[exchange.Name] = struct{}{}
+		a.conn.mu.Unlock()
+	}
+	for _, destination := range spec.Destinations {
+		if err := ctx.Err(); err != nil {
+			return driver.TopologyDiff{}, classify("ensure_topology", driver.KindTransient, err)
+		}
+		if destination.Name == "" {
+			return driver.TopologyDiff{}, classify("ensure_topology", driver.KindFatal, errors.New("destination name is empty"))
+		}
+		if exists, err := a.queueExists(ctx, destination.Name, destination.Durable, queueArguments(destination)); err != nil {
+			return driver.TopologyDiff{}, err
+		} else if !exists {
+			return driver.TopologyDiff{}, classify("ensure_topology", driver.KindNotFound, fmt.Errorf("destination %q is missing: %w", destination.Name, driver.ErrDestinationMissing))
+		}
+		diff.Existing = append(diff.Existing, destination.Name)
+		a.conn.mu.Lock()
+		if destination.Delay > 0 {
+			a.conn.deferred[destination.Name] = destination.Delay
+		}
+		a.conn.mu.Unlock()
+		if destination.Delay > 0 {
+			parkName := destination.Name + ".park"
+			exists, err := a.queueExists(ctx, parkName, true, parkingArguments(destination.Name))
+			if err != nil {
+				return driver.TopologyDiff{}, err
+			}
+			if !exists {
+				return driver.TopologyDiff{}, classify("ensure_topology", driver.KindNotFound, fmt.Errorf("parking destination %q is missing: %w", parkName, driver.ErrDestinationMissing))
+			}
+			diff.Existing = append(diff.Existing, parkName)
+		}
+	}
+	return diff, nil
+}
+
+func (a *admin) scanOrphans(ctx context.Context, spec driver.TopologySpec, diff *driver.TopologyDiff) {
+	if len(spec.Scope) == 0 {
+		diff.OrphanScanError = "orphan scan disabled because no scope was supplied"
+		return
+	}
+	queues, err := a.conn.management.listQueues(ctx)
+	if err != nil {
+		diff.OrphanScanError = err.Error()
+		return
+	}
+	known := make(map[string]struct{}, len(spec.Destinations))
+	byName := make(map[string]managementQueue, len(queues))
+	for _, destination := range spec.Destinations {
+		known[destination.Name] = struct{}{}
+	}
+	for _, queue := range queues {
+		byName[queue.Name] = queue
+	}
+	orphans := make(map[string]int64)
+	order := make([]string, 0)
+	add := func(name string, messages int64) {
+		if _, exists := orphans[name]; !exists {
+			order = append(order, name)
+		}
+		orphans[name] += messages
+	}
+	for _, queue := range queues {
+		if !matchesScope(queue.Name, spec.Scope) {
+			continue
+		}
+		if _, exists := known[queue.Name]; exists {
+			continue
+		}
+		if strings.HasSuffix(queue.Name, ".park") {
+			parent := strings.TrimSuffix(queue.Name, ".park")
+			if _, parentExists := byName[parent]; parentExists {
+				if _, parentKnown := known[parent]; !parentKnown {
+					add(parent, queue.totalMessages())
+				}
+				continue
+			}
+		}
+		add(queue.Name, queue.totalMessages())
+	}
+	for _, name := range order {
+		diff.Orphaned = append(diff.Orphaned, driver.OrphanedDestination{Name: name, Messages: orphans[name]})
+	}
+}
+
+func matchesScope(name string, scopes []string) bool {
+	for _, scope := range scopes {
+		if strings.HasPrefix(name, scope) {
+			return true
+		}
+	}
+	return false
 }
 
 func validateExchange(exchange driver.ExchangeSpec) error {
@@ -275,4 +397,9 @@ func (a *admin) openChannel(ctx context.Context) (*amqp.Channel, error) {
 func isNotFound(err error) bool {
 	var amqpErr *amqp.Error
 	return errors.As(err, &amqpErr) && amqpErr.Code == 404
+}
+
+func isPermission(err error) bool {
+	var amqpErr *amqp.Error
+	return errors.As(err, &amqpErr) && amqpErr.Code == 403
 }

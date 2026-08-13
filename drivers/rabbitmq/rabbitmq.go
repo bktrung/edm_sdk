@@ -40,6 +40,7 @@ func (Driver) Capabilities() driver.Capabilities {
 		NativeDLQ:            true,
 		ConsumerScaling:      driver.ScalingFree,
 		Fanout:               driver.FanoutAtPublish,
+		LagQueryable:         true,
 	}
 }
 
@@ -72,7 +73,7 @@ func (Driver) Open(ctx context.Context, cfg driver.Config) (driver.Conn, error) 
 			}
 			conn, err := dial(openCtx, endpoint, cfg)
 			if err == nil {
-				return newConn(conn, Driver{}.Capabilities()), nil
+				return newConn(conn, Driver{}.Capabilities(), endpoint), nil
 			}
 			lastErr = err
 		}
@@ -95,6 +96,7 @@ type conn struct {
 	amqp       *amqp.Connection
 	caps       driver.Capabilities
 	info       driver.BrokerInfo
+	management *managementClient
 	closed     bool
 	active     map[*consumer]struct{}
 	producers  map[*producer]struct{}
@@ -106,17 +108,18 @@ type conn struct {
 
 var _ driver.Conn = (*conn)(nil)
 
-func newConn(amqpConn *amqp.Connection, caps driver.Capabilities) *conn {
+func newConn(amqpConn *amqp.Connection, caps driver.Capabilities, endpoint string) *conn {
 	return &conn{
-		amqp:      amqpConn,
-		caps:      caps,
-		info:      brokerInfo(amqpConn),
-		active:    make(map[*consumer]struct{}),
-		producers: make(map[*producer]struct{}),
-		exchanges: make(map[string]struct{}),
-		bindings:  make(map[bindingKey]bool),
-		deferred:  make(map[string]time.Duration),
-		ephemeral: make(map[string]*amqp.Channel),
+		amqp:       amqpConn,
+		caps:       caps,
+		info:       brokerInfo(amqpConn),
+		management: newManagementClient(endpoint),
+		active:     make(map[*consumer]struct{}),
+		producers:  make(map[*producer]struct{}),
+		exchanges:  make(map[string]struct{}),
+		bindings:   make(map[bindingKey]bool),
+		deferred:   make(map[string]time.Duration),
+		ephemeral:  make(map[string]*amqp.Channel),
 	}
 }
 

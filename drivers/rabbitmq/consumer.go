@@ -51,7 +51,7 @@ type lane struct {
 	tag         string
 	prefetch    int
 	deliveries  <-chan amqp.Delivery
-	pending     chan driver.InboundMessage
+	pending     chan amqp.Delivery
 	resume      chan struct{}
 
 	mu     sync.Mutex
@@ -90,6 +90,9 @@ func newConsumer(conn *conn, cfg driver.ConsumerConfig) (*consumer, error) {
 		if err != nil {
 			_ = channel.Close()
 			c.closeLanes()
+			if cfg.Exclusive && isPermission(err) {
+				return nil, classify("consumer", driver.KindFatal, fmt.Errorf("exclusive consumer refused: %w", err))
+			}
 			return nil, classifyAMQP("consumer", driver.KindNotFound, err)
 		}
 		lane := &lane{
@@ -99,7 +102,7 @@ func newConsumer(conn *conn, cfg driver.ConsumerConfig) (*consumer, error) {
 			tag:         tag,
 			prefetch:    prefetch,
 			deliveries:  deliveries,
-			pending:     make(chan driver.InboundMessage, prefetch),
+			pending:     make(chan amqp.Delivery, prefetch),
 			resume:      make(chan struct{}),
 		}
 		c.lanes = append(c.lanes, lane)
@@ -155,22 +158,35 @@ func (c *consumer) readDeliveries(lane *lane) {
 	defer close(lane.pending)
 	for delivery := range lane.deliveries {
 		c.mu.Lock()
-		if c.stopped {
-			c.mu.Unlock()
+		stopped, draining := c.stopped, c.draining
+		c.mu.Unlock()
+		if stopped || draining {
 			continue
 		}
-		settler := &settler{owner: c, delivery: delivery}
-		c.settlers[settler] = struct{}{}
-		c.outstanding++
-		c.mu.Unlock()
-		lane.pending <- inboundMessage(lane.destination, delivery, settler)
+		select {
+		case lane.pending <- delivery:
+		case <-c.stoppedC:
+			return
+		}
 	}
 }
 
 func (c *consumer) emitMessages(lane *lane) {
 	defer c.forward.Done()
-	for message := range lane.pending {
+	for delivery := range lane.pending {
+		c.mu.Lock()
+		if c.draining || c.stopped {
+			c.mu.Unlock()
+			return
+		}
+		c.mu.Unlock()
 		for {
+			c.mu.Lock()
+			if c.draining || c.stopped {
+				c.mu.Unlock()
+				return
+			}
+			c.mu.Unlock()
 			lane.mu.Lock()
 			paused, resume := lane.paused, lane.resume
 			lane.mu.Unlock()
@@ -183,12 +199,29 @@ func (c *consumer) emitMessages(lane *lane) {
 				return
 			}
 		}
+		settler := &settler{owner: c, destination: lane.destination, delivery: delivery}
+		c.mu.Lock()
+		if c.draining || c.stopped {
+			c.mu.Unlock()
+			return
+		}
+		c.settlers[settler] = struct{}{}
+		c.outstanding++
+		c.mu.Unlock()
+		message := inboundMessage(lane.destination, delivery, settler, c.nativeDeliveryCount())
 		select {
 		case c.messages <- message:
 		case <-c.stoppedC:
 			return
 		}
 	}
+}
+
+func (c *consumer) nativeDeliveryCount() bool {
+	if c.cfg.Effective == (driver.Capabilities{}) {
+		return c.conn.caps.NativeDeliveryCount
+	}
+	return c.cfg.Effective.NativeDeliveryCount
 }
 
 func (c *consumer) watchClose(lane *lane) {
@@ -214,7 +247,7 @@ func (c *consumer) sendError(err error) {
 	}
 }
 
-func inboundMessage(destination string, delivery amqp.Delivery, settler *settler) driver.InboundMessage {
+func inboundMessage(destination string, delivery amqp.Delivery, settler *settler, nativeCount bool) driver.InboundMessage {
 	headers := amqpHeaders(delivery)
 	receivedAt := delivery.Timestamp
 	if receivedAt.IsZero() {
@@ -225,7 +258,7 @@ func inboundMessage(destination string, delivery amqp.Delivery, settler *settler
 		Key:           headerValue(delivery.Headers[partitionKeyHeader]),
 		Headers:       headers,
 		Body:          append([]byte(nil), delivery.Body...),
-		DeliveryCount: deliveryCount(delivery),
+		DeliveryCount: deliveryCount(delivery, nativeCount),
 		ReceivedAt:    receivedAt,
 		Ref:           driver.BrokerRef{Tag: delivery.DeliveryTag},
 		Settle:        settler,
@@ -235,7 +268,10 @@ func inboundMessage(destination string, delivery amqp.Delivery, settler *settler
 // deliveryCount reports the broker's redelivery counter. RabbitMQ 4.x names it
 // x-acquired-count on quorum queues; x-delivery-count is the pre-4.0 name and is
 // still accepted so a driver pointed at an older broker keeps working.
-func deliveryCount(delivery amqp.Delivery) int {
+func deliveryCount(delivery amqp.Delivery, nativeCount bool) int {
+	if !nativeCount {
+		return -1
+	}
 	for _, name := range []string{"x-acquired-count", "x-delivery-count"} {
 		if count, ok := headerCount(delivery.Headers[name]); ok {
 			return count
@@ -376,15 +412,6 @@ func (c *consumer) Drain(ctx context.Context) error {
 		return nil
 	}
 	c.draining = true
-	for _, lane := range c.lanes {
-		lane.mu.Lock()
-		if lane.paused {
-			lane.paused = false
-			close(lane.resume)
-			lane.resume = make(chan struct{})
-		}
-		lane.mu.Unlock()
-	}
 	lanes := append([]*lane(nil), c.lanes...)
 	c.mu.Unlock()
 
@@ -393,10 +420,7 @@ func (c *consumer) Drain(ctx context.Context) error {
 			return classifyAMQP("drain", driver.KindTransient, err)
 		}
 	}
-	if err := c.waitReaders(ctx, "drain"); err != nil {
-		return err
-	}
-	return c.waitForwarders(ctx, "drain")
+	return nil
 }
 
 func (c *consumer) waitReaders(ctx context.Context, op string) error {
@@ -451,6 +475,12 @@ func (c *consumer) Stop(ctx context.Context) error {
 	if err := c.Drain(ctx); err != nil {
 		return err
 	}
+	if err := c.waitReaders(ctx, "stop"); err != nil {
+		return err
+	}
+	if err := c.waitForwarders(ctx, "stop"); err != nil {
+		return err
+	}
 	c.mu.Lock()
 	if c.stopped {
 		c.mu.Unlock()
@@ -478,7 +508,29 @@ func (c *consumer) Lag(ctx context.Context) (map[string]int64, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, classify("lag", driver.KindTransient, err)
 	}
-	return nil, classify("lag", driver.KindFatal, driver.ErrUnsupported)
+	if !c.cfg.Effective.LagQueryable {
+		return nil, classify("lag", driver.KindFatal, driver.ErrUnsupported)
+	}
+	channel, err := c.conn.amqp.Channel()
+	if err != nil {
+		return nil, classifyAMQP("lag", driver.KindTransient, err)
+	}
+	defer channel.Close()
+	lag := make(map[string]int64, len(c.lanes))
+	for _, lane := range c.lanes {
+		if err := ctx.Err(); err != nil {
+			return nil, classify("lag", driver.KindTransient, err)
+		}
+		queue, err := channel.QueueInspect(lane.destination)
+		if err != nil {
+			if isNotFound(err) {
+				return nil, classify("lag", driver.KindNotFound, errors.Join(driver.ErrDestinationMissing, err))
+			}
+			return nil, classifyAMQP("lag", driver.KindTransient, err)
+		}
+		lag[lane.destination] = int64(queue.Messages)
+	}
+	return lag, nil
 }
 
 func (c *consumer) release(settler *settler) {
