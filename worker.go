@@ -266,8 +266,13 @@ func (r *Runner) Drain(ctx context.Context) error {
 			grace = 0
 		}
 		delay := drainTimeout - grace
+		// The grace timer must not join the group whose completion it waits for.
+		// It watches done, and done is closed only after that group's Wait returns,
+		// so putting it there makes Wait block for the whole grace delay even when
+		// every delivery has already finished. asyncGroup is never waited by the
+		// runner, which is exactly what this goroutine needs.
 		r.mu.Lock()
-		group := r.group
+		group := r.asyncGroup
 		r.mu.Unlock()
 		if delay <= 0 || group == nil {
 			handlerCancel()
