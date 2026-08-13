@@ -11,9 +11,3 @@ func PartitionKeyOf(e Envelope) string {
 		return e.ID
 	}
 }
-
-// RoutingKey returns the lane and partition key in the form
-// "<priority>.<partition-key>".
-func RoutingKey(e Envelope) string {
-	return e.Priority.String() + "." + PartitionKeyOf(e)
-}

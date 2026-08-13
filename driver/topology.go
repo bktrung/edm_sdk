@@ -40,10 +40,17 @@ type Route struct {
 	Key      string // broker routing key; ignored when no routing layer exists
 }
 
+// BindingSpec joins a publish entry point to a destination that receives a copy.
+type BindingSpec struct {
+	Source      string // exchange name, from TopologySpec.Exchanges
+	Destination string // destination name, from TopologySpec.Destinations
+}
+
 // TopologySpec is the declarative description of broker topology.
 type TopologySpec struct {
 	Exchanges    []ExchangeSpec
 	Destinations []DestinationSpec
+	Bindings     []BindingSpec
 	// Scope lists prefixes the driver may scan for core-owned orphans. An empty
 	// Scope disables scanning and sets OrphanScanError.
 	Scope []string

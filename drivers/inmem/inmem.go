@@ -76,6 +76,7 @@ func (d Driver) Open(ctx context.Context, _ driver.Config) (driver.Conn, error) 
 		caps:         d.Capabilities(),
 		info:         driver.BrokerInfo{Kind: "inmem", Version: "1"},
 		destinations: make(map[string]*destination),
+		history:      make(map[string][]*queuedMessage),
 		consumers:    make(map[*consumer]struct{}),
 		groups:       make(map[string]*groupState),
 		wake:         make(chan struct{}, 1),
@@ -93,6 +94,7 @@ type conn struct {
 	caps             driver.Capabilities
 	info             driver.BrokerInfo
 	destinations     map[string]*destination
+	history          map[string][]*queuedMessage
 	consumers        map[*consumer]struct{}
 	groups           map[string]*groupState
 	producers        int
@@ -123,10 +125,11 @@ type groupState struct {
 }
 
 type queuedMessage struct {
-	message       driver.OutboundMessage
-	deliveryCount int
-	sequence      uint64
-	due           time.Time
+	message         driver.OutboundMessage
+	deliveryCount   int
+	sequence        uint64
+	due             time.Time
+	deliveredGroups map[string]bool
 }
 
 func (c *conn) Capabilities() driver.Capabilities { return c.caps }
@@ -175,10 +178,12 @@ func (c *conn) newConsumer(ctx context.Context, cfg driver.ConsumerConfig, ackDe
 		}
 	}
 	var group *groupState
+	createdGroup := false
 	startAfter := make(map[string]uint64, len(cfg.Destinations))
 	if cfg.Group != "" {
 		group = c.groups[cfg.Group]
 		if group == nil {
+			createdGroup = true
 			group = &groupState{positions: make(map[string]uint64, len(cfg.Destinations))}
 			c.groups[cfg.Group] = group
 			if cfg.StartAt == driver.StartLatest {
@@ -189,6 +194,9 @@ func (c *conn) newConsumer(ctx context.Context, cfg driver.ConsumerConfig, ackDe
 		}
 		for _, name := range cfg.Destinations {
 			startAfter[name] = group.positions[name]
+		}
+		if createdGroup && cfg.StartAt != driver.StartLatest {
+			c.replayHistoryLocked(cfg.Group, cfg.Destinations, startAfter)
 		}
 	} else if cfg.StartAt == driver.StartLatest {
 		for _, name := range cfg.Destinations {
@@ -221,6 +229,35 @@ func (c *conn) newConsumer(ctx context.Context, cfg driver.ConsumerConfig, ackDe
 	c.dispatchLocked()
 	c.signalWake()
 	return cs, nil
+}
+
+func (c *conn) replayHistoryLocked(group string, destinations []string, startAfter map[string]uint64) {
+	for _, name := range destinations {
+		dest := c.destinations[name]
+		current := make(map[uint64]struct{}, len(dest.messages))
+		for _, message := range dest.messages {
+			current[message.sequence] = struct{}{}
+		}
+		for _, original := range c.history[name] {
+			if original.sequence <= startAfter[name] {
+				continue
+			}
+			if _, ok := current[original.sequence]; ok {
+				continue
+			}
+			deliveredGroups := make(map[string]bool, len(c.groups))
+			for existing := range c.groups {
+				deliveredGroups[existing] = existing != group
+			}
+			dest.messages = append(dest.messages, &queuedMessage{
+				message:         cloneOutbound(original.message),
+				deliveryCount:   original.deliveryCount,
+				sequence:        original.sequence,
+				due:             original.due,
+				deliveredGroups: deliveredGroups,
+			})
+		}
+	}
 }
 
 func (c *conn) Ping(ctx context.Context) error {
@@ -384,6 +421,9 @@ func (c *conn) requeueDeliveryLocked(delivery *settler, now time.Time) {
 	}
 	delivery.message.deliveryCount++
 	delivery.message.due = now
+	if delivery.message.deliveredGroups != nil {
+		delete(delivery.message.deliveredGroups, consumer.cfg.Group)
+	}
 	if dest, ok := c.destinations[name]; ok {
 		dest.messages = append([]*queuedMessage{delivery.message}, dest.messages...)
 	}
@@ -425,12 +465,18 @@ destinationLoop:
 					cs.outstanding++
 					cs.unsettled[dest.spec.Name]++
 					cs.inflight[delivery] = struct{}{}
+					if msg.deliveredGroups == nil {
+						msg.deliveredGroups = make(map[string]bool)
+					}
+					msg.deliveredGroups[cs.cfg.Group] = true
 					key := string(msg.message.Key)
 					if key != "" {
 						dest.affinity[key] = cs
 						cs.unsettledKey[deliveryKey{destination: dest.spec.Name, key: key}]++
 					}
-					dest.messages = append(dest.messages[:i], dest.messages[i+1:]...)
+					if dest.messageComplete(msg) {
+						dest.messages = append(dest.messages[:i], dest.messages[i+1:]...)
+					}
 					delivered = true
 				default:
 					continue destinationLoop
@@ -456,6 +502,9 @@ func (c *conn) destinationNamesLocked() []string {
 func (d *destination) pickConsumer(message *queuedMessage) *consumer {
 	eligible := make([]*consumer, 0, len(d.order))
 	for _, cs := range d.order {
+		if message.deliveredGroups != nil && message.deliveredGroups[cs.cfg.Group] {
+			continue
+		}
 		if !cs.stopped && !cs.draining && !cs.paused[d.spec.Name] &&
 			cs.canReceive(d.spec.Name) && cs.visible(message, d.spec.Name) {
 			eligible = append(eligible, cs)
@@ -476,6 +525,20 @@ func (d *destination) pickConsumer(message *queuedMessage) *consumer {
 	cs := eligible[d.next%len(eligible)]
 	d.next++
 	return cs
+}
+
+func (d *destination) messageComplete(message *queuedMessage) bool {
+	groups := make(map[string]struct{})
+	for _, cs := range d.order {
+		if cs.stopped || cs.draining {
+			continue
+		}
+		groups[cs.cfg.Group] = struct{}{}
+		if message.deliveredGroups == nil || !message.deliveredGroups[cs.cfg.Group] {
+			return false
+		}
+	}
+	return len(groups) > 0
 }
 
 func (c *consumer) canReceive(destination string) bool {

@@ -11,6 +11,7 @@ func TestStrict_ZeroesEveryNegotiableCapability(t *testing.T) {
 	got := (Capabilities{
 		PerMessageAck:        true,
 		OrderedByKey:         true,
+		Fanout:               FanoutAtPublish,
 		NativePriority:       PriorityStrict,
 		NativePriorityLevels: 32,
 		NativeDelay:          true,
@@ -26,6 +27,7 @@ func TestStrict_ZeroesEveryNegotiableCapability(t *testing.T) {
 	// Constraints survive the strict profile; capabilities do not. A field added
 	// here must be a fact about the broker that holds under either profile.
 	kept := map[string]bool{
+		"Fanout":          true,
 		"ConsumerScaling": true,
 		"OrderedByKey":    true,
 		"MaxMessageBytes": true,

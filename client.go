@@ -22,7 +22,6 @@ type Client struct {
 	config         Config
 	source         string
 	producer       string
-	driver         string
 	producerHandle driver.Producer
 	metrics        *obs.Metrics
 
@@ -101,7 +100,6 @@ func New(ctx context.Context, cfg Config, opts ...Option) (*Client, error) {
 		config:    cfg,
 		source:    fmt.Sprintf("/%s/%s", cfg.Env, cfg.Service),
 		producer:  fmt.Sprintf("%s/unknown/%s", cfg.Service, cfg.InstanceID),
-		driver:    options.driver.Name(),
 		metrics:   metrics,
 		runners:   make(map[*Runner]struct{}),
 	}

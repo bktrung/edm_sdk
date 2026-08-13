@@ -7,6 +7,7 @@ package driver
 type Capabilities struct {
 	PerMessageAck        bool         // native per-message settlement
 	OrderedByKey         bool         // ordering guaranteed for equal keys
+	Fanout               FanoutMode   // when one message becomes one copy per subscription
 	NativePriority       PriorityMode // None | Relative | Strict
 	NativePriorityLevels int          // native priority depth
 	NativeDelay          bool         // broker-level delayed delivery support
@@ -17,6 +18,16 @@ type Capabilities struct {
 	MaxHeaderBytes       int          // physical broker limit
 	LagQueryable         bool         // broker exposes backlog
 }
+
+// FanoutMode describes when a published message becomes one copy per subscription.
+type FanoutMode int
+
+const (
+	// FanoutAtConsume means subscriptions share a destination and consume independently.
+	FanoutAtConsume FanoutMode = iota
+	// FanoutAtPublish means the broker copies messages to per-subscription destinations.
+	FanoutAtPublish
+)
 
 // PriorityMode describes broker-side priority support.
 type PriorityMode int
@@ -79,6 +90,7 @@ func (s Scaling) String() string {
 // partition count, which read literally says no consumer may ever receive.
 func (c Capabilities) Strict() Capabilities {
 	return Capabilities{
+		Fanout:          c.Fanout,
 		ConsumerScaling: c.ConsumerScaling,
 		OrderedByKey:    c.OrderedByKey,
 		MaxMessageBytes: c.MaxMessageBytes,

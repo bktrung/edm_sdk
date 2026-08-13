@@ -23,7 +23,7 @@ var groupManifest = []manifestEntry{
 	{name: "rebalance", declared: 11},
 	{name: "failure", declared: 15},
 	{name: "topology", declared: 15},
-	{name: "capability", declared: 25},
+	{name: "capability", declared: 26},
 	{name: "lag", declared: 5},
 }
 
