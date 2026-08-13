@@ -147,11 +147,18 @@ func returnedPublishError(returned amqp.Return) error {
 }
 
 func amqpPublishing(message driver.OutboundMessage) (amqp.Publishing, error) {
-	headers := make(amqp.Table, len(message.Headers))
+	headers := make(amqp.Table, len(message.Headers)+1)
 	publishing := amqp.Publishing{
 		DeliveryMode: amqp.Persistent,
 		Headers:      headers,
 		Body:         append([]byte(nil), message.Body...),
+	}
+	// A fanout exchange ignores the AMQP routing key, so the ordering identity
+	// needs a header of its own. It is deliberately not a cloudEvents: header:
+	// it is a transport detail rather than an envelope attribute, and it must
+	// not surface in the portable header set on the way back.
+	if len(message.Key) > 0 {
+		headers[partitionKeyHeader] = string(message.Key)
 	}
 	for _, header := range message.Headers {
 		value := string(header.Value)

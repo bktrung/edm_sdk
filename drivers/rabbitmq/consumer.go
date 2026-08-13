@@ -16,6 +16,12 @@ import (
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/driver"
 )
 
+// partitionKeyHeader carries OutboundMessage.Key across the wire. A fanout
+// exchange ignores the AMQP routing key, so the ordering identity cannot ride
+// there, and it is not an envelope attribute so it does not belong under the
+// cloudEvents: prefix.
+const partitionKeyHeader = "x-f1-partition-key"
+
 var consumerSequence atomic.Uint64
 
 type consumer struct {
@@ -216,7 +222,7 @@ func inboundMessage(destination string, delivery amqp.Delivery, settler *settler
 	}
 	return driver.InboundMessage{
 		Destination:   destination,
-		Key:           headerValueByKey(headers, "cloudEvents:f1partitionkey"),
+		Key:           headerValue(delivery.Headers[partitionKeyHeader]),
 		Headers:       headers,
 		Body:          append([]byte(nil), delivery.Body...),
 		DeliveryCount: deliveryCount(delivery),
@@ -470,16 +476,29 @@ func (c *consumer) release(settler *settler) {
 func amqpHeaders(delivery amqp.Delivery) []driver.Header {
 	values := make(map[string][]byte, len(delivery.Headers)+4)
 	for key, value := range delivery.Headers {
-		key = strings.TrimPrefix(key, "cloudEvents:")
-		if strings.HasPrefix(key, "x-") {
+		// Only cloudEvents: headers are envelope attributes. Everything else is
+		// owned by the broker or by this driver (x-delivery-count, x-death, the
+		// partition key) and is not part of the portable header set. Matching on
+		// the prefix rather than trimming it first keeps an attribute that is
+		// itself named x-something, which the core is free to send.
+		name, prefixed := strings.CutPrefix(key, "cloudEvents:")
+		if !prefixed {
 			continue
 		}
-		values[key] = headerValue(value)
+		values[name] = headerValue(value)
 	}
+	// AMQP properties fill in only where the attribute header is absent. The
+	// header carries the value the core sent; the property is a lossy copy for
+	// AMQP-native tooling, and the timestamp property in particular is POSIX
+	// seconds, so preferring it would silently truncate a sub-second time.
 	setProperty := func(key, value string) {
-		if value != "" {
-			values[key] = []byte(value)
+		if value == "" {
+			return
 		}
+		if _, ok := values[key]; ok {
+			return
+		}
+		values[key] = []byte(value)
 	}
 	setProperty("id", delivery.MessageId)
 	setProperty("type", delivery.Type)
