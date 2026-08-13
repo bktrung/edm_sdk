@@ -42,12 +42,59 @@ const Exported = 1
 	}
 }
 
+func TestLoadFixtureReadsDocumentedNotBuilt(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "fixture.json")
+	data := []byte(`{"package":"sample","symbols":["Present"],"documented-not-built":["Translator"]}`)
+	if err := os.WriteFile(path, data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	packageName, symbols, gaps, err := loadFixture(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if packageName != "sample" || !reflect.DeepEqual(symbols, []string{"Present"}) || !reflect.DeepEqual(gaps, []string{"Translator"}) {
+		t.Fatalf("fixture = %q, %v, %v; want sample, [Present], [Translator]", packageName, symbols, gaps)
+	}
+}
 func TestSurfaceDifferencesReportFixtureOnlySymbols(t *testing.T) {
-	missing, stale := surfaceDifferences([]string{"Present", "New"}, []string{"Present", "Stale"})
+	missing, stale, closed := surfaceDifferences(
+		[]string{"Present", "New"},
+		[]string{"Present", "Stale"},
+		[]string{"Gap"},
+	)
 	if !reflect.DeepEqual(missing, []string{"New"}) {
 		t.Fatalf("missing = %v, want [New]", missing)
 	}
 	if !reflect.DeepEqual(stale, []string{"Stale"}) {
 		t.Fatalf("stale = %v, want [Stale]", stale)
+	}
+	if len(closed) != 0 {
+		t.Fatalf("closed = %v, want []", closed)
+	}
+}
+func TestSurfaceDifferencesAllowDocumentedNotBuiltSymbols(t *testing.T) {
+	missing, stale, closed := surfaceDifferences(
+		[]string{"Present"},
+		[]string{"Present"},
+		[]string{"Translator"},
+	)
+	if len(missing) != 0 || len(stale) != 0 || len(closed) != 0 {
+		t.Fatalf("absent gap differences = %v, %v, %v; want none", missing, stale, closed)
+	}
+	missing, stale, closed = surfaceDifferences(
+		[]string{"Present"},
+		[]string{"Present", "Translator"},
+		nil,
+	)
+	if len(missing) != 0 || !reflect.DeepEqual(stale, []string{"Translator"}) || len(closed) != 0 {
+		t.Fatalf("stale gap differences = %v, %v, %v; want stale Translator", missing, stale, closed)
+	}
+	missing, stale, closed = surfaceDifferences(
+		[]string{"Present", "Translator"},
+		[]string{"Present"},
+		[]string{"Translator"},
+	)
+	if len(missing) != 0 || len(stale) != 0 || !reflect.DeepEqual(closed, []string{"Translator"}) {
+		t.Fatalf("closed gap differences = %v, %v, %v; want closed Translator", missing, stale, closed)
 	}
 }

@@ -137,5 +137,8 @@
     "WithTopic",
     "WithTopology",
     "WithTracerProvider"
+  ],
+  "documented-not-built": [
+    "Translator"
   ]
 }

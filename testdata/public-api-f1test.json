@@ -8,5 +8,6 @@
     "Client.Deliver",
     "Client.Published",
     "NewClient"
-  ]
+  ],
+  "documented-not-built": []
 }
