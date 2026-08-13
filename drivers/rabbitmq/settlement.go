@@ -12,6 +12,7 @@ type settler struct {
 	mu       sync.Mutex
 	owner    *consumer
 	delivery amqp.Delivery
+	settling bool
 	settled  bool
 }
 
@@ -30,10 +31,11 @@ func (s *settler) settle(ctx context.Context, options driver.NackOptions, nack b
 		return classify("settle", driver.KindTransient, err)
 	}
 	s.mu.Lock()
-	if s.settled {
+	if s.settled || s.settling {
 		s.mu.Unlock()
 		return classify("settle", driver.KindFatal, driver.ErrAlreadySettled)
 	}
+	s.settling = true
 	s.mu.Unlock()
 
 	var err error
@@ -43,14 +45,14 @@ func (s *settler) settle(ctx context.Context, options driver.NackOptions, nack b
 		err = s.delivery.Ack(false)
 	}
 	if err != nil {
+		s.mu.Lock()
+		s.settling = false
+		s.mu.Unlock()
 		return classifyAMQP("settle", driver.KindTransient, err)
 	}
 
 	s.mu.Lock()
-	if s.settled {
-		s.mu.Unlock()
-		return classify("settle", driver.KindFatal, driver.ErrAlreadySettled)
-	}
+	s.settling = false
 	s.settled = true
 	s.mu.Unlock()
 	s.owner.release(s)
