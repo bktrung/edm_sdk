@@ -95,6 +95,7 @@ type conn struct {
 	info       driver.BrokerInfo
 	closed     bool
 	active     map[*consumer]struct{}
+	producers  map[*producer]struct{}
 	exchanges  map[string]struct{}
 	bindings   map[bindingKey]bool
 }
@@ -107,6 +108,7 @@ func newConn(amqpConn *amqp.Connection, caps driver.Capabilities) *conn {
 		caps:      caps,
 		info:      brokerInfo(amqpConn),
 		active:    make(map[*consumer]struct{}),
+		producers: make(map[*producer]struct{}),
 		exchanges: make(map[string]struct{}),
 		bindings:  make(map[bindingKey]bool),
 	}
@@ -120,11 +122,29 @@ func (c *conn) BrokerInfo() driver.BrokerInfo {
 	return copyBrokerInfo(c.info)
 }
 
-func (c *conn) Producer(ctx context.Context, _ driver.ProducerConfig) (driver.Producer, error) {
+func (c *conn) Producer(ctx context.Context, cfg driver.ProducerConfig) (driver.Producer, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, classify("producer", driver.KindTransient, err)
 	}
-	return nil, classify("producer", driver.KindFatal, driver.ErrUnsupported)
+	c.mu.RLock()
+	if c.closed || c.amqp.IsClosed() {
+		c.mu.RUnlock()
+		return nil, classify("producer", driver.KindTransient, amqp.ErrClosed)
+	}
+	c.mu.RUnlock()
+	producer, err := newProducer(c, cfg)
+	if err != nil {
+		return nil, err
+	}
+	c.mu.Lock()
+	if c.closed || c.amqp.IsClosed() {
+		c.mu.Unlock()
+		_ = producer.Close(context.Background())
+		return nil, classify("producer", driver.KindTransient, amqp.ErrClosed)
+	}
+	c.producers[producer] = struct{}{}
+	c.mu.Unlock()
+	return producer, nil
 }
 
 func (c *conn) Consumer(ctx context.Context, cfg driver.ConsumerConfig) (driver.Consumer, error) {
@@ -184,7 +204,7 @@ func (c *conn) Close(ctx context.Context) error {
 		c.mu.Unlock()
 		return nil
 	}
-	if len(c.active) != 0 {
+	if len(c.active) != 0 || len(c.producers) != 0 {
 		c.mu.Unlock()
 		return classify("close", driver.KindFatal, driver.ErrResourcesOutstanding)
 	}
@@ -391,4 +411,10 @@ func classifyAMQP(op string, fallback driver.Kind, err error) error {
 		}
 	}
 	return classify(op, kind, err)
+}
+
+func (c *conn) removeProducer(producer *producer) {
+	c.mu.Lock()
+	delete(c.producers, producer)
+	c.mu.Unlock()
 }

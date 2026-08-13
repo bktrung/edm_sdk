@@ -4,7 +4,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -206,7 +208,7 @@ func (c *consumer) sendError(err error) {
 }
 
 func inboundMessage(destination string, delivery amqp.Delivery, settler *settler) driver.InboundMessage {
-	headers := amqpHeaders(delivery.Headers)
+	headers := amqpHeaders(delivery)
 	receivedAt := delivery.Timestamp
 	if receivedAt.IsZero() {
 		receivedAt = time.Now() //nolint:forbidigo // the port requires receipt time and drivers have no clock dependency
@@ -253,14 +255,6 @@ func deliveryCount(delivery amqp.Delivery) int {
 		return 1
 	}
 	return 0
-}
-
-func amqpHeaders(values amqp.Table) []driver.Header {
-	headers := make([]driver.Header, 0, len(values))
-	for key, value := range values {
-		headers = append(headers, driver.Header{Key: key, Value: headerValue(value)})
-	}
-	return headers
 }
 
 func headerValueByKey(headers []driver.Header, key string) []byte {
@@ -467,4 +461,39 @@ func (c *consumer) release(settler *settler) {
 		c.outstanding--
 	}
 	c.mu.Unlock()
+}
+
+func amqpHeaders(delivery amqp.Delivery) []driver.Header {
+	values := make(map[string][]byte, len(delivery.Headers)+4)
+	for key, value := range delivery.Headers {
+		if strings.HasPrefix(key, "cloudEvents:") {
+			key = strings.TrimPrefix(key, "cloudEvents:")
+		}
+		if strings.HasPrefix(key, "x-") {
+			continue
+		}
+		values[key] = headerValue(value)
+	}
+	setProperty := func(key, value string) {
+		if value != "" {
+			values[key] = []byte(value)
+		}
+	}
+	setProperty("id", delivery.MessageId)
+	setProperty("type", delivery.Type)
+	setProperty("datacontenttype", delivery.ContentType)
+	setProperty("f1correlationid", delivery.CorrelationId)
+	if !delivery.Timestamp.IsZero() {
+		setProperty("time", delivery.Timestamp.Format(time.RFC3339Nano))
+	}
+	keys := make([]string, 0, len(values))
+	for key := range values {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	headers := make([]driver.Header, 0, len(keys))
+	for _, key := range keys {
+		headers = append(headers, driver.Header{Key: key, Value: values[key]})
+	}
+	return headers
 }
