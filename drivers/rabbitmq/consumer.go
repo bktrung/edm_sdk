@@ -60,7 +60,7 @@ type lane struct {
 
 var _ driver.Consumer = (*consumer)(nil)
 
-func newConsumer(conn *conn, ctx context.Context, cfg driver.ConsumerConfig) (*consumer, error) {
+func newConsumer(conn *conn, cfg driver.ConsumerConfig) (*consumer, error) {
 	c := &consumer{
 		conn:     conn,
 		cfg:      cfg,
@@ -86,7 +86,7 @@ func newConsumer(conn *conn, ctx context.Context, cfg driver.ConsumerConfig) (*c
 			return nil, classifyAMQP("consumer", driver.KindFatal, err)
 		}
 		tag := "f1-consumer-" + strconv.FormatUint(consumerSequence.Add(1), 10)
-		deliveries, err := channel.ConsumeWithContext(ctx, destination, tag, false, cfg.Exclusive, false, false, nil)
+		deliveries, err := channel.Consume(destination, tag, false, cfg.Exclusive, false, false, nil)
 		if err != nil {
 			_ = channel.Close()
 			c.closeLanes()

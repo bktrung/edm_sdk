@@ -161,7 +161,7 @@ func (c *conn) Consumer(ctx context.Context, cfg driver.ConsumerConfig) (driver.
 	if len(cfg.Destinations) == 0 {
 		return nil, classify("consumer", driver.KindFatal, errors.New("no destinations"))
 	}
-	consumer, err := newConsumer(c, ctx, cfg)
+	consumer, err := newConsumer(c, cfg)
 	if err != nil {
 		return nil, err
 	}
