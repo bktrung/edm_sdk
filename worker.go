@@ -383,7 +383,7 @@ func openRunnerConsumer(r *Runner, ctx context.Context) (driver.Consumer, error)
 	if conn == nil {
 		return nil, errors.New("f1: client is not connected")
 	}
-	destinations := subscriptionDestinations(effective, source, r.subscription.Name, r.subscription)
+	destinations := subscriptionDestinations(effective, source, r.subscription)
 	if policy != driver.TopologyNone {
 		if admin := conn.Admin(); admin != nil {
 			topology := subscriptionTopologySpecs(effective, source, r.subscription)
@@ -947,12 +947,12 @@ func truncateError(err error) string {
 	return value
 }
 
-func subscriptionDestinations(effective driver.Capabilities, source, subscription string, sub Subscription) []string {
+func subscriptionDestinations(effective driver.Capabilities, source string, sub Subscription) []string {
 	set := make(map[string]struct{})
 	for _, topic := range sub.Topics {
 		logical := topicFor(topic)
 		for _, priority := range sub.Priorities {
-			set[consumeDestination(effective, source, logical, priority, subscription)] = struct{}{}
+			set[consumeDestination(effective, source, logical, priority, sub.Name)] = struct{}{}
 			for tier := 1; tier <= retryTiers(sub.Retry); tier++ {
 				set[retryDestinationFor(source, logical, priority, tier, sub.Name)] = struct{}{}
 			}
