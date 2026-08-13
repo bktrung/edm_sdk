@@ -138,3 +138,28 @@ $(APISURFACE): tools/apisurface/main.go tools/apisurface/go.mod
 
 $(APIDIFF): tools/apidiff/go.mod tools/apidiff/go.sum
 	cd tools/apidiff && go build -o ../../.tools/bin/apidiff golang.org/x/exp/cmd/apidiff
+
+.PHONY: broker-up broker-down broker-smoke
+
+## broker-up: start the pinned local RabbitMQ fixture.
+broker-up:
+	docker compose -f docker/docker-compose.yml up -d
+
+## broker-down: stop the local RabbitMQ fixture and keep its named volume.
+broker-down:
+	docker compose -f docker/docker-compose.yml down
+
+## broker-smoke: wait for RabbitMQ health and print its version.
+broker-smoke:
+	@set -e; \
+	for attempt in $$(seq 1 60); do \
+		health=$$(docker compose -f docker/docker-compose.yml ps --format '{{.Health}}' rabbitmq 2>/dev/null || true); \
+		if [ "$$health" = "healthy" ]; then \
+			docker compose -f docker/docker-compose.yml exec -T rabbitmq rabbitmq-diagnostics -q status | grep 'RabbitMQ version'; \
+			exit 0; \
+		fi; \
+		sleep 1; \
+	done; \
+	echo "broker-smoke: RabbitMQ did not become healthy" >&2; \
+	docker compose -f docker/docker-compose.yml ps; \
+	exit 1
