@@ -27,6 +27,36 @@ func TestPublishTopicsOptionRejectsEmptyAndDuplicate(t *testing.T) {
 	options := clientOptions{}
 	require.NoError(t, WithPublishTopics("orders.created")(&options))
 	require.Error(t, WithPublishTopics("orders.created")(&options))
+	options = clientOptions{}
+	require.NoError(t, WithPublishTopics("orders.created.v1")(&options))
+	require.Error(t, WithPublishTopics("orders.created")(&options))
+}
+
+func TestVersionedPublishTopicUsesCanonicalEntryPoint(t *testing.T) {
+	producer := &recordingProducer{}
+	admin := &topologyRecordingAdmin{}
+	conn := &topologyTestConn{
+		testConn: &testConn{caps: driver.Capabilities{MaxHeaderBytes: CoreMaxHeaderBytes}},
+		admin:    admin,
+		producer: producer,
+	}
+	cfg := testClientConfig(t)
+	cfg.Topology.Priorities = []Priority{PriorityNormal}
+	client, err := New(context.Background(), cfg,
+		WithDriver(&topologyTestDriver{conn: conn}),
+		WithPublishTopics("orders.created.v1"),
+	)
+	require.NoError(t, err)
+	defer func() { require.NoError(t, client.Close(context.Background())) }()
+
+	require.Len(t, admin.specs, 1)
+	require.Equal(t, []string{"f1.test.orders.created.normal"}, destinationNames(admin.specs[0].Destinations))
+	_, err = client.Publisher().Publish(context.Background(), "orders.created.v1", map[string]string{"id": "o1"})
+	require.NoError(t, err)
+	producer.mu.Lock()
+	require.Len(t, producer.messages, 1)
+	require.Equal(t, "f1.test.orders.created.normal", producer.messages[0].Destination)
+	producer.mu.Unlock()
 }
 
 func TestPublisherTopologyHasOnlyEntryPoints(t *testing.T) {

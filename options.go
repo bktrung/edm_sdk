@@ -157,16 +157,19 @@ func WithPublishTopics(topics ...string) Option {
 		for _, topic := range options.publishTopics {
 			seen[topic] = struct{}{}
 		}
+		canonical := make([]string, 0, len(topics))
 		for _, topic := range topics {
 			if topic == "" {
 				return fmt.Errorf("f1: WithPublishTopics topic must not be empty")
 			}
-			if _, ok := seen[topic]; ok {
+			logical := topicFor(topic)
+			if _, ok := seen[logical]; ok {
 				return fmt.Errorf("f1: WithPublishTopics contains duplicate topic %q", topic)
 			}
-			seen[topic] = struct{}{}
+			seen[logical] = struct{}{}
+			canonical = append(canonical, logical)
 		}
-		options.publishTopics = append(options.publishTopics, topics...)
+		options.publishTopics = append(options.publishTopics, canonical...)
 		options.publishTopicsSet = true
 		return nil
 	}
