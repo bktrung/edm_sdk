@@ -88,22 +88,27 @@ func (Driver) Open(ctx context.Context, cfg driver.Config) (driver.Conn, error) 
 }
 
 type conn struct {
-	mu     sync.RWMutex
-	amqp   *amqp.Connection
-	caps   driver.Capabilities
-	info   driver.BrokerInfo
-	closed bool
-	active map[*consumer]struct{}
+	mu         sync.RWMutex
+	topologyMu sync.Mutex
+	amqp       *amqp.Connection
+	caps       driver.Capabilities
+	info       driver.BrokerInfo
+	closed     bool
+	active     map[*consumer]struct{}
+	exchanges  map[string]struct{}
+	bindings   map[bindingKey]bool
 }
 
 var _ driver.Conn = (*conn)(nil)
 
 func newConn(amqpConn *amqp.Connection, caps driver.Capabilities) *conn {
 	return &conn{
-		amqp:   amqpConn,
-		caps:   caps,
-		info:   brokerInfo(amqpConn),
-		active: make(map[*consumer]struct{}),
+		amqp:      amqpConn,
+		caps:      caps,
+		info:      brokerInfo(amqpConn),
+		active:    make(map[*consumer]struct{}),
+		exchanges: make(map[string]struct{}),
+		bindings:  make(map[bindingKey]bool),
 	}
 }
 
@@ -142,7 +147,7 @@ func (c *conn) Consumer(ctx context.Context, cfg driver.ConsumerConfig) (driver.
 	return consumer, nil
 }
 
-func (c *conn) Admin() driver.Admin { return &admin{} }
+func (c *conn) Admin() driver.Admin { return &admin{conn: c} }
 
 func (c *conn) removeConsumer(consumer *consumer) {
 	c.mu.Lock()

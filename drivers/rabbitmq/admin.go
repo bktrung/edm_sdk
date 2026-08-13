@@ -6,15 +6,15 @@ import (
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/driver"
 )
 
-type admin struct{}
+type admin struct{ conn *conn }
 
 var _ driver.Admin = (*admin)(nil)
 
-func (a *admin) EnsureTopology(ctx context.Context, _ driver.TopologySpec) (driver.TopologyDiff, error) {
+func (a *admin) EnsureTopology(ctx context.Context, spec driver.TopologySpec) (driver.TopologyDiff, error) {
 	if err := ctx.Err(); err != nil {
 		return driver.TopologyDiff{}, classify("ensure_topology", driver.KindTransient, err)
 	}
-	return driver.TopologyDiff{}, classify("ensure_topology", driver.KindFatal, driver.ErrUnsupported)
+	return a.ensureTopology(ctx, spec)
 }
 
 func (a *admin) DescribeTopology(ctx context.Context, _ []string) (driver.TopologyState, error) {
