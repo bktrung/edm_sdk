@@ -5,7 +5,7 @@ package f1test
 import (
 	"context"
 	"errors"
-	"runtime"
+	"fmt"
 	"strings"
 	"sync"
 	"testing"
@@ -26,6 +26,7 @@ type Client struct {
 
 	clock    *clock.Fake
 	captures *captureStore
+	state    *captureState
 }
 
 // Captured is one message accepted by the in-memory driver's producer.
@@ -60,19 +61,25 @@ func closeClient(client *Client) error {
 
 func newClient(opts ...f1.Option) (*Client, error) {
 	fake := clock.NewFake(time.Unix(0, 0))
-	captures := &captureStore{}
+	captures := &captureStore{publishedSignal: make(chan struct{}, 1)}
+	state := &captureState{
+		destinations: make(map[string]chan struct{}),
+		ready:        make(map[string]bool),
+		waiting:      make(chan string, 16),
+		released:     make(chan struct{}, 16),
+	}
 	options := append([]f1.Option(nil), opts...)
 	// These options are last so every helper always observes the same fake
 	// clock that the in-memory driver's deferred-delivery queue uses.
 	options = append(options,
-		f1.WithDriver(captureDriver{inner: inmem.New(fake), captures: captures}),
+		f1.WithDriver(captureDriver{inner: inmem.New(fake), captures: captures, state: state}),
 		f1.WithClock(fake),
 	)
 	core, err := f1.New(context.Background(), testConfig(), options...)
 	if err != nil {
 		return nil, err
 	}
-	return &Client{Client: core, clock: fake, captures: captures}, nil
+	return &Client{Client: core, clock: fake, captures: captures, state: state}, nil
 }
 
 func testConfig() f1.Config {
@@ -109,23 +116,28 @@ func testConfig() f1.Config {
 	}
 }
 
-// Deliver publishes an event through the in-memory broker. A subscription
-// returned by Client.Subscribe must be running for its handler to receive it.
-// The call fails the test when the message is not accepted by the driver.
+// Deliver waits for the event's destination to be created, then publishes an
+// event through the in-memory broker. A subscription returned by
+// Client.Subscribe must be running for its handler to receive it. The call
+// fails the test when the destination is not ready or the message is not
+// accepted by the driver.
 func (c *Client) Deliver(t *testing.T, eventType string, payload any, opts ...f1.PublishOption) {
 	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := deliver(c, ctx, eventType, payload, opts...); err != nil {
+		t.Fatalf("f1test: deliver %q: %v", eventType, err)
+	}
+}
+
+func deliver(c *Client, ctx context.Context, eventType string, payload any, opts ...f1.PublishOption) error {
 	if c == nil || c.Client == nil {
-		t.Fatal("f1test: nil client")
+		return errors.New("f1test: nil client")
 	}
-	for attempt := 0; attempt < 1000; attempt++ {
-		if _, err := c.Publisher().Publish(context.Background(), eventType, payload, opts...); err == nil {
-			return
-		} else if !errors.Is(err, driver.ErrDestinationMissing) {
-			t.Fatalf("f1test: deliver %q: %v", eventType, err)
-		}
-		runtime.Gosched()
+	if _, err := c.Publisher().Publish(ctx, eventType, payload, opts...); err != nil {
+		return err
 	}
-	t.Fatalf("f1test: deliver %q: subscription topology was not ready", eventType)
+	return nil
 }
 
 // Published returns and clears messages accepted by the in-memory driver that
@@ -146,27 +158,81 @@ func (c *Client) DLQ() []Captured {
 	return c.captures.take(true)
 }
 
-// Advance moves the fake clock. The same concrete clock is supplied to both
-// the core and in-memory driver, so advancing it also fires deferred retry
-// deliveries owned by the driver.
+// Advance moves the fake clock and releases due deferred messages from the
+// in-memory driver before returning. The same concrete clock is supplied to
+// the core and driver, so both sides observe the new instant.
 func (c *Client) Advance(d time.Duration) {
 	if c == nil || c.clock == nil {
 		return
 	}
 	c.clock.Advance(d)
-	// A producer can signal the driver's pump immediately before this method
-	// runs. Give that pump a chance to register its due timer, then drain timers
-	// that became due at the new instant without introducing real-time sleeps.
-	for i := 0; i < 32; i++ {
-		runtime.Gosched()
-		c.clock.Advance(0)
+	if c.state != nil && c.state.releaseDue != nil {
+		c.state.releaseDue()
+	}
+}
+
+type captureState struct {
+	mu           sync.Mutex
+	destinations map[string]chan struct{}
+	ready        map[string]bool
+	waiting      chan string
+	releaseDue   func()
+	released     chan struct{}
+}
+
+func (s *captureState) destinationGate(name string) (chan struct{}, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	gate := s.destinations[name]
+	ready := s.ready[name]
+	if gate == nil {
+		gate = make(chan struct{})
+		s.destinations[name] = gate
+		if ready {
+			close(gate)
+		}
+	}
+	return gate, ready
+}
+
+func (s *captureState) markReady(specs []driver.DestinationSpec) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, spec := range specs {
+		gate := s.destinations[spec.Name]
+		if gate == nil {
+			gate = make(chan struct{})
+			s.destinations[spec.Name] = gate
+		}
+		if s.ready[spec.Name] {
+			continue
+		}
+		s.ready[spec.Name] = true
+		close(gate)
+	}
+}
+
+func (s *captureState) waitDestination(ctx context.Context, name string) error {
+	gate, ready := s.destinationGate(name)
+	if !ready {
+		select {
+		case s.waiting <- name:
+		default:
+		}
+	}
+	select {
+	case <-gate:
+		return nil
+	case <-ctx.Done():
+		return fmt.Errorf("f1test: destination %q was not ready: %w", name, ctx.Err())
 	}
 }
 
 type captureStore struct {
-	mu        sync.Mutex
-	published []Captured
-	dlq       []Captured
+	mu              sync.Mutex
+	published       []Captured
+	dlq             []Captured
+	publishedSignal chan struct{}
 }
 
 func (s *captureStore) add(messages []driver.OutboundMessage, err error) {
@@ -184,7 +250,7 @@ func (s *captureStore) add(messages []driver.OutboundMessage, err error) {
 	}
 
 	s.mu.Lock()
-	defer s.mu.Unlock()
+	published := false
 	for index, message := range messages {
 		if _, ok := failed[index]; ok {
 			continue
@@ -194,6 +260,30 @@ func (s *captureStore) add(messages []driver.OutboundMessage, err error) {
 			s.dlq = append(s.dlq, captured)
 		} else {
 			s.published = append(s.published, captured)
+			published = true
+		}
+	}
+	s.mu.Unlock()
+	if published && s.publishedSignal != nil {
+		select {
+		case s.publishedSignal <- struct{}{}:
+		default:
+		}
+	}
+}
+
+func (s *captureStore) waitPublished(ctx context.Context) error {
+	for {
+		s.mu.Lock()
+		published := len(s.published) > 0
+		s.mu.Unlock()
+		if published {
+			return nil
+		}
+		select {
+		case <-s.publishedSignal:
+		case <-ctx.Done():
+			return ctx.Err()
 		}
 	}
 }
@@ -228,6 +318,7 @@ func captureMessage(message driver.OutboundMessage) Captured {
 type captureDriver struct {
 	inner    inmem.Driver
 	captures *captureStore
+	state    *captureState
 }
 
 func (d captureDriver) Name() string                      { return d.inner.Name() }
@@ -237,12 +328,43 @@ func (d captureDriver) Open(ctx context.Context, cfg driver.Config) (driver.Conn
 	if err != nil {
 		return nil, err
 	}
-	return &captureConn{Conn: conn, captures: d.captures}, nil
+	if advancer, ok := conn.(interface{ ReleaseDue() }); ok && d.state != nil {
+		d.state.releaseDue = func() {
+			advancer.ReleaseDue()
+			select {
+			case d.state.released <- struct{}{}:
+			default:
+			}
+		}
+	}
+	return &captureConn{Conn: conn, captures: d.captures, state: d.state}, nil
 }
 
 type captureConn struct {
 	driver.Conn
 	captures *captureStore
+	state    *captureState
+}
+
+func (c *captureConn) Admin() driver.Admin {
+	admin := c.Conn.Admin()
+	if admin == nil {
+		return nil
+	}
+	return &captureAdmin{Admin: admin, state: c.state}
+}
+
+type captureAdmin struct {
+	driver.Admin
+	state *captureState
+}
+
+func (a *captureAdmin) EnsureTopology(ctx context.Context, spec driver.TopologySpec) (driver.TopologyDiff, error) {
+	diff, err := a.Admin.EnsureTopology(ctx, spec)
+	if err == nil && a.state != nil {
+		a.state.markReady(spec.Destinations)
+	}
+	return diff, err
 }
 
 func (c *captureConn) Producer(ctx context.Context, cfg driver.ProducerConfig) (driver.Producer, error) {
@@ -250,15 +372,23 @@ func (c *captureConn) Producer(ctx context.Context, cfg driver.ProducerConfig) (
 	if err != nil || producer == nil {
 		return producer, err
 	}
-	return &captureProducer{Producer: producer, captures: c.captures}, nil
+	return &captureProducer{Producer: producer, captures: c.captures, state: c.state}, nil
 }
 
 type captureProducer struct {
 	driver.Producer
 	captures *captureStore
+	state    *captureState
 }
 
 func (p *captureProducer) Publish(ctx context.Context, messages ...driver.OutboundMessage) error {
+	if p.state != nil {
+		for _, message := range messages {
+			if err := p.state.waitDestination(ctx, message.Destination); err != nil {
+				return err
+			}
+		}
+	}
 	err := p.Producer.Publish(ctx, messages...)
 	p.captures.add(messages, err)
 	return err
