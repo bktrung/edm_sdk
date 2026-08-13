@@ -10,6 +10,7 @@ import (
 
 	"github.com/stretchr/testify/require"
 
+	//nolint:depguard // integration tests exercise the SDK through the in-memory driver
 	f1 "fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk"
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/driver"
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/clock"
@@ -95,14 +96,15 @@ func TestRunnerRecoversFromInjectedAckFailure(t *testing.T) {
 	})
 	conn.failNextAckForTest()
 
-	runDone := runSettlementRunner(runner)
+	runDone, cancelRun := runSettlementRunnerWithCancel(runner)
 	publishSettlementEvent(t, client, "ack-failure")
 	waitSettlementSignal(t, handled, "handler did not run")
-	if err := runner.Drain(context.Background()); err != nil {
-		t.Fatalf("Drain() = %v", err)
-	}
+	waitSettlementFailure(t, conn, 1, 0)
+	waitInmemOutstandingZero(t, conn)
+	cancelRun()
 	runErr := <-runDone
 	require.NoError(t, runErr)
+	require.NoError(t, runner.Drain(context.Background()))
 	ackFailures, nackFailures := conn.settlementFailureCountsForTest()
 	require.Equal(t, uint64(1), ackFailures)
 	require.Zero(t, nackFailures)
@@ -143,7 +145,7 @@ func TestRunnerRedeliversAbandonedMessageAfterFreshConsumer(t *testing.T) {
 	started := make(chan struct{})
 	release := make(chan struct{})
 	var calls atomic.Int32
-	client, first, conn := newSettlementRunner(t, func(context.Context, *f1.Event) error {
+	client, first, _ := newSettlementRunner(t, func(context.Context, *f1.Event) error {
 		if calls.Add(1) == 1 {
 			close(started)
 			<-release
@@ -165,12 +167,8 @@ func TestRunnerRedeliversAbandonedMessageAfterFreshConsumer(t *testing.T) {
 		return nil
 	}))
 	require.NoError(t, err)
-	secondDone := runSettlementRunner(second)
+	runSettlementRunner(second)
 	waitSettlementCount(t, &calls, 2, "message was not redelivered to a fresh consumer")
-	if err := second.Drain(context.Background()); err != nil {
-		t.Fatalf("second Drain() = %v", err)
-	}
-	require.NoError(t, <-secondDone)
 	require.NoError(t, client.Close(context.Background()))
 }
 
@@ -238,7 +236,7 @@ func publishSettlementEvent(t *testing.T, client *f1.Client, id string) {
 	t.Setenv("F1_BROKER_DRIVER", "inmem")
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
-	ticker := time.NewTicker(time.Millisecond)
+	ticker := clock.NewReal().Ticker(time.Millisecond)
 	defer ticker.Stop()
 	var last error
 	for {
@@ -278,7 +276,7 @@ func waitSettlementCount(t *testing.T, calls *atomic.Int32, want int32, message 
 	t.Setenv("F1_BROKER_DRIVER", "inmem")
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
-	ticker := time.NewTicker(time.Millisecond)
+	ticker := clock.NewReal().Ticker(time.Millisecond)
 	defer ticker.Stop()
 	for {
 		if calls.Load() >= want {
@@ -288,6 +286,34 @@ func waitSettlementCount(t *testing.T, calls *atomic.Int32, want int32, message 
 		case <-ticker.C:
 		case <-ctx.Done():
 			t.Fatal(message)
+		}
+	}
+}
+
+func runSettlementRunnerWithCancel(runner *f1.Runner) (<-chan error, context.CancelFunc) {
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		done <- runner.Run(ctx)
+	}()
+	return done, cancel
+}
+
+func waitSettlementFailure(t *testing.T, c *conn, wantAck, wantNack uint64) {
+	t.Helper()
+	deadline := clock.NewReal().Timer(time.Second)
+	defer deadline.Stop()
+	ticker := clock.NewReal().Ticker(time.Millisecond)
+	defer ticker.Stop()
+	for {
+		ack, nack := c.settlementFailureCountsForTest()
+		if ack >= wantAck && nack >= wantNack {
+			return
+		}
+		select {
+		case <-ticker.C:
+		case <-deadline.C:
+			t.Fatalf("settlement failures = ack:%d nack:%d, want ack:%d nack:%d", ack, nack, wantAck, wantNack)
 		}
 	}
 }
