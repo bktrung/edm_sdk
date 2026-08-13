@@ -1,3 +1,4 @@
+// Package main runs the RabbitMQ publisher quickstart service.
 package main
 
 import (

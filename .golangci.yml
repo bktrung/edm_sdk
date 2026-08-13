@@ -237,6 +237,11 @@ linters:
         linters:
           - forbidigo
         text: "use a clock.Clock's"
+      # Example stdout is the interface shown in the quickstart.
+      - path: examples/
+        linters:
+          - forbidigo
+        text: "use structured logging, not a print function"
 
 formatters:
   enable:

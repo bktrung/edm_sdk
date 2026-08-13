@@ -1,3 +1,4 @@
+// Package main runs the RabbitMQ consumer quickstart service.
 package main
 
 import (
