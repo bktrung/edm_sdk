@@ -12,6 +12,7 @@ import (
 )
 
 func TestRabbitMQSettlementRequeueIncrementsDeliveryCount(t *testing.T) {
+	requireBroker(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	conn, consumer, channel := newSettlementFixture(t, ctx, "rabbitmq-driver-settlement-requeue")
@@ -26,11 +27,21 @@ func TestRabbitMQSettlementRequeueIncrementsDeliveryCount(t *testing.T) {
 	if err := first.Settle.Nack(ctx, driver.NackOptions{Requeue: true, CountAsFailure: true}); err != nil {
 		t.Fatalf("Nack(requeue): %v", err)
 	}
+	// Exact values, not "greater than": a driver that cannot read the broker's
+	// counter and returns a constant on Redelivered satisfies an inequality, and
+	// this assertion is the only thing standing between that and a green suite.
 	second := receiveSettlement(t, ctx, consumer)
-	if second.DeliveryCount <= first.DeliveryCount {
-		t.Fatalf("redelivery DeliveryCount = %d, first = %d", second.DeliveryCount, first.DeliveryCount)
+	if second.DeliveryCount != 1 {
+		t.Fatalf("first redelivery DeliveryCount = %d, want 1", second.DeliveryCount)
 	}
-	if err := second.Settle.Nack(ctx, driver.NackOptions{}); err != nil {
+	if err := second.Settle.Nack(ctx, driver.NackOptions{Requeue: true, CountAsFailure: true}); err != nil {
+		t.Fatalf("Nack(requeue) second: %v", err)
+	}
+	third := receiveSettlement(t, ctx, consumer)
+	if third.DeliveryCount != 2 {
+		t.Fatalf("second redelivery DeliveryCount = %d, want 2", third.DeliveryCount)
+	}
+	if err := third.Settle.Nack(ctx, driver.NackOptions{}); err != nil {
 		t.Fatalf("Nack(discard): %v", err)
 	}
 	if err := consumer.Stop(ctx); err != nil {
@@ -42,6 +53,7 @@ func TestRabbitMQSettlementRequeueIncrementsDeliveryCount(t *testing.T) {
 }
 
 func TestRabbitMQSettlementConcurrentCallsSingleFlight(t *testing.T) {
+	requireBroker(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	conn, consumer, channel := newSettlementFixture(t, ctx, "rabbitmq-driver-settlement-concurrent")

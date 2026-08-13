@@ -232,48 +232,65 @@ func inboundMessage(destination string, delivery amqp.Delivery, settler *settler
 	}
 }
 
+// deliveryCount reports the broker's redelivery counter. RabbitMQ 4.x names it
+// x-acquired-count on quorum queues; x-delivery-count is the pre-4.0 name and is
+// still accepted so a driver pointed at an older broker keeps working.
 func deliveryCount(delivery amqp.Delivery) int {
-	value, ok := delivery.Headers["x-delivery-count"]
-	if ok {
-		switch count := value.(type) {
-		case int:
+	for _, name := range []string{"x-acquired-count", "x-delivery-count"} {
+		if count, ok := headerCount(delivery.Headers[name]); ok {
 			return count
-		case int8:
-			return int(count)
-		case int16:
-			return int(count)
-		case int32:
-			return int(count)
-		case int64:
-			return int(count)
-		case uint:
-			return int(count)
-		case uint8:
-			return int(count)
-		case uint16:
-			return int(count)
-		case uint32:
-			return int(count)
-		case uint64:
-			if count > uint64(^uint(0)>>1) {
-				return int(^uint(0) >> 1)
-			}
-			return int(count)
 		}
 	}
 	if delivery.Redelivered {
-		return 1
+		// The broker redelivered but reported no count. Guessing 1 would state a
+		// count this driver does not have, and a caller cannot tell a guess from a
+		// real one; -1 is the port's value for an unavailable counter.
+		return -1
 	}
+	// Quorum queues, the only kind this driver declares, omit the header on a
+	// first delivery. That is a real count of zero, not an absent one.
 	return 0
 }
 
-func headerValueByKey(headers []driver.Header, key string) []byte {
-	for _, header := range headers {
-		if header.Key == key {
-			return append([]byte(nil), header.Value...)
+// maxCount is the largest redelivery count this driver can report. AMQP header
+// values are wider than int, and a count that does not fit is clamped rather
+// than wrapped into a small or negative number.
+const maxCount = int(^uint(0) >> 1)
+
+func headerCount(value any) (int, bool) {
+	switch count := value.(type) {
+	case int:
+		return count, true
+	case int8:
+		return int(count), true
+	case int16:
+		return int(count), true
+	case int32:
+		return int(count), true
+	case int64:
+		if count > int64(maxCount) {
+			return maxCount, true
 		}
+		return int(count), true
+	case uint:
+		if count > uint(maxCount) {
+			return maxCount, true
+		}
+		return int(count), true
+	case uint8:
+		return int(count), true
+	case uint16:
+		return int(count), true
+	case uint32:
+		return int(count), true
+	case uint64:
+		if count > uint64(maxCount) {
+			return maxCount, true
+		}
+		return int(count), true
+	default:
+		return 0, false
 	}
-	return nil
 }
 
 func headerValue(value any) []byte {
