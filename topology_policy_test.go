@@ -8,6 +8,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/driver"
+	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/clock"
 )
 
 func TestTopologyPolicyDerivesFromOptionAndConfig(t *testing.T) {
@@ -44,6 +45,7 @@ func TestTopologyPolicyDerivesFromOptionAndConfig(t *testing.T) {
 		})
 	}
 }
+
 func TestPublisherTopologyPolicyUsesDerivedConfig(t *testing.T) {
 	cases := []struct {
 		name          string
@@ -117,13 +119,13 @@ func TestConsumerTopologyPolicyUsesDerivedConfig(t *testing.T) {
 			if test.wantSpecs == 0 {
 				select {
 				case <-conn.consumerOpened:
-				case <-time.After(time.Second):
+				case <-clock.NewReal().Timer(time.Second).C:
 					t.Fatal("consumer did not open")
 				}
 			} else {
 				select {
 				case <-admin.called:
-				case <-time.After(time.Second):
+				case <-clock.NewReal().Timer(time.Second).C:
 					t.Fatal("topology was not ensured")
 				}
 			}
