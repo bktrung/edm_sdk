@@ -53,6 +53,7 @@ linters:
             - "!**/drivers/**"
             - "!**/f1test/**"
             - "!**/cmd/**"
+            - "!**/examples/**"
             - "!**/internal/obs/**"
           deny:
             - pkg: fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/drivers
@@ -134,6 +135,19 @@ linters:
               desc: "cmd registers drivers and must not import broker clients directly"
             - pkg: github.com/rabbitmq/amqp091-go
               desc: "cmd registers drivers and must not import broker clients directly"
+
+        # An example service is a composition root, like cmd/: it is the layer that
+        # chooses a driver, so it may import one. It must still reach the broker only
+        # through the driver, because an example that bypassed the SDK would teach the
+        # wrong thing to the first person who copies it.
+        examples:
+          files:
+            - "**/examples/**"
+          deny:
+            - pkg: github.com/twmb/franz-go
+              desc: "an example selects a driver and must not import a broker client directly"
+            - pkg: github.com/rabbitmq/amqp091-go
+              desc: "an example selects a driver and must not import a broker client directly"
 
         f1test:
           files:
