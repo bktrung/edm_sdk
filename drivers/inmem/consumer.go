@@ -99,6 +99,9 @@ func (c *consumer) Stop(ctx context.Context) error {
 				break
 			}
 		}
+		if len(c.conn.destinations[name].consumers) == 0 {
+			c.conn.history[name] = nil
+		}
 	}
 	delete(c.conn.consumers, c)
 	close(c.messages)
@@ -186,6 +189,9 @@ func (s *settler) settle(ctx context.Context, opt driver.NackOptions, nack bool)
 	if nack && opt.Requeue {
 		s.message.deliveryCount++
 		s.message.due = s.conn.clock.Now()
+		if s.message.deliveredGroups != nil {
+			delete(s.message.deliveredGroups, s.consumer.cfg.Group)
+		}
 		if dest, ok := s.conn.destinations[s.message.message.Destination]; ok {
 			dest.messages = append([]*queuedMessage{s.message}, dest.messages...)
 		}
