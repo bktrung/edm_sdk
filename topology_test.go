@@ -91,7 +91,7 @@ func TestSubscriptionTopologyMatchesFanoutModes(t *testing.T) {
 			}
 			wantSubscribed := append(append([]string(nil), test.main...), wantRetry...)
 			sort.Strings(wantSubscribed)
-			if got := subscriptionDestinations(effective, source, sub); !reflect.DeepEqual(got, wantSubscribed) {
+			if got := subscriptionDestinations(effective, source, sub.Name, sub); !reflect.DeepEqual(got, wantSubscribed) {
 				t.Fatalf("subscribed destinations = %v, want %v", got, wantSubscribed)
 			}
 

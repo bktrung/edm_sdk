@@ -17,6 +17,18 @@ import (
 // Option configures a Client during New.
 type Option func(*clientOptions) error
 
+// TopologyPolicy selects how the SDK handles required broker topology.
+type TopologyPolicy = driver.TopologyPolicy
+
+const (
+	// TopologyDeclare creates missing topology and is the default.
+	TopologyDeclare = driver.TopologyDeclare
+	// TopologyVerify checks that topology exists and creates nothing.
+	TopologyVerify = driver.TopologyVerify
+	// TopologyNone assumes topology exists and makes no broker round trip.
+	TopologyNone = driver.TopologyNone
+)
+
 // PublisherOption configures a Publisher. No per-publisher controls are
 // defined in this version; the type reserves the API extension point.
 type PublisherOption struct{}
@@ -31,6 +43,9 @@ type clientOptions struct {
 	strictPortability bool
 	middleware        []Middleware
 	errorHandler      func(context.Context, *Event, error)
+	publishTopics     []string
+	publishTopicsSet  bool
+	topologyPolicy    driver.TopologyPolicy
 }
 
 // WithDriver supplies the broker driver New opens eagerly.
@@ -131,6 +146,39 @@ func WithErrorHandler(handler func(context.Context, *Event, error)) Option {
 			return fmt.Errorf("f1: WithErrorHandler requires a non-nil handler")
 		}
 		options.errorHandler = handler
+		return nil
+	}
+}
+
+// WithPublishTopics names the logical topics this client publishes.
+func WithPublishTopics(topics ...string) Option {
+	return func(options *clientOptions) error {
+		seen := make(map[string]struct{}, len(options.publishTopics)+len(topics))
+		for _, topic := range options.publishTopics {
+			seen[topic] = struct{}{}
+		}
+		for _, topic := range topics {
+			if topic == "" {
+				return fmt.Errorf("f1: WithPublishTopics topic must not be empty")
+			}
+			if _, ok := seen[topic]; ok {
+				return fmt.Errorf("f1: WithPublishTopics contains duplicate topic %q", topic)
+			}
+			seen[topic] = struct{}{}
+		}
+		options.publishTopics = append(options.publishTopics, topics...)
+		options.publishTopicsSet = true
+		return nil
+	}
+}
+
+// WithTopology selects how the SDK handles required broker topology.
+func WithTopology(p TopologyPolicy) Option {
+	return func(options *clientOptions) error {
+		if p < TopologyDeclare || p > TopologyNone {
+			return fmt.Errorf("f1: WithTopology received unsupported policy %d", p)
+		}
+		options.topologyPolicy = p
 		return nil
 	}
 }

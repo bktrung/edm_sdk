@@ -309,6 +309,9 @@ func buildOutbound(ctx context.Context, options clientOptions, effective driver.
 	if topic == "" {
 		topic = topicFor(message.EventType)
 	}
+	if err := validatePublishTopic(options, topic); err != nil {
+		return driver.OutboundMessage{}, "", err
+	}
 	partitionKey := publish.key
 	if partitionKey == "" {
 		partitionKey = publish.subject
@@ -382,6 +385,17 @@ func topicFor(eventType string) string {
 	}
 	return eventType[:index]
 }
+func validatePublishTopic(options clientOptions, topic string) error {
+	if !options.publishTopicsSet {
+		return nil
+	}
+	for _, listed := range options.publishTopics {
+		if listed == topic {
+			return nil
+		}
+	}
+	return fmt.Errorf("topic %q was not listed in WithPublishTopics", topic)
+}
 
 func priorityHint(priority Priority) uint8 {
 	switch priority {
@@ -404,6 +418,21 @@ func sourceEnvironment(source string) string {
 
 func publishEntryPoint(source, topic string, priority Priority) string {
 	return fmt.Sprintf("f1.%s.%s.%s", sourceEnvironment(source), topic, priority.String())
+}
+func publisherTopologySpec(effective driver.Capabilities, source string, topics []string, priorities []Priority) driver.TopologySpec {
+	result := driver.TopologySpec{Effective: effective}
+	for _, topic := range topics {
+		logical := topicFor(topic)
+		for _, priority := range priorities {
+			entryPoint := publishEntryPoint(source, logical, priority)
+			if effective.Fanout == driver.FanoutAtPublish {
+				result.Exchanges = append(result.Exchanges, driver.ExchangeSpec{Name: entryPoint, Kind: "fanout", Durable: true})
+			} else {
+				result.Destinations = append(result.Destinations, driver.DestinationSpec{Name: entryPoint, Kind: driver.DestMain, Durable: true})
+			}
+		}
+	}
+	return result
 }
 
 func newEventID(now time.Time) (string, error) {

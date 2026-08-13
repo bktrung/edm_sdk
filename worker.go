@@ -378,15 +378,19 @@ func openRunnerConsumer(r *Runner, ctx context.Context) (driver.Consumer, error)
 	conn := r.client.conn
 	effective := r.client.effective
 	source := r.client.source
+	policy := r.client.options.topologyPolicy
 	r.client.mu.Unlock()
 	if conn == nil {
 		return nil, errors.New("f1: client is not connected")
 	}
-	destinations := subscriptionDestinations(effective, source, r.subscription)
-	if admin := conn.Admin(); admin != nil {
-		topology := subscriptionTopologySpecs(effective, source, r.subscription)
-		if _, err := admin.EnsureTopology(ctx, topology); err != nil {
-			return nil, fmt.Errorf("f1: ensure subscription topology: %w", err)
+	destinations := subscriptionDestinations(effective, source, r.subscription.Name, r.subscription)
+	if policy != driver.TopologyNone {
+		if admin := conn.Admin(); admin != nil {
+			topology := subscriptionTopologySpecs(effective, source, r.subscription)
+			topology.Policy = policy
+			if _, err := admin.EnsureTopology(ctx, topology); err != nil {
+				return nil, fmt.Errorf("f1: ensure subscription topology: %w", err)
+			}
 		}
 	}
 	perDestination := make(map[string]int, len(destinations))
@@ -943,12 +947,12 @@ func truncateError(err error) string {
 	return value
 }
 
-func subscriptionDestinations(effective driver.Capabilities, source string, sub Subscription) []string {
+func subscriptionDestinations(effective driver.Capabilities, source, subscription string, sub Subscription) []string {
 	set := make(map[string]struct{})
 	for _, topic := range sub.Topics {
 		logical := topicFor(topic)
 		for _, priority := range sub.Priorities {
-			set[consumeDestination(effective, source, logical, priority, sub.Name)] = struct{}{}
+			set[consumeDestination(effective, source, logical, priority, subscription)] = struct{}{}
 			for tier := 1; tier <= retryTiers(sub.Retry); tier++ {
 				set[retryDestinationFor(source, logical, priority, tier, sub.Name)] = struct{}{}
 			}
