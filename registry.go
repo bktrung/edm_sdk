@@ -51,6 +51,13 @@ func (r *inflightRegistry) Add(_ driver.InboundMessage) uint64 {
 	return r.registry.Add()
 }
 
+// SetDisposition records the message outcome to use if the delivery settles successfully.
+func (r *inflightRegistry) SetDisposition(id uint64, disposition dispatch.Disposition) {
+	if r != nil {
+		r.registry.SetDisposition(id, disposition)
+	}
+}
+
 // Remove records the default successful settlement for a delivery.
 func (r *inflightRegistry) Remove(id uint64) {
 	if r != nil {
@@ -72,10 +79,10 @@ func (r *inflightRegistry) Counts() settlementCounts {
 	counts := r.registry.Counts()
 	return settlementCounts{
 		received:  counts.Received,
-		settled:   counts.Settled,
-		requeued:  counts.Requeued,
-		unknown:   counts.Unknown,
-		abandoned: counts.Abandoned,
+		settled:   counts.Settlements.Settled,
+		requeued:  counts.Settlements.Requeued,
+		unknown:   counts.Settlements.Unknown,
+		abandoned: counts.Settlements.Abandoned,
 	}
 }
 

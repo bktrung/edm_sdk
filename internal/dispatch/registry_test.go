@@ -25,7 +25,7 @@ func TestRegistryAccountsEverySettlementOutcome(t *testing.T) {
 	if counts.Received != 5 {
 		t.Fatalf("received = %d, want 5", counts.Received)
 	}
-	if got := counts.Settled + counts.Requeued + counts.Unknown + counts.Abandoned; got != counts.Received {
+	if got := counts.Settlements.Settled + counts.Settlements.Requeued + counts.Settlements.Unknown + counts.Settlements.Abandoned; got != counts.Received {
 		t.Fatalf("outcome total = %d, received = %d", got, counts.Received)
 	}
 	if registry.Len() != 0 {
@@ -64,7 +64,7 @@ func TestRegistryNilAndDuplicateRemoval(t *testing.T) {
 	id := value.Add()
 	value.Remove(id)
 	value.Remove(id)
-	if value.Counts().Received != 1 || value.Counts().Settled != 1 {
+	if value.Counts().Received != 1 || value.Counts().Settlements.Settled != 1 {
 		t.Fatalf("duplicate removal changed counts: %+v", value.Counts())
 	}
 }

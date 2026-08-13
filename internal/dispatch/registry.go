@@ -31,30 +31,68 @@ const (
 	SettlementOutcomeAbandoned
 )
 
-// SettlementCounts is a snapshot of received deliveries by settlement outcome.
+// Disposition identifies the terminal message outcome recorded by the dispatch registry.
+type Disposition uint8
+
+const (
+	// DispositionHandled means the original message was acknowledged successfully.
+	DispositionHandled Disposition = iota
+	// DispositionRequeued means the original message is left for broker redelivery.
+	DispositionRequeued
+	// DispositionRetried means a successor retry or deferral copy was published.
+	DispositionRetried
+	// DispositionDeadLettered means a successor dead-letter copy was published.
+	DispositionDeadLettered
+)
+
+// DispositionCounts is a snapshot of terminal message dispositions.
+type DispositionCounts struct {
+	Handled      uint64
+	Requeued     uint64
+	Retried      uint64
+	DeadLettered uint64
+}
+
+// Total returns the number of recorded message dispositions.
+func (c DispositionCounts) Total() uint64 {
+	return c.Handled + c.Requeued + c.Retried + c.DeadLettered
+}
+
+// SettlementCounts is a snapshot of settlement call outcomes.
 type SettlementCounts struct {
-	Received  uint64
 	Settled   uint64
 	Requeued  uint64
 	Unknown   uint64
 	Abandoned uint64
 }
 
+// Total returns the number of recorded settlement outcomes.
+func (c SettlementCounts) Total() uint64 {
+	return c.Settled + c.Requeued + c.Unknown + c.Abandoned
+}
+
+// Counts is a snapshot of received deliveries and both accounting axes.
+type Counts struct {
+	Received     uint64
+	Settlements  SettlementCounts
+	Dispositions DispositionCounts
+}
+
 // Registry tracks accepted work until its settlement result is recorded.
 type Registry struct {
 	mu      sync.Mutex
-	items   map[uint64]struct{}
+	items   map[uint64]Disposition
 	next    uint64
 	zero    chan struct{}
 	changed chan struct{}
-	count   SettlementCounts
+	count   Counts
 }
 
 // NewRegistry returns an empty settlement-aware registry.
 func NewRegistry() *Registry {
 	zero := make(chan struct{})
 	close(zero)
-	return &Registry{items: make(map[uint64]struct{}), zero: zero, changed: make(chan struct{})}
+	return &Registry{items: make(map[uint64]Disposition), zero: zero, changed: make(chan struct{})}
 }
 
 // Add registers work and returns its identity.
@@ -69,18 +107,16 @@ func (r *Registry) Add() uint64 {
 		r.zero = make(chan struct{})
 	}
 	r.count.Received++
-	r.items[r.next] = struct{}{}
+	r.items[r.next] = DispositionHandled
 	return r.next
 }
 
-// Remove records the default successful settlement for a delivery.
-func (r *Registry) Remove(id uint64) {
-	r.RemoveAs(id, SettlementOutcomeSettled)
-}
-
-// RemoveAs removes a delivery and records its settlement outcome.
-func (r *Registry) RemoveAs(id uint64, outcome SettlementOutcome) {
+// SetDisposition records the message outcome to use if the delivery settles successfully.
+func (r *Registry) SetDisposition(id uint64, disposition Disposition) {
 	if r == nil {
+		return
+	}
+	if disposition < DispositionHandled || disposition > DispositionDeadLettered {
 		return
 	}
 	r.mu.Lock()
@@ -88,30 +124,63 @@ func (r *Registry) RemoveAs(id uint64, outcome SettlementOutcome) {
 	if _, ok := r.items[id]; !ok {
 		return
 	}
+	r.items[id] = disposition
+}
+
+// Remove records the default successful settlement for a delivery.
+func (r *Registry) Remove(id uint64) {
+	r.RemoveAs(id, SettlementOutcomeSettled)
+}
+
+// RemoveAs removes a delivery and records both accounting outcomes.
+func (r *Registry) RemoveAs(id uint64, outcome SettlementOutcome) {
+	if r == nil {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	disposition, ok := r.items[id]
+	if !ok {
+		return
+	}
 	delete(r.items, id)
 	close(r.changed)
 	r.changed = make(chan struct{})
 	switch outcome {
 	case SettlementOutcomeSettled:
-		r.count.Settled++
+		switch disposition {
+		case DispositionHandled:
+			r.count.Dispositions.Handled++
+		case DispositionRequeued:
+			r.count.Dispositions.Requeued++
+		case DispositionRetried:
+			r.count.Dispositions.Retried++
+		case DispositionDeadLettered:
+			r.count.Dispositions.DeadLettered++
+		}
+		r.count.Settlements.Settled++
 	case SettlementOutcomeRequeued:
-		r.count.Requeued++
+		r.count.Dispositions.Requeued++
+		r.count.Settlements.Requeued++
 	case SettlementOutcomeUnknown:
-		r.count.Unknown++
+		r.count.Dispositions.Requeued++
+		r.count.Settlements.Unknown++
 	case SettlementOutcomeAbandoned:
-		r.count.Abandoned++
+		r.count.Dispositions.Requeued++
+		r.count.Settlements.Abandoned++
 	default:
-		r.count.Unknown++
+		r.count.Dispositions.Requeued++
+		r.count.Settlements.Unknown++
 	}
 	if len(r.items) == 0 {
 		close(r.zero)
 	}
 }
 
-// Counts returns a snapshot of all recorded settlement outcomes.
-func (r *Registry) Counts() SettlementCounts {
+// Counts returns a snapshot of received deliveries and both accounting axes.
+func (r *Registry) Counts() Counts {
 	if r == nil {
-		return SettlementCounts{}
+		return Counts{}
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
