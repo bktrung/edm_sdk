@@ -10,8 +10,11 @@ GOLANGCI_LINT := $(CURDIR)/.tools/bin/golangci-lint
 export GOPRIVATE := fgit.zapps.vn
 
 APISURFACE := $(CURDIR)/.tools/bin/apisurface
+APIDIFF := $(CURDIR)/.tools/bin/apidiff
+API_DIFF_BASELINE_DIR := $(CURDIR)/testdata/api-diff
+API_DIFF_BREAKING_CHANGE ?= 0
 
-.PHONY: build test-fast test test-chaos kpi lint verify-agnostic verify-self-contained check-cardinality swap-report check-fixture check-api-surface check-api-surface-codec check-api-surface-driver check-api-surface-f1test
+.PHONY: build test-fast test test-chaos kpi lint verify-agnostic verify-self-contained check-cardinality swap-report check-fixture check-api-surface check-api-surface-codec check-api-surface-driver check-api-surface-f1test check-api-diff record-api-diff-baseline
 
 ## build: compile all packages with reproducible build flags.
 build:
@@ -66,7 +69,7 @@ swap-report:
 ## check-fixture: validate the local fixtures used by tests and tooling.
 check-fixture:
 	go test ./...
-	$(MAKE) check-api-surface check-api-surface-codec check-api-surface-driver check-api-surface-f1test
+	$(MAKE) check-api-surface check-api-surface-codec check-api-surface-driver check-api-surface-f1test check-api-diff
 
 ## check-api-surface: verify exported symbols against the f1 public API fixture.
 check-api-surface: $(APISURFACE)
@@ -84,5 +87,46 @@ check-api-surface-driver: $(APISURFACE)
 check-api-surface-f1test: $(APISURFACE)
 	$(APISURFACE) -package f1test -fixture testdata/public-api-f1test.json
 
+## check-api-diff: report API changes and fail on incompatible changes.
+check-api-diff: $(APIDIFF)
+	@set -e; \
+	for spec in \
+		"f1:$(MODULE):f1.export" \
+		"driver:$(MODULE)/driver:driver.export" \
+		"codec:$(MODULE)/codec:codec.export"; do \
+		package=$${spec%%:*}; rest=$${spec#*:}; import_path=$${rest%%:*}; baseline=$${rest#*:}; \
+		report=$$(mktemp); \
+		trap 'rm -f "$$report"' EXIT; \
+		$(APIDIFF) "$(API_DIFF_BASELINE_DIR)/$$baseline" "$$import_path" >"$$report"; \
+		cat "$$report"; \
+		if grep -q '^Incompatible changes:' "$$report"; then \
+			echo "api-diff: $$package has incompatible changes" >&2; \
+			exit 1; \
+		elif [ ! -s "$$report" ]; then \
+			echo "api-diff: $$package unchanged"; \
+		fi; \
+		rm -f "$$report"; \
+	done
+
+## record-api-diff-baseline: refresh committed snapshots; breaking changes require explicit approval.
+record-api-diff-baseline: $(APIDIFF)
+	@if [ -f "$(API_DIFF_BASELINE_DIR)/f1.export" ] && \
+		[ -f "$(API_DIFF_BASELINE_DIR)/driver.export" ] && \
+		[ -f "$(API_DIFF_BASELINE_DIR)/codec.export" ] && \
+		[ "$(API_DIFF_BREAKING_CHANGE)" != "1" ]; then \
+		$(MAKE) check-api-diff; \
+	elif [ "$(API_DIFF_BREAKING_CHANGE)" = "1" ]; then \
+		echo "api-diff: refreshing baseline with breaking-change approval"; \
+	else \
+		echo "api-diff: creating initial baseline"; \
+	fi
+	@mkdir -p "$(API_DIFF_BASELINE_DIR)"
+	$(APIDIFF) -w "$(API_DIFF_BASELINE_DIR)/f1.export" $(MODULE)
+	$(APIDIFF) -w "$(API_DIFF_BASELINE_DIR)/driver.export" $(MODULE)/driver
+	$(APIDIFF) -w "$(API_DIFF_BASELINE_DIR)/codec.export" $(MODULE)/codec
+
 $(APISURFACE): tools/apisurface/main.go tools/apisurface/go.mod
 	cd tools/apisurface && go build -o ../../.tools/bin/apisurface .
+
+$(APIDIFF): tools/apidiff/go.mod tools/apidiff/go.sum
+	cd tools/apidiff && go build -o ../../.tools/bin/apidiff golang.org/x/exp/cmd/apidiff
