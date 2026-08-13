@@ -12,6 +12,7 @@ import (
 )
 
 func TestProducerConfirmAndReturn(t *testing.T) {
+	requireBroker(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 
@@ -88,6 +89,7 @@ func TestProducerConfirmAndReturn(t *testing.T) {
 }
 
 func TestProducerPublishesToDeclaredFanoutExchange(t *testing.T) {
+	requireBroker(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 

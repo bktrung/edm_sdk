@@ -11,6 +11,7 @@ import (
 )
 
 func TestConsumerPauseResume(t *testing.T) {
+	requireBroker(t)
 	raw, err := amqp.Dial(defaultEndpoint)
 	if err != nil {
 		t.Fatalf("raw broker connection: %v", err)

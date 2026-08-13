@@ -41,6 +41,7 @@ func TestOpenRejectsSCRAM(t *testing.T) {
 }
 
 func TestDriverOpenPingClose(t *testing.T) {
+	requireBroker(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	conn, err := (Driver{}).Open(ctx, driver.Config{Endpoints: []string{defaultEndpoint}, ConnectTimeout: 10 * time.Second})
