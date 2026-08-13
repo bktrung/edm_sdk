@@ -1,6 +1,10 @@
 package lifecycle
 
-import "sync/atomic"
+import (
+	"sync/atomic"
+
+	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/dispatch"
+)
 
 // Disposition is the terminal accounting category for one accepted message.
 type Disposition uint8
@@ -49,6 +53,27 @@ func (a *Accounting) Record(disposition Disposition) {
 		a.retried.Add(1)
 	case DeadLettered:
 		a.deadLettered.Add(1)
+	}
+}
+
+// RecordSettlement maps a settlement result to the message disposition axis.
+// A successful settlement needs settledAs because the call result alone does
+// not distinguish handled, retried, and dead-lettered messages. Unknown and
+// abandoned settlements are counted as requeued because the broker must
+// redeliver work whose settlement did not complete.
+func (a *Accounting) RecordSettlement(outcome dispatch.SettlementOutcome, settledAs Disposition) {
+	if a == nil {
+		return
+	}
+	if outcome != dispatch.SettlementOutcomeSettled {
+		a.Record(Requeued)
+		return
+	}
+	switch settledAs {
+	case Handled, Retried, DeadLettered:
+		a.Record(settledAs)
+	default:
+		a.Record(Requeued)
 	}
 }
 
