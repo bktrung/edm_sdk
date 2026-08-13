@@ -385,6 +385,7 @@ func topicFor(eventType string) string {
 	}
 	return eventType[:index]
 }
+
 func validatePublishTopic(options clientOptions, topic string) error {
 	if !options.publishTopicsSet {
 		return nil
@@ -419,6 +420,7 @@ func sourceEnvironment(source string) string {
 func publishEntryPoint(source, topic string, priority Priority) string {
 	return fmt.Sprintf("f1.%s.%s.%s", sourceEnvironment(source), topic, priority.String())
 }
+
 func publisherTopologySpec(effective driver.Capabilities, source string, topics []string, priorities []Priority) driver.TopologySpec {
 	result := driver.TopologySpec{Effective: effective}
 	for _, topic := range topics {

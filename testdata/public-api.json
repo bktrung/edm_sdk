@@ -6,6 +6,7 @@
     "BrokerConfig",
     "Client",
     "Client.Close",
+    "Client.ensurePublisherTopology",
     "Client.Health",
     "Client.Limits",
     "Client.Publisher",
@@ -106,6 +107,10 @@
     "SubscriptionConfig",
     "Terminal",
     "TopologyConfig",
+    "TopologyDeclare",
+    "TopologyNone",
+    "TopologyPolicy",
+    "TopologyVerify",
     "TracingConfig",
     "Translator",
     "Unavailable",
@@ -128,9 +133,11 @@
     "WithMeterProvider",
     "WithMiddleware",
     "WithPriority",
+    "WithPublishTopics",
     "WithStrictPortability",
     "WithSubject",
     "WithTopic",
+    "WithTopology",
     "WithTracerProvider"
   ]
 }

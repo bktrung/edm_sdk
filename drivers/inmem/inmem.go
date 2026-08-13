@@ -12,12 +12,14 @@ import (
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/clock"
 )
 
-// Driver is a stateless in-memory driver factory. Clock selects the time
-// source used by connections; a nil clock uses the real clock. The minimal
-// capability mode is conformance-only and intentionally unexported.
+// Driver is an in-memory driver factory. New returns isolated connections;
+// NewShared returns connections over one broker. Clock selects the time source
+// used by connections; a nil clock uses the real clock. The minimal capability
+// mode is conformance-only and intentionally unexported.
 type Driver struct {
 	Clock   clock.Clock
 	minimal bool
+	shared  *sharedBroker
 }
 
 const (
@@ -31,6 +33,11 @@ var _ driver.Driver = Driver{}
 
 // New returns a driver using c for all time-dependent behavior.
 func New(c clock.Clock) Driver { return Driver{Clock: c} }
+
+// NewShared returns a driver whose repeated Open calls share one broker.
+func NewShared(c clock.Clock) Driver {
+	return Driver{Clock: c, shared: &sharedBroker{}}
+}
 
 // Name returns the stable in-memory driver key.
 func (Driver) Name() string { return "inmem" }
@@ -62,11 +69,33 @@ func (d Driver) Capabilities() driver.Capabilities {
 	return caps
 }
 
-// Open creates an isolated in-memory connection.
+type sharedBroker struct {
+	mu   sync.Mutex
+	conn *conn
+	refs int
+}
+
+// Open creates an in-memory connection, isolated unless d came from NewShared.
 func (d Driver) Open(ctx context.Context, _ driver.Config) (driver.Conn, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, classify("open", driver.KindTransient, err)
 	}
+	if d.shared != nil {
+		d.shared.mu.Lock()
+		defer d.shared.mu.Unlock()
+		if d.shared.conn == nil {
+			isolated := d
+			isolated.shared = nil
+			opened, err := isolated.Open(ctx, driver.Config{})
+			if err != nil {
+				return nil, err
+			}
+			d.shared.conn = opened.(*conn)
+		}
+		d.shared.refs++
+		return &sharedConn{Conn: d.shared.conn, broker: d.shared}, nil
+	}
+
 	c := d.Clock
 	if c == nil {
 		c = clock.NewReal()
@@ -85,6 +114,38 @@ func (d Driver) Open(ctx context.Context, _ driver.Config) (driver.Conn, error) 
 	}
 	go conn.pump()
 	return conn, nil
+}
+
+type sharedConn struct {
+	driver.Conn
+	broker *sharedBroker
+	mu     sync.Mutex
+	closed bool
+}
+
+func (c *sharedConn) Close(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.closed {
+		return nil
+	}
+	c.broker.mu.Lock()
+	defer c.broker.mu.Unlock()
+	if c.broker.refs > 1 {
+		c.broker.refs--
+		c.closed = true
+		return nil
+	}
+	if err := c.Conn.Close(ctx); err != nil {
+		return err
+	}
+	c.broker.refs = 0
+	c.broker.conn = nil
+	c.closed = true
+	return nil
 }
 
 type conn struct {

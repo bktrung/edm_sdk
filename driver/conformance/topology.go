@@ -642,6 +642,7 @@ func findPruneResult(results []driver.PruneResult, name string) driver.PruneResu
 	}
 	return driver.PruneResult{}
 }
+
 func runTopologyPolicyChecks(group *groupContext) {
 	group.Check("TopologyVerify reports the first missing destination without creating", func(t *testing.T) {
 		admin := group.conn.Admin()
