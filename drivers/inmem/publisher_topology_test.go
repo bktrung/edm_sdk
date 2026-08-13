@@ -79,6 +79,7 @@ func publisherTopologyTestConfig() f1.Config {
 			DefaultPrefetch: 64,
 		},
 		Topology: f1.TopologyConfig{
+			AutoCreate:        true,
 			VerifyOnStart:     true,
 			PartitionsDefault: 12,
 			RetentionDefault:  7 * 24 * time.Hour,

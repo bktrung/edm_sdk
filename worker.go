@@ -378,8 +378,8 @@ func openRunnerConsumer(r *Runner, ctx context.Context) (driver.Consumer, error)
 	conn := r.client.conn
 	effective := r.client.effective
 	source := r.client.source
-	policy := r.client.options.topologyPolicy
 	r.client.mu.Unlock()
+	policy := r.client.topologyPolicy()
 	if conn == nil {
 		return nil, errors.New("f1: client is not connected")
 	}

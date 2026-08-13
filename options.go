@@ -46,6 +46,7 @@ type clientOptions struct {
 	publishTopics     []string
 	publishTopicsSet  bool
 	topologyPolicy    driver.TopologyPolicy
+	topologyPolicySet bool
 }
 
 // WithDriver supplies the broker driver New opens eagerly.
@@ -182,6 +183,7 @@ func WithTopology(p TopologyPolicy) Option {
 			return fmt.Errorf("f1: WithTopology received unsupported policy %d", p)
 		}
 		options.topologyPolicy = p
+		options.topologyPolicySet = true
 		return nil
 	}
 }

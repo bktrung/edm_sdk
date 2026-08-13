@@ -113,8 +113,22 @@ func New(ctx context.Context, cfg Config, opts ...Option) (*Client, error) {
 	return client, nil
 }
 
+func (c *Client) topologyPolicy() driver.TopologyPolicy {
+	if c.options.topologyPolicySet {
+		return c.options.topologyPolicy
+	}
+	if c.config.Topology.AutoCreate {
+		return driver.TopologyDeclare
+	}
+	if c.config.Topology.VerifyOnStart {
+		return driver.TopologyVerify
+	}
+	return driver.TopologyNone
+}
+
 func (c *Client) ensurePublisherTopology(ctx context.Context) error {
-	if !c.options.publishTopicsSet || c.options.topologyPolicy == driver.TopologyNone {
+	policy := c.topologyPolicy()
+	if !c.options.publishTopicsSet || policy == driver.TopologyNone {
 		return nil
 	}
 	admin := c.conn.Admin()
@@ -122,7 +136,7 @@ func (c *Client) ensurePublisherTopology(ctx context.Context) error {
 		return errors.New("f1: publisher topology requires driver admin")
 	}
 	spec := publisherTopologySpec(c.effective, c.source, c.options.publishTopics, c.config.Topology.Priorities)
-	spec.Policy = c.options.topologyPolicy
+	spec.Policy = policy
 	if _, err := admin.EnsureTopology(ctx, spec); err != nil {
 		return fmt.Errorf("f1: ensure publisher topology: %w", err)
 	}
