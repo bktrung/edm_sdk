@@ -174,7 +174,6 @@ func (p *Publisher) PublishBatch(ctx context.Context, messages []Message) (Batch
 	conn := p.client.conn
 	effective := p.client.effective
 	options := p.client.options
-	destinationDriver := p.client.driver
 	source := p.client.source
 	producerIdentity := p.client.producer
 	p.client.mu.Unlock()
@@ -182,7 +181,7 @@ func (p *Publisher) PublishBatch(ctx context.Context, messages []Message) (Batch
 	outbound := make([]driver.OutboundMessage, len(messages))
 	ids := make([]string, len(messages))
 	for i, message := range messages {
-		outboundMessage, id, err := buildOutbound(ctx, options, effective, destinationDriver, source, producerIdentity, message)
+		outboundMessage, id, err := buildOutbound(ctx, options, effective, source, producerIdentity, message)
 		if err != nil {
 			return result, fmt.Errorf("f1: message %d: %w", i, err)
 		}
@@ -276,7 +275,7 @@ func warnUnclassified(logger *slog.Logger, err error) {
 	}
 }
 
-func buildOutbound(ctx context.Context, options clientOptions, effective driver.Capabilities, driverName, source, producerIdentity string, message Message) (driver.OutboundMessage, string, error) {
+func buildOutbound(ctx context.Context, options clientOptions, effective driver.Capabilities, source, producerIdentity string, message Message) (driver.OutboundMessage, string, error) {
 	if err := ctx.Err(); err != nil {
 		return driver.OutboundMessage{}, "", err
 	}
@@ -363,7 +362,7 @@ func buildOutbound(ctx context.Context, options clientOptions, effective driver.
 		headers = append(headers, driver.Header{Key: key, Value: []byte(headerMap[key])})
 	}
 	return driver.OutboundMessage{
-		Destination: physicalTopic(driverName, source, topic, publish.priority),
+		Destination: publishEntryPoint(source, topic, publish.priority),
 		Key:         []byte(partitionKey),
 		Headers:     headers,
 		Body:        body,
@@ -395,19 +394,16 @@ func priorityHint(priority Priority) uint8 {
 	}
 }
 
-const rabbitMQDriverName = "rabbitmq"
-
-func physicalTopic(driverName, source, topic string, priority Priority) string {
+func sourceEnvironment(source string) string {
 	env := strings.TrimPrefix(source, "/")
 	if index := strings.IndexByte(env, '/'); index >= 0 {
 		env = env[:index]
 	}
-	switch driverName {
-	case rabbitMQDriverName:
-		return fmt.Sprintf("f1.%s.%s", env, topic)
-	default:
-		return fmt.Sprintf("f1.%s.%s.%s", env, topic, priority.String())
-	}
+	return env
+}
+
+func publishEntryPoint(source, topic string, priority Priority) string {
+	return fmt.Sprintf("f1.%s.%s.%s", sourceEnvironment(source), topic, priority.String())
 }
 
 func newEventID(now time.Time) (string, error) {
