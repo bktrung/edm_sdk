@@ -86,6 +86,14 @@ func (r *inflightRegistry) Counts() settlementCounts {
 	}
 }
 
+// DispositionCounts returns a snapshot of terminal message dispositions.
+func (r *inflightRegistry) DispositionCounts() dispatch.DispositionCounts {
+	if r == nil {
+		return dispatch.DispositionCounts{}
+	}
+	return r.registry.Counts().Dispositions
+}
+
 // Len returns the number of deliveries without a recorded settlement result.
 func (r *inflightRegistry) Len() int {
 	if r == nil {
