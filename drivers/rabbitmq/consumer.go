@@ -11,8 +11,9 @@ import (
 	"sync/atomic"
 	"time"
 
-	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/driver"
 	amqp "github.com/rabbitmq/amqp091-go"
+
+	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/driver"
 )
 
 var consumerSequence atomic.Uint64
@@ -53,7 +54,7 @@ type lane struct {
 
 var _ driver.Consumer = (*consumer)(nil)
 
-func newConsumer(conn *conn, cfg driver.ConsumerConfig) (*consumer, error) {
+func newConsumer(conn *conn, ctx context.Context, cfg driver.ConsumerConfig) (*consumer, error) {
 	c := &consumer{
 		conn:     conn,
 		cfg:      cfg,
@@ -79,7 +80,7 @@ func newConsumer(conn *conn, cfg driver.ConsumerConfig) (*consumer, error) {
 			return nil, classifyAMQP("consumer", driver.KindFatal, err)
 		}
 		tag := "f1-consumer-" + strconv.FormatUint(consumerSequence.Add(1), 10)
-		deliveries, err := channel.ConsumeWithContext(context.Background(), destination, tag, false, cfg.Exclusive, false, false, nil)
+		deliveries, err := channel.ConsumeWithContext(ctx, destination, tag, false, cfg.Exclusive, false, false, nil)
 		if err != nil {
 			_ = channel.Close()
 			c.closeLanes()
@@ -248,6 +249,9 @@ func deliveryCount(delivery amqp.Delivery) int {
 		case uint32:
 			return int(count)
 		case uint64:
+			if count > uint64(^uint(0)>>1) {
+				return int(^uint(0) >> 1)
+			}
 			return int(count)
 		}
 	}
@@ -466,9 +470,7 @@ func (c *consumer) release(settler *settler) {
 func amqpHeaders(delivery amqp.Delivery) []driver.Header {
 	values := make(map[string][]byte, len(delivery.Headers)+4)
 	for key, value := range delivery.Headers {
-		if strings.HasPrefix(key, "cloudEvents:") {
-			key = strings.TrimPrefix(key, "cloudEvents:")
-		}
+		key = strings.TrimPrefix(key, "cloudEvents:")
 		if strings.HasPrefix(key, "x-") {
 			continue
 		}

@@ -12,11 +12,13 @@ import (
 	"sync"
 	"time"
 
-	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/driver"
 	amqp "github.com/rabbitmq/amqp091-go"
+
+	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/driver"
 )
 
-const defaultEndpoint = "amqp://guest:guest@localhost:5672/"
+// Local fixture credentials are intentional and never used for production endpoints.
+const defaultEndpoint = "amqp://guest:guest@localhost:5672/" //nolint:gosec // test fixture endpoint
 
 var _ driver.Driver = Driver{}
 
@@ -139,7 +141,7 @@ func (c *conn) Producer(ctx context.Context, cfg driver.ProducerConfig) (driver.
 	c.mu.Lock()
 	if c.closed || c.amqp.IsClosed() {
 		c.mu.Unlock()
-		_ = producer.Close(context.Background())
+		_ = producer.channel.Close()
 		return nil, classify("producer", driver.KindTransient, amqp.ErrClosed)
 	}
 	c.producers[producer] = struct{}{}
@@ -159,7 +161,7 @@ func (c *conn) Consumer(ctx context.Context, cfg driver.ConsumerConfig) (driver.
 	if len(cfg.Destinations) == 0 {
 		return nil, classify("consumer", driver.KindFatal, errors.New("no destinations"))
 	}
-	consumer, err := newConsumer(c, cfg)
+	consumer, err := newConsumer(c, ctx, cfg)
 	if err != nil {
 		return nil, err
 	}
@@ -305,6 +307,7 @@ func makeAMQPConfig(cfg driver.Config) (amqp.Config, error) {
 	config.TLSClientConfig = tlsConfig
 	return config, nil
 }
+
 func validateSASL(settings *driver.SASLConfig) error {
 	if settings == nil {
 		return nil

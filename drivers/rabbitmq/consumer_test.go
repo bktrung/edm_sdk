@@ -5,8 +5,9 @@ import (
 	"testing"
 	"time"
 
-	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/driver"
 	amqp "github.com/rabbitmq/amqp091-go"
+
+	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/driver"
 )
 
 func TestConsumerPauseResume(t *testing.T) {

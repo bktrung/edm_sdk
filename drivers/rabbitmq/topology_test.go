@@ -5,8 +5,9 @@ import (
 	"testing"
 	"time"
 
-	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/driver"
 	amqp "github.com/rabbitmq/amqp091-go"
+
+	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/driver"
 )
 
 func TestEnsureTopologyDeclaresFanoutAndBinding(t *testing.T) {
@@ -36,7 +37,7 @@ func TestEnsureTopologyDeclaresFanoutAndBinding(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
-	defer func() { _ = conn.Close(context.Background()) }()
+	defer func() { _ = conn.Close(ctx) }()
 
 	spec := driver.TopologySpec{
 		Exchanges:    []driver.ExchangeSpec{{Name: exchange, Kind: "fanout", Durable: true}},

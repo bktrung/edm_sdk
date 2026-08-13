@@ -5,8 +5,9 @@ import (
 	"errors"
 	"fmt"
 
-	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/driver"
 	amqp "github.com/rabbitmq/amqp091-go"
+
+	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/driver"
 )
 
 type bindingKey struct {
@@ -140,7 +141,10 @@ func queueArguments(spec driver.DestinationSpec) amqp.Table {
 		args["x-queue-type"] = "quorum"
 	}
 	if spec.DeliveryLimit > 0 {
-		args["x-delivery-limit"] = int32(spec.DeliveryLimit)
+		if spec.DeliveryLimit > 2147483647 {
+			spec.DeliveryLimit = 2147483647
+		}
+		args["x-delivery-limit"] = int32(spec.DeliveryLimit) //nolint:gosec // bounded above before conversion
 	}
 	if spec.DeadLetter != nil {
 		args["x-dead-letter-exchange"] = spec.DeadLetter.Exchange

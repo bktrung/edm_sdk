@@ -6,8 +6,9 @@ import (
 	"testing"
 	"time"
 
-	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/driver"
 	amqp "github.com/rabbitmq/amqp091-go"
+
+	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/driver"
 )
 
 func TestRabbitMQSettlementRequeueIncrementsDeliveryCount(t *testing.T) {
@@ -107,12 +108,12 @@ func newSettlementFixture(t *testing.T, ctx context.Context, queue string) (driv
 	}
 	consumer, err := conn.Consumer(ctx, driver.ConsumerConfig{Destinations: []string{queue}, Prefetch: 1, PerDestination: map[string]int{queue: 1}})
 	if err != nil {
-		_ = conn.Close(context.Background())
+		_ = conn.Close(ctx)
 		t.Fatalf("Consumer: %v", err)
 	}
 	t.Cleanup(func() {
-		_ = consumer.Stop(context.Background())
-		_ = conn.Close(context.Background())
+		_ = consumer.Stop(ctx)
+		_ = conn.Close(ctx)
 	})
 	return conn, consumer, channel
 }

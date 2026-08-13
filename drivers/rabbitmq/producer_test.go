@@ -6,8 +6,9 @@ import (
 	"testing"
 	"time"
 
-	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/driver"
 	amqp "github.com/rabbitmq/amqp091-go"
+
+	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/driver"
 )
 
 func TestProducerConfirmAndReturn(t *testing.T) {
@@ -190,6 +191,6 @@ func openProducerFixture(t *testing.T, ctx context.Context, queue string) (drive
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
-	t.Cleanup(func() { _ = conn.Close(context.Background()) })
+	t.Cleanup(func() { _ = conn.Close(ctx) })
 	return conn, channel
 }
