@@ -314,7 +314,7 @@ func runCapability(group *groupContext) {
 
 	group.Check("capability report includes every declared field", func(t *testing.T) {
 		want := map[string]struct{}{
-			"PerMessageAck": {}, "OrderedByKey": {}, "NativePriority": {},
+			"PerMessageAck": {}, "OrderedByKey": {}, "Fanout": {}, "NativePriority": {},
 			"NativePriorityLevels": {}, "NativeDelay": {}, "NativeDeliveryCount": {},
 			"NativeDLQ": {}, "ConsumerScaling": {}, "MaxMessageBytes": {},
 			"MaxHeaderBytes": {}, "LagQueryable": {},
@@ -356,6 +356,7 @@ func runCapability(group *groupContext) {
 func capabilityDeclarationChecks(group *groupContext) {
 	checkCapabilityDeclaration(group, "declares per-message acknowledgement policy", "PerMessageAck", func(c driver.Capabilities) string { return strconv.FormatBool(c.PerMessageAck) })
 	checkCapabilityDeclaration(group, "declares ordered-by-key policy", "OrderedByKey", func(c driver.Capabilities) string { return strconv.FormatBool(c.OrderedByKey) })
+	checkCapabilityDeclaration(group, "declares fanout mode", "Fanout", func(c driver.Capabilities) string { return strconv.Itoa(int(c.Fanout)) })
 	checkCapabilityDeclaration(group, "declares native priority mode", "NativePriority", func(c driver.Capabilities) string { return c.NativePriority.String() })
 	checkCapabilityDeclaration(group, "declares native priority levels", "NativePriorityLevels", func(c driver.Capabilities) string { return strconv.Itoa(c.NativePriorityLevels) })
 	checkCapabilityDeclaration(group, "declares native delay policy", "NativeDelay", func(c driver.Capabilities) string { return strconv.FormatBool(c.NativeDelay) })

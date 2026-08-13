@@ -374,19 +374,15 @@ func openRunnerConsumer(r *Runner, ctx context.Context) (driver.Consumer, error)
 	r.client.mu.Lock()
 	conn := r.client.conn
 	effective := r.client.effective
-	driverName := r.client.driver
 	source := r.client.source
 	r.client.mu.Unlock()
 	if conn == nil {
 		return nil, errors.New("f1: client is not connected")
 	}
-	destinations := subscriptionDestinations(driverName, source, r.subscription)
+	destinations := subscriptionDestinations(effective, source, r.subscription)
 	if admin := conn.Admin(); admin != nil {
-		if _, err := admin.EnsureTopology(ctx, driver.TopologySpec{
-			Destinations: subscriptionTopologySpecs(driverName, source, r.subscription),
-			Scope:        []string{destinationScope(source)},
-			Effective:    effective,
-		}); err != nil {
+		topology := subscriptionTopologySpecs(effective, source, r.subscription)
+		if _, err := admin.EnsureTopology(ctx, topology); err != nil {
 			return nil, fmt.Errorf("f1: ensure subscription topology: %w", err)
 		}
 	}
@@ -921,13 +917,14 @@ func truncateError(err error) string {
 	return value
 }
 
-func subscriptionDestinations(driverName, source string, sub Subscription) []string {
+func subscriptionDestinations(effective driver.Capabilities, source string, sub Subscription) []string {
 	set := make(map[string]struct{})
 	for _, topic := range sub.Topics {
+		logical := topicFor(topic)
 		for _, priority := range sub.Priorities {
-			set[physicalTopic(driverName, source, topicFor(topic), priority)] = struct{}{}
+			set[consumeDestination(effective, source, logical, priority, sub.Name)] = struct{}{}
 			for tier := 1; tier <= retryTiers(sub.Retry); tier++ {
-				set[retryDestinationFor(driverName, source, topicFor(topic), priority, tier, sub.Name)] = struct{}{}
+				set[retryDestinationFor(source, logical, priority, tier, sub.Name)] = struct{}{}
 			}
 		}
 	}
@@ -939,38 +936,70 @@ func subscriptionDestinations(driverName, source string, sub Subscription) []str
 	return result
 }
 
-func destinationScope(source string) string {
-	env := strings.TrimPrefix(source, "/")
-	if index := strings.IndexByte(env, '/'); index >= 0 {
-		env = env[:index]
+func destinationScope(source string, sub Subscription) []string {
+	env := sourceEnvironment(source)
+	set := make(map[string]struct{})
+	for _, topic := range sub.Topics {
+		logical := topicFor(topic)
+		set[fmt.Sprintf("f1.%s.%s.%s.", env, logical, sub.Name)] = struct{}{}
+		set[fmt.Sprintf("f1.%s.%s.dlq.%s.", env, logical, sub.Name)] = struct{}{}
 	}
-	return "f1." + env + "."
+	result := make([]string, 0, len(set))
+	for scope := range set {
+		result = append(result, scope)
+	}
+	sort.Strings(result)
+	return result
 }
 
-func subscriptionTopologySpecs(driverName, source string, sub Subscription) []driver.DestinationSpec {
-	result := make([]driver.DestinationSpec, 0)
+func subscriptionTopologySpecs(effective driver.Capabilities, source string, sub Subscription) driver.TopologySpec {
+	result := driver.TopologySpec{Effective: effective, Scope: destinationScope(source, sub)}
 	seen := make(map[string]struct{})
+	exchanges := make(map[string]struct{})
 	add := func(spec driver.DestinationSpec) {
 		if _, ok := seen[spec.Name]; ok {
 			return
 		}
 		seen[spec.Name] = struct{}{}
-		result = append(result, spec)
+		result.Destinations = append(result.Destinations, spec)
+	}
+	addExchange := func(spec driver.ExchangeSpec) {
+		if _, ok := exchanges[spec.Name]; ok {
+			return
+		}
+		exchanges[spec.Name] = struct{}{}
+		result.Exchanges = append(result.Exchanges, spec)
 	}
 	for _, topic := range sub.Topics {
 		logical := topicFor(topic)
 		for _, priority := range sub.Priorities {
-			add(driver.DestinationSpec{Name: physicalTopic(driverName, source, logical, priority), Kind: driver.DestMain, Durable: true})
+			entryPoint := publishEntryPoint(source, logical, priority)
+			main := consumeDestination(effective, source, logical, priority, sub.Name)
+			backstop := deadLetterDestinationFor(source, logical, sub.Name) + ".backstop"
+			route := &driver.Route{Key: backstop}
+			add(driver.DestinationSpec{Name: main, Kind: driver.DestMain, Durable: true, DeadLetter: route, DeliveryLimit: sub.Retry.MaxAttempts + 5})
+			if effective.Fanout == driver.FanoutAtPublish {
+				addExchange(driver.ExchangeSpec{Name: entryPoint, Kind: "fanout", Durable: true})
+				result.Bindings = append(result.Bindings, driver.BindingSpec{Source: entryPoint, Destination: main})
+			}
 			for tier := 1; tier <= retryTiers(sub.Retry); tier++ {
-				add(driver.DestinationSpec{Name: retryDestinationFor(driverName, source, logical, priority, tier, sub.Name), Kind: driver.DestRetry, Durable: true, Delay: sub.Retry.DelayFor(tier)})
+				add(driver.DestinationSpec{Name: retryDestinationFor(source, logical, priority, tier, sub.Name), Kind: driver.DestRetry, Durable: true, Delay: sub.Retry.DelayFor(tier), DeadLetter: route, DeliveryLimit: sub.Retry.MaxAttempts + 5})
 			}
 		}
 		add(driver.DestinationSpec{Name: deadLetterDestinationFor(source, logical, sub.Name), Kind: driver.DestDLQ, Durable: true})
+		add(driver.DestinationSpec{Name: deadLetterDestinationFor(source, logical, sub.Name) + ".backstop", Kind: driver.DestBackstopDLQ, Durable: true})
 	}
 	// Decode failures may not yield an event type, so keep a stable DLQ for
 	// malformed messages whose topic cannot be recovered from the envelope.
 	add(driver.DestinationSpec{Name: deadLetterDestinationFor(source, "unknown", sub.Name), Kind: driver.DestDLQ, Durable: true})
-	sort.Slice(result, func(i, j int) bool { return result[i].Name < result[j].Name })
+	sort.Slice(result.Destinations, func(i, j int) bool { return result.Destinations[i].Name < result.Destinations[j].Name })
+	sort.Slice(result.Exchanges, func(i, j int) bool { return result.Exchanges[i].Name < result.Exchanges[j].Name })
+	sort.Slice(result.Bindings, func(i, j int) bool {
+		if result.Bindings[i].Source == result.Bindings[j].Source {
+			return result.Bindings[i].Destination < result.Bindings[j].Destination
+		}
+		return result.Bindings[i].Source < result.Bindings[j].Source
+	})
 	return result
 }
 
@@ -984,26 +1013,20 @@ func deadLetterDestination(r *Runner, envelope Envelope, message driver.InboundM
 }
 
 func retryDestination(r *Runner, envelope Envelope, tier int) string {
-	return retryDestinationFor(r.client.driver, r.client.source, topicFor(envelope.Type), envelope.Priority, tier, r.subscription.Name)
+	return retryDestinationFor(r.client.source, topicFor(envelope.Type), envelope.Priority, tier, r.subscription.Name)
 }
 
 func deadLetterDestinationFor(source, topic, subscription string) string {
-	env := strings.TrimPrefix(source, "/")
-	if index := strings.IndexByte(env, '/'); index >= 0 {
-		env = env[:index]
-	}
-	return fmt.Sprintf("f1.%s.%s.dlq.%s", env, topic, subscription)
+	return fmt.Sprintf("f1.%s.%s.dlq.%s", sourceEnvironment(source), topic, subscription)
 }
 
-func retryDestinationFor(driverName, source, topic string, priority Priority, tier int, subscription string) string {
-	// Keep retry names beside physicalTopic: both are core-owned topology names,
-	// and the two broker layouts are part of the frozen destination contract.
-	env := strings.TrimPrefix(source, "/")
-	if index := strings.IndexByte(env, '/'); index >= 0 {
-		env = env[:index]
+func retryDestinationFor(source, topic string, priority Priority, tier int, subscription string) string {
+	return fmt.Sprintf("f1.%s.%s.%s.%s.retry.%d", sourceEnvironment(source), topic, subscription, priority, tier)
+}
+
+func consumeDestination(effective driver.Capabilities, source, topic string, priority Priority, subscription string) string {
+	if effective.Fanout == driver.FanoutAtPublish {
+		return fmt.Sprintf("f1.%s.%s.%s.%s", sourceEnvironment(source), topic, subscription, priority)
 	}
-	if driverName == rabbitMQDriverName {
-		return fmt.Sprintf("f1.%s.%s.%s.%s.retry.%d", env, topic, subscription, priority, tier)
-	}
-	return fmt.Sprintf("f1.%s.%s.%s.retry.%d.%s", env, topic, priority, tier, subscription)
+	return publishEntryPoint(source, topic, priority)
 }

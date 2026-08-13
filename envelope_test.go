@@ -166,23 +166,6 @@ func TestEnvelope_TracedMessageSurvivesDecodeEncodeRoundTrip(t *testing.T) {
 	require.Equal(t, headers, replayed)
 }
 
-func TestRoutingKey_ComposesPriorityAndPartitionKey(t *testing.T) {
-	t.Parallel()
-
-	e := f1.Envelope{ID: "evt-1", Subject: "ORD-1", Priority: f1.PriorityHigh}
-
-	require.Equal(t, "high.ORD-1", f1.RoutingKey(e))
-	require.NotContains(t, f1.RoutingKey(e), "1.ORD-1", "an int-valued priority must never leak into the routing key")
-
-	e.PartitionKey = "override-key"
-	require.Equal(t, "override-key", f1.PartitionKeyOf(e), "f1partitionkey overrides subject")
-	require.Equal(t, "high.override-key", f1.RoutingKey(e))
-
-	e2 := f1.Envelope{ID: "evt-2", Priority: f1.PriorityLow}
-	require.Equal(t, "evt-2", f1.PartitionKeyOf(e2), "falls back to id when subject and f1partitionkey are both empty")
-	require.Equal(t, "low.evt-2", f1.RoutingKey(e2))
-}
-
 func TestPriority_MarshalsToWireString(t *testing.T) {
 	t.Parallel()
 
@@ -481,10 +464,6 @@ func TestPriority_UndeclaredValueDoesNotBecomeALane(t *testing.T) {
 	require.True(t, f1.PriorityNormal.Valid())
 	require.True(t, f1.PriorityHigh.Valid())
 	require.True(t, f1.PriorityLow.Valid())
-
-	rk := f1.RoutingKey(f1.Envelope{ID: "evt-1", Priority: undeclared})
-	require.Equal(t, "invalid.evt-1", rk)
-	require.NotContains(t, rk, "normal.", "an undeclared priority must never silently become the normal lane")
 
 	e := fullEnvelope()
 	e.Priority = undeclared
