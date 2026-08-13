@@ -9,6 +9,8 @@ import (
 	"runtime/debug"
 	"sort"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"golang.org/x/sync/errgroup"
@@ -29,6 +31,12 @@ type deliveryState struct {
 
 type deliveryMetrics struct {
 	attemptDivergence obs.SampledGaugeSet
+	topics            []string
+	stuckWorkers      atomic.Int64
+	activeHandlers    atomic.Int64
+	retired           atomic.Bool
+	unregisterOnce    sync.Once
+	unregister        func()
 }
 
 const deliveryPriorityLanes = 3
@@ -38,7 +46,17 @@ func newDeliveryMetrics(topics []string) deliveryMetrics {
 	for i, topic := range topics {
 		names[i] = topicFor(topic)
 	}
-	return deliveryMetrics{attemptDivergence: obs.NewSampledGaugeSet(names, deliveryPriorityLanes)}
+	sort.Strings(names)
+	unique := names[:0]
+	for _, name := range names {
+		if len(unique) == 0 || unique[len(unique)-1] != name {
+			unique = append(unique, name)
+		}
+	}
+	return deliveryMetrics{
+		attemptDivergence: obs.NewSampledGaugeSet(unique, deliveryPriorityLanes),
+		topics:            append([]string(nil), unique...),
+	}
 }
 
 func (m *deliveryMetrics) observeAttemptDivergence(eventType string, priority Priority, value uint64) {
@@ -52,6 +70,81 @@ func (m *deliveryMetrics) sampleAttemptDivergence(topic string, priority Priorit
 		return 0
 	}
 	return m.attemptDivergence.Sample(topic, int(priority))
+}
+
+func (m *deliveryMetrics) sampleAttemptDivergenceByTopic() map[string]int64 {
+	values := make(map[string]int64, len(m.topics))
+	for _, topic := range m.topics {
+		var highWater uint64
+		for lane := 0; lane < deliveryPriorityLanes; lane++ {
+			if value := m.attemptDivergence.Sample(topic, lane); value > highWater {
+				highWater = value
+			}
+		}
+		values[topic] = int64(highWater)
+	}
+	return values
+}
+
+func (m *deliveryMetrics) currentStuckWorkers() int64 {
+	return m.stuckWorkers.Load()
+}
+
+type handlerActivity struct {
+	metrics *deliveryMetrics
+	mu      sync.Mutex
+	stuck   bool
+	done    bool
+}
+
+func (m *deliveryMetrics) beginHandler() *handlerActivity {
+	m.activeHandlers.Add(1)
+	return &handlerActivity{metrics: m}
+}
+
+func (a *handlerActivity) markStuck() {
+	a.mu.Lock()
+	if !a.done && !a.stuck {
+		a.stuck = true
+		a.metrics.stuckWorkers.Add(1)
+	}
+	a.mu.Unlock()
+}
+
+func (a *handlerActivity) finish() {
+	a.mu.Lock()
+	if a.done {
+		a.mu.Unlock()
+		return
+	}
+	a.done = true
+	if a.stuck {
+		a.metrics.stuckWorkers.Add(-1)
+	}
+	a.mu.Unlock()
+	a.metrics.endHandler()
+}
+
+func (m *deliveryMetrics) endHandler() {
+	if m.activeHandlers.Add(-1) == 0 {
+		m.unregisterIfReady()
+	}
+}
+
+func (m *deliveryMetrics) retire() {
+	m.retired.Store(true)
+	m.unregisterIfReady()
+}
+
+func (m *deliveryMetrics) unregisterIfReady() {
+	if !m.retired.Load() || m.activeHandlers.Load() != 0 {
+		return
+	}
+	m.unregisterOnce.Do(func() {
+		if m.unregister != nil {
+			m.unregister()
+		}
+	})
 }
 
 // Run starts the consumer, owns its fetcher and workers, and returns when the
@@ -232,6 +325,7 @@ func finishRunner(r *Runner) {
 		delete(r.client.runners, r)
 		r.client.mu.Unlock()
 	}
+	r.metrics.retire()
 }
 
 func runnerError(r *Runner) error {
@@ -570,7 +664,9 @@ func invokeHandler(r *Runner, parent context.Context, handler Handler, event *Ev
 		group = new(errgroup.Group)
 	}
 	r.mu.Unlock()
+	activity := r.metrics.beginHandler()
 	group.Go(func() error {
+		defer activity.finish()
 		result := handlerResult{}
 		func() {
 			defer func() {
@@ -606,6 +702,7 @@ func invokeHandler(r *Runner, parent context.Context, handler Handler, event *Ev
 	case <-shutdownDone:
 		return handlerResult{stuck: true}
 	case <-stuck.C:
+		activity.markStuck()
 		runnerLogger(r).Warn("f1 stuck worker", "metric", "f1_stuck_workers", "subscription", r.subscription.Name, "threshold", 2*timeout)
 	}
 	stackTimer := r.client.options.clock.Timer(timeout * 2)

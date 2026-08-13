@@ -79,14 +79,15 @@ linters:
           files:
             - "**/*.go"
             - "!**/internal/obs/**"
+            - "!**/f1test/**"
           allow:
             - go.opentelemetry.io/otel/metric
             - go.opentelemetry.io/otel/trace
           deny:
             - pkg: go.opentelemetry.io/otel$
-              desc: "only internal/obs may use OpenTelemetry global providers"
+              desc: "core code must use OpenTelemetry global providers only in internal/obs"
             - pkg: go.opentelemetry.io/otel/sdk
-              desc: "only internal/obs may use the OpenTelemetry SDK"
+              desc: "core code must use the OpenTelemetry SDK only in internal/obs"
             - pkg: go.opentelemetry.io/otel/semconv
               desc: "only internal/obs may use OpenTelemetry semantic conventions"
 
@@ -144,9 +145,10 @@ linters:
             - fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/driver
             - fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/drivers/inmem
             - fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/clock
+            - go.opentelemetry.io/otel
           deny:
             - pkg: $all
-              desc: "f1test may import only the SDK, in-memory driver, clock, and test assertions"
+              desc: "f1test may import only the SDK, in-memory driver, clock, test assertions, and metric reader"
 
         drivers-kafka:
           files:

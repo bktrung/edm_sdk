@@ -17,11 +17,13 @@ var (
 	registry   []MetricDefinition
 )
 
-// Register the first M1 family here so the CI check is linked to a real
-// declaration. This records a family and its bounded labels; it does not
-// emit a measurement.
+// Register metric families here so the cardinality check is linked to real
+// declarations. This records families and their bounded labels; it does not
+// emit measurements.
 func init() {
 	RegisterMetric("f1_capability_info", "feature", "mode")
+	RegisterMetric("f1_attempt_divergence", "topic")
+	RegisterMetric("f1_stuck_workers", "subscription")
 }
 
 // RegisterMetric records a metric family for validation and instrumentation.

@@ -10,6 +10,7 @@ import (
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/codec"
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/driver"
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/clock"
+	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/obs"
 )
 
 // Client is an eagerly connected messaging client.
@@ -23,6 +24,7 @@ type Client struct {
 	producer       string
 	driver         string
 	producerHandle driver.Producer
+	metrics        *obs.Metrics
 
 	mu              sync.Mutex
 	closed          bool
@@ -87,6 +89,11 @@ func New(ctx context.Context, cfg Config, opts ...Option) (*Client, error) {
 	if options.strictPortability {
 		effective = effective.Strict()
 	}
+	metrics, err := obs.NewMetrics(options.meterProvider)
+	if err != nil {
+		_ = connection.Close(ctx)
+		return nil, fmt.Errorf("f1: initialize metrics: %w", err)
+	}
 	client := &Client{
 		conn:      connection,
 		effective: effective,
@@ -95,6 +102,7 @@ func New(ctx context.Context, cfg Config, opts ...Option) (*Client, error) {
 		source:    fmt.Sprintf("/%s/%s", cfg.Env, cfg.Service),
 		producer:  fmt.Sprintf("%s/unknown/%s", cfg.Service, cfg.InstanceID),
 		driver:    options.driver.Name(),
+		metrics:   metrics,
 		runners:   make(map[*Runner]struct{}),
 	}
 	client.limits = limitsFor(options.driver.Name(), connection.BrokerInfo(), effective)
@@ -235,7 +243,7 @@ func (c *Client) Close(ctx context.Context) error {
 		}
 		c.closed = true
 		c.closing = false
-		return producerCloseErr
+		return errors.Join(producerCloseErr, c.metrics.Close())
 	}
 	if err := c.conn.Close(ctx); err != nil {
 		c.closing = false
@@ -243,7 +251,7 @@ func (c *Client) Close(ctx context.Context) error {
 	}
 	c.closed = true
 	c.closing = false
-	return nil
+	return c.metrics.Close()
 }
 
 // publishMessages sends core-generated successor messages through the client's
