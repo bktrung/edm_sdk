@@ -101,6 +101,7 @@ type Runner struct {
 	lifecycle             *lifecycle.Machine
 	accounting            *lifecycle.Accounting
 	dispatchPool          *dispatch.Pool
+	deliveryIDs           []uint64
 }
 
 const terminalNotificationTimeout = time.Second

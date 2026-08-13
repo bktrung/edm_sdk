@@ -44,11 +44,17 @@ func (m *Machine) Drain(ctx context.Context, cfg Config, hooks Hooks) error {
 	if phaseClock == nil {
 		phaseClock = clock.NewReal()
 	}
-	if err := m.Transition(Draining); err != nil {
-		return err
-	}
-	if err := sleep(ctx, cfg.PreStopDelay, phaseClock); err != nil {
-		return m.abort(err)
+	switch m.State() {
+	case Ready:
+		if err := sleep(ctx, cfg.PreStopDelay, phaseClock); err != nil {
+			return m.abort(err)
+		}
+		if err := m.Transition(Draining); err != nil {
+			return err
+		}
+	case Draining:
+	default:
+		return errors.New("lifecycle: drain requires ready or draining state")
 	}
 	if hooks.Drain != nil {
 		if err := runWithTimeout(ctx, cfg.DrainTimeout, hooks.Drain, phaseClock); err != nil {

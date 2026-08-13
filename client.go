@@ -239,51 +239,96 @@ func (c *Client) Close(ctx context.Context) error {
 		runners = append(runners, runner)
 	}
 	c.mu.Unlock()
+
+	fail := func(err error) error {
+		c.mu.Lock()
+		c.closing = false
+		c.mu.Unlock()
+		return err
+	}
+	activeRunner := false
 	for _, runner := range runners {
-		if err := runner.Drain(ctx); err != nil {
-			c.mu.Lock()
-			c.closing = false
-			c.mu.Unlock()
-			return err
+		runner.mu.Lock()
+		activeRunner = activeRunner || (runner.started && !runner.finished)
+		runner.mu.Unlock()
+	}
+	if activeRunner {
+		if err := waitForClock(ctx, c.options.clock, c.config.Lifecycle.PreStopDelay); err != nil {
+			return fail(err)
 		}
 	}
+
+	runnerErrors := make(chan error, len(runners))
+	var group sync.WaitGroup
+	group.Add(len(runners))
+	for _, runner := range runners {
+		go func(runner *Runner) {
+			defer group.Done()
+			if err := runner.Drain(ctx); err != nil {
+				runnerErrors <- err
+			}
+		}(runner)
+	}
+	group.Wait()
+	close(runnerErrors)
+	var drainErrors []error
+	for err := range runnerErrors {
+		drainErrors = append(drainErrors, err)
+	}
+	if err := errors.Join(drainErrors...); err != nil {
+		return fail(err)
+	}
 	if idle != nil {
-		select {
-		case <-idle:
-		case <-ctx.Done():
-			c.mu.Lock()
-			c.closing = false
-			c.mu.Unlock()
-			return ctx.Err()
+		idleTimeout := c.config.Lifecycle.DrainTimeout
+		err := runWithClockTimeout(ctx, c.options.clock, idleTimeout, func(waitCtx context.Context) error {
+			select {
+			case <-idle:
+				return nil
+			case <-waitCtx.Done():
+				return waitCtx.Err()
+			}
+		})
+		if err != nil {
+			return fail(err)
 		}
 	}
 
 	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.producerHandle != nil {
-		if err := c.producerHandle.Flush(ctx); err != nil {
-			c.closing = false
-			return err
+	producer := c.producerHandle
+	conn := c.conn
+	c.mu.Unlock()
+	if producer != nil {
+		c.mu.Lock()
+		flushErr := runWithClockTimeout(ctx, c.options.clock, c.config.Lifecycle.FlushTimeout, producer.Flush)
+		c.mu.Unlock()
+		if flushErr != nil {
+			return fail(flushErr)
 		}
-		producerCloseErr := c.producerHandle.Close(ctx)
+		c.mu.Lock()
+		producerCloseErr := runWithClockTimeout(ctx, c.options.clock, c.config.Lifecycle.CloseTimeout, producer.Close)
 		c.producerHandle = nil
+		c.mu.Unlock()
 		if producerCloseErr != nil && c.options.logger != nil {
 			c.options.logger.Warn("f1 producer close failed", "error", producerCloseErr)
 		}
-		if err := c.conn.Close(ctx); err != nil {
-			c.closing = false
-			return errors.Join(producerCloseErr, err)
+		connErr := runWithClockTimeout(ctx, c.options.clock, c.config.Lifecycle.CloseTimeout, conn.Close)
+		if connErr != nil {
+			return fail(errors.Join(producerCloseErr, connErr))
 		}
+		c.mu.Lock()
 		c.closed = true
 		c.closing = false
+		c.mu.Unlock()
 		return errors.Join(producerCloseErr, c.metrics.Close())
 	}
-	if err := c.conn.Close(ctx); err != nil {
-		c.closing = false
-		return err
+	connErr := runWithClockTimeout(ctx, c.options.clock, c.config.Lifecycle.CloseTimeout, conn.Close)
+	if connErr != nil {
+		return fail(connErr)
 	}
+	c.mu.Lock()
 	c.closed = true
 	c.closing = false
+	c.mu.Unlock()
 	return c.metrics.Close()
 }
 
