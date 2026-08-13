@@ -61,6 +61,13 @@ func (a *admin) ensureTopology(ctx context.Context, spec driver.TopologySpec) (d
 			continue
 		}
 		seenDestinations[destination.Name] = struct{}{}
+		a.conn.mu.Lock()
+		if destination.Delay > 0 {
+			a.conn.deferred[destination.Name] = destination.Delay
+		} else {
+			delete(a.conn.deferred, destination.Name)
+		}
+		a.conn.mu.Unlock()
 		args := queueArguments(destination)
 		exists, err := a.queueExists(ctx, destination.Name, destination.Durable, args)
 		if err != nil {
@@ -195,7 +202,8 @@ func (a *admin) queueExists(ctx context.Context, name string, durable bool, args
 		return false, err
 	}
 	defer channel.Close()
-	_, err = channel.QueueDeclarePassive(name, durable, false, false, false, args)
+	declaredDurable, autoDelete, exclusive := queueFlags(durable)
+	_, err = channel.QueueDeclarePassive(name, declaredDurable, autoDelete, exclusive, false, args)
 	if err == nil {
 		return true, nil
 	}
@@ -210,11 +218,30 @@ func (a *admin) declareQueue(ctx context.Context, name string, durable bool, arg
 	if err != nil {
 		return err
 	}
-	defer channel.Close()
-	if _, err := channel.QueueDeclare(name, durable, false, false, false, args); err != nil {
+	declaredDurable, autoDelete, exclusive := queueFlags(durable)
+	if _, err := channel.QueueDeclare(name, declaredDurable, autoDelete, exclusive, false, args); err != nil {
+		_ = channel.Close()
 		return classifyAMQP("ensure_topology", driver.KindFatal, err)
 	}
+	if durable {
+		_ = channel.Close()
+		return nil
+	}
+	a.conn.mu.Lock()
+	old := a.conn.ephemeral[name]
+	a.conn.ephemeral[name] = channel
+	a.conn.mu.Unlock()
+	if old != nil {
+		_ = old.Close()
+	}
 	return nil
+}
+
+func queueFlags(durable bool) (bool, bool, bool) {
+	if durable {
+		return true, false, false
+	}
+	return false, false, true
 }
 
 func (a *admin) bindQueue(ctx context.Context, binding driver.BindingSpec) error {

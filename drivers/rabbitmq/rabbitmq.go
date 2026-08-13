@@ -100,6 +100,8 @@ type conn struct {
 	producers  map[*producer]struct{}
 	exchanges  map[string]struct{}
 	bindings   map[bindingKey]bool
+	deferred   map[string]time.Duration
+	ephemeral  map[string]*amqp.Channel
 }
 
 var _ driver.Conn = (*conn)(nil)
@@ -113,6 +115,8 @@ func newConn(amqpConn *amqp.Connection, caps driver.Capabilities) *conn {
 		producers: make(map[*producer]struct{}),
 		exchanges: make(map[string]struct{}),
 		bindings:  make(map[bindingKey]bool),
+		deferred:  make(map[string]time.Duration),
+		ephemeral: make(map[string]*amqp.Channel),
 	}
 }
 
@@ -213,7 +217,15 @@ func (c *conn) Close(ctx context.Context) error {
 	c.closed = true
 	deadline, hasDeadline := ctx.Deadline()
 	amqpConn := c.amqp
+	ephemeral := make([]*amqp.Channel, 0, len(c.ephemeral))
+	for _, channel := range c.ephemeral {
+		ephemeral = append(ephemeral, channel)
+	}
+	c.ephemeral = nil
 	c.mu.Unlock()
+	for _, channel := range ephemeral {
+		_ = channel.Close()
+	}
 
 	var err error
 	if hasDeadline {

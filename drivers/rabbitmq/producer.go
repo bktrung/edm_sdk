@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strconv"
 	"sync"
 	"time"
 
@@ -82,25 +83,49 @@ func (p *producer) Publish(ctx context.Context, msgs ...driver.OutboundMessage) 
 }
 
 func (p *producer) publishOne(ctx context.Context, message driver.OutboundMessage) error {
-	exchange, routingKey := p.target(message.Destination)
+	exchange, routingKey, expiration := p.target(message)
 	publishing, err := amqpPublishing(message)
 	if err != nil {
 		return classify("publish", driver.KindFatal, err)
 	}
+	publishing.Expiration = expiration
 	if err := p.channel.PublishWithContext(ctx, exchange, routingKey, true, false, publishing); err != nil {
 		return classifyAMQP("publish", driver.KindTransient, err)
 	}
 	return p.waitConfirm(ctx)
 }
 
-func (p *producer) target(destination string) (string, string) {
+func (p *producer) target(message driver.OutboundMessage) (string, string, string) {
+	destination := message.Destination
 	p.conn.mu.RLock()
 	_, isExchange := p.conn.exchanges[destination]
+	delay, isDeferred := p.conn.deferred[destination]
 	p.conn.mu.RUnlock()
-	if isExchange {
-		return destination, ""
+	if isDeferred {
+		due := message.DelayUntil
+		now := time.Now() //nolint:forbidigo // the driver computes remaining delay at publish time
+		if due.IsZero() {
+			due = now.Add(delay)
+		}
+		if remaining := due.Sub(now); remaining > 0 {
+			return "", destination + ".park", expirationMillis(remaining)
+		}
 	}
-	return "", destination
+	if isExchange {
+		return destination, "", ""
+	}
+	return "", destination, ""
+}
+
+func expirationMillis(remaining time.Duration) string {
+	millis := remaining / time.Millisecond
+	if remaining%time.Millisecond != 0 {
+		millis++
+	}
+	if millis < 1 {
+		millis = 1
+	}
+	return strconv.FormatInt(int64(millis), 10)
 }
 
 func (p *producer) waitConfirm(ctx context.Context) error {
