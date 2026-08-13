@@ -3,6 +3,7 @@ package f1test
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"sync"
 	"testing"
 	"time"
@@ -114,7 +115,8 @@ func TestMetricsPublishesCurrentStuckWorkers(t *testing.T) {
 	reader := metric.NewManualReader()
 	provider := metric.NewMeterProvider(metric.WithReader(reader))
 	t.Cleanup(func() { require.NoError(t, provider.Shutdown(context.Background())) })
-	c := NewClient(t, f1.WithMeterProvider(provider))
+	stuckReported := make(chan struct{})
+	c := NewClient(t, f1.WithMeterProvider(provider), f1.WithLogger(slog.New(&signalHandler{message: "f1 stuck worker", signal: stuckReported})))
 
 	started := make(chan struct{})
 	release := make(chan struct{})
@@ -169,13 +171,18 @@ func TestMetricsPublishesCurrentStuckWorkers(t *testing.T) {
 	case <-timer.C:
 		t.Fatal("handler did not start")
 	}
+	c.clock.BlockUntil(1)
 	c.Advance(20 * time.Millisecond)
 
+	timer = clock.NewReal().Timer(time.Second)
+	select {
+	case <-stuckReported:
+	case <-timer.C:
+		t.Fatal("stuck worker was not reported")
+	}
+	timer.Stop()
+
 	for i := 0; i < 2; i++ {
-		assert.Eventually(t, func() bool {
-			value, ok := readGaugeValue(t, reader, "f1_stuck_workers", "subscription", "orders")
-			return ok && value == 1
-		}, time.Second, time.Millisecond)
 		value, ok := readGaugeValue(t, reader, "f1_stuck_workers", "subscription", "orders")
 		assert.True(t, ok)
 		assert.Equal(t, int64(1), value)
@@ -188,10 +195,9 @@ func TestMetricsPublishesCurrentStuckWorkers(t *testing.T) {
 	case <-timer.C:
 		t.Fatal("stuck handler did not return")
 	}
-	assert.Eventually(t, func() bool {
-		value, ok := readGaugeValue(t, reader, "f1_stuck_workers", "subscription", "orders")
-		return ok && value == 0
-	}, time.Second, time.Millisecond)
+	value, ok := readGaugeValue(t, reader, "f1_stuck_workers", "subscription", "orders")
+	assert.True(t, ok)
+	assert.Equal(t, int64(0), value)
 }
 
 func readGaugeValue(t *testing.T, reader *metric.ManualReader, name, labelKey, labelValue string) (int64, bool) {
@@ -222,3 +228,22 @@ func readGaugeValue(t *testing.T, reader *metric.ManualReader, name, labelKey, l
 	}
 	return 0, false
 }
+
+type signalHandler struct {
+	message string
+	signal  chan struct{}
+	once    sync.Once
+}
+
+func (h *signalHandler) Enabled(context.Context, slog.Level) bool { return true }
+
+func (h *signalHandler) Handle(_ context.Context, record slog.Record) error {
+	if record.Message == h.message {
+		h.once.Do(func() { close(h.signal) })
+	}
+	return nil
+}
+
+func (h *signalHandler) WithAttrs([]slog.Attr) slog.Handler { return h }
+
+func (h *signalHandler) WithGroup(string) slog.Handler { return h }
