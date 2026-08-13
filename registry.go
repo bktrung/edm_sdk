@@ -2,26 +2,26 @@ package f1
 
 import (
 	"context"
-	"sync"
 
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/driver"
+	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/dispatch"
 )
 
-type settlementOperation uint8
+type settlementOperation = dispatch.SettlementOperation
 
 const (
-	settlementOperationNone settlementOperation = iota
-	settlementOperationAck
-	settlementOperationNack
+	settlementOperationNone = dispatch.SettlementOperationNone
+	settlementOperationAck  = dispatch.SettlementOperationAck
+	settlementOperationNack = dispatch.SettlementOperationNack
 )
 
-type settlementOutcome uint8
+type settlementOutcome = dispatch.SettlementOutcome
 
 const (
-	settlementOutcomeSettled settlementOutcome = iota
-	settlementOutcomeRequeued
-	settlementOutcomeUnknown
-	settlementOutcomeAbandoned
+	settlementOutcomeSettled   = dispatch.SettlementOutcomeSettled
+	settlementOutcomeRequeued  = dispatch.SettlementOutcomeRequeued
+	settlementOutcomeUnknown   = dispatch.SettlementOutcomeUnknown
+	settlementOutcomeAbandoned = dispatch.SettlementOutcomeAbandoned
 )
 
 type settlementCounts struct {
@@ -32,93 +32,73 @@ type settlementCounts struct {
 	abandoned uint64
 }
 
-// inflightRegistry tracks broker deliveries from the moment the fetcher accepts
-// them until the worker has completed settlement. The mutex protects both the
-// map and the zero-transition channel; callers never hold it while doing
-// handler, publish, or driver work.
-// Invariant: items contains every delivery accepted by the fetcher until its
-// settlement call returns; the zero channel changes only under mu.
+// inflightRegistry preserves the root worker's settlement call shape while
+// delegating storage and accounting to the internal dispatch registry.
 type inflightRegistry struct {
-	mu    sync.Mutex
-	items map[uint64]driver.InboundMessage
-	next  uint64
-	zero  chan struct{}
-	count settlementCounts
+	registry *dispatch.Registry
 }
 
 func newInflightRegistry() *inflightRegistry {
-	return &inflightRegistry{items: make(map[uint64]driver.InboundMessage), zero: closedSignal()}
+	return &inflightRegistry{registry: dispatch.NewRegistry()}
 }
 
-func closedSignal() chan struct{} {
-	ch := make(chan struct{})
-	close(ch)
-	return ch
-}
-
-// Add registers a delivery before it is placed on the worker queue.
-func (r *inflightRegistry) Add(message driver.InboundMessage) uint64 {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	r.next++
-	if len(r.items) == 0 {
-		r.zero = make(chan struct{})
+// Add registers a delivery. The message is accepted for compatibility, but
+// the registry only needs the identity key and does not retain the message.
+func (r *inflightRegistry) Add(_ driver.InboundMessage) uint64 {
+	if r == nil {
+		return 0
 	}
-	r.count.received++
-	id := r.next
-	r.items[id] = message
-	return id
+	return r.registry.Add()
 }
 
-// Remove deregisters a delivery after its settlement call has returned.
+// Remove records the default successful settlement for a delivery.
 func (r *inflightRegistry) Remove(id uint64) {
-	r.RemoveAs(id, settlementOutcomeSettled)
+	if r != nil {
+		r.registry.Remove(id)
+	}
 }
 
+// RemoveAs removes a delivery and records its settlement outcome.
 func (r *inflightRegistry) RemoveAs(id uint64, outcome settlementOutcome) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if _, ok := r.items[id]; !ok {
-		return
-	}
-	delete(r.items, id)
-	switch outcome {
-	case settlementOutcomeSettled:
-		r.count.settled++
-	case settlementOutcomeRequeued:
-		r.count.requeued++
-	case settlementOutcomeUnknown:
-		r.count.unknown++
-	case settlementOutcomeAbandoned:
-		r.count.abandoned++
-	}
-	if len(r.items) == 0 {
-		close(r.zero)
+	if r != nil {
+		r.registry.RemoveAs(id, outcome)
 	}
 }
 
 func (r *inflightRegistry) Counts() settlementCounts {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	return r.count
-}
-
-// Len returns the number of deliveries that have not completed settlement.
-func (r *inflightRegistry) Len() int {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	return len(r.items)
-}
-
-// WaitZero waits until every registered delivery has completed settlement.
-func (r *inflightRegistry) WaitZero(ctx context.Context) error {
-	r.mu.Lock()
-	zero := r.zero
-	r.mu.Unlock()
-	select {
-	case <-zero:
-		return nil
-	case <-ctx.Done():
-		return ctx.Err()
+	if r == nil {
+		return settlementCounts{}
 	}
+	counts := r.registry.Counts()
+	return settlementCounts{
+		received:  counts.Received,
+		settled:   counts.Settled,
+		requeued:  counts.Requeued,
+		unknown:   counts.Unknown,
+		abandoned: counts.Abandoned,
+	}
+}
+
+// Len returns the number of deliveries without a recorded settlement result.
+func (r *inflightRegistry) Len() int {
+	if r == nil {
+		return 0
+	}
+	return r.registry.Len()
+}
+
+// WaitZero waits until every registered delivery has a settlement result.
+func (r *inflightRegistry) WaitZero(ctx context.Context) error {
+	if r == nil {
+		return nil
+	}
+	return r.registry.WaitZero(ctx)
+}
+
+// WaitFor waits until every selected delivery has a settlement result.
+func (r *inflightRegistry) WaitFor(ctx context.Context, ids []uint64) error {
+	if r == nil {
+		return nil
+	}
+	return r.registry.WaitFor(ctx, ids)
 }
