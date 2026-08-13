@@ -975,19 +975,34 @@ func subscriptionTopologySpecs(effective driver.Capabilities, source string, sub
 		for _, priority := range sub.Priorities {
 			entryPoint := publishEntryPoint(source, logical, priority)
 			main := consumeDestination(effective, source, logical, priority, sub.Name)
+			// The backstop catches messages the BROKER dead-lettered on its own
+			// delivery counter, which the core never classified. Only a broker
+			// that routes to a dead-letter target on a delivery limit can put a
+			// message there, so on any other broker the route, the counter and
+			// the queue would all be inert - and the queue would sit empty
+			// forever, which reads as a bug to whoever finds it.
 			backstop := deadLetterDestinationFor(source, logical, sub.Name) + ".backstop"
-			route := &driver.Route{Key: backstop}
-			add(driver.DestinationSpec{Name: main, Kind: driver.DestMain, Durable: true, DeadLetter: route, DeliveryLimit: sub.Retry.MaxAttempts + 5})
+			var route *driver.Route
+			limit := 0
+			if effective.NativeDLQ {
+				route = &driver.Route{Key: backstop}
+				// Headroom over the core's own ladder: the core dead-letters
+				// first, so this firing at all means the two disagree.
+				limit = sub.Retry.MaxAttempts + 5
+			}
+			add(driver.DestinationSpec{Name: main, Kind: driver.DestMain, Durable: true, DeadLetter: route, DeliveryLimit: limit})
 			if effective.Fanout == driver.FanoutAtPublish {
 				addExchange(driver.ExchangeSpec{Name: entryPoint, Kind: "fanout", Durable: true})
 				result.Bindings = append(result.Bindings, driver.BindingSpec{Source: entryPoint, Destination: main})
 			}
 			for tier := 1; tier <= retryTiers(sub.Retry); tier++ {
-				add(driver.DestinationSpec{Name: retryDestinationFor(source, logical, priority, tier, sub.Name), Kind: driver.DestRetry, Durable: true, Delay: sub.Retry.DelayFor(tier), DeadLetter: route, DeliveryLimit: sub.Retry.MaxAttempts + 5})
+				add(driver.DestinationSpec{Name: retryDestinationFor(source, logical, priority, tier, sub.Name), Kind: driver.DestRetry, Durable: true, Delay: sub.Retry.DelayFor(tier), DeadLetter: route, DeliveryLimit: limit})
 			}
 		}
 		add(driver.DestinationSpec{Name: deadLetterDestinationFor(source, logical, sub.Name), Kind: driver.DestDLQ, Durable: true})
-		add(driver.DestinationSpec{Name: deadLetterDestinationFor(source, logical, sub.Name) + ".backstop", Kind: driver.DestBackstopDLQ, Durable: true})
+		if effective.NativeDLQ {
+			add(driver.DestinationSpec{Name: deadLetterDestinationFor(source, logical, sub.Name) + ".backstop", Kind: driver.DestBackstopDLQ, Durable: true})
+		}
 	}
 	// Decode failures may not yield an event type, so keep a stable DLQ for
 	// malformed messages whose topic cannot be recovered from the envelope.
