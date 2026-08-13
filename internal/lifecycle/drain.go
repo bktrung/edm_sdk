@@ -10,7 +10,6 @@ import (
 
 // Hooks are the resource operations owned by a runner or client.
 type Hooks struct {
-	PreStopDelay  time.Duration
 	Drain         func(context.Context) error
 	CancelHandler func()
 	WaitSettled   func(context.Context) error
@@ -22,7 +21,6 @@ type Hooks struct {
 type Config struct {
 	// Clock provides deterministic timing for shutdown phases.
 	Clock        clock.Clock
-	PreStopDelay time.Duration
 	DrainTimeout time.Duration
 	HandlerGrace time.Duration
 	FlushTimeout time.Duration
@@ -44,16 +42,12 @@ func (m *Machine) Drain(ctx context.Context, cfg Config, hooks Hooks) error {
 	if phaseClock == nil {
 		phaseClock = clock.NewReal()
 	}
-	switch m.State() {
-	case Ready:
-		if err := sleep(ctx, cfg.PreStopDelay, phaseClock); err != nil {
-			return m.abort(err)
-		}
+	state := m.State()
+	if state == Ready {
 		if err := m.Transition(Draining); err != nil {
 			return err
 		}
-	case Draining:
-	default:
+	} else if state != Draining {
 		return errors.New("lifecycle: drain requires ready or draining state")
 	}
 	if hooks.Drain != nil {
@@ -106,20 +100,6 @@ func (m *Machine) Drain(ctx context.Context, cfg Config, hooks Hooks) error {
 func (m *Machine) abort(err error) error {
 	transitionErr := m.Transition(Aborted)
 	return errors.Join(err, transitionErr)
-}
-
-func sleep(ctx context.Context, delay time.Duration, clk clock.Clock) error {
-	if delay <= 0 {
-		return nil
-	}
-	timer := clk.Timer(delay)
-	defer timer.Stop()
-	select {
-	case <-timer.C:
-		return nil
-	case <-ctx.Done():
-		return ctx.Err()
-	}
 }
 
 func runWithTimeout(parent context.Context, timeout time.Duration, fn func(context.Context) error, clk clock.Clock) error {

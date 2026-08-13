@@ -109,11 +109,3 @@ func (r *inflightRegistry) WaitZero(ctx context.Context) error {
 	}
 	return r.registry.WaitZero(ctx)
 }
-
-// WaitFor waits until every selected delivery has a settlement result.
-func (r *inflightRegistry) WaitFor(ctx context.Context, ids []uint64) error {
-	if r == nil {
-		return nil
-	}
-	return r.registry.WaitFor(ctx, ids)
-}

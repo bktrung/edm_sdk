@@ -5,13 +5,79 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/driver"
+	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/clock"
 )
+
+func TestClientCloseBoundsProducerFlush(t *testing.T) {
+	fake := clock.NewFake(time.Unix(0, 0))
+	producer := &recordingProducer{
+		flushStarted: make(chan struct{}),
+		flushRelease: make(chan struct{}),
+	}
+	client := newPublishClient(t, producer, WithClock(fake))
+	client.config.Lifecycle.FlushTimeout = 5 * time.Second
+	defer close(producer.flushRelease)
+	if _, err := client.Publisher().Publish(context.Background(), "orders.created", "payload"); err != nil {
+		t.Fatal(err)
+	}
+
+	closeDone := make(chan error, 1)
+	go func() { closeDone <- client.Close(context.Background()) }()
+	<-producer.flushStarted
+	waitForFakeTimer(t, fake)
+	fake.Advance(5 * time.Second)
+	err := <-closeDone
+	if !errors.Is(err, context.DeadlineExceeded) || !strings.Contains(err.Error(), "flush phase") {
+		t.Fatalf("Close() error = %v, want flush phase deadline", err)
+	}
+}
+
+func TestClientCloseBoundsConnectionClose(t *testing.T) {
+	fake := clock.NewFake(time.Unix(0, 0))
+	conn := &publishConn{
+		info:         driver.BrokerInfo{Kind: "test", Version: "1"},
+		closeStarted: make(chan struct{}),
+		closeRelease: make(chan struct{}),
+	}
+	client, err := New(context.Background(), testClientConfig(t), WithDriver(&publishDriver{conn: conn}), WithClock(fake))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = client.Close(context.Background()) })
+	client.config.Lifecycle.CloseTimeout = 5 * time.Second
+	defer close(conn.closeRelease)
+
+	closeDone := make(chan error, 1)
+	go func() { closeDone <- client.Close(context.Background()) }()
+	<-conn.closeStarted
+	waitForFakeTimer(t, fake)
+	fake.Advance(5 * time.Second)
+	err = <-closeDone
+	if !errors.Is(err, context.DeadlineExceeded) || !strings.Contains(err.Error(), "close phase") {
+		t.Fatalf("Close() error = %v, want close phase deadline", err)
+	}
+}
+
+func waitForFakeTimer(t *testing.T, fake *clock.Fake) {
+	t.Helper()
+	watchdog := clock.NewReal().Timer(time.Second)
+	defer watchdog.Stop()
+	for fake.NumWaiters() == 0 {
+		select {
+		case <-watchdog.C:
+			t.Fatal("shutdown timeout timer was not registered")
+		default:
+			runtime.Gosched()
+		}
+	}
+}
 
 func TestPublishIsSynchronousUntilDurable(t *testing.T) {
 	t.Parallel()
@@ -380,11 +446,14 @@ func (*publishDriver) Capabilities() driver.Capabilities { return driver.Capabil
 func (d *publishDriver) Open(context.Context, driver.Config) (driver.Conn, error) { return d.conn, nil }
 
 type publishConn struct {
-	mu            sync.Mutex
-	producer      driver.Producer
-	info          driver.BrokerInfo
-	producerCalls int
-	closeCalls    int
+	mu               sync.Mutex
+	producer         driver.Producer
+	info             driver.BrokerInfo
+	producerCalls    int
+	closeCalls       int
+	closeStarted     chan struct{}
+	closeStartedOnce sync.Once
+	closeRelease     chan struct{}
 }
 
 func (*publishConn) Capabilities() driver.Capabilities { return driver.Capabilities{} }
@@ -409,21 +478,30 @@ func (*publishConn) Ping(context.Context) error { return nil }
 func (c *publishConn) Close(context.Context) error {
 	c.mu.Lock()
 	c.closeCalls++
+	started := c.closeStarted
+	release := c.closeRelease
+	if started != nil {
+		c.closeStartedOnce.Do(func() { close(started) })
+	}
 	c.mu.Unlock()
+	if release != nil {
+		<-release
+	}
 	return nil
 }
 
 type recordingProducer struct {
-	mu             sync.Mutex
-	messages       []driver.OutboundMessage
-	publishErr     error
-	publishStarted chan struct{}
-	publishRelease chan struct{}
-	closeCalls     int
-	flushCalls     int
-	closeErr       error
-	flushStarted   chan struct{}
-	flushRelease   chan struct{}
+	mu               sync.Mutex
+	messages         []driver.OutboundMessage
+	publishErr       error
+	publishStarted   chan struct{}
+	publishRelease   chan struct{}
+	closeCalls       int
+	flushCalls       int
+	closeErr         error
+	flushStarted     chan struct{}
+	flushStartedOnce sync.Once
+	flushRelease     chan struct{}
 }
 
 func (p *recordingProducer) Publish(_ context.Context, messages ...driver.OutboundMessage) error {
@@ -447,7 +525,7 @@ func (p *recordingProducer) Flush(context.Context) error {
 	started := p.flushStarted
 	release := p.flushRelease
 	if started != nil {
-		close(started)
+		p.flushStartedOnce.Do(func() { close(started) })
 	}
 	p.mu.Unlock()
 	if release != nil {

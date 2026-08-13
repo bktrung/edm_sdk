@@ -182,7 +182,6 @@ func (r *Runner) Run(ctx context.Context) error {
 	r.inflight = newInflightRegistry()
 	r.lifecycle = lifecycle.New()
 	r.accounting = lifecycle.NewAccounting(r.inflight.registry)
-	r.deliveryIDs = nil
 	runCtx, cancel := context.WithCancel(ctx)
 	r.runCtx, r.cancel = runCtx, cancel
 	handlerCtx, handlerCancel := context.WithCancel(ctx)
@@ -224,7 +223,7 @@ func (r *Runner) Run(ctx context.Context) error {
 		CloseTimeout: r.client.config.Lifecycle.CloseTimeout,
 	}, lifecycle.Hooks{
 		WaitSettled: func(ctx context.Context) error {
-			return r.inflight.WaitFor(ctx, runnerDeliveryIDs(r))
+			return r.inflight.WaitZero(ctx)
 		},
 		Close: func(ctx context.Context) error {
 			return stopRunnerConsumer(r, ctx)
@@ -561,41 +560,8 @@ func setRunnerError(r *Runner, err error) {
 	r.mu.Unlock()
 }
 
-func runnerDeliveryIDs(r *Runner) []uint64 {
-	if r == nil {
-		return nil
-	}
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	return append([]uint64(nil), r.deliveryIDs...)
-}
-
-//nolint:contextcheck // helper preserves the caller context while using an injected timer.
-func waitForClock(ctx context.Context, clk clock.Clock, delay time.Duration) error {
-	if ctx == nil {
-		ctx = context.Background()
-	}
-	if err := ctx.Err(); err != nil {
-		return err
-	}
-	if delay <= 0 {
-		return nil
-	}
-	if clk == nil {
-		clk = clock.NewReal()
-	}
-	timer := clk.Timer(delay)
-	defer timer.Stop()
-	select {
-	case <-timer.C:
-		return nil
-	case <-ctx.Done():
-		return ctx.Err()
-	}
-}
-
 //nolint:contextcheck // helper derives the phase context from the caller.
-func runWithClockTimeout(parent context.Context, clk clock.Clock, timeout time.Duration, fn func(context.Context) error) error {
+func runWithClockTimeout(parent context.Context, clk clock.Clock, timeout time.Duration, phase string, fn func(context.Context) error) error {
 	if fn == nil {
 		return nil
 	}
@@ -618,7 +584,7 @@ func runWithClockTimeout(parent context.Context, clk clock.Clock, timeout time.D
 	case err := <-done:
 		return err
 	case <-timer.C:
-		return context.DeadlineExceeded
+		return fmt.Errorf("f1: shutdown %s phase timed out: %w", phase, context.DeadlineExceeded)
 	case <-parent.Done():
 		return parent.Err()
 	}
@@ -794,9 +760,6 @@ func fetchRunnerAfterCancel(r *Runner, parent context.Context, messages <-chan d
 func enqueueDelivery(r *Runner, ctx context.Context, dispatch chan<- delivery, message driver.InboundMessage) bool {
 	id := r.inflight.Add(message)
 	item := delivery{id: id, message: message}
-	r.mu.Lock()
-	r.deliveryIDs = append(r.deliveryIDs, id)
-	r.mu.Unlock()
 	select {
 	case dispatch <- item:
 		return true

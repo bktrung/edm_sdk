@@ -36,27 +36,9 @@ func TestRegistryAccountsEverySettlementOutcome(t *testing.T) {
 	}
 }
 
-func TestRegistryWaitForSubset(t *testing.T) {
-	registry := NewRegistry()
-	first, second := registry.Add(), registry.Add()
-	registry.Remove(first)
-	if err := registry.WaitFor(context.Background(), []uint64{first}); err != nil {
-		t.Fatal(err)
-	}
-	if registry.Len() != 1 {
-		t.Fatalf("registry len = %d, want 1", registry.Len())
-	}
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-	if err := registry.WaitFor(ctx, []uint64{second}); err == nil {
-		t.Fatal("WaitFor must respect cancellation")
-	}
-	registry.Remove(second)
-}
-
 func TestRegistryNilAndDuplicateRemoval(t *testing.T) {
 	var registry *Registry
-	if registry.Len() != 0 || registry.WaitZero(context.Background()) != nil || registry.WaitFor(context.Background(), nil) != nil {
+	if registry.Len() != 0 || registry.WaitZero(context.Background()) != nil {
 		t.Fatal("nil registry should be empty and immediately complete")
 	}
 	value := NewRegistry()

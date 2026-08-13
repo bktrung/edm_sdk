@@ -13,7 +13,6 @@ import (
 
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/driver"
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/clock"
-	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/lifecycle"
 )
 
 func TestNewValidatesOptionsEagerly(t *testing.T) {
@@ -93,47 +92,9 @@ func TestHealthRejectsClosedClient(t *testing.T) {
 	}
 }
 
-func TestCloseAppliesPreStopBeforeRunnerDrain(t *testing.T) {
-	cfg := testClientConfig(t)
-	cfg.Lifecycle.PreStopDelay = 5 * time.Second
-	fake := clock.NewFake(time.Unix(0, 0))
-	client, err := New(context.Background(), cfg, WithDriver(&testDriver{conn: &testConn{}}), WithClock(fake))
-	if err != nil {
-		t.Fatal(err)
-	}
-	done := make(chan struct{})
-	runner := &Runner{
-		client:    client,
-		started:   true,
-		done:      done,
-		lifecycle: lifecycle.New(),
-		cancel:    func() { close(done) },
-	}
-	if err := runner.lifecycle.Transition(lifecycle.Ready); err != nil {
-		t.Fatal(err)
-	}
-	client.mu.Lock()
-	client.runners[runner] = struct{}{}
-	client.mu.Unlock()
-	closeDone := make(chan error, 1)
-	go func() { closeDone <- client.Close(context.Background()) }()
-	fake.BlockUntil(1)
-	if got := runner.lifecycle.State(); got != lifecycle.Ready {
-		t.Fatalf("runner state before pre-stop = %s, want ready", got)
-	}
-	fake.Advance(5 * time.Second)
-	if err := <-closeDone; err != nil {
-		t.Fatalf("Close() error = %v", err)
-	}
-	if got := runner.lifecycle.State(); got != lifecycle.Draining {
-		t.Fatalf("runner state after pre-stop = %s, want draining", got)
-	}
-}
-
 func TestCloseDrainsAllRunnersAfterOneFails(t *testing.T) {
 	t.Parallel()
 	cfg := testClientConfig(t)
-	cfg.Lifecycle.PreStopDelay = 0
 	conn := &testConn{}
 	client, err := New(context.Background(), cfg, WithDriver(&testDriver{conn: conn}))
 	if err != nil {

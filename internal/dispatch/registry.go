@@ -80,19 +80,18 @@ type Counts struct {
 
 // Registry tracks accepted work until its settlement result is recorded.
 type Registry struct {
-	mu      sync.Mutex
-	items   map[uint64]Disposition
-	next    uint64
-	zero    chan struct{}
-	changed chan struct{}
-	count   Counts
+	mu    sync.Mutex
+	items map[uint64]Disposition
+	next  uint64
+	zero  chan struct{}
+	count Counts
 }
 
 // NewRegistry returns an empty settlement-aware registry.
 func NewRegistry() *Registry {
 	zero := make(chan struct{})
 	close(zero)
-	return &Registry{items: make(map[uint64]Disposition), zero: zero, changed: make(chan struct{})}
+	return &Registry{items: make(map[uint64]Disposition), zero: zero}
 }
 
 // Add registers work and returns its identity.
@@ -144,8 +143,6 @@ func (r *Registry) RemoveAs(id uint64, outcome SettlementOutcome) {
 		return
 	}
 	delete(r.items, id)
-	close(r.changed)
-	r.changed = make(chan struct{})
 	switch outcome {
 	case SettlementOutcomeSettled:
 		switch disposition {
@@ -215,37 +212,5 @@ func (r *Registry) WaitZero(ctx context.Context) error {
 		return nil
 	case <-ctx.Done():
 		return ctx.Err()
-	}
-}
-
-// WaitFor waits until every identity in ids has a settlement result.
-//
-//nolint:contextcheck // the caller context intentionally controls this wait.
-func (r *Registry) WaitFor(ctx context.Context, ids []uint64) error {
-	if r == nil || len(ids) == 0 {
-		return nil
-	}
-	if ctx == nil {
-		ctx = context.Background()
-	}
-	for {
-		r.mu.Lock()
-		remaining := false
-		for _, id := range ids {
-			if _, ok := r.items[id]; ok {
-				remaining = true
-				break
-			}
-		}
-		changed := r.changed
-		r.mu.Unlock()
-		if !remaining {
-			return nil
-		}
-		select {
-		case <-changed:
-		case <-ctx.Done():
-			return ctx.Err()
-		}
 	}
 }

@@ -246,18 +246,6 @@ func (c *Client) Close(ctx context.Context) error {
 		c.mu.Unlock()
 		return err
 	}
-	activeRunner := false
-	for _, runner := range runners {
-		runner.mu.Lock()
-		activeRunner = activeRunner || (runner.started && !runner.finished)
-		runner.mu.Unlock()
-	}
-	if activeRunner {
-		if err := waitForClock(ctx, c.options.clock, c.config.Lifecycle.PreStopDelay); err != nil {
-			return fail(err)
-		}
-	}
-
 	runnerErrors := make(chan error, len(runners))
 	var group sync.WaitGroup
 	group.Add(len(runners))
@@ -280,7 +268,7 @@ func (c *Client) Close(ctx context.Context) error {
 	}
 	if idle != nil {
 		idleTimeout := c.config.Lifecycle.DrainTimeout
-		err := runWithClockTimeout(ctx, c.options.clock, idleTimeout, func(waitCtx context.Context) error {
+		err := runWithClockTimeout(ctx, c.options.clock, idleTimeout, "drain", func(waitCtx context.Context) error {
 			select {
 			case <-idle:
 				return nil
@@ -299,19 +287,19 @@ func (c *Client) Close(ctx context.Context) error {
 	c.mu.Unlock()
 	if producer != nil {
 		c.mu.Lock()
-		flushErr := runWithClockTimeout(ctx, c.options.clock, c.config.Lifecycle.FlushTimeout, producer.Flush)
+		flushErr := runWithClockTimeout(ctx, c.options.clock, c.config.Lifecycle.FlushTimeout, "flush", producer.Flush)
 		c.mu.Unlock()
 		if flushErr != nil {
 			return fail(flushErr)
 		}
 		c.mu.Lock()
-		producerCloseErr := runWithClockTimeout(ctx, c.options.clock, c.config.Lifecycle.CloseTimeout, producer.Close)
+		producerCloseErr := runWithClockTimeout(ctx, c.options.clock, c.config.Lifecycle.CloseTimeout, "close", producer.Close)
 		c.producerHandle = nil
 		c.mu.Unlock()
 		if producerCloseErr != nil && c.options.logger != nil {
 			c.options.logger.Warn("f1 producer close failed", "error", producerCloseErr)
 		}
-		connErr := runWithClockTimeout(ctx, c.options.clock, c.config.Lifecycle.CloseTimeout, conn.Close)
+		connErr := runWithClockTimeout(ctx, c.options.clock, c.config.Lifecycle.CloseTimeout, "close", conn.Close)
 		if connErr != nil {
 			return fail(errors.Join(producerCloseErr, connErr))
 		}
@@ -321,7 +309,7 @@ func (c *Client) Close(ctx context.Context) error {
 		c.mu.Unlock()
 		return errors.Join(producerCloseErr, c.metrics.Close())
 	}
-	connErr := runWithClockTimeout(ctx, c.options.clock, c.config.Lifecycle.CloseTimeout, conn.Close)
+	connErr := runWithClockTimeout(ctx, c.options.clock, c.config.Lifecycle.CloseTimeout, "close", conn.Close)
 	if connErr != nil {
 		return fail(connErr)
 	}

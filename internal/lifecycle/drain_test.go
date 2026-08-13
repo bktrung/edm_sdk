@@ -41,7 +41,7 @@ func TestDrainRunsPhasesInOrder(t *testing.T) {
 	}
 }
 
-func TestDrainKeepsReadyDuringPreStopAndBoundsFlushWithFakeClock(t *testing.T) {
+func TestDrainTransitionsImmediatelyAndBoundsFlushWithFakeClock(t *testing.T) {
 	fake := clock.NewFake(time.Unix(0, 0))
 	machine := New()
 	if err := machine.Transition(Ready); err != nil {
@@ -52,7 +52,6 @@ func TestDrainKeepsReadyDuringPreStopAndBoundsFlushWithFakeClock(t *testing.T) {
 	go func() {
 		done <- machine.Drain(context.Background(), Config{
 			Clock:        fake,
-			PreStopDelay: 5 * time.Second,
 			FlushTimeout: 7 * time.Second,
 		}, Hooks{
 			Drain: func(context.Context) error {
@@ -77,11 +76,6 @@ func TestDrainKeepsReadyDuringPreStopAndBoundsFlushWithFakeClock(t *testing.T) {
 			},
 		})
 	}()
-	fake.BlockUntil(1)
-	if got := machine.State(); got != Ready {
-		t.Fatalf("state during pre-stop = %s, want ready", got)
-	}
-	fake.Advance(5 * time.Second)
 	<-flushStarted
 	fake.BlockUntil(1)
 	fake.Advance(7 * time.Second)
@@ -164,25 +158,13 @@ func TestDrainDeadlineUsesInjectedClock(t *testing.T) {
 	}
 }
 
-func TestDrainRunsPreStopAndFlushErrors(t *testing.T) {
+func TestDrainRunsFlushErrors(t *testing.T) {
 	machine := New()
 	if err := machine.Transition(Ready); err != nil {
 		t.Fatal(err)
 	}
-	if err := machine.Drain(context.Background(), Config{PreStopDelay: time.Millisecond}, Hooks{Drain: func(context.Context) error { return nil }, Flush: func(context.Context) error { return errors.New("flush failed") }}); err == nil || machine.State() != Aborted {
+	if err := machine.Drain(context.Background(), Config{}, Hooks{Drain: func(context.Context) error { return nil }, Flush: func(context.Context) error { return errors.New("flush failed") }}); err == nil || machine.State() != Aborted {
 		t.Fatalf("flush failure = %v, state = %s", err, machine.State())
-	}
-}
-
-func TestDrainHonorsCancellationDuringPreStop(t *testing.T) {
-	machine := New()
-	if err := machine.Transition(Ready); err != nil {
-		t.Fatal(err)
-	}
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-	if err := machine.Drain(ctx, Config{PreStopDelay: time.Second}, Hooks{}); !errors.Is(err, context.Canceled) || machine.State() != Aborted {
-		t.Fatalf("cancelled drain = %v, state = %s", err, machine.State())
 	}
 }
 
