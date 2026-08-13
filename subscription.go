@@ -216,6 +216,9 @@ func (c *Client) Subscribe(ctx context.Context, sub Subscription) (*Runner, erro
 		return nil, errors.New("f1: client is closing")
 	}
 	c.runners[runner] = struct{}{}
+	if c.metrics != nil {
+		runner.metrics.unregister = c.metrics.Register(effective.Name, runner.metrics.sampleAttemptDivergenceByTopic, runner.metrics.currentStuckWorkers)
+	}
 	c.mu.Unlock()
 	return runner, nil
 }

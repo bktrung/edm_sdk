@@ -66,8 +66,8 @@ func WithLogger(logger *slog.Logger) Option {
 	}
 }
 
-// WithMeterProvider records a meter provider for the observability layer.
-// It is retained until the metrics integration is implemented.
+// WithMeterProvider configures the meter provider used by the observability
+// layer.
 func WithMeterProvider(provider metric.MeterProvider) Option {
 	return func(options *clientOptions) error {
 		if isNil(provider) {

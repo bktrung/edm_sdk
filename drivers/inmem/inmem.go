@@ -262,6 +262,22 @@ func (c *conn) signalWake() {
 	}
 }
 
+// ReleaseDue dispatches deferred messages whose due time has arrived.
+// It lets deterministic test helpers coordinate fake time with the driver's
+// deferred-delivery storage without adding test methods to the driver port.
+func (c *conn) ReleaseDue() {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.closed {
+		return
+	}
+	c.dispatchLocked()
+	c.signalWake()
+}
+
 func (c *conn) pump() {
 	defer close(c.pumpDone)
 	for {
