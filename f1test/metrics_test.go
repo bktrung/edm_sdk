@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"runtime"
 	"sync"
 	"testing"
 	"time"
@@ -171,7 +172,13 @@ func TestMetricsPublishesCurrentStuckWorkers(t *testing.T) {
 	case <-timer.C:
 		t.Fatal("handler did not start")
 	}
-	c.clock.BlockUntil(1)
+	armTimer := clock.NewReal().Timer(time.Second)
+	select {
+	case <-c.timer20ms:
+	case <-armTimer.C:
+		t.Fatal("handler timeout timer was not armed")
+	}
+	armTimer.Stop()
 	c.Advance(20 * time.Millisecond)
 
 	timer = clock.NewReal().Timer(time.Second)
@@ -195,9 +202,25 @@ func TestMetricsPublishesCurrentStuckWorkers(t *testing.T) {
 	case <-timer.C:
 		t.Fatal("stuck handler did not return")
 	}
-	value, ok := readGaugeValue(t, reader, "f1_stuck_workers", "subscription", "orders")
-	assert.True(t, ok)
-	assert.Equal(t, int64(0), value)
+	waitForGaugeZero(t, reader)
+}
+
+func waitForGaugeZero(t *testing.T, reader *metric.ManualReader) {
+	t.Helper()
+	timer := clock.NewReal().Timer(time.Second)
+	defer timer.Stop()
+	for {
+		value, ok := readGaugeValue(t, reader, "f1_stuck_workers", "subscription", "orders")
+		if ok && value == 0 {
+			return
+		}
+		select {
+		case <-timer.C:
+			t.Fatal("stuck worker gauge did not return to zero")
+		default:
+			runtime.Gosched()
+		}
+	}
 }
 
 func readGaugeValue(t *testing.T, reader *metric.ManualReader, name, labelKey, labelValue string) (int64, bool) {
