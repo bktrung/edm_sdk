@@ -161,6 +161,7 @@ func (p *Pool) start(_ int, queue <-chan Work) {
 				default:
 				}
 			case <-p.closing:
+				<-p.idle
 				for {
 					select {
 					case work := <-queue:
