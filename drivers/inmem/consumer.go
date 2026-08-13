@@ -165,6 +165,16 @@ func (s *settler) settle(ctx context.Context, opt driver.NackOptions, nack bool)
 	if s.settled {
 		return classify("settle", driver.KindFatal, driver.ErrAlreadySettled)
 	}
+	if nack && s.conn.failNextNack {
+		s.conn.failNextNack = false
+		s.conn.nackFailures++
+		return classify("nack", driver.KindTransient, errors.New("injected nack failure"))
+	}
+	if !nack && s.conn.failNextAck {
+		s.conn.failNextAck = false
+		s.conn.ackFailures++
+		return classify("ack", driver.KindTransient, errors.New("injected ack failure"))
+	}
 	s.settled = true
 	delete(s.consumer.inflight, s)
 	if s.consumer.outstanding > 0 {

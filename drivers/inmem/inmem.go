@@ -101,6 +101,10 @@ type conn struct {
 	closed           bool
 	failPublish      bool
 	failPublishFatal bool
+	failNextAck      bool
+	failNextNack     bool
+	ackFailures      uint64
+	nackFailures     uint64
 	nextRef          atomic.Uint64
 	nextMessage      atomic.Uint64
 	wake             chan struct{}

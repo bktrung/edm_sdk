@@ -720,21 +720,28 @@ func invokeHandler(r *Runner, parent context.Context, handler Handler, event *Ev
 
 func ackDelivery(_ *Runner, ctx context.Context, message driver.InboundMessage, states ...*deliveryState) bool {
 	state := stateFor(states)
-	state.attempted = true
 	if message.Settle == nil {
 		return false
 	}
-	state.settled = message.Settle.Ack(ctx) == nil
+	if len(states) > 0 && states[0] != nil {
+		rememberSettlementOperation(state, settlementOperationAck)
+	}
+	err := message.Settle.Ack(ctx)
+	state.attempted = true
+	state.settled = err == nil
 	return state.settled
 }
 
 func nackDelivery(_ *Runner, ctx context.Context, message driver.InboundMessage, options driver.NackOptions, states ...*deliveryState) error {
 	state := stateFor(states)
-	state.attempted = true
 	if message.Settle == nil {
 		return errors.New("f1: delivered message has no settler")
 	}
+	if len(states) > 0 && states[0] != nil {
+		rememberSettlementOperation(state, settlementOperationNack)
+	}
 	err := message.Settle.Nack(ctx, options)
+	state.attempted = true
 	state.settled = err == nil
 	return err
 }
