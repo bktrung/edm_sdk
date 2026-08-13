@@ -11,21 +11,22 @@ import (
 )
 
 type consumer struct {
-	conn         *conn
-	cfg          driver.ConsumerConfig
-	destinations []string
-	messages     chan driver.InboundMessage
-	errs         chan error
-	paused       map[string]bool
-	draining     bool
-	stopped      bool
-	group        *groupState
-	startAfter   map[string]uint64
-	outstanding  int
-	unsettled    map[string]int
-	unsettledKey map[deliveryKey]int
-	ackDeadline  time.Duration
-	inflight     map[*settler]struct{}
+	conn                    *conn
+	cfg                     driver.ConsumerConfig
+	destinations            []string
+	messages                chan driver.InboundMessage
+	errs                    chan error
+	paused                  map[string]bool
+	draining                bool
+	stopped                 bool
+	group                   *groupState
+	startAfter              map[string]uint64
+	outstanding             int
+	unsettled               map[string]int
+	unsettledKey            map[deliveryKey]int
+	ackDeadline             time.Duration
+	inflight                map[*settler]struct{}
+	stopOutstandingFailures uint64
 }
 
 type deliveryKey struct {
@@ -87,6 +88,7 @@ func (c *consumer) Stop(ctx context.Context) error {
 		return nil
 	}
 	if c.outstanding != 0 {
+		c.stopOutstandingFailures++
 		return classify("stop", driver.KindFatal, fmt.Errorf("cannot stop with %d outstanding messages", c.outstanding))
 	}
 	c.stopped = true
@@ -164,6 +166,16 @@ func (s *settler) settle(ctx context.Context, opt driver.NackOptions, nack bool)
 	defer s.mu.Unlock()
 	if s.settled {
 		return classify("settle", driver.KindFatal, driver.ErrAlreadySettled)
+	}
+	if nack && s.conn.failNextNack {
+		s.conn.failNextNack = false
+		s.conn.nackFailures++
+		return classify("nack", driver.KindTransient, errors.New("injected nack failure"))
+	}
+	if !nack && s.conn.failNextAck {
+		s.conn.failNextAck = false
+		s.conn.ackFailures++
+		return classify("ack", driver.KindTransient, errors.New("injected ack failure"))
 	}
 	s.settled = true
 	delete(s.consumer.inflight, s)
