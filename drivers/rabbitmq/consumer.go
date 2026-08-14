@@ -233,6 +233,15 @@ func (c *consumer) emitMessages(lane *lane) {
 	}
 }
 
+func (c *consumer) hasDestination(destination string) bool {
+	for _, lane := range c.lanes {
+		if lane.destination == destination {
+			return true
+		}
+	}
+	return false
+}
+
 func (c *consumer) nativeDeliveryCount() bool {
 	if c.cfg.Effective == (driver.Capabilities{}) {
 		return c.conn.caps.NativeDeliveryCount

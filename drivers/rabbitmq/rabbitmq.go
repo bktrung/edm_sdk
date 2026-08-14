@@ -200,6 +200,25 @@ func (c *conn) Consumer(ctx context.Context, cfg driver.ConsumerConfig) (driver.
 	if len(cfg.Destinations) == 0 {
 		return nil, classify("consumer", driver.KindFatal, errors.New("no destinations"))
 	}
+	if cfg.Exclusive {
+		for _, destination := range cfg.Destinations {
+			for active := range c.active {
+				if active.hasDestination(destination) {
+					return nil, classify("consumer", driver.KindFatal, fmt.Errorf("exclusive consumer refused: destination %q already has a consumer", destination))
+				}
+			}
+		}
+	}
+	for active := range c.active {
+		if !active.cfg.Exclusive {
+			continue
+		}
+		for _, destination := range cfg.Destinations {
+			if active.hasDestination(destination) {
+				return nil, classify("consumer", driver.KindFatal, fmt.Errorf("exclusive consumer refused: destination %q already has an exclusive consumer", destination))
+			}
+		}
+	}
 	consumer, err := newConsumer(c, cfg)
 	if err != nil {
 		return nil, err
