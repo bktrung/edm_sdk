@@ -50,6 +50,7 @@ func capabilitiesForQueueKind(kind queueKind) driver.Capabilities {
 	caps := Driver{}.Capabilities()
 	if kind == queueKindClassic {
 		caps.NativeDeliveryCount = false
+		caps.NativeDLQ = false
 	}
 	return caps
 }

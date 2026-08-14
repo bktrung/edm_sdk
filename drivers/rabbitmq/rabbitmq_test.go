@@ -55,11 +55,19 @@ func TestConfiguredQueueKind(t *testing.T) {
 }
 
 func TestQueueKindCapabilities(t *testing.T) {
-	if got := capabilitiesForQueueKind(queueKindQuorum).NativeDeliveryCount; !got {
+	quorum := capabilitiesForQueueKind(queueKindQuorum)
+	if !quorum.NativeDeliveryCount {
 		t.Fatal("quorum capabilities NativeDeliveryCount = false, want true")
 	}
-	if got := capabilitiesForQueueKind(queueKindClassic).NativeDeliveryCount; got {
+	if !quorum.NativeDLQ {
+		t.Fatal("quorum capabilities NativeDLQ = false, want true")
+	}
+	classic := capabilitiesForQueueKind(queueKindClassic)
+	if classic.NativeDeliveryCount {
 		t.Fatal("classic capabilities NativeDeliveryCount = true, want false")
+	}
+	if classic.NativeDLQ {
+		t.Fatal("classic capabilities NativeDLQ = true, want false")
 	}
 }
 
@@ -68,12 +76,13 @@ func TestConnectionCapabilitiesFollowQueueType(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	cases := []struct {
-		name       string
-		options    map[string]string
-		wantNative bool
+		name          string
+		options       map[string]string
+		wantNative    bool
+		wantNativeDLQ bool
 	}{
-		{name: "default quorum", wantNative: true},
-		{name: "classic", options: map[string]string{"rabbitmq.queueType": "classic"}, wantNative: false},
+		{name: "default quorum", wantNative: true, wantNativeDLQ: true},
+		{name: "classic", options: map[string]string{"rabbitmq.queueType": "classic"}, wantNative: false, wantNativeDLQ: false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -86,6 +95,9 @@ func TestConnectionCapabilitiesFollowQueueType(t *testing.T) {
 			defer func() { _ = conn.Close(ctx) }()
 			if got := conn.Capabilities().NativeDeliveryCount; got != tc.wantNative {
 				t.Fatalf("NativeDeliveryCount = %t, want %t", got, tc.wantNative)
+			}
+			if got := conn.Capabilities().NativeDLQ; got != tc.wantNativeDLQ {
+				t.Fatalf("NativeDLQ = %t, want %t", got, tc.wantNativeDLQ)
 			}
 		})
 	}
