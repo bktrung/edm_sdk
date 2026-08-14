@@ -208,10 +208,24 @@ func runRebalance(group *groupContext) {
 		if err := producerB.Publish(group.ctx, driver.OutboundMessage{Destination: "rebalance.key-b", Body: []byte("control")}); err != nil {
 			t.Fatal(err)
 		}
-		control := receiveMessage(t, group, survivor)
-		if control.Destination != "rebalance.key-b" {
-			t.Fatalf("control destination = %q, want rebalance.key-b", control.Destination)
-		}
+		var control driver.InboundMessage
+		var beforeControl []driver.InboundMessage
+		waitFor(t, group, "control destination delivery", func() (bool, string) {
+			select {
+			case message, ok := <-survivor.Messages():
+				if !ok {
+					return false, "Messages channel closed"
+				}
+				if message.Destination != "rebalance.key-b" {
+					beforeControl = append(beforeControl, message)
+					return false, fmt.Sprintf("received destination=%q; waiting for control", message.Destination)
+				}
+				control = message
+				return true, "received control destination"
+			default:
+				return false, "no control message"
+			}
+		})
 		ackMessage(t, group, control)
 		waitForStable(t, group, "non-owner consumer to avoid concurrent keyed delivery", func() (bool, string) {
 			select {
@@ -224,6 +238,11 @@ func runRebalance(group *groupContext) {
 				return true, "no concurrent keyed delivery"
 			}
 		})
+		for _, message := range beforeControl {
+			if err := message.Settle.Nack(group.ctx, driver.NackOptions{Requeue: true}); err != nil {
+				t.Fatalf("requeue pre-control message: %v", err)
+			}
+		}
 		ackMessage(t, group, keyK)
 		duplicate := receiveMessage(t, group, survivor)
 		if string(duplicate.Key) != "K" {
