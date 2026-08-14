@@ -1,0 +1,714 @@
+{
+  "configured": {
+    "driver": "rabbitmq",
+    "broker": "RabbitMQ 4.3.4",
+    "config": {},
+    "profiles": [
+      "full",
+      "strict"
+    ],
+    "failureFixture": "absent",
+    "deadlineFixture": "absent"
+  },
+  "observed": {
+    "profilesMatch": true,
+    "groups": [
+      {
+        "name": "publish",
+        "declared": 14,
+        "observed": 14,
+        "status": "passed",
+        "skipped": []
+      },
+      {
+        "name": "consume",
+        "declared": 17,
+        "observed": 17,
+        "status": "passed",
+        "skipped": []
+      },
+      {
+        "name": "settle",
+        "declared": 16,
+        "observed": 16,
+        "status": "passed",
+        "skipped": []
+      },
+      {
+        "name": "ordering",
+        "declared": 8,
+        "observed": 8,
+        "status": "passed",
+        "skipped": []
+      },
+      {
+        "name": "deferred",
+        "declared": 9,
+        "observed": 9,
+        "status": "passed-with-skips",
+        "skipped": [
+          {
+            "Name": "parked delivery does not consume an ack deadline",
+            "Reason": "deadline fixture is not configured"
+          }
+        ]
+      },
+      {
+        "name": "drain",
+        "declared": 12,
+        "observed": 12,
+        "status": "passed",
+        "skipped": []
+      },
+      {
+        "name": "rebalance",
+        "declared": 11,
+        "observed": 11,
+        "status": "passed",
+        "skipped": []
+      },
+      {
+        "name": "failure",
+        "declared": 15,
+        "observed": 0,
+        "status": "skipped",
+        "skipped": []
+      },
+      {
+        "name": "topology",
+        "declared": 17,
+        "observed": 17,
+        "status": "passed",
+        "skipped": []
+      },
+      {
+        "name": "capability",
+        "declared": 26,
+        "observed": 26,
+        "status": "passed",
+        "skipped": []
+      },
+      {
+        "name": "lag",
+        "declared": 5,
+        "observed": 5,
+        "status": "passed",
+        "skipped": []
+      }
+    ],
+    "behaviorVector": [
+      {
+        "ID": "confirmed-visible",
+        "Outcome": "ok",
+        "AttemptCount": 0,
+        "FinalDestination": "publish.visible"
+      },
+      {
+        "ID": "zero-value",
+        "Outcome": "ok",
+        "AttemptCount": 0,
+        "FinalDestination": "publish.zero"
+      },
+      {
+        "ID": "flush-safe",
+        "Outcome": "ok",
+        "AttemptCount": 0,
+        "FinalDestination": "publish.flush"
+      },
+      {
+        "ID": "partial-failure",
+        "Outcome": "partial",
+        "AttemptCount": 0,
+        "FinalDestination": "publish.partial"
+      },
+      {
+        "ID": "missing-destination",
+        "Outcome": "not_found",
+        "AttemptCount": 0,
+        "FinalDestination": "publish.no-such-destination"
+      },
+      {
+        "ID": "total-failure",
+        "Outcome": "failed",
+        "AttemptCount": 0,
+        "FinalDestination": "publish.total"
+      },
+      {
+        "ID": "empty-publish",
+        "Outcome": "ok",
+        "AttemptCount": 0,
+        "FinalDestination": "publish.empty"
+      },
+      {
+        "ID": "cancelled",
+        "Outcome": "cancelled",
+        "AttemptCount": 0,
+        "FinalDestination": "publish.cancelled"
+      },
+      {
+        "ID": "body-fidelity",
+        "Outcome": "ok",
+        "AttemptCount": 0,
+        "FinalDestination": "publish.body"
+      },
+      {
+        "ID": "header-fidelity",
+        "Outcome": "ok",
+        "AttemptCount": 0,
+        "FinalDestination": "publish.headers"
+      },
+      {
+        "ID": "key-fidelity",
+        "Outcome": "ok",
+        "AttemptCount": 0,
+        "FinalDestination": "publish.key"
+      },
+      {
+        "ID": "input-copy",
+        "Outcome": "ok",
+        "AttemptCount": 0,
+        "FinalDestination": "publish.clone"
+      },
+      {
+        "ID": "concurrent-publish",
+        "Outcome": "ok",
+        "AttemptCount": 0,
+        "FinalDestination": "publish.concurrent"
+      },
+      {
+        "ID": "identity",
+        "Outcome": "ok",
+        "AttemptCount": 0,
+        "FinalDestination": "consume.identity"
+      },
+      {
+        "ID": "delivery-count",
+        "Outcome": "ok",
+        "AttemptCount": 0,
+        "FinalDestination": "consume.delivery-count"
+      },
+      {
+        "ID": "multi-destination",
+        "Outcome": "ok",
+        "AttemptCount": 0,
+        "FinalDestination": "consume.dest-a,consume.dest-b"
+      },
+      {
+        "ID": "prefetch-total",
+        "Outcome": "ok",
+        "AttemptCount": 0,
+        "FinalDestination": "consume.prefetch-total"
+      },
+      {
+        "ID": "prefetch-share",
+        "Outcome": "ok",
+        "AttemptCount": 0,
+        "FinalDestination": "consume.prefetch-share"
+      },
+      {
+        "ID": "pause-isolated",
+        "Outcome": "ok",
+        "AttemptCount": 0,
+        "FinalDestination": "consume.pause-a,consume.pause-b"
+      },
+      {
+        "ID": "pause-idempotent",
+        "Outcome": "ok",
+        "AttemptCount": 0,
+        "FinalDestination": "consume.pause-repeat-a,consume.pause-repeat-b"
+      },
+      {
+        "ID": "resume-lossless",
+        "Outcome": "ok",
+        "AttemptCount": 0,
+        "FinalDestination": "consume.resume"
+      },
+      {
+        "ID": "pause-bound",
+        "Outcome": "ok",
+        "AttemptCount": 0,
+        "FinalDestination": "consume.pause-bound"
+      },
+      {
+        "ID": "errors-open",
+        "Outcome": "ok",
+        "AttemptCount": 0,
+        "FinalDestination": "consume.errors"
+      },
+      {
+        "ID": "start-earliest",
+        "Outcome": "ok",
+        "AttemptCount": 0,
+        "FinalDestination": "consume.earliest"
+      },
+      {
+        "ID": "start-existing",
+        "Outcome": "ok",
+        "AttemptCount": 0,
+        "FinalDestination": "consume.existing-group"
+      },
+      {
+        "ID": "zero-value",
+        "Outcome": "ok",
+        "AttemptCount": 0,
+        "FinalDestination": "consume.zero"
+      },
+      {
+        "ID": "cancel-consumer",
+        "Outcome": "cancelled",
+        "AttemptCount": 0,
+        "FinalDestination": "consume.cancel-create"
+      },
+      {
+        "ID": "cancel-drain",
+        "Outcome": "cancelled",
+        "AttemptCount": 0,
+        "FinalDestination": "consume.cancel-drain"
+      },
+      {
+        "ID": "cancel-lag",
+        "Outcome": "cancelled",
+        "AttemptCount": 0,
+        "FinalDestination": "consume.cancel-lag"
+      },
+      {
+        "ID": "cancel-stop",
+        "Outcome": "cancelled",
+        "AttemptCount": 0,
+        "FinalDestination": "consume.cancel-stop"
+      },
+      {
+        "ID": "ack-visible",
+        "Outcome": "ack",
+        "AttemptCount": 0,
+        "FinalDestination": "settle.ack"
+      },
+      {
+        "ID": "nack-requeue",
+        "Outcome": "redelivered",
+        "AttemptCount": 2,
+        "FinalDestination": "settle.requeue"
+      },
+      {
+        "ID": "nack-discard",
+        "Outcome": "discarded",
+        "AttemptCount": 0,
+        "FinalDestination": "settle.discard"
+      },
+      {
+        "ID": "no-redelivery",
+        "Outcome": "discarded",
+        "AttemptCount": 0,
+        "FinalDestination": "settle.no-redelivery"
+      },
+      {
+        "ID": "ack-no-redelivery",
+        "Outcome": "ack",
+        "AttemptCount": 0,
+        "FinalDestination": "settle.ack-no-redelivery"
+      },
+      {
+        "ID": "settle-after-stop",
+        "Outcome": "already-settled",
+        "AttemptCount": 0,
+        "FinalDestination": "settle.after-stop"
+      },
+      {
+        "ID": "double-ack",
+        "Outcome": "already-settled",
+        "AttemptCount": 0,
+        "FinalDestination": "settle.double-ack"
+      },
+      {
+        "ID": "ack-nack",
+        "Outcome": "already-settled",
+        "AttemptCount": 0,
+        "FinalDestination": "settle.ack-nack"
+      },
+      {
+        "ID": "nack-ack",
+        "Outcome": "already-settled",
+        "AttemptCount": 0,
+        "FinalDestination": "settle.nack-ack"
+      },
+      {
+        "ID": "double-nack",
+        "Outcome": "already-settled",
+        "AttemptCount": 0,
+        "FinalDestination": "settle.double-nack"
+      },
+      {
+        "ID": "out-of-order",
+        "Outcome": "ack",
+        "AttemptCount": 0,
+        "FinalDestination": "settle.out-of-order"
+      },
+      {
+        "ID": "mixed-order",
+        "Outcome": "redelivered",
+        "AttemptCount": 2,
+        "FinalDestination": "settle.mixed-order"
+      },
+      {
+        "ID": "stop-after-settlement",
+        "Outcome": "ack",
+        "AttemptCount": 0,
+        "FinalDestination": "settle.stop"
+      },
+      {
+        "ID": "concurrent",
+        "Outcome": "ack",
+        "AttemptCount": 0,
+        "FinalDestination": "settle.concurrent"
+      },
+      {
+        "ID": "cancel-ack",
+        "Outcome": "cancelled",
+        "AttemptCount": 0,
+        "FinalDestination": "settle.cancel-ack"
+      },
+      {
+        "ID": "cancel-nack",
+        "Outcome": "cancelled",
+        "AttemptCount": 2,
+        "FinalDestination": "settle.cancel-nack"
+      },
+      {
+        "ID": "ordering-initial",
+        "Outcome": "one,two,three",
+        "AttemptCount": 0,
+        "FinalDestination": "ordering.initial"
+      },
+      {
+        "ID": "ordering-refill",
+        "Outcome": "one,two,three,four,five,six",
+        "AttemptCount": 0,
+        "FinalDestination": "ordering.refill"
+      },
+      {
+        "ID": "ordering-keys",
+        "Outcome": "per-key",
+        "AttemptCount": 0,
+        "FinalDestination": "ordering.keys"
+      },
+      {
+        "ID": "ordering-progress",
+        "Outcome": "independent",
+        "AttemptCount": 0,
+        "FinalDestination": "ordering.progress"
+      },
+      {
+        "ID": "ordering-requeue",
+        "Outcome": "one,two",
+        "AttemptCount": 0,
+        "FinalDestination": "ordering.requeue"
+      },
+      {
+        "ID": "ordering-nil",
+        "Outcome": "delivered",
+        "AttemptCount": 0,
+        "FinalDestination": "ordering.nil"
+      },
+      {
+        "ID": "ordering-exclusive",
+        "Outcome": "usable",
+        "AttemptCount": 0,
+        "FinalDestination": "ordering.exclusive"
+      },
+      {
+        "ID": "ordering-zero",
+        "Outcome": "one,two",
+        "AttemptCount": 0,
+        "FinalDestination": "ordering.zero"
+      },
+      {
+        "ID": "deferred-never-early",
+        "Outcome": "on-time",
+        "AttemptCount": 0,
+        "FinalDestination": "deferred.never-early"
+      },
+      {
+        "ID": "deferred-bounded-late",
+        "Outcome": "bounded",
+        "AttemptCount": 0,
+        "FinalDestination": "deferred.bounded-late"
+      },
+      {
+        "ID": "deferred-band",
+        "Outcome": "all-delivered",
+        "AttemptCount": 0,
+        "FinalDestination": "deferred.band"
+      },
+      {
+        "ID": "deferred-destination-delay",
+        "Outcome": "nominal-delay",
+        "AttemptCount": 0,
+        "FinalDestination": "deferred.destination-delay"
+      },
+      {
+        "ID": "deferred-zero",
+        "Outcome": "immediate",
+        "AttemptCount": 0,
+        "FinalDestination": "deferred.zero"
+      },
+      {
+        "ID": "deferred-auxiliary",
+        "Outcome": "counted",
+        "AttemptCount": 0,
+        "FinalDestination": "deferred.auxiliary"
+      },
+      {
+        "ID": "deferred-ready",
+        "Outcome": "excludes-auxiliary",
+        "AttemptCount": 0,
+        "FinalDestination": "deferred.ready"
+      },
+      {
+        "ID": "deferred-release",
+        "Outcome": "ready",
+        "AttemptCount": 0,
+        "FinalDestination": "deferred.release"
+      },
+      {
+        "ID": "drain-prompt",
+        "Outcome": "ok",
+        "AttemptCount": 0,
+        "FinalDestination": "drain.prompt"
+      },
+      {
+        "ID": "drain-no-new",
+        "Outcome": "withheld",
+        "AttemptCount": 0,
+        "FinalDestination": "drain.no-new"
+      },
+      {
+        "ID": "drain-settleable",
+        "Outcome": "acked",
+        "AttemptCount": 0,
+        "FinalDestination": "drain.settleable"
+      },
+      {
+        "ID": "drain-messages-open",
+        "Outcome": "open",
+        "AttemptCount": 0,
+        "FinalDestination": "drain.messages-open"
+      },
+      {
+        "ID": "drain-unsettled",
+        "Outcome": "cleared",
+        "AttemptCount": 0,
+        "FinalDestination": "drain.unsettled"
+      },
+      {
+        "ID": "drain-accounting",
+        "Outcome": "lossless",
+        "AttemptCount": 0,
+        "FinalDestination": "drain.accounting"
+      },
+      {
+        "ID": "drain-stop-refusal",
+        "Outcome": "fatal",
+        "AttemptCount": 0,
+        "FinalDestination": "drain.refusal"
+      },
+      {
+        "ID": "drain-timeout",
+        "Outcome": "timeout",
+        "AttemptCount": 0,
+        "FinalDestination": "drain.timeout"
+      },
+      {
+        "ID": "drain-errors-distinct",
+        "Outcome": "distinct",
+        "AttemptCount": 0,
+        "FinalDestination": "drain.distinguishable"
+      },
+      {
+        "ID": "drain-idempotent",
+        "Outcome": "ok",
+        "AttemptCount": 0,
+        "FinalDestination": "drain.idempotent"
+      },
+      {
+        "ID": "drain-stop",
+        "Outcome": "stopped",
+        "AttemptCount": 0,
+        "FinalDestination": "drain.stop"
+      },
+      {
+        "ID": "drain-messages-closed",
+        "Outcome": "closed",
+        "AttemptCount": 0,
+        "FinalDestination": "drain.messages-closed"
+      },
+      {
+        "ID": "rebalance-scale-up",
+        "Outcome": "distributed",
+        "AttemptCount": 0,
+        "FinalDestination": "rebalance.scale-up"
+      },
+      {
+        "ID": "rebalance-reassign",
+        "Outcome": "reassigned",
+        "AttemptCount": 0,
+        "FinalDestination": "rebalance.reassign"
+      },
+      {
+        "ID": "rebalance-in-flight",
+        "Outcome": "redelivered",
+        "AttemptCount": 2,
+        "FinalDestination": "rebalance.in-flight"
+      },
+      {
+        "ID": "rebalance-delivery-count",
+        "Outcome": "redelivered",
+        "AttemptCount": 2,
+        "FinalDestination": "rebalance.delivery-count"
+      },
+      {
+        "ID": "rebalance-prefetch",
+        "Outcome": "bounded",
+        "AttemptCount": 0,
+        "FinalDestination": "rebalance.prefetch"
+      },
+      {
+        "ID": "rebalance-repeat",
+        "Outcome": "stable",
+        "AttemptCount": 0,
+        "FinalDestination": "rebalance.repeat"
+      },
+      {
+        "ID": "rebalance-settle",
+        "Outcome": "handled",
+        "AttemptCount": 0,
+        "FinalDestination": "rebalance.settle"
+      },
+      {
+        "ID": "rebalance-key-exclusive",
+        "Outcome": "exclusive",
+        "AttemptCount": 0,
+        "FinalDestination": "rebalance.key-a"
+      },
+      {
+        "ID": "rebalance-settled-key",
+        "Outcome": "reassigned",
+        "AttemptCount": 0,
+        "FinalDestination": "rebalance.affinity"
+      },
+      {
+        "ID": "rebalance-join-in-flight",
+        "Outcome": "preserved",
+        "AttemptCount": 0,
+        "FinalDestination": "rebalance.join-in-flight"
+      },
+      {
+        "ID": "rebalance-idle-join",
+        "Outcome": "joined",
+        "AttemptCount": 0,
+        "FinalDestination": "rebalance.idle-join"
+      },
+      {
+        "ID": "topology-verify-missing",
+        "Outcome": "not-found",
+        "AttemptCount": 0,
+        "FinalDestination": "topology.verify.missing"
+      },
+      {
+        "ID": "topology-none",
+        "Outcome": "untouched",
+        "AttemptCount": 0,
+        "FinalDestination": "topology.none"
+      },
+      {
+        "ID": "topology-create",
+        "Outcome": "created",
+        "AttemptCount": 0,
+        "FinalDestination": "topology.create"
+      },
+      {
+        "ID": "topology-idempotent",
+        "Outcome": "existing",
+        "AttemptCount": 0,
+        "FinalDestination": "topology.idempotent"
+      },
+      {
+        "ID": "topology-mixed-diff",
+        "Outcome": "mixed",
+        "AttemptCount": 0,
+        "FinalDestination": "topology.mixed.created"
+      },
+      {
+        "ID": "topology-orphan-under-report",
+        "Outcome": "orphaned",
+        "AttemptCount": 0,
+        "FinalDestination": "topology.orphan.under.low"
+      },
+      {
+        "ID": "topology-orphan-over-report",
+        "Outcome": "excluded",
+        "AttemptCount": 0,
+        "FinalDestination": "topology.orphan.over.sub2.main"
+      },
+      {
+        "ID": "topology-orphan-boundary",
+        "Outcome": "excluded",
+        "AttemptCount": 0,
+        "FinalDestination": "topology.orphan.boundary.worker-v2.main"
+      },
+      {
+        "ID": "topology-orphan-scan-disabled",
+        "Outcome": "skipped",
+        "AttemptCount": 0,
+        "FinalDestination": "topology.orphan.noscan.dropped"
+      },
+      {
+        "ID": "topology-orphan-auxiliary",
+        "Outcome": "counted",
+        "AttemptCount": 0,
+        "FinalDestination": "topology.orphan.aux.dropped"
+      },
+      {
+        "ID": "topology-describe-depth",
+        "Outcome": "counted",
+        "AttemptCount": 0,
+        "FinalDestination": "topology.describe.depth"
+      },
+      {
+        "ID": "topology-prune-ready-guard",
+        "Outcome": "refused",
+        "AttemptCount": 0,
+        "FinalDestination": "topology.prune.ready"
+      },
+      {
+        "ID": "topology-prune-park-guard",
+        "Outcome": "refused",
+        "AttemptCount": 0,
+        "FinalDestination": "topology.prune.park"
+      },
+      {
+        "ID": "topology-prune-consumer-guard",
+        "Outcome": "refused",
+        "AttemptCount": 0,
+        "FinalDestination": "topology.prune.consumer"
+      },
+      {
+        "ID": "topology-prune-missing",
+        "Outcome": "refused",
+        "AttemptCount": 0,
+        "FinalDestination": "topology.prune.missing"
+      },
+      {
+        "ID": "topology-purge",
+        "Outcome": "emptied",
+        "AttemptCount": 0,
+        "FinalDestination": "topology.purge"
+      },
+      {
+        "ID": "topology-cancel",
+        "Outcome": "cancelled",
+        "AttemptCount": 0,
+        "FinalDestination": "topology.cancel"
+      }
+    ]
+  }
+}
