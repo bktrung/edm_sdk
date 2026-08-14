@@ -137,6 +137,8 @@ func (p *producer) target(ctx context.Context, message driver.OutboundMessage) (
 	return "", destination, "", nil
 }
 
+const maxExpirationMillis int64 = 2147483647
+
 func expirationMillis(remaining time.Duration) string {
 	millis := remaining / time.Millisecond
 	if remaining%time.Millisecond != 0 {
@@ -144,6 +146,9 @@ func expirationMillis(remaining time.Duration) string {
 	}
 	if millis < 1 {
 		millis = 1
+	}
+	if millis > time.Duration(maxExpirationMillis) {
+		millis = time.Duration(maxExpirationMillis)
 	}
 	return strconv.FormatInt(int64(millis), 10)
 }

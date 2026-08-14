@@ -91,6 +91,12 @@ func TestConnectionCapabilitiesFollowQueueType(t *testing.T) {
 	}
 }
 
+func TestExpirationMillisClampsLargeDelay(t *testing.T) {
+	if got := expirationMillis(100 * 365 * 24 * time.Hour); got != "2147483647" {
+		t.Fatalf("expirationMillis(100 years) = %q, want 2147483647", got)
+	}
+}
+
 func TestOpenRejectsSCRAM(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()

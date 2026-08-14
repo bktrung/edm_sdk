@@ -199,7 +199,7 @@ func (a *admin) scanOrphans(ctx context.Context, spec driver.TopologySpec, diff 
 		diff.OrphanScanError = "orphan scan disabled because no scope was supplied"
 		return
 	}
-	queues, err := a.conn.management.listQueues(ctx)
+	queues, err := a.freshQueueList(ctx, spec.Scope)
 	if err != nil {
 		diff.OrphanScanError = err.Error()
 		return
@@ -241,6 +241,29 @@ func (a *admin) scanOrphans(ctx context.Context, spec driver.TopologySpec, diff 
 	for _, name := range order {
 		diff.Orphaned = append(diff.Orphaned, driver.OrphanedDestination{Name: name, Messages: orphans[name]})
 	}
+}
+
+func (a *admin) freshQueueList(ctx context.Context, scopes []string) ([]managementQueue, error) {
+	queues, err := a.conn.management.listQueues(ctx)
+	if err != nil {
+		return nil, err
+	}
+	for index := range queues {
+		queue := &queues[index]
+		if !matchesScope(queue.Name, scopes) || queue.totalMessages() > 0 {
+			continue
+		}
+		ready, inspectErr := a.inspectQueue(ctx, queue.Name)
+		if inspectErr == nil && ready > 0 {
+			if int64(ready) > queue.MessagesReady {
+				queue.MessagesReady = int64(ready)
+			}
+			if int64(ready) > queue.Messages {
+				queue.Messages = int64(ready)
+			}
+		}
+	}
+	return queues, nil
 }
 
 func matchesScope(name string, scopes []string) bool {
