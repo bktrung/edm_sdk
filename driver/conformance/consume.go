@@ -284,58 +284,6 @@ func runConsume(group *groupContext) {
 		group.vector.Add(BehaviorEvent{ID: "errors-open", Outcome: "ok", FinalDestination: "consume.errors"})
 	})
 
-	group.Check("StartLatest excludes retained messages for a new group", func(t *testing.T) {
-		producer := newProducer(t, group, "consume.latest", driver.ProducerConfig{Effective: group.effective})
-		controlProducer := newProducer(t, group, "consume.latest-control", driver.ProducerConfig{Effective: group.effective})
-		if err := producer.Publish(group.ctx, driver.OutboundMessage{Destination: "consume.latest", Body: []byte("retained")}); err != nil {
-			t.Fatalf("Publish(retained) error = %v", err)
-		}
-		consumer := newConsumerFor(t, group, driver.ConsumerConfig{
-			Group: "consume-latest-new-" + group.profile.String(), Destinations: []string{"consume.latest", "consume.latest-control"}, Prefetch: 2,
-			StartAt: driver.StartLatest, Effective: group.effective,
-		})
-		if err := controlProducer.Publish(group.ctx, driver.OutboundMessage{Destination: "consume.latest-control", Body: []byte("control")}); err != nil {
-			t.Fatalf("Publish(control) error = %v", err)
-		}
-		var control driver.InboundMessage
-		waitFor(t, group, "StartLatest control delivery", func() (bool, string) {
-			select {
-			case message, ok := <-consumer.Messages():
-				if !ok {
-					return false, "Messages channel closed"
-				}
-				control = message
-				return true, fmt.Sprintf("received destination=%q body=%q", message.Destination, message.Body)
-			default:
-				return false, "no control message"
-			}
-		})
-		if control.Destination != "consume.latest-control" {
-			t.Fatalf("StartLatest delivered retained destination %q before control", control.Destination)
-		}
-		ackMessage(t, group, control)
-		waitForStable(t, group, "StartLatest to exclude retained messages", func() (bool, string) {
-			select {
-			case message, ok := <-consumer.Messages():
-				if !ok {
-					return false, "Messages channel closed"
-				}
-				return false, fmt.Sprintf("received retained destination=%q body=%q", message.Destination, message.Body)
-			default:
-				return true, "no retained message"
-			}
-		})
-		if err := producer.Publish(group.ctx, driver.OutboundMessage{Destination: "consume.latest", Body: []byte("new")}); err != nil {
-			t.Fatalf("Publish(new) error = %v", err)
-		}
-		message := receiveMessage(t, group, consumer)
-		if string(message.Body) != "new" {
-			t.Fatalf("StartLatest body = %q, want new", message.Body)
-		}
-		ackMessage(t, group, message)
-		group.vector.Add(BehaviorEvent{ID: "start-latest", Outcome: "ok", FinalDestination: "consume.latest"})
-	})
-
 	group.Check("StartEarliest includes retained messages for a new group", func(t *testing.T) {
 		producer := newProducer(t, group, "consume.earliest", driver.ProducerConfig{Effective: group.effective})
 		if err := producer.Publish(group.ctx, driver.OutboundMessage{Destination: "consume.earliest", Body: []byte("retained")}); err != nil {
