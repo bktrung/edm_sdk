@@ -1,5 +1,8 @@
-// Command apisurface verifies that the root package's exported API is present
-// in the public API fixture.
+// Command apisurface checks the two symbol arrays in a public API fixture.
+// The symbols array lists documented symbols expected in the package. The
+// documented-not-built array records documented gaps allowed to be absent;
+// those entries are neither missing nor stale, but fail once exported so they
+// can move into symbols.
 package main
 
 import (
@@ -41,7 +44,7 @@ func main() {
 	if !filepath.IsAbs(fixturePath) {
 		fixturePath = filepath.Join(repoRoot, fixturePath)
 	}
-	fixturePackage, declared, err := loadFixture(fixturePath)
+	fixturePackage, declared, documentedNotBuilt, err := loadFixture(fixturePath)
 	if err != nil {
 		fail("load %s: %v", fixturePath, err)
 	}
@@ -49,23 +52,26 @@ func main() {
 		fail("fixture %s declares package %q, requested %q", fixturePath, fixturePackage, packageName)
 	}
 
-	known := make(map[string]bool, len(declared))
-	for _, s := range declared {
-		known[s] = true
-	}
-
-	var undeclared []string
-	for _, s := range actual {
-		if !known[s] {
-			undeclared = append(undeclared, s)
-		}
-	}
-
-	if len(undeclared) > 0 {
+	missingFromFixture, staleFixture, closedGaps := surfaceDifferences(actual, declared, documentedNotBuilt)
+	if len(missingFromFixture) > 0 {
 		fmt.Fprintf(os.Stderr, "apisurface: package %s exports symbols missing from the fixture:\n", packageName)
-		for _, s := range undeclared {
+		for _, s := range missingFromFixture {
 			fmt.Fprintf(os.Stderr, "  %s\n", s)
 		}
+	}
+	if len(staleFixture) > 0 {
+		fmt.Fprintf(os.Stderr, "apisurface: fixture for package %s declares symbols not exported by the package:\n", packageName)
+		for _, s := range staleFixture {
+			fmt.Fprintf(os.Stderr, "  %s\n", s)
+		}
+	}
+	if len(closedGaps) > 0 {
+		fmt.Fprintf(os.Stderr, "apisurface: package %s exported documented-not-built symbols; move them to symbols:\n", packageName)
+		for _, s := range closedGaps {
+			fmt.Fprintf(os.Stderr, "  %s\n", s)
+		}
+	}
+	if len(missingFromFixture) > 0 || len(staleFixture) > 0 || len(closedGaps) > 0 {
 		fmt.Fprintf(os.Stderr, "apisurface: update the fixture for package %s and rerun the fixture checks\n", packageName)
 		os.Exit(1)
 	}
@@ -79,20 +85,52 @@ func fail(format string, args ...any) {
 }
 
 type publicAPIFixture struct {
-	Package string   `json:"package"`
-	Symbols []string `json:"symbols"`
+	Package            string   `json:"package"`
+	Symbols            []string `json:"symbols"`
+	DocumentedNotBuilt []string `json:"documented-not-built"`
 }
 
-func loadFixture(path string) (string, []string, error) {
+func loadFixture(path string) (string, []string, []string, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
-		return "", nil, err
+		return "", nil, nil, err
 	}
 	var fixture publicAPIFixture
 	if err := json.Unmarshal(data, &fixture); err != nil {
-		return "", nil, err
+		return "", nil, nil, err
 	}
-	return fixture.Package, fixture.Symbols, nil
+	return fixture.Package, fixture.Symbols, fixture.DocumentedNotBuilt, nil
+}
+
+func surfaceDifferences(actual, declared, documentedNotBuilt []string) (missingFromFixture, staleFixture, closedGaps []string) {
+	actualSet := make(map[string]bool, len(actual))
+	for _, symbol := range actual {
+		actualSet[symbol] = true
+	}
+	declaredSet := make(map[string]bool, len(declared))
+	for _, symbol := range declared {
+		declaredSet[symbol] = true
+	}
+	documentedNotBuiltSet := make(map[string]bool, len(documentedNotBuilt))
+	for _, symbol := range documentedNotBuilt {
+		documentedNotBuiltSet[symbol] = true
+	}
+	for symbol := range actualSet {
+		if documentedNotBuiltSet[symbol] {
+			closedGaps = append(closedGaps, symbol)
+		} else if !declaredSet[symbol] {
+			missingFromFixture = append(missingFromFixture, symbol)
+		}
+	}
+	for symbol := range declaredSet {
+		if !actualSet[symbol] && !documentedNotBuiltSet[symbol] {
+			staleFixture = append(staleFixture, symbol)
+		}
+	}
+	sort.Strings(missingFromFixture)
+	sort.Strings(staleFixture)
+	sort.Strings(closedGaps)
+	return missingFromFixture, staleFixture, closedGaps
 }
 
 func extractSurface(moduleDir, pkg string) ([]string, error) {

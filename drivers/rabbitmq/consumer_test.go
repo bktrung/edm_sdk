@@ -123,3 +123,36 @@ func TestConsumerPauseResume(t *testing.T) {
 		t.Fatalf("Close: %v", err)
 	}
 }
+
+func TestConsumerDrainAfterCreationContextCancellation(t *testing.T) {
+	requireBroker(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	const queue = "rabbitmq-driver-consumer-cancel-drain"
+
+	conn, err := (Driver{}).Open(ctx, driver.Config{Endpoints: []string{defaultEndpoint}})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer func() { _ = conn.Close(context.Background()) }()
+	if _, err := conn.Admin().EnsureTopology(ctx, driver.TopologySpec{
+		Destinations: []driver.DestinationSpec{{Name: queue, Durable: true}},
+	}); err != nil {
+		t.Fatalf("EnsureTopology: %v", err)
+	}
+
+	consumer, err := conn.Consumer(ctx, driver.ConsumerConfig{Destinations: []string{queue}, Prefetch: 1})
+	if err != nil {
+		t.Fatalf("Consumer: %v", err)
+	}
+	cancel()
+
+	drainCtx, drainCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer drainCancel()
+	if err := consumer.Drain(drainCtx); err != nil {
+		t.Fatalf("Drain after creation context cancellation: %v", err)
+	}
+	if err := consumer.Stop(drainCtx); err != nil {
+		t.Fatalf("Stop after Drain: %v", err)
+	}
+}

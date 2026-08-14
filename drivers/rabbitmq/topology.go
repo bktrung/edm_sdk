@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 
 	amqp "github.com/rabbitmq/amqp091-go"
 
@@ -16,6 +17,12 @@ type bindingKey struct {
 }
 
 func (a *admin) ensureTopology(ctx context.Context, spec driver.TopologySpec) (driver.TopologyDiff, error) {
+	if spec.Policy == driver.TopologyNone {
+		return driver.TopologyDiff{}, nil
+	}
+	if spec.Policy == driver.TopologyVerify {
+		return a.verifyTopology(ctx, spec)
+	}
 	a.conn.topologyMu.Lock()
 	defer a.conn.topologyMu.Unlock()
 
@@ -61,7 +68,14 @@ func (a *admin) ensureTopology(ctx context.Context, spec driver.TopologySpec) (d
 			continue
 		}
 		seenDestinations[destination.Name] = struct{}{}
-		args := queueArguments(destination)
+		a.conn.mu.Lock()
+		if destination.Delay > 0 {
+			a.conn.deferred[destination.Name] = destination.Delay
+		} else {
+			delete(a.conn.deferred, destination.Name)
+		}
+		a.conn.mu.Unlock()
+		args := queueArguments(destination, a.conn.queueKind)
 		exists, err := a.queueExists(ctx, destination.Name, destination.Durable, args)
 		if err != nil {
 			return driver.TopologyDiff{}, err
@@ -120,7 +134,145 @@ func (a *admin) ensureTopology(ctx context.Context, spec driver.TopologySpec) (d
 		a.conn.mu.Unlock()
 		diff.CreatedBindings = append(diff.CreatedBindings, binding.Destination)
 	}
+	a.scanOrphans(ctx, spec, &diff)
 	return diff, nil
+}
+
+func (a *admin) verifyTopology(ctx context.Context, spec driver.TopologySpec) (driver.TopologyDiff, error) {
+	a.conn.topologyMu.Lock()
+	defer a.conn.topologyMu.Unlock()
+	var diff driver.TopologyDiff
+	for _, exchange := range spec.Exchanges {
+		if err := ctx.Err(); err != nil {
+			return driver.TopologyDiff{}, classify("ensure_topology", driver.KindTransient, err)
+		}
+		if err := validateExchange(exchange); err != nil {
+			return driver.TopologyDiff{}, classify("ensure_topology", driver.KindFatal, err)
+		}
+		exists, err := a.exchangeExists(ctx, exchange)
+		if err != nil {
+			return driver.TopologyDiff{}, err
+		}
+		if !exists {
+			return driver.TopologyDiff{}, classify("ensure_topology", driver.KindNotFound, fmt.Errorf("exchange %q is missing: %w", exchange.Name, driver.ErrDestinationMissing))
+		}
+		diff.Existing = append(diff.Existing, exchange.Name)
+		a.conn.mu.Lock()
+		a.conn.exchanges[exchange.Name] = struct{}{}
+		a.conn.mu.Unlock()
+	}
+	for _, destination := range spec.Destinations {
+		if err := ctx.Err(); err != nil {
+			return driver.TopologyDiff{}, classify("ensure_topology", driver.KindTransient, err)
+		}
+		if destination.Name == "" {
+			return driver.TopologyDiff{}, classify("ensure_topology", driver.KindFatal, errors.New("destination name is empty"))
+		}
+		if exists, err := a.queueExists(ctx, destination.Name, destination.Durable, queueArguments(destination, a.conn.queueKind)); err != nil {
+			return driver.TopologyDiff{}, err
+		} else if !exists {
+			return driver.TopologyDiff{}, classify("ensure_topology", driver.KindNotFound, fmt.Errorf("destination %q is missing: %w", destination.Name, driver.ErrDestinationMissing))
+		}
+		diff.Existing = append(diff.Existing, destination.Name)
+		a.conn.mu.Lock()
+		if destination.Delay > 0 {
+			a.conn.deferred[destination.Name] = destination.Delay
+		}
+		a.conn.mu.Unlock()
+		if destination.Delay > 0 {
+			parkName := destination.Name + ".park"
+			exists, err := a.queueExists(ctx, parkName, true, parkingArguments(destination.Name))
+			if err != nil {
+				return driver.TopologyDiff{}, err
+			}
+			if !exists {
+				return driver.TopologyDiff{}, classify("ensure_topology", driver.KindNotFound, fmt.Errorf("parking destination %q is missing: %w", parkName, driver.ErrDestinationMissing))
+			}
+			diff.Existing = append(diff.Existing, parkName)
+		}
+	}
+	return diff, nil
+}
+
+func (a *admin) scanOrphans(ctx context.Context, spec driver.TopologySpec, diff *driver.TopologyDiff) {
+	if len(spec.Scope) == 0 {
+		diff.OrphanScanError = "orphan scan disabled because no scope was supplied"
+		return
+	}
+	queues, err := a.freshQueueList(ctx, spec.Scope)
+	if err != nil {
+		diff.OrphanScanError = err.Error()
+		return
+	}
+	known := make(map[string]struct{}, len(spec.Destinations))
+	byName := make(map[string]managementQueue, len(queues))
+	for _, destination := range spec.Destinations {
+		known[destination.Name] = struct{}{}
+	}
+	for _, queue := range queues {
+		byName[queue.Name] = queue
+	}
+	orphans := make(map[string]int64)
+	order := make([]string, 0)
+	add := func(name string, messages int64) {
+		if _, exists := orphans[name]; !exists {
+			order = append(order, name)
+		}
+		orphans[name] += messages
+	}
+	for _, queue := range queues {
+		if !matchesScope(queue.Name, spec.Scope) {
+			continue
+		}
+		if _, exists := known[queue.Name]; exists {
+			continue
+		}
+		if strings.HasSuffix(queue.Name, ".park") {
+			parent := strings.TrimSuffix(queue.Name, ".park")
+			if _, parentExists := byName[parent]; parentExists {
+				if _, parentKnown := known[parent]; !parentKnown {
+					add(parent, queue.totalMessages())
+				}
+				continue
+			}
+		}
+		add(queue.Name, queue.totalMessages())
+	}
+	for _, name := range order {
+		diff.Orphaned = append(diff.Orphaned, driver.OrphanedDestination{Name: name, Messages: orphans[name]})
+	}
+}
+
+func (a *admin) freshQueueList(ctx context.Context, scopes []string) ([]managementQueue, error) {
+	queues, err := a.conn.management.listQueues(ctx)
+	if err != nil {
+		return nil, err
+	}
+	for index := range queues {
+		queue := &queues[index]
+		if !matchesScope(queue.Name, scopes) || queue.totalMessages() > 0 {
+			continue
+		}
+		ready, inspectErr := a.inspectQueue(ctx, queue.Name)
+		if inspectErr == nil && ready > 0 {
+			if int64(ready) > queue.MessagesReady {
+				queue.MessagesReady = int64(ready)
+			}
+			if int64(ready) > queue.Messages {
+				queue.Messages = int64(ready)
+			}
+		}
+	}
+	return queues, nil
+}
+
+func matchesScope(name string, scopes []string) bool {
+	for _, scope := range scopes {
+		if strings.HasPrefix(name, scope) {
+			return true
+		}
+	}
+	return false
 }
 
 func validateExchange(exchange driver.ExchangeSpec) error {
@@ -135,11 +287,9 @@ func validateExchange(exchange driver.ExchangeSpec) error {
 	}
 }
 
-func queueArguments(spec driver.DestinationSpec) amqp.Table {
+func queueArguments(spec driver.DestinationSpec, kind queueKind) amqp.Table {
 	args := amqp.Table{}
-	if spec.Durable {
-		args["x-queue-type"] = "quorum"
-	}
+	args["x-queue-type"] = string(kind)
 	if spec.DeliveryLimit > 0 {
 		if spec.DeliveryLimit > 2147483647 {
 			spec.DeliveryLimit = 2147483647
@@ -195,7 +345,8 @@ func (a *admin) queueExists(ctx context.Context, name string, durable bool, args
 		return false, err
 	}
 	defer channel.Close()
-	_, err = channel.QueueDeclarePassive(name, durable, false, false, false, args)
+	declaredDurable, autoDelete, exclusive := queueFlags(durable, a.conn.queueKind)
+	_, err = channel.QueueDeclarePassive(name, declaredDurable, autoDelete, exclusive, false, args)
 	if err == nil {
 		return true, nil
 	}
@@ -210,11 +361,33 @@ func (a *admin) declareQueue(ctx context.Context, name string, durable bool, arg
 	if err != nil {
 		return err
 	}
-	defer channel.Close()
-	if _, err := channel.QueueDeclare(name, durable, false, false, false, args); err != nil {
+	declaredDurable, autoDelete, exclusive := queueFlags(durable, a.conn.queueKind)
+	if _, err := channel.QueueDeclare(name, declaredDurable, autoDelete, exclusive, false, args); err != nil {
+		_ = channel.Close()
 		return classifyAMQP("ensure_topology", driver.KindFatal, err)
 	}
+	if durable {
+		_ = channel.Close()
+		return nil
+	}
+	a.conn.mu.Lock()
+	old := a.conn.ephemeral[name]
+	a.conn.ephemeral[name] = channel
+	a.conn.mu.Unlock()
+	if old != nil {
+		_ = old.Close()
+	}
 	return nil
+}
+
+func queueFlags(durable bool, kind queueKind) (bool, bool, bool) {
+	if kind == queueKindQuorum {
+		return true, false, false
+	}
+	if durable {
+		return true, false, false
+	}
+	return false, false, true
 }
 
 func (a *admin) bindQueue(ctx context.Context, binding driver.BindingSpec) error {
@@ -248,4 +421,9 @@ func (a *admin) openChannel(ctx context.Context) (*amqp.Channel, error) {
 func isNotFound(err error) bool {
 	var amqpErr *amqp.Error
 	return errors.As(err, &amqpErr) && amqpErr.Code == 404
+}
+
+func isPermission(err error) bool {
+	var amqpErr *amqp.Error
+	return errors.As(err, &amqpErr) && amqpErr.Code == 403
 }

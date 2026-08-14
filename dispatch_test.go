@@ -10,6 +10,7 @@ import (
 
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/driver"
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/clock"
+	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/lifecycle"
 )
 
 func TestOversizeBodyDeadLettersBeforeHandlerRuns(t *testing.T) {
@@ -459,4 +460,68 @@ func (c *dispatchConsumer) Stop(context.Context) error {
 
 func (*dispatchConsumer) Lag(context.Context) (map[string]int64, error) {
 	return nil, driver.ErrUnsupported
+}
+
+func waitDispatchSignal(t *testing.T, signal <-chan struct{}, message string) {
+	t.Helper()
+	timer := clock.NewReal().Timer(time.Second)
+	defer timer.Stop()
+	select {
+	case <-signal:
+	case <-timer.C:
+		t.Fatal(message)
+	}
+}
+
+func TestRunnerAccountingAxesSumAfterMixedOutcomes(t *testing.T) {
+	producer := &dispatchProducer{}
+	conn := &dispatchConn{producer: producer}
+	cfg := testClientConfig(t)
+	client, err := New(context.Background(), cfg, WithDriver(&dispatchDriver{conn: conn}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = client.Close(context.Background()) }()
+	runner := &Runner{
+		client: client,
+		subscription: Subscription{
+			Name: "orders", Retry: RetryConfig{MaxAttempts: 2, InitialInterval: time.Second}, MaxDeferrals: 1,
+			HandlerTimeout: time.Second,
+		},
+		inflight: newInflightRegistry(),
+	}
+	runner.accounting = lifecycle.NewAccounting(runner.inflight.registry)
+	message := func(id string, settler driver.Settler) driver.InboundMessage {
+		envelope := Envelope{SpecVersion: "1.0", ID: id, Source: "/test/orders", Type: "orders.created", Priority: PriorityNormal, Attempt: 1}
+		headers, err := envelope.EncodeHeaders(CoreMaxHeaderBytes)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return driver.InboundMessage{Destination: "f1.test.orders.created.normal", Headers: headerSlice(headers), Body: []byte(`{}`), DeliveryCount: 1, Settle: settler}
+	}
+	process := func(id string, handler Handler, ctx context.Context) {
+		runner.subscription.Handlers = map[string]Handler{"orders.created": handler}
+		item := message(id, &dispatchSettler{})
+		itemID := runner.inflight.Add(item)
+		processDelivery(runner, ctx, delivery{id: itemID, message: item})
+	}
+	process("retry", HandlerFunc(func(context.Context, *Event) error { return errors.New("temporary") }), context.Background())
+	process("dead-letter", HandlerFunc(func(context.Context, *Event) error { return Terminal(errors.New("invalid")) }), context.Background())
+	requeueCtx, cancel := context.WithCancel(context.Background())
+	cancel()
+	process("requeue", HandlerFunc(func(ctx context.Context, _ *Event) error {
+		<-ctx.Done()
+		return ctx.Err()
+	}), requeueCtx)
+	settlement := runner.inflight.Counts()
+	disposition := runner.inflight.DispositionCounts()
+	if settlement.received != 3 || settlement.settled+settlement.requeued+settlement.unknown+settlement.abandoned != 3 {
+		t.Fatalf("settlement counts = %#v, want three received and terminal outcomes", settlement)
+	}
+	if disposition.Total() != 3 || disposition.Retried != 1 || disposition.DeadLettered != 1 || disposition.Requeued != 1 {
+		t.Fatalf("disposition counts = %#v, want one retry, dead-letter, and requeue", disposition)
+	}
+	if got := runner.accounting.Snapshot(); got != disposition {
+		t.Fatalf("read-only accounting = %#v, registry dispositions = %#v", got, disposition)
+	}
 }

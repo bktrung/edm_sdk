@@ -25,6 +25,90 @@ func TestDriverCapabilities(t *testing.T) {
 	}
 }
 
+func TestConfiguredQueueKind(t *testing.T) {
+	cases := []struct {
+		name    string
+		options map[string]string
+		want    queueKind
+		ok      bool
+	}{
+		{name: "default", want: queueKindQuorum, ok: true},
+		{name: "quorum", options: map[string]string{"rabbitmq.queueType": "quorum"}, want: queueKindQuorum, ok: true},
+		{name: "classic", options: map[string]string{"rabbitmq.queueType": "classic"}, want: queueKindClassic, ok: true},
+		{name: "case and spaces", options: map[string]string{"rabbitmq.queueType": " CLASSIC "}, want: queueKindClassic, ok: true},
+		{name: "unsupported", options: map[string]string{"rabbitmq.queueType": "stream"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := configuredQueueKind(tc.options)
+			if tc.ok {
+				if err != nil || got != tc.want {
+					t.Fatalf("configuredQueueKind() = %q, %v, want %q", got, err, tc.want)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), "quorum, classic") {
+				t.Fatalf("configuredQueueKind() error = %v, want supported queue list", err)
+			}
+		})
+	}
+}
+
+func TestQueueKindCapabilities(t *testing.T) {
+	quorum := capabilitiesForQueueKind(queueKindQuorum)
+	if !quorum.NativeDeliveryCount {
+		t.Fatal("quorum capabilities NativeDeliveryCount = false, want true")
+	}
+	if !quorum.NativeDLQ {
+		t.Fatal("quorum capabilities NativeDLQ = false, want true")
+	}
+	classic := capabilitiesForQueueKind(queueKindClassic)
+	if classic.NativeDeliveryCount {
+		t.Fatal("classic capabilities NativeDeliveryCount = true, want false")
+	}
+	if classic.NativeDLQ {
+		t.Fatal("classic capabilities NativeDLQ = true, want false")
+	}
+}
+
+func TestConnectionCapabilitiesFollowQueueType(t *testing.T) {
+	requireBroker(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	cases := []struct {
+		name          string
+		options       map[string]string
+		wantNative    bool
+		wantNativeDLQ bool
+	}{
+		{name: "default quorum", wantNative: true, wantNativeDLQ: true},
+		{name: "classic", options: map[string]string{"rabbitmq.queueType": "classic"}, wantNative: false, wantNativeDLQ: false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			conn, err := (Driver{}).Open(ctx, driver.Config{
+				Endpoints: []string{defaultEndpoint}, DriverOptions: tc.options,
+			})
+			if err != nil {
+				t.Fatalf("Open() error = %v", err)
+			}
+			defer func() { _ = conn.Close(ctx) }()
+			if got := conn.Capabilities().NativeDeliveryCount; got != tc.wantNative {
+				t.Fatalf("NativeDeliveryCount = %t, want %t", got, tc.wantNative)
+			}
+			if got := conn.Capabilities().NativeDLQ; got != tc.wantNativeDLQ {
+				t.Fatalf("NativeDLQ = %t, want %t", got, tc.wantNativeDLQ)
+			}
+		})
+	}
+}
+
+func TestExpirationMillisClampsLargeDelay(t *testing.T) {
+	if got := expirationMillis(100 * 365 * 24 * time.Hour); got != "2147483647" {
+		t.Fatalf("expirationMillis(100 years) = %q, want 2147483647", got)
+	}
+}
+
 func TestOpenRejectsSCRAM(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()

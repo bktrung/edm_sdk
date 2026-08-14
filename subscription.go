@@ -15,6 +15,8 @@ import (
 	"golang.org/x/sync/errgroup"
 
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/driver"
+	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/dispatch"
+	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/lifecycle"
 )
 
 // Subscription declares one consumer group, its delivery policy, and the
@@ -95,7 +97,11 @@ type Runner struct {
 	finished              bool
 	runErr                error
 	inflight              *inflightRegistry
+	retryDestinationTiers map[string]int
 	metrics               deliveryMetrics
+	lifecycle             *lifecycle.Machine
+	accounting            *lifecycle.Accounting
+	dispatchPool          *dispatch.Pool
 }
 
 const terminalNotificationTimeout = time.Second
@@ -185,7 +191,7 @@ func (c *Client) Subscribe(ctx context.Context, sub Subscription) (*Runner, erro
 		return nil, err
 	}
 	if resolved.Mode == OrderedByKey && !c.effective.OrderedByKey {
-		return nil, fmt.Errorf("f1: subscriptions.%s ordered_by_key is unavailable under the connected driver", sub.Name)
+		return nil, fmt.Errorf("f1: subscription %s requests ordered_by_key, but feature is unavailable", sub.Name)
 	}
 	c.mu.Lock()
 	if c.closed || c.conn == nil {
@@ -217,7 +223,7 @@ func (c *Client) Subscribe(ctx context.Context, sub Subscription) (*Runner, erro
 	}
 	c.runners[runner] = struct{}{}
 	if c.metrics != nil {
-		runner.metrics.unregister = c.metrics.Register(effective.Name, runner.metrics.sampleAttemptDivergenceByTopic, runner.metrics.currentStuckWorkers)
+		runner.metrics.unregister = c.metrics.Register(effective.Name, runner.metrics.sampleAttemptDivergenceByTopic, runner.metrics.currentStuckWorkers, runner.metrics.sampleRetryAfterClamped)
 	}
 	c.mu.Unlock()
 	return runner, nil
@@ -339,9 +345,6 @@ func validateSubscription(cfg Config, name string, sub SubscriptionConfig) error
 	}
 	if sub.Mode != Unordered && sub.Mode != OrderedByKey {
 		return fmt.Errorf("f1: subscriptions.%s.mode is unsupported", name)
-	}
-	if sub.Mode == OrderedByKey && sub.Concurrency > 1 {
-		return fmt.Errorf("f1: subscriptions.%s ordered_by_key requires concurrency 1 until key-affinity dispatch is available", name)
 	}
 	if sub.UnmatchedPolicy != Ignore && sub.UnmatchedPolicy != DeadLetter {
 		return fmt.Errorf("f1: subscriptions.%s.unmatchedPolicy is unsupported", name)

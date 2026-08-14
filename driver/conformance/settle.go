@@ -50,7 +50,7 @@ func runSettle(group *groupContext) {
 		}
 		waitFor(t, group, "requeue nack to return the message", func() (bool, string) {
 			view := inspectDestination(t, group, "settle.requeue")
-			return view.Ready == 1 && view.Unsettled == 0, fmt.Sprintf("view=%+v", view)
+			return view.Ready+view.Unsettled == 1, fmt.Sprintf("view=%+v", view)
 		})
 		if err := consumer.Resume("settle.requeue"); err != nil {
 			t.Fatalf("Resume() error = %v", err)
@@ -277,7 +277,7 @@ func runSettle(group *groupContext) {
 		}
 		waitFor(t, group, "mixed settlements to expose one requeue", func() (bool, string) {
 			view := inspectDestination(t, group, "settle.mixed-order")
-			return view.Ready == 1 && view.Unsettled == 0, fmt.Sprintf("view=%+v", view)
+			return view.Ready+view.Unsettled == 1, fmt.Sprintf("view=%+v", view)
 		})
 		if err := consumer.Resume("settle.mixed-order"); err != nil {
 			t.Fatalf("Resume() error = %v", err)

@@ -3,41 +3,80 @@ package lifecycle
 import (
 	"context"
 	"errors"
-	"sync/atomic"
 	"testing"
 	"time"
 
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/clock"
 )
 
-func TestDrainRunsPhasesInOrder(t *testing.T) {
+func TestDrainTransitionsImmediatelyAndBoundsFlushWithFakeClock(t *testing.T) {
+	fake := clock.NewFake(time.Unix(0, 0))
 	machine := New()
 	if err := machine.Transition(Ready); err != nil {
 		t.Fatal(err)
 	}
-	var phases []string
-	add := func(name string) func(context.Context) error {
-		return func(context.Context) error { phases = append(phases, name); return nil }
+	flushStarted := make(chan struct{})
+	done := make(chan error, 1)
+	go func() {
+		done <- machine.Drain(context.Background(), Config{
+			Clock:        fake,
+			FlushTimeout: 7 * time.Second,
+		}, Hooks{
+			Drain: func(context.Context) error {
+				if machine.State() != Draining {
+					return errors.New("drain hook ran outside draining state")
+				}
+				return nil
+			},
+			WaitSettled: func(context.Context) error {
+				if machine.State() != Settling {
+					return errors.New("settle hook ran outside settling state")
+				}
+				return nil
+			},
+			Flush: func(ctx context.Context) error {
+				if machine.State() != Flushing {
+					return errors.New("flush hook ran outside flushing state")
+				}
+				close(flushStarted)
+				<-ctx.Done()
+				return ctx.Err()
+			},
+		})
+	}()
+	<-flushStarted
+	fake.BlockUntil(1)
+	fake.Advance(7 * time.Second)
+	if err := <-done; !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Drain() error = %v, want deadline exceeded", err)
 	}
-	var cancelled atomic.Bool
-	err := machine.Drain(context.Background(), Config{}, Hooks{
-		Drain:         add("drain"),
-		CancelHandler: func() { phases = append(phases, "cancel"); cancelled.Store(true) },
-		WaitSettled:   add("settle"),
-		Flush:         add("flush"),
-		Close:         add("close"),
-	})
-	if err != nil || machine.State() != Closed || !cancelled.Load() {
-		t.Fatalf("Drain() = %v, state = %s, cancelled = %v", err, machine.State(), cancelled.Load())
+	if got := machine.State(); got != Aborted {
+		t.Fatalf("state after flush deadline = %s, want aborted", got)
 	}
-	want := []string{"drain", "cancel", "settle", "flush", "close"}
-	if got := phases; len(got) != len(want) {
-		t.Fatalf("phases = %v, want %v", got, want)
+}
+
+func TestDrainBoundsCloseWithFakeClock(t *testing.T) {
+	fake := clock.NewFake(time.Unix(0, 0))
+	machine := New()
+	if err := machine.Transition(Ready); err != nil {
+		t.Fatal(err)
 	}
-	for i := range phases {
-		if phases[i] != want[i] {
-			t.Fatalf("phases = %v, want %v", phases, want)
-		}
+	done := make(chan error, 1)
+	go func() {
+		done <- machine.Drain(context.Background(), Config{Clock: fake, CloseTimeout: 11 * time.Second}, Hooks{
+			Close: func(ctx context.Context) error {
+				<-ctx.Done()
+				return ctx.Err()
+			},
+		})
+	}()
+	fake.BlockUntil(1)
+	fake.Advance(11 * time.Second)
+	if err := <-done; !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Drain() error = %v, want deadline exceeded", err)
+	}
+	if got := machine.State(); got != Aborted {
+		t.Fatalf("state after close deadline = %s, want aborted", got)
 	}
 }
 
@@ -87,25 +126,13 @@ func TestDrainDeadlineUsesInjectedClock(t *testing.T) {
 	}
 }
 
-func TestDrainRunsPreStopAndFlushErrors(t *testing.T) {
+func TestDrainRunsFlushErrors(t *testing.T) {
 	machine := New()
 	if err := machine.Transition(Ready); err != nil {
 		t.Fatal(err)
 	}
-	if err := machine.Drain(context.Background(), Config{PreStopDelay: time.Millisecond}, Hooks{Drain: func(context.Context) error { return nil }, Flush: func(context.Context) error { return errors.New("flush failed") }}); err == nil || machine.State() != Aborted {
+	if err := machine.Drain(context.Background(), Config{}, Hooks{Drain: func(context.Context) error { return nil }, Flush: func(context.Context) error { return errors.New("flush failed") }}); err == nil || machine.State() != Aborted {
 		t.Fatalf("flush failure = %v, state = %s", err, machine.State())
-	}
-}
-
-func TestDrainHonorsCancellationDuringPreStop(t *testing.T) {
-	machine := New()
-	if err := machine.Transition(Ready); err != nil {
-		t.Fatal(err)
-	}
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-	if err := machine.Drain(ctx, Config{PreStopDelay: time.Second}, Hooks{}); !errors.Is(err, context.Canceled) || machine.State() != Aborted {
-		t.Fatalf("cancelled drain = %v, state = %s", err, machine.State())
 	}
 }
 
@@ -126,6 +153,10 @@ func TestDrainPassesIndependentHookTimeouts(t *testing.T) {
 func TestDrainRejectsInvalidStartingState(t *testing.T) {
 	if err := New().Drain(context.Background(), Config{}, Hooks{}); err == nil {
 		t.Fatal("starting drain must be rejected")
+	}
+	var machine *Machine
+	if err := machine.Drain(context.Background(), Config{}, Hooks{}); err == nil {
+		t.Fatal("nil machine drain must fail")
 	}
 }
 
@@ -155,19 +186,29 @@ func TestDrainAbortsOnEachHookError(t *testing.T) {
 	}
 }
 
-func TestDrainCancelsHandlerAfterGrace(t *testing.T) {
+func TestDrainReturnsHookAndParentErrors(t *testing.T) {
 	machine := New()
 	if err := machine.Transition(Ready); err != nil {
 		t.Fatal(err)
 	}
-	called := make(chan struct{})
-	err := machine.Drain(context.Background(), Config{DrainTimeout: 5 * time.Millisecond, HandlerGrace: 4 * time.Millisecond}, Hooks{CancelHandler: func() { close(called) }})
-	if err != nil || machine.State() != Closed {
-		t.Fatalf("Drain() = %v, state = %s", err, machine.State())
+	want := errors.New("flush failed before timeout")
+	if err := machine.Drain(context.Background(), Config{FlushTimeout: time.Hour}, Hooks{Flush: func(context.Context) error { return want }}); !errors.Is(err, want) {
+		t.Fatalf("Drain() error = %v, want %v", err, want)
 	}
-	select {
-	case <-called:
-	default:
-		t.Fatal("handler cancellation was not called")
+
+	machine = New()
+	if err := machine.Transition(Ready); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := machine.Drain(ctx, Config{DrainTimeout: time.Hour}, Hooks{Drain: func(ctx context.Context) error {
+		<-ctx.Done()
+		return ctx.Err()
+	}}); !errors.Is(err, context.Canceled) {
+		t.Fatalf("Drain() cancelled error = %v, want context canceled", err)
+	}
+	if machine.State() != Aborted {
+		t.Fatalf("cancelled drain state = %s, want aborted", machine.State())
 	}
 }

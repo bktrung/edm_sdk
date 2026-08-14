@@ -229,3 +229,29 @@ func TestSlotHelpersHandleEmptyAndSparseGroups(t *testing.T) {
 		t.Fatal("nil scheduler pending count must be zero")
 	}
 }
+
+func TestAgingKeepsLowPriorityMovingUnderSustainedHighLoad(t *testing.T) {
+	start := time.Unix(0, 0)
+	fake := clock.NewFake(start)
+	scheduler, err := New([]LaneSpec{
+		{ID: "high", Weight: 8, Capacity: 32},
+		{ID: "low", Weight: 1, Budget: 10 * time.Millisecond, Capacity: 2},
+	}, fake, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 16; i++ {
+		if err := scheduler.Enqueue("high", Item{Value: "high", EnqueuedAt: start}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := scheduler.Enqueue("low", Item{Value: "low", EnqueuedAt: start}); err != nil {
+		t.Fatal(err)
+	}
+	fake.Advance(10 * time.Millisecond)
+
+	item, ok := scheduler.Next()
+	if !ok || item.Value != "low" {
+		t.Fatalf("aged low-priority item = %#v, %v; want low", item.Value, ok)
+	}
+}

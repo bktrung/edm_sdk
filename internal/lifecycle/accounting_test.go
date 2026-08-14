@@ -35,3 +35,13 @@ func TestAccountingReadsRegistryDispositions(t *testing.T) {
 		t.Fatalf("disposition total = %d, received = %d", counts.Total(), len(outcomes))
 	}
 }
+
+func TestAccountingNilViewsAreEmpty(t *testing.T) {
+	var accounting *Accounting
+	if got := accounting.Snapshot(); got != (Counts{}) {
+		t.Fatalf("nil Accounting snapshot = %+v, want empty", got)
+	}
+	if got := NewAccounting(nil).Snapshot(); got != (Counts{}) {
+		t.Fatalf("nil registry snapshot = %+v, want empty", got)
+	}
+}

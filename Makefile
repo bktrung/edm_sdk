@@ -139,7 +139,7 @@ $(APISURFACE): tools/apisurface/main.go tools/apisurface/go.mod
 $(APIDIFF): tools/apidiff/go.mod tools/apidiff/go.sum
 	cd tools/apidiff && go build -o ../../.tools/bin/apidiff golang.org/x/exp/cmd/apidiff
 
-.PHONY: broker-up broker-down broker-smoke test-rabbitmq
+.PHONY: broker-up broker-down broker-reset broker-smoke test-rabbitmq
 
 ## test-rabbitmq: run the RabbitMQ driver suite against the fixture, starting it
 ## first. F1_REQUIRE_RABBITMQ makes an unreachable broker a failure rather than a
@@ -155,6 +155,10 @@ broker-up:
 ## broker-down: stop the local RabbitMQ fixture and keep its named volume.
 broker-down:
 	docker compose -f docker/docker-compose.yml down
+
+## broker-reset: stop the fixture and remove its named volume.
+broker-reset:
+	docker compose -f docker/docker-compose.yml down -v
 
 ## broker-smoke: wait for RabbitMQ health and print its version.
 broker-smoke:

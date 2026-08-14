@@ -11,9 +11,10 @@ import (
 const meterName = "fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/obs"
 
 type metricSource struct {
-	subscription string
-	divergence   func() map[string]int64
-	stuckWorkers func() int64
+	subscription      string
+	divergence        func() map[string]int64
+	stuckWorkers      func() int64
+	retryAfterClamped func() map[string]uint64
 }
 
 // Metrics owns the observable instruments and their collection callback.
@@ -27,6 +28,7 @@ type Metrics struct {
 	registration metric.Registration
 	divergence   metric.Int64ObservableGauge
 	stuck        metric.Int64ObservableGauge
+	clamped      metric.Int64ObservableCounter
 }
 
 // NewMetrics creates the SDK metric publisher. A nil provider leaves the
@@ -51,9 +53,17 @@ func NewMetrics(provider metric.MeterProvider) (*Metrics, error) {
 	if err != nil {
 		return nil, err
 	}
+	clamped, err := meter.Int64ObservableCounter(
+		"f1_retry_after_clamped_total",
+		metric.WithDescription("Retry-After requests clamped into a retry tier jitter band."),
+	)
+	if err != nil {
+		return nil, err
+	}
 	metrics.divergence = divergence
 	metrics.stuck = stuck
-	registration, err := meter.RegisterCallback(metrics.observe, divergence, stuck)
+	metrics.clamped = clamped
+	registration, err := meter.RegisterCallback(metrics.observe, divergence, stuck, clamped)
 	if err != nil {
 		return nil, err
 	}
@@ -63,7 +73,7 @@ func NewMetrics(provider metric.MeterProvider) (*Metrics, error) {
 
 // Register connects one subscription's sampled sources to the collection
 // callback and returns an idempotent unregister function.
-func (m *Metrics) Register(subscription string, divergence func() map[string]int64, stuckWorkers func() int64) func() {
+func (m *Metrics) Register(subscription string, divergence func() map[string]int64, stuckWorkers func() int64, retryAfterClamped func() map[string]uint64) func() {
 	if m == nil {
 		return func() {}
 	}
@@ -74,7 +84,8 @@ func (m *Metrics) Register(subscription string, divergence func() map[string]int
 	}
 	m.nextID++
 	id := m.nextID
-	m.sources[id] = metricSource{subscription: subscription, divergence: divergence, stuckWorkers: stuckWorkers}
+	clamped := retryAfterClamped
+	m.sources[id] = metricSource{subscription: subscription, divergence: divergence, stuckWorkers: stuckWorkers, retryAfterClamped: clamped}
 	m.mu.Unlock()
 
 	var once sync.Once
@@ -116,10 +127,16 @@ func (m *Metrics) observe(_ context.Context, observer metric.Observer) error {
 	}
 	divergence := m.divergence
 	stuck := m.stuck
+	clamped := m.clamped
 	m.mu.RUnlock()
 
 	divergenceValues := make(map[string]int64)
 	stuckValues := make(map[string]int64, len(sources))
+	type clampKey struct {
+		topic        string
+		subscription string
+	}
+	clampedValues := make(map[clampKey]uint64, len(sources))
 	for _, source := range sources {
 		if source.divergence != nil {
 			for topic, value := range source.divergence() {
@@ -133,12 +150,27 @@ func (m *Metrics) observe(_ context.Context, observer metric.Observer) error {
 			value = source.stuckWorkers()
 		}
 		stuckValues[source.subscription] += value
+		if source.retryAfterClamped != nil {
+			for topic, value := range source.retryAfterClamped() {
+				clampedValues[clampKey{topic: topic, subscription: source.subscription}] += value
+			}
+		}
 	}
 	for topic, value := range divergenceValues {
 		observer.ObserveInt64(divergence, value, metric.WithAttributes(attribute.String("topic", topic)))
 	}
 	for subscription, value := range stuckValues {
 		observer.ObserveInt64(stuck, value, metric.WithAttributes(attribute.String("subscription", subscription)))
+	}
+	const maxMetricInt64 = uint64(1<<63 - 1)
+	for key, value := range clampedValues {
+		if value > maxMetricInt64 {
+			value = maxMetricInt64
+		}
+		observer.ObserveInt64(clamped, int64(value), metric.WithAttributes(
+			attribute.String("topic", key.topic),
+			attribute.String("subscription", key.subscription),
+		))
 	}
 	return nil
 }

@@ -16,7 +16,12 @@ import (
 	"golang.org/x/sync/errgroup"
 
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/driver"
+	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/clock"
+	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/dispatch"
+	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/lifecycle"
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/obs"
+	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/retry"
+	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/sched"
 )
 
 type delivery struct {
@@ -25,16 +30,19 @@ type delivery struct {
 }
 
 type deliveryState struct {
+	id        uint64
 	attempted bool
 	settled   bool
 	// operation records which settlement call was last made, so that a failed
 	// one can be retried in kind rather than guessed at.
-	operation settlementOperation
+	operation   settlementOperation
+	nackOptions driver.NackOptions
 }
 
 type deliveryMetrics struct {
 	attemptDivergence obs.SampledGaugeSet
 	topics            []string
+	retryAfterClamped []obs.SampledCounter
 	stuckWorkers      atomic.Int64
 	activeHandlers    atomic.Int64
 	retired           atomic.Bool
@@ -59,6 +67,7 @@ func newDeliveryMetrics(topics []string) deliveryMetrics {
 	return deliveryMetrics{
 		attemptDivergence: obs.NewSampledGaugeSet(unique, deliveryPriorityLanes),
 		topics:            append([]string(nil), unique...),
+		retryAfterClamped: make([]obs.SampledCounter, len(unique)),
 	}
 }
 
@@ -91,6 +100,24 @@ func (m *deliveryMetrics) sampleAttemptDivergenceByTopic() map[string]int64 {
 
 func (m *deliveryMetrics) currentStuckWorkers() int64 {
 	return m.stuckWorkers.Load()
+}
+
+func (m *deliveryMetrics) recordRetryAfterClamped(eventType string) {
+	topic := topicFor(eventType)
+	index := sort.SearchStrings(m.topics, topic)
+	if index < len(m.topics) && m.topics[index] == topic {
+		m.retryAfterClamped[index].Add(1)
+	}
+}
+
+func (m *deliveryMetrics) sampleRetryAfterClamped() map[string]uint64 {
+	values := make(map[string]uint64, len(m.topics))
+	for index, topic := range m.topics {
+		if value := m.retryAfterClamped[index].Sample(); value > 0 {
+			values[topic] = value
+		}
+	}
+	return values
 }
 
 type handlerActivity struct {
@@ -173,6 +200,8 @@ func (r *Runner) Run(ctx context.Context) error {
 	r.started = true
 	r.done = make(chan struct{})
 	r.inflight = newInflightRegistry()
+	r.lifecycle = lifecycle.New()
+	r.accounting = lifecycle.NewAccounting(r.inflight.registry)
 	runCtx, cancel := context.WithCancel(ctx)
 	r.runCtx, r.cancel = runCtx, cancel
 	handlerCtx, handlerCancel := context.WithCancel(ctx)
@@ -194,46 +223,212 @@ func (r *Runner) Run(ctx context.Context) error {
 	r.consumer = consumer
 	r.mu.Unlock()
 
-	dispatch := make(chan delivery, r.subscription.Concurrency)
-	group.Go(func() error { return fetchRunner(r, runCtx, dispatch) })
-	for i := 0; i < r.subscription.Concurrency; i++ {
-		group.Go(func() error {
-			for item := range dispatch {
-				processDelivery(r, runCtx, item)
-			}
-			return nil
-		})
+	if err := r.lifecycle.Transition(lifecycle.Ready); err != nil {
+		return err
 	}
+	deliveries := make(chan delivery, r.subscription.Concurrency)
+	group.Go(func() error { return fetchRunner(r, runCtx, deliveries) })
+	group.Go(func() error { return runDispatchPipeline(r, runCtx, deliveries) })
 	group.Go(func() error { return consumeRunnerErrors(r, runCtx) })
 	err = group.Wait()
 	if err == nil {
 		err = runnerError(r)
 	}
-	if r.inflight != nil {
-		waitTimeout := r.client.config.Lifecycle.DrainTimeout
-		if waitTimeout <= 0 {
-			waitTimeout = time.Minute
-		}
-		waitCtx, cancel := context.WithTimeout(runnerSettlementContext(r, runCtx), waitTimeout)
-		if waitErr := r.inflight.WaitZero(waitCtx); err == nil && waitErr != nil {
-			err = waitErr
-		}
-		cancel()
+	shutdownCtx := context.WithoutCancel(runnerSettlementContext(r, runCtx))
+	shutdownErr := r.lifecycle.Drain(shutdownCtx, lifecycle.Config{
+		Clock:        r.client.options.clock,
+		DrainTimeout: r.client.config.Lifecycle.DrainTimeout,
+		FlushTimeout: r.client.config.Lifecycle.FlushTimeout,
+		CloseTimeout: r.client.config.Lifecycle.CloseTimeout,
+	}, lifecycle.Hooks{
+		WaitSettled: func(ctx context.Context) error {
+			return r.inflight.WaitZero(ctx)
+		},
+		Close: func(ctx context.Context) error {
+			return stopRunnerConsumer(r, ctx)
+		},
+	})
+	if err == nil {
+		err = shutdownErr
+	} else if shutdownErr != nil {
+		err = errors.Join(err, shutdownErr)
 	}
-	if err != nil && r.inflight.Len() != 0 {
-		return err
-	}
-	closeTimeout := r.client.config.Lifecycle.CloseTimeout
-	if closeTimeout <= 0 {
-		closeTimeout = time.Minute
-	}
-	stopCtx, cancel := context.WithTimeout(runnerSettlementContext(r, runCtx), closeTimeout)
-	defer cancel()
-	stopErr := stopRunnerConsumer(r, stopCtx)
+	return err
+}
+
+func runDispatchPipeline(r *Runner, ctx context.Context, deliveries <-chan delivery) error {
+	scheduler, err := newRunnerScheduler(r)
 	if err != nil {
 		return err
 	}
-	return stopErr
+	pipelineCtx := context.WithoutCancel(ctx)
+	pool, err := dispatch.NewPool(pipelineCtx, r.subscription.Concurrency, r.subscription.Mode == OrderedByKey, r.subscription.Prefetch)
+	if err != nil {
+		return err
+	}
+	r.mu.Lock()
+	r.dispatchPool = pool
+	r.mu.Unlock()
+	defer func() {
+		pool.Close()
+		r.mu.Lock()
+		r.dispatchPool = nil
+		r.mu.Unlock()
+	}()
+
+	var pending *delivery
+	open := true
+	for open || pending != nil || schedulerHasItems(scheduler) {
+		if pending != nil {
+			laneID := deliveryLane(r, pending.message)
+			err := scheduler.Enqueue(laneID, sched.Item{Value: *pending, EnqueuedAt: r.client.options.clock.Now()})
+			if err == nil {
+				pending = nil
+			} else if !errors.Is(err, sched.ErrLaneFull) {
+				return err
+			}
+		}
+		if item, ok := scheduler.Next(); ok {
+			work := item.Value.(delivery)
+			if err := pool.Submit(pipelineCtx, dispatch.Work{
+				Key: append([]byte(nil), work.message.Key...),
+				Run: func(context.Context) { processDelivery(r, ctx, work) },
+			}); err != nil {
+				return err
+			}
+			continue
+		}
+		if pending != nil {
+			if err := pool.WaitFree(pipelineCtx); err != nil {
+				return err
+			}
+			continue
+		}
+		if !open {
+			break
+		}
+		item, ok := <-deliveries
+		if !ok {
+			open = false
+			continue
+		}
+		pending = &item
+	}
+	return nil
+}
+
+func schedulerHasItems(scheduler *sched.Scheduler) bool {
+	return scheduler != nil && scheduler.Pending() > 0
+}
+
+func newRunnerScheduler(r *Runner) (*sched.Scheduler, error) {
+	weights := r.subscription.Fairness.Weights
+	budgets := r.subscription.Fairness.Budgets
+	divisor := r.subscription.Fairness.RetryWeightDivisor
+	if divisor < 1 {
+		divisor = 2
+	}
+	factor := r.subscription.Fairness.PrefetchFactor
+	if factor < 1 {
+		factor = 2
+	}
+	type laneMeta struct {
+		group  string
+		weight int
+		budget time.Duration
+	}
+	meta := make(map[string]laneMeta, len(r.subscription.Topics)*len(r.subscription.Priorities)*(1+retryTiers(r.subscription.Retry)))
+	groups := make(map[string]struct{})
+	totalWeight := 0
+	for _, topic := range r.subscription.Topics {
+		for _, priority := range r.subscription.Priorities {
+			weight := weights[priority]
+			if weight < 1 {
+				weight = 1
+			}
+			budget := budgets[priority]
+			for tier := 0; tier <= retryTiers(r.subscription.Retry); tier++ {
+				laneID := schedulerLaneID(topicFor(topic), priority, tier)
+				group := laneID
+				if tier > 0 {
+					group = schedulerRetryGroupID(topicFor(topic), priority)
+				}
+				laneWeight, laneBudget := weight, budget
+				if tier > 0 {
+					laneWeight /= divisor
+					if laneWeight < 1 {
+						laneWeight = 1
+					}
+					laneBudget *= 2
+				}
+				meta[laneID] = laneMeta{group: group, weight: laneWeight, budget: laneBudget}
+				if _, exists := groups[group]; !exists {
+					groups[group] = struct{}{}
+					totalWeight += laneWeight
+				}
+			}
+		}
+	}
+	if totalWeight < 1 {
+		totalWeight = 1
+	}
+	specs := make([]sched.LaneSpec, 0, len(meta))
+	ids := make([]string, 0, len(meta))
+	for id := range meta {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	for _, id := range ids {
+		lane := meta[id]
+		capacity := (r.subscription.Concurrency*lane.weight + totalWeight - 1) / totalWeight
+		if capacity < 2 {
+			capacity = 2
+		}
+		capacity *= factor
+		specs = append(specs, sched.LaneSpec{ID: id, Group: lane.group, Weight: lane.weight, Budget: lane.budget, Capacity: capacity})
+	}
+	return sched.New(specs, r.client.options.clock, r.subscription.Fairness.AgingEnabled)
+}
+
+func schedulerLaneID(topic string, priority Priority, tier int) string {
+	if tier > 0 {
+		return fmt.Sprintf("%s.%s.%s.%d", topic, priority, retryDestinationSegment, tier)
+	}
+	return fmt.Sprintf("%s.%s.main", topic, priority)
+}
+
+func schedulerRetryGroupID(topic string, priority Priority) string {
+	return fmt.Sprintf("%s.%s.%s", topic, priority, retryDestinationSegment)
+}
+
+func deliveryLane(r *Runner, message driver.InboundMessage) string {
+	envelope, err := DecodeHeaders(inboundHeaders(message.Headers))
+	if err == nil {
+		r.mu.Lock()
+		tier := r.retryDestinationTiers[message.Destination]
+		r.mu.Unlock()
+		topic := topicFor(envelope.Type)
+		effective := r.client.effective
+		for _, configured := range r.subscription.Topics {
+			logical := topicFor(configured)
+			if tier == 0 {
+				if consumeDestination(effective, r.client.source, logical, envelope.Priority, r.subscription.Name) == message.Destination {
+					topic = logical
+					break
+				}
+				continue
+			}
+			if retryDestinationFor(r.client.source, logical, envelope.Priority, tier, r.subscription.Name) == message.Destination {
+				topic = logical
+				break
+			}
+		}
+		return schedulerLaneID(topic, envelope.Priority, tier)
+	}
+	if len(r.subscription.Topics) > 0 && len(r.subscription.Priorities) > 0 {
+		return schedulerLaneID(topicFor(r.subscription.Topics[0]), r.subscription.Priorities[0], 0)
+	}
+	return ""
 }
 
 // Drain stops fetching and waits for all worker deliveries to settle. A
@@ -251,6 +446,23 @@ func (r *Runner) Drain(ctx context.Context) error {
 	handlerCancel := r.handlerCancel
 	handlerShutdownCancel := r.handlerShutdownCancel
 	done := r.done
+	if r.lifecycle != nil {
+		switch r.lifecycle.State() {
+		case lifecycle.Ready:
+			if err := r.lifecycle.Transition(lifecycle.Draining); err != nil {
+				r.mu.Unlock()
+				return err
+			}
+		case lifecycle.Starting:
+		case lifecycle.Draining, lifecycle.Settling, lifecycle.Flushing:
+		case lifecycle.Closed:
+			r.mu.Unlock()
+			return nil
+		default:
+			r.mu.Unlock()
+			return fmt.Errorf("f1: runner cannot drain from lifecycle state %s", r.lifecycle.State())
+		}
+	}
 	r.draining = true
 	r.mu.Unlock()
 	if cancel != nil {
@@ -266,8 +478,13 @@ func (r *Runner) Drain(ctx context.Context) error {
 			grace = 0
 		}
 		delay := drainTimeout - grace
+		// The grace timer must not join the group whose completion it waits for.
+		// It watches done, and done is closed only after that group's Wait returns,
+		// so putting it there makes Wait block for the whole grace delay even when
+		// every delivery has already finished. asyncGroup is never waited by the
+		// runner, which is exactly what this goroutine needs.
 		r.mu.Lock()
-		group := r.group
+		group := r.asyncGroup
 		r.mu.Unlock()
 		if delay <= 0 || group == nil {
 			handlerCancel()
@@ -348,6 +565,36 @@ func setRunnerError(r *Runner, err error) {
 	r.mu.Unlock()
 }
 
+//nolint:contextcheck // helper derives the phase context from the caller.
+func runWithClockTimeout(parent context.Context, clk clock.Clock, timeout time.Duration, phase string, fn func(context.Context) error) error {
+	if fn == nil {
+		return nil
+	}
+	if parent == nil {
+		parent = context.Background()
+	}
+	if timeout <= 0 {
+		return fn(parent)
+	}
+	if clk == nil {
+		clk = clock.NewReal()
+	}
+	phaseCtx, cancel := context.WithCancel(parent)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- fn(phaseCtx) }()
+	timer := clk.Timer(timeout)
+	defer timer.Stop()
+	select {
+	case err := <-done:
+		return err
+	case <-timer.C:
+		return fmt.Errorf("f1: shutdown %s phase timed out: %w", phase, context.DeadlineExceeded)
+	case <-parent.Done():
+		return parent.Err()
+	}
+}
+
 func runnerSettlementContext(r *Runner, fallback context.Context) context.Context {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -384,6 +631,10 @@ func openRunnerConsumer(r *Runner, ctx context.Context) (driver.Consumer, error)
 		return nil, errors.New("f1: client is not connected")
 	}
 	destinations := subscriptionDestinations(effective, source, r.subscription)
+	retryDestinationTiers := retryDestinationTierMap(source, r.subscription)
+	r.mu.Lock()
+	r.retryDestinationTiers = retryDestinationTiers
+	r.mu.Unlock()
 	if policy != driver.TopologyNone {
 		if admin := conn.Admin(); admin != nil {
 			topology := subscriptionTopologySpecs(effective, source, r.subscription)
@@ -524,22 +775,27 @@ func enqueueDelivery(r *Runner, ctx context.Context, dispatch chan<- delivery, m
 	case <-ctx.Done():
 		// A cancellation path may still have a delivery in the channel. Put it
 		// back through the broker rather than losing it locally.
-		_ = nackDelivery(r, runnerSettlementContext(r, ctx), message, driver.NackOptions{Requeue: true})
-		r.inflight.Remove(id)
+		state := &deliveryState{id: id}
+		err := nackDelivery(r, runnerSettlementContext(r, ctx), message, driver.NackOptions{Requeue: true}, state)
+		outcome := settlementOutcomeRequeued
+		if err != nil {
+			outcome = settlementOutcomeUnknown
+		}
+		r.inflight.RemoveAs(id, outcome)
 		return false
 	}
 }
 
 func processDelivery(r *Runner, ctx context.Context, item delivery) {
 	abandoned := false
-	state := &deliveryState{}
+	state := &deliveryState{id: item.id}
 	var envelope Envelope
 	defer func() {
 		if recovered := recover(); recovered != nil {
 			err := fmt.Errorf("handler panic: %v\n%s", recovered, debug.Stack())
 			deadLetterAndSettle(r, ctx, item.message, envelope, ReasonPanic, err, state)
 		}
-		if !state.settled && !state.attempted {
+		if !state.settled && !state.attempted && abandoned {
 			_ = nackDelivery(r, runnerSettlementContext(r, ctx), item.message, driver.NackOptions{Requeue: true}, state)
 		}
 		operation := state.operation
@@ -548,7 +804,7 @@ func processDelivery(r *Runner, ctx context.Context, item delivery) {
 			case settlementOperationAck:
 				_ = ackDelivery(r, runnerSettlementContext(r, ctx), item.message, state)
 			case settlementOperationNack:
-				_ = nackDelivery(r, runnerSettlementContext(r, ctx), item.message, driver.NackOptions{Requeue: true}, state)
+				_ = nackDelivery(r, runnerSettlementContext(r, ctx), item.message, state.nackOptions, state)
 			}
 		}
 		if !state.settled && operation == settlementOperationAck {
@@ -580,6 +836,13 @@ func dispatchMessage(r *Runner, ctx context.Context, message driver.InboundMessa
 		envelope.Attempt = 1
 	}
 	*envelopeOut = envelope
+	maxAttempts := envelope.MaxAttempts
+	if maxAttempts <= 0 {
+		maxAttempts = r.subscription.Retry.MaxAttempts
+	}
+	if retry.CounterRunaway(envelope.Attempt, envelope.Deferrals, maxAttempts, r.subscription.MaxDeferrals) {
+		return deadLetterAndSettle(r, ctx, message, envelope, ReasonPoison, errors.New("retry counter exceeded sanity margin"), state)
+	}
 	// Record at receipt, before handler work or settlement: a failed settlement
 	// can cause the broker to redeliver this delivery.
 	recordAttemptDivergence(r, envelope.Type, envelope.Priority, envelope.Attempt, message.DeliveryCount)
@@ -609,14 +872,14 @@ func dispatchMessage(r *Runner, ctx context.Context, message driver.InboundMessa
 	if result.err == nil {
 		return ackDelivery(r, runnerSettlementContext(r, ctx), message, state)
 	}
-	if IsDropped(result.err) {
+	outcome := classifyRetryError(result.err)
+	switch outcome.Kind {
+	case retry.Drop:
 		runnerNotifyDiscarded(r, runnerSettlementContext(r, ctx), Discarded{Envelope: envelope, Reason: DiscardDropped, Err: result.err})
 		return ackDelivery(r, runnerSettlementContext(r, ctx), message, state)
-	}
-	if IsTerminal(result.err) {
+	case retry.Terminal:
 		return deadLetterAndSettle(r, ctx, message, envelope, ReasonTerminal, result.err, state)
-	}
-	if IsUnavailable(result.err) {
+	case retry.Unavailable:
 		if retryTiers(r.subscription.Retry) == 0 {
 			return deadLetterAndSettle(r, ctx, message, envelope, ReasonDependencyUnavailable, result.err, state)
 		}
@@ -626,14 +889,28 @@ func dispatchMessage(r *Runner, ctx context.Context, message driver.InboundMessa
 		}
 		return retryAndSettle(r, ctx, message, envelope, result.err, deferrals, false, state)
 	}
-	maxAttempts := envelope.MaxAttempts
-	if maxAttempts <= 0 {
-		maxAttempts = r.subscription.Retry.MaxAttempts
-	}
 	if envelope.Attempt >= maxAttempts {
 		return deadLetterAndSettle(r, ctx, message, envelope, ReasonMaxAttempts, result.err, state)
 	}
 	return retryAndSettle(r, ctx, message, envelope, result.err, 0, true, state)
+}
+
+func classifyRetryError(err error) retry.Outcome {
+	switch {
+	case IsTerminal(err):
+		return retry.Outcome{Kind: retry.Terminal, Err: err}
+	case IsDropped(err):
+		return retry.Outcome{Kind: retry.Drop, Err: err}
+	case IsUnavailable(err):
+		return retry.Outcome{Kind: retry.Unavailable, Err: err}
+	}
+	if delay, ok := RetryDelay(err); ok {
+		if delay < 0 {
+			delay = 0
+		}
+		return retry.Outcome{Kind: retry.RetryAfter, Delay: delay, Err: err}
+	}
+	return retry.Classify(err)
 }
 
 func recordAttemptDivergence(r *Runner, eventType string, priority Priority, attempt, deliveryCount int) {
@@ -745,24 +1022,35 @@ func invokeHandler(r *Runner, parent context.Context, handler Handler, event *Ev
 	}
 }
 
-func ackDelivery(_ *Runner, ctx context.Context, message driver.InboundMessage, states ...*deliveryState) bool {
+func ackDelivery(r *Runner, ctx context.Context, message driver.InboundMessage, states ...*deliveryState) bool {
+	return ackDeliveryAs(r, ctx, message, lifecycle.Handled, states...)
+}
+
+func ackDeliveryAs(r *Runner, ctx context.Context, message driver.InboundMessage, disposition lifecycle.Disposition, states ...*deliveryState) bool {
 	state := stateFor(states)
 	if message.Settle == nil {
 		return false
 	}
 	state.operation = settlementOperationAck
+	if r != nil && r.inflight != nil {
+		r.inflight.SetDisposition(state.id, dispatch.Disposition(disposition))
+	}
 	err := message.Settle.Ack(ctx)
 	state.attempted = true
 	state.settled = err == nil
 	return state.settled
 }
 
-func nackDelivery(_ *Runner, ctx context.Context, message driver.InboundMessage, options driver.NackOptions, states ...*deliveryState) error {
+func nackDelivery(r *Runner, ctx context.Context, message driver.InboundMessage, options driver.NackOptions, states ...*deliveryState) error {
 	state := stateFor(states)
 	if message.Settle == nil {
 		return errors.New("f1: delivered message has no settler")
 	}
 	state.operation = settlementOperationNack
+	state.nackOptions = options
+	if r != nil && r.inflight != nil {
+		r.inflight.SetDisposition(state.id, dispatch.DispositionRequeued)
+	}
 	err := message.Settle.Nack(ctx, options)
 	state.attempted = true
 	state.settled = err == nil
@@ -772,9 +1060,10 @@ func nackDelivery(_ *Runner, ctx context.Context, message driver.InboundMessage,
 func deadLetterAndSettle(r *Runner, ctx context.Context, message driver.InboundMessage, envelope Envelope, reason DeathReason, lastErr error, states ...*deliveryState) bool {
 	state := stateFor(states)
 	if err := deadLetter(r, ctx, message, envelope, reason, lastErr); err != nil {
+		_ = nackDelivery(r, runnerSettlementContext(r, ctx), message, driver.NackOptions{CountAsFailure: true}, state)
 		return false
 	}
-	return ackDelivery(r, runnerSettlementContext(r, ctx), message, state)
+	return ackDeliveryAs(r, runnerSettlementContext(r, ctx), message, lifecycle.DeadLettered, state)
 }
 
 func deadLetter(r *Runner, ctx context.Context, message driver.InboundMessage, envelope Envelope, reason DeathReason, lastErr error) error {
@@ -834,35 +1123,36 @@ func retryAndSettle(r *Runner, ctx context.Context, message driver.InboundMessag
 	if copyEnvelope.MaxAttempts == 0 {
 		copyEnvelope.MaxAttempts = r.subscription.Retry.MaxAttempts
 	}
-	tier := deferrals
-	if tier == 0 {
-		tier = envelope.Attempt
+	retryConfig := retry.Config{
+		MaxAttempts:     r.subscription.Retry.MaxAttempts,
+		InitialInterval: r.subscription.Retry.InitialInterval,
+		Multiplier:      r.subscription.Retry.Multiplier,
+		MaxInterval:     r.subscription.Retry.MaxInterval,
+		Jitter:          r.subscription.Retry.Jitter,
+		Tiers:           r.subscription.Retry.Tiers,
 	}
-	if tier < 1 {
-		tier = 1
-	}
-	tiers := retryTiers(r.subscription.Retry)
+	tiers := retryConfig.TierCount()
 	if tiers == 0 {
 		return deadLetterAndSettle(r, ctx, message, envelope, ReasonMaxAttempts, lastErr, state)
 	}
-	if tier > tiers {
-		tier = tiers
+	tier := retry.ResolveTier(retryConfig, envelope.Attempt)
+	if deferrals > 0 {
+		tier = retry.DeferralTier(deferrals, tiers)
 	}
-	delay := r.subscription.Retry.DelayFor(tier)
+	delay := retryConfig.DelayFor(tier)
 	if requested, ok := RetryDelay(lastErr); ok {
-		if requested < 0 {
-			requested = 0
+		resolvedTier, resolvedDelay, clamped := retry.ResolveRetryAfter(retryConfig, requested)
+		if clamped {
+			r.metrics.recordRetryAfterClamped(envelope.Type)
 		}
-		if max := r.subscription.Retry.MaxInterval; max > 0 && requested > max {
-			requested = max
-		}
-		delay = requested
+		tier, delay = resolvedTier, resolvedDelay
 	}
 	now := r.client.options.clock.Now().UTC()
 	due := now.Add(delay)
 	copyEnvelope.DueTime = &due
 	encoded, err := copyEnvelope.EncodeHeaders(r.client.config.Codec.MaxHeaderBytes)
 	if err != nil {
+		_ = nackDelivery(r, runnerSettlementContext(r, ctx), message, driver.NackOptions{CountAsFailure: true}, state)
 		return false
 	}
 	destination := retryDestination(r, copyEnvelope, tier)
@@ -872,9 +1162,10 @@ func retryAndSettle(r *Runner, ctx context.Context, message driver.InboundMessag
 	}
 	sort.Slice(out.Headers, func(i, j int) bool { return out.Headers[i].Key < out.Headers[j].Key })
 	if err := publishMessages(r.client, runnerSettlementContext(r, ctx), true, out); err != nil {
+		_ = nackDelivery(r, runnerSettlementContext(r, ctx), message, driver.NackOptions{CountAsFailure: true}, state)
 		return false
 	}
-	return ackDelivery(r, runnerSettlementContext(r, ctx), message, state)
+	return ackDeliveryAs(r, runnerSettlementContext(r, ctx), message, lifecycle.Retried, state)
 }
 
 func stopRunnerConsumer(r *Runner, ctx context.Context) error {
@@ -945,6 +1236,19 @@ func truncateError(err error) string {
 		return value[:4<<10]
 	}
 	return value
+}
+
+func retryDestinationTierMap(source string, sub Subscription) map[string]int {
+	result := make(map[string]int)
+	for _, topic := range sub.Topics {
+		logical := topicFor(topic)
+		for _, priority := range sub.Priorities {
+			for tier := 1; tier <= retryTiers(sub.Retry); tier++ {
+				result[retryDestinationFor(source, logical, priority, tier, sub.Name)] = tier
+			}
+		}
+	}
+	return result
 }
 
 func subscriptionDestinations(effective driver.Capabilities, source string, sub Subscription) []string {
@@ -1066,7 +1370,7 @@ func deadLetterDestinationFor(source, topic, subscription string) string {
 }
 
 func retryDestinationFor(source, topic string, priority Priority, tier int, subscription string) string {
-	return fmt.Sprintf("f1.%s.%s.%s.%s.retry.%d", sourceEnvironment(source), topic, subscription, priority, tier)
+	return fmt.Sprintf("f1.%s.%s.%s.%s.%s.%d", sourceEnvironment(source), topic, subscription, priority, retryDestinationSegment, tier)
 }
 
 func consumeDestination(effective driver.Capabilities, source, topic string, priority Priority, subscription string) string {

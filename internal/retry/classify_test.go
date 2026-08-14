@@ -77,3 +77,17 @@ func TestClassifyPreservesWrappedMarkers(t *testing.T) {
 		t.Fatalf("Classify() kind = %v, want Unavailable", got)
 	}
 }
+
+type allClassificationsError struct{ error }
+
+func (allClassificationsError) RetryTerminal() bool               { return true }
+func (allClassificationsError) RetryDropped() bool                { return true }
+func (allClassificationsError) RetryUnavailable() bool            { return true }
+func (allClassificationsError) RetryDelay() (time.Duration, bool) { return time.Hour, true }
+func (allClassificationsError) RetryPanic() bool                  { return true }
+
+func TestClassifyTerminalOutranksEveryOtherDisposition(t *testing.T) {
+	if got := Classify(allClassificationsError{errors.New("failure")}); got.Kind != Terminal {
+		t.Fatalf("Classify() kind = %v, want Terminal", got.Kind)
+	}
+}

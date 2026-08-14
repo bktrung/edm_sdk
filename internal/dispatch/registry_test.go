@@ -2,6 +2,7 @@ package dispatch
 
 import (
 	"context"
+	"errors"
 	"testing"
 )
 
@@ -36,27 +37,9 @@ func TestRegistryAccountsEverySettlementOutcome(t *testing.T) {
 	}
 }
 
-func TestRegistryWaitForSubset(t *testing.T) {
-	registry := NewRegistry()
-	first, second := registry.Add(), registry.Add()
-	registry.Remove(first)
-	if err := registry.WaitFor(context.Background(), []uint64{first}); err != nil {
-		t.Fatal(err)
-	}
-	if registry.Len() != 1 {
-		t.Fatalf("registry len = %d, want 1", registry.Len())
-	}
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-	if err := registry.WaitFor(ctx, []uint64{second}); err == nil {
-		t.Fatal("WaitFor must respect cancellation")
-	}
-	registry.Remove(second)
-}
-
 func TestRegistryNilAndDuplicateRemoval(t *testing.T) {
 	var registry *Registry
-	if registry.Len() != 0 || registry.WaitZero(context.Background()) != nil || registry.WaitFor(context.Background(), nil) != nil {
+	if registry.Len() != 0 || registry.WaitZero(context.Background()) != nil {
 		t.Fatal("nil registry should be empty and immediately complete")
 	}
 	value := NewRegistry()
@@ -67,4 +50,35 @@ func TestRegistryNilAndDuplicateRemoval(t *testing.T) {
 	if value.Counts().Received != 1 || value.Counts().Settlements.Settled != 1 {
 		t.Fatalf("duplicate removal changed counts: %+v", value.Counts())
 	}
+}
+
+func TestRegistryRejectsInvalidInputsAndWaitCancellation(t *testing.T) {
+	var nilRegistry *Registry
+	if nilRegistry.Add() != 0 || nilRegistry.Counts() != (Counts{}) {
+		t.Fatal("nil registry should ignore Add and Counts")
+	}
+	nilRegistry.SetDisposition(1, DispositionHandled)
+	nilRegistry.RemoveAs(1, SettlementOutcomeSettled)
+
+	registry := NewRegistry()
+	id := registry.Add()
+	registry.SetDisposition(id, Disposition(255))
+	registry.SetDisposition(id+1, DispositionHandled)
+	registry.RemoveAs(id, SettlementOutcome(255))
+	counts := registry.Counts()
+	if counts.Settlements.Unknown != 1 || counts.Dispositions.Requeued != 1 {
+		t.Fatalf("invalid outcome counts = %+v, want one unknown requeue", counts)
+	}
+	if err := registry.WaitZero(context.Background()); err != nil {
+		t.Fatalf("WaitZero() = %v", err)
+	}
+
+	pending := NewRegistry()
+	pending.Add()
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := pending.WaitZero(ctx); !errors.Is(err, context.Canceled) {
+		t.Fatalf("WaitZero(cancelled) = %v, want context canceled", err)
+	}
+	pending.Remove(1)
 }

@@ -1,9 +1,13 @@
 package f1
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"log/slog"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -29,6 +33,62 @@ func TestNewValidatesOptionsEagerly(t *testing.T) {
 	}
 	if _, err := New(context.Background(), cfg, WithDriver(&testDriver{}), WithMeterProvider(noop.NewMeterProvider()), WithTracerProvider(tracenoop.NewTracerProvider())); err != nil {
 		t.Fatalf("New() error = %v, want typed observability providers accepted", err)
+	}
+}
+
+func TestLogCapabilitiesWarnsForConfiguredUnavailableFeature(t *testing.T) {
+	var logs bytes.Buffer
+	cfg, err := LoadConfig(writeConfig(t, `
+f1:
+  env: test
+  service: orders
+  broker:
+    driver: inmem
+  subscriptions:
+    orders:
+      topics: [orders.created]
+      mode: orderedByKey
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	client, err := New(context.Background(), cfg,
+		WithDriver(&testDriver{conn: &testConn{info: driver.BrokerInfo{Kind: "test", Version: "1"}}}),
+		WithLogger(slog.New(slog.NewTextHandler(&logs, nil))),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = client.Close(context.Background()) })
+	assertOrderedCapabilityLog(t, logs.String(), "WARN")
+}
+
+func TestLogCapabilitiesAnnouncesUnusedUnavailableFeatureAtInfo(t *testing.T) {
+	var logs bytes.Buffer
+	client, err := New(context.Background(), testClientConfig(t),
+		WithDriver(&testDriver{conn: &testConn{info: driver.BrokerInfo{Kind: "test", Version: "1"}}}),
+		WithLogger(slog.New(slog.NewTextHandler(&logs, nil))),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = client.Close(context.Background()) })
+	assertOrderedCapabilityLog(t, logs.String(), "INFO")
+}
+
+func assertOrderedCapabilityLog(t *testing.T, output, wantLevel string) {
+	t.Helper()
+	var matches []string
+	for _, line := range strings.Split(output, "\n") {
+		if strings.Contains(line, "feature=ordered_by_key") {
+			matches = append(matches, line)
+		}
+	}
+	if len(matches) != 1 {
+		t.Fatalf("ordered_by_key log lines = %d, want 1; output = %q", len(matches), output)
+	}
+	if !strings.Contains(matches[0], "level="+wantLevel+" ") {
+		t.Fatalf("ordered_by_key log = %q, want level %s", matches[0], wantLevel)
 	}
 }
 
@@ -88,6 +148,84 @@ func TestHealthRejectsClosedClient(t *testing.T) {
 	}
 	if err := client.Health(context.Background()); err == nil || !strings.Contains(err.Error(), "closed") {
 		t.Fatalf("Health() error = %v, want closed-client error", err)
+	}
+}
+
+func TestCloseDrainsAllRunnersAfterOneFails(t *testing.T) {
+	t.Parallel()
+	cfg := testClientConfig(t)
+	conn := &testConn{}
+	client, err := New(context.Background(), cfg, WithDriver(&testDriver{conn: conn}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstErr := errors.New("first runner failed")
+	middleErr := errors.New("middle runner failed")
+	var drainCalls atomic.Int32
+	firstDone := make(chan struct{})
+	middleDone := make(chan struct{})
+	lastDone := make(chan struct{})
+	var release sync.Once
+	releaseAll := func() {
+		release.Do(func() {
+			close(firstDone)
+			close(middleDone)
+			close(lastDone)
+		})
+	}
+	makeRunner := func(runErr error, done chan struct{}) *Runner {
+		return &Runner{
+			client:  client,
+			started: true,
+			done:    done,
+			runErr:  runErr,
+			cancel: func() {
+				if drainCalls.Add(1) == 3 {
+					releaseAll()
+				}
+			},
+		}
+	}
+	first := makeRunner(firstErr, firstDone)
+	middle := makeRunner(middleErr, middleDone)
+	last := makeRunner(nil, lastDone)
+	client.mu.Lock()
+	client.runners[first] = struct{}{}
+	client.runners[middle] = struct{}{}
+	client.runners[last] = struct{}{}
+	client.mu.Unlock()
+
+	closeContext, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	err = client.Close(closeContext)
+	if !errors.Is(err, middleErr) {
+		t.Fatalf("Close() error = %v, want middle runner error", err)
+	}
+	if !errors.Is(err, firstErr) {
+		t.Fatalf("Close() error = %v, want joined first runner error", err)
+	}
+	for name, done := range map[string]<-chan struct{}{
+		"first":  firstDone,
+		"middle": middleDone,
+		"last":   lastDone,
+	} {
+		select {
+		case <-done:
+		default:
+			t.Fatalf("%s runner was not observably drained", name)
+		}
+	}
+	if got, want := drainCalls.Load(), int32(3); got != want {
+		t.Fatalf("runner drain calls = %d, want %d", got, want)
+	}
+
+	for _, runner := range []*Runner{first, middle} {
+		runner.mu.Lock()
+		runner.runErr = nil
+		runner.mu.Unlock()
+	}
+	if err := client.Close(context.Background()); err != nil {
+		t.Fatalf("second Close() error = %v", err)
 	}
 }
 

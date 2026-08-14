@@ -10,11 +10,12 @@ import (
 )
 
 type settler struct {
-	mu       sync.Mutex
-	owner    *consumer
-	delivery amqp.Delivery
-	settling bool
-	settled  bool
+	mu          sync.Mutex
+	owner       *consumer
+	destination string
+	delivery    amqp.Delivery
+	settling    bool
+	settled     bool
 }
 
 var _ driver.Settler = (*settler)(nil)

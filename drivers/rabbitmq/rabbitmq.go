@@ -28,6 +28,33 @@ type Driver struct{}
 // Name returns the stable RabbitMQ driver key.
 func (Driver) Name() string { return "rabbitmq" }
 
+type queueKind string
+
+const (
+	queueKindQuorum  queueKind = "quorum"
+	queueKindClassic queueKind = "classic"
+)
+
+func configuredQueueKind(options map[string]string) (queueKind, error) {
+	switch strings.ToLower(strings.TrimSpace(options["rabbitmq.queueType"])) {
+	case "", string(queueKindQuorum):
+		return queueKindQuorum, nil
+	case string(queueKindClassic):
+		return queueKindClassic, nil
+	default:
+		return "", fmt.Errorf("rabbitmq: unsupported queueType %q; supported values: quorum, classic, or empty", options["rabbitmq.queueType"])
+	}
+}
+
+func capabilitiesForQueueKind(kind queueKind) driver.Capabilities {
+	caps := Driver{}.Capabilities()
+	if kind == queueKindClassic {
+		caps.NativeDeliveryCount = false
+		caps.NativeDLQ = false
+	}
+	return caps
+}
+
 // Capabilities reports the RabbitMQ behavior used by this driver.
 func (Driver) Capabilities() driver.Capabilities {
 	return driver.Capabilities{
@@ -40,6 +67,7 @@ func (Driver) Capabilities() driver.Capabilities {
 		NativeDLQ:            true,
 		ConsumerScaling:      driver.ScalingFree,
 		Fanout:               driver.FanoutAtPublish,
+		LagQueryable:         true,
 	}
 }
 
@@ -51,6 +79,10 @@ func (Driver) Open(ctx context.Context, cfg driver.Config) (driver.Conn, error) 
 	}
 
 	if err := validateSASL(cfg.SASL); err != nil {
+		return nil, classify("open", driver.KindFatal, err)
+	}
+	queueKind, err := configuredQueueKind(cfg.DriverOptions)
+	if err != nil {
 		return nil, classify("open", driver.KindFatal, err)
 	}
 	openCtx := ctx
@@ -72,7 +104,7 @@ func (Driver) Open(ctx context.Context, cfg driver.Config) (driver.Conn, error) 
 			}
 			conn, err := dial(openCtx, endpoint, cfg)
 			if err == nil {
-				return newConn(conn, Driver{}.Capabilities()), nil
+				return newConn(conn, capabilitiesForQueueKind(queueKind), endpoint, queueKind), nil
 			}
 			lastErr = err
 		}
@@ -95,24 +127,32 @@ type conn struct {
 	amqp       *amqp.Connection
 	caps       driver.Capabilities
 	info       driver.BrokerInfo
+	queueKind  queueKind
+	management *managementClient
 	closed     bool
 	active     map[*consumer]struct{}
 	producers  map[*producer]struct{}
 	exchanges  map[string]struct{}
 	bindings   map[bindingKey]bool
+	deferred   map[string]time.Duration
+	ephemeral  map[string]*amqp.Channel
 }
 
 var _ driver.Conn = (*conn)(nil)
 
-func newConn(amqpConn *amqp.Connection, caps driver.Capabilities) *conn {
+func newConn(amqpConn *amqp.Connection, caps driver.Capabilities, endpoint string, kind queueKind) *conn {
 	return &conn{
-		amqp:      amqpConn,
-		caps:      caps,
-		info:      brokerInfo(amqpConn),
-		active:    make(map[*consumer]struct{}),
-		producers: make(map[*producer]struct{}),
-		exchanges: make(map[string]struct{}),
-		bindings:  make(map[bindingKey]bool),
+		amqp:       amqpConn,
+		caps:       caps,
+		info:       brokerInfo(amqpConn),
+		queueKind:  kind,
+		management: newManagementClient(endpoint),
+		active:     make(map[*consumer]struct{}),
+		producers:  make(map[*producer]struct{}),
+		exchanges:  make(map[string]struct{}),
+		bindings:   make(map[bindingKey]bool),
+		deferred:   make(map[string]time.Duration),
+		ephemeral:  make(map[string]*amqp.Channel),
 	}
 }
 
@@ -161,7 +201,26 @@ func (c *conn) Consumer(ctx context.Context, cfg driver.ConsumerConfig) (driver.
 	if len(cfg.Destinations) == 0 {
 		return nil, classify("consumer", driver.KindFatal, errors.New("no destinations"))
 	}
-	consumer, err := newConsumer(c, ctx, cfg)
+	if cfg.Exclusive {
+		for _, destination := range cfg.Destinations {
+			for active := range c.active {
+				if active.hasDestination(destination) {
+					return nil, classify("consumer", driver.KindFatal, fmt.Errorf("exclusive consumer refused: destination %q already has a consumer", destination))
+				}
+			}
+		}
+	}
+	for active := range c.active {
+		if !active.cfg.Exclusive {
+			continue
+		}
+		for _, destination := range cfg.Destinations {
+			if active.hasDestination(destination) {
+				return nil, classify("consumer", driver.KindFatal, fmt.Errorf("exclusive consumer refused: destination %q already has an exclusive consumer", destination))
+			}
+		}
+	}
+	consumer, err := newConsumer(c, cfg)
 	if err != nil {
 		return nil, err
 	}
@@ -213,7 +272,15 @@ func (c *conn) Close(ctx context.Context) error {
 	c.closed = true
 	deadline, hasDeadline := ctx.Deadline()
 	amqpConn := c.amqp
+	ephemeral := make([]*amqp.Channel, 0, len(c.ephemeral))
+	for _, channel := range c.ephemeral {
+		ephemeral = append(ephemeral, channel)
+	}
+	c.ephemeral = nil
 	c.mu.Unlock()
+	for _, channel := range ephemeral {
+		_ = channel.Close()
+	}
 
 	var err error
 	if hasDeadline {

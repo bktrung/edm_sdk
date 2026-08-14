@@ -40,11 +40,7 @@ func runTopology(group *groupContext) {
 		if containsName(diff.Existing, name) {
 			t.Fatalf("Existing=%v, want %q absent on first creation", diff.Existing, name)
 		}
-		t.Cleanup(func() {
-			if _, err := admin.Purge(group.ctx, name); err != nil {
-				t.Errorf("purge destination %q: %v", name, err)
-			}
-		})
+		cleanupTopologyDestinations(t, admin, group.ctx, name)
 		// FinalDestination is the profile-independent label: the two profile
 		// passes must record identical vectors, but the actual destination name
 		// is suffixed per profile to stay unique across the shared Conn.
@@ -101,13 +97,7 @@ func runTopology(group *groupContext) {
 		}); err != nil {
 			t.Fatalf("EnsureTopology(seed): %v", err)
 		}
-		t.Cleanup(func() {
-			for _, name := range []string{existing, created} {
-				if _, err := admin.Purge(group.ctx, name); err != nil {
-					t.Errorf("purge destination %q: %v", name, err)
-				}
-			}
-		})
+		cleanupTopologyDestinations(t, admin, group.ctx, existing, created)
 		diff, err := admin.EnsureTopology(group.ctx, driver.TopologySpec{
 			Destinations: []driver.DestinationSpec{{Name: existing}, {Name: created}},
 			Effective:    group.effective,
@@ -623,6 +613,32 @@ func containsName(names []string, want string) bool {
 		}
 	}
 	return false
+}
+
+func cleanupTopologyDestinations(t *testing.T, admin driver.Admin, ctx context.Context, names ...string) {
+	t.Helper()
+	t.Cleanup(func() {
+		results, err := admin.Prune(ctx, names)
+		if err != nil {
+			t.Errorf("prune destinations %v: %v", names, err)
+			return
+		}
+		for _, name := range names {
+			result := findPruneResult(results, name)
+			if !result.Deleted {
+				t.Errorf("Prune(%q)=%+v, want deleted", name, result)
+				continue
+			}
+			_, describeErr := admin.DescribeTopology(ctx, []string{name})
+			if describeErr == nil {
+				t.Errorf("DescribeTopology(%q) succeeded after cleanup, want destination missing", name)
+				continue
+			}
+			if !errors.Is(describeErr, driver.ErrDestinationMissing) {
+				t.Errorf("DescribeTopology(%q) after cleanup: %v", name, describeErr)
+			}
+		}
+	})
 }
 
 func findOrphan(orphans []driver.OrphanedDestination, name string) (driver.OrphanedDestination, bool) {

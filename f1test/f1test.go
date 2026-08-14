@@ -24,9 +24,10 @@ import (
 type Client struct {
 	*f1.Client
 
-	clock    *clock.Fake
-	captures *captureStore
-	state    *captureState
+	clock     *clock.Fake
+	timer20ms <-chan struct{}
+	captures  *captureStore
+	state     *captureState
 }
 
 // Captured is one message accepted by the in-memory driver's producer.
@@ -61,6 +62,8 @@ func closeClient(client *Client) error {
 
 func newClient(opts ...f1.Option) (*Client, error) {
 	fake := clock.NewFake(time.Unix(0, 0))
+	timer20ms := make(chan struct{})
+	observedClock := &observedClock{Fake: fake, delay: 20 * time.Millisecond, armed: timer20ms}
 	captures := &captureStore{publishedSignal: make(chan struct{}, 1)}
 	state := &captureState{
 		destinations: make(map[string]chan struct{}),
@@ -72,14 +75,14 @@ func newClient(opts ...f1.Option) (*Client, error) {
 	// These options are last so every helper always observes the same fake
 	// clock that the in-memory driver's deferred-delivery queue uses.
 	options = append(options,
-		f1.WithDriver(captureDriver{inner: inmem.New(fake), captures: captures, state: state}),
-		f1.WithClock(fake),
+		f1.WithDriver(captureDriver{inner: inmem.New(observedClock), captures: captures, state: state}),
+		f1.WithClock(observedClock),
 	)
 	core, err := f1.New(context.Background(), testConfig(), options...)
 	if err != nil {
 		return nil, err
 	}
-	return &Client{Client: core, clock: fake, captures: captures, state: state}, nil
+	return &Client{Client: core, clock: fake, timer20ms: timer20ms, captures: captures, state: state}, nil
 }
 
 func testConfig() f1.Config {
@@ -393,4 +396,18 @@ func (p *captureProducer) Publish(ctx context.Context, messages ...driver.Outbou
 	err := p.Producer.Publish(ctx, messages...)
 	p.captures.add(messages, err)
 	return err
+}
+
+type observedClock struct {
+	*clock.Fake
+	delay time.Duration
+	armed chan struct{}
+	once  sync.Once
+}
+
+func (c *observedClock) Timer(d time.Duration) clock.Timer {
+	if d == c.delay {
+		c.once.Do(func() { close(c.armed) })
+	}
+	return c.Fake.Timer(d)
 }

@@ -21,7 +21,9 @@ type Option func(*clientOptions) error
 type TopologyPolicy = driver.TopologyPolicy
 
 const (
-	// TopologyDeclare creates missing topology and is the default.
+	// TopologyDeclare creates missing topology. Effective policy selection gives
+	// an explicit WithTopology override priority, then uses topology.autoCreate;
+	// topology.verifyOnStart selects verification, otherwise TopologyNone applies.
 	TopologyDeclare = driver.TopologyDeclare
 	// TopologyVerify checks that topology exists and creates nothing.
 	TopologyVerify = driver.TopologyVerify
@@ -176,7 +178,9 @@ func WithPublishTopics(topics ...string) Option {
 	}
 }
 
-// WithTopology selects how the SDK handles required broker topology.
+// WithTopology selects how the SDK handles required broker topology and
+// overrides configured policy. Without it, autoCreate selects declare,
+// verifyOnStart selects verify, and neither setting selects none.
 func WithTopology(p TopologyPolicy) Option {
 	return func(options *clientOptions) error {
 		if p < TopologyDeclare || p > TopologyNone {

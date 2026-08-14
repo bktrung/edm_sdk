@@ -2,8 +2,10 @@ package dispatch
 
 import (
 	"context"
+	"errors"
 	"runtime"
 	"sync"
+	"sync/atomic"
 	"testing"
 )
 
@@ -175,4 +177,94 @@ func TestPoolNilOperations(t *testing.T) {
 	if err := pool.WaitFree(context.Background()); err == nil {
 		t.Fatal("nil pool WaitFree must fail")
 	}
+}
+
+func TestPoolSubmitAndWaitCancellationPaths(t *testing.T) {
+	parent, cancelParent := context.WithCancel(context.Background())
+	pool, err := NewPool(parent, 1, false, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	started := make(chan struct{})
+	release := make(chan struct{})
+	if err := pool.Submit(context.Background(), Work{Run: func(context.Context) {
+		close(started)
+		<-release
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	<-started
+	if err := pool.Submit(context.Background(), Work{Run: func(context.Context) {}}); err != nil {
+		t.Fatal(err)
+	}
+	cancelParent()
+	if err := pool.Submit(context.Background(), Work{Run: func(context.Context) {}}); !errors.Is(err, context.Canceled) {
+		t.Fatalf("Submit() after parent cancellation = %v, want context canceled", err)
+	}
+	if err := pool.WaitFree(context.Background()); !errors.Is(err, context.Canceled) {
+		t.Fatalf("WaitFree after parent cancellation = %v, want context canceled", err)
+	}
+	close(release)
+	pool.Close()
+
+	resized, err := NewPool(context.Background(), 2, false, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var resizedRuns atomic.Int32
+	for i := 0; i < 2; i++ {
+		if err := resized.Submit(context.Background(), Work{Run: func(context.Context) { resizedRuns.Add(1) }}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	resized.Close()
+	if got, want := resizedRuns.Load(), int32(2); got != want {
+		t.Fatalf("resized pool runs = %d, want %d", got, want)
+	}
+}
+
+func TestPoolSubmitReturnsClosedDuringClose(t *testing.T) {
+	pool, err := NewPool(context.Background(), 1, false, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	started := make(chan struct{})
+	release := make(chan struct{})
+	if err := pool.Submit(context.Background(), Work{Run: func(context.Context) {
+		close(started)
+		<-release
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	<-started
+	if err := pool.Submit(context.Background(), Work{Run: func(context.Context) {}}); err != nil {
+		t.Fatal(err)
+	}
+	submitDone := make(chan error, 1)
+	go func() {
+		submitDone <- pool.Submit(context.Background(), Work{Run: func(context.Context) {}})
+	}()
+	for i := 0; i < 100000; i++ {
+		pool.mu.Lock()
+		active := pool.active
+		pool.mu.Unlock()
+		if active > 0 {
+			break
+		}
+		if i == 99999 {
+			t.Fatal("blocked submit did not reach the pool")
+		}
+		runtime.Gosched()
+	}
+	closeDone := make(chan struct{})
+	go func() {
+		pool.Close()
+		close(closeDone)
+	}()
+	<-pool.closing
+	if err := <-submitDone; err == nil || err.Error() != "dispatch: pool is closed" {
+		t.Fatalf("blocked Submit() error = %v, want pool closed", err)
+	}
+	close(release)
+	<-closeDone
 }

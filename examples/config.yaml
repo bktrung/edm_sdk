@@ -1,0 +1,27 @@
+f1:
+  env: dev
+  service: quickstart
+  instanceId: local
+  broker:
+    driver: rabbitmq
+    endpoints:
+      # Change this URI for the real broker host, port, credentials, and vhost.
+      - amqp://guest:guest@localhost:5672/
+    connectTimeout: 10s
+    defaultPrefetch: 1
+  topology:
+    # Development creates entry points and queues; production should provision them instead.
+    autoCreate: true
+    verifyOnStart: false
+    priorities: [normal]
+  subscriptions:
+    quickstart:
+      topics: [quickstart.message]
+      concurrency: 1
+      prefetch: 1
+      priorities: [normal]
+      retry:
+        maxAttempts: 1
+      maxDeferrals: 1
+      handlerTimeout: 5s
+      unmatchedPolicy: deadletter

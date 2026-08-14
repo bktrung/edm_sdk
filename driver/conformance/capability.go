@@ -320,6 +320,7 @@ func runCapability(group *groupContext) {
 			"MaxHeaderBytes": {}, "LagQueryable": {},
 			"PerMessageAck/independent": {}, "OrderedByKey/receipt": {},
 			"NativePriority/delivery": {}, "NativeDelay/delivery": {},
+			"Fanout/delivery":                {},
 			"NativeDeliveryCount/redelivery": {}, "NackRequeueFalse/settlement": {},
 			"ConsumerScaling/delivery": {}, "LagQueryable/query": {},
 			"MaxMessageBytes/probe": {}, "MaxHeaderBytes/probe": {},
@@ -356,7 +357,7 @@ func runCapability(group *groupContext) {
 func capabilityDeclarationChecks(group *groupContext) {
 	checkCapabilityDeclaration(group, "declares per-message acknowledgement policy", "PerMessageAck", func(c driver.Capabilities) string { return strconv.FormatBool(c.PerMessageAck) })
 	checkCapabilityDeclaration(group, "declares ordered-by-key policy", "OrderedByKey", func(c driver.Capabilities) string { return strconv.FormatBool(c.OrderedByKey) })
-	checkCapabilityDeclaration(group, "declares fanout mode", "Fanout", func(c driver.Capabilities) string { return strconv.Itoa(int(c.Fanout)) })
+	checkFanoutDeclaration(group)
 	checkCapabilityDeclaration(group, "declares native priority mode", "NativePriority", func(c driver.Capabilities) string { return c.NativePriority.String() })
 	checkCapabilityDeclaration(group, "declares native priority levels", "NativePriorityLevels", func(c driver.Capabilities) string { return strconv.Itoa(c.NativePriorityLevels) })
 	checkCapabilityDeclaration(group, "declares native delay policy", "NativeDelay", func(c driver.Capabilities) string { return strconv.FormatBool(c.NativeDelay) })
@@ -366,6 +367,79 @@ func capabilityDeclarationChecks(group *groupContext) {
 	checkCapabilityDeclaration(group, "declares maximum message bytes", "MaxMessageBytes", func(c driver.Capabilities) string { return strconv.Itoa(c.MaxMessageBytes) })
 	checkCapabilityDeclaration(group, "declares maximum header bytes", "MaxHeaderBytes", func(c driver.Capabilities) string { return strconv.Itoa(c.MaxHeaderBytes) })
 	checkCapabilityDeclaration(group, "declares lag query policy", "LagQueryable", func(c driver.Capabilities) string { return strconv.FormatBool(c.LagQueryable) })
+}
+
+func checkFanoutDeclaration(group *groupContext) {
+	group.Check("declares fanout mode", func(t *testing.T) {
+		want := strconv.Itoa(int(effectiveCapabilities(group.conn.Capabilities(), group.profile).Fanout))
+		got := strconv.Itoa(int(group.effective.Fanout))
+		if got != want {
+			t.Fatalf("Fanout declaration=%q, want effective=%q", got, want)
+		}
+		group.capability("Fanout", got, "declared", "effective declaration reached the driver configuration")
+		if group.effective.Fanout != driver.FanoutAtPublish {
+			group.capability("Fanout/delivery", got, "denied", "the driver does not claim publish-time fanout")
+			return
+		}
+
+		exchange := "capability.fanout." + group.profile.String() + ".exchange"
+		firstDestination := "capability.fanout." + group.profile.String() + ".first"
+		secondDestination := "capability.fanout." + group.profile.String() + ".second"
+		if _, err := group.conn.Admin().EnsureTopology(group.ctx, driver.TopologySpec{
+			Exchanges: []driver.ExchangeSpec{{Name: exchange, Kind: "fanout", Durable: true}},
+			Destinations: []driver.DestinationSpec{
+				{Name: firstDestination, Durable: true},
+				{Name: secondDestination, Durable: true},
+			},
+			Bindings: []driver.BindingSpec{
+				{Source: exchange, Destination: firstDestination},
+				{Source: exchange, Destination: secondDestination},
+			},
+			Effective: group.effective,
+		}); err != nil {
+			t.Fatalf("EnsureTopology fanout probe: %v", err)
+		}
+		producer, err := group.conn.Producer(group.ctx, driver.ProducerConfig{
+			RequireDurableAck: true, Effective: group.effective,
+		})
+		if err != nil {
+			t.Fatalf("Producer fanout probe: %v", err)
+		}
+		t.Cleanup(func() {
+			if err := producer.Close(group.ctx); err != nil {
+				t.Errorf("close fanout probe producer: %v", err)
+			}
+		})
+		t.Cleanup(func() {
+			for _, destination := range []string{firstDestination, secondDestination} {
+				if _, err := group.conn.Admin().Purge(group.ctx, destination); err != nil {
+					t.Errorf("purge fanout probe destination %q: %v", destination, err)
+				}
+			}
+		})
+		first := newConsumerFor(t, group, driver.ConsumerConfig{
+			Destinations: []string{firstDestination}, Prefetch: 1, Effective: group.effective,
+		})
+		second := newConsumerFor(t, group, driver.ConsumerConfig{
+			Destinations: []string{secondDestination}, Prefetch: 1, Effective: group.effective,
+		})
+		if err := producer.Publish(group.ctx, driver.OutboundMessage{
+			Destination: exchange, Body: []byte("fanout-copy"),
+		}); err != nil {
+			t.Fatalf("fanout publish: %v", err)
+		}
+		firstMessage := receiveMessage(t, group, first)
+		secondMessage := receiveMessage(t, group, second)
+		for name, message := range map[string]driver.InboundMessage{
+			"first": firstMessage, "second": secondMessage,
+		} {
+			if string(message.Body) != "fanout-copy" {
+				t.Fatalf("%s fanout body=%q, want fanout-copy", name, message.Body)
+			}
+			ackMessage(t, group, message)
+		}
+		group.capability("Fanout/delivery", got, "claimed", "one publish reached both independent subscription destinations")
+	})
 }
 
 func checkCapabilityDeclaration(group *groupContext, name, field string, read func(driver.Capabilities) string) {
