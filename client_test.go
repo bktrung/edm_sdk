@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -100,44 +101,71 @@ func TestCloseDrainsAllRunnersAfterOneFails(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	firstErr := errors.New("first runner failed")
 	middleErr := errors.New("middle runner failed")
 	var drainCalls atomic.Int32
-	makeRunner := func(runErr error) *Runner {
-		done := make(chan struct{})
-		var cancelled atomic.Bool
+	firstDone := make(chan struct{})
+	middleDone := make(chan struct{})
+	lastDone := make(chan struct{})
+	var release sync.Once
+	releaseAll := func() {
+		release.Do(func() {
+			close(firstDone)
+			close(middleDone)
+			close(lastDone)
+		})
+	}
+	makeRunner := func(runErr error, done chan struct{}) *Runner {
 		return &Runner{
 			client:  client,
 			started: true,
 			done:    done,
 			runErr:  runErr,
 			cancel: func() {
-				drainCalls.Add(1)
-				if cancelled.CompareAndSwap(false, true) {
-					close(done)
+				if drainCalls.Add(1) == 3 {
+					releaseAll()
 				}
 			},
 		}
 	}
-	first := makeRunner(nil)
-	middle := makeRunner(middleErr)
-	last := makeRunner(nil)
+	first := makeRunner(firstErr, firstDone)
+	middle := makeRunner(middleErr, middleDone)
+	last := makeRunner(nil, lastDone)
 	client.mu.Lock()
 	client.runners[first] = struct{}{}
 	client.runners[middle] = struct{}{}
 	client.runners[last] = struct{}{}
 	client.mu.Unlock()
 
-	err = client.Close(context.Background())
+	closeContext, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	err = client.Close(closeContext)
 	if !errors.Is(err, middleErr) {
 		t.Fatalf("Close() error = %v, want middle runner error", err)
+	}
+	if !errors.Is(err, firstErr) {
+		t.Fatalf("Close() error = %v, want joined first runner error", err)
+	}
+	for name, done := range map[string]<-chan struct{}{
+		"first":  firstDone,
+		"middle": middleDone,
+		"last":   lastDone,
+	} {
+		select {
+		case <-done:
+		default:
+			t.Fatalf("%s runner was not observably drained", name)
+		}
 	}
 	if got, want := drainCalls.Load(), int32(3); got != want {
 		t.Fatalf("runner drain calls = %d, want %d", got, want)
 	}
 
-	middle.mu.Lock()
-	middle.runErr = nil
-	middle.mu.Unlock()
+	for _, runner := range []*Runner{first, middle} {
+		runner.mu.Lock()
+		runner.runErr = nil
+		runner.mu.Unlock()
+	}
 	if err := client.Close(context.Background()); err != nil {
 		t.Fatalf("second Close() error = %v", err)
 	}
