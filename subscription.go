@@ -189,6 +189,9 @@ func (c *Client) Subscribe(ctx context.Context, sub Subscription) (*Runner, erro
 	if err := validateSubscription(c.config, sub.Name, resolved); err != nil {
 		return nil, err
 	}
+	if resolved.Mode == OrderedByKey && !c.effective.OrderedByKey {
+		return nil, fmt.Errorf("f1: subscription %s requests ordered_by_key, but feature is unavailable", sub.Name)
+	}
 	c.mu.Lock()
 	if c.closed || c.conn == nil {
 		c.mu.Unlock()

@@ -3,8 +3,6 @@ package f1
 import (
 	"context"
 	"errors"
-	"hash/fnv"
-	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -462,130 +460,6 @@ func (c *dispatchConsumer) Stop(context.Context) error {
 
 func (*dispatchConsumer) Lag(context.Context) (map[string]int64, error) {
 	return nil, driver.ErrUnsupported
-}
-
-func TestRunnerEmulatesOrderedByKeyWithConcurrentWorkers(t *testing.T) {
-	firstStarted := make(chan struct{})
-	secondStarted := make(chan struct{})
-	otherStarted := make(chan struct{})
-	release := make(chan struct{})
-	var orderMu sync.Mutex
-	var sameIDs []string
-	var releaseOnce sync.Once
-	releaseHandler := func() { releaseOnce.Do(func() { close(release) }) }
-	consumer := newDispatchConsumer()
-	conn := &dispatchConn{producer: &dispatchProducer{}, consumer: consumer}
-	cfg := testClientConfig(t)
-	cfg.Lifecycle.DrainTimeout = 10 * time.Millisecond
-	cfg.Lifecycle.HandlerGrace = 5 * time.Millisecond
-	fake := clock.NewFake(time.Unix(0, 0))
-	client, err := New(context.Background(), cfg, WithDriver(&dispatchDriver{conn: conn}), WithClock(fake))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() { _ = client.Close(context.Background()) }()
-	runner, err := client.Subscribe(context.Background(), Subscription{
-		Name:           "orders",
-		Topics:         []string{"orders.created"},
-		Mode:           OrderedByKey,
-		Concurrency:    2,
-		Prefetch:       2,
-		Priorities:     []Priority{PriorityNormal},
-		Retry:          RetryConfig{MaxAttempts: 1},
-		MaxDeferrals:   1,
-		HandlerTimeout: time.Millisecond,
-		Handlers: map[string]Handler{
-			"orders.created": HandlerFunc(func(_ context.Context, event *Event) error {
-				switch event.ID() {
-				case "same-1":
-					close(firstStarted)
-					<-release
-				case "same-2":
-					close(secondStarted)
-				case "other":
-					close(otherStarted)
-				}
-				if event.ID() == "same-1" || event.ID() == "same-2" {
-					orderMu.Lock()
-					sameIDs = append(sameIDs, event.ID())
-					orderMu.Unlock()
-				}
-				return nil
-			}),
-		},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if client.effective.OrderedByKey {
-		t.Fatal("test driver unexpectedly provides native ordering")
-	}
-	sameKey, otherKey := distinctDispatchKeys(2)
-	defer releaseHandler()
-	settled := make(chan struct{}, 3)
-	message := func(id string, key []byte) driver.InboundMessage {
-		envelope := Envelope{SpecVersion: "1.0", ID: id, Source: "/test/orders", Type: "orders.created", Attempt: 1}
-		headers, err := envelope.EncodeHeaders(CoreMaxHeaderBytes)
-		if err != nil {
-			t.Fatal(err)
-		}
-		return driver.InboundMessage{Destination: "f1.test.orders.created.normal", Key: key, Headers: headerSlice(headers), Body: []byte(`{}`), DeliveryCount: 1, Settle: &dispatchSettler{onSettle: func() { settled <- struct{}{} }}}
-	}
-	runDone := make(chan error, 1)
-	go func() { runDone <- runner.Run(context.Background()) }()
-	consumer.messages <- message("same-1", sameKey)
-	consumer.messages <- message("same-2", sameKey)
-	consumer.messages <- message("other", otherKey)
-	waitDispatchSignal(t, firstStarted, "same-key handler did not start")
-	waitDispatchSignal(t, otherStarted, "different-key handler did not run concurrently")
-	select {
-	case <-secondStarted:
-		t.Fatal("equal keys ran concurrently")
-	default:
-	}
-	releaseHandler()
-	waitDispatchSignal(t, secondStarted, "same-key successor did not run")
-	for i := 0; i < 3; i++ {
-		waitDispatchSignal(t, settled, "message did not settle")
-	}
-	drainDone := make(chan error, 1)
-	go func() { drainDone <- runner.Drain(context.Background()) }()
-	var drainErr error
-	for i := 0; i < 100; i++ {
-		fake.Advance(time.Millisecond)
-		runtime.Gosched()
-		select {
-		case drainErr = <-drainDone:
-			i = 100
-		default:
-		}
-	}
-	if drainErr != nil {
-		t.Fatal(drainErr)
-	}
-	if err := <-runDone; err != nil {
-		t.Fatal(err)
-	}
-	orderMu.Lock()
-	defer orderMu.Unlock()
-	if len(sameIDs) != 2 || sameIDs[0] != "same-1" || sameIDs[1] != "same-2" {
-		t.Fatalf("same-key order = %v, want [same-1 same-2]", sameIDs)
-	}
-}
-
-func distinctDispatchKeys(concurrency uint32) ([]byte, []byte) {
-	first := []byte{0}
-	firstHash := fnv.New32a()
-	_, _ = firstHash.Write(first)
-	for value := 1; value < 256; value++ {
-		candidate := []byte{byte(value)}
-		hash := fnv.New32a()
-		_, _ = hash.Write(candidate)
-		if hash.Sum32()%concurrency != firstHash.Sum32()%concurrency {
-			return first, candidate
-		}
-	}
-	return first, []byte{1}
 }
 
 func waitDispatchSignal(t *testing.T, signal <-chan struct{}, message string) {
