@@ -162,12 +162,27 @@ func logCapabilities(c *Client) {
 		if feature.Detail != "" {
 			attrs = append(attrs, "detail", feature.Detail)
 		}
-		if feature.Mode == FeatureUnavailable {
+		warn := feature.Mode == FeatureUnavailable && capabilityRequired(c, feature.Feature)
+		if warn {
 			c.options.logger.Warn("f1 capability unavailable", attrs...)
+		} else if feature.Mode == FeatureUnavailable {
+			c.options.logger.Info("f1 capability unavailable", attrs...)
 		} else {
 			c.options.logger.Info("f1 capability emulated", attrs...)
 		}
 	}
+}
+
+func capabilityRequired(c *Client, feature string) bool {
+	if c == nil || feature != "ordered_by_key" {
+		return false
+	}
+	for _, subscription := range c.config.Subscriptions {
+		if subscription.Mode == OrderedByKey {
+			return true
+		}
+	}
+	return false
 }
 
 func featureModeString(mode FeatureMode) string {

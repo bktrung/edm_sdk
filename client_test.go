@@ -1,8 +1,10 @@
 package f1
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"log/slog"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -31,6 +33,62 @@ func TestNewValidatesOptionsEagerly(t *testing.T) {
 	}
 	if _, err := New(context.Background(), cfg, WithDriver(&testDriver{}), WithMeterProvider(noop.NewMeterProvider()), WithTracerProvider(tracenoop.NewTracerProvider())); err != nil {
 		t.Fatalf("New() error = %v, want typed observability providers accepted", err)
+	}
+}
+
+func TestLogCapabilitiesWarnsForConfiguredUnavailableFeature(t *testing.T) {
+	var logs bytes.Buffer
+	cfg, err := LoadConfig(writeConfig(t, `
+f1:
+  env: test
+  service: orders
+  broker:
+    driver: inmem
+  subscriptions:
+    orders:
+      topics: [orders.created]
+      mode: orderedByKey
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	client, err := New(context.Background(), cfg,
+		WithDriver(&testDriver{conn: &testConn{info: driver.BrokerInfo{Kind: "test", Version: "1"}}}),
+		WithLogger(slog.New(slog.NewTextHandler(&logs, nil))),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = client.Close(context.Background()) })
+	assertOrderedCapabilityLog(t, logs.String(), "WARN")
+}
+
+func TestLogCapabilitiesAnnouncesUnusedUnavailableFeatureAtInfo(t *testing.T) {
+	var logs bytes.Buffer
+	client, err := New(context.Background(), testClientConfig(t),
+		WithDriver(&testDriver{conn: &testConn{info: driver.BrokerInfo{Kind: "test", Version: "1"}}}),
+		WithLogger(slog.New(slog.NewTextHandler(&logs, nil))),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = client.Close(context.Background()) })
+	assertOrderedCapabilityLog(t, logs.String(), "INFO")
+}
+
+func assertOrderedCapabilityLog(t *testing.T, output, wantLevel string) {
+	t.Helper()
+	var matches []string
+	for _, line := range strings.Split(output, "\n") {
+		if strings.Contains(line, "feature=ordered_by_key") {
+			matches = append(matches, line)
+		}
+	}
+	if len(matches) != 1 {
+		t.Fatalf("ordered_by_key log lines = %d, want 1; output = %q", len(matches), output)
+	}
+	if !strings.Contains(matches[0], "level="+wantLevel+" ") {
+		t.Fatalf("ordered_by_key log = %q, want level %s", matches[0], wantLevel)
 	}
 }
 
