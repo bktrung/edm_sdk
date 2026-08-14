@@ -222,7 +222,7 @@ func (c *Client) Subscribe(ctx context.Context, sub Subscription) (*Runner, erro
 	}
 	c.runners[runner] = struct{}{}
 	if c.metrics != nil {
-		runner.metrics.unregister = c.metrics.Register(effective.Name, runner.metrics.sampleAttemptDivergenceByTopic, runner.metrics.currentStuckWorkers)
+		runner.metrics.unregister = c.metrics.Register(effective.Name, runner.metrics.sampleAttemptDivergenceByTopic, runner.metrics.currentStuckWorkers, runner.metrics.sampleRetryAfterClamped)
 	}
 	c.mu.Unlock()
 	return runner, nil

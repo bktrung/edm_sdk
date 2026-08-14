@@ -24,6 +24,7 @@ func init() {
 	RegisterMetric("f1_capability_info", "feature", "mode")
 	RegisterMetric("f1_attempt_divergence", "topic")
 	RegisterMetric("f1_stuck_workers", "subscription")
+	RegisterMetric("f1_retry_after_clamped_total", "topic", "subscription")
 }
 
 // RegisterMetric records a metric family for validation and instrumentation.

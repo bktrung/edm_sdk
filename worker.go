@@ -36,12 +36,14 @@ type deliveryState struct {
 	settled   bool
 	// operation records which settlement call was last made, so that a failed
 	// one can be retried in kind rather than guessed at.
-	operation settlementOperation
+	operation   settlementOperation
+	nackOptions driver.NackOptions
 }
 
 type deliveryMetrics struct {
 	attemptDivergence obs.SampledGaugeSet
 	topics            []string
+	retryAfterClamped []obs.SampledCounter
 	stuckWorkers      atomic.Int64
 	activeHandlers    atomic.Int64
 	retired           atomic.Bool
@@ -66,6 +68,7 @@ func newDeliveryMetrics(topics []string) deliveryMetrics {
 	return deliveryMetrics{
 		attemptDivergence: obs.NewSampledGaugeSet(unique, deliveryPriorityLanes),
 		topics:            append([]string(nil), unique...),
+		retryAfterClamped: make([]obs.SampledCounter, len(unique)),
 	}
 }
 
@@ -98,6 +101,24 @@ func (m *deliveryMetrics) sampleAttemptDivergenceByTopic() map[string]int64 {
 
 func (m *deliveryMetrics) currentStuckWorkers() int64 {
 	return m.stuckWorkers.Load()
+}
+
+func (m *deliveryMetrics) recordRetryAfterClamped(eventType string) {
+	topic := topicFor(eventType)
+	index := sort.SearchStrings(m.topics, topic)
+	if index < len(m.topics) && m.topics[index] == topic {
+		m.retryAfterClamped[index].Add(1)
+	}
+}
+
+func (m *deliveryMetrics) sampleRetryAfterClamped() map[string]uint64 {
+	values := make(map[string]uint64, len(m.topics))
+	for index, topic := range m.topics {
+		if value := m.retryAfterClamped[index].Sample(); value > 0 {
+			values[topic] = value
+		}
+	}
+	return values
 }
 
 type handlerActivity struct {
@@ -373,19 +394,19 @@ func newRunnerScheduler(r *Runner) (*sched.Scheduler, error) {
 
 func schedulerLaneID(topic string, priority Priority, tier int) string {
 	if tier > 0 {
-		return fmt.Sprintf("%s.%s.retry.%d", topic, priority, tier)
+		return fmt.Sprintf("%s.%s.%s.%d", topic, priority, retryDestinationSegment, tier)
 	}
 	return fmt.Sprintf("%s.%s.main", topic, priority)
 }
 
 func schedulerRetryGroupID(topic string, priority Priority) string {
-	return fmt.Sprintf("%s.%s.retry", topic, priority)
+	return fmt.Sprintf("%s.%s.%s", topic, priority, retryDestinationSegment)
 }
 
 func deliveryLane(r *Runner, message driver.InboundMessage) string {
 	envelope, err := DecodeHeaders(inboundHeaders(message.Headers))
 	if err == nil {
-		tier := retryTierForDestination(message.Destination)
+		tier := retryTierFromHeaders(message.Headers)
 		topic := topicFor(envelope.Type)
 		effective := r.client.effective
 		for _, configured := range r.subscription.Topics {
@@ -410,16 +431,20 @@ func deliveryLane(r *Runner, message driver.InboundMessage) string {
 	return ""
 }
 
-func retryTierForDestination(destination string) int {
-	index := strings.LastIndex(destination, ".retry.")
-	if index < 0 {
+const retryTierHeader = "f1retrytier"
+
+func retryTierFromHeaders(headers []driver.Header) int {
+	var value string
+	for _, header := range headers {
+		if header.Key == retryTierHeader {
+			value = string(header.Value)
+			break
+		}
+	}
+	if value == "" {
 		return 0
 	}
-	rest := destination[index+len(".retry."):]
-	if end := strings.IndexByte(rest, '.'); end >= 0 {
-		rest = rest[:end]
-	}
-	tier, err := strconv.Atoi(rest)
+	tier, err := strconv.Atoi(value)
 	if err != nil || tier < 1 {
 		return 0
 	}
@@ -786,7 +811,7 @@ func processDelivery(r *Runner, ctx context.Context, item delivery) {
 			err := fmt.Errorf("handler panic: %v\n%s", recovered, debug.Stack())
 			deadLetterAndSettle(r, ctx, item.message, envelope, ReasonPanic, err, state)
 		}
-		if !state.settled && !state.attempted {
+		if !state.settled && !state.attempted && abandoned {
 			_ = nackDelivery(r, runnerSettlementContext(r, ctx), item.message, driver.NackOptions{Requeue: true}, state)
 		}
 		operation := state.operation
@@ -795,7 +820,7 @@ func processDelivery(r *Runner, ctx context.Context, item delivery) {
 			case settlementOperationAck:
 				_ = ackDelivery(r, runnerSettlementContext(r, ctx), item.message, state)
 			case settlementOperationNack:
-				_ = nackDelivery(r, runnerSettlementContext(r, ctx), item.message, driver.NackOptions{Requeue: true}, state)
+				_ = nackDelivery(r, runnerSettlementContext(r, ctx), item.message, state.nackOptions, state)
 			}
 		}
 		if !state.settled && operation == settlementOperationAck {
@@ -827,6 +852,13 @@ func dispatchMessage(r *Runner, ctx context.Context, message driver.InboundMessa
 		envelope.Attempt = 1
 	}
 	*envelopeOut = envelope
+	maxAttempts := envelope.MaxAttempts
+	if maxAttempts <= 0 {
+		maxAttempts = r.subscription.Retry.MaxAttempts
+	}
+	if retry.CounterRunaway(envelope.Attempt, envelope.Deferrals, maxAttempts, r.subscription.MaxDeferrals) {
+		return deadLetterAndSettle(r, ctx, message, envelope, ReasonPoison, errors.New("retry counter exceeded sanity margin"), state)
+	}
 	// Record at receipt, before handler work or settlement: a failed settlement
 	// can cause the broker to redeliver this delivery.
 	recordAttemptDivergence(r, envelope.Type, envelope.Priority, envelope.Attempt, message.DeliveryCount)
@@ -872,10 +904,6 @@ func dispatchMessage(r *Runner, ctx context.Context, message driver.InboundMessa
 			return deadLetterAndSettle(r, ctx, message, envelope, ReasonDependencyUnavailable, result.err, state)
 		}
 		return retryAndSettle(r, ctx, message, envelope, result.err, deferrals, false, state)
-	}
-	maxAttempts := envelope.MaxAttempts
-	if maxAttempts <= 0 {
-		maxAttempts = r.subscription.Retry.MaxAttempts
 	}
 	if envelope.Attempt >= maxAttempts {
 		return deadLetterAndSettle(r, ctx, message, envelope, ReasonMaxAttempts, result.err, state)
@@ -1035,6 +1063,7 @@ func nackDelivery(r *Runner, ctx context.Context, message driver.InboundMessage,
 		return errors.New("f1: delivered message has no settler")
 	}
 	state.operation = settlementOperationNack
+	state.nackOptions = options
 	if r != nil && r.inflight != nil {
 		r.inflight.SetDisposition(state.id, dispatch.DispositionRequeued)
 	}
@@ -1047,6 +1076,7 @@ func nackDelivery(r *Runner, ctx context.Context, message driver.InboundMessage,
 func deadLetterAndSettle(r *Runner, ctx context.Context, message driver.InboundMessage, envelope Envelope, reason DeathReason, lastErr error, states ...*deliveryState) bool {
 	state := stateFor(states)
 	if err := deadLetter(r, ctx, message, envelope, reason, lastErr); err != nil {
+		_ = nackDelivery(r, runnerSettlementContext(r, ctx), message, driver.NackOptions{CountAsFailure: true}, state)
 		return false
 	}
 	return ackDeliveryAs(r, runnerSettlementContext(r, ctx), message, lifecycle.DeadLettered, state)
@@ -1127,7 +1157,10 @@ func retryAndSettle(r *Runner, ctx context.Context, message driver.InboundMessag
 	}
 	delay := retryConfig.DelayFor(tier)
 	if requested, ok := RetryDelay(lastErr); ok {
-		resolvedTier, resolvedDelay, _ := retry.ResolveRetryAfter(retryConfig, requested)
+		resolvedTier, resolvedDelay, clamped := retry.ResolveRetryAfter(retryConfig, requested)
+		if clamped {
+			r.metrics.recordRetryAfterClamped(envelope.Type)
+		}
 		tier, delay = resolvedTier, resolvedDelay
 	}
 	now := r.client.options.clock.Now().UTC()
@@ -1135,15 +1168,18 @@ func retryAndSettle(r *Runner, ctx context.Context, message driver.InboundMessag
 	copyEnvelope.DueTime = &due
 	encoded, err := copyEnvelope.EncodeHeaders(r.client.config.Codec.MaxHeaderBytes)
 	if err != nil {
+		_ = nackDelivery(r, runnerSettlementContext(r, ctx), message, driver.NackOptions{CountAsFailure: true}, state)
 		return false
 	}
 	destination := retryDestination(r, copyEnvelope, tier)
+	encoded[retryTierHeader] = strconv.Itoa(tier)
 	out := driver.OutboundMessage{Destination: destination, Key: append([]byte(nil), message.Key...), Body: append([]byte(nil), message.Body...), DelayUntil: due}
 	for key, value := range encoded {
 		out.Headers = append(out.Headers, driver.Header{Key: key, Value: []byte(value)})
 	}
 	sort.Slice(out.Headers, func(i, j int) bool { return out.Headers[i].Key < out.Headers[j].Key })
 	if err := publishMessages(r.client, runnerSettlementContext(r, ctx), true, out); err != nil {
+		_ = nackDelivery(r, runnerSettlementContext(r, ctx), message, driver.NackOptions{CountAsFailure: true}, state)
 		return false
 	}
 	return ackDeliveryAs(r, runnerSettlementContext(r, ctx), message, lifecycle.Retried, state)
@@ -1338,7 +1374,7 @@ func deadLetterDestinationFor(source, topic, subscription string) string {
 }
 
 func retryDestinationFor(source, topic string, priority Priority, tier int, subscription string) string {
-	return fmt.Sprintf("f1.%s.%s.%s.%s.retry.%d", sourceEnvironment(source), topic, subscription, priority, tier)
+	return fmt.Sprintf("f1.%s.%s.%s.%s.%s.%d", sourceEnvironment(source), topic, subscription, priority, retryDestinationSegment, tier)
 }
 
 func consumeDestination(effective driver.Capabilities, source, topic string, priority Priority, subscription string) string {
