@@ -121,15 +121,45 @@ func TestRetryAfterClampRecordsMetricAndCarriesTier(t *testing.T) {
 	if got := runner.metrics.sampleRetryAfterClamped()["orders.retry.created"]; got != 1 {
 		t.Fatalf("clamp samples = %d, want 1", got)
 	}
-	if got := headerValue(producer.messages[0].Headers, retryTierHeader); got != "2" {
-		t.Fatalf("carried retry tier = %q, want 2", got)
-	}
+	retryDestination := producer.messages[0].Destination
+	runner.retryDestinationTiers = map[string]int{retryDestination: 2}
 	inbound := driver.InboundMessage{
-		Destination: producer.messages[0].Destination,
+		Destination: retryDestination,
 		Headers:     producer.messages[0].Headers,
 	}
 	if got, want := deliveryLane(runner, inbound), schedulerLaneID("orders.retry.created", PriorityHigh, 2); got != want {
 		t.Fatalf("delivery lane = %q, want %q", got, want)
+	}
+	runner.retryDestinationTiers[retryDestination] = 1
+	if got, want := deliveryLane(runner, inbound), schedulerLaneID("orders.retry.created", PriorityHigh, 1); got != want {
+		t.Fatalf("wrong destination tier lane = %q, want %q", got, want)
+	}
+}
+
+func TestOpenRunnerConsumerBuildsRetryDestinationTiers(t *testing.T) {
+	consumer := newDispatchConsumer()
+	producer := &dispatchProducer{}
+	client, err := New(context.Background(), testClientConfig(t), WithDriver(&dispatchDriver{conn: &dispatchConn{producer: producer, consumer: consumer}}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = client.Close(context.Background()) }()
+	runner := &Runner{
+		client: client,
+		subscription: Subscription{
+			Name:       "orders",
+			Topics:     []string{"orders.created"},
+			Priorities: []Priority{PriorityHigh},
+			Retry:      RetryConfig{MaxAttempts: 3},
+		},
+		config: SubscriptionConfig{Prefetch: 1},
+	}
+	if _, err := openRunnerConsumer(runner, context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	wantDestination := retryDestinationFor(client.source, "orders.created", PriorityHigh, 2, "orders")
+	if got := runner.retryDestinationTiers[wantDestination]; got != 2 {
+		t.Fatalf("retry tier for %q = %d, want 2", wantDestination, got)
 	}
 }
 

@@ -8,7 +8,6 @@ import (
 	"runtime"
 	"runtime/debug"
 	"sort"
-	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -406,7 +405,9 @@ func schedulerRetryGroupID(topic string, priority Priority) string {
 func deliveryLane(r *Runner, message driver.InboundMessage) string {
 	envelope, err := DecodeHeaders(inboundHeaders(message.Headers))
 	if err == nil {
-		tier := retryTierFromHeaders(message.Headers)
+		r.mu.Lock()
+		tier := r.retryDestinationTiers[message.Destination]
+		r.mu.Unlock()
 		topic := topicFor(envelope.Type)
 		effective := r.client.effective
 		for _, configured := range r.subscription.Topics {
@@ -429,26 +430,6 @@ func deliveryLane(r *Runner, message driver.InboundMessage) string {
 		return schedulerLaneID(topicFor(r.subscription.Topics[0]), r.subscription.Priorities[0], 0)
 	}
 	return ""
-}
-
-const retryTierHeader = "f1retrytier"
-
-func retryTierFromHeaders(headers []driver.Header) int {
-	var value string
-	for _, header := range headers {
-		if header.Key == retryTierHeader {
-			value = string(header.Value)
-			break
-		}
-	}
-	if value == "" {
-		return 0
-	}
-	tier, err := strconv.Atoi(value)
-	if err != nil || tier < 1 {
-		return 0
-	}
-	return tier
 }
 
 // Drain stops fetching and waits for all worker deliveries to settle. A
@@ -651,6 +632,10 @@ func openRunnerConsumer(r *Runner, ctx context.Context) (driver.Consumer, error)
 		return nil, errors.New("f1: client is not connected")
 	}
 	destinations := subscriptionDestinations(effective, source, r.subscription)
+	retryDestinationTiers := retryDestinationTierMap(source, r.subscription)
+	r.mu.Lock()
+	r.retryDestinationTiers = retryDestinationTiers
+	r.mu.Unlock()
 	if policy != driver.TopologyNone {
 		if admin := conn.Admin(); admin != nil {
 			topology := subscriptionTopologySpecs(effective, source, r.subscription)
@@ -1172,7 +1157,6 @@ func retryAndSettle(r *Runner, ctx context.Context, message driver.InboundMessag
 		return false
 	}
 	destination := retryDestination(r, copyEnvelope, tier)
-	encoded[retryTierHeader] = strconv.Itoa(tier)
 	out := driver.OutboundMessage{Destination: destination, Key: append([]byte(nil), message.Key...), Body: append([]byte(nil), message.Body...), DelayUntil: due}
 	for key, value := range encoded {
 		out.Headers = append(out.Headers, driver.Header{Key: key, Value: []byte(value)})
@@ -1253,6 +1237,19 @@ func truncateError(err error) string {
 		return value[:4<<10]
 	}
 	return value
+}
+
+func retryDestinationTierMap(source string, sub Subscription) map[string]int {
+	result := make(map[string]int)
+	for _, topic := range sub.Topics {
+		logical := topicFor(topic)
+		for _, priority := range sub.Priorities {
+			for tier := 1; tier <= retryTiers(sub.Retry); tier++ {
+				result[retryDestinationFor(source, logical, priority, tier, sub.Name)] = tier
+			}
+		}
+	}
+	return result
 }
 
 func subscriptionDestinations(effective driver.Capabilities, source string, sub Subscription) []string {

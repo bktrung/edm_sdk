@@ -97,6 +97,7 @@ type Runner struct {
 	finished              bool
 	runErr                error
 	inflight              *inflightRegistry
+	retryDestinationTiers map[string]int
 	metrics               deliveryMetrics
 	lifecycle             *lifecycle.Machine
 	accounting            *lifecycle.Accounting
