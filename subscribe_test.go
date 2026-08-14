@@ -33,6 +33,32 @@ func TestSubscribeRejectsOrderedByKeyWhenUnavailable(t *testing.T) {
 	}
 }
 
+func TestSubscribeAcceptsOrderedByKeyWhenNative(t *testing.T) {
+	t.Parallel()
+	conn := &testConn{caps: driver.Capabilities{OrderedByKey: true}, info: testBrokerInfo()}
+	client, err := New(context.Background(), testClientConfig(t), WithDriver(&testDriver{conn: conn}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = client.Close(context.Background()) })
+	status := featureStatus(client.Limits(), "ordered_by_key")
+	if status.Mode != FeatureNative {
+		t.Fatalf("ordered_by_key limit = %v, want native", status.Mode)
+	}
+	runner, err := client.Subscribe(context.Background(), Subscription{
+		Name:        "orders",
+		Topics:      []string{"orders.created"},
+		Mode:        OrderedByKey,
+		Concurrency: 2,
+	})
+	if err != nil {
+		t.Fatalf("Subscribe() error = %v, want ordered mode to be accepted", err)
+	}
+	if runner == nil || runner.config.Mode != OrderedByKey || runner.config.Concurrency != 2 {
+		t.Fatalf("resolved subscription = %#v, want ordered mode with concurrency 2", runner.config)
+	}
+}
+
 func TestSubscribeRejectsPrefetchBelowLaneCount(t *testing.T) {
 	t.Parallel()
 	client := newPublishClient(t, &recordingProducer{})
