@@ -89,8 +89,8 @@ func TestOrderedByKeyKeepsEqualKeysSerialAndDifferentKeysConcurrent(t *testing.T
 	}()
 
 	messages := make([]f1.Message, 0, totalMessages)
-	for i := 0; i < messagesPerKey; i++ {
-		for _, key := range keys {
+	for _, key := range keys {
+		for i := 0; i < messagesPerKey; i++ {
 			messages = append(messages, f1.Message{
 				EventType: "orders.created.v1",
 				Payload:   struct{ Key string }{Key: key},
