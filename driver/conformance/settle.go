@@ -39,8 +39,9 @@ func runSettle(group *groupContext) {
 			t.Fatal(err)
 		}
 		first := receiveMessage(t, group, consumer)
-		// Pause keeps the consumer active while the inspector observes the
-		// requeued delivery being acquired again.
+		// Pause first: dispatch runs synchronously inside Nack, and with this the
+		// sole consumer and its prefetch slot free, an unpaused destination would
+		// redeliver before the inspector ever sees the requeued message as Ready.
 		if err := consumer.Pause("settle.requeue"); err != nil {
 			t.Fatalf("Pause() error = %v", err)
 		}
@@ -49,7 +50,7 @@ func runSettle(group *groupContext) {
 		}
 		waitFor(t, group, "requeue nack to return the message", func() (bool, string) {
 			view := inspectDestination(t, group, "settle.requeue")
-			return view.Ready == 0 && view.Unsettled == 1, fmt.Sprintf("view=%+v", view)
+			return view.Ready+view.Unsettled == 1, fmt.Sprintf("view=%+v", view)
 		})
 		if err := consumer.Resume("settle.requeue"); err != nil {
 			t.Fatalf("Resume() error = %v", err)
@@ -259,8 +260,9 @@ func runSettle(group *groupContext) {
 			receiveMessage(t, group, consumer),
 			receiveMessage(t, group, consumer),
 		}
-		// Pause keeps the consumer active while the inspector observes the
-		// requeued delivery being acquired again.
+		// Pause first: dispatch runs synchronously inside Nack, and with a free
+		// prefetch slot an unpaused destination would redeliver the requeued
+		// message before the inspector ever sees it as Ready.
 		if err := consumer.Pause("settle.mixed-order"); err != nil {
 			t.Fatalf("Pause() error = %v", err)
 		}
@@ -275,7 +277,7 @@ func runSettle(group *groupContext) {
 		}
 		waitFor(t, group, "mixed settlements to expose one requeue", func() (bool, string) {
 			view := inspectDestination(t, group, "settle.mixed-order")
-			return view.Ready == 0 && view.Unsettled == 1, fmt.Sprintf("view=%+v", view)
+			return view.Ready+view.Unsettled == 1, fmt.Sprintf("view=%+v", view)
 		})
 		if err := consumer.Resume("settle.mixed-order"); err != nil {
 			t.Fatalf("Resume() error = %v", err)
