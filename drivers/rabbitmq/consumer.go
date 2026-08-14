@@ -53,6 +53,7 @@ type lane struct {
 	deliveries  <-chan amqp.Delivery
 	pending     chan amqp.Delivery
 	resume      chan struct{}
+	emitting    int
 
 	mu     sync.Mutex
 	paused bool
@@ -174,9 +175,15 @@ func (c *consumer) readDeliveries(lane *lane) {
 func (c *consumer) emitMessages(lane *lane) {
 	defer c.forward.Done()
 	for delivery := range lane.pending {
+		lane.mu.Lock()
+		lane.emitting++
+		lane.mu.Unlock()
 		c.mu.Lock()
 		if c.draining || c.stopped {
 			c.mu.Unlock()
+			lane.mu.Lock()
+			lane.emitting--
+			lane.mu.Unlock()
 			return
 		}
 		c.mu.Unlock()
@@ -184,6 +191,9 @@ func (c *consumer) emitMessages(lane *lane) {
 			c.mu.Lock()
 			if c.draining || c.stopped {
 				c.mu.Unlock()
+				lane.mu.Lock()
+				lane.emitting--
+				lane.mu.Unlock()
 				return
 			}
 			c.mu.Unlock()
@@ -203,11 +213,17 @@ func (c *consumer) emitMessages(lane *lane) {
 		c.mu.Lock()
 		if c.draining || c.stopped {
 			c.mu.Unlock()
+			lane.mu.Lock()
+			lane.emitting--
+			lane.mu.Unlock()
 			return
 		}
 		c.settlers[settler] = struct{}{}
 		c.outstanding++
 		c.mu.Unlock()
+		lane.mu.Lock()
+		lane.emitting--
+		lane.mu.Unlock()
 		message := inboundMessage(lane.destination, delivery, settler, c.nativeDeliveryCount())
 		select {
 		case c.messages <- message:

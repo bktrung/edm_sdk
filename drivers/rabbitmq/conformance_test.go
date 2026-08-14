@@ -58,7 +58,9 @@ func rabbitInspector(raw driver.Conn) (conformance.Inspect, error) {
 			}
 			for _, lane := range item.lanes {
 				if lane.destination == destination {
-					unsettled += int64(len(lane.pending) + len(lane.deliveries))
+					lane.mu.Lock()
+					unsettled += int64(len(lane.pending) + len(lane.deliveries) + lane.emitting)
+					lane.mu.Unlock()
 				}
 			}
 			item.mu.Unlock()
