@@ -177,8 +177,10 @@ func runRebalance(group *groupContext) {
 		})
 		if err := producerA.Publish(group.ctx,
 			driver.OutboundMessage{Destination: "rebalance.key-a", Key: []byte("K")},
-			driver.OutboundMessage{Destination: "rebalance.key-a", Key: []byte("L")},
 		); err != nil {
+			t.Fatal(err)
+		}
+		if err := producerB.Publish(group.ctx, driver.OutboundMessage{Destination: "rebalance.key-b", Key: []byte("L")}); err != nil {
 			t.Fatal(err)
 		}
 		var keyK, keyL driver.InboundMessage
