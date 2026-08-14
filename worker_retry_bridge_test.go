@@ -163,6 +163,49 @@ func TestOpenRunnerConsumerBuildsRetryDestinationTiers(t *testing.T) {
 	}
 }
 
+func TestRetryDestinationTierMapMatchesSubscriptionDestinations(t *testing.T) {
+	source := "/test/orders"
+	sub := Subscription{
+		Name:       "orders",
+		Topics:     []string{"orders.created", "payments.created"},
+		Priorities: []Priority{PriorityHigh, PriorityNormal},
+		Retry: RetryConfig{
+			Tiers: []time.Duration{time.Second, 2 * time.Second},
+		},
+	}
+	effective := driver.Capabilities{Fanout: driver.FanoutAtConsume}
+	destinations := subscriptionDestinations(effective, source, sub)
+
+	mainDestinations := make(map[string]struct{})
+	for _, topic := range sub.Topics {
+		logical := topicFor(topic)
+		for _, priority := range sub.Priorities {
+			mainDestinations[consumeDestination(effective, source, logical, priority, sub.Name)] = struct{}{}
+		}
+	}
+	wantRetry := make(map[string]struct{})
+	for _, destination := range destinations {
+		if _, ok := mainDestinations[destination]; !ok {
+			wantRetry[destination] = struct{}{}
+		}
+	}
+
+	gotRetry := retryDestinationTierMap(source, sub)
+	if len(gotRetry) != len(wantRetry) {
+		t.Fatalf("retry destination count = %d, want %d", len(gotRetry), len(wantRetry))
+	}
+	for destination := range wantRetry {
+		if _, ok := gotRetry[destination]; !ok {
+			t.Errorf("retry destination %q is missing from tier map", destination)
+		}
+	}
+	for destination := range gotRetry {
+		if _, ok := wantRetry[destination]; !ok {
+			t.Errorf("tier map contains non-retry destination %q", destination)
+		}
+	}
+}
+
 type retryBridgeFailingProducer struct{}
 
 func (*retryBridgeFailingProducer) Publish(context.Context, ...driver.OutboundMessage) error {

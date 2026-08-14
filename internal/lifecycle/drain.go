@@ -10,11 +10,10 @@ import (
 
 // Hooks are the resource operations owned by a runner or client.
 type Hooks struct {
-	Drain         func(context.Context) error
-	CancelHandler func()
-	WaitSettled   func(context.Context) error
-	Flush         func(context.Context) error
-	Close         func(context.Context) error
+	Drain       func(context.Context) error
+	WaitSettled func(context.Context) error
+	Flush       func(context.Context) error
+	Close       func(context.Context) error
 }
 
 // Config defines independent wall-clock shutdown budgets.
@@ -22,7 +21,6 @@ type Config struct {
 	// Clock provides deterministic timing for shutdown phases.
 	Clock        clock.Clock
 	DrainTimeout time.Duration
-	HandlerGrace time.Duration
 	FlushTimeout time.Duration
 	CloseTimeout time.Duration
 }
@@ -57,24 +55,6 @@ func (m *Machine) Drain(ctx context.Context, cfg Config, hooks Hooks) error {
 	}
 	if err := m.Transition(Settling); err != nil {
 		return err
-	}
-	if hooks.CancelHandler != nil {
-		grace := cfg.HandlerGrace
-		if cfg.DrainTimeout > 0 && grace >= cfg.DrainTimeout {
-			grace = 0
-		}
-		if cfg.DrainTimeout > grace {
-			timer := phaseClock.Timer(cfg.DrainTimeout - grace)
-			select {
-			case <-timer.C:
-				hooks.CancelHandler()
-			case <-ctx.Done():
-				timer.Stop()
-				return m.abort(ctx.Err())
-			}
-		} else {
-			hooks.CancelHandler()
-		}
 	}
 	if hooks.WaitSettled != nil {
 		if err := runWithTimeout(ctx, cfg.DrainTimeout, hooks.WaitSettled, phaseClock); err != nil {

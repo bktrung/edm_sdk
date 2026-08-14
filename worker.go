@@ -238,7 +238,6 @@ func (r *Runner) Run(ctx context.Context) error {
 	shutdownErr := r.lifecycle.Drain(shutdownCtx, lifecycle.Config{
 		Clock:        r.client.options.clock,
 		DrainTimeout: r.client.config.Lifecycle.DrainTimeout,
-		HandlerGrace: r.client.config.Lifecycle.HandlerGrace,
 		FlushTimeout: r.client.config.Lifecycle.FlushTimeout,
 		CloseTimeout: r.client.config.Lifecycle.CloseTimeout,
 	}, lifecycle.Hooks{
