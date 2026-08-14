@@ -25,6 +25,72 @@ func TestDriverCapabilities(t *testing.T) {
 	}
 }
 
+func TestConfiguredQueueKind(t *testing.T) {
+	cases := []struct {
+		name    string
+		options map[string]string
+		want    queueKind
+		ok      bool
+	}{
+		{name: "default", want: queueKindQuorum, ok: true},
+		{name: "quorum", options: map[string]string{"rabbitmq.queueType": "quorum"}, want: queueKindQuorum, ok: true},
+		{name: "classic", options: map[string]string{"rabbitmq.queueType": "classic"}, want: queueKindClassic, ok: true},
+		{name: "case and spaces", options: map[string]string{"rabbitmq.queueType": " CLASSIC "}, want: queueKindClassic, ok: true},
+		{name: "unsupported", options: map[string]string{"rabbitmq.queueType": "stream"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := configuredQueueKind(tc.options)
+			if tc.ok {
+				if err != nil || got != tc.want {
+					t.Fatalf("configuredQueueKind() = %q, %v, want %q", got, err, tc.want)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), "quorum, classic") {
+				t.Fatalf("configuredQueueKind() error = %v, want supported queue list", err)
+			}
+		})
+	}
+}
+
+func TestQueueKindCapabilities(t *testing.T) {
+	if got := capabilitiesForQueueKind(queueKindQuorum).NativeDeliveryCount; !got {
+		t.Fatal("quorum capabilities NativeDeliveryCount = false, want true")
+	}
+	if got := capabilitiesForQueueKind(queueKindClassic).NativeDeliveryCount; got {
+		t.Fatal("classic capabilities NativeDeliveryCount = true, want false")
+	}
+}
+
+func TestConnectionCapabilitiesFollowQueueType(t *testing.T) {
+	requireBroker(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	cases := []struct {
+		name       string
+		options    map[string]string
+		wantNative bool
+	}{
+		{name: "default quorum", wantNative: true},
+		{name: "classic", options: map[string]string{"rabbitmq.queueType": "classic"}, wantNative: false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			conn, err := (Driver{}).Open(ctx, driver.Config{
+				Endpoints: []string{defaultEndpoint}, DriverOptions: tc.options,
+			})
+			if err != nil {
+				t.Fatalf("Open() error = %v", err)
+			}
+			defer func() { _ = conn.Close(ctx) }()
+			if got := conn.Capabilities().NativeDeliveryCount; got != tc.wantNative {
+				t.Fatalf("NativeDeliveryCount = %t, want %t", got, tc.wantNative)
+			}
+		})
+	}
+}
+
 func TestOpenRejectsSCRAM(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()

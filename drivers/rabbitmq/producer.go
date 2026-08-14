@@ -83,7 +83,10 @@ func (p *producer) Publish(ctx context.Context, msgs ...driver.OutboundMessage) 
 }
 
 func (p *producer) publishOne(ctx context.Context, message driver.OutboundMessage) error {
-	exchange, routingKey, expiration := p.target(message)
+	exchange, routingKey, expiration, err := p.target(ctx, message)
+	if err != nil {
+		return err
+	}
 	publishing, err := amqpPublishing(message)
 	if err != nil {
 		return classify("publish", driver.KindFatal, err)
@@ -95,26 +98,43 @@ func (p *producer) publishOne(ctx context.Context, message driver.OutboundMessag
 	return p.waitConfirm(ctx)
 }
 
-func (p *producer) target(message driver.OutboundMessage) (string, string, string) {
+func (p *producer) ensureParking(ctx context.Context, destination string) error {
+	if err := (&admin{conn: p.conn}).declareQueue(ctx, destination+".park", true, parkingArguments(destination)); err != nil {
+		return err
+	}
+	p.conn.mu.Lock()
+	if _, exists := p.conn.deferred[destination]; !exists {
+		p.conn.deferred[destination] = 0
+	}
+	p.conn.mu.Unlock()
+	return nil
+}
+
+func (p *producer) target(ctx context.Context, message driver.OutboundMessage) (string, string, string, error) {
 	destination := message.Destination
 	p.conn.mu.RLock()
 	_, isExchange := p.conn.exchanges[destination]
 	delay, isDeferred := p.conn.deferred[destination]
 	p.conn.mu.RUnlock()
-	if isDeferred {
+	if isDeferred || !message.DelayUntil.IsZero() {
 		due := message.DelayUntil
 		now := time.Now() //nolint:forbidigo // the driver computes remaining delay at publish time
 		if due.IsZero() {
 			due = now.Add(delay)
 		}
 		if remaining := due.Sub(now); remaining > 0 {
-			return "", destination + ".park", expirationMillis(remaining)
+			if !isDeferred {
+				if err := p.ensureParking(ctx, destination); err != nil {
+					return "", "", "", err
+				}
+			}
+			return "", destination + ".park", expirationMillis(remaining), nil
 		}
 	}
 	if isExchange {
-		return destination, "", ""
+		return destination, "", "", nil
 	}
-	return "", destination, ""
+	return "", destination, "", nil
 }
 
 func expirationMillis(remaining time.Duration) string {

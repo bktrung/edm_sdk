@@ -28,6 +28,32 @@ type Driver struct{}
 // Name returns the stable RabbitMQ driver key.
 func (Driver) Name() string { return "rabbitmq" }
 
+type queueKind string
+
+const (
+	queueKindQuorum  queueKind = "quorum"
+	queueKindClassic queueKind = "classic"
+)
+
+func configuredQueueKind(options map[string]string) (queueKind, error) {
+	switch strings.ToLower(strings.TrimSpace(options["rabbitmq.queueType"])) {
+	case "", string(queueKindQuorum):
+		return queueKindQuorum, nil
+	case string(queueKindClassic):
+		return queueKindClassic, nil
+	default:
+		return "", fmt.Errorf("rabbitmq: unsupported queueType %q; supported values: quorum, classic, or empty", options["rabbitmq.queueType"])
+	}
+}
+
+func capabilitiesForQueueKind(kind queueKind) driver.Capabilities {
+	caps := Driver{}.Capabilities()
+	if kind == queueKindClassic {
+		caps.NativeDeliveryCount = false
+	}
+	return caps
+}
+
 // Capabilities reports the RabbitMQ behavior used by this driver.
 func (Driver) Capabilities() driver.Capabilities {
 	return driver.Capabilities{
@@ -54,6 +80,10 @@ func (Driver) Open(ctx context.Context, cfg driver.Config) (driver.Conn, error) 
 	if err := validateSASL(cfg.SASL); err != nil {
 		return nil, classify("open", driver.KindFatal, err)
 	}
+	queueKind, err := configuredQueueKind(cfg.DriverOptions)
+	if err != nil {
+		return nil, classify("open", driver.KindFatal, err)
+	}
 	openCtx := ctx
 	if cfg.ConnectTimeout > 0 {
 		var cancel context.CancelFunc
@@ -73,7 +103,7 @@ func (Driver) Open(ctx context.Context, cfg driver.Config) (driver.Conn, error) 
 			}
 			conn, err := dial(openCtx, endpoint, cfg)
 			if err == nil {
-				return newConn(conn, Driver{}.Capabilities(), endpoint), nil
+				return newConn(conn, capabilitiesForQueueKind(queueKind), endpoint, queueKind), nil
 			}
 			lastErr = err
 		}
@@ -96,6 +126,7 @@ type conn struct {
 	amqp       *amqp.Connection
 	caps       driver.Capabilities
 	info       driver.BrokerInfo
+	queueKind  queueKind
 	management *managementClient
 	closed     bool
 	active     map[*consumer]struct{}
@@ -108,11 +139,12 @@ type conn struct {
 
 var _ driver.Conn = (*conn)(nil)
 
-func newConn(amqpConn *amqp.Connection, caps driver.Capabilities, endpoint string) *conn {
+func newConn(amqpConn *amqp.Connection, caps driver.Capabilities, endpoint string, kind queueKind) *conn {
 	return &conn{
 		amqp:       amqpConn,
 		caps:       caps,
 		info:       brokerInfo(amqpConn),
+		queueKind:  kind,
 		management: newManagementClient(endpoint),
 		active:     make(map[*consumer]struct{}),
 		producers:  make(map[*producer]struct{}),

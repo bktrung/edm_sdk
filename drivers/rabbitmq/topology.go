@@ -75,7 +75,7 @@ func (a *admin) ensureTopology(ctx context.Context, spec driver.TopologySpec) (d
 			delete(a.conn.deferred, destination.Name)
 		}
 		a.conn.mu.Unlock()
-		args := queueArguments(destination)
+		args := queueArguments(destination, a.conn.queueKind)
 		exists, err := a.queueExists(ctx, destination.Name, destination.Durable, args)
 		if err != nil {
 			return driver.TopologyDiff{}, err
@@ -168,7 +168,7 @@ func (a *admin) verifyTopology(ctx context.Context, spec driver.TopologySpec) (d
 		if destination.Name == "" {
 			return driver.TopologyDiff{}, classify("ensure_topology", driver.KindFatal, errors.New("destination name is empty"))
 		}
-		if exists, err := a.queueExists(ctx, destination.Name, destination.Durable, queueArguments(destination)); err != nil {
+		if exists, err := a.queueExists(ctx, destination.Name, destination.Durable, queueArguments(destination, a.conn.queueKind)); err != nil {
 			return driver.TopologyDiff{}, err
 		} else if !exists {
 			return driver.TopologyDiff{}, classify("ensure_topology", driver.KindNotFound, fmt.Errorf("destination %q is missing: %w", destination.Name, driver.ErrDestinationMissing))
@@ -264,11 +264,9 @@ func validateExchange(exchange driver.ExchangeSpec) error {
 	}
 }
 
-func queueArguments(spec driver.DestinationSpec) amqp.Table {
+func queueArguments(spec driver.DestinationSpec, kind queueKind) amqp.Table {
 	args := amqp.Table{}
-	if spec.Durable {
-		args["x-queue-type"] = "quorum"
-	}
+	args["x-queue-type"] = string(kind)
 	if spec.DeliveryLimit > 0 {
 		if spec.DeliveryLimit > 2147483647 {
 			spec.DeliveryLimit = 2147483647
@@ -324,7 +322,7 @@ func (a *admin) queueExists(ctx context.Context, name string, durable bool, args
 		return false, err
 	}
 	defer channel.Close()
-	declaredDurable, autoDelete, exclusive := queueFlags(durable)
+	declaredDurable, autoDelete, exclusive := queueFlags(durable, a.conn.queueKind)
 	_, err = channel.QueueDeclarePassive(name, declaredDurable, autoDelete, exclusive, false, args)
 	if err == nil {
 		return true, nil
@@ -340,7 +338,7 @@ func (a *admin) declareQueue(ctx context.Context, name string, durable bool, arg
 	if err != nil {
 		return err
 	}
-	declaredDurable, autoDelete, exclusive := queueFlags(durable)
+	declaredDurable, autoDelete, exclusive := queueFlags(durable, a.conn.queueKind)
 	if _, err := channel.QueueDeclare(name, declaredDurable, autoDelete, exclusive, false, args); err != nil {
 		_ = channel.Close()
 		return classifyAMQP("ensure_topology", driver.KindFatal, err)
@@ -359,7 +357,10 @@ func (a *admin) declareQueue(ctx context.Context, name string, durable bool, arg
 	return nil
 }
 
-func queueFlags(durable bool) (bool, bool, bool) {
+func queueFlags(durable bool, kind queueKind) (bool, bool, bool) {
+	if kind == queueKindQuorum {
+		return true, false, false
+	}
 	if durable {
 		return true, false, false
 	}
