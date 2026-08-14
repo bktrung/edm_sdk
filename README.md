@@ -110,6 +110,8 @@ Press Ctrl-C in terminal 2, then stop the broker:
 make broker-down
 ```
 
+For a fresh broker volume, use `make broker-reset` instead of `make broker-down`.
+
 ## Comment conventions
 
 Comments should help a reader understand the code without narrating obvious statements.
