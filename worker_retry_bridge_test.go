@@ -138,6 +138,32 @@ func TestRetryAndSettleIncrementsAttempt(t *testing.T) {
 	}
 }
 
+func TestRunWithClockTimeoutZeroMeansNoTimeout(t *testing.T) {
+	want := errors.New("completed without a deadline")
+	got := runWithClockTimeout(context.Background(), nil, 0, "flush", func(ctx context.Context) error {
+		select {
+		case <-ctx.Done():
+			t.Fatal("zero timeout canceled the phase")
+		default:
+		}
+		return want
+	})
+	if !errors.Is(got, want) {
+		t.Fatalf("runWithClockTimeout() error = %v, want %v", got, want)
+	}
+}
+
+func TestRunWithClockTimeoutRejectsNegativeTimeout(t *testing.T) {
+	called := false
+	err := runWithClockTimeout(context.Background(), nil, -time.Second, "flush", func(context.Context) error {
+		called = true
+		return nil
+	})
+	if err == nil || called {
+		t.Fatalf("runWithClockTimeout() error = %v, called = %v; want negative timeout rejection", err, called)
+	}
+}
+
 func TestOpenRunnerConsumerBuildsRetryDestinationTiers(t *testing.T) {
 	consumer := newDispatchConsumer()
 	producer := &dispatchProducer{}

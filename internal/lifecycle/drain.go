@@ -16,7 +16,8 @@ type Hooks struct {
 	Close       func(context.Context) error
 }
 
-// Config defines independent wall-clock shutdown budgets.
+// Config defines independent wall-clock shutdown budgets. A zero budget
+// disables its deadline; negative budgets are invalid.
 type Config struct {
 	// Clock provides deterministic timing for shutdown phases.
 	Clock        clock.Clock
@@ -88,7 +89,10 @@ func runWithTimeout(parent context.Context, timeout time.Duration, fn func(conte
 	}
 	ctx, cancel := context.WithCancel(parent)
 	defer cancel()
-	if timeout <= 0 {
+	if timeout < 0 {
+		return errors.New("lifecycle: timeout must not be negative")
+	}
+	if timeout == 0 {
 		return fn(ctx)
 	}
 	done := make(chan error, 1)
