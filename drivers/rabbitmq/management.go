@@ -32,6 +32,13 @@ type managementQueue struct {
 	Consumers     int64  `json:"consumers"`
 }
 
+type managementBinding struct {
+	Source          string `json:"source"`
+	Destination     string `json:"destination"`
+	DestinationType string `json:"destination_type"`
+	RoutingKey      string `json:"routing_key"`
+}
+
 func newManagementClient(endpoint string, cfg driver.Config) (*managementClient, error) {
 	parsed, err := url.Parse(endpoint)
 	if err != nil || parsed.Hostname() == "" {
@@ -111,6 +118,10 @@ func (m *managementClient) queuesPath() string {
 	return m.baseURL + "/api/queues/" + url.PathEscape(m.vhost)
 }
 
+func (m *managementClient) bindingsPath() string {
+	return m.baseURL + "/api/bindings/" + url.PathEscape(m.vhost)
+}
+
 func (m *managementClient) listQueues(ctx context.Context) ([]managementQueue, error) {
 	request, err := http.NewRequestWithContext(ctx, http.MethodGet, m.queuesPath(), nil)
 	if err != nil {
@@ -131,6 +142,28 @@ func (m *managementClient) listQueues(ctx context.Context) ([]managementQueue, e
 		return nil, fmt.Errorf("management API decode queues: %w", err)
 	}
 	return queues, nil
+}
+
+func (m *managementClient) listBindings(ctx context.Context) ([]managementBinding, error) {
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, m.bindingsPath(), nil)
+	if err != nil {
+		return nil, err
+	}
+	request.SetBasicAuth(m.username, m.password)
+	response, err := m.client.Do(request)
+	if err != nil {
+		return nil, err
+	}
+	defer response.Body.Close()
+	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
+		body, _ := io.ReadAll(io.LimitReader(response.Body, 4096))
+		return nil, fmt.Errorf("management API GET bindings: %s: %s", response.Status, strings.TrimSpace(string(body)))
+	}
+	var bindings []managementBinding
+	if err := json.NewDecoder(response.Body).Decode(&bindings); err != nil {
+		return nil, fmt.Errorf("management API decode bindings: %w", err)
+	}
+	return bindings, nil
 }
 
 func (m *managementClient) deleteQueue(ctx context.Context, name string) (bool, error) {

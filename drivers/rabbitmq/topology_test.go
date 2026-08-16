@@ -2,6 +2,7 @@ package rabbitmq
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 
@@ -87,6 +88,68 @@ func TestEnsureTopologyDeclaresFanoutAndBinding(t *testing.T) {
 		}
 	case <-ctx.Done():
 		t.Fatalf("waiting for routed message: %v", ctx.Err())
+	}
+}
+
+func TestVerifyTopologyReportsDeletedBinding(t *testing.T) {
+	requireBroker(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	const exchange = "rabbitmq-driver-verify-binding-exchange"
+	const queue = "rabbitmq-driver-verify-binding-queue"
+	raw, err := amqp.Dial(defaultEndpoint)
+	if err != nil {
+		t.Fatalf("Dial: %v", err)
+	}
+	t.Cleanup(func() { _ = raw.Close() })
+	rawChannel, err := raw.Channel()
+	if err != nil {
+		t.Fatalf("Channel: %v", err)
+	}
+	t.Cleanup(func() { _ = rawChannel.Close() })
+	_, _ = rawChannel.QueueDelete(queue, false, false, false)
+	_ = rawChannel.ExchangeDelete(exchange, false, false)
+	t.Cleanup(func() {
+		_, _ = rawChannel.QueueDelete(queue, false, false, false)
+		_ = rawChannel.ExchangeDelete(exchange, false, false)
+	})
+
+	conn, err := (Driver{}).Open(ctx, driver.Config{Endpoints: []string{defaultEndpoint}})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	t.Cleanup(func() { _ = conn.Close(ctx) })
+
+	spec := driver.TopologySpec{
+		Exchanges:    []driver.ExchangeSpec{{Name: exchange, Kind: "fanout", Durable: true}},
+		Destinations: []driver.DestinationSpec{{Name: queue, Durable: true}},
+		Bindings:     []driver.BindingSpec{{Source: exchange, Destination: queue}},
+	}
+	if _, err := conn.Admin().EnsureTopology(ctx, spec); err != nil {
+		t.Fatalf("EnsureTopology: %v", err)
+	}
+	if err := rawChannel.QueueUnbind(queue, "", exchange, nil); err != nil {
+		t.Fatalf("QueueUnbind: %v", err)
+	}
+
+	spec.Policy = driver.TopologyVerify
+	_, err = conn.Admin().EnsureTopology(ctx, spec)
+	if err == nil {
+		t.Fatal("TopologyVerify() error = nil after binding deletion")
+	}
+	message := err.Error()
+	if !strings.Contains(message, "binding") || !strings.Contains(message, exchange) || !strings.Contains(message, queue) {
+		t.Fatalf("TopologyVerify() error = %q, want binding and endpoint names", message)
+	}
+
+	spec.Policy = driver.TopologyDeclare
+	repaired, err := conn.Admin().EnsureTopology(ctx, spec)
+	if err != nil {
+		t.Fatalf("EnsureTopology after binding deletion: %v", err)
+	}
+	if !containsString(repaired.CreatedBindings, queue) {
+		t.Fatalf("EnsureTopology after binding deletion CreatedBindings = %v, want %q", repaired.CreatedBindings, queue)
 	}
 }
 

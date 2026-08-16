@@ -107,31 +107,33 @@ func (a *admin) ensureTopology(ctx context.Context, spec driver.TopologySpec) (d
 	}
 
 	seenBindings := make(map[bindingKey]struct{}, len(spec.Bindings))
+	actualBindings := make(map[bindingKey]struct{})
+	if len(spec.Bindings) > 0 {
+		var err error
+		actualBindings, err = a.currentBindings(ctx)
+		if err != nil {
+			return driver.TopologyDiff{}, classify("ensure_topology", driver.KindTransient, err)
+		}
+	}
 	for _, binding := range spec.Bindings {
 		if err := ctx.Err(); err != nil {
 			return driver.TopologyDiff{}, classify("ensure_topology", driver.KindTransient, err)
 		}
-		if binding.Source == "" || binding.Destination == "" {
-			return driver.TopologyDiff{}, classify("ensure_topology", driver.KindFatal, errors.New("binding source and destination are required"))
+		if err := validateBinding(binding); err != nil {
+			return driver.TopologyDiff{}, classify("ensure_topology", driver.KindFatal, err)
 		}
 		key := bindingKey{source: binding.Source, destination: binding.Destination}
 		if _, seen := seenBindings[key]; seen {
 			continue
 		}
 		seenBindings[key] = struct{}{}
-		a.conn.mu.RLock()
-		known := a.conn.bindings[key]
-		a.conn.mu.RUnlock()
-		if known {
+		if _, known := actualBindings[key]; known {
 			diff.Existing = append(diff.Existing, binding.Destination)
 			continue
 		}
 		if err := a.bindQueue(ctx, binding); err != nil {
 			return driver.TopologyDiff{}, err
 		}
-		a.conn.mu.Lock()
-		a.conn.bindings[key] = true
-		a.conn.mu.Unlock()
 		diff.CreatedBindings = append(diff.CreatedBindings, binding.Destination)
 	}
 	a.scanOrphans(ctx, spec, &diff)
@@ -191,7 +193,58 @@ func (a *admin) verifyTopology(ctx context.Context, spec driver.TopologySpec) (d
 			diff.Existing = append(diff.Existing, parkName)
 		}
 	}
+	actualBindings := make(map[bindingKey]struct{})
+	if len(spec.Bindings) > 0 {
+		var err error
+		actualBindings, err = a.currentBindings(ctx)
+		if err != nil {
+			return driver.TopologyDiff{}, classify("ensure_topology", driver.KindTransient, err)
+		}
+	}
+	seenBindings := make(map[bindingKey]struct{}, len(spec.Bindings))
+	for _, binding := range spec.Bindings {
+		if err := validateBinding(binding); err != nil {
+			return driver.TopologyDiff{}, classify("ensure_topology", driver.KindFatal, err)
+		}
+		key := bindingKey{source: binding.Source, destination: binding.Destination}
+		if _, seen := seenBindings[key]; seen {
+			continue
+		}
+		seenBindings[key] = struct{}{}
+		if _, exists := actualBindings[key]; !exists {
+			return driver.TopologyDiff{}, classify("ensure_topology", driver.KindNotFound, fmt.Errorf("binding %q -> %q is missing: %w", binding.Source, binding.Destination, driver.ErrDestinationMissing))
+		}
+		diff.Existing = append(diff.Existing, binding.Destination)
+	}
 	return diff, nil
+}
+
+func (a *admin) currentBindings(ctx context.Context) (map[bindingKey]struct{}, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if a.conn.management == nil {
+		return nil, errors.New("rabbitmq: binding verification unsupported: management client is unavailable")
+	}
+	bindings, err := a.conn.management.listBindings(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("rabbitmq: binding verification unavailable: %w", err)
+	}
+	actual := make(map[bindingKey]struct{}, len(bindings))
+	for _, binding := range bindings {
+		if binding.DestinationType != "queue" || binding.RoutingKey != "" {
+			continue
+		}
+		actual[bindingKey{source: binding.Source, destination: binding.Destination}] = struct{}{}
+	}
+	return actual, nil
+}
+
+func validateBinding(binding driver.BindingSpec) error {
+	if binding.Source == "" || binding.Destination == "" {
+		return errors.New("binding source and destination are required")
+	}
+	return nil
 }
 
 func (a *admin) scanOrphans(ctx context.Context, spec driver.TopologySpec, diff *driver.TopologyDiff) {
