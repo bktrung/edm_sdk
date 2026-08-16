@@ -136,6 +136,23 @@ func TestDrainRunsFlushErrors(t *testing.T) {
 	}
 }
 
+func TestDrainRejectsNegativeTimeout(t *testing.T) {
+	machine := New()
+	if err := machine.Transition(Ready); err != nil {
+		t.Fatal(err)
+	}
+	called := false
+	err := machine.Drain(context.Background(), Config{DrainTimeout: -time.Second}, Hooks{
+		Drain: func(context.Context) error {
+			called = true
+			return nil
+		},
+	})
+	if err == nil || called || machine.State() != Aborted {
+		t.Fatalf("Drain() error = %v, called = %v, state = %s; want negative timeout rejection", err, called, machine.State())
+	}
+}
+
 func TestDrainPassesIndependentHookTimeouts(t *testing.T) {
 	machine := New()
 	if err := machine.Transition(Ready); err != nil {

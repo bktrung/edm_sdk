@@ -354,16 +354,8 @@ func validateSubscription(cfg Config, name string, sub SubscriptionConfig) error
 		}
 		seen[priority] = struct{}{}
 	}
-	if sub.Retry.MaxAttempts < 1 || sub.Retry.MaxAttempts > 20 {
-		return fmt.Errorf("f1: subscriptions.%s.retry.maxAttempts must be between 1 and 20", name)
-	}
-	if sub.Retry.Jitter < 0 || sub.Retry.Jitter > .5 {
-		return fmt.Errorf("f1: subscriptions.%s.retry.jitter must be between 0 and 0.5", name)
-	}
-	for i, tier := range sub.Retry.Tiers {
-		if tier <= 0 {
-			return fmt.Errorf("f1: subscriptions.%s.retry.tiers[%d] must be positive", name, i)
-		}
+	if err := validateRetryConfig("subscriptions."+name+".retry", sub.Retry); err != nil {
+		return err
 	}
 	tiers := retryTiers(sub.Retry)
 	lanes := len(sub.Topics) * len(sub.Priorities) * (1 + tiers)

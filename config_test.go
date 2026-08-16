@@ -1,6 +1,7 @@
 package f1
 
 import (
+	"math"
 	"os"
 	"path/filepath"
 	"strings"
@@ -265,6 +266,103 @@ func TestLoadConfigValidatesBrokerTimeoutRelationships(t *testing.T) {
 				t.Fatalf("LoadConfig() error = %v, want %s", err, test.want)
 			}
 		})
+	}
+}
+
+func TestValidateConfigRejectsInvalidRetryValues(t *testing.T) {
+	cases := invalidRetryValueCases()
+	for _, test := range cases {
+		t.Run(test.name, func(t *testing.T) {
+			cfg := validValidationConfig()
+			retry := cfg.Subscriptions["orders"].Retry
+			test.set(&retry)
+			cfg.Subscriptions["orders"] = withRetry(cfg.Subscriptions["orders"], retry)
+			if err := validateConfig(cfg); err == nil || !strings.Contains(err.Error(), test.field) {
+				t.Fatalf("validateConfig() error = %v, want %s validation", err, test.field)
+			}
+		})
+	}
+}
+
+func TestValidateSubscriptionRejectsInvalidRetryValues(t *testing.T) {
+	cfg := validValidationConfig()
+	for _, test := range invalidRetryValueCases() {
+		t.Run(test.name, func(t *testing.T) {
+			sub := cfg.Subscriptions["orders"]
+			test.set(&sub.Retry)
+			if err := validateSubscription(cfg, "orders", sub); err == nil || !strings.Contains(err.Error(), test.field) {
+				t.Fatalf("validateSubscription() error = %v, want %s validation", err, test.field)
+			}
+		})
+	}
+}
+
+func TestValidateConfigRejectsNegativeLifecycleDurations(t *testing.T) {
+	cases := []struct {
+		name string
+		set  func(*LifecycleConfig)
+	}{
+		{name: "pre stop delay", set: func(cfg *LifecycleConfig) { cfg.PreStopDelay = -time.Second }},
+		{name: "drain timeout", set: func(cfg *LifecycleConfig) { cfg.DrainTimeout = -time.Second }},
+		{name: "handler grace", set: func(cfg *LifecycleConfig) { cfg.HandlerGrace = -time.Second }},
+		{name: "flush timeout", set: func(cfg *LifecycleConfig) { cfg.FlushTimeout = -time.Second }},
+		{name: "close timeout", set: func(cfg *LifecycleConfig) { cfg.CloseTimeout = -time.Second }},
+		{name: "rebalance drain timeout", set: func(cfg *LifecycleConfig) { cfg.RebalanceDrainTimeout = -time.Second }},
+	}
+	for _, test := range cases {
+		t.Run(test.name, func(t *testing.T) {
+			cfg := validValidationConfig()
+			cfg.Subscriptions = nil
+			test.set(&cfg.Lifecycle)
+			if err := validateConfig(cfg); err == nil || !strings.Contains(err.Error(), "lifecycle") {
+				t.Fatalf("validateConfig() error = %v, want lifecycle validation", err)
+			}
+		})
+	}
+}
+
+func validValidationConfig() Config {
+	cfg := defaultConfig()
+	cfg.Env = "test"
+	cfg.Service = "orders"
+	cfg.Broker.Driver = "inmem"
+	cfg.Subscriptions = map[string]SubscriptionConfig{
+		"orders": {
+			Topics:         []string{"orders"},
+			Concurrency:    1,
+			Prefetch:       64,
+			Priorities:     []Priority{PriorityNormal},
+			Retry:          RetryConfig{MaxAttempts: 2, Tiers: []time.Duration{time.Second}},
+			HandlerTimeout: time.Second,
+		},
+	}
+	return cfg
+}
+
+func withRetry(sub SubscriptionConfig, retry RetryConfig) SubscriptionConfig {
+	sub.Retry = retry
+	return sub
+}
+
+func invalidRetryValueCases() []struct {
+	name  string
+	field string
+	set   func(*RetryConfig)
+} {
+	return []struct {
+		name  string
+		field string
+		set   func(*RetryConfig)
+	}{
+		{name: "negative initial interval", field: "initialInterval", set: func(cfg *RetryConfig) { cfg.InitialInterval = -time.Second }},
+		{name: "negative multiplier", field: "multiplier", set: func(cfg *RetryConfig) { cfg.Multiplier = -1 }},
+		{name: "nan multiplier", field: "multiplier", set: func(cfg *RetryConfig) { cfg.Multiplier = math.NaN() }},
+		{name: "positive infinity multiplier", field: "multiplier", set: func(cfg *RetryConfig) { cfg.Multiplier = math.Inf(1) }},
+		{name: "negative infinity multiplier", field: "multiplier", set: func(cfg *RetryConfig) { cfg.Multiplier = math.Inf(-1) }},
+		{name: "negative max interval", field: "maxInterval", set: func(cfg *RetryConfig) { cfg.MaxInterval = -time.Second }},
+		{name: "nan jitter", field: "jitter", set: func(cfg *RetryConfig) { cfg.Jitter = math.NaN() }},
+		{name: "positive infinity jitter", field: "jitter", set: func(cfg *RetryConfig) { cfg.Jitter = math.Inf(1) }},
+		{name: "negative retry tier", field: "tiers", set: func(cfg *RetryConfig) { cfg.Tiers = []time.Duration{-time.Second} }},
 	}
 }
 

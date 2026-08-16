@@ -3,6 +3,7 @@ package f1
 import (
 	"bytes"
 	"fmt"
+	"math"
 	"os"
 	"strings"
 	"time"
@@ -43,7 +44,8 @@ type CodecConfig struct {
 	MaxBodyBytes   int    `yaml:"maxBodyBytes"`
 }
 
-// LifecycleConfig configures the timing of graceful client shutdown.
+// LifecycleConfig configures the timing of graceful client shutdown. Zero
+// disables the corresponding delay or deadline; negative values are invalid.
 type LifecycleConfig struct {
 	PreStopDelay          time.Duration `yaml:"preStopDelay"`
 	DrainTimeout          time.Duration `yaml:"drainTimeout"`
@@ -270,6 +272,9 @@ func validateConfig(cfg Config) error {
 	if cfg.Codec.MaxBodyBytes <= 0 {
 		return fmt.Errorf("f1: codec.maxBodyBytes must be positive")
 	}
+	if err := validateLifecycleConfig(cfg.Lifecycle); err != nil {
+		return err
+	}
 	for name, subscription := range cfg.Subscriptions {
 		if len(subscription.Topics) == 0 {
 			return fmt.Errorf("f1: subscriptions.%s.topics must not be empty", name)
@@ -277,11 +282,8 @@ func validateConfig(cfg Config) error {
 		if subscription.Concurrency < 1 || subscription.Concurrency > 1024 {
 			return fmt.Errorf("f1: subscriptions.%s.concurrency must be between 1 and 1024", name)
 		}
-		if subscription.Retry.MaxAttempts < 1 || subscription.Retry.MaxAttempts > 20 {
-			return fmt.Errorf("f1: subscriptions.%s.retry.maxAttempts must be between 1 and 20", name)
-		}
-		if subscription.Retry.Jitter < 0 || subscription.Retry.Jitter > .5 {
-			return fmt.Errorf("f1: subscriptions.%s.retry.jitter must be between 0 and 0.5", name)
+		if err := validateRetryConfig("subscriptions."+name+".retry", subscription.Retry); err != nil {
+			return err
 		}
 		lanes := len(subscription.Topics) * len(subscription.Priorities) * (1 + retryTiers(subscription.Retry))
 		if subscription.Prefetch < lanes {
@@ -316,6 +318,50 @@ func validateConfig(cfg Config) error {
 			if consumerTimeout < subscription.HandlerTimeout*3 {
 				return fmt.Errorf("f1: broker.rabbitmq.consumerTimeout must be at least subscriptions.%s.handlerTimeout x 3", name)
 			}
+		}
+	}
+	return nil
+}
+
+func validateRetryConfig(path string, retry RetryConfig) error {
+	if retry.MaxAttempts < 1 || retry.MaxAttempts > 20 {
+		return fmt.Errorf("f1: %s.maxAttempts must be between 1 and 20", path)
+	}
+	if retry.InitialInterval < 0 {
+		return fmt.Errorf("f1: %s.initialInterval must not be negative", path)
+	}
+	if retry.Multiplier < 0 || math.IsNaN(retry.Multiplier) || math.IsInf(retry.Multiplier, 0) {
+		return fmt.Errorf("f1: %s.multiplier must be finite and non-negative", path)
+	}
+	if retry.MaxInterval < 0 {
+		return fmt.Errorf("f1: %s.maxInterval must not be negative", path)
+	}
+	if retry.Jitter < 0 || retry.Jitter > .5 || math.IsNaN(retry.Jitter) || math.IsInf(retry.Jitter, 0) {
+		return fmt.Errorf("f1: %s.jitter must be finite and between 0 and 0.5", path)
+	}
+	for i, tier := range retry.Tiers {
+		if tier <= 0 {
+			return fmt.Errorf("f1: %s.tiers[%d] must be positive", path, i)
+		}
+	}
+	return nil
+}
+
+func validateLifecycleConfig(lifecycle LifecycleConfig) error {
+	values := []struct {
+		name  string
+		value time.Duration
+	}{
+		{name: "preStopDelay", value: lifecycle.PreStopDelay},
+		{name: "drainTimeout", value: lifecycle.DrainTimeout},
+		{name: "handlerGrace", value: lifecycle.HandlerGrace},
+		{name: "flushTimeout", value: lifecycle.FlushTimeout},
+		{name: "closeTimeout", value: lifecycle.CloseTimeout},
+		{name: "rebalanceDrainTimeout", value: lifecycle.RebalanceDrainTimeout},
+	}
+	for _, item := range values {
+		if item.value < 0 {
+			return fmt.Errorf("f1: lifecycle.%s must not be negative", item.name)
 		}
 	}
 	return nil

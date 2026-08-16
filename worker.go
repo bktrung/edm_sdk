@@ -470,41 +470,43 @@ func (r *Runner) Drain(ctx context.Context) error {
 	}
 	if handlerCancel != nil {
 		drainTimeout := r.client.config.Lifecycle.DrainTimeout
-		if drainTimeout <= 0 {
-			drainTimeout = time.Minute
+		if drainTimeout < 0 {
+			return fmt.Errorf("f1: lifecycle.drainTimeout must not be negative")
 		}
-		grace := r.client.config.Lifecycle.HandlerGrace
-		if grace < 0 || grace >= drainTimeout {
-			grace = 0
-		}
-		delay := drainTimeout - grace
-		// The grace timer must not join the group whose completion it waits for.
-		// It watches done, and done is closed only after that group's Wait returns,
-		// so putting it there makes Wait block for the whole grace delay even when
-		// every delivery has already finished. asyncGroup is never waited by the
-		// runner, which is exactly what this goroutine needs.
-		r.mu.Lock()
-		group := r.asyncGroup
-		r.mu.Unlock()
-		if delay <= 0 || group == nil {
-			handlerCancel()
-			if handlerShutdownCancel != nil {
-				handlerShutdownCancel()
+		if drainTimeout > 0 {
+			grace := r.client.config.Lifecycle.HandlerGrace
+			if grace < 0 || grace >= drainTimeout {
+				grace = 0
 			}
-		} else {
-			group.Go(func() error {
-				timer := r.client.options.clock.Timer(delay)
-				defer timer.Stop()
-				select {
-				case <-timer.C:
-					handlerCancel()
-					if handlerShutdownCancel != nil {
-						handlerShutdownCancel()
-					}
-				case <-done:
+			delay := drainTimeout - grace
+			// The grace timer must not join the group whose completion it waits for.
+			// It watches done, and done is closed only after that group's Wait returns,
+			// so putting it there makes Wait block for the whole grace delay even when
+			// every delivery has already finished. asyncGroup is never waited by the
+			// runner, which is exactly what this goroutine needs.
+			r.mu.Lock()
+			group := r.asyncGroup
+			r.mu.Unlock()
+			if delay <= 0 || group == nil {
+				handlerCancel()
+				if handlerShutdownCancel != nil {
+					handlerShutdownCancel()
 				}
-				return nil
-			})
+			} else {
+				group.Go(func() error {
+					timer := r.client.options.clock.Timer(delay)
+					defer timer.Stop()
+					select {
+					case <-timer.C:
+						handlerCancel()
+						if handlerShutdownCancel != nil {
+							handlerShutdownCancel()
+						}
+					case <-done:
+					}
+					return nil
+				})
+			}
 		}
 	}
 	select {
@@ -573,7 +575,10 @@ func runWithClockTimeout(parent context.Context, clk clock.Clock, timeout time.D
 	if parent == nil {
 		parent = context.Background()
 	}
-	if timeout <= 0 {
+	if timeout < 0 {
+		return fmt.Errorf("f1: shutdown %s phase timeout must not be negative", phase)
+	}
+	if timeout == 0 {
 		return fn(parent)
 	}
 	if clk == nil {
@@ -595,6 +600,13 @@ func runWithClockTimeout(parent context.Context, clk clock.Clock, timeout time.D
 	}
 }
 
+func contextWithOptionalTimeout(parent context.Context, timeout time.Duration) (context.Context, context.CancelFunc) {
+	if timeout == 0 {
+		return context.WithCancel(parent)
+	}
+	return context.WithTimeout(parent, timeout)
+}
+
 func runnerSettlementContext(r *Runner, fallback context.Context) context.Context {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -603,11 +615,8 @@ func runnerSettlementContext(r *Runner, fallback context.Context) context.Contex
 	}
 	if fallback != nil && fallback.Err() != nil {
 		drainTimeout := r.client.config.Lifecycle.DrainTimeout
-		if drainTimeout <= 0 {
-			drainTimeout = time.Minute
-		}
 		base := context.WithoutCancel(fallback)
-		r.settleCtx, r.settleCancel = context.WithTimeout(base, drainTimeout)
+		r.settleCtx, r.settleCancel = contextWithOptionalTimeout(base, drainTimeout)
 		return r.settleCtx
 	}
 	return fallback
@@ -732,17 +741,17 @@ func fetchRunner(r *Runner, ctx context.Context, dispatch chan<- delivery) error
 
 func fetchRunnerAfterCancel(r *Runner, parent context.Context, messages <-chan driver.InboundMessage, dispatch chan<- delivery) error {
 	drainTimeout := r.client.config.Lifecycle.DrainTimeout
-	if drainTimeout <= 0 {
-		drainTimeout = time.Minute
+	if drainTimeout < 0 {
+		return fmt.Errorf("f1: lifecycle.drainTimeout must not be negative")
 	}
 	drainBase := context.WithoutCancel(parent)
-	drainCtx, cancel := context.WithTimeout(drainBase, drainTimeout)
+	drainCtx, cancel := contextWithOptionalTimeout(drainBase, drainTimeout)
 	defer cancel()
 	r.mu.Lock()
 	if r.settleCancel != nil {
 		r.settleCancel()
 	}
-	r.settleCtx, r.settleCancel = context.WithTimeout(drainBase, drainTimeout)
+	r.settleCtx, r.settleCancel = contextWithOptionalTimeout(drainBase, drainTimeout)
 	r.mu.Unlock()
 	r.mu.Lock()
 	consumer := r.consumer
