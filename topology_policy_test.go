@@ -173,7 +173,6 @@ func topologyTestSubscription() Subscription {
 		Prefetch:       1,
 		Priorities:     []Priority{PriorityNormal},
 		Retry:          RetryConfig{MaxAttempts: 1},
-		MaxDeferrals:   1,
 		HandlerTimeout: time.Second,
 	}
 }

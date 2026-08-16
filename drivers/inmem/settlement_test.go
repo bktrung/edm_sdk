@@ -213,7 +213,6 @@ func settlementSubscription(handler func(context.Context, *f1.Event) error) f1.S
 		Prefetch:       1,
 		Priorities:     []f1.Priority{f1.PriorityNormal},
 		Retry:          f1.RetryConfig{MaxAttempts: 1},
-		MaxDeferrals:   1,
 		HandlerTimeout: 20 * time.Millisecond,
 		Handlers: map[string]f1.Handler{
 			"orders.created.v1": f1.HandlerFunc(handler),

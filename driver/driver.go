@@ -103,7 +103,7 @@ type Consumer interface {
 	Errors() <-chan error
 
 	// Pause stops delivery without leaving the consumer group. Accumulation must
-	// remain within the destination's prefetch share; use deferral for outages.
+	// remain within the destination's prefetch share; callers own outage policy.
 	Pause(destinations ...string) error
 
 	// Resume restarts delivery after Pause.

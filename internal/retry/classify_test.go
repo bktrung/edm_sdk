@@ -16,11 +16,6 @@ type droppedError struct{ error }
 
 func (droppedError) RetryDropped() bool { return true }
 
-type unavailableError struct{ error }
-
-func (e unavailableError) RetryUnavailable() bool { return true }
-func (e unavailableError) Unwrap() error          { return e.error }
-
 type delayedError struct {
 	error
 	delay time.Duration
@@ -43,7 +38,6 @@ func TestClassifyOutcomes(t *testing.T) {
 		{name: "nil", kind: Success},
 		{name: "drop", err: droppedError{base}, kind: Drop},
 		{name: "terminal", err: terminalError{base}, kind: Terminal},
-		{name: "unavailable", err: unavailableError{base}, kind: Unavailable},
 		{name: "retry after", err: delayedError{error: base, delay: 3 * time.Second}, kind: RetryAfter, delay: 3 * time.Second},
 		{name: "deadline", err: context.DeadlineExceeded, kind: DeadlineExceeded},
 		{name: "panic", err: panicError{base}, kind: Panic},
@@ -59,30 +53,10 @@ func TestClassifyOutcomes(t *testing.T) {
 	}
 }
 
-func TestClassifyTerminalOutranksUnavailable(t *testing.T) {
-	base := errors.New("failure")
-	for _, err := range []error{
-		unavailableError{terminalError{base}},
-		terminalError{unavailableError{base}},
-	} {
-		if got := Classify(err).Kind; got != Terminal {
-			t.Fatalf("Classify() kind = %v, want Terminal", got)
-		}
-	}
-}
-
-func TestClassifyPreservesWrappedMarkers(t *testing.T) {
-	err := errors.Join(errors.New("outer"), unavailableError{errors.New("inner")})
-	if got := Classify(err).Kind; got != Unavailable {
-		t.Fatalf("Classify() kind = %v, want Unavailable", got)
-	}
-}
-
 type allClassificationsError struct{ error }
 
 func (allClassificationsError) RetryTerminal() bool               { return true }
 func (allClassificationsError) RetryDropped() bool                { return true }
-func (allClassificationsError) RetryUnavailable() bool            { return true }
 func (allClassificationsError) RetryDelay() (time.Duration, bool) { return time.Hour, true }
 func (allClassificationsError) RetryPanic() bool                  { return true }
 

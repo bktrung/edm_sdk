@@ -31,18 +31,12 @@
         "decode",
         "expired",
         "poison",
-        "unmatched",
-        "dependency_unavailable"
+        "unmatched"
       ]
     },
     {
       "attribute": "f1deathtime",
       "type": "RFC3339",
-      "setBy": "core"
-    },
-    {
-      "attribute": "f1deferrals",
-      "type": "int",
       "setBy": "core"
     },
     {

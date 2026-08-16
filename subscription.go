@@ -30,7 +30,6 @@ type Subscription struct {
 	Priorities      []Priority
 	Fairness        FairnessConfig
 	Retry           RetryConfig
-	MaxDeferrals    int
 	HandlerTimeout  time.Duration
 	UnmatchedPolicy UnmatchedPolicy
 	OnDeadLetter    func(context.Context, DeadLettered)
@@ -211,7 +210,6 @@ func (c *Client) Subscribe(ctx context.Context, sub Subscription) (*Runner, erro
 	effective.Priorities = append([]Priority(nil), resolved.Priorities...)
 	effective.Fairness = cloneFairness(resolved.Fairness)
 	effective.Retry = cloneRetry(resolved.Retry)
-	effective.MaxDeferrals = resolved.MaxDeferrals
 	effective.HandlerTimeout = resolved.HandlerTimeout
 	effective.UnmatchedPolicy = resolved.UnmatchedPolicy
 	effective.Handlers = wrapHandlers(c.options.middleware, sub.Handlers)
@@ -284,9 +282,6 @@ func overlayLoadedSubscription(dst *SubscriptionConfig, src SubscriptionConfig) 
 	if p.Retry || !retryZero(src.Retry) {
 		dst.Retry = cloneRetry(src.Retry)
 	}
-	if p.MaxDeferrals || src.MaxDeferrals != 0 {
-		dst.MaxDeferrals = src.MaxDeferrals
-	}
 	if p.HandlerTimeout || src.HandlerTimeout != 0 {
 		dst.HandlerTimeout = src.HandlerTimeout
 	}
@@ -316,9 +311,6 @@ func overlayExplicitSubscription(dst *SubscriptionConfig, src Subscription) {
 	}
 	if !retryZero(src.Retry) {
 		dst.Retry = mergeRetry(dst.Retry, src.Retry)
-	}
-	if src.MaxDeferrals != 0 {
-		dst.MaxDeferrals = src.MaxDeferrals
 	}
 	if src.HandlerTimeout != 0 {
 		dst.HandlerTimeout = src.HandlerTimeout
@@ -374,9 +366,6 @@ func validateSubscription(cfg Config, name string, sub SubscriptionConfig) error
 		}
 	}
 	tiers := retryTiers(sub.Retry)
-	if sub.MaxDeferrals <= tiers {
-		return fmt.Errorf("f1: subscriptions.%s.maxDeferrals %d must exceed retry tiers %d", name, sub.MaxDeferrals, tiers)
-	}
 	lanes := len(sub.Topics) * len(sub.Priorities) * (1 + tiers)
 	if sub.Prefetch < lanes {
 		return fmt.Errorf("f1: subscriptions.%s.prefetch %d must be at least lane count %d (topics x priorities x (1 + retryTiers))", name, sub.Prefetch, lanes)
@@ -445,13 +434,6 @@ func applySubscriptionEnvironment(name string, cfg *SubscriptionConfig) error {
 			priorities = append(priorities, priority)
 		}
 		cfg.Priorities = priorities
-	}
-	if value, ok := lookupSubscriptionEnv(prefix, "maxDeferrals"); ok {
-		parsed, err := strconv.Atoi(value)
-		if err != nil {
-			return fmt.Errorf("f1: %s maxDeferrals: %w", envKey(prefix, "maxDeferrals"), err)
-		}
-		cfg.MaxDeferrals = parsed
 	}
 	if value, ok := lookupSubscriptionEnv(prefix, "handlerTimeout"); ok {
 		parsed, err := time.ParseDuration(value)

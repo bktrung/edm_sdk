@@ -242,7 +242,7 @@ func TestProducerAttemptCapDoesNotCreateZeroRetryTier(t *testing.T) {
 	}}
 	settler := &dispatchSettler{}
 	envelope := Envelope{SpecVersion: "1.0", ID: "evt-cap", Source: "/test/orders", Type: "orders.created", Attempt: 1, MaxAttempts: 3}
-	if !retryAndSettle(runner, context.Background(), driver.InboundMessage{Destination: "orders", Settle: settler}, envelope, errors.New("temporary"), 0, true) {
+	if !retryAndSettle(runner, context.Background(), driver.InboundMessage{Destination: "orders", Settle: settler}, envelope, errors.New("temporary")) {
 		t.Fatal("producer-capped event was not settled")
 	}
 	if len(producer.messages) != 1 || !strings.Contains(producer.messages[0].Destination, ".dlq.") || strings.Contains(producer.messages[0].Destination, ".retry.0") {
@@ -506,7 +506,7 @@ func TestRunnerAccountingAxesSumAfterMixedOutcomes(t *testing.T) {
 	runner := &Runner{
 		client: client,
 		subscription: Subscription{
-			Name: "orders", Retry: RetryConfig{MaxAttempts: 2, InitialInterval: time.Second}, MaxDeferrals: 1,
+			Name: "orders", Retry: RetryConfig{MaxAttempts: 2, InitialInterval: time.Second},
 			HandlerTimeout: time.Second,
 		},
 		inflight: newInflightRegistry(),

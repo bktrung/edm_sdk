@@ -47,7 +47,6 @@ func fullEnvelope() f1.Envelope {
 		Priority:       f1.PriorityHigh,
 		Attempt:        1,
 		MaxAttempts:    5,
-		Deferrals:      2,
 		DueTime:        &due,
 		OriginalDest:   "com.za.order.created",
 		CorrelationID:  "corr-1",
@@ -101,7 +100,7 @@ func deathReasonWireValues() []string {
 	return []string{
 		f1.ReasonMaxAttempts.String(), f1.ReasonTerminal.String(), f1.ReasonPanic.String(),
 		f1.ReasonDecode.String(), f1.ReasonExpired.String(), f1.ReasonPoison.String(),
-		f1.ReasonUnmatched.String(), f1.ReasonDependencyUnavailable.String(),
+		f1.ReasonUnmatched.String(),
 	}
 }
 
@@ -200,6 +199,49 @@ func TestDLQ_UnknownReasonSurvivesReplay(t *testing.T) {
 	replayed, err := e.EncodeHeaders(0)
 	require.NoError(t, err)
 	require.Equal(t, "a_reason_this_build_predates", replayed["f1deathreason"])
+}
+
+func TestArchivedDeferralsHeaderSurvivesReplay(t *testing.T) {
+	t.Parallel()
+
+	headers := map[string]string{
+		"specversion":     "1.0",
+		"id":              "archived-deferral",
+		"source":          "/legacy/orders",
+		"type":            "orders.created.v1",
+		"f1priority":      "normal",
+		"f1attempt":       "2",
+		"f1deferrals":     "7",
+		"f1correlationid": "archived-deferral",
+	}
+
+	e, err := f1.DecodeHeaders(headers)
+	require.NoError(t, err)
+	replayed, err := e.EncodeHeaders(0)
+	require.NoError(t, err)
+	require.Equal(t, "7", replayed["f1deferrals"])
+}
+
+func TestArchivedDependencyUnavailableReasonSurvivesReplay(t *testing.T) {
+	t.Parallel()
+
+	headers := map[string]string{
+		"specversion":     "1.0",
+		"id":              "archived-dependency-outage",
+		"source":          "/legacy/orders",
+		"type":            "orders.created.v1",
+		"f1priority":      "normal",
+		"f1attempt":       "2",
+		"f1deathreason":   "dependency_unavailable",
+		"f1correlationid": "archived-dependency-outage",
+	}
+
+	e, err := f1.DecodeHeaders(headers)
+	require.NoError(t, err)
+	require.Equal(t, "dependency_unavailable", e.DeathReason.String())
+	replayed, err := e.EncodeHeaders(0)
+	require.NoError(t, err)
+	require.Equal(t, "dependency_unavailable", replayed["f1deathreason"])
 }
 
 func TestMaxAttempts_AbsentUnlessProducerSets(t *testing.T) {
@@ -310,12 +352,12 @@ func TestEnvelope_SizeGuardDeathErrorEmptyStopsShrinking(t *testing.T) {
 	require.NotPanics(t, func() { _, _ = e.EncodeHeaders(1) })
 }
 
-func TestDeathReason_ValidIsTrueForEachOfTheEightReasons(t *testing.T) {
+func TestDeathReason_ValidIsTrueForEachOfTheSevenReasons(t *testing.T) {
 	t.Parallel()
 
 	for _, r := range []f1.DeathReason{
 		f1.ReasonMaxAttempts, f1.ReasonTerminal, f1.ReasonPanic, f1.ReasonDecode,
-		f1.ReasonExpired, f1.ReasonPoison, f1.ReasonUnmatched, f1.ReasonDependencyUnavailable,
+		f1.ReasonExpired, f1.ReasonPoison, f1.ReasonUnmatched,
 	} {
 		require.True(t, r.Valid(), r)
 	}
@@ -332,7 +374,6 @@ func TestEnvelope_DecodeHeadersRejectsMalformedValues(t *testing.T) {
 		"time":          "not-a-time",
 		"f1attempt":     "not-an-int",
 		"f1maxattempts": "not-an-int",
-		"f1deferrals":   "not-an-int",
 		"f1duetime":     "not-a-time",
 		"f1expiry":      "not-a-time",
 		"f1deathtime":   "not-a-time",

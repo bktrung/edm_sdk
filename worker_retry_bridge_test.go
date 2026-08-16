@@ -22,7 +22,6 @@ func newRetryBridgeRunner(t *testing.T, producer *dispatchProducer, topic string
 			Topics:         []string{topic},
 			Priorities:     []Priority{PriorityHigh},
 			Retry:          RetryConfig{MaxAttempts: 3, Tiers: []time.Duration{time.Second, 2 * time.Second}, Jitter: 0.2},
-			MaxDeferrals:   24,
 			HandlerTimeout: time.Second,
 		},
 		metrics: newDeliveryMetrics([]string{topic}),
@@ -73,33 +72,6 @@ func TestDispatchDeadLettersRunawayCounter(t *testing.T) {
 	}
 }
 
-func TestDispatchDeadLettersRunawayDeferrals(t *testing.T) {
-	producer := &dispatchProducer{}
-	client, runner := newRetryBridgeRunner(t, producer, "orders.created")
-	defer func() { _ = client.Close(context.Background()) }()
-
-	settler := &dispatchSettler{}
-	envelope := Envelope{
-		SpecVersion: "1.0",
-		ID:          "runaway-deferrals",
-		Source:      "/test/orders",
-		Type:        "orders.created.v1",
-		Priority:    PriorityHigh,
-		Attempt:     1,
-		Deferrals:   35,
-	}
-	message := retryBridgeMessage(t, envelope, settler)
-	if !dispatchMessage(runner, context.Background(), message, &Envelope{}, new(bool)) {
-		t.Fatal("runaway deferral message was not settled")
-	}
-	if !settler.acked || len(producer.messages) != 1 {
-		t.Fatalf("poison hand-off settled=%v copies=%d, want settled with one copy", settler.acked, len(producer.messages))
-	}
-	if got := headerValue(producer.messages[0].Headers, "f1deathreason"); got != ReasonPoison.String() {
-		t.Fatalf("death reason = %q, want %q", got, ReasonPoison)
-	}
-}
-
 func TestRetryAfterClampRecordsMetricAndCarriesTier(t *testing.T) {
 	producer := &dispatchProducer{}
 	client, runner := newRetryBridgeRunner(t, producer, "orders.retry.created")
@@ -115,7 +87,7 @@ func TestRetryAfterClampRecordsMetricAndCarriesTier(t *testing.T) {
 		Attempt:     1,
 	}
 	message := retryBridgeMessage(t, envelope, settler)
-	if !retryAndSettle(runner, context.Background(), message, envelope, RetryAfter(errors.New("slow"), 5*time.Minute), 0, true) {
+	if !retryAndSettle(runner, context.Background(), message, envelope, RetryAfter(errors.New("slow"), 5*time.Minute)) {
 		t.Fatal("retry successor was not published and settled")
 	}
 	if got := runner.metrics.sampleRetryAfterClamped()["orders.retry.created"]; got != 1 {
@@ -133,6 +105,36 @@ func TestRetryAfterClampRecordsMetricAndCarriesTier(t *testing.T) {
 	runner.retryDestinationTiers[retryDestination] = 1
 	if got, want := deliveryLane(runner, inbound), schedulerLaneID("orders.retry.created", PriorityHigh, 1); got != want {
 		t.Fatalf("wrong destination tier lane = %q, want %q", got, want)
+	}
+}
+
+func TestRetryAndSettleIncrementsAttempt(t *testing.T) {
+	producer := &dispatchProducer{}
+	client, runner := newRetryBridgeRunner(t, producer, "orders.retry.created")
+	defer func() { _ = client.Close(context.Background()) }()
+
+	settler := &dispatchSettler{}
+	envelope := Envelope{
+		SpecVersion: "1.0",
+		ID:          "ordinary-retry",
+		Source:      "/test/orders",
+		Type:        "orders.retry.created.v1",
+		Priority:    PriorityHigh,
+		Attempt:     1,
+	}
+	message := retryBridgeMessage(t, envelope, settler)
+	if !retryAndSettle(runner, context.Background(), message, envelope, errors.New("temporary")) {
+		t.Fatal("ordinary retry was not published and settled")
+	}
+	if len(producer.messages) != 1 {
+		t.Fatalf("retry copies = %d, want 1", len(producer.messages))
+	}
+	got, err := DecodeHeaders(inboundHeaders(producer.messages[0].Headers))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Attempt != 2 {
+		t.Fatalf("retry attempt = %d, want 2", got.Attempt)
 	}
 }
 
@@ -239,7 +241,7 @@ func TestFailedSuccessorHandoffsDoNotBareRequeue(t *testing.T) {
 		{
 			name: "retry",
 			handOff: func(r *Runner, ctx context.Context, message driver.InboundMessage, envelope Envelope, state *deliveryState) bool {
-				return retryAndSettle(r, ctx, message, envelope, errors.New("temporary"), 0, true, state)
+				return retryAndSettle(r, ctx, message, envelope, errors.New("temporary"), state)
 			},
 		},
 		{

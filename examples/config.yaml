@@ -22,6 +22,5 @@ f1:
       priorities: [normal]
       retry:
         maxAttempts: 1
-      maxDeferrals: 1
       handlerTimeout: 5s
       unmatchedPolicy: deadletter

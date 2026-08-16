@@ -16,8 +16,6 @@ const (
 	Drop
 	// Terminal means the message is dead-lettered without another attempt.
 	Terminal
-	// Unavailable means the message is deferred without advancing its attempt.
-	Unavailable
 	// RetryAfter means the message is retried with an explicit delay.
 	RetryAfter
 	// DeadlineExceeded means the handler timed out and should be retried.
@@ -41,9 +39,6 @@ type terminalMarker interface {
 type droppedMarker interface {
 	RetryDropped() bool
 }
-type unavailableMarker interface {
-	RetryUnavailable() bool
-}
 type delayMarker interface {
 	RetryDelay() (time.Duration, bool)
 }
@@ -51,8 +46,7 @@ type panicMarker interface {
 	RetryPanic() bool
 }
 
-// Classify maps an error to exactly one retry disposition. Terminal has
-// precedence over unavailable when both markers occur in one error chain.
+// Classify maps an error to exactly one retry disposition.
 func Classify(err error) Outcome {
 	if err == nil {
 		return Outcome{Kind: Success}
@@ -64,10 +58,6 @@ func Classify(err error) Outcome {
 	var dropped droppedMarker
 	if errors.As(err, &dropped) && dropped.RetryDropped() {
 		return Outcome{Kind: Drop, Err: err}
-	}
-	var unavailable unavailableMarker
-	if errors.As(err, &unavailable) && unavailable.RetryUnavailable() {
-		return Outcome{Kind: Unavailable, Err: err}
 	}
 	var delay delayMarker
 	if errors.As(err, &delay) {

@@ -10,7 +10,7 @@ const (
 	Handled = dispatch.DispositionHandled
 	// Requeued means the original message was returned for broker redelivery.
 	Requeued = dispatch.DispositionRequeued
-	// Retried means a successor retry or deferral copy was durably published.
+	// Retried means a successor retry copy was durably published.
 	Retried = dispatch.DispositionRetried
 	// DeadLettered means a successor dead-letter copy was durably published.
 	DeadLettered = dispatch.DispositionDeadLettered

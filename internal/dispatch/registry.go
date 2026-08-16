@@ -39,7 +39,7 @@ const (
 	DispositionHandled Disposition = iota
 	// DispositionRequeued means the original message is left for broker redelivery.
 	DispositionRequeued
-	// DispositionRetried means a successor retry or deferral copy was published.
+	// DispositionRetried means a successor retry copy was published.
 	DispositionRetried
 	// DispositionDeadLettered means a successor dead-letter copy was published.
 	DispositionDeadLettered

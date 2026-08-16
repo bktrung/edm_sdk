@@ -38,7 +38,6 @@ func TestMetricsPublishesAttemptDivergence(t *testing.T) {
 		Prefetch:       4,
 		Priorities:     []f1.Priority{f1.PriorityHigh, f1.PriorityNormal},
 		Retry:          f1.RetryConfig{MaxAttempts: 2, Tiers: []time.Duration{time.Second}},
-		MaxDeferrals:   2,
 		HandlerTimeout: time.Second,
 		Handlers: map[string]f1.Handler{
 			"orders.created.v1": f1.HandlerFunc(func(_ context.Context, event *f1.Event) error {
@@ -131,7 +130,6 @@ func TestMetricsPublishesCurrentStuckWorkers(t *testing.T) {
 		Prefetch:       1,
 		Priorities:     []f1.Priority{f1.PriorityNormal},
 		Retry:          f1.RetryConfig{MaxAttempts: 1},
-		MaxDeferrals:   1,
 		HandlerTimeout: 10 * time.Millisecond,
 		Handlers: map[string]f1.Handler{
 			"orders.created.v1": f1.HandlerFunc(func(context.Context, *f1.Event) error {

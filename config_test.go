@@ -104,7 +104,6 @@ f1:
     orders:
       topics: [com.za.order.created]
       mode: orderedByKey
-      maxDeferrals: 25
       unmatchedPolicy: deadletter
       retry:
         tiers: [1s, 5s]
@@ -116,7 +115,7 @@ f1:
 		t.Fatalf("LoadConfig() error = %v", err)
 	}
 	sub := cfg.Subscriptions["orders"]
-	if sub.Mode != OrderedByKey || sub.MaxDeferrals != 25 || sub.UnmatchedPolicy != DeadLetter {
+	if sub.Mode != OrderedByKey || sub.UnmatchedPolicy != DeadLetter {
 		t.Fatalf("subscription = %#v", sub)
 	}
 	if got, want := sub.Retry.DelayFor(3), 5*time.Second; got != want {
@@ -162,12 +161,8 @@ func TestLoadConfigRejectsSubscriptionWithoutTopics(t *testing.T) {
 func TestLoadConfigSubscriptionDefaultsAndRemovedDLQKey(t *testing.T) {
 	t.Parallel()
 	path := writeConfig(t, "f1:\n  env: test\n  service: orders\n  broker:\n    driver: inmem\n  subscriptions:\n    orders:\n      topics: [orders]\n")
-	cfg, err := LoadConfig(path)
-	if err != nil {
+	if _, err := LoadConfig(path); err != nil {
 		t.Fatal(err)
-	}
-	if got, want := cfg.Subscriptions["orders"].MaxDeferrals, 24; got != want {
-		t.Fatalf("MaxDeferrals = %d, want %d", got, want)
 	}
 	path = writeConfig(t, "f1:\n  env: test\n  service: orders\n  broker:\n    driver: inmem\n  subscriptions:\n    orders:\n      dlq:\n        enabled: false\n")
 	if _, err := LoadConfig(path); err == nil || !strings.Contains(err.Error(), "dlq") {

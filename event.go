@@ -139,11 +139,3 @@ func (e *Event) IdempotencyKey() string {
 	}
 	return e.envelope.ID
 }
-
-// Deferrals returns the number of dependency deferrals.
-func (e *Event) Deferrals() int {
-	if e == nil {
-		return 0
-	}
-	return e.envelope.Deferrals
-}

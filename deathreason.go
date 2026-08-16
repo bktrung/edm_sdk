@@ -22,8 +22,6 @@ const (
 	ReasonPoison DeathReason = "poison"
 	// ReasonUnmatched means no handler matched the event type.
 	ReasonUnmatched DeathReason = "unmatched"
-	// ReasonDependencyUnavailable means the deferral limit was exceeded.
-	ReasonDependencyUnavailable DeathReason = "dependency_unavailable"
 )
 
 // String returns the wire value of r.
@@ -33,7 +31,7 @@ func (r DeathReason) String() string { return string(r) }
 func (r DeathReason) Valid() bool {
 	switch r {
 	case ReasonMaxAttempts, ReasonTerminal, ReasonPanic, ReasonDecode,
-		ReasonExpired, ReasonPoison, ReasonUnmatched, ReasonDependencyUnavailable:
+		ReasonExpired, ReasonPoison, ReasonUnmatched:
 		return true
 	default:
 		return false

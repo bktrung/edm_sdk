@@ -16,7 +16,7 @@ Each of these is testable, and each is enforced by CI, not documentation:
 
 - **At-least-once delivery, with a stable message identity.** Transport redelivers during failures
   and rolling restarts - that is the guarantee, not a bug. F1 generates an event id, uses it as the
-  idempotency key by default, and preserves that key across every retry, deferral, dead-letter and
+  idempotency key by default, and preserves that key across every retry, dead-letter and
   redelivery copy of the same message. F1 does not deduplicate handler effects and keeps no store of
   seen keys: a service reads `Event.IdempotencyKey()` and makes its own effect safe to apply twice.
   Measured as `f1_messages_lost_total == 0`.

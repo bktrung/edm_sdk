@@ -1,2 +1,2 @@
-// Package retry contains broker-independent retry and deferral decisions.
+// Package retry contains broker-independent retry decisions.
 package retry

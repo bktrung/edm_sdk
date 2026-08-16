@@ -7,12 +7,11 @@ import (
 
 // classifiedError carries one handler outcome through wrapped error chains.
 type classifiedError struct {
-	err         error
-	terminal    bool
-	dropped     bool
-	unavailable bool
-	retryDelay  time.Duration
-	hasDelay    bool
+	err        error
+	terminal   bool
+	dropped    bool
+	retryDelay time.Duration
+	hasDelay   bool
 }
 
 func (e *classifiedError) Error() string {
@@ -47,15 +46,6 @@ func Drop(err error) error {
 	return &classifiedError{err: err, dropped: true}
 }
 
-// Unavailable defers a message without increasing its attempt count.
-// When the deferral limit is exceeded, the message is dead-lettered.
-func Unavailable(err error) error {
-	if err == nil {
-		return nil
-	}
-	return &classifiedError{err: err, unavailable: true}
-}
-
 // IsTerminal reports whether err or an error it wraps is terminal.
 func IsTerminal(err error) bool {
 	for current := err; current != nil; {
@@ -75,13 +65,6 @@ func IsTerminal(err error) bool {
 func IsDropped(err error) bool {
 	var classified *classifiedError
 	return errors.As(err, &classified) && classified.dropped
-}
-
-// IsUnavailable reports whether err's outermost classification is unavailable.
-// A terminal outer classification takes precedence when both are present.
-func IsUnavailable(err error) bool {
-	var classified *classifiedError
-	return errors.As(err, &classified) && classified.unavailable
 }
 
 // RetryDelay returns an explicit retry delay carried by err.

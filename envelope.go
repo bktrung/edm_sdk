@@ -24,7 +24,6 @@ type Envelope struct {
 	Priority       Priority // encoded as a string on the wire
 	Attempt        int
 	MaxAttempts    int // absent unless producer-capped or stamped on a retry copy
-	Deferrals      int
 	DueTime        *time.Time
 	OriginalDest   string
 	CorrelationID  string
@@ -92,9 +91,6 @@ func (e Envelope) EncodeHeaders(driverMaxBytes int) (map[string]string, error) {
 	setOpt(h, "dataschema", e.DataSchema)
 	if e.MaxAttempts != 0 {
 		h["f1maxattempts"] = strconv.Itoa(e.MaxAttempts)
-	}
-	if e.Deferrals != 0 {
-		h["f1deferrals"] = strconv.Itoa(e.Deferrals)
 	}
 	setOptTime(h, "f1duetime", e.DueTime)
 	setOpt(h, "f1originaldest", e.OriginalDest)
@@ -211,13 +207,6 @@ func DecodeHeaders(h map[string]string) (Envelope, error) {
 		}
 		e.MaxAttempts = n
 	}
-	if v, ok := h["f1deferrals"]; ok {
-		n, err := strconv.Atoi(v)
-		if err != nil {
-			return Envelope{}, fmt.Errorf("f1: header f1deferrals: %w", err)
-		}
-		e.Deferrals = n
-	}
 	var err error
 	if e.DueTime, err = parseOptTime(h, "f1duetime"); err != nil {
 		return Envelope{}, err
@@ -287,7 +276,7 @@ var knownHeaders = map[string]bool{
 	"specversion": true, "id": true, "source": true, "type": true, "time": true,
 	"datacontenttype": true, "subject": true, "dataschema": true,
 	"f1idempotencykey": true, "f1priority": true, "f1attempt": true,
-	"f1maxattempts": true, "f1deferrals": true, "f1duetime": true,
+	"f1maxattempts": true, "f1duetime": true,
 	"f1originaldest": true, "f1correlationid": true, "f1causationid": true,
 	"f1producer": true, "f1partitionkey": true, "f1expiry": true,
 	"f1deatherror": true, "f1deathreason": true, "f1deathtime": true,
