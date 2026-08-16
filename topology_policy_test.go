@@ -142,6 +142,29 @@ func TestConsumerTopologyPolicyUsesDerivedConfig(t *testing.T) {
 	}
 }
 
+func TestConsumerTopologyErrorsWithoutAdmin(t *testing.T) {
+	cfg := testClientConfig(t) // AutoCreate = true derives TopologyDeclare
+	consumer := newDispatchConsumer()
+	client, err := New(context.Background(), cfg,
+		WithDriver(&dispatchDriver{conn: &dispatchConn{producer: &dispatchProducer{}, consumer: consumer}}))
+	require.NoError(t, err)
+	defer func() { _ = client.Close(context.Background()) }()
+
+	runner := &Runner{
+		client: client,
+		subscription: Subscription{
+			Name:       "orders",
+			Topics:     []string{"orders.created"},
+			Priorities: []Priority{PriorityNormal},
+			Retry:      RetryConfig{MaxAttempts: 1},
+		},
+		config: SubscriptionConfig{Prefetch: 1},
+	}
+	_, err = openRunnerConsumer(runner, context.Background())
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "requires driver admin")
+}
+
 func topologyTestSubscription() Subscription {
 	return Subscription{
 		Name:           "orders-worker",

@@ -636,12 +636,14 @@ func openRunnerConsumer(r *Runner, ctx context.Context) (driver.Consumer, error)
 	r.retryDestinationTiers = retryDestinationTiers
 	r.mu.Unlock()
 	if policy != driver.TopologyNone {
-		if admin := conn.Admin(); admin != nil {
-			topology := subscriptionTopologySpecs(effective, source, r.subscription)
-			topology.Policy = policy
-			if _, err := admin.EnsureTopology(ctx, topology); err != nil {
-				return nil, fmt.Errorf("f1: ensure subscription topology: %w", err)
-			}
+		admin := conn.Admin()
+		if admin == nil {
+			return nil, errors.New("f1: consumer topology requires driver admin")
+		}
+		topology := subscriptionTopologySpecs(effective, source, r.subscription)
+		topology.Policy = policy
+		if _, err := admin.EnsureTopology(ctx, topology); err != nil {
+			return nil, fmt.Errorf("f1: ensure subscription topology: %w", err)
 		}
 	}
 	perDestination := make(map[string]int, len(destinations))

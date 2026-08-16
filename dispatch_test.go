@@ -282,7 +282,7 @@ func TestRunnerRunRejectedWhileClientClosing(t *testing.T) {
 
 func TestRunnerDispatchesHandlerAndDrains(t *testing.T) {
 	consumer := newDispatchConsumer()
-	conn := &dispatchConn{producer: &dispatchProducer{}, consumer: consumer}
+	conn := &dispatchConn{producer: &dispatchProducer{}, consumer: consumer, admin: &dispatchAdmin{}}
 	client, err := New(context.Background(), testClientConfig(t), WithDriver(&dispatchDriver{conn: conn}))
 	if err != nil {
 		t.Fatal(err)
@@ -341,6 +341,7 @@ type dispatchConn struct {
 	mu           sync.Mutex
 	producer     *dispatchProducer
 	consumer     *dispatchConsumer
+	admin        driver.Admin
 	closed       bool
 	closeStarted chan struct{}
 	closeRelease chan struct{}
@@ -358,7 +359,7 @@ func (c *dispatchConn) Consumer(context.Context, driver.ConsumerConfig) (driver.
 	}
 	return c.consumer, nil
 }
-func (*dispatchConn) Admin() driver.Admin        { return nil }
+func (c *dispatchConn) Admin() driver.Admin      { return c.admin }
 func (*dispatchConn) Ping(context.Context) error { return nil }
 func (c *dispatchConn) Close(context.Context) error {
 	c.mu.Lock()
@@ -373,6 +374,26 @@ func (c *dispatchConn) Close(context.Context) error {
 		<-release
 	}
 	return nil
+}
+
+// dispatchAdmin is a no-op driver.Admin: EnsureTopology succeeds trivially,
+// matching what every real driver in this repo provides, so dispatch tests
+// that are not exercising topology behavior are not tripped by the consumer
+// path now requiring a non-nil Admin under a non-TopologyNone policy.
+type dispatchAdmin struct{}
+
+func (*dispatchAdmin) EnsureTopology(context.Context, driver.TopologySpec) (driver.TopologyDiff, error) {
+	return driver.TopologyDiff{}, nil
+}
+
+func (*dispatchAdmin) DescribeTopology(context.Context, []string) (driver.TopologyState, error) {
+	return driver.TopologyState{}, driver.ErrUnsupported
+}
+
+func (*dispatchAdmin) Purge(context.Context, string) (int64, error) { return 0, driver.ErrUnsupported }
+
+func (*dispatchAdmin) Prune(context.Context, []string) ([]driver.PruneResult, error) {
+	return nil, driver.ErrUnsupported
 }
 
 type dispatchProducer struct {

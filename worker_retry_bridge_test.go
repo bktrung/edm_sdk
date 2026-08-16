@@ -139,7 +139,7 @@ func TestRetryAfterClampRecordsMetricAndCarriesTier(t *testing.T) {
 func TestOpenRunnerConsumerBuildsRetryDestinationTiers(t *testing.T) {
 	consumer := newDispatchConsumer()
 	producer := &dispatchProducer{}
-	client, err := New(context.Background(), testClientConfig(t), WithDriver(&dispatchDriver{conn: &dispatchConn{producer: producer, consumer: consumer}}))
+	client, err := New(context.Background(), testClientConfig(t), WithDriver(&dispatchDriver{conn: &dispatchConn{producer: producer, consumer: consumer, admin: &dispatchAdmin{}}}))
 	if err != nil {
 		t.Fatal(err)
 	}

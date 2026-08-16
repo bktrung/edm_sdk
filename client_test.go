@@ -36,6 +36,25 @@ func TestNewValidatesOptionsEagerly(t *testing.T) {
 	}
 }
 
+func TestTracerProviderAndErrorHandlerAreRetained(t *testing.T) {
+	t.Parallel()
+	cfg := testClientConfig(t)
+	tracer := tracenoop.NewTracerProvider()
+	var handlerCalls int
+	handler := func(context.Context, *Event, error) { handlerCalls++ }
+	client, err := New(context.Background(), cfg, WithDriver(&testDriver{}), WithTracerProvider(tracer), WithErrorHandler(handler))
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	defer func() { _ = client.Close(context.Background()) }()
+	if client.options.tracerProvider != tracer {
+		t.Fatal("tracerProvider was not retained on the client")
+	}
+	if client.options.errorHandler == nil {
+		t.Fatal("errorHandler was not retained on the client")
+	}
+}
+
 func TestLogCapabilitiesWarnsForConfiguredUnavailableFeature(t *testing.T) {
 	var logs bytes.Buffer
 	cfg, err := LoadConfig(writeConfig(t, `
