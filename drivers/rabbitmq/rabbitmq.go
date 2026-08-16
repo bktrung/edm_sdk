@@ -105,7 +105,12 @@ func (Driver) Open(ctx context.Context, cfg driver.Config) (driver.Conn, error) 
 			}
 			conn, err := dial(openCtx, endpoint, cfg)
 			if err == nil {
-				return newConn(conn, capabilitiesForQueueKind(queueKind), endpoint, queueKind), nil
+				managedConn, connErr := newConn(conn, capabilitiesForQueueKind(queueKind), endpoint, cfg, queueKind)
+				if connErr != nil {
+					_ = conn.Close()
+					return nil, classify("open", driver.KindFatal, connErr)
+				}
+				return managedConn, nil
 			}
 			lastErr = err
 		}
@@ -141,20 +146,24 @@ type conn struct {
 
 var _ driver.Conn = (*conn)(nil)
 
-func newConn(amqpConn *amqp.Connection, caps driver.Capabilities, endpoint string, kind queueKind) *conn {
+func newConn(amqpConn *amqp.Connection, caps driver.Capabilities, endpoint string, cfg driver.Config, kind queueKind) (*conn, error) {
+	management, err := newManagementClient(endpoint, cfg)
+	if err != nil {
+		return nil, err
+	}
 	return &conn{
 		amqp:       amqpConn,
 		caps:       caps,
 		info:       brokerInfo(amqpConn),
 		queueKind:  kind,
-		management: newManagementClient(endpoint),
+		management: management,
 		active:     make(map[*consumer]struct{}),
 		producers:  make(map[*producer]struct{}),
 		exchanges:  make(map[string]struct{}),
 		bindings:   make(map[bindingKey]bool),
 		deferred:   make(map[string]time.Duration),
 		ephemeral:  make(map[string]*amqp.Channel),
-	}
+	}, nil
 }
 
 func (c *conn) Capabilities() driver.Capabilities { return c.caps }

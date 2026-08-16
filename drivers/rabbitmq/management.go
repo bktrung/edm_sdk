@@ -10,7 +10,12 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"time"
+
+	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/driver"
 )
+
+const defaultManagementTimeout = 30 * time.Second
 
 type managementClient struct {
 	baseURL  string
@@ -27,38 +32,75 @@ type managementQueue struct {
 	Consumers     int64  `json:"consumers"`
 }
 
-func newManagementClient(endpoint string) *managementClient {
+func newManagementClient(endpoint string, cfg driver.Config) (*managementClient, error) {
 	parsed, err := url.Parse(endpoint)
 	if err != nil || parsed.Hostname() == "" {
-		return &managementClient{baseURL: "http://localhost:15672", username: "guest", vhost: "/"}
+		if err == nil {
+			err = fmt.Errorf("missing host")
+		}
+		return nil, fmt.Errorf("rabbitmq: invalid management endpoint %q: %w", endpoint, err)
 	}
 	scheme := "http"
 	managementPort := 15672
-	if parsed.Scheme == "amqps" {
+	if parsed.Scheme == "amqps" || (cfg.TLS != nil && cfg.TLS.Enabled) {
 		scheme = "https"
 		managementPort = 15671
 	}
-	if parsed.Port() == "5671" {
+	if parsed.Port() == "5671" || parsed.Port() == "15671" {
 		managementPort = 15671
 	}
+	if parsed.Port() == "15672" {
+		managementPort = 15672
+	}
 	host := net.JoinHostPort(parsed.Hostname(), strconv.Itoa(managementPort))
-	username, password := "guest", "guest"
+	username, password := "", ""
 	if parsed.User != nil {
 		username = parsed.User.Username()
 		password, _ = parsed.User.Password()
 	}
-	vhost := "/"
-	if escaped := strings.TrimPrefix(parsed.EscapedPath(), "/"); escaped != "" {
-		if decoded, decodeErr := url.PathUnescape(escaped); decodeErr == nil && decoded != "" {
-			vhost = "/" + strings.TrimPrefix(decoded, "/")
+	if cfg.SASL != nil && (cfg.SASL.Username != "" || cfg.SASL.Password != "") {
+		username = cfg.SASL.Username
+		password = cfg.SASL.Password
+	}
+	vhost := cfg.DriverOptions["rabbitmq.vhost"]
+	if vhost == "" {
+		vhost = "/"
+		if escaped := strings.TrimPrefix(parsed.EscapedPath(), "/"); escaped != "" {
+			decoded, decodeErr := url.PathUnescape(escaped)
+			if decodeErr != nil {
+				return nil, fmt.Errorf("rabbitmq: invalid management endpoint vhost %q: %w", parsed.EscapedPath(), decodeErr)
+			}
+			if decoded != "" {
+				vhost = "/" + strings.TrimPrefix(decoded, "/")
+			}
 		}
+	}
+	if vhost == "" {
+		vhost = "/"
+	}
+	timeout := cfg.ConnectTimeout
+	if timeout <= 0 {
+		timeout = defaultManagementTimeout
+	}
+	client := http.Client{Timeout: timeout}
+	if cfg.TLS != nil && cfg.TLS.Enabled {
+		tlsSettings := *cfg.TLS
+		tlsSettings.InsecureSkipVerify = cfg.TLS.InsecureSkipVerify
+		tlsClientConfig, tlsErr := tlsConfig(&tlsSettings)
+		if tlsErr != nil {
+			return nil, tlsErr
+		}
+		transport := http.DefaultTransport.(*http.Transport).Clone()
+		transport.TLSClientConfig = tlsClientConfig
+		client.Transport = transport
 	}
 	return &managementClient{
 		baseURL:  scheme + "://" + host,
 		username: username,
 		password: password,
 		vhost:    vhost,
-	}
+		client:   client,
+	}, nil
 }
 
 func (m *managementClient) queuePath(name string) string {
