@@ -136,6 +136,7 @@ type conn struct {
 	queueKind  queueKind
 	management *managementClient
 	closed     bool
+	closing    bool
 	active     map[*consumer]struct{}
 	producers  map[*producer]struct{}
 	exchanges  map[string]struct{}
@@ -177,7 +178,7 @@ func (c *conn) Producer(ctx context.Context, cfg driver.ProducerConfig) (driver.
 		return nil, classify("producer", driver.KindTransient, err)
 	}
 	c.mu.RLock()
-	if c.closed || c.amqp.IsClosed() {
+	if c.closed || c.closing || c.amqp.IsClosed() {
 		c.mu.RUnlock()
 		return nil, classify("producer", driver.KindTransient, amqp.ErrClosed)
 	}
@@ -187,7 +188,7 @@ func (c *conn) Producer(ctx context.Context, cfg driver.ProducerConfig) (driver.
 		return nil, err
 	}
 	c.mu.Lock()
-	if c.closed || c.amqp.IsClosed() {
+	if c.closed || c.closing || c.amqp.IsClosed() {
 		c.mu.Unlock()
 		_ = producer.channel.Close()
 		return nil, classify("producer", driver.KindTransient, amqp.ErrClosed)
@@ -203,7 +204,7 @@ func (c *conn) Consumer(ctx context.Context, cfg driver.ConsumerConfig) (driver.
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.closed || c.amqp.IsClosed() {
+	if c.closed || c.closing || c.amqp.IsClosed() {
 		return nil, classify("consumer", driver.KindTransient, amqp.ErrClosed)
 	}
 	if len(cfg.Destinations) == 0 {
@@ -249,7 +250,7 @@ func (c *conn) Ping(ctx context.Context) error {
 		return classify("ping", driver.KindTransient, err)
 	}
 	c.mu.RLock()
-	if c.closed || c.amqp.IsClosed() {
+	if c.closed || c.closing || c.amqp.IsClosed() {
 		c.mu.RUnlock()
 		return classify("ping", driver.KindTransient, amqp.ErrClosed)
 	}
@@ -273,11 +274,15 @@ func (c *conn) Close(ctx context.Context) error {
 		c.mu.Unlock()
 		return nil
 	}
+	if c.closing {
+		c.mu.Unlock()
+		return classify("close", driver.KindTransient, errors.New("close already in progress"))
+	}
 	if len(c.active) != 0 || len(c.producers) != 0 {
 		c.mu.Unlock()
 		return classify("close", driver.KindFatal, driver.ErrResourcesOutstanding)
 	}
-	c.closed = true
+	c.closing = true
 	deadline, hasDeadline := ctx.Deadline()
 	amqpConn := c.amqp
 	ephemeral := make([]*amqp.Channel, 0, len(c.ephemeral))
@@ -299,15 +304,29 @@ func (c *conn) Close(ctx context.Context) error {
 		select {
 		case err = <-done:
 		case <-ctx.Done():
+			c.mu.Lock()
+			c.closing = false
+			c.mu.Unlock()
 			return classify("close", driver.KindTransient, ctx.Err())
 		}
 	}
 	if errors.Is(err, amqp.ErrClosed) {
+		c.mu.Lock()
+		c.closing = false
+		c.closed = true
+		c.mu.Unlock()
 		return nil
 	}
 	if err != nil {
+		c.mu.Lock()
+		c.closing = false
+		c.mu.Unlock()
 		return classifyAMQP("close", driver.KindTransient, err)
 	}
+	c.mu.Lock()
+	c.closing = false
+	c.closed = true
+	c.mu.Unlock()
 	return nil
 }
 

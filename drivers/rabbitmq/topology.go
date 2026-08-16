@@ -461,7 +461,7 @@ func (a *admin) openChannel(ctx context.Context) (*amqp.Channel, error) {
 	}
 	a.conn.mu.RLock()
 	defer a.conn.mu.RUnlock()
-	if a.conn.closed || a.conn.amqp.IsClosed() {
+	if a.conn.closed || a.conn.closing || a.conn.amqp.IsClosed() {
 		return nil, classify("ensure_topology", driver.KindTransient, amqp.ErrClosed)
 	}
 	channel, err := a.conn.amqp.Channel()
