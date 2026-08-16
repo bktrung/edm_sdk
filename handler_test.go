@@ -6,7 +6,6 @@ import (
 	"reflect"
 	"strings"
 	"testing"
-	"time"
 
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/driver"
 )
@@ -127,61 +126,6 @@ func TestChain_UserMiddlewarePanicIsRecovered(t *testing.T) {
 	}
 	if !strings.Contains(headerValue(producer.messages[0].Headers, "f1deatherror"), "middleware boom") {
 		t.Fatalf("panic error header = %q, want middleware panic", headerValue(producer.messages[0].Headers, "f1deatherror"))
-	}
-}
-
-func TestChain_UserMiddlewareCanClassifyUnavailable(t *testing.T) {
-	producer := &dispatchProducer{}
-	client, err := New(context.Background(), testClientConfig(t),
-		WithDriver(&dispatchDriver{conn: &dispatchConn{producer: producer}}),
-		WithMiddleware(func(next Handler) Handler {
-			return HandlerFunc(func(ctx context.Context, event *Event) error {
-				return Unavailable(next.Handle(ctx, event))
-			})
-		}),
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() { _ = client.Close(context.Background()) }()
-
-	runner, err := client.Subscribe(context.Background(), Subscription{
-		Name: "orders", MaxDeferrals: 24,
-		Topics: []string{"orders.created"},
-		Retry:  RetryConfig{MaxAttempts: 3, InitialInterval: time.Second, Multiplier: 2, MaxInterval: time.Second},
-		Handlers: map[string]Handler{
-			"orders.created": HandlerFunc(func(context.Context, *Event) error { return errors.New("dependency unavailable") }),
-		},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	envelope := Envelope{SpecVersion: "1.0", ID: "evt-middleware-unavailable", Source: "/test/orders", Type: "orders.created", Attempt: 1}
-	headers, err := envelope.EncodeHeaders(CoreMaxHeaderBytes)
-	if err != nil {
-		t.Fatal(err)
-	}
-	settler := &dispatchSettler{}
-	if !dispatchMessage(runner, context.Background(), driver.InboundMessage{
-		Destination: "orders",
-		Headers:     headerSlice(headers),
-		Body:        []byte(`{}`),
-		Settle:      settler,
-	}, &Envelope{}, new(bool)) {
-		t.Fatal("middleware-classified unavailable message was not settled")
-	}
-	if !settler.acked {
-		t.Fatal("middleware-classified unavailable message was not acked")
-	}
-	if len(producer.messages) != 1 || strings.Contains(producer.messages[0].Destination, ".dlq.") || !strings.Contains(producer.messages[0].Destination, ".retry.") {
-		t.Fatalf("successor destination = %q, want retry destination", producer.messages[0].Destination)
-	}
-	successor, err := DecodeHeaders(inboundHeaders(producer.messages[0].Headers))
-	if err != nil {
-		t.Fatalf("decode successor headers: %v", err)
-	}
-	if successor.Deferrals != 1 || successor.Attempt != 1 {
-		t.Fatalf("successor envelope = deferrals %d, attempt %d; want deferrals 1 and attempt 1", successor.Deferrals, successor.Attempt)
 	}
 }
 

@@ -170,6 +170,47 @@ func runConsume(group *groupContext) {
 		group.vector.Add(BehaviorEvent{ID: "pause-isolated", Outcome: "ok", FinalDestination: "consume.pause-a,consume.pause-b"})
 	})
 
+	group.Check("empty pause stops every destination and resume restarts delivery", func(t *testing.T) {
+		producerA := newProducer(t, group, "consume.pause-all-a", driver.ProducerConfig{Effective: group.effective})
+		producerB := newProducer(t, group, "consume.pause-all-b", driver.ProducerConfig{Effective: group.effective})
+		consumer := newConsumerFor(t, group, driver.ConsumerConfig{
+			Destinations: []string{"consume.pause-all-a", "consume.pause-all-b"}, Prefetch: 2, Effective: group.effective,
+		})
+		if err := consumer.Pause(); err != nil {
+			t.Fatalf("Pause() error = %v", err)
+		}
+		if err := producerA.Publish(group.ctx, driver.OutboundMessage{Destination: "consume.pause-all-a"}); err != nil {
+			t.Fatalf("Publish(a) error = %v", err)
+		}
+		if err := producerB.Publish(group.ctx, driver.OutboundMessage{Destination: "consume.pause-all-b"}); err != nil {
+			t.Fatalf("Publish(b) error = %v", err)
+		}
+		waitForStable(t, group, "empty Pause to stop every destination", func() (bool, string) {
+			select {
+			case message, ok := <-consumer.Messages():
+				if !ok {
+					return false, "Messages channel closed"
+				}
+				return false, fmt.Sprintf("received paused destination %q", message.Destination)
+			default:
+				return true, "no delivery while paused"
+			}
+		})
+		if err := consumer.Resume(); err != nil {
+			t.Fatalf("Resume() error = %v", err)
+		}
+		seen := map[string]bool{}
+		for range 2 {
+			message := receiveMessage(t, group, consumer)
+			seen[message.Destination] = true
+			ackMessage(t, group, message)
+		}
+		if !seen["consume.pause-all-a"] || !seen["consume.pause-all-b"] {
+			t.Fatalf("destinations after Resume() = %v, want both destinations", seen)
+		}
+		group.vector.Add(BehaviorEvent{ID: "pause-all", Outcome: "ok", FinalDestination: "consume.pause-all-a,consume.pause-all-b"})
+	})
+
 	group.Check("repeated pause is idempotent", func(t *testing.T) {
 		producerA := newProducer(t, group, "consume.pause-repeat-a", driver.ProducerConfig{Effective: group.effective})
 		producerB := newProducer(t, group, "consume.pause-repeat-b", driver.ProducerConfig{Effective: group.effective})

@@ -141,8 +141,9 @@ func WithMiddleware(middleware ...Middleware) Option {
 	}
 }
 
-// WithErrorHandler records an asynchronous driver-error callback.
-// Dispatch wires it when consumers are introduced.
+// WithErrorHandler records an asynchronous driver-error callback. The
+// handler is retained on the client but not yet invoked: no dispatch path
+// calls it in this version.
 func WithErrorHandler(handler func(context.Context, *Event, error)) Option {
 	return func(options *clientOptions) error {
 		if handler == nil {

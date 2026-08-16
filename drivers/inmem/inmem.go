@@ -419,11 +419,13 @@ func (c *conn) pump() {
 func (c *conn) nextDueLocked() (time.Time, bool) {
 	var next time.Time
 	for _, dest := range c.destinations {
-		if len(dest.messages) == 0 || dest.messages[0].due.IsZero() {
-			continue
-		}
-		if next.IsZero() || dest.messages[0].due.Before(next) {
-			next = dest.messages[0].due
+		for _, message := range dest.messages {
+			if message.due.IsZero() {
+				continue
+			}
+			if next.IsZero() || message.due.Before(next) {
+				next = message.due
+			}
 		}
 	}
 	for consumer := range c.consumers {
@@ -518,7 +520,7 @@ destinationLoop:
 			delivered := false
 			for i, msg := range dest.messages {
 				if !msg.due.IsZero() && now.Before(msg.due) {
-					break
+					continue
 				}
 				cs := dest.pickConsumer(msg)
 				if cs == nil {

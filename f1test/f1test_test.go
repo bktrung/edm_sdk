@@ -25,7 +25,6 @@ func TestClientDeliverAndCapture(t *testing.T) {
 		Prefetch:       1,
 		Priorities:     []f1.Priority{f1.PriorityNormal},
 		Retry:          f1.RetryConfig{MaxAttempts: 1},
-		MaxDeferrals:   1,
 		HandlerTimeout: time.Second,
 		Handlers: map[string]f1.Handler{
 			"orders.created.v1": f1.HandlerFunc(func(context.Context, *f1.Event) error {
@@ -68,7 +67,6 @@ func TestClientDeliverWaitsForRunningSubscription(t *testing.T) {
 		Prefetch:       1,
 		Priorities:     []f1.Priority{f1.PriorityNormal},
 		Retry:          f1.RetryConfig{MaxAttempts: 1},
-		MaxDeferrals:   1,
 		HandlerTimeout: time.Second,
 		Handlers: map[string]f1.Handler{
 			"orders.created.v1": f1.HandlerFunc(func(context.Context, *f1.Event) error {
@@ -110,7 +108,6 @@ func TestClientDeliverWaitsForEachSubscriptionDestination(t *testing.T) {
 		Prefetch:       1,
 		Priorities:     []f1.Priority{f1.PriorityNormal},
 		Retry:          f1.RetryConfig{MaxAttempts: 1},
-		MaxDeferrals:   1,
 		HandlerTimeout: time.Second,
 		Handlers: map[string]f1.Handler{
 			"orders.created.v1": f1.HandlerFunc(func(context.Context, *f1.Event) error {
@@ -127,7 +124,6 @@ func TestClientDeliverWaitsForEachSubscriptionDestination(t *testing.T) {
 		Prefetch:       1,
 		Priorities:     []f1.Priority{f1.PriorityNormal},
 		Retry:          f1.RetryConfig{MaxAttempts: 1},
-		MaxDeferrals:   1,
 		HandlerTimeout: time.Second,
 		Handlers: map[string]f1.Handler{
 			"payments.created.v1": f1.HandlerFunc(func(context.Context, *f1.Event) error {
@@ -183,7 +179,6 @@ func TestClientCapturesDeadLetterCopies(t *testing.T) {
 		Prefetch:       1,
 		Priorities:     []f1.Priority{f1.PriorityNormal},
 		Retry:          f1.RetryConfig{MaxAttempts: 1},
-		MaxDeferrals:   1,
 		HandlerTimeout: time.Second,
 		OnDeadLetter:   func(context.Context, f1.DeadLettered) { close(deadLettered) },
 		Handlers: map[string]f1.Handler{
@@ -224,7 +219,6 @@ func TestClientAdvanceFiresDriverRetry(t *testing.T) {
 		Prefetch:       2,
 		Priorities:     []f1.Priority{f1.PriorityNormal},
 		Retry:          f1.RetryConfig{MaxAttempts: 2, Tiers: []time.Duration{time.Second}},
-		MaxDeferrals:   2,
 		HandlerTimeout: time.Second,
 		Handlers: map[string]f1.Handler{
 			"orders.created.v1": f1.HandlerFunc(func(context.Context, *f1.Event) error {

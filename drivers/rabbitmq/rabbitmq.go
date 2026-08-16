@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/url"
 	"os"
 	"strings"
 	"sync"
@@ -104,7 +105,12 @@ func (Driver) Open(ctx context.Context, cfg driver.Config) (driver.Conn, error) 
 			}
 			conn, err := dial(openCtx, endpoint, cfg)
 			if err == nil {
-				return newConn(conn, capabilitiesForQueueKind(queueKind), endpoint, queueKind), nil
+				managedConn, connErr := newConn(conn, capabilitiesForQueueKind(queueKind), endpoint, cfg, queueKind)
+				if connErr != nil {
+					_ = conn.Close()
+					return nil, classify("open", driver.KindFatal, connErr)
+				}
+				return managedConn, nil
 			}
 			lastErr = err
 		}
@@ -130,30 +136,33 @@ type conn struct {
 	queueKind  queueKind
 	management *managementClient
 	closed     bool
+	closing    bool
 	active     map[*consumer]struct{}
 	producers  map[*producer]struct{}
 	exchanges  map[string]struct{}
-	bindings   map[bindingKey]bool
 	deferred   map[string]time.Duration
 	ephemeral  map[string]*amqp.Channel
 }
 
 var _ driver.Conn = (*conn)(nil)
 
-func newConn(amqpConn *amqp.Connection, caps driver.Capabilities, endpoint string, kind queueKind) *conn {
+func newConn(amqpConn *amqp.Connection, caps driver.Capabilities, endpoint string, cfg driver.Config, kind queueKind) (*conn, error) {
+	management, err := newManagementClient(endpoint, cfg)
+	if err != nil {
+		return nil, err
+	}
 	return &conn{
 		amqp:       amqpConn,
 		caps:       caps,
 		info:       brokerInfo(amqpConn),
 		queueKind:  kind,
-		management: newManagementClient(endpoint),
+		management: management,
 		active:     make(map[*consumer]struct{}),
 		producers:  make(map[*producer]struct{}),
 		exchanges:  make(map[string]struct{}),
-		bindings:   make(map[bindingKey]bool),
 		deferred:   make(map[string]time.Duration),
 		ephemeral:  make(map[string]*amqp.Channel),
-	}
+	}, nil
 }
 
 func (c *conn) Capabilities() driver.Capabilities { return c.caps }
@@ -169,7 +178,7 @@ func (c *conn) Producer(ctx context.Context, cfg driver.ProducerConfig) (driver.
 		return nil, classify("producer", driver.KindTransient, err)
 	}
 	c.mu.RLock()
-	if c.closed || c.amqp.IsClosed() {
+	if c.closed || c.closing || c.amqp.IsClosed() {
 		c.mu.RUnlock()
 		return nil, classify("producer", driver.KindTransient, amqp.ErrClosed)
 	}
@@ -179,7 +188,7 @@ func (c *conn) Producer(ctx context.Context, cfg driver.ProducerConfig) (driver.
 		return nil, err
 	}
 	c.mu.Lock()
-	if c.closed || c.amqp.IsClosed() {
+	if c.closed || c.closing || c.amqp.IsClosed() {
 		c.mu.Unlock()
 		_ = producer.channel.Close()
 		return nil, classify("producer", driver.KindTransient, amqp.ErrClosed)
@@ -195,7 +204,7 @@ func (c *conn) Consumer(ctx context.Context, cfg driver.ConsumerConfig) (driver.
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.closed || c.amqp.IsClosed() {
+	if c.closed || c.closing || c.amqp.IsClosed() {
 		return nil, classify("consumer", driver.KindTransient, amqp.ErrClosed)
 	}
 	if len(cfg.Destinations) == 0 {
@@ -241,7 +250,7 @@ func (c *conn) Ping(ctx context.Context) error {
 		return classify("ping", driver.KindTransient, err)
 	}
 	c.mu.RLock()
-	if c.closed || c.amqp.IsClosed() {
+	if c.closed || c.closing || c.amqp.IsClosed() {
 		c.mu.RUnlock()
 		return classify("ping", driver.KindTransient, amqp.ErrClosed)
 	}
@@ -265,11 +274,15 @@ func (c *conn) Close(ctx context.Context) error {
 		c.mu.Unlock()
 		return nil
 	}
+	if c.closing {
+		c.mu.Unlock()
+		return classify("close", driver.KindTransient, errors.New("close already in progress"))
+	}
 	if len(c.active) != 0 || len(c.producers) != 0 {
 		c.mu.Unlock()
 		return classify("close", driver.KindFatal, driver.ErrResourcesOutstanding)
 	}
-	c.closed = true
+	c.closing = true
 	deadline, hasDeadline := ctx.Deadline()
 	amqpConn := c.amqp
 	ephemeral := make([]*amqp.Channel, 0, len(c.ephemeral))
@@ -291,15 +304,29 @@ func (c *conn) Close(ctx context.Context) error {
 		select {
 		case err = <-done:
 		case <-ctx.Done():
+			c.mu.Lock()
+			c.closing = false
+			c.mu.Unlock()
 			return classify("close", driver.KindTransient, ctx.Err())
 		}
 	}
 	if errors.Is(err, amqp.ErrClosed) {
+		c.mu.Lock()
+		c.closing = false
+		c.closed = true
+		c.mu.Unlock()
 		return nil
 	}
 	if err != nil {
+		c.mu.Lock()
+		c.closing = false
+		c.mu.Unlock()
 		return classifyAMQP("close", driver.KindTransient, err)
 	}
+	c.mu.Lock()
+	c.closing = false
+	c.closed = true
+	c.mu.Unlock()
 	return nil
 }
 
@@ -411,16 +438,42 @@ func tlsConfig(settings *driver.TLSConfig) (*tls.Config, error) {
 	return config, nil
 }
 
+// isTestEndpoint reports whether every endpoint in the list resolves to an
+// exact loopback literal: the hostname "localhost" or an IP address for
+// which net.IP.IsLoopback is true. An empty list or any endpoint that fails
+// to parse, or whose host is not an exact loopback literal, makes the whole
+// list ineligible for insecure TLS.
 func isTestEndpoint(endpoints []string) bool {
 	if len(endpoints) == 0 {
-		return true
+		return false
 	}
 	for _, endpoint := range endpoints {
-		if strings.Contains(endpoint, "localhost") || strings.Contains(endpoint, "127.0.0.1") {
-			return true
+		if !isLoopbackEndpoint(endpoint) {
+			return false
 		}
 	}
-	return false
+	return true
+}
+
+// isLoopbackEndpoint reports whether the host portion of endpoint is exactly
+// "localhost" or an IP address that net.IP.IsLoopback confirms is loopback.
+// A hostname that merely contains "localhost" or a loopback IP as a
+// substring, such as an attacker-registrable "evil-localhost.example.com",
+// does not qualify.
+func isLoopbackEndpoint(endpoint string) bool {
+	parsed, err := url.Parse(endpoint)
+	if err != nil {
+		return false
+	}
+	host := parsed.Hostname()
+	if host == "" {
+		return false
+	}
+	if host == "localhost" {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 func waitRetry(ctx context.Context) error {

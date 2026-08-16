@@ -636,12 +636,14 @@ func openRunnerConsumer(r *Runner, ctx context.Context) (driver.Consumer, error)
 	r.retryDestinationTiers = retryDestinationTiers
 	r.mu.Unlock()
 	if policy != driver.TopologyNone {
-		if admin := conn.Admin(); admin != nil {
-			topology := subscriptionTopologySpecs(effective, source, r.subscription)
-			topology.Policy = policy
-			if _, err := admin.EnsureTopology(ctx, topology); err != nil {
-				return nil, fmt.Errorf("f1: ensure subscription topology: %w", err)
-			}
+		admin := conn.Admin()
+		if admin == nil {
+			return nil, errors.New("f1: consumer topology requires driver admin")
+		}
+		topology := subscriptionTopologySpecs(effective, source, r.subscription)
+		topology.Policy = policy
+		if _, err := admin.EnsureTopology(ctx, topology); err != nil {
+			return nil, fmt.Errorf("f1: ensure subscription topology: %w", err)
 		}
 	}
 	perDestination := make(map[string]int, len(destinations))
@@ -840,7 +842,7 @@ func dispatchMessage(r *Runner, ctx context.Context, message driver.InboundMessa
 	if maxAttempts <= 0 {
 		maxAttempts = r.subscription.Retry.MaxAttempts
 	}
-	if retry.CounterRunaway(envelope.Attempt, envelope.Deferrals, maxAttempts, r.subscription.MaxDeferrals) {
+	if retry.CounterRunaway(envelope.Attempt, maxAttempts) {
 		return deadLetterAndSettle(r, ctx, message, envelope, ReasonPoison, errors.New("retry counter exceeded sanity margin"), state)
 	}
 	// Record at receipt, before handler work or settlement: a failed settlement
@@ -879,20 +881,11 @@ func dispatchMessage(r *Runner, ctx context.Context, message driver.InboundMessa
 		return ackDelivery(r, runnerSettlementContext(r, ctx), message, state)
 	case retry.Terminal:
 		return deadLetterAndSettle(r, ctx, message, envelope, ReasonTerminal, result.err, state)
-	case retry.Unavailable:
-		if retryTiers(r.subscription.Retry) == 0 {
-			return deadLetterAndSettle(r, ctx, message, envelope, ReasonDependencyUnavailable, result.err, state)
-		}
-		deferrals := envelope.Deferrals + 1
-		if deferrals > r.subscription.MaxDeferrals {
-			return deadLetterAndSettle(r, ctx, message, envelope, ReasonDependencyUnavailable, result.err, state)
-		}
-		return retryAndSettle(r, ctx, message, envelope, result.err, deferrals, false, state)
 	}
 	if envelope.Attempt >= maxAttempts {
 		return deadLetterAndSettle(r, ctx, message, envelope, ReasonMaxAttempts, result.err, state)
 	}
-	return retryAndSettle(r, ctx, message, envelope, result.err, 0, true, state)
+	return retryAndSettle(r, ctx, message, envelope, result.err, state)
 }
 
 func classifyRetryError(err error) retry.Outcome {
@@ -901,8 +894,6 @@ func classifyRetryError(err error) retry.Outcome {
 		return retry.Outcome{Kind: retry.Terminal, Err: err}
 	case IsDropped(err):
 		return retry.Outcome{Kind: retry.Drop, Err: err}
-	case IsUnavailable(err):
-		return retry.Outcome{Kind: retry.Unavailable, Err: err}
 	}
 	if delay, ok := RetryDelay(err); ok {
 		if delay < 0 {
@@ -1106,7 +1097,7 @@ func deadLetter(r *Runner, ctx context.Context, message driver.InboundMessage, e
 	return nil
 }
 
-func retryAndSettle(r *Runner, ctx context.Context, message driver.InboundMessage, envelope Envelope, lastErr error, deferrals int, attempt bool, states ...*deliveryState) bool {
+func retryAndSettle(r *Runner, ctx context.Context, message driver.InboundMessage, envelope Envelope, lastErr error, states ...*deliveryState) bool {
 	state := stateFor(states)
 	copyEnvelope := envelope
 	if copyEnvelope.OriginalDest == "" {
@@ -1115,11 +1106,7 @@ func retryAndSettle(r *Runner, ctx context.Context, message driver.InboundMessag
 	copyEnvelope.DeathError = ""
 	copyEnvelope.DeathReason = ReasonUnspecified
 	copyEnvelope.DeathTime = nil
-	if deferrals > 0 {
-		copyEnvelope.Deferrals = deferrals
-	} else if attempt {
-		copyEnvelope.Attempt++
-	}
+	copyEnvelope.Attempt++
 	if copyEnvelope.MaxAttempts == 0 {
 		copyEnvelope.MaxAttempts = r.subscription.Retry.MaxAttempts
 	}
@@ -1136,9 +1123,6 @@ func retryAndSettle(r *Runner, ctx context.Context, message driver.InboundMessag
 		return deadLetterAndSettle(r, ctx, message, envelope, ReasonMaxAttempts, lastErr, state)
 	}
 	tier := retry.ResolveTier(retryConfig, envelope.Attempt)
-	if deferrals > 0 {
-		tier = retry.DeferralTier(deferrals, tiers)
-	}
 	delay := retryConfig.DelayFor(tier)
 	if requested, ok := RetryDelay(lastErr); ok {
 		resolvedTier, resolvedDelay, clamped := retry.ResolveRetryAfter(retryConfig, requested)

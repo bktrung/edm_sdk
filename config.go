@@ -162,7 +162,6 @@ type SubscriptionConfig struct {
 	Priorities      []Priority      `yaml:"priorities"`
 	Fairness        FairnessConfig  `yaml:"fairness"`
 	Retry           RetryConfig     `yaml:"retry"`
-	MaxDeferrals    int             `yaml:"maxDeferrals"`
 	HandlerTimeout  time.Duration   `yaml:"handlerTimeout"`
 	UnmatchedPolicy UnmatchedPolicy `yaml:"unmatchedPolicy"`
 
@@ -172,8 +171,8 @@ type SubscriptionConfig struct {
 // subscriptionPresence records YAML keys whose explicit zero value must win
 // over a documented default during the later Go subscription merge.
 type subscriptionPresence struct {
-	Topics, Mode, Concurrency, Prefetch, Priorities                bool
-	Fairness, Retry, MaxDeferrals, HandlerTimeout, UnmatchedPolicy bool
+	Topics, Mode, Concurrency, Prefetch, Priorities  bool
+	Fairness, Retry, HandlerTimeout, UnmatchedPolicy bool
 }
 
 // LoadConfig reads path, applies environment overrides, fills defaults, and
@@ -283,9 +282,6 @@ func validateConfig(cfg Config) error {
 		}
 		if subscription.Retry.Jitter < 0 || subscription.Retry.Jitter > .5 {
 			return fmt.Errorf("f1: subscriptions.%s.retry.jitter must be between 0 and 0.5", name)
-		}
-		if subscription.MaxDeferrals <= retryTiers(subscription.Retry) {
-			return fmt.Errorf("f1: subscriptions.%s.maxDeferrals %d must exceed retry tiers %d", name, subscription.MaxDeferrals, retryTiers(subscription.Retry))
 		}
 		lanes := len(subscription.Topics) * len(subscription.Priorities) * (1 + retryTiers(subscription.Retry))
 		if subscription.Prefetch < lanes {
@@ -487,7 +483,6 @@ type rawSubscription struct {
 	Priorities      []rawPriority `yaml:"priorities"`
 	Fairness        rawFairness   `yaml:"fairness"`
 	Retry           rawRetry      `yaml:"retry"`
-	MaxDeferrals    int           `yaml:"maxDeferrals"`
 	HandlerTimeout  time.Duration `yaml:"handlerTimeout"`
 	UnmatchedPolicy rawPolicy     `yaml:"unmatchedPolicy"`
 	presence        subscriptionPresence
@@ -497,12 +492,12 @@ func defaultSubscription() SubscriptionConfig {
 	return SubscriptionConfig{
 		Concurrency: 16, Priorities: []Priority{PriorityHigh, PriorityNormal, PriorityLow},
 		Fairness: FairnessConfig{Weights: map[Priority]int{PriorityHigh: 8, PriorityNormal: 4, PriorityLow: 1}, Budgets: map[Priority]time.Duration{PriorityHigh: 5 * time.Second, PriorityNormal: 30 * time.Second, PriorityLow: 120 * time.Second}, RetryWeightDivisor: 2, CostModel: "count", PrefetchFactor: 2, AgingEnabled: true},
-		Retry:    RetryConfig{MaxAttempts: 4, InitialInterval: time.Second, Multiplier: 5, MaxInterval: 30 * time.Second, Jitter: .2}, MaxDeferrals: 24, HandlerTimeout: 30 * time.Second,
+		Retry:    RetryConfig{MaxAttempts: 4, InitialInterval: time.Second, Multiplier: 5, MaxInterval: 30 * time.Second, Jitter: .2}, HandlerTimeout: 30 * time.Second,
 	}
 }
 
 func (y *rawSubscription) UnmarshalYAML(value *yaml.Node) error {
-	if err := requireKnownKeys(value, "topics", "mode", "concurrency", "prefetch", "priorities", "fairness", "retry", "maxDeferrals", "handlerTimeout", "unmatchedPolicy"); err != nil {
+	if err := requireKnownKeys(value, "topics", "mode", "concurrency", "prefetch", "priorities", "fairness", "retry", "handlerTimeout", "unmatchedPolicy"); err != nil {
 		return err
 	}
 	type rawSubscriptionInput rawSubscription
@@ -524,7 +519,7 @@ func (y rawSubscription) config() (SubscriptionConfig, error) {
 	if err != nil {
 		return SubscriptionConfig{}, err
 	}
-	return SubscriptionConfig{Topics: y.Topics, Mode: Mode(y.Mode), Concurrency: y.Concurrency, Prefetch: y.Prefetch, Priorities: priorities, Fairness: fairness, Retry: RetryConfig(y.Retry), MaxDeferrals: y.MaxDeferrals, HandlerTimeout: y.HandlerTimeout, UnmatchedPolicy: UnmatchedPolicy(y.UnmatchedPolicy), presence: y.presence}, nil
+	return SubscriptionConfig{Topics: y.Topics, Mode: Mode(y.Mode), Concurrency: y.Concurrency, Prefetch: y.Prefetch, Priorities: priorities, Fairness: fairness, Retry: RetryConfig(y.Retry), HandlerTimeout: y.HandlerTimeout, UnmatchedPolicy: UnmatchedPolicy(y.UnmatchedPolicy), presence: y.presence}, nil
 }
 
 func rawSubscriptionFromConfig(subscription SubscriptionConfig) rawSubscription {
@@ -540,7 +535,7 @@ func rawSubscriptionFromConfig(subscription SubscriptionConfig) rawSubscription 
 	for priority, budget := range subscription.Fairness.Budgets {
 		budgets[priority.String()] = budget
 	}
-	return rawSubscription{Topics: subscription.Topics, Mode: rawMode(subscription.Mode), Concurrency: subscription.Concurrency, Prefetch: subscription.Prefetch, Priorities: priorities, Fairness: rawFairness{Weights: weights, Budgets: budgets, RetryWeightDivisor: subscription.Fairness.RetryWeightDivisor, CostModel: subscription.Fairness.CostModel, PrefetchFactor: subscription.Fairness.PrefetchFactor, AgingEnabled: subscription.Fairness.AgingEnabled}, Retry: rawRetry(subscription.Retry), MaxDeferrals: subscription.MaxDeferrals, HandlerTimeout: subscription.HandlerTimeout, UnmatchedPolicy: rawPolicy(subscription.UnmatchedPolicy), presence: subscription.presence}
+	return rawSubscription{Topics: subscription.Topics, Mode: rawMode(subscription.Mode), Concurrency: subscription.Concurrency, Prefetch: subscription.Prefetch, Priorities: priorities, Fairness: rawFairness{Weights: weights, Budgets: budgets, RetryWeightDivisor: subscription.Fairness.RetryWeightDivisor, CostModel: subscription.Fairness.CostModel, PrefetchFactor: subscription.Fairness.PrefetchFactor, AgingEnabled: subscription.Fairness.AgingEnabled}, Retry: rawRetry(subscription.Retry), HandlerTimeout: subscription.HandlerTimeout, UnmatchedPolicy: rawPolicy(subscription.UnmatchedPolicy), presence: subscription.presence}
 }
 
 func subscriptionPresenceFromNode(node *yaml.Node) subscriptionPresence {
@@ -564,8 +559,6 @@ func subscriptionPresenceFromNode(node *yaml.Node) subscriptionPresence {
 			presence.Fairness = true
 		case "retry":
 			presence.Retry = true
-		case "maxDeferrals":
-			presence.MaxDeferrals = true
 		case "handlerTimeout":
 			presence.HandlerTimeout = true
 		case "unmatchedPolicy":

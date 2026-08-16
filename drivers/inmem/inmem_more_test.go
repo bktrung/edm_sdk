@@ -78,6 +78,33 @@ func closeTest(t *testing.T, ctx context.Context, conn driver.Conn, producer dri
 	require.NoError(t, conn.Close(ctx))
 }
 
+func TestDelayedDispatchOrdersByDueTime(t *testing.T) {
+	start := time.Unix(0, 0)
+	fake := clock.NewFake(start)
+	ctx, conn, producer := openTest(t, fake, driver.DestinationSpec{Name: "delayed-order"})
+	consumer, err := conn.Consumer(ctx, driver.ConsumerConfig{Destinations: []string{"delayed-order"}, Effective: testCaps()})
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		_ = consumer.Stop(ctx)
+		_ = producer.Close(ctx)
+		_ = conn.Close(ctx)
+	})
+
+	require.NoError(t, producer.Publish(ctx,
+		driver.OutboundMessage{Destination: "delayed-order", DelayUntil: start.Add(10 * time.Second), Body: []byte("long")},
+		driver.OutboundMessage{Destination: "delayed-order", DelayUntil: start.Add(time.Second), Body: []byte("short")},
+	))
+	fake.BlockUntil(1)
+	fake.Advance(time.Second)
+	short := receiveTest(t, consumer)
+	require.Equal(t, []byte("short"), short.Body)
+	require.NoError(t, short.Settle.Ack(ctx))
+	fake.Advance(9 * time.Second)
+	long := receiveTest(t, consumer)
+	require.Equal(t, []byte("long"), long.Body)
+	require.NoError(t, long.Settle.Ack(ctx))
+}
+
 func TestDelayedDelivery_WaitsWithoutBurningCPU(t *testing.T) {
 	clk := &countingClock{Clock: clock.NewReal()}
 	ctx, conn, producer := openTest(t, clk, driver.DestinationSpec{Name: "delayed", Delay: 50 * time.Millisecond})

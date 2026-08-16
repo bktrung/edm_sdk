@@ -37,7 +37,6 @@ func TestOrderedByKeyKeepsEqualKeysSerialAndDifferentKeysConcurrent(t *testing.T
 		Prefetch:       totalMessages,
 		Priorities:     []f1.Priority{f1.PriorityNormal},
 		Retry:          f1.RetryConfig{MaxAttempts: 1},
-		MaxDeferrals:   1,
 		HandlerTimeout: time.Second,
 		Handlers: map[string]f1.Handler{
 			"orders.created.v1": f1.HandlerFunc(func(_ context.Context, event *f1.Event) error {

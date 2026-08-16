@@ -53,6 +53,9 @@ func (c *consumer) setPaused(destinations []string, paused bool) error {
 	if c.stopped {
 		return classify("consumer", driver.KindFatal, errors.New("consumer stopped"))
 	}
+	if len(destinations) == 0 {
+		destinations = c.destinations
+	}
 	for _, name := range destinations {
 		if !contains(c.destinations, name) {
 			return classify("consumer", driver.KindNotFound, driver.ErrDestinationMissing)

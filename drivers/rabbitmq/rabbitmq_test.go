@@ -146,6 +146,40 @@ func TestDriverOpenPingClose(t *testing.T) {
 	}
 }
 
+type expiredDeadlineContext struct {
+	context.Context
+	deadline time.Time
+}
+
+func (c expiredDeadlineContext) Deadline() (time.Time, bool) {
+	return c.deadline, true
+}
+
+func TestCloseTimeoutRemainsRetryable(t *testing.T) {
+	requireBroker(t)
+	connContext, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	publicConn, err := (Driver{}).Open(connContext, driver.Config{Endpoints: []string{defaultEndpoint}})
+	if err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	rabbitConn := publicConn.(*conn)
+
+	closeErr := publicConn.Close(expiredDeadlineContext{
+		Context:  context.Background(),
+		deadline: time.Unix(0, 0),
+	})
+	if closeErr == nil {
+		t.Fatal("Close() error = nil, want underlying close timeout")
+	}
+	if rabbitConn.closed {
+		t.Fatal("connection marked closed after failed underlying close; a later Close cannot retry")
+	}
+	if retryErr := publicConn.Close(context.Background()); retryErr != nil {
+		t.Fatalf("retry Close() error = %v, want success after retry", retryErr)
+	}
+}
+
 func TestClassifyAMQPNotFound(t *testing.T) {
 	err := classifyAMQP("consume", driver.KindTransient, &amqp.Error{Code: 404, Reason: "not found"})
 	if !errors.Is(err, driver.ErrDestinationMissing) {
