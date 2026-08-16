@@ -104,9 +104,11 @@ type Consumer interface {
 
 	// Pause stops delivery without leaving the consumer group. Accumulation must
 	// remain within the destination's prefetch share; callers own outage policy.
+	// An empty destinations list applies to every destination held by the consumer.
 	Pause(destinations ...string) error
 
-	// Resume restarts delivery after Pause.
+	// Resume restarts delivery after Pause. An empty destinations list applies to
+	// every destination held by the consumer.
 	Resume(destinations ...string) error
 
 	// Drain stops fetching new messages while keeping outstanding messages
