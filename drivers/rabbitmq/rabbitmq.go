@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/url"
 	"os"
 	"strings"
 	"sync"
@@ -411,16 +412,42 @@ func tlsConfig(settings *driver.TLSConfig) (*tls.Config, error) {
 	return config, nil
 }
 
+// isTestEndpoint reports whether every endpoint in the list resolves to an
+// exact loopback literal: the hostname "localhost" or an IP address for
+// which net.IP.IsLoopback is true. An empty list or any endpoint that fails
+// to parse, or whose host is not an exact loopback literal, makes the whole
+// list ineligible for insecure TLS.
 func isTestEndpoint(endpoints []string) bool {
 	if len(endpoints) == 0 {
-		return true
+		return false
 	}
 	for _, endpoint := range endpoints {
-		if strings.Contains(endpoint, "localhost") || strings.Contains(endpoint, "127.0.0.1") {
-			return true
+		if !isLoopbackEndpoint(endpoint) {
+			return false
 		}
 	}
-	return false
+	return true
+}
+
+// isLoopbackEndpoint reports whether the host portion of endpoint is exactly
+// "localhost" or an IP address that net.IP.IsLoopback confirms is loopback.
+// A hostname that merely contains "localhost" or a loopback IP as a
+// substring, such as an attacker-registrable "evil-localhost.example.com",
+// does not qualify.
+func isLoopbackEndpoint(endpoint string) bool {
+	parsed, err := url.Parse(endpoint)
+	if err != nil {
+		return false
+	}
+	host := parsed.Hostname()
+	if host == "" {
+		return false
+	}
+	if host == "localhost" {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 func waitRetry(ctx context.Context) error {
