@@ -46,10 +46,11 @@ Implementation: [`internal/dispatch/pool.go`](../internal/dispatch/pool.go)
 flowchart LR
     W[Work item] --> MODE{OrderedByKey?}
     MODE -->|no| SHARED[Shared queue]
-    MODE -->|yes| HASH[FNV(key) % workers]
+    MODE -->|yes| HASH["FNV(key) % workers"]
     HASH --> Q1[Worker queue]
     SHARED --> Q2[Worker queue]
-    Q1 & Q2 --> G[Worker goroutine]
+    Q1 --> G[Worker goroutine]
+    Q2 --> G
     G --> RUN[Run handler and complete settlement]
 ```
 

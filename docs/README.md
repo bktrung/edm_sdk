@@ -1,4 +1,21 @@
-# F1 runtime guide
+# F1 documentation
+
+Choose the route that matches your role:
+
+## For service authors
+
+Follow these guides to add F1 to an application:
+
+- [Getting started](user-guide/getting-started.md) — install the module, load configuration, and connect a driver.
+- [Publishing events](user-guide/publishing-events.md) — publish versioned events and choose routing metadata.
+- [Consuming events](user-guide/consuming-events.md) — register handlers, decode payloads, and run a subscription.
+- [Handling failures](user-guide/handling-failures.md) — choose retry, terminal, drop, dead-letter, and idempotency behavior.
+- [Graceful shutdown](user-guide/graceful-shutdown.md) — drain runners and close clients without losing accepted work.
+- [Testing](user-guide/testing.md) — test handlers deterministically with the in-memory test client.
+
+## For maintainers
+
+The runtime guide below explains implementation boundaries, message flows, and source-reading order.
 
 This is the shortest route from “what is F1?” to “where does this line run?”
 
@@ -10,7 +27,11 @@ flowchart LR
     D --> E[Dispatch and scheduling]
     D --> F[Settlement and shutdown]
     B --> G[Drivers and capabilities]
-    C & D & E & F & G --> H[Reading guide and tests]
+    C --> H[Reading guide and tests]
+    D --> H
+    E --> H
+    F --> H
+    G --> H
 ```
 
 ## Guides

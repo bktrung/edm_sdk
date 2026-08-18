@@ -135,6 +135,7 @@ and the [Google Go Style Guide](https://google.github.io/styleguide/go/guide.htm
 
 Start with these local documents:
 
-- [`docs/README.md`](docs/README.md) - concise runtime guides, diagrams, and reading order.
+- [`docs/README.md`](docs/README.md) - choose between the service-author guides and the maintainer runtime guide.
+- [`docs/user-guide/getting-started.md`](docs/user-guide/getting-started.md) - install and connect the SDK in a Go service.
 - [`ARCHITECTURE.md`](ARCHITECTURE.md) - current package boundaries and invariants.
 - This README - product guarantees, non-goals, installation, and quickstart.
