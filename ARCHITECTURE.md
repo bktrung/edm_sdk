@@ -1,85 +1,133 @@
 # Architecture
 
-What each package owns, how a message moves through them, and the import boundaries that keep it
-that way. This file describes structure, not the reasoning behind it: it tells you where code goes
-and what may import what, so that a change lands in the right package and the build catches it when
-it does not.
+This document is the compact map of the current implementation. For runtime walkthroughs, use
+[`docs/`](docs/README.md).
 
-## Layers
+## System shape
 
-One-way dependency, application at the top:
+```mermaid
+flowchart TB
+    APP[Application]
+    F1[package f1\npublic API and orchestration]
+    INT[internal/*\nclock · retry · sched · dispatch · lifecycle · obs]
+    PORT[driver/\nstdlib-only broker port]
+    IM[drivers/inmem]
+    RMQ[drivers/rabbitmq]
+    BROKER[(RabbitMQ or in-memory state)]
 
+    APP --> F1 --> INT --> PORT
+    PORT --> IM
+    PORT --> RMQ --> BROKER
 ```
-application code (service-owned handlers)
-    -> package f1            public API: Client, Publisher, Consumer, Handler, Event
-        -> internal/*        core: codec, dispatch, sched, retry, lifecycle, obs
-            -> driver        the port: interfaces only, stdlib only
-drivers/kafka, drivers/rabbitmq, drivers/inmem
-    -> driver                implement the port
-    -> their broker's client library
+
+The core does not import `drivers/**` or a broker client. Drivers implement the port and own broker
+syntax. `make verify-agnostic` checks this boundary.
+
+## Runtime message paths
+
+### Publish
+
+```mermaid
+sequenceDiagram
+    participant App
+    participant P as Publisher
+    participant C as Codec + Envelope
+    participant D as driver.Producer
+    participant B as Broker
+    App->>P: Publish(eventType, payload)
+    P->>C: Encode payload and headers
+    P->>D: Publish physical destination
+    D->>B: Durable write
+    B-->>D: Confirmation
+    D-->>App: Event ID or error
 ```
 
-The core never has a `switch driver.Name()`. A capability the core needs to branch on belongs in the
-capability model, not a type switch.
+### Consume
 
-## Package tree
+```mermaid
+sequenceDiagram
+    participant B as Broker
+    participant D as driver.Consumer
+    participant R as Runner
+    participant S as Scheduler
+    participant W as Worker
+    participant H as Handler
+    participant P as Shared producer
+    B->>D: Delivery + settler
+    D->>R: InboundMessage
+    R->>S: Bounded lane
+    S->>W: Selected work
+    W->>H: Event
+    alt retry or DLQ
+        H-->>W: Error classification
+        W->>P: Publish successor durably
+        W->>D: Ack original
+    else handled
+        H-->>W: nil
+        W->>D: Ack original
+    end
+```
 
-| Package | Owns |
-|---|---|
-| `.` (`package f1`) | The public API surface: `Client`, `Publisher`, `Consumer`, `Handler`, `Event`, error taxonomy |
-| `driver/` (`package driver`) | The port: the interfaces a broker driver implements. Zero third-party imports |
-| `drivers/inmem/` (`package inmem`) | Deterministic, race-free reference driver; the SDK's canonical test fake |
-| `codec/` | Payload encode/decode behind a port. Public API, not `internal/` - a third party can implement its own codec |
-| `internal/clock/` | Injectable time source; all timing-dependent code goes through it |
-| `internal/obs/` | Metric, trace and log emission, including the sampling loop |
+The successor copy is published before the original is acknowledged. This prevents loss but allows
+duplicates; application effects must use `Event.IdempotencyKey()` when they need deduplication.
 
-`internal/dispatch`, `internal/sched`, `internal/retry`, `internal/lifecycle`, `drivers/kafka`,
-`drivers/rabbitmq` and `cmd/` are part of the target layout and are not created yet. Add one only
-when the code that lives in it arrives, so the tree never advertises a package a reader cannot open.
+## Current package ownership
 
-There is no `dedupe`, no `outbox` and no `store/`, and none of them is pending: **the SDK opens no
-database.** That single absence is what keeps a schema to migrate, a connection pool to size and a
-preflight check to run out of every service that adopts F1. A package for any of the three is a
-scope change, not a missing file.
+| Package | Current responsibility |
+| --- | --- |
+| `.` (`package f1`) | `Client`, `Publisher`, `Subscription`, `Runner`, `Event`, envelope, errors, routing |
+| `codec/` | Public payload codec port and JSON implementation |
+| `driver/` | Broker port: connection, producer, consumer, settlement, admin, topology, capabilities |
+| `driver/conformance/` | Driver-independent contract suite; imports the port, not a driver |
+| `internal/clock/` | Real and fake time |
+| `internal/retry/` | Error classification, backoff tiers, retry sanity |
+| `internal/sched/` | Bounded weighted lanes and aging |
+| `internal/dispatch/` | Worker pool, ordered-key routing, settlement registry |
+| `internal/lifecycle/` | Runner drain state machine and disposition accounting; `Client.Close` coordinates runner drains |
+| `internal/obs/` | OpenTelemetry metric registration and sampled collection |
+| `drivers/inmem/` | Deterministic reference broker and test driver |
+| `drivers/rabbitmq/` | AMQP and RabbitMQ management adapter |
+| `f1test/` | Deterministic black-box test client built on in-memory transport |
+| `tools/` | API surface, API diff, and metric-cardinality checks |
 
-## Data flow
+Kafka is recognized by shared configuration and port types, but `drivers/kafka/` is not present.
+There is no SDK database, deduplication store, or outbox.
 
-Publish: `f1.Publisher` resolves the logical topic to a physical destination, builds the envelope,
-and hands it to `driver.Producer`; `Publish` returns only after the broker has durably
-acknowledged. Consume: a driver delivers into per-lane buffers, a DWRR scheduler picks the next
-message, a worker decodes it, runs the handler, and settles - acking the original only after any
-retry or DLQ copy is confirmed, never before.
+## Core ownership
 
-That ack ordering is the zero-loss guarantee and it is not an implementation detail: a message is
-acked only once its retry or dead-letter copy is durable, so a crash at any point leaves the
-original redeliverable rather than lost. The cost is paid in duplicates: a crash between "copy
-confirmed" and "original acked" redelivers a message whose effect already landed. Loss is prevented
-structurally here; duplication is left for the handler to absorb through `Event.IdempotencyKey()`.
+```mermaid
+flowchart LR
+    C[Client\nconnection + admission] --> P[Publisher\nencode + publish]
+    C --> R[Runner\none subscription]
+    R --> F[Fetcher]
+    R --> S[Scheduler]
+    R --> W[Dispatch pool]
+    W --> T[Settlement]
+    C --> L[Close/drain]
+```
+
+- `Client` eagerly opens one connection and shares one producer.
+- `Publisher` builds outbound messages; it does not own broker resources.
+- `Runner` owns one consumer and its worker pipeline.
+- `driver.Settler` owns the broker-specific operation for one delivery.
+- `inflightRegistry` tracks accepted deliveries until settlement is known.
 
 ## Import boundaries
 
-Three rules, enforced by `depguard` and proven by `make verify-agnostic`:
+Enforced through `.golangci.yml` and `make verify-agnostic`:
 
-- `internal/**` and the root package (`f1`) must not import `drivers/**`, or a broker client
-  directly.
-- `driver` (the port) must not import anything outside stdlib.
-- A `drivers/<broker>` package must import stdlib, `driver`, and only its own broker client - not
-  another driver's.
+- root and `internal/**` must not import `drivers/**` or broker clients;
+- `driver/**` outside conformance imports only the standard library;
+- each concrete driver imports the standard library, the port, and its own broker client only;
+- `driver/conformance` imports the port and test dependencies, never a concrete driver;
+- `examples/` may select a driver but must not use a broker client directly.
 
-Two packages sit inside those paths but are not bound by the rule covering them, and each has its
-own `depguard` list:
+## Detailed runtime guides
 
-- `driver/conformance/` is a test suite, not the port. It imports the port and testify, and never a
-  driver: it is what every driver is measured against, so it cannot know any of them.
-- `cmd/` is this module's composition root. Its binaries register drivers by blank import exactly as
-  an application does, so "core must not import drivers" does not apply there - but reaching a
-  broker client directly still does.
-
-A violation fails the build; `make verify-agnostic` is that failure made checkable on demand,
-independent of the rest of `make lint`.
-
-**When editing these rules:** `depguard` matches import paths by *prefix*. Allowing
-`.../driver` also allows `.../drivers/kafka`, because the first is a literal prefix of the second.
-Every rule that allows the port therefore carries an explicit `.../drivers` deny, and deny wins over
-allow. Removing one of those denies leaves a rule that reads correctly and enforces nothing - change
-these only alongside a probe that watches the rule fail.
+- [Runtime overview](docs/runtime-overview.md)
+- [Publish flow](docs/publish-flow.md)
+- [Consume flow](docs/consume-flow.md)
+- [Dispatch and scheduling](docs/dispatch-and-scheduling.md)
+- [Settlement and shutdown](docs/settlement-and-shutdown.md)
+- [Drivers and capabilities](docs/drivers-and-capabilities.md)
+- [Reading guide](docs/reading-guide.md)
