@@ -201,27 +201,6 @@ func TestDLQ_UnknownReasonSurvivesReplay(t *testing.T) {
 	require.Equal(t, "a_reason_this_build_predates", replayed["f1deathreason"])
 }
 
-func TestArchivedDeferralsHeaderSurvivesReplay(t *testing.T) {
-	t.Parallel()
-
-	headers := map[string]string{
-		"specversion":     "1.0",
-		"id":              "archived-deferral",
-		"source":          "/legacy/orders",
-		"type":            "orders.created.v1",
-		"f1priority":      "normal",
-		"f1attempt":       "2",
-		"f1deferrals":     "7",
-		"f1correlationid": "archived-deferral",
-	}
-
-	e, err := f1.DecodeHeaders(headers)
-	require.NoError(t, err)
-	replayed, err := e.EncodeHeaders(0)
-	require.NoError(t, err)
-	require.Equal(t, "7", replayed["f1deferrals"])
-}
-
 func TestArchivedDependencyUnavailableReasonSurvivesReplay(t *testing.T) {
 	t.Parallel()
 

@@ -7,8 +7,7 @@ priority scheduling, zero-loss shutdown, and observability. The message broker i
 driver, swapped by configuration.
 
 This file states what must be true of F1: the guarantees it owes a service author, and the things it
-deliberately does not do. It is not a tour of the code - see
-[`ARCHITECTURE.md`](ARCHITECTURE.md) for that.
+deliberately does not do. For the code tour, start with [`docs/`](docs/README.md).
 
 ## Guarantees
 
@@ -19,7 +18,6 @@ Each of these is testable, and each is enforced by CI, not documentation:
   idempotency key by default, and preserves that key across every retry, dead-letter and
   redelivery copy of the same message. F1 does not deduplicate handler effects and keeps no store of
   seen keys: a service reads `Event.IdempotencyKey()` and makes its own effect safe to apply twice.
-  Measured as `f1_messages_lost_total == 0`.
 - **Zero-loss graceful shutdown.** A drain protocol settles every in-flight message before the
   process exits; nothing accepted is dropped on a rolling restart or `SIGTERM`.
 - **Automatic retry to a dead-letter queue.** Retryable failures move through a tiered backoff
@@ -38,9 +36,8 @@ Each of these is testable, and each is enforced by CI, not documentation:
 - **Capability declaration, no silent degradation.** F1 declares its limits under the connected
   driver at runtime (`Client.Limits()`) and fails or degrades explicitly and observably when a
   requested feature is unavailable under that driver.
-- **Broker agnostic.** Swapping the driver is a configuration and topology change with zero
-  business-code modification, demonstrated by a driver-flip test (`make swap-report`) and enforced
-  by an import-boundary lint (`make verify-agnostic`) that fails the build on a violation.
+- **Broker agnostic.** The core depends on the `driver` port, not a broker client. Concrete drivers
+  are selected by the application and import-boundary linting is enforced by `make verify-agnostic`.
 
 ## Non-goals for v1
 
@@ -56,9 +53,10 @@ Each of these is testable, and each is enforced by CI, not documentation:
 - Request/reply over messaging. Use gRPC.
 - Schema registry integration. v1 uses JSON plus a versioned envelope; the codec port has hooks for
   Avro/Protobuf, but no registry client ships in v1.
-- NATS JetStream / Pulsar drivers. The port is designed to accommodate them; neither is scheduled.
-- Multiple broker versions per broker. v1 targets one pinned, stable version of Kafka and one of
-  RabbitMQ.
+- NATS JetStream / Pulsar drivers. The port is designed to accommodate them; neither is present.
+- Kafka has shared configuration and port compatibility surfaces, but no `drivers/kafka` package is
+  committed in this repository.
+- Multiple broker versions per broker. The RabbitMQ adapter targets one stable broker family.
 
 ## Install
 
@@ -137,6 +135,6 @@ and the [Google Go Style Guide](https://google.github.io/styleguide/go/guide.htm
 
 Start with these local documents:
 
-- [`ARCHITECTURE.md`](ARCHITECTURE.md) - package layout, data flow, the import boundaries
-  `make verify-agnostic` enforces.
-- This README.
+- [`docs/README.md`](docs/README.md) - concise runtime guides, diagrams, and reading order.
+- [`ARCHITECTURE.md`](ARCHITECTURE.md) - current package boundaries and invariants.
+- This README - product guarantees, non-goals, installation, and quickstart.
