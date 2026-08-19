@@ -7,6 +7,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/retry"
 )
 
 func TestLoadConfigUnknownKeyIsStartupError(t *testing.T) {
@@ -316,6 +318,37 @@ func TestValidateConfigRejectsNegativeLifecycleDurations(t *testing.T) {
 			test.set(&cfg.Lifecycle)
 			if err := validateConfig(cfg); err == nil || !strings.Contains(err.Error(), "lifecycle") {
 				t.Fatalf("validateConfig() error = %v, want lifecycle validation", err)
+			}
+		})
+	}
+}
+
+func TestRetryConfigDelayForAgreesWithInternalRetryLadder(t *testing.T) {
+	cases := []struct {
+		name    string
+		cfg     RetryConfig
+		attempt int
+	}{
+		{name: "negative initial interval", cfg: RetryConfig{InitialInterval: -time.Second, Multiplier: 2}, attempt: 3},
+		{name: "zero initial interval", cfg: RetryConfig{Multiplier: 2}, attempt: 2},
+		{name: "zero multiplier", cfg: RetryConfig{InitialInterval: time.Second}, attempt: 3},
+		{name: "explicit tiers", cfg: RetryConfig{Tiers: []time.Duration{time.Second, 3 * time.Second, 9 * time.Second}}, attempt: 2},
+		{name: "attempt beyond tier count", cfg: RetryConfig{Tiers: []time.Duration{time.Second, 3 * time.Second}}, attempt: 5},
+	}
+	for _, test := range cases {
+		t.Run(test.name, func(t *testing.T) {
+			got := test.cfg.DelayFor(test.attempt)
+			internalCfg := retry.Config{
+				MaxAttempts:     test.cfg.MaxAttempts,
+				InitialInterval: test.cfg.InitialInterval,
+				Multiplier:      test.cfg.Multiplier,
+				MaxInterval:     test.cfg.MaxInterval,
+				Jitter:          test.cfg.Jitter,
+				Tiers:           test.cfg.Tiers,
+			}
+			want := internalCfg.DelayFor(test.attempt)
+			if got != want {
+				t.Fatalf("RetryConfig.DelayFor(%d) = %v, internal/retry.Config.DelayFor(%d) = %v; want agreement", test.attempt, got, test.attempt, want)
 			}
 		})
 	}

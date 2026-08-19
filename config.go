@@ -9,6 +9,8 @@ import (
 	"time"
 
 	"gopkg.in/yaml.v3"
+
+	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/retry"
 )
 
 // Config is the fully resolved configuration used to construct a Client.
@@ -127,34 +129,19 @@ type RetryConfig struct {
 	Tiers           []time.Duration
 }
 
-// DelayFor returns the retry delay for a one-based retry number.
+// DelayFor returns the retry delay for a one-based retry number. It
+// delegates to internal/retry so the two consumers of this ladder - the
+// message due-time calculation and the retry destination's queue TTL - never
+// disagree.
 func (r RetryConfig) DelayFor(attempt int) time.Duration {
-	if attempt < 1 {
-		attempt = 1
-	}
-	if len(r.Tiers) > 0 {
-		i := attempt - 1
-		if i >= len(r.Tiers) {
-			i = len(r.Tiers) - 1
-		}
-		return r.Tiers[i]
-	}
-	initial := r.InitialInterval
-	if initial == 0 {
-		initial = time.Second
-	}
-	multiplier := r.Multiplier
-	if multiplier == 0 {
-		multiplier = 5
-	}
-	delay := initial
-	for i := 1; i < attempt; i++ {
-		delay = time.Duration(float64(delay) * multiplier)
-	}
-	if r.MaxInterval > 0 && delay > r.MaxInterval {
-		return r.MaxInterval
-	}
-	return delay
+	return retry.Config{
+		MaxAttempts:     r.MaxAttempts,
+		InitialInterval: r.InitialInterval,
+		Multiplier:      r.Multiplier,
+		MaxInterval:     r.MaxInterval,
+		Jitter:          r.Jitter,
+		Tiers:           r.Tiers,
+	}.DelayFor(attempt)
 }
 
 // SubscriptionConfig carries every Subscription field that YAML can set.
