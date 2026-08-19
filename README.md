@@ -11,7 +11,10 @@ deliberately does not do. For the code tour, start with [`docs/`](docs/README.md
 
 ## Guarantees
 
-Each of these is testable, and each is enforced by CI, not documentation:
+Each of these is testable. Most are enforced today by CI - `make test`, `make lint`,
+`make verify-agnostic`, and `make check-cardinality` all run in the pipeline. A few are designed
+for but not yet proven by a suite: `make swap-report`, `make test-chaos`, and `make kpi` exist as
+placeholders today, each printing "not available yet" until its harness is built.
 
 - **At-least-once delivery, with a stable message identity.** Transport redelivers during failures
   and rolling restarts - that is the guarantee, not a bug. F1 generates an event id, uses it as the
