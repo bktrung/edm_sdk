@@ -83,10 +83,7 @@ func (p *producer) Publish(ctx context.Context, msgs ...driver.OutboundMessage) 
 }
 
 func (p *producer) publishOne(ctx context.Context, message driver.OutboundMessage) error {
-	exchange, routingKey, expiration, err := p.target(ctx, message)
-	if err != nil {
-		return err
-	}
+	exchange, routingKey, expiration := p.target(message)
 	publishing, err := amqpPublishing(message)
 	if err != nil {
 		return classify("publish", driver.KindFatal, err)
@@ -98,43 +95,41 @@ func (p *producer) publishOne(ctx context.Context, message driver.OutboundMessag
 	return p.waitConfirm(ctx)
 }
 
-func (p *producer) ensureParking(ctx context.Context, destination string) error {
-	if err := (&admin{conn: p.conn}).declareQueue(ctx, destination+".park", true, parkingArguments(destination)); err != nil {
-		return err
-	}
-	p.conn.mu.Lock()
-	if _, exists := p.conn.deferred[destination]; !exists {
-		p.conn.deferred[destination] = 0
-	}
-	p.conn.mu.Unlock()
-	return nil
-}
-
-func (p *producer) target(ctx context.Context, message driver.OutboundMessage) (string, string, string, error) {
+// target decides AMQP routing for one outbound message. Whether Destination
+// names a fan-out entry point is never looked up here: the core already
+// resolved that, in one read of one effective capability set, and carries
+// the answer on the message itself. A driver that looked the answer up
+// again in its own state could disagree with what the core declared, which
+// is the defect this replaces.
+//
+// The deferred-destination read is kept, deliberately, against the letter
+// of the exchange-routing fix above: the driver port's conformance
+// requirement is that a destination declared with a native delay supplies
+// the due time when DelayUntil is zero, so a publisher that never learned
+// the delay can still be parked correctly. This is the one cache read this
+// function keeps, and it is read-only against state EnsureTopology already
+// populated - the publish path still declares nothing and still never calls
+// ensureParking. Routing to the parking queue name itself always prefers
+// OutboundMessage.DelayUntil when the core supplied one.
+func (p *producer) target(message driver.OutboundMessage) (exchange, routingKey, expiration string) {
 	destination := message.Destination
 	p.conn.mu.RLock()
-	_, isExchange := p.conn.exchanges[destination]
 	delay, isDeferred := p.conn.deferred[destination]
 	p.conn.mu.RUnlock()
 	if isDeferred || !message.DelayUntil.IsZero() {
-		due := message.DelayUntil
 		now := time.Now() //nolint:forbidigo // the driver computes remaining delay at publish time
+		due := message.DelayUntil
 		if due.IsZero() {
 			due = now.Add(delay)
 		}
 		if remaining := due.Sub(now); remaining > 0 {
-			if !isDeferred {
-				if err := p.ensureParking(ctx, destination); err != nil {
-					return "", "", "", err
-				}
-			}
-			return "", destination + ".park", expirationMillis(remaining), nil
+			return "", destination + ".park", expirationMillis(remaining)
 		}
 	}
-	if isExchange {
-		return destination, "", "", nil
+	if message.EntryPoint {
+		return destination, "", ""
 	}
-	return "", destination, "", nil
+	return "", destination, ""
 }
 
 const maxExpirationMillis int64 = 2147483647

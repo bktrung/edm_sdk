@@ -51,9 +51,6 @@ func (a *admin) ensureTopology(ctx context.Context, spec driver.TopologySpec) (d
 			}
 			diff.CreatedExchanges = append(diff.CreatedExchanges, exchange.Name)
 		}
-		a.conn.mu.Lock()
-		a.conn.exchanges[exchange.Name] = struct{}{}
-		a.conn.mu.Unlock()
 	}
 
 	seenDestinations := make(map[string]struct{}, len(spec.Destinations))
@@ -159,9 +156,6 @@ func (a *admin) verifyTopology(ctx context.Context, spec driver.TopologySpec) (d
 			return driver.TopologyDiff{}, classify("ensure_topology", driver.KindNotFound, fmt.Errorf("exchange %q is missing: %w", exchange.Name, driver.ErrDestinationMissing))
 		}
 		diff.Existing = append(diff.Existing, exchange.Name)
-		a.conn.mu.Lock()
-		a.conn.exchanges[exchange.Name] = struct{}{}
-		a.conn.mu.Unlock()
 	}
 	for _, destination := range spec.Destinations {
 		if err := ctx.Err(); err != nil {

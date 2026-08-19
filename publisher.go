@@ -366,6 +366,7 @@ func buildOutbound(ctx context.Context, options clientOptions, effective driver.
 	}
 	return driver.OutboundMessage{
 		Destination: publishEntryPoint(source, topic, publish.priority),
+		EntryPoint:  isFanoutEntryPoint(effective),
 		Key:         []byte(partitionKey),
 		Headers:     headers,
 		Body:        body,
@@ -421,13 +422,28 @@ func publishEntryPoint(source, topic string, priority Priority) string {
 	return fmt.Sprintf("f1.%s.%s.%s", sourceEnvironment(source), topic, priority.String())
 }
 
+// isFanoutEntryPoint reports whether a publish entry point is declared as a
+// fan-out exchange under the given effective capability set.
+//
+// This is the one place that decision is made, and both the publish path
+// (buildOutbound, deciding OutboundMessage.EntryPoint) and the topology-declare
+// path (publisherTopologySpec, deciding whether to declare an exchange or a
+// plain destination) call it with the same effective value. Computing the
+// same boolean twice from two independent reads would let a publish be
+// marked as an entry point on a capability set where the exchange was never
+// declared; funnelling both decisions through one function on one value
+// makes that divergence structurally impossible rather than merely unlikely.
+func isFanoutEntryPoint(effective driver.Capabilities) bool {
+	return effective.Fanout == driver.FanoutAtPublish
+}
+
 func publisherTopologySpec(effective driver.Capabilities, source string, topics []string, priorities []Priority) driver.TopologySpec {
 	result := driver.TopologySpec{Effective: effective}
 	for _, topic := range topics {
 		logical := topicFor(topic)
 		for _, priority := range priorities {
 			entryPoint := publishEntryPoint(source, logical, priority)
-			if effective.Fanout == driver.FanoutAtPublish {
+			if isFanoutEntryPoint(effective) {
 				result.Exchanges = append(result.Exchanges, driver.ExchangeSpec{Name: entryPoint, Kind: "fanout", Durable: true})
 			} else {
 				result.Destinations = append(result.Destinations, driver.DestinationSpec{Name: entryPoint, Kind: driver.DestMain, Durable: true})

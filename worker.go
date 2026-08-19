@@ -1377,7 +1377,7 @@ func subscriptionTopologySpecs(effective driver.Capabilities, source string, sub
 				limit = sub.Retry.MaxAttempts + 5
 			}
 			add(driver.DestinationSpec{Name: main, Kind: driver.DestMain, Durable: true, DeadLetter: route, DeliveryLimit: limit})
-			if effective.Fanout == driver.FanoutAtPublish {
+			if isFanoutEntryPoint(effective) {
 				addExchange(driver.ExchangeSpec{Name: entryPoint, Kind: "fanout", Durable: true})
 				result.Bindings = append(result.Bindings, driver.BindingSpec{Source: entryPoint, Destination: main})
 			}
@@ -1426,7 +1426,7 @@ func retryDestinationFor(source, topic string, priority Priority, tier int, subs
 }
 
 func consumeDestination(effective driver.Capabilities, source, topic string, priority Priority, subscription string) string {
-	if effective.Fanout == driver.FanoutAtPublish {
+	if isFanoutEntryPoint(effective) {
 		return fmt.Sprintf("f1.%s.%s.%s.%s", sourceEnvironment(source), topic, subscription, priority)
 	}
 	return publishEntryPoint(source, topic, priority)
