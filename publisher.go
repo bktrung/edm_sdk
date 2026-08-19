@@ -164,8 +164,12 @@ func (p *Publisher) PublishBatch(ctx context.Context, messages []Message) (Batch
 		return result, nil
 	}
 
-	// Build outside the client lock, then recheck admission: Close may have
-	// entered its closing state while encoding this batch.
+	// Close is a barrier: a publish admitted here, before closing is set,
+	// is counted as in flight for Close's idle wait for the rest of this
+	// call, however long buildOutbound's caller-supplied codec work takes.
+	// A publish that reaches this check after Close has already set closing
+	// is rejected immediately; it is never given the chance to slip through
+	// a later check while Close is already tearing the connection down.
 	p.client.mu.Lock()
 	if p.client.closed || p.client.closing || p.client.conn == nil {
 		p.client.mu.Unlock()
@@ -176,7 +180,9 @@ func (p *Publisher) PublishBatch(ctx context.Context, messages []Message) (Batch
 	options := p.client.options
 	source := p.client.source
 	producerIdentity := p.client.producer
+	beginPublish(p.client)
 	p.client.mu.Unlock()
+	defer endPublish(p.client)
 
 	outbound := make([]driver.OutboundMessage, len(messages))
 	ids := make([]string, len(messages))
@@ -189,6 +195,9 @@ func (p *Publisher) PublishBatch(ctx context.Context, messages []Message) (Batch
 		ids[i] = id
 	}
 
+	// This publish was already admitted above and is counted in Close's
+	// idle wait, so closing may legitimately be true here; only a fully
+	// closed client or a torn-down connection stop it from proceeding.
 	p.client.mu.Lock()
 	if p.client.closed || p.client.conn == nil {
 		p.client.mu.Unlock()
@@ -205,15 +214,11 @@ func (p *Publisher) PublishBatch(ctx context.Context, messages []Message) (Batch
 			p.client.producerHandle = producer
 		}
 	}
-	if err == nil {
-		beginPublish(p.client)
-	}
 	p.client.mu.Unlock()
 	if err != nil {
 		warnUnclassified(p.client.options.logger, err)
 		return result, fmt.Errorf("f1: create publisher: %w", err)
 	}
-	defer endPublish(p.client)
 	publishErr := producer.Publish(ctx, outbound...)
 	if publishErr == nil {
 		for i, id := range ids {
