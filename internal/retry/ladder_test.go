@@ -68,6 +68,76 @@ func TestTierCountAndResolveTierBoundaries(t *testing.T) {
 	}
 }
 
+func TestDelayForDefensiveDefaults(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		cfg     Config
+		attempt int
+		want    time.Duration
+	}{
+		{
+			name:    "zero InitialInterval and zero Multiplier both default, second attempt",
+			cfg:     Config{},
+			attempt: 2,
+			want:    5 * time.Second,
+		},
+		{
+			name:    "zero InitialInterval and zero Multiplier both default, third attempt",
+			cfg:     Config{},
+			attempt: 3,
+			want:    25 * time.Second,
+		},
+		{
+			name:    "negative InitialInterval defaults to 1s",
+			cfg:     Config{InitialInterval: -3 * time.Second},
+			attempt: 1,
+			want:    time.Second,
+		},
+		{
+			name:    "negative InitialInterval with an explicit Multiplier",
+			cfg:     Config{InitialInterval: -3 * time.Second, Multiplier: 2},
+			attempt: 3,
+			want:    4 * time.Second,
+		},
+		{
+			name:    "zero Multiplier defaults to 5 with an explicit InitialInterval",
+			cfg:     Config{InitialInterval: 2 * time.Second, Multiplier: 0},
+			attempt: 2,
+			want:    10 * time.Second,
+		},
+		{
+			name:    "zero InitialInterval interacts with MaxInterval clamp",
+			cfg:     Config{InitialInterval: 0, Multiplier: 10, MaxInterval: 20 * time.Second},
+			attempt: 3,
+			want:    20 * time.Second,
+		},
+		{
+			name:    "negative InitialInterval stays under MaxInterval when unclamped",
+			cfg:     Config{InitialInterval: -time.Second, Multiplier: 10, MaxInterval: 20 * time.Second},
+			attempt: 2,
+			want:    10 * time.Second,
+		},
+		{
+			name:    "explicit Tiers overrides zero InitialInterval and zero Multiplier",
+			cfg:     Config{InitialInterval: 0, Multiplier: 0, Tiers: []time.Duration{3 * time.Second, 9 * time.Second}},
+			attempt: 1,
+			want:    3 * time.Second,
+		},
+		{
+			name:    "explicit Tiers overrides negative InitialInterval and holds at the last tier",
+			cfg:     Config{InitialInterval: -5 * time.Second, Multiplier: 0, Tiers: []time.Duration{3 * time.Second, 9 * time.Second}},
+			attempt: 5,
+			want:    9 * time.Second,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got := test.cfg.DelayFor(test.attempt); got != test.want {
+				t.Fatalf("DelayFor(%d) with %+v = %s, want %s", test.attempt, test.cfg, got, test.want)
+			}
+		})
+	}
+}
+
 func TestResolveRetryAfterClampsNegativeAndJitterBounds(t *testing.T) {
 	if tier, delay, clamped := ResolveRetryAfter(Config{Tiers: []time.Duration{time.Second}, Jitter: -1}, -time.Second); tier != 1 || delay != time.Second || !clamped {
 		t.Fatalf("negative request = %d, %s, %v", tier, delay, clamped)
