@@ -168,7 +168,7 @@ f1:
 }
 
 func TestUnmatchedDiscardReasonIsNotDeathReason(t *testing.T) {
-	discarded := discardUnmatched(Envelope{})
+	discarded := discardUnmatched(Envelope{}, nil)
 	if discarded.Reason != DiscardUnmatched {
 		t.Fatalf("discard reason = %q, want %q", discarded.Reason, DiscardUnmatched)
 	}

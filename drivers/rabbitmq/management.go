@@ -3,6 +3,7 @@ package rabbitmq
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -17,6 +18,11 @@ import (
 
 const defaultManagementTimeout = 30 * time.Second
 
+// errQueueNotFound marks a management API 404 for one queue, distinct from a
+// transport or authorisation failure so callers can decide separately
+// whether "the queue is gone" is expected.
+var errQueueNotFound = errors.New("rabbitmq: queue not found")
+
 type managementClient struct {
 	baseURL  string
 	username string
@@ -26,10 +32,11 @@ type managementClient struct {
 }
 
 type managementQueue struct {
-	Name          string `json:"name"`
-	Messages      int64  `json:"messages"`
-	MessagesReady int64  `json:"messages_ready"`
-	Consumers     int64  `json:"consumers"`
+	Name          string         `json:"name"`
+	Messages      int64          `json:"messages"`
+	MessagesReady int64          `json:"messages_ready"`
+	Consumers     int64          `json:"consumers"`
+	Arguments     map[string]any `json:"arguments"` // broker-reported argument values are heterogeneous JSON scalars
 }
 
 type managementBinding struct {
@@ -142,6 +149,34 @@ func (m *managementClient) listQueues(ctx context.Context) ([]managementQueue, e
 		return nil, fmt.Errorf("management API decode queues: %w", err)
 	}
 	return queues, nil
+}
+
+// getQueue fetches one queue's current state, including its broker-recorded
+// arguments. Unlike QueueDeclarePassive, this reports what the broker
+// actually holds, which is what argument-drift detection compares against.
+func (m *managementClient) getQueue(ctx context.Context, name string) (managementQueue, error) {
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, m.queuePath(name), nil)
+	if err != nil {
+		return managementQueue{}, err
+	}
+	request.SetBasicAuth(m.username, m.password)
+	response, err := m.client.Do(request)
+	if err != nil {
+		return managementQueue{}, err
+	}
+	defer response.Body.Close()
+	if response.StatusCode == http.StatusNotFound {
+		return managementQueue{}, fmt.Errorf("management API GET queue %q: %w", name, errQueueNotFound)
+	}
+	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
+		body, _ := io.ReadAll(io.LimitReader(response.Body, 4096))
+		return managementQueue{}, fmt.Errorf("management API GET queue %q: %s: %s", name, response.Status, strings.TrimSpace(string(body)))
+	}
+	var queue managementQueue
+	if err := json.NewDecoder(response.Body).Decode(&queue); err != nil {
+		return managementQueue{}, fmt.Errorf("management API decode queue %q: %w", name, err)
+	}
+	return queue, nil
 }
 
 func (m *managementClient) listBindings(ctx context.Context) ([]managementBinding, error) {

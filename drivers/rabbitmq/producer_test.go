@@ -149,7 +149,7 @@ func TestProducerPublishesToDeclaredFanoutExchange(t *testing.T) {
 	}
 	deliveriesA := consume(queueA, "producer-fanout-a")
 	deliveriesB := consume(queueB, "producer-fanout-b")
-	if err := producer.Publish(ctx, driver.OutboundMessage{Destination: exchange, Body: []byte("fanout")}); err != nil {
+	if err := producer.Publish(ctx, driver.OutboundMessage{Destination: exchange, EntryPoint: true, Body: []byte("fanout")}); err != nil {
 		t.Fatalf("Publish exchange: %v", err)
 	}
 	for name, deliveries := range map[string]<-chan amqp.Delivery{"a": deliveriesA, "b": deliveriesB} {
@@ -195,4 +195,105 @@ func openProducerFixture(t *testing.T, ctx context.Context, queue string) (drive
 	}
 	t.Cleanup(func() { _ = conn.Close(ctx) })
 	return conn, channel
+}
+
+// TestProducerTargetRoutesEntryPointToExchange proves target() routes an
+// entry-point publish to its named exchange with no routing key, purely from
+// OutboundMessage.EntryPoint, and offline: no live broker connection. The
+// table runs once per topology policy to document that this is now true
+// regardless of policy - the defect this replaces was that a pre-provisioned
+// exchange only routed correctly once EnsureTopology had populated a
+// process-local cache, so it broke under exactly the policy where a
+// pre-provisioned exchange is the whole point (no admin call is ever made).
+// target() takes no policy argument any more; the loop asserts the same
+// answer under all three names so a future reintroduction of policy-derived
+// routing would have to change this test to pass.
+func TestProducerTargetRoutesEntryPointToExchange(t *testing.T) {
+	policies := map[string]driver.TopologyPolicy{
+		"TopologyNone":    driver.TopologyNone,
+		"TopologyDeclare": driver.TopologyDeclare,
+		"TopologyVerify":  driver.TopologyVerify,
+	}
+	for name, policy := range policies {
+		t.Run(name, func(t *testing.T) {
+			t.Logf("target() takes no policy argument; asserting under policy %d (%s) for documentation", policy, name)
+			p := &producer{conn: &conn{}}
+			exchange, routingKey, expiration := p.target(driver.OutboundMessage{Destination: "orders.fanout", EntryPoint: true})
+			if exchange != "orders.fanout" {
+				t.Fatalf("target() exchange = %q, want %q", exchange, "orders.fanout")
+			}
+			if routingKey != "" {
+				t.Fatalf("target() routingKey = %q, want empty for a fanout exchange", routingKey)
+			}
+			if expiration != "" {
+				t.Fatalf("target() expiration = %q, want empty for a non-deferred publish", expiration)
+			}
+		})
+	}
+}
+
+// TestProducerTargetRetryAndDLQStayConcreteDestinations proves the fix does
+// not pass by routing everything to an exchange: a retry or DLQ publish
+// carries EntryPoint: false, its zero value, and must still route to the
+// AMQP default exchange with the destination as routing key.
+func TestProducerTargetRetryAndDLQStayConcreteDestinations(t *testing.T) {
+	cases := []string{
+		"f1.prod.orders.created.worker.high.retry.1",
+		"f1.prod.orders.created.dlq.worker",
+	}
+	p := &producer{conn: &conn{}}
+	for _, destination := range cases {
+		t.Run(destination, func(t *testing.T) {
+			exchange, routingKey, expiration := p.target(driver.OutboundMessage{Destination: destination})
+			if exchange != "" {
+				t.Fatalf("target() exchange = %q, want empty for a concrete destination", exchange)
+			}
+			if routingKey != destination {
+				t.Fatalf("target() routingKey = %q, want %q", routingKey, destination)
+			}
+			if expiration != "" {
+				t.Fatalf("target() expiration = %q, want empty for a non-deferred publish", expiration)
+			}
+		})
+	}
+}
+
+// TestProducerTargetDeferredDestinationParks proves an explicit DelayUntil
+// still parks, with no ensureParking call from the publish path: parking
+// queues are declared once in EnsureTopology, and the publish path only
+// ever asks for one that should already exist.
+func TestProducerTargetDeferredDestinationParks(t *testing.T) {
+	p := &producer{conn: &conn{}}
+	due := time.Now().Add(time.Hour) //nolint:forbidigo // building a fixed future DelayUntil for the test
+	exchange, routingKey, expiration := p.target(driver.OutboundMessage{Destination: "orders.deferred", DelayUntil: due})
+	if exchange != "" {
+		t.Fatalf("target() exchange = %q, want empty for a parked publish", exchange)
+	}
+	if routingKey != "orders.deferred.park" {
+		t.Fatalf("target() routingKey = %q, want %q", routingKey, "orders.deferred.park")
+	}
+	if expiration == "" {
+		t.Fatal("target() expiration is empty, want a positive TTL for a future DelayUntil")
+	}
+}
+
+// TestProducerTargetDestinationDelayFallsBackWhenDelayUntilIsZero proves a
+// declared destination-level delay still supplies the due time when the
+// message carries no DelayUntil. The driver port conformance suite requires
+// this ("a destination-level Delay supplying the due time when DelayUntil
+// is zero"), so target() keeps a read of the delay EnsureTopology already
+// recorded for this one purpose, even though the exchange-routing cache
+// read next to it was removed.
+func TestProducerTargetDestinationDelayFallsBackWhenDelayUntilIsZero(t *testing.T) {
+	p := &producer{conn: &conn{deferred: map[string]time.Duration{"orders.deferred": time.Hour}}}
+	exchange, routingKey, expiration := p.target(driver.OutboundMessage{Destination: "orders.deferred"})
+	if exchange != "" {
+		t.Fatalf("target() exchange = %q, want empty for a parked publish", exchange)
+	}
+	if routingKey != "orders.deferred.park" {
+		t.Fatalf("target() routingKey = %q, want %q", routingKey, "orders.deferred.park")
+	}
+	if expiration == "" {
+		t.Fatal("target() expiration is empty, want a positive TTL derived from the destination's declared delay")
+	}
 }

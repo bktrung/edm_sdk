@@ -31,6 +31,12 @@ type Client struct {
 	activePublishes int
 	publishIdle     chan struct{}
 	runners         map[*Runner]struct{}
+
+	// producerCloseWait holds a still-running producer Close call from a
+	// prior Close attempt that did not return within its close timeout. A
+	// retried Close rejoins this same call instead of starting a second one
+	// against the same producer.
+	producerCloseWait <-chan error
 }
 
 // Limits describes how the connected broker provides each SDK feature.
@@ -230,10 +236,14 @@ func (c *Client) Limits() Limits {
 }
 
 // Close flushes and releases the driver resources. It is safe to call
-// repeatedly after a successful close; flush or connection errors leave the
-// Client open so the caller can retry. A producer close error is returned
-// after the connection has still been released. A concurrent Close call
-// returns an error stating that shutdown is already in progress.
+// repeatedly after a successful close; flush, producer-close, or connection
+// errors leave the Client open so the caller can retry. The connection is
+// never closed until the shared producer's own Close call has genuinely
+// returned: if that call does not return within its close timeout, Close
+// reports the failure and leaves the connection untouched, and a retried
+// Close rejoins the same pending producer close rather than starting a new
+// one. A concurrent Close call returns an error stating that shutdown is
+// already in progress.
 func (c *Client) Close(ctx context.Context) error {
 	if c == nil {
 		return nil
@@ -299,16 +309,43 @@ func (c *Client) Close(ctx context.Context) error {
 	c.mu.Lock()
 	producer := c.producerHandle
 	conn := c.conn
+	producerCloseWait := c.producerCloseWait
 	c.mu.Unlock()
 	if producer != nil {
-		c.mu.Lock()
-		flushErr := runWithClockTimeout(ctx, c.options.clock, c.config.Lifecycle.FlushTimeout, "flush", producer.Flush)
-		c.mu.Unlock()
-		if flushErr != nil {
-			return fail(flushErr)
+		if producerCloseWait == nil {
+			c.mu.Lock()
+			flushErr := runWithClockTimeout(ctx, c.options.clock, c.config.Lifecycle.FlushTimeout, "flush", producer.Flush)
+			c.mu.Unlock()
+			if flushErr != nil {
+				return fail(flushErr)
+			}
+			// producer.Close runs against context.Background, not ctx: this
+			// call may outlive the current Close attempt (see below), and a
+			// retried Close must be able to rejoin it rather than have it
+			// rejected up front by a context this attempt already owns.
+			//nolint:contextcheck // deliberately decoupled from this attempt's ctx; see comment above.
+			producerCloseWait = startPhase(context.Background(), producer.Close)
+		}
+
+		producerCloseErr, resolved := joinPhase(ctx, c.options.clock, c.config.Lifecycle.CloseTimeout, "close", producerCloseWait)
+		if !resolved {
+			// producer.Close has not returned. The driver's Close contract
+			// requires every Producer created from a connection to be closed
+			// first, so Conn.Close must not run while producer.Close may
+			// still be in flight against the same connection. Keep the
+			// pending call so a retried Close rejoins it instead of starting
+			// a second one, and report the failure without ever touching
+			// the connection.
+			c.mu.Lock()
+			c.producerCloseWait = producerCloseWait
+			c.mu.Unlock()
+			if c.options.logger != nil {
+				c.options.logger.Warn("f1 producer close did not return in time", "error", producerCloseErr)
+			}
+			return fail(producerCloseErr)
 		}
 		c.mu.Lock()
-		producerCloseErr := runWithClockTimeout(ctx, c.options.clock, c.config.Lifecycle.CloseTimeout, "close", producer.Close)
+		c.producerCloseWait = nil
 		c.producerHandle = nil
 		c.mu.Unlock()
 		if producerCloseErr != nil && c.options.logger != nil {

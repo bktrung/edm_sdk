@@ -10,9 +10,18 @@ type OutboundMessage struct {
 	// Destination is physical and already resolved by the core. Drivers must
 	// not construct or parse destination names.
 	Destination string
-	Key         []byte
-	Headers     []Header
-	Body        []byte
+	// EntryPoint reports whether Destination names a publish entry point that
+	// the broker fans out to every subscriber destination, rather than one
+	// concrete destination. The zero value, false, means one concrete
+	// destination: the behaviour every driver and every existing message
+	// already has. The core sets this field from the same capability read
+	// that decided whether the entry point was declared as a fan-out target;
+	// drivers MUST NOT infer it from the destination name or from any cache
+	// of their own.
+	EntryPoint bool
+	Key        []byte
+	Headers    []Header
+	Body       []byte
 
 	// Priority is a hint. The core never relies on broker-side priority for
 	// correctness.

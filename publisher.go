@@ -164,8 +164,12 @@ func (p *Publisher) PublishBatch(ctx context.Context, messages []Message) (Batch
 		return result, nil
 	}
 
-	// Build outside the client lock, then recheck admission: Close may have
-	// entered its closing state while encoding this batch.
+	// Close is a barrier: a publish admitted here, before closing is set,
+	// is counted as in flight for Close's idle wait for the rest of this
+	// call, however long buildOutbound's caller-supplied codec work takes.
+	// A publish that reaches this check after Close has already set closing
+	// is rejected immediately; it is never given the chance to slip through
+	// a later check while Close is already tearing the connection down.
 	p.client.mu.Lock()
 	if p.client.closed || p.client.closing || p.client.conn == nil {
 		p.client.mu.Unlock()
@@ -176,7 +180,10 @@ func (p *Publisher) PublishBatch(ctx context.Context, messages []Message) (Batch
 	options := p.client.options
 	source := p.client.source
 	producerIdentity := p.client.producer
+	maxBodyBytes := p.client.config.Codec.MaxBodyBytes
+	beginPublish(p.client)
 	p.client.mu.Unlock()
+	defer endPublish(p.client)
 
 	outbound := make([]driver.OutboundMessage, len(messages))
 	ids := make([]string, len(messages))
@@ -185,10 +192,26 @@ func (p *Publisher) PublishBatch(ctx context.Context, messages []Message) (Batch
 		if err != nil {
 			return result, fmt.Errorf("f1: message %d: %w", i, err)
 		}
+		// codec.maxBodyBytes is a caller-facing guardrail: it exists so an
+		// application publish with an oversized payload fails fast and
+		// visibly, the same way an oversized inbound delivery is
+		// dead-lettered. It is enforced only here, on a publish this call
+		// originated. The SDK's own retry, DLQ, and backstop republishes
+		// (worker.go) carry the already-received body forward unchanged and
+		// are deliberately exempt: applying this limit to a successor copy
+		// would turn a body that was already accepted once into a new,
+		// silent message-loss path, which is exactly the class of bug the
+		// SDK's own retry and DLQ handling exists to prevent.
+		if maxBodyBytes > 0 && len(outboundMessage.Body) > maxBodyBytes {
+			return result, fmt.Errorf("f1: message %d: body exceeds codec.maxBodyBytes (%d)", i, maxBodyBytes)
+		}
 		outbound[i] = outboundMessage
 		ids[i] = id
 	}
 
+	// This publish was already admitted above and is counted in Close's
+	// idle wait, so closing may legitimately be true here; only a fully
+	// closed client or a torn-down connection stop it from proceeding.
 	p.client.mu.Lock()
 	if p.client.closed || p.client.conn == nil {
 		p.client.mu.Unlock()
@@ -205,15 +228,11 @@ func (p *Publisher) PublishBatch(ctx context.Context, messages []Message) (Batch
 			p.client.producerHandle = producer
 		}
 	}
-	if err == nil {
-		beginPublish(p.client)
-	}
 	p.client.mu.Unlock()
 	if err != nil {
 		warnUnclassified(p.client.options.logger, err)
 		return result, fmt.Errorf("f1: create publisher: %w", err)
 	}
-	defer endPublish(p.client)
 	publishErr := producer.Publish(ctx, outbound...)
 	if publishErr == nil {
 		for i, id := range ids {
@@ -366,6 +385,7 @@ func buildOutbound(ctx context.Context, options clientOptions, effective driver.
 	}
 	return driver.OutboundMessage{
 		Destination: publishEntryPoint(source, topic, publish.priority),
+		EntryPoint:  isFanoutEntryPoint(effective),
 		Key:         []byte(partitionKey),
 		Headers:     headers,
 		Body:        body,
@@ -421,13 +441,28 @@ func publishEntryPoint(source, topic string, priority Priority) string {
 	return fmt.Sprintf("f1.%s.%s.%s", sourceEnvironment(source), topic, priority.String())
 }
 
+// isFanoutEntryPoint reports whether a publish entry point is declared as a
+// fan-out exchange under the given effective capability set.
+//
+// This is the one place that decision is made, and both the publish path
+// (buildOutbound, deciding OutboundMessage.EntryPoint) and the topology-declare
+// path (publisherTopologySpec, deciding whether to declare an exchange or a
+// plain destination) call it with the same effective value. Computing the
+// same boolean twice from two independent reads would let a publish be
+// marked as an entry point on a capability set where the exchange was never
+// declared; funnelling both decisions through one function on one value
+// makes that divergence structurally impossible rather than merely unlikely.
+func isFanoutEntryPoint(effective driver.Capabilities) bool {
+	return effective.Fanout == driver.FanoutAtPublish
+}
+
 func publisherTopologySpec(effective driver.Capabilities, source string, topics []string, priorities []Priority) driver.TopologySpec {
 	result := driver.TopologySpec{Effective: effective}
 	for _, topic := range topics {
 		logical := topicFor(topic)
 		for _, priority := range priorities {
 			entryPoint := publishEntryPoint(source, logical, priority)
-			if effective.Fanout == driver.FanoutAtPublish {
+			if isFanoutEntryPoint(effective) {
 				result.Exchanges = append(result.Exchanges, driver.ExchangeSpec{Name: entryPoint, Kind: "fanout", Durable: true})
 			} else {
 				result.Destinations = append(result.Destinations, driver.DestinationSpec{Name: entryPoint, Kind: driver.DestMain, Durable: true})

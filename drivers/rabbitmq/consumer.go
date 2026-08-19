@@ -385,7 +385,7 @@ func headerValue(value any) []byte {
 	case uint64:
 		return []byte(strconv.FormatUint(value, 10))
 	default:
-		return []byte(fmt.Sprint(value))
+		return fmt.Append(nil, value)
 	}
 }
 

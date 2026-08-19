@@ -39,7 +39,10 @@ type Subscription struct {
 
 // DeadLettered describes one message whose confirmed copy reached a DLQ.
 type DeadLettered struct {
-	Envelope    Envelope
+	Envelope Envelope
+	// Body is an independent copy of the message payload, safe to read after
+	// this callback returns and after settlement completes.
+	Body        []byte
 	Reason      DeathReason
 	Attempt     int
 	LastErr     error
@@ -50,8 +53,11 @@ type DeadLettered struct {
 // retaining a copy.
 type Discarded struct {
 	Envelope Envelope
-	Reason   DiscardReason
-	Err      error
+	// Body is an independent copy of the message payload, safe to read after
+	// this callback returns and after settlement completes.
+	Body   []byte
+	Reason DiscardReason
+	Err    error
 }
 
 // DiscardReason identifies why a message was acknowledged without a retained
@@ -65,8 +71,8 @@ const (
 	DiscardDropped DiscardReason = "dropped"
 )
 
-func discardUnmatched(envelope Envelope) Discarded {
-	return Discarded{Envelope: envelope, Reason: DiscardUnmatched}
+func discardUnmatched(envelope Envelope, body []byte) Discarded {
+	return Discarded{Envelope: envelope, Body: body, Reason: DiscardUnmatched}
 }
 
 // Runner owns a validated subscription. Message dispatch is attached by the
@@ -117,6 +123,42 @@ func runnerNotifyDiscarded(r *Runner, parent context.Context, payload Discarded)
 		return
 	}
 	runnerNotify(r, parent, func(ctx context.Context) { r.subscription.OnDiscarded(ctx, payload) }, "discarded")
+}
+
+// runnerNotifyError delivers an asynchronous error to the client's
+// WithErrorHandler callback, if one is configured. event is nil for a
+// connection-level error that belongs to no message.
+//
+// Unlike runnerNotify above, this call never waits on the handler: one of
+// its two call sites is failSuccessorHandoff, on the synchronous
+// delivery/settlement path, so waiting even briefly here would let a slow
+// handler stall a delivery. The handler runs on r.asyncGroup, on its own
+// goroutine, with panic recovery and a terminalNotificationTimeout deadline
+// passed through its context; the deadline is advisory (Go cannot force-stop
+// a goroutine that ignores ctx), but the caller itself never blocks on it.
+func runnerNotifyError(r *Runner, parent context.Context, event *Event, cause error) {
+	if r == nil || r.client == nil || r.client.options.errorHandler == nil || cause == nil || parent == nil {
+		return
+	}
+	handler := r.client.options.errorHandler
+	r.mu.Lock()
+	group := r.asyncGroup
+	r.mu.Unlock()
+	if group == nil {
+		group = new(errgroup.Group)
+	}
+	logger := runnerLogger(r)
+	group.Go(func() (err error) {
+		defer func() {
+			if recovered := recover(); recovered != nil {
+				logger.Warn("f1 error handler panicked", "panic", recovered)
+			}
+		}()
+		ctx, cancel := context.WithTimeout(parent, terminalNotificationTimeout)
+		defer cancel()
+		handler(ctx, event, cause)
+		return nil
+	})
 }
 
 func runnerNotify(r *Runner, parent context.Context, callback func(context.Context), kind string) {
@@ -365,7 +407,7 @@ func validateSubscription(cfg Config, name string, sub SubscriptionConfig) error
 	if sub.HandlerTimeout <= 0 {
 		return fmt.Errorf("f1: subscriptions.%s.handlerTimeout must be positive", name)
 	}
-	if cfg.Lifecycle.DrainTimeout != 0 && cfg.Lifecycle.DrainTimeout <= sub.HandlerTimeout {
+	if cfg.Lifecycle.DrainTimeout <= sub.HandlerTimeout {
 		return fmt.Errorf("f1: lifecycle.drainTimeout must exceed subscriptions.%s.handlerTimeout", name)
 	}
 	for priority, weight := range sub.Fairness.Weights {

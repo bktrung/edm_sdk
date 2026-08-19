@@ -92,8 +92,7 @@ func (e *Error) Retryable() bool {
 // Classify returns err's kind and whether it implements ClassifiedError.
 // Unclassified errors return KindTransient and false; Classify does not log.
 func Classify(err error) (Kind, bool) {
-	var classified ClassifiedError
-	if errors.As(err, &classified) {
+	if classified, ok := errors.AsType[ClassifiedError](err); ok {
 		return classified.Kind(), true
 	}
 	return KindTransient, false

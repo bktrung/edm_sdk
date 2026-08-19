@@ -600,6 +600,58 @@ func runWithClockTimeout(parent context.Context, clk clock.Clock, timeout time.D
 	}
 }
 
+// startPhase launches fn on ctx and returns a channel that receives its
+// single result. It exists so a shutdown phase that must not be abandoned on
+// timeout (see joinPhase) can be started once and rejoined across repeated
+// calls, instead of being started again on every retry.
+//
+//nolint:contextcheck // helper derives the phase context from the caller.
+func startPhase(ctx context.Context, fn func(context.Context) error) <-chan error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	done := make(chan error, 1)
+	go func() { done <- fn(ctx) }()
+	return done
+}
+
+// joinPhase waits for a phase started by startPhase to report its result on
+// done, bounded by timeout on clk and by parent. resolved is false when the
+// wait ended by timeout or by parent's cancellation rather than the phase
+// itself finishing; done is still live in that case, and the caller must
+// keep it and rejoin later rather than starting the phase again.
+//
+//nolint:contextcheck // helper derives the phase context from the caller.
+func joinPhase(parent context.Context, clk clock.Clock, timeout time.Duration, phase string, done <-chan error) (err error, resolved bool) {
+	if parent == nil {
+		parent = context.Background()
+	}
+	if timeout < 0 {
+		return fmt.Errorf("f1: shutdown %s phase timeout must not be negative", phase), false
+	}
+	if timeout == 0 {
+		select {
+		case err = <-done:
+			return err, true
+		case <-parent.Done():
+			return parent.Err(), false
+		}
+	}
+	if clk == nil {
+		clk = clock.NewReal()
+	}
+	timer := clk.Timer(timeout)
+	defer timer.Stop()
+	select {
+	case err = <-done:
+		return err, true
+	case <-timer.C:
+		return fmt.Errorf("f1: shutdown %s phase timed out: %w", phase, context.DeadlineExceeded), false
+	case <-parent.Done():
+		return parent.Err(), false
+	}
+}
+
 func contextWithOptionalTimeout(parent context.Context, timeout time.Duration) (context.Context, context.CancelFunc) {
 	if timeout == 0 {
 		return context.WithCancel(parent)
@@ -706,6 +758,11 @@ func consumeRunnerErrors(r *Runner, ctx context.Context) error {
 			}
 			runnerLogger(r).Error("f1 consumer error", "subscription", r.subscription.Name, "error", err)
 			setRunnerError(r, err)
+			// r.cancel below is about to cancel ctx, so the notification gets its
+			// own detached context: the handler's terminalNotificationTimeout
+			// budget must not collapse to zero just because the same error that
+			// is being reported is also what triggers shutdown.
+			runnerNotifyError(r, context.WithoutCancel(ctx), nil, err)
 			if r.cancel != nil {
 				r.cancel()
 			}
@@ -868,7 +925,7 @@ func dispatchMessage(r *Runner, ctx context.Context, message driver.InboundMessa
 		if r.subscription.UnmatchedPolicy == DeadLetter {
 			return deadLetterAndSettle(r, ctx, message, envelope, ReasonUnmatched, errors.New("no handler matched event type"), state)
 		}
-		runnerNotifyDiscarded(r, runnerSettlementContext(r, ctx), discardUnmatched(envelope))
+		runnerNotifyDiscarded(r, runnerSettlementContext(r, ctx), discardUnmatched(envelope, append([]byte(nil), message.Body...)))
 		return ackDelivery(r, runnerSettlementContext(r, ctx), message, state)
 	}
 	event := &Event{envelope: envelope, raw: append([]byte(nil), message.Body...), codec: r.client.options.codec, headers: headers}
@@ -886,7 +943,7 @@ func dispatchMessage(r *Runner, ctx context.Context, message driver.InboundMessa
 	outcome := classifyRetryError(result.err)
 	switch outcome.Kind {
 	case retry.Drop:
-		runnerNotifyDiscarded(r, runnerSettlementContext(r, ctx), Discarded{Envelope: envelope, Reason: DiscardDropped, Err: result.err})
+		runnerNotifyDiscarded(r, runnerSettlementContext(r, ctx), Discarded{Envelope: envelope, Body: append([]byte(nil), message.Body...), Reason: DiscardDropped, Err: result.err})
 		return ackDelivery(r, runnerSettlementContext(r, ctx), message, state)
 	case retry.Terminal:
 		return deadLetterAndSettle(r, ctx, message, envelope, ReasonTerminal, result.err, state)
@@ -1060,22 +1117,30 @@ func nackDelivery(r *Runner, ctx context.Context, message driver.InboundMessage,
 func deadLetterAndSettle(r *Runner, ctx context.Context, message driver.InboundMessage, envelope Envelope, reason DeathReason, lastErr error, states ...*deliveryState) bool {
 	state := stateFor(states)
 	if err := deadLetter(r, ctx, message, envelope, reason, lastErr); err != nil {
-		_ = nackDelivery(r, runnerSettlementContext(r, ctx), message, driver.NackOptions{CountAsFailure: true}, state)
+		failSuccessorHandoff(r, runnerSettlementContext(r, ctx), "dead_letter", eventFromDelivery(r, message, envelope), err)
 		return false
 	}
 	return ackDeliveryAs(r, runnerSettlementContext(r, ctx), message, lifecycle.DeadLettered, state)
 }
 
+// deadLetter republishes message to its dead-letter destination, carrying
+// the already-received body forward unchanged. It deliberately does not
+// apply codec.maxBodyBytes: that limit is a caller-facing guardrail
+// enforced only on a publish the application originated (publisher.go). A
+// body reaching this function was already accepted onto the broker once;
+// rejecting the same bytes here on their way to the dead-letter destination
+// would turn a successful delivery into a silent message-loss path instead
+// of the visible one dead-lettering exists to provide.
 func deadLetter(r *Runner, ctx context.Context, message driver.InboundMessage, envelope Envelope, reason DeathReason, lastErr error) error {
 	if reason == ReasonDecode && envelope.ID == "" {
 		// Preserve the raw headers when the envelope itself could not be decoded.
 		headers := inboundHeaders(message.Headers)
 		destination := deadLetterDestination(r, envelope, message)
 		setDeathHeaders(headers, reason, lastErr, r.client.options.clock.Now().UTC(), message.Destination)
-		if err := publishMessages(r.client, runnerSettlementContext(r, ctx), true, driver.OutboundMessage{Destination: destination, Key: append([]byte(nil), message.Key...), Headers: headerSlice(headers), Body: append([]byte(nil), message.Body...)}); err != nil {
+		if err := publishSuccessor(r, runnerSettlementContext(r, ctx), driver.OutboundMessage{Destination: destination, Key: append([]byte(nil), message.Key...), Headers: headerSlice(headers), Body: append([]byte(nil), message.Body...)}); err != nil {
 			return err
 		}
-		runnerNotifyDeadLetter(r, runnerSettlementContext(r, ctx), DeadLettered{Envelope: Envelope{}, Reason: reason, Attempt: 0, LastErr: lastErr, Destination: destination})
+		runnerNotifyDeadLetter(r, runnerSettlementContext(r, ctx), DeadLettered{Envelope: Envelope{}, Body: append([]byte(nil), message.Body...), Reason: reason, Attempt: 0, LastErr: lastErr, Destination: destination})
 		return nil
 	}
 	death := envelope
@@ -1099,13 +1164,85 @@ func deadLetter(r *Runner, ctx context.Context, message driver.InboundMessage, e
 		out.Headers = append(out.Headers, driver.Header{Key: key, Value: []byte(value)})
 	}
 	sort.Slice(out.Headers, func(i, j int) bool { return out.Headers[i].Key < out.Headers[j].Key })
-	if err := publishMessages(r.client, runnerSettlementContext(r, ctx), true, out); err != nil {
+	if err := publishSuccessor(r, runnerSettlementContext(r, ctx), out); err != nil {
 		return err
 	}
-	runnerNotifyDeadLetter(r, runnerSettlementContext(r, ctx), DeadLettered{Envelope: death, Reason: reason, Attempt: death.Attempt, LastErr: lastErr, Destination: destination})
+	runnerNotifyDeadLetter(r, runnerSettlementContext(r, ctx), DeadLettered{Envelope: death, Body: append([]byte(nil), message.Body...), Reason: reason, Attempt: death.Attempt, LastErr: lastErr, Destination: destination})
 	return nil
 }
 
+// maxSuccessorPublishAttempts bounds how many times the SDK retries
+// publishing a retry or dead-letter successor before treating the
+// settlement budget as exhausted. It stays small on purpose: the whole
+// chain - successor publish, then original settlement - must complete
+// inside the broker's consumer-liveness window, and every extra attempt
+// spends part of that window.
+const maxSuccessorPublishAttempts = 3
+
+// successorPublishBackoff bounds the wait between successor publish
+// retries. It is short and fixed: a delivery held unsettled may only ever
+// wait for something bounded and short, never open-ended.
+const successorPublishBackoff = 100 * time.Millisecond
+
+// publishSuccessor publishes a retry or dead-letter copy, retrying up to
+// maxSuccessorPublishAttempts times with a short fixed backoff between
+// attempts. It stops as soon as ctx ends, so it never outlives the caller's
+// remaining settlement budget.
+func publishSuccessor(r *Runner, ctx context.Context, messages ...driver.OutboundMessage) error {
+	var lastErr error
+	for attempt := 1; attempt <= maxSuccessorPublishAttempts; attempt++ {
+		if err := ctx.Err(); err != nil {
+			if lastErr == nil {
+				lastErr = err
+			}
+			break
+		}
+		err := publishMessages(r.client, ctx, true, messages...)
+		if err == nil {
+			return nil
+		}
+		lastErr = err
+		if attempt == maxSuccessorPublishAttempts {
+			break
+		}
+		if sleepErr := r.client.options.clock.Sleep(ctx, successorPublishBackoff); sleepErr != nil {
+			break
+		}
+	}
+	return lastErr
+}
+
+// eventFromDelivery builds the read-only Event view of an inbound delivery,
+// for handing to code outside the normal handler dispatch path (such as the
+// error handler) that still needs to identify which message an async
+// failure is about.
+func eventFromDelivery(r *Runner, message driver.InboundMessage, envelope Envelope) *Event {
+	return &Event{envelope: envelope, raw: append([]byte(nil), message.Body...), codec: r.client.options.codec, headers: inboundHeaders(message.Headers)}
+}
+
+// failSuccessorHandoff runs once a retry or dead-letter successor could not
+// be published within its bounded republish budget. The consume-side
+// ordering invariant only allows releasing the original delivery once every
+// possible successor is confirmed durable, so this never settles the
+// delivery: it stops the runner's consumer instead, and the broker
+// redelivers the still-unacked message once the channel closes, the same
+// mechanism relied on for a crash.
+func failSuccessorHandoff(r *Runner, ctx context.Context, op string, event *Event, cause error) {
+	kind, _ := driver.Classify(cause)
+	classified := &driver.Error{Driver: r.client.options.driver.Name(), Op: op, K: kind, Err: cause}
+	setRunnerError(r, classified)
+	runnerNotifyError(r, ctx, event, classified)
+	if err := stopRunnerConsumer(r, ctx); err != nil {
+		runnerLogger(r).Error("f1 failed to stop consumer after a successor publish exhausted its republish budget", "op", op, "cause", classified, "stop_error", err)
+		return
+	}
+	runnerLogger(r).Error("f1 successor publish exhausted its republish budget; consumer stopped", "op", op, "cause", classified)
+}
+
+// retryAndSettle republishes message to its retry destination, carrying the
+// already-received body forward unchanged. Like deadLetter, it deliberately
+// does not apply codec.maxBodyBytes: that limit only guards a publish the
+// application originated, and this body was already accepted once.
 func retryAndSettle(r *Runner, ctx context.Context, message driver.InboundMessage, envelope Envelope, lastErr error, states ...*deliveryState) bool {
 	state := stateFor(states)
 	copyEnvelope := envelope
@@ -1154,8 +1291,8 @@ func retryAndSettle(r *Runner, ctx context.Context, message driver.InboundMessag
 		out.Headers = append(out.Headers, driver.Header{Key: key, Value: []byte(value)})
 	}
 	sort.Slice(out.Headers, func(i, j int) bool { return out.Headers[i].Key < out.Headers[j].Key })
-	if err := publishMessages(r.client, runnerSettlementContext(r, ctx), true, out); err != nil {
-		_ = nackDelivery(r, runnerSettlementContext(r, ctx), message, driver.NackOptions{CountAsFailure: true}, state)
+	if err := publishSuccessor(r, runnerSettlementContext(r, ctx), out); err != nil {
+		failSuccessorHandoff(r, runnerSettlementContext(r, ctx), "retry", eventFromDelivery(r, message, envelope), err)
 		return false
 	}
 	return ackDeliveryAs(r, runnerSettlementContext(r, ctx), message, lifecycle.Retried, state)
@@ -1318,7 +1455,7 @@ func subscriptionTopologySpecs(effective driver.Capabilities, source string, sub
 				limit = sub.Retry.MaxAttempts + 5
 			}
 			add(driver.DestinationSpec{Name: main, Kind: driver.DestMain, Durable: true, DeadLetter: route, DeliveryLimit: limit})
-			if effective.Fanout == driver.FanoutAtPublish {
+			if isFanoutEntryPoint(effective) {
 				addExchange(driver.ExchangeSpec{Name: entryPoint, Kind: "fanout", Durable: true})
 				result.Bindings = append(result.Bindings, driver.BindingSpec{Source: entryPoint, Destination: main})
 			}
@@ -1367,7 +1504,7 @@ func retryDestinationFor(source, topic string, priority Priority, tier int, subs
 }
 
 func consumeDestination(effective driver.Capabilities, source, topic string, priority Priority, subscription string) string {
-	if effective.Fanout == driver.FanoutAtPublish {
+	if isFanoutEntryPoint(effective) {
 		return fmt.Sprintf("f1.%s.%s.%s.%s", sourceEnvironment(source), topic, subscription, priority)
 	}
 	return publishEntryPoint(source, topic, priority)

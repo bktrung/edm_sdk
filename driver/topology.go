@@ -95,6 +95,24 @@ type TopologyDiff struct {
 	// OrphanScanError explains why orphan scanning did not run. When non-empty,
 	// Orphaned is incomplete.
 	OrphanScanError string
+	// Drifted lists destinations whose broker-side arguments no longer match
+	// the spec, populated under TopologyVerify. A driver whose passive
+	// existence check cannot see argument values on its own MUST use another
+	// channel (for RabbitMQ, the management API) to compare them, or MUST
+	// leave Drifted empty and fail the call outright rather than report a
+	// clean diff it did not actually verify.
+	Drifted []ArgumentDrift
+}
+
+// ArgumentDrift reports one destination argument whose broker-side value no
+// longer matches what the spec asks for. The comparison is one-directional:
+// only arguments the spec sets are checked, so broker-added arguments the
+// spec never mentioned are never reported as drift.
+type ArgumentDrift struct {
+	Name     string // destination name
+	Argument string // the argument key that differs, e.g. "x-delivery-limit"
+	Want     string // the spec's value, formatted for display
+	Got      string // the broker's actual value, formatted for display; "<absent>" when the key is missing entirely
 }
 
 // OrphanedDestination is a broker destination absent from the current spec.

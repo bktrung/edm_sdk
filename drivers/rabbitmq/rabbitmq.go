@@ -139,7 +139,6 @@ type conn struct {
 	closing    bool
 	active     map[*consumer]struct{}
 	producers  map[*producer]struct{}
-	exchanges  map[string]struct{}
 	deferred   map[string]time.Duration
 	ephemeral  map[string]*amqp.Channel
 }
@@ -159,7 +158,6 @@ func newConn(amqpConn *amqp.Connection, caps driver.Capabilities, endpoint strin
 		management: management,
 		active:     make(map[*consumer]struct{}),
 		producers:  make(map[*producer]struct{}),
-		exchanges:  make(map[string]struct{}),
 		deferred:   make(map[string]time.Duration),
 		ephemeral:  make(map[string]*amqp.Channel),
 	}, nil
