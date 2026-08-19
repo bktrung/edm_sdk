@@ -61,7 +61,7 @@ func (p *producer) Publish(ctx context.Context, messages ...driver.OutboundMessa
 			due:      due,
 		}
 		dest.messages = append(dest.messages, queued)
-		p.conn.history[message.Destination] = append(p.conn.history[message.Destination], &queuedMessage{
+		p.conn.recordHistoryLocked(message.Destination, &queuedMessage{
 			message:  cloneOutbound(message),
 			sequence: queued.sequence,
 			due:      due,

@@ -27,6 +27,18 @@ const (
 	// they are deliberately independent of the in-memory store's capacity.
 	maxMessageBytes = 1 << 20
 	maxHeaderBytes  = 64 << 10
+
+	// maxDestinationHistory bounds how many published messages a destination
+	// retains to replay for a consumer group that attaches from earliest
+	// after every prior consumer has already left. Every already-attached
+	// consumer group is served from the live per-destination queue, not from
+	// history, so history exists only for that late-attach replay case; left
+	// unbounded, a destination with a long-lived attached consumer and
+	// continuous publishing grows it for the life of the connection. Once
+	// capped, a group attaching from earliest sees the newest
+	// maxDestinationHistory messages, oldest evicted first - the same
+	// trade-off a real broker with bounded retention makes.
+	maxDestinationHistory = 10000
 )
 
 var _ driver.Driver = Driver{}
@@ -323,6 +335,19 @@ func (c *conn) replayHistoryLocked(group string, destinations []string, startAft
 			})
 		}
 	}
+}
+
+// recordHistoryLocked appends entry to destination's replay history,
+// evicting the oldest entries first once maxDestinationHistory is exceeded.
+// The caller must hold c.mu.
+func (c *conn) recordHistoryLocked(destination string, entry *queuedMessage) {
+	entries := append(c.history[destination], entry)
+	if overflow := len(entries) - maxDestinationHistory; overflow > 0 {
+		kept := make([]*queuedMessage, len(entries)-overflow)
+		copy(kept, entries[overflow:])
+		entries = kept
+	}
+	c.history[destination] = entries
 }
 
 func (c *conn) Ping(ctx context.Context) error {
