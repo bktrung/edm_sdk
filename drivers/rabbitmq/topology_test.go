@@ -153,6 +153,90 @@ func TestVerifyTopologyReportsDeletedBinding(t *testing.T) {
 	}
 }
 
+func TestVerifyTopologyReportsArgumentDrift(t *testing.T) {
+	requireBroker(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	const drifted = "rabbitmq-driver-verify-drift-queue"
+	const clean = "rabbitmq-driver-verify-drift-clean-queue"
+	raw, err := amqp.Dial(defaultEndpoint)
+	if err != nil {
+		t.Fatalf("Dial: %v", err)
+	}
+	t.Cleanup(func() { _ = raw.Close() })
+	rawChannel, err := raw.Channel()
+	if err != nil {
+		t.Fatalf("Channel: %v", err)
+	}
+	t.Cleanup(func() { _ = rawChannel.Close() })
+	_, _ = rawChannel.QueueDelete(drifted, false, false, false)
+	_, _ = rawChannel.QueueDelete(clean, false, false, false)
+	t.Cleanup(func() {
+		_, _ = rawChannel.QueueDelete(drifted, false, false, false)
+		_, _ = rawChannel.QueueDelete(clean, false, false, false)
+	})
+
+	// Declare the queue out of band with a delivery limit the spec below does
+	// not agree with. QueueDeclarePassive would not catch this: it checks the
+	// queue's name only. The management-API-backed drift check is what must
+	// catch it.
+	if _, err := rawChannel.QueueDeclare(drifted, true, false, false, false, amqp.Table{
+		"x-queue-type":     "quorum",
+		"x-delivery-limit": int32(3),
+	}); err != nil {
+		t.Fatalf("out-of-band QueueDeclare(%q): %v", drifted, err)
+	}
+
+	conn, err := (Driver{}).Open(ctx, driver.Config{Endpoints: []string{defaultEndpoint}})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	t.Cleanup(func() { _ = conn.Close(ctx) })
+
+	driftedSpec := driver.TopologySpec{
+		Policy:       driver.TopologyVerify,
+		Destinations: []driver.DestinationSpec{{Name: drifted, Durable: true, DeliveryLimit: 7}},
+	}
+	diff, err := conn.Admin().EnsureTopology(ctx, driftedSpec)
+	if err != nil {
+		t.Fatalf("EnsureTopology(verify) for drifted queue: %v", err)
+	}
+	if len(diff.Drifted) == 0 {
+		t.Fatalf("Drifted = %v, want an entry naming x-delivery-limit", diff.Drifted)
+	}
+	found := false
+	for _, d := range diff.Drifted {
+		if d.Name == drifted && d.Argument == "x-delivery-limit" {
+			found = true
+			if d.Want != "7" || d.Got != "3" {
+				t.Fatalf("Drifted entry = %+v, want Want=7 Got=3", d)
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("Drifted = %v, want an entry for %q naming x-delivery-limit", diff.Drifted, drifted)
+	}
+
+	// A queue declared to match the spec must report no drift, so the check
+	// is not simply always-fail.
+	cleanSpec := driver.TopologySpec{
+		Policy:       driver.TopologyDeclare,
+		Destinations: []driver.DestinationSpec{{Name: clean, Durable: true, DeliveryLimit: 7}},
+	}
+	if _, err := conn.Admin().EnsureTopology(ctx, cleanSpec); err != nil {
+		t.Fatalf("EnsureTopology(declare) for clean queue: %v", err)
+	}
+	cleanSpec.Policy = driver.TopologyVerify
+	cleanDiff, err := conn.Admin().EnsureTopology(ctx, cleanSpec)
+	if err != nil {
+		t.Fatalf("EnsureTopology(verify) for clean queue: %v", err)
+	}
+	if len(cleanDiff.Drifted) != 0 {
+		t.Fatalf("Drifted = %v, want empty for a correctly declared queue", cleanDiff.Drifted)
+	}
+}
+
 func containsString(values []string, want string) bool {
 	for _, value := range values {
 		if value == want {

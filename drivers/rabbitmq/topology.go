@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 
 	amqp "github.com/rabbitmq/amqp091-go"
@@ -164,12 +165,18 @@ func (a *admin) verifyTopology(ctx context.Context, spec driver.TopologySpec) (d
 		if destination.Name == "" {
 			return driver.TopologyDiff{}, classify("ensure_topology", driver.KindFatal, errors.New("destination name is empty"))
 		}
-		if exists, err := a.queueExists(ctx, destination.Name, destination.Durable, queueArguments(destination, a.conn.queueKind)); err != nil {
+		mainArgs := queueArguments(destination, a.conn.queueKind)
+		if exists, err := a.queueExists(ctx, destination.Name, destination.Durable, mainArgs); err != nil {
 			return driver.TopologyDiff{}, err
 		} else if !exists {
 			return driver.TopologyDiff{}, classify("ensure_topology", driver.KindNotFound, fmt.Errorf("destination %q is missing: %w", destination.Name, driver.ErrDestinationMissing))
 		}
 		diff.Existing = append(diff.Existing, destination.Name)
+		drifted, err := a.argumentDrift(ctx, destination.Name, mainArgs)
+		if err != nil {
+			return driver.TopologyDiff{}, classify("ensure_topology", driver.KindTransient, fmt.Errorf("rabbitmq: argument drift verification unavailable for %q: %w", destination.Name, err))
+		}
+		diff.Drifted = append(diff.Drifted, drifted...)
 		a.conn.mu.Lock()
 		if destination.Delay > 0 {
 			a.conn.deferred[destination.Name] = destination.Delay
@@ -177,7 +184,8 @@ func (a *admin) verifyTopology(ctx context.Context, spec driver.TopologySpec) (d
 		a.conn.mu.Unlock()
 		if destination.Delay > 0 {
 			parkName := destination.Name + ".park"
-			exists, err := a.queueExists(ctx, parkName, true, parkingArguments(destination.Name))
+			parkArgs := parkingArguments(destination.Name)
+			exists, err := a.queueExists(ctx, parkName, true, parkArgs)
 			if err != nil {
 				return driver.TopologyDiff{}, err
 			}
@@ -185,6 +193,11 @@ func (a *admin) verifyTopology(ctx context.Context, spec driver.TopologySpec) (d
 				return driver.TopologyDiff{}, classify("ensure_topology", driver.KindNotFound, fmt.Errorf("parking destination %q is missing: %w", parkName, driver.ErrDestinationMissing))
 			}
 			diff.Existing = append(diff.Existing, parkName)
+			parkDrifted, err := a.argumentDrift(ctx, parkName, parkArgs)
+			if err != nil {
+				return driver.TopologyDiff{}, classify("ensure_topology", driver.KindTransient, fmt.Errorf("rabbitmq: argument drift verification unavailable for %q: %w", parkName, err))
+			}
+			diff.Drifted = append(diff.Drifted, parkDrifted...)
 		}
 	}
 	actualBindings := make(map[bindingKey]struct{})
@@ -232,6 +245,88 @@ func (a *admin) currentBindings(ctx context.Context) (map[bindingKey]struct{}, e
 		actual[bindingKey{source: binding.Source, destination: binding.Destination}] = struct{}{}
 	}
 	return actual, nil
+}
+
+// argumentDrift compares the arguments a destination was declared with
+// against what the broker actually holds, read through the management API
+// because AMQP's QueueDeclarePassive checks the queue's name only and
+// ignores the arguments passed to it. The comparison is one-directional:
+// only keys present in want are checked, so broker-added arguments outside
+// want never appear as drift.
+//
+// A nil management client, or any failure reaching it, is returned as an
+// error rather than folded into an empty result: TopologyVerify must be able
+// to say "this was not checked" instead of silently reporting a clean diff.
+func (a *admin) argumentDrift(ctx context.Context, name string, want amqp.Table) ([]driver.ArgumentDrift, error) {
+	if a.conn.management == nil {
+		return nil, errors.New("rabbitmq: argument drift verification unsupported: management client is unavailable")
+	}
+	if len(want) == 0 {
+		return nil, nil
+	}
+	queue, err := a.conn.management.getQueue(ctx, name)
+	if err != nil {
+		return nil, err
+	}
+	keys := make([]string, 0, len(want))
+	for key := range want {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	var drifted []driver.ArgumentDrift
+	for _, key := range keys {
+		wantValue := want[key]
+		gotValue, present := queue.Arguments[key]
+		if present && argumentValuesEqual(wantValue, gotValue) {
+			continue
+		}
+		got := "<absent>"
+		if present {
+			got = fmt.Sprint(gotValue)
+		}
+		drifted = append(drifted, driver.ArgumentDrift{
+			Name:     name,
+			Argument: key,
+			Want:     fmt.Sprint(wantValue),
+			Got:      got,
+		})
+	}
+	return drifted, nil
+}
+
+// argumentValuesEqual compares one declared argument value against the
+// broker's reported value for the same key. The two never share a Go type
+// even when they agree: AMQP integer arguments go over the wire as int32 or
+// similar, and the management API's JSON response decodes every number to
+// float64, so a plain interface{} equality check would report every
+// integer argument as permanently drifted. Numeric types are compared by
+// value; everything else falls back to fmt.Sprint, which is enough for the
+// string arguments this driver declares (queue type, exchange and routing
+// key names).
+func argumentValuesEqual(want, got any) bool {
+	wantNumber, wantIsNumber := toFloat64(want)
+	gotNumber, gotIsNumber := toFloat64(got)
+	if wantIsNumber || gotIsNumber {
+		return wantIsNumber && gotIsNumber && wantNumber == gotNumber
+	}
+	return fmt.Sprint(want) == fmt.Sprint(got)
+}
+
+func toFloat64(value any) (float64, bool) {
+	switch v := value.(type) {
+	case float64:
+		return v, true
+	case float32:
+		return float64(v), true
+	case int:
+		return float64(v), true
+	case int32:
+		return float64(v), true
+	case int64:
+		return float64(v), true
+	default:
+		return 0, false
+	}
 }
 
 func validateBinding(binding driver.BindingSpec) error {
