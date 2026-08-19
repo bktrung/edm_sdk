@@ -88,7 +88,7 @@ func (a *admin) ensureTopology(ctx context.Context, spec driver.TopologySpec) (d
 		}
 		if destination.Delay > 0 {
 			parkName := destination.Name + ".park"
-			parkArgs := parkingArguments(destination.Name)
+			parkArgs := parkingArguments(destination.Name, a.conn.queueKind)
 			parkExists, err := a.queueExists(ctx, parkName, true, parkArgs)
 			if err != nil {
 				return driver.TopologyDiff{}, err
@@ -184,7 +184,7 @@ func (a *admin) verifyTopology(ctx context.Context, spec driver.TopologySpec) (d
 		a.conn.mu.Unlock()
 		if destination.Delay > 0 {
 			parkName := destination.Name + ".park"
-			parkArgs := parkingArguments(destination.Name)
+			parkArgs := parkingArguments(destination.Name, a.conn.queueKind)
 			exists, err := a.queueExists(ctx, parkName, true, parkArgs)
 			if err != nil {
 				return driver.TopologyDiff{}, err
@@ -429,6 +429,14 @@ func validateExchange(exchange driver.ExchangeSpec) error {
 	}
 }
 
+// queueArguments builds the declare-time arguments for a destination queue.
+// When the queue is quorum-kind and spec carries a dead-letter route, it adds
+// x-dead-letter-strategy and x-overflow alongside the route so the broker's
+// at-least-once dead-letter delivery guarantee actually applies. RabbitMQ
+// requires all three (the DLX/DLRK pair plus both of these) together;
+// dropping any one of them downgrades dead-lettering to at-most-once with no
+// error from the broker, so a future edit that removes one of the three
+// reintroduces silent message loss and no test outside this file will fail.
 func queueArguments(spec driver.DestinationSpec, kind queueKind) amqp.Table {
 	args := amqp.Table{}
 	args["x-queue-type"] = string(kind)
@@ -441,16 +449,41 @@ func queueArguments(spec driver.DestinationSpec, kind queueKind) amqp.Table {
 	if spec.DeadLetter != nil {
 		args["x-dead-letter-exchange"] = spec.DeadLetter.Exchange
 		args["x-dead-letter-routing-key"] = spec.DeadLetter.Key
+		if kind == queueKindQuorum {
+			args["x-dead-letter-strategy"] = "at-least-once"
+			args["x-overflow"] = "reject-publish"
+		}
 	}
 	return args
 }
 
-func parkingArguments(destination string) amqp.Table {
-	return amqp.Table{
-		"x-queue-type":              "quorum",
+// parkingArguments builds the declare-time arguments for a destination's
+// park queue, the holding queue every delayed or retried message sits in
+// until its per-message TTL expires and RabbitMQ dead-letters it onward to
+// destination. kind follows the connection's configured queue kind so a
+// classic-configured deployment gets classic park queues rather than a
+// hardcoded quorum type it may not support.
+//
+// On quorum, x-dead-letter-strategy and x-overflow are added alongside the
+// dead-letter exchange and routing key. All three are required together to
+// get RabbitMQ's at-least-once dead-letter delivery guarantee; the park
+// queue is the delay mechanism itself, not a failure path, so losing a
+// dead-lettered message here silently drops a retry. Removing any one of the
+// three arguments downgrades to at-most-once with no error from the broker.
+// Classic queues do not support at-least-once dead-lettering, so both are
+// omitted there and the delay path stays at-most-once on a classic
+// deployment.
+func parkingArguments(destination string, kind queueKind) amqp.Table {
+	args := amqp.Table{
+		"x-queue-type":              string(kind),
 		"x-dead-letter-exchange":    "",
 		"x-dead-letter-routing-key": destination,
 	}
+	if kind == queueKindQuorum {
+		args["x-dead-letter-strategy"] = "at-least-once"
+		args["x-overflow"] = "reject-publish"
+	}
+	return args
 }
 
 func (a *admin) exchangeExists(ctx context.Context, spec driver.ExchangeSpec) (bool, error) {
