@@ -321,6 +321,24 @@ func TestValidateConfigRejectsNegativeLifecycleDurations(t *testing.T) {
 	}
 }
 
+func TestValidateConfigRejectsZeroDrainTimeout(t *testing.T) {
+	cfg := validValidationConfig()
+	cfg.Subscriptions = nil
+	cfg.Lifecycle.DrainTimeout = 0
+	if err := validateConfig(cfg); err == nil || !strings.Contains(err.Error(), "drainTimeout") {
+		t.Fatalf("validateConfig() error = %v, want drainTimeout validation", err)
+	}
+}
+
+func TestValidateSubscriptionRejectsZeroDrainTimeout(t *testing.T) {
+	cfg := validValidationConfig()
+	cfg.Lifecycle.DrainTimeout = 0
+	sub := cfg.Subscriptions["orders"]
+	if err := validateSubscription(cfg, "orders", sub); err == nil || !strings.Contains(err.Error(), "drainTimeout") {
+		t.Fatalf("validateSubscription() error = %v, want drainTimeout validation", err)
+	}
+}
+
 func validValidationConfig() Config {
 	cfg := defaultConfig()
 	cfg.Env = "test"

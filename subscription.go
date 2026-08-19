@@ -365,7 +365,7 @@ func validateSubscription(cfg Config, name string, sub SubscriptionConfig) error
 	if sub.HandlerTimeout <= 0 {
 		return fmt.Errorf("f1: subscriptions.%s.handlerTimeout must be positive", name)
 	}
-	if cfg.Lifecycle.DrainTimeout != 0 && cfg.Lifecycle.DrainTimeout <= sub.HandlerTimeout {
+	if cfg.Lifecycle.DrainTimeout <= sub.HandlerTimeout {
 		return fmt.Errorf("f1: lifecycle.drainTimeout must exceed subscriptions.%s.handlerTimeout", name)
 	}
 	for priority, weight := range sub.Fairness.Weights {

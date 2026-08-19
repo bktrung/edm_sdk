@@ -46,6 +46,8 @@ type CodecConfig struct {
 
 // LifecycleConfig configures the timing of graceful client shutdown. Zero
 // disables the corresponding delay or deadline; negative values are invalid.
+// DrainTimeout is the exception: it must be positive, since a disabled drain
+// deadline means shutdown never completes.
 type LifecycleConfig struct {
 	PreStopDelay          time.Duration `yaml:"preStopDelay"`
 	DrainTimeout          time.Duration `yaml:"drainTimeout"`
@@ -348,12 +350,18 @@ func validateRetryConfig(path string, retry RetryConfig) error {
 }
 
 func validateLifecycleConfig(lifecycle LifecycleConfig) error {
+	// drainTimeout is not part of the general zero-means-unset rule: the
+	// runtime does not merge a default onto it outside the LoadConfig path,
+	// so a zero value would reach the drain deadline as unbounded shutdown
+	// rather than a default. It must be positive, not merely non-negative.
+	if lifecycle.DrainTimeout <= 0 {
+		return fmt.Errorf("f1: lifecycle.drainTimeout must be positive")
+	}
 	values := []struct {
 		name  string
 		value time.Duration
 	}{
 		{name: "preStopDelay", value: lifecycle.PreStopDelay},
-		{name: "drainTimeout", value: lifecycle.DrainTimeout},
 		{name: "handlerGrace", value: lifecycle.HandlerGrace},
 		{name: "flushTimeout", value: lifecycle.FlushTimeout},
 		{name: "closeTimeout", value: lifecycle.CloseTimeout},
