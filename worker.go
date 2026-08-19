@@ -1118,6 +1118,14 @@ func deadLetterAndSettle(r *Runner, ctx context.Context, message driver.InboundM
 	return ackDeliveryAs(r, runnerSettlementContext(r, ctx), message, lifecycle.DeadLettered, state)
 }
 
+// deadLetter republishes message to its dead-letter destination, carrying
+// the already-received body forward unchanged. It deliberately does not
+// apply codec.maxBodyBytes: that limit is a caller-facing guardrail
+// enforced only on a publish the application originated (publisher.go). A
+// body reaching this function was already accepted onto the broker once;
+// rejecting the same bytes here on their way to the dead-letter destination
+// would turn a successful delivery into a silent message-loss path instead
+// of the visible one dead-lettering exists to provide.
 func deadLetter(r *Runner, ctx context.Context, message driver.InboundMessage, envelope Envelope, reason DeathReason, lastErr error) error {
 	if reason == ReasonDecode && envelope.ID == "" {
 		// Preserve the raw headers when the envelope itself could not be decoded.
@@ -1217,6 +1225,10 @@ func failSuccessorHandoff(r *Runner, ctx context.Context, op string, cause error
 	runnerLogger(r).Error("f1 successor publish exhausted its republish budget; consumer stopped", "op", op, "cause", classified)
 }
 
+// retryAndSettle republishes message to its retry destination, carrying the
+// already-received body forward unchanged. Like deadLetter, it deliberately
+// does not apply codec.maxBodyBytes: that limit only guards a publish the
+// application originated, and this body was already accepted once.
 func retryAndSettle(r *Runner, ctx context.Context, message driver.InboundMessage, envelope Envelope, lastErr error, states ...*deliveryState) bool {
 	state := stateFor(states)
 	copyEnvelope := envelope

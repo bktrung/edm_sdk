@@ -180,6 +180,7 @@ func (p *Publisher) PublishBatch(ctx context.Context, messages []Message) (Batch
 	options := p.client.options
 	source := p.client.source
 	producerIdentity := p.client.producer
+	maxBodyBytes := p.client.config.Codec.MaxBodyBytes
 	beginPublish(p.client)
 	p.client.mu.Unlock()
 	defer endPublish(p.client)
@@ -190,6 +191,19 @@ func (p *Publisher) PublishBatch(ctx context.Context, messages []Message) (Batch
 		outboundMessage, id, err := buildOutbound(ctx, options, effective, source, producerIdentity, message)
 		if err != nil {
 			return result, fmt.Errorf("f1: message %d: %w", i, err)
+		}
+		// codec.maxBodyBytes is a caller-facing guardrail: it exists so an
+		// application publish with an oversized payload fails fast and
+		// visibly, the same way an oversized inbound delivery is
+		// dead-lettered. It is enforced only here, on a publish this call
+		// originated. The SDK's own retry, DLQ, and backstop republishes
+		// (worker.go) carry the already-received body forward unchanged and
+		// are deliberately exempt: applying this limit to a successor copy
+		// would turn a body that was already accepted once into a new,
+		// silent message-loss path, which is exactly the class of bug the
+		// SDK's own retry and DLQ handling exists to prevent.
+		if maxBodyBytes > 0 && len(outboundMessage.Body) > maxBodyBytes {
+			return result, fmt.Errorf("f1: message %d: body exceeds codec.maxBodyBytes (%d)", i, maxBodyBytes)
 		}
 		outbound[i] = outboundMessage
 		ids[i] = id
