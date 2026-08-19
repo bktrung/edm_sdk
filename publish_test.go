@@ -502,6 +502,9 @@ type recordingProducer struct {
 	flushStarted     chan struct{}
 	flushStartedOnce sync.Once
 	flushRelease     chan struct{}
+	closeStarted     chan struct{}
+	closeStartedOnce sync.Once
+	closeRelease     chan struct{}
 }
 
 func (p *recordingProducer) Publish(_ context.Context, messages ...driver.OutboundMessage) error {
@@ -537,6 +540,15 @@ func (p *recordingProducer) Flush(context.Context) error {
 func (p *recordingProducer) Close(context.Context) error {
 	p.mu.Lock()
 	p.closeCalls++
+	started := p.closeStarted
+	release := p.closeRelease
+	err := p.closeErr
+	if started != nil {
+		p.closeStartedOnce.Do(func() { close(started) })
+	}
 	p.mu.Unlock()
-	return p.closeErr
+	if release != nil {
+		<-release
+	}
+	return err
 }

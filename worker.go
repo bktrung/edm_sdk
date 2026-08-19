@@ -600,6 +600,58 @@ func runWithClockTimeout(parent context.Context, clk clock.Clock, timeout time.D
 	}
 }
 
+// startPhase launches fn on ctx and returns a channel that receives its
+// single result. It exists so a shutdown phase that must not be abandoned on
+// timeout (see joinPhase) can be started once and rejoined across repeated
+// calls, instead of being started again on every retry.
+//
+//nolint:contextcheck // helper derives the phase context from the caller.
+func startPhase(ctx context.Context, fn func(context.Context) error) <-chan error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	done := make(chan error, 1)
+	go func() { done <- fn(ctx) }()
+	return done
+}
+
+// joinPhase waits for a phase started by startPhase to report its result on
+// done, bounded by timeout on clk and by parent. resolved is false when the
+// wait ended by timeout or by parent's cancellation rather than the phase
+// itself finishing; done is still live in that case, and the caller must
+// keep it and rejoin later rather than starting the phase again.
+//
+//nolint:contextcheck // helper derives the phase context from the caller.
+func joinPhase(parent context.Context, clk clock.Clock, timeout time.Duration, phase string, done <-chan error) (err error, resolved bool) {
+	if parent == nil {
+		parent = context.Background()
+	}
+	if timeout < 0 {
+		return fmt.Errorf("f1: shutdown %s phase timeout must not be negative", phase), false
+	}
+	if timeout == 0 {
+		select {
+		case err = <-done:
+			return err, true
+		case <-parent.Done():
+			return parent.Err(), false
+		}
+	}
+	if clk == nil {
+		clk = clock.NewReal()
+	}
+	timer := clk.Timer(timeout)
+	defer timer.Stop()
+	select {
+	case err = <-done:
+		return err, true
+	case <-timer.C:
+		return fmt.Errorf("f1: shutdown %s phase timed out: %w", phase, context.DeadlineExceeded), false
+	case <-parent.Done():
+		return parent.Err(), false
+	}
+}
+
 func contextWithOptionalTimeout(parent context.Context, timeout time.Duration) (context.Context, context.CancelFunc) {
 	if timeout == 0 {
 		return context.WithCancel(parent)
