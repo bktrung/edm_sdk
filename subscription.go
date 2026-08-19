@@ -39,7 +39,10 @@ type Subscription struct {
 
 // DeadLettered describes one message whose confirmed copy reached a DLQ.
 type DeadLettered struct {
-	Envelope    Envelope
+	Envelope Envelope
+	// Body is an independent copy of the message payload, safe to read after
+	// this callback returns and after settlement completes.
+	Body        []byte
 	Reason      DeathReason
 	Attempt     int
 	LastErr     error
@@ -50,8 +53,11 @@ type DeadLettered struct {
 // retaining a copy.
 type Discarded struct {
 	Envelope Envelope
-	Reason   DiscardReason
-	Err      error
+	// Body is an independent copy of the message payload, safe to read after
+	// this callback returns and after settlement completes.
+	Body   []byte
+	Reason DiscardReason
+	Err    error
 }
 
 // DiscardReason identifies why a message was acknowledged without a retained
@@ -65,8 +71,8 @@ const (
 	DiscardDropped DiscardReason = "dropped"
 )
 
-func discardUnmatched(envelope Envelope) Discarded {
-	return Discarded{Envelope: envelope, Reason: DiscardUnmatched}
+func discardUnmatched(envelope Envelope, body []byte) Discarded {
+	return Discarded{Envelope: envelope, Body: body, Reason: DiscardUnmatched}
 }
 
 // Runner owns a validated subscription. Message dispatch is attached by the

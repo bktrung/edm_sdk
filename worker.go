@@ -868,7 +868,7 @@ func dispatchMessage(r *Runner, ctx context.Context, message driver.InboundMessa
 		if r.subscription.UnmatchedPolicy == DeadLetter {
 			return deadLetterAndSettle(r, ctx, message, envelope, ReasonUnmatched, errors.New("no handler matched event type"), state)
 		}
-		runnerNotifyDiscarded(r, runnerSettlementContext(r, ctx), discardUnmatched(envelope))
+		runnerNotifyDiscarded(r, runnerSettlementContext(r, ctx), discardUnmatched(envelope, append([]byte(nil), message.Body...)))
 		return ackDelivery(r, runnerSettlementContext(r, ctx), message, state)
 	}
 	event := &Event{envelope: envelope, raw: append([]byte(nil), message.Body...), codec: r.client.options.codec, headers: headers}
@@ -886,7 +886,7 @@ func dispatchMessage(r *Runner, ctx context.Context, message driver.InboundMessa
 	outcome := classifyRetryError(result.err)
 	switch outcome.Kind {
 	case retry.Drop:
-		runnerNotifyDiscarded(r, runnerSettlementContext(r, ctx), Discarded{Envelope: envelope, Reason: DiscardDropped, Err: result.err})
+		runnerNotifyDiscarded(r, runnerSettlementContext(r, ctx), Discarded{Envelope: envelope, Body: append([]byte(nil), message.Body...), Reason: DiscardDropped, Err: result.err})
 		return ackDelivery(r, runnerSettlementContext(r, ctx), message, state)
 	case retry.Terminal:
 		return deadLetterAndSettle(r, ctx, message, envelope, ReasonTerminal, result.err, state)
@@ -1075,7 +1075,7 @@ func deadLetter(r *Runner, ctx context.Context, message driver.InboundMessage, e
 		if err := publishMessages(r.client, runnerSettlementContext(r, ctx), true, driver.OutboundMessage{Destination: destination, Key: append([]byte(nil), message.Key...), Headers: headerSlice(headers), Body: append([]byte(nil), message.Body...)}); err != nil {
 			return err
 		}
-		runnerNotifyDeadLetter(r, runnerSettlementContext(r, ctx), DeadLettered{Envelope: Envelope{}, Reason: reason, Attempt: 0, LastErr: lastErr, Destination: destination})
+		runnerNotifyDeadLetter(r, runnerSettlementContext(r, ctx), DeadLettered{Envelope: Envelope{}, Body: append([]byte(nil), message.Body...), Reason: reason, Attempt: 0, LastErr: lastErr, Destination: destination})
 		return nil
 	}
 	death := envelope
@@ -1102,7 +1102,7 @@ func deadLetter(r *Runner, ctx context.Context, message driver.InboundMessage, e
 	if err := publishMessages(r.client, runnerSettlementContext(r, ctx), true, out); err != nil {
 		return err
 	}
-	runnerNotifyDeadLetter(r, runnerSettlementContext(r, ctx), DeadLettered{Envelope: death, Reason: reason, Attempt: death.Attempt, LastErr: lastErr, Destination: destination})
+	runnerNotifyDeadLetter(r, runnerSettlementContext(r, ctx), DeadLettered{Envelope: death, Body: append([]byte(nil), message.Body...), Reason: reason, Attempt: death.Attempt, LastErr: lastErr, Destination: destination})
 	return nil
 }
 
