@@ -259,6 +259,13 @@ func (s *retryBridgeSettler) Nack(_ context.Context, options driver.NackOptions)
 	return nil
 }
 
+// TestFailedSuccessorHandoffsDoNotBareRequeue is a preservation guard: it
+// asserts a failed retry or dead-letter hand-off never gives the original
+// back to the broker uncounted (a "bare requeue", Requeue: true with no
+// failure accounting - doc 09's one sanctioned bare requeue is the drain
+// phase, not this path). It says nothing about whether the original is
+// discarded, which is a separate invariant covered by
+// TestFailedSuccessorHandoffLeavesOriginalUnsettled.
 func TestFailedSuccessorHandoffsDoNotBareRequeue(t *testing.T) {
 	cases := []struct {
 		name    string
@@ -297,14 +304,70 @@ func TestFailedSuccessorHandoffsDoNotBareRequeue(t *testing.T) {
 			if testCase.handOff(runner, context.Background(), message, envelope, state) {
 				t.Fatal("failed successor hand-off was reported as successful")
 			}
-			if len(settler.nacks) != 1 {
-				t.Fatalf("Nack calls = %d, want 1", len(settler.nacks))
+			for _, nack := range settler.nacks {
+				if nack.Requeue {
+					t.Fatalf("bare requeue occurred: %+v", nack)
+				}
 			}
-			if settler.nacks[0].Requeue || !settler.nacks[0].CountAsFailure {
-				t.Fatalf("fallback Nack options = %+v, want non-requeue failure", settler.nacks[0])
+		})
+	}
+}
+
+// TestFailedSuccessorHandoffLeavesOriginalUnsettled proves doc 06's
+// consume-side ordering invariant: the original is only released once every
+// possible successor is confirmed durable. When the successor publish keeps
+// failing, the original must stay completely unsettled - no ack, no nack of
+// any kind, including the requeue=false form the SDK previously used - and
+// the runner's consumer must be stopped so the broker redelivers the
+// still-unacked delivery once the channel closes.
+func TestFailedSuccessorHandoffLeavesOriginalUnsettled(t *testing.T) {
+	cases := []struct {
+		name    string
+		handOff func(*Runner, context.Context, driver.InboundMessage, Envelope, *deliveryState) bool
+	}{
+		{
+			name: "retry",
+			handOff: func(r *Runner, ctx context.Context, message driver.InboundMessage, envelope Envelope, state *deliveryState) bool {
+				return retryAndSettle(r, ctx, message, envelope, errors.New("temporary"), state)
+			},
+		},
+		{
+			name: "dead-letter",
+			handOff: func(r *Runner, ctx context.Context, message driver.InboundMessage, envelope Envelope, state *deliveryState) bool {
+				return deadLetterAndSettle(r, ctx, message, envelope, ReasonTerminal, errors.New("terminal"), state)
+			},
+		},
+	}
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			producer := &dispatchProducer{}
+			client, runner := newRetryBridgeRunner(t, producer, "orders.created")
+			defer func() { _ = client.Close(context.Background()) }()
+			client.producerHandle = &retryBridgeFailingProducer{}
+			consumer := newDispatchConsumer()
+			runner.consumer = consumer
+			settler := &retryBridgeSettler{}
+			envelope := Envelope{
+				SpecVersion: "1.0",
+				ID:          "handoff-failure",
+				Source:      "/test/orders",
+				Type:        "orders.created.v1",
+				Priority:    PriorityHigh,
+				Attempt:     1,
+			}
+			message := retryBridgeMessage(t, envelope, settler)
+			state := &deliveryState{}
+			if testCase.handOff(runner, context.Background(), message, envelope, state) {
+				t.Fatal("failed successor hand-off was reported as successful")
 			}
 			if settler.acks != 0 {
-				t.Fatalf("Ack calls = %d, want 0", settler.acks)
+				t.Fatalf("Ack calls = %d, want 0: original must stay unsettled", settler.acks)
+			}
+			if len(settler.nacks) != 0 {
+				t.Fatalf("Nack calls = %d, want 0: original must stay unsettled, not released via requeue=false", len(settler.nacks))
+			}
+			if !consumer.stopped {
+				t.Fatal("consumer was not stopped after the successor publish exhausted its budget")
 			}
 		})
 	}
