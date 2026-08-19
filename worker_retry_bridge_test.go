@@ -262,8 +262,8 @@ func (s *retryBridgeSettler) Nack(_ context.Context, options driver.NackOptions)
 // TestFailedSuccessorHandoffsDoNotBareRequeue is a preservation guard: it
 // asserts a failed retry or dead-letter hand-off never gives the original
 // back to the broker uncounted (a "bare requeue", Requeue: true with no
-// failure accounting - doc 09's one sanctioned bare requeue is the drain
-// phase, not this path). It says nothing about whether the original is
+// failure accounting - the one sanctioned bare requeue is the drain phase,
+// not this path). It says nothing about whether the original is
 // discarded, which is a separate invariant covered by
 // TestFailedSuccessorHandoffLeavesOriginalUnsettled.
 func TestFailedSuccessorHandoffsDoNotBareRequeue(t *testing.T) {
@@ -313,8 +313,8 @@ func TestFailedSuccessorHandoffsDoNotBareRequeue(t *testing.T) {
 	}
 }
 
-// TestFailedSuccessorHandoffLeavesOriginalUnsettled proves doc 06's
-// consume-side ordering invariant: the original is only released once every
+// TestFailedSuccessorHandoffLeavesOriginalUnsettled proves the consume-side
+// ordering invariant: the original is only released once every
 // possible successor is confirmed durable. When the successor publish keeps
 // failing, the original must stay completely unsettled - no ack, no nack of
 // any kind, including the requeue=false form the SDK previously used - and

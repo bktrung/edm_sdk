@@ -758,6 +758,11 @@ func consumeRunnerErrors(r *Runner, ctx context.Context) error {
 			}
 			runnerLogger(r).Error("f1 consumer error", "subscription", r.subscription.Name, "error", err)
 			setRunnerError(r, err)
+			// r.cancel below is about to cancel ctx, so the notification gets its
+			// own detached context: the handler's terminalNotificationTimeout
+			// budget must not collapse to zero just because the same error that
+			// is being reported is also what triggers shutdown.
+			runnerNotifyError(r, context.WithoutCancel(ctx), nil, err)
 			if r.cancel != nil {
 				r.cancel()
 			}
@@ -1112,7 +1117,7 @@ func nackDelivery(r *Runner, ctx context.Context, message driver.InboundMessage,
 func deadLetterAndSettle(r *Runner, ctx context.Context, message driver.InboundMessage, envelope Envelope, reason DeathReason, lastErr error, states ...*deliveryState) bool {
 	state := stateFor(states)
 	if err := deadLetter(r, ctx, message, envelope, reason, lastErr); err != nil {
-		failSuccessorHandoff(r, runnerSettlementContext(r, ctx), "dead_letter", err)
+		failSuccessorHandoff(r, runnerSettlementContext(r, ctx), "dead_letter", eventFromDelivery(r, message, envelope), err)
 		return false
 	}
 	return ackDeliveryAs(r, runnerSettlementContext(r, ctx), message, lifecycle.DeadLettered, state)
@@ -1207,17 +1212,26 @@ func publishSuccessor(r *Runner, ctx context.Context, messages ...driver.Outboun
 	return lastErr
 }
 
+// eventFromDelivery builds the read-only Event view of an inbound delivery,
+// for handing to code outside the normal handler dispatch path (such as the
+// error handler) that still needs to identify which message an async
+// failure is about.
+func eventFromDelivery(r *Runner, message driver.InboundMessage, envelope Envelope) *Event {
+	return &Event{envelope: envelope, raw: append([]byte(nil), message.Body...), codec: r.client.options.codec, headers: inboundHeaders(message.Headers)}
+}
+
 // failSuccessorHandoff runs once a retry or dead-letter successor could not
-// be published within its bounded republish budget. Doc 06's consume-side
-// ordering invariant only allows releasing the original once every possible
-// successor is confirmed durable, so this never settles the delivery: it
-// stops the runner's consumer instead, and the broker redelivers the
-// still-unacked message once the channel closes, the same mechanism relied
-// on for a crash.
-func failSuccessorHandoff(r *Runner, ctx context.Context, op string, cause error) {
+// be published within its bounded republish budget. The consume-side
+// ordering invariant only allows releasing the original delivery once every
+// possible successor is confirmed durable, so this never settles the
+// delivery: it stops the runner's consumer instead, and the broker
+// redelivers the still-unacked message once the channel closes, the same
+// mechanism relied on for a crash.
+func failSuccessorHandoff(r *Runner, ctx context.Context, op string, event *Event, cause error) {
 	kind, _ := driver.Classify(cause)
 	classified := &driver.Error{Driver: r.client.options.driver.Name(), Op: op, K: kind, Err: cause}
 	setRunnerError(r, classified)
+	runnerNotifyError(r, ctx, event, classified)
 	if err := stopRunnerConsumer(r, ctx); err != nil {
 		runnerLogger(r).Error("f1 failed to stop consumer after a successor publish exhausted its republish budget", "op", op, "cause", classified, "stop_error", err)
 		return
@@ -1278,7 +1292,7 @@ func retryAndSettle(r *Runner, ctx context.Context, message driver.InboundMessag
 	}
 	sort.Slice(out.Headers, func(i, j int) bool { return out.Headers[i].Key < out.Headers[j].Key })
 	if err := publishSuccessor(r, runnerSettlementContext(r, ctx), out); err != nil {
-		failSuccessorHandoff(r, runnerSettlementContext(r, ctx), "retry", err)
+		failSuccessorHandoff(r, runnerSettlementContext(r, ctx), "retry", eventFromDelivery(r, message, envelope), err)
 		return false
 	}
 	return ackDeliveryAs(r, runnerSettlementContext(r, ctx), message, lifecycle.Retried, state)

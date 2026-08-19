@@ -125,6 +125,42 @@ func runnerNotifyDiscarded(r *Runner, parent context.Context, payload Discarded)
 	runnerNotify(r, parent, func(ctx context.Context) { r.subscription.OnDiscarded(ctx, payload) }, "discarded")
 }
 
+// runnerNotifyError delivers an asynchronous error to the client's
+// WithErrorHandler callback, if one is configured. event is nil for a
+// connection-level error that belongs to no message.
+//
+// Unlike runnerNotify above, this call never waits on the handler: one of
+// its two call sites is failSuccessorHandoff, on the synchronous
+// delivery/settlement path, so waiting even briefly here would let a slow
+// handler stall a delivery. The handler runs on r.asyncGroup, on its own
+// goroutine, with panic recovery and a terminalNotificationTimeout deadline
+// passed through its context; the deadline is advisory (Go cannot force-stop
+// a goroutine that ignores ctx), but the caller itself never blocks on it.
+func runnerNotifyError(r *Runner, parent context.Context, event *Event, cause error) {
+	if r == nil || r.client == nil || r.client.options.errorHandler == nil || cause == nil || parent == nil {
+		return
+	}
+	handler := r.client.options.errorHandler
+	r.mu.Lock()
+	group := r.asyncGroup
+	r.mu.Unlock()
+	if group == nil {
+		group = new(errgroup.Group)
+	}
+	logger := runnerLogger(r)
+	group.Go(func() (err error) {
+		defer func() {
+			if recovered := recover(); recovered != nil {
+				logger.Warn("f1 error handler panicked", "panic", recovered)
+			}
+		}()
+		ctx, cancel := context.WithTimeout(parent, terminalNotificationTimeout)
+		defer cancel()
+		handler(ctx, event, cause)
+		return nil
+	})
+}
+
 func runnerNotify(r *Runner, parent context.Context, callback func(context.Context), kind string) {
 	r.mu.Lock()
 	group := r.asyncGroup

@@ -141,9 +141,17 @@ func WithMiddleware(middleware ...Middleware) Option {
 	}
 }
 
-// WithErrorHandler records an asynchronous driver-error callback. The
-// handler is retained on the client but not yet invoked: no dispatch path
-// calls it in this version.
+// WithErrorHandler records a callback for asynchronous errors the caller has
+// no other way to observe: driver-level errors read from the consumer's
+// error stream, and a retry or dead-letter successor publish that exhausts
+// its bounded republish budget. The event argument identifies which
+// delivery the error is about; it is nil for a connection-level error that
+// belongs to no message. The handler never receives an error returned by a
+// subscription's own handler function - those already flow through the
+// retry and dead-letter ladder, and reporting them here too would double
+// them. The handler runs on its own goroutine with a bounded deadline: a
+// slow or panicking handler is logged and abandoned, never allowed to stall
+// delivery, settlement, or shutdown.
 func WithErrorHandler(handler func(context.Context, *Event, error)) Option {
 	return func(options *clientOptions) error {
 		if handler == nil {
