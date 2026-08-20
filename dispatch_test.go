@@ -483,16 +483,32 @@ func (c *dispatchConsumer) Stop(context.Context) error {
 func (c *dispatchConsumer) Release(context.Context) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.open != 0 {
-		return errors.New("outstanding dispatch message")
-	}
 	if !c.stopped {
 		c.released = true
+		c.open = 0
 		c.stopped = true
 		close(c.messages)
 		close(c.errs)
 	}
 	return nil
+}
+
+func TestDispatchConsumerReleaseReturnsOutstandingDeliveries(t *testing.T) {
+	consumer := newDispatchConsumer()
+	consumer.open = 1
+
+	if err := consumer.Release(context.Background()); err != nil {
+		t.Fatalf("Release() = %v, want nil with an outstanding delivery", err)
+	}
+	if !consumer.released {
+		t.Fatal("Release() did not record released=true")
+	}
+	if !consumer.stopped {
+		t.Fatal("Release() did not close the consumer")
+	}
+	if consumer.open != 0 {
+		t.Fatalf("Release() left %d outstanding deliveries, want 0", consumer.open)
+	}
 }
 
 func (*dispatchConsumer) Lag(context.Context) (map[string]int64, error) {
