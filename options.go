@@ -7,7 +7,6 @@ import (
 	"reflect"
 
 	"go.opentelemetry.io/otel/metric"
-	"go.opentelemetry.io/otel/trace"
 
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/codec"
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/driver"
@@ -31,16 +30,11 @@ const (
 	TopologyNone = driver.TopologyNone
 )
 
-// PublisherOption configures a Publisher. No per-publisher controls are
-// defined in this version; the type reserves the API extension point.
-type PublisherOption struct{}
-
 type clientOptions struct {
 	driver            driver.Driver
 	codec             codec.Codec
 	logger            *slog.Logger
 	meterProvider     metric.MeterProvider
-	tracerProvider    trace.TracerProvider
 	clock             clock.Clock
 	strictPortability bool
 	middleware        []Middleware
@@ -92,18 +86,6 @@ func WithMeterProvider(provider metric.MeterProvider) Option {
 			return fmt.Errorf("f1: WithMeterProvider requires a non-nil provider")
 		}
 		options.meterProvider = provider
-		return nil
-	}
-}
-
-// WithTracerProvider records a tracer provider for the observability layer.
-// It is retained until the tracing integration is implemented.
-func WithTracerProvider(provider trace.TracerProvider) Option {
-	return func(options *clientOptions) error {
-		if isNil(provider) {
-			return fmt.Errorf("f1: WithTracerProvider requires a non-nil provider")
-		}
-		options.tracerProvider = provider
 		return nil
 	}
 }

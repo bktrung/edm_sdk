@@ -95,6 +95,87 @@ func TestRabbitMQSettlementConcurrentCallsSingleFlight(t *testing.T) {
 	}
 }
 
+func TestRabbitMQReleaseRequeuesOutstandingDelivery(t *testing.T) {
+	requireBroker(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	conn, consumer, channel := newSettlementFixture(t, ctx, "rabbitmq-driver-release-requeue")
+
+	if err := channel.PublishWithContext(ctx, "", "rabbitmq-driver-release-requeue", false, false, amqp.Publishing{Body: []byte("body")}); err != nil {
+		t.Fatalf("Publish: %v", err)
+	}
+	first := receiveSettlement(t, ctx, consumer)
+	if err := consumer.Release(ctx); err != nil {
+		t.Fatalf("Release: %v", err)
+	}
+
+	second, err := conn.Consumer(ctx, driver.ConsumerConfig{
+		Destinations: []string{"rabbitmq-driver-release-requeue"},
+		Prefetch:     1,
+		PerDestination: map[string]int{
+			"rabbitmq-driver-release-requeue": 1,
+		},
+	})
+	if err != nil {
+		t.Fatalf("second Consumer: %v", err)
+	}
+	redelivered := receiveSettlement(t, ctx, second)
+	if string(redelivered.Body) != string(first.Body) {
+		t.Fatalf("redelivered body = %q, want %q", redelivered.Body, first.Body)
+	}
+	if err := redelivered.Settle.Ack(ctx); err != nil {
+		t.Fatalf("Ack redelivery: %v", err)
+	}
+	if err := second.Stop(ctx); err != nil {
+		t.Fatalf("second Stop: %v", err)
+	}
+	if err := conn.Close(ctx); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+}
+
+func TestRabbitMQReleaseClosesAndIsIdempotent(t *testing.T) {
+	requireBroker(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	conn, consumer, _ := newSettlementFixture(t, ctx, "rabbitmq-driver-release-idempotent")
+
+	if err := consumer.Release(ctx); err != nil {
+		t.Fatalf("first Release: %v", err)
+	}
+	if err := consumer.Release(ctx); err != nil {
+		t.Fatalf("second Release: %v", err)
+	}
+	select {
+	case _, ok := <-consumer.Messages():
+		if ok {
+			t.Fatal("Messages remained open after Release")
+		}
+	case <-ctx.Done():
+		t.Fatalf("waiting for Messages close: %v", ctx.Err())
+	}
+	if err := consumer.Stop(ctx); err != nil {
+		t.Fatalf("Stop after Release: %v", err)
+	}
+
+	stopped, err := conn.Consumer(ctx, driver.ConsumerConfig{
+		Destinations: []string{"rabbitmq-driver-release-idempotent"},
+		Prefetch:     1,
+	})
+	if err != nil {
+		t.Fatalf("stopped Consumer: %v", err)
+	}
+	if err := stopped.Stop(ctx); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+	if err := stopped.Release(ctx); err != nil {
+		t.Fatalf("Release after Stop: %v", err)
+	}
+	if err := conn.Close(ctx); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+}
+
 func newSettlementFixture(t *testing.T, ctx context.Context, queue string) (driver.Conn, driver.Consumer, *amqp.Channel) {
 	t.Helper()
 	raw, err := amqp.Dial(defaultEndpoint)

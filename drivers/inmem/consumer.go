@@ -116,6 +116,40 @@ func (c *consumer) Stop(ctx context.Context) error {
 	return nil
 }
 
+func (c *consumer) Release(ctx context.Context) error {
+	c.conn.mu.Lock()
+	defer c.conn.mu.Unlock()
+	if c.stopped {
+		return nil
+	}
+	if err := ctx.Err(); err != nil {
+		return classify("release", driver.KindTransient, err)
+	}
+	for delivery := range c.inflight {
+		c.conn.requeueDeliveryLocked(delivery, c.conn.clock.Now())
+	}
+	c.stopped = true
+	for _, name := range c.destinations {
+		delete(c.conn.destinations[name].consumers, c)
+		order := c.conn.destinations[name].order
+		for i, current := range order {
+			if current == c {
+				c.conn.destinations[name].order = append(order[:i], order[i+1:]...)
+				break
+			}
+		}
+		if len(c.conn.destinations[name].consumers) == 0 {
+			c.conn.history[name] = nil
+		}
+	}
+	delete(c.conn.consumers, c)
+	close(c.messages)
+	close(c.errs)
+	c.conn.dispatchLocked()
+	c.conn.signalWake()
+	return nil
+}
+
 func (c *consumer) Lag(ctx context.Context) (map[string]int64, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, classify("lag", driver.KindTransient, err)

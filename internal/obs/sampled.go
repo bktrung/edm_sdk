@@ -16,6 +16,11 @@ func (c *SampledCounter) Add(delta uint64) {
 	c.value.Add(delta)
 }
 
+// Load returns the accumulated total without resetting it.
+func (c *SampledCounter) Load() uint64 {
+	return c.value.Load()
+}
+
 // Sample returns the accumulated value and starts the next sampling window.
 func (c *SampledCounter) Sample() uint64 {
 	return c.value.Swap(0)

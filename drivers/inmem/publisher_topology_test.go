@@ -79,12 +79,9 @@ func publisherTopologyTestConfig() f1.Config {
 			DefaultPrefetch: 64,
 		},
 		Topology: f1.TopologyConfig{
-			AutoCreate:        true,
-			VerifyOnStart:     true,
-			PartitionsDefault: 12,
-			RetentionDefault:  7 * 24 * time.Hour,
-			DLQRetention:      30 * 24 * time.Hour,
-			Priorities:        []f1.Priority{f1.PriorityNormal},
+			AutoCreate:    true,
+			VerifyOnStart: true,
+			Priorities:    []f1.Priority{f1.PriorityNormal},
 		},
 		Codec: f1.CodecConfig{
 			Default:        "json",

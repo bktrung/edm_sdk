@@ -27,13 +27,13 @@ func (a *admin) EnsureTopology(ctx context.Context, spec driver.TopologySpec) (d
 			if _, ok := a.conn.destinations[item.Name]; !ok {
 				return diff, classify("ensure_topology", driver.KindNotFound, fmt.Errorf("%s: %w", item.Name, driver.ErrDestinationMissing))
 			}
-			diff.Existing = append(diff.Existing, item.Name)
+			diff.ExistingDestinations = append(diff.ExistingDestinations, item.Name)
 		}
 		return diff, nil
 	}
 	for _, item := range spec.Destinations {
 		if _, ok := a.conn.destinations[item.Name]; ok {
-			diff.Existing = append(diff.Existing, item.Name)
+			diff.ExistingDestinations = append(diff.ExistingDestinations, item.Name)
 			continue
 		}
 		a.conn.destinations[item.Name] = &destination{spec: item, consumers: make(map[*consumer]struct{}), affinity: make(map[string]*consumer)}

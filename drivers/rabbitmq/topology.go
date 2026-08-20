@@ -45,7 +45,7 @@ func (a *admin) ensureTopology(ctx context.Context, spec driver.TopologySpec) (d
 			return driver.TopologyDiff{}, err
 		}
 		if exists {
-			diff.Existing = append(diff.Existing, exchange.Name)
+			diff.ExistingExchanges = append(diff.ExistingExchanges, exchange.Name)
 		} else {
 			if err := a.declareExchange(ctx, exchange); err != nil {
 				return driver.TopologyDiff{}, err
@@ -79,7 +79,7 @@ func (a *admin) ensureTopology(ctx context.Context, spec driver.TopologySpec) (d
 			return driver.TopologyDiff{}, err
 		}
 		if exists {
-			diff.Existing = append(diff.Existing, destination.Name)
+			diff.ExistingDestinations = append(diff.ExistingDestinations, destination.Name)
 		} else {
 			if err := a.declareQueue(ctx, destination.Name, destination.Durable, args); err != nil {
 				return driver.TopologyDiff{}, err
@@ -94,7 +94,7 @@ func (a *admin) ensureTopology(ctx context.Context, spec driver.TopologySpec) (d
 				return driver.TopologyDiff{}, err
 			}
 			if parkExists {
-				diff.Existing = append(diff.Existing, parkName)
+				diff.ExistingDestinations = append(diff.ExistingDestinations, parkName)
 			} else {
 				if err := a.declareQueue(ctx, parkName, true, parkArgs); err != nil {
 					return driver.TopologyDiff{}, err
@@ -126,13 +126,13 @@ func (a *admin) ensureTopology(ctx context.Context, spec driver.TopologySpec) (d
 		}
 		seenBindings[key] = struct{}{}
 		if _, known := actualBindings[key]; known {
-			diff.Existing = append(diff.Existing, binding.Destination)
+			diff.ExistingBindings = append(diff.ExistingBindings, binding)
 			continue
 		}
 		if err := a.bindQueue(ctx, binding); err != nil {
 			return driver.TopologyDiff{}, err
 		}
-		diff.CreatedBindings = append(diff.CreatedBindings, binding.Destination)
+		diff.CreatedBindings = append(diff.CreatedBindings, binding)
 	}
 	a.scanOrphans(ctx, spec, &diff)
 	return diff, nil
@@ -156,7 +156,7 @@ func (a *admin) verifyTopology(ctx context.Context, spec driver.TopologySpec) (d
 		if !exists {
 			return driver.TopologyDiff{}, classify("ensure_topology", driver.KindNotFound, fmt.Errorf("exchange %q is missing: %w", exchange.Name, driver.ErrDestinationMissing))
 		}
-		diff.Existing = append(diff.Existing, exchange.Name)
+		diff.ExistingExchanges = append(diff.ExistingExchanges, exchange.Name)
 	}
 	for _, destination := range spec.Destinations {
 		if err := ctx.Err(); err != nil {
@@ -171,7 +171,7 @@ func (a *admin) verifyTopology(ctx context.Context, spec driver.TopologySpec) (d
 		} else if !exists {
 			return driver.TopologyDiff{}, classify("ensure_topology", driver.KindNotFound, fmt.Errorf("destination %q is missing: %w", destination.Name, driver.ErrDestinationMissing))
 		}
-		diff.Existing = append(diff.Existing, destination.Name)
+		diff.ExistingDestinations = append(diff.ExistingDestinations, destination.Name)
 		drifted, err := a.argumentDrift(ctx, destination.Name, mainArgs)
 		if err != nil {
 			return driver.TopologyDiff{}, classify("ensure_topology", driver.KindTransient, fmt.Errorf("rabbitmq: argument drift verification unavailable for %q: %w", destination.Name, err))
@@ -192,7 +192,7 @@ func (a *admin) verifyTopology(ctx context.Context, spec driver.TopologySpec) (d
 			if !exists {
 				return driver.TopologyDiff{}, classify("ensure_topology", driver.KindNotFound, fmt.Errorf("parking destination %q is missing: %w", parkName, driver.ErrDestinationMissing))
 			}
-			diff.Existing = append(diff.Existing, parkName)
+			diff.ExistingDestinations = append(diff.ExistingDestinations, parkName)
 			parkDrifted, err := a.argumentDrift(ctx, parkName, parkArgs)
 			if err != nil {
 				return driver.TopologyDiff{}, classify("ensure_topology", driver.KindTransient, fmt.Errorf("rabbitmq: argument drift verification unavailable for %q: %w", parkName, err))
@@ -221,7 +221,7 @@ func (a *admin) verifyTopology(ctx context.Context, spec driver.TopologySpec) (d
 		if _, exists := actualBindings[key]; !exists {
 			return driver.TopologyDiff{}, classify("ensure_topology", driver.KindNotFound, fmt.Errorf("binding %q -> %q is missing: %w", binding.Source, binding.Destination, driver.ErrDestinationMissing))
 		}
-		diff.Existing = append(diff.Existing, binding.Destination)
+		diff.ExistingBindings = append(diff.ExistingBindings, binding)
 	}
 	return diff, nil
 }

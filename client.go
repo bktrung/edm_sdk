@@ -65,10 +65,9 @@ const (
 	FeatureUnavailable
 )
 
-// New applies opts, validates them, and opens the supplied driver before
-// returning. Startup errors are returned before any publish or subscribe call.
-// Until subscription construction supplies Go-side defaults, cfg is expected
-// to come from LoadConfig; hand-built Config values are validated as supplied.
+// New applies opts, normalizes and validates cfg, and opens the supplied driver
+// before returning. Startup errors are returned before any publish or subscribe
+// call. Env and Service remain required for hand-built configurations.
 func New(ctx context.Context, cfg Config, opts ...Option) (*Client, error) {
 	options := clientOptions{codec: codec.JSON{}, clock: clock.NewReal(), logger: slog.Default()}
 	for _, option := range opts {
@@ -82,6 +81,7 @@ func New(ctx context.Context, cfg Config, opts ...Option) (*Client, error) {
 	if options.driver == nil {
 		return nil, fmt.Errorf("f1: New requires WithDriver")
 	}
+	cfg = normalizeConfig(cfg)
 	if err := validateConfig(cfg); err != nil {
 		return nil, err
 	}
@@ -150,9 +150,8 @@ func (c *Client) ensurePublisherTopology(ctx context.Context) error {
 }
 
 // Publisher returns a publisher using this client's connected driver and
-// configured codec. Publisher options are reserved for future per-publisher
-// controls and currently have no effect.
-func (c *Client) Publisher(_ ...PublisherOption) *Publisher {
+// configured codec.
+func (c *Client) Publisher() *Publisher {
 	return &Publisher{client: c}
 }
 
@@ -235,15 +234,17 @@ func (c *Client) Limits() Limits {
 	return result
 }
 
-// Close flushes and releases the driver resources. It is safe to call
-// repeatedly after a successful close; flush, producer-close, or connection
-// errors leave the Client open so the caller can retry. The connection is
-// never closed until the shared producer's own Close call has genuinely
-// returned: if that call does not return within its close timeout, Close
-// reports the failure and leaves the connection untouched, and a retried
-// Close rejoins the same pending producer close rather than starting a new
-// one. A concurrent Close call returns an error stating that shutdown is
-// already in progress.
+// Close flushes and releases the driver resources. A flush error leaves the
+// Client open so the caller can retry. If the producer Close call does not
+// return within the close timeout, the Client also stays open, the connection
+// is untouched, and a retried Close rejoins the same pending call rather than
+// starting another one. If producer Close returns an error, shutdown
+// continues: the producer has finished, the Client closes, and the error is
+// logged and returned. If connection Close fails, the Client stays open so a
+// retried Close can attempt it again. In short, Close keeps the Client open
+// while something is pending and closes it when everything has finished,
+// successfully or not. A concurrent Close call returns an error stating that
+// shutdown is already in progress.
 func (c *Client) Close(ctx context.Context) error {
 	if c == nil {
 		return nil

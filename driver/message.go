@@ -5,55 +5,53 @@ import (
 	"time"
 )
 
-// OutboundMessage is a message ready for broker transport.
+// OutboundMessage is a message the driver sends to a broker.
 type OutboundMessage struct {
-	// Destination is physical and already resolved by the core. Drivers must
-	// not construct or parse destination names.
+	// Destination is the broker destination already selected by the core.
+	// Drivers must use it as provided and must not build or parse its name.
 	Destination string
-	// EntryPoint reports whether Destination names a publish entry point that
-	// the broker fans out to every subscriber destination, rather than one
-	// concrete destination. The zero value, false, means one concrete
-	// destination: the behaviour every driver and every existing message
-	// already has. The core sets this field from the same capability read
-	// that decided whether the entry point was declared as a fan-out target;
-	// drivers MUST NOT infer it from the destination name or from any cache
-	// of their own.
+	// EntryPoint is true when Destination is a publish entry point that the
+	// broker fans out to subscriber destinations. False means Destination is
+	// one concrete destination. The core sets this from the selected
+	// capability; drivers must not infer it from the name or their own cache.
 	EntryPoint bool
 	Key        []byte
 	Headers    []Header
 	Body       []byte
 
-	// Priority is a hint. The core never relies on broker-side priority for
-	// correctness.
+	// Priority is an optional broker-priority hint. The core does not depend on
+	// broker priority for correctness.
 	Priority uint8
 
-	// DelayUntil is the due time for a deferred destination. Zero means
-	// deliver immediately.
+	// DelayUntil is the time when a deferred message becomes eligible for
+	// delivery. Zero means deliver immediately.
 	DelayUntil time.Time
 }
 
-// InboundMessage is a message delivered from a broker.
+// InboundMessage is a message received from a broker.
 type InboundMessage struct {
 	Destination string
 	Key         []byte
 	Headers     []Header
 	Body        []byte
 
-	// DeliveryCount is the broker redelivery counter, or -1 when unavailable.
-	DeliveryCount int       // -1 when the broker does not track it
+	// DeliveryCount is the number of previous broker redeliveries, or -1 when
+	// the broker does not provide this information.
+	DeliveryCount int
 	ReceivedAt    time.Time // time received by the driver
-	Ref           BrokerRef // opaque broker identity for forensics
-	Settle        Settler   // settles this message exactly once
+	Ref           BrokerRef // broker reference for this delivery
+	Settle        Settler   // finishes this delivery exactly once
 }
 
-// Header is one wire header.
+// Header is one key/value metadata item sent with a broker message.
 type Header struct {
 	Key   string
 	Value []byte
 }
 
-// BrokerRef identifies a broker message opaquely to the core.
-// Each driver uses one identity form: Partition and Offset, Tag, or Raw.
+// BrokerRef stores the broker-specific identity of a delivery. The core does
+// not interpret its fields; each driver uses the identity format supported by
+// its broker: partition and offset, delivery tag, or raw string.
 type BrokerRef struct {
 	Partition int32
 	Offset    int64
@@ -61,23 +59,24 @@ type BrokerRef struct {
 	Raw       string
 }
 
-// Settler settles one delivered message exactly once.
-// Implementations must be safe for concurrent use.
+// Settler provides operations to finish one broker delivery. A delivery must
+// not be settled more than once, and implementations must support concurrent
+// use.
 type Settler interface {
 	// Ack marks the message as successfully handled.
 	Ack(ctx context.Context) error
 
-	// Nack returns the message for broker redelivery or broker-policy
-	// discard/dead-lettering.
+	// Nack asks the broker to redeliver the message or to discard/dead-letter it
+	// according to broker policy.
 	Nack(ctx context.Context, opt NackOptions) error
 }
 
-// NackOptions controls broker redelivery.
+// NackOptions controls what the broker should do after Nack.
 type NackOptions struct {
-	// Requeue asks the broker to redeliver. False means discard or
-	// dead-letter according to broker policy.
+	// Requeue asks the broker to deliver the message again. False means let the
+	// broker discard or dead-letter it according to policy.
 	Requeue bool
-	// CountAsFailure is best effort because drivers may count every return as a
-	// delivery failure.
+	// CountAsFailure asks the driver to count this as a failed delivery. This is
+	// best effort because some brokers count every rejected delivery.
 	CountAsFailure bool
 }

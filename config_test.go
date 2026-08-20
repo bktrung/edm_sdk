@@ -4,6 +4,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -26,6 +27,27 @@ f1:
 	_, err := LoadConfig(path)
 	if err == nil || !strings.Contains(err.Error(), "unknown") {
 		t.Fatalf("LoadConfig() error = %v, want unknown-key error", err)
+	}
+}
+
+// TestLoadConfigObservabilityBlockIsStartupError documents that the removed
+// observability configuration tree is a strict-decode unknown key, not a
+// silently ignored one: an old YAML file that still carries an
+// "observability:" block now fails LoadConfig instead of round-tripping.
+func TestLoadConfigObservabilityBlockIsStartupError(t *testing.T) {
+	t.Parallel()
+	path := writeConfig(t, `
+f1:
+  env: test
+  service: orders
+  broker:
+    driver: inmem
+  observability:
+    logLevel: info
+`)
+	_, err := LoadConfig(path)
+	if err == nil || !strings.Contains(err.Error(), "observability") {
+		t.Fatalf("LoadConfig() error = %v, want observability unknown-key error", err)
 	}
 }
 
@@ -136,7 +158,7 @@ func TestLoadConfigAppliesNestedDefaults(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !cfg.Topology.VerifyOnStart || cfg.Codec.MaxBodyBytes != 1024*1024 || !cfg.Observability.Metrics.Enabled {
+	if !cfg.Topology.VerifyOnStart || cfg.Codec.MaxBodyBytes != 1024*1024 {
 		t.Fatalf("defaults = %#v", cfg)
 	}
 }
@@ -432,4 +454,83 @@ func writeConfig(t *testing.T, content string) string {
 		t.Fatal(err)
 	}
 	return path
+}
+
+func TestValidateConfigRejectsInvalidPriorityLists(t *testing.T) {
+	tests := []struct {
+		name string
+		set  func(*Config)
+		want string
+	}{
+		{name: "empty topology", set: func(cfg *Config) { cfg.Topology.Priorities = nil }, want: "topology.priorities"},
+		{name: "invalid topology", set: func(cfg *Config) { cfg.Topology.Priorities = []Priority{Priority(99)} }, want: "topology.priorities"},
+		{name: "duplicate topology", set: func(cfg *Config) { cfg.Topology.Priorities = []Priority{PriorityHigh, PriorityHigh} }, want: "topology.priorities"},
+		{name: "empty subscription", set: func(cfg *Config) { cfg.Subscriptions["orders"] = withPriorities(cfg.Subscriptions["orders"], nil) }, want: "subscriptions.orders.priorities"},
+		{name: "invalid subscription", set: func(cfg *Config) {
+			cfg.Subscriptions["orders"] = withPriorities(cfg.Subscriptions["orders"], []Priority{Priority(99)})
+		}, want: "subscriptions.orders.priorities"},
+		{name: "duplicate subscription", set: func(cfg *Config) {
+			cfg.Subscriptions["orders"] = withPriorities(cfg.Subscriptions["orders"], []Priority{PriorityNormal, PriorityNormal})
+		}, want: "subscriptions.orders.priorities"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			cfg := validValidationConfig()
+			test.set(&cfg)
+			if err := validateConfig(cfg); err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("validateConfig() error = %v, want %s validation", err, test.want)
+			}
+		})
+	}
+}
+
+func withPriorities(sub SubscriptionConfig, priorities []Priority) SubscriptionConfig {
+	sub.Priorities = priorities
+	return sub
+}
+
+func TestNormalizeConfigAcceptsMinimalHandBuiltConfig(t *testing.T) {
+	t.Parallel()
+	cfg := normalizeConfig(Config{
+		Env:     "test",
+		Service: "orders",
+		Broker:  BrokerConfig{Driver: "inmem"},
+		Subscriptions: map[string]SubscriptionConfig{
+			"orders": {Topics: []string{"orders.created"}},
+		},
+	})
+	if err := validateConfig(cfg); err != nil {
+		t.Fatalf("validateConfig() after normalization: %v", err)
+	}
+	defaults := defaultConfig()
+	if cfg.Codec.ContentMode != defaults.Codec.ContentMode || cfg.Codec.MaxBodyBytes != defaults.Codec.MaxBodyBytes {
+		t.Fatalf("codec defaults = %#v, want %#v", cfg.Codec, defaults.Codec)
+	}
+	if !reflect.DeepEqual(cfg.Topology.Priorities, defaults.Topology.Priorities) || cfg.Lifecycle != defaults.Lifecycle {
+		t.Fatalf("topology/lifecycle defaults = %#v/%#v", cfg.Topology, cfg.Lifecycle)
+	}
+	sub := cfg.Subscriptions["orders"]
+	subDefaults := defaultSubscription()
+	if sub.Concurrency != subDefaults.Concurrency || sub.Prefetch != defaults.Broker.DefaultPrefetch || !reflect.DeepEqual(sub.Priorities, subDefaults.Priorities) || sub.Retry.MaxAttempts != subDefaults.Retry.MaxAttempts || sub.HandlerTimeout != subDefaults.HandlerTimeout {
+		t.Fatalf("subscription defaults = %#v, want concurrency=%d prefetch=%d priorities=%v maxAttempts=%d handlerTimeout=%s", sub, subDefaults.Concurrency, defaults.Broker.DefaultPrefetch, subDefaults.Priorities, subDefaults.Retry.MaxAttempts, subDefaults.HandlerTimeout)
+	}
+}
+
+func TestNormalizeConfigPreservesVerifyOnStartFalse(t *testing.T) {
+	cfg := normalizeConfig(Config{Topology: TopologyConfig{VerifyOnStart: false}})
+	if cfg.Topology.VerifyOnStart {
+		t.Fatal("VerifyOnStart = true after normalization, want false")
+	}
+}
+
+func TestLoadConfigNormalizationIsNoOp(t *testing.T) {
+	t.Parallel()
+	path := writeConfig(t, "f1:\n  env: test\n  service: orders\n  broker:\n    driver: inmem\n  subscriptions:\n    orders:\n      topics: [orders.created]\n")
+	cfg, err := LoadConfig(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if normalized := normalizeConfig(cfg); !reflect.DeepEqual(normalized, cfg) {
+		t.Fatalf("normalization changed LoadConfig result: %#v -> %#v", cfg, normalized)
+	}
 }

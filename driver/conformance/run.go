@@ -27,6 +27,7 @@ func Run(t *testing.T, suite Suite) Report {
 	}
 
 	ctx := context.Background()
+	factoryCapabilities := suite.Driver.Capabilities()
 	conn, err := suite.Driver.Open(ctx, suite.Config)
 	if err != nil {
 		t.Fatalf("conformance: open driver: %v", err)
@@ -67,7 +68,7 @@ func Run(t *testing.T, suite Suite) Report {
 		profile := profile
 		var result ProfileReport
 		ok := t.Run(profile.String(), func(profileTest *testing.T) {
-			result = runProfile(profileTest, ctx, conn, inspect, profile, inject, deadline, &report)
+			result = runProfile(profileTest, ctx, conn, inspect, profile, factoryCapabilities, inject, deadline, &report)
 		})
 		if !ok {
 			t.Fatalf("conformance: %s profile failed", profile)
@@ -95,6 +96,7 @@ func runProfile(
 	conn driver.Conn,
 	inspect Inspect,
 	profile Profile,
+	factoryCapabilities driver.Capabilities,
 	inject FaultInjector,
 	deadline DeadlineFixture,
 	report *Report,
@@ -194,7 +196,7 @@ func runProfile(
 			}
 			groupResult = &groupContext{
 				t: groupTest, ctx: ctx, conn: conn, inspect: inspect,
-				profile: profile, effective: effective, inject: inject, report: report,
+				profile: profile, effective: effective, factoryCapabilities: factoryCapabilities, inject: inject, report: report,
 				checkNames: make(map[string]struct{}),
 				skips:      make(map[string]string), deadline: deadline,
 			}

@@ -113,7 +113,7 @@ func (m *deliveryMetrics) recordRetryAfterClamped(eventType string) {
 func (m *deliveryMetrics) sampleRetryAfterClamped() map[string]uint64 {
 	values := make(map[string]uint64, len(m.topics))
 	for index, topic := range m.topics {
-		if value := m.retryAfterClamped[index].Sample(); value > 0 {
+		if value := m.retryAfterClamped[index].Load(); value > 0 {
 			values[topic] = value
 		}
 	}
@@ -1224,19 +1224,19 @@ func eventFromDelivery(r *Runner, message driver.InboundMessage, envelope Envelo
 // be published within its bounded republish budget. The consume-side
 // ordering invariant only allows releasing the original delivery once every
 // possible successor is confirmed durable, so this never settles the
-// delivery: it stops the runner's consumer instead, and the broker
-// redelivers the still-unacked message once the channel closes, the same
-// mechanism relied on for a crash.
+// delivery: it releases the runner's consumer instead. Release leaves the
+// delivery unsettled, closes the consumer, and lets the broker redeliver the
+// message, the same mechanism relied on for a crash.
 func failSuccessorHandoff(r *Runner, ctx context.Context, op string, event *Event, cause error) {
 	kind, _ := driver.Classify(cause)
 	classified := &driver.Error{Driver: r.client.options.driver.Name(), Op: op, K: kind, Err: cause}
 	setRunnerError(r, classified)
 	runnerNotifyError(r, ctx, event, classified)
-	if err := stopRunnerConsumer(r, ctx); err != nil {
-		runnerLogger(r).Error("f1 failed to stop consumer after a successor publish exhausted its republish budget", "op", op, "cause", classified, "stop_error", err)
+	if err := releaseRunnerConsumer(r, ctx); err != nil {
+		runnerLogger(r).Error("f1 failed to release consumer after a successor publish exhausted its republish budget", "op", op, "cause", classified, "release_error", err)
 		return
 	}
-	runnerLogger(r).Error("f1 successor publish exhausted its republish budget; consumer stopped", "op", op, "cause", classified)
+	runnerLogger(r).Error("f1 successor publish exhausted its republish budget; consumer released", "op", op, "cause", classified)
 }
 
 // retryAndSettle republishes message to its retry destination, carrying the
@@ -1309,6 +1309,24 @@ func stopRunnerConsumer(r *Runner, ctx context.Context) error {
 		return err
 	}
 	return nil
+}
+
+func releaseRunnerConsumer(r *Runner, ctx context.Context) error {
+	r.mu.Lock()
+	consumer := r.consumer
+	r.mu.Unlock()
+	if consumer == nil {
+		return nil
+	}
+	if err := consumer.Release(ctx); err == nil {
+		return nil
+	} else if !errors.Is(err, driver.ErrUnsupported) {
+		return err
+	} else if stopErr := consumer.Stop(ctx); stopErr != nil {
+		return errors.Join(err, stopErr)
+	} else {
+		return err
+	}
 }
 
 func matchHandler(handlers map[string]Handler, eventType string) Handler {

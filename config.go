@@ -24,18 +24,14 @@ type Config struct {
 	Topology      TopologyConfig                `yaml:"topology"`
 	Codec         CodecConfig                   `yaml:"codec"`
 	Lifecycle     LifecycleConfig               `yaml:"lifecycle"`
-	Observability ObservabilityConfig           `yaml:"observability"`
 	Subscriptions map[string]SubscriptionConfig `yaml:"subscriptions"`
 }
 
 // TopologyConfig configures the destinations a Client verifies or creates.
 type TopologyConfig struct {
-	AutoCreate        bool          `yaml:"autoCreate"`
-	VerifyOnStart     bool          `yaml:"verifyOnStart"`
-	PartitionsDefault int           `yaml:"partitionsDefault"`
-	RetentionDefault  time.Duration `yaml:"retentionDefault"`
-	DLQRetention      time.Duration `yaml:"dlqRetention"`
-	Priorities        []Priority    `yaml:"priorities"`
+	AutoCreate    bool       `yaml:"autoCreate"`
+	VerifyOnStart bool       `yaml:"verifyOnStart"`
+	Priorities    []Priority `yaml:"priorities"`
 }
 
 // CodecConfig configures the codec selection and envelope size limits.
@@ -57,36 +53,6 @@ type LifecycleConfig struct {
 	FlushTimeout          time.Duration `yaml:"flushTimeout"`
 	CloseTimeout          time.Duration `yaml:"closeTimeout"`
 	RebalanceDrainTimeout time.Duration `yaml:"rebalanceDrainTimeout"`
-}
-
-// ObservabilityConfig configures the client logs, metrics, and tracing.
-type ObservabilityConfig struct {
-	LogLevel    string            `yaml:"logLevel"`
-	LogFormat   string            `yaml:"logFormat"`
-	LogSampling LogSamplingConfig `yaml:"logSampling"`
-	Metrics     MetricsConfig     `yaml:"metrics"`
-	Tracing     TracingConfig     `yaml:"tracing"`
-}
-
-// LogSamplingConfig bounds the log volume emitted during a failure storm.
-type LogSamplingConfig struct {
-	Enabled    bool `yaml:"enabled"`
-	Burst      int  `yaml:"burst"`
-	Thereafter int  `yaml:"thereafter"`
-}
-
-// MetricsConfig configures whether the client emits metrics and their schema mode.
-type MetricsConfig struct {
-	Enabled      bool   `yaml:"enabled"`
-	SemconvOptIn string `yaml:"semconvOptIn"`
-}
-
-// TracingConfig configures whether the client emits traces and their sampling.
-type TracingConfig struct {
-	Enabled              bool    `yaml:"enabled"`
-	SampleRatio          float64 `yaml:"sampleRatio"`
-	AlwaysSampleRetries  bool    `yaml:"alwaysSampleRetries"`
-	AlwaysSampleFailures bool    `yaml:"alwaysSampleFailures"`
 }
 
 // Mode selects whether a Subscription preserves per-key delivery order.
@@ -180,6 +146,7 @@ func LoadConfig(path string) (Config, error) {
 		}
 	}
 	applyEnvironment(&cfg)
+	cfg = normalizeConfig(cfg)
 	if err := validateConfig(cfg); err != nil {
 		return Config{}, err
 	}
@@ -189,12 +156,70 @@ func LoadConfig(path string) (Config, error) {
 func defaultConfig() Config {
 	return Config{
 		Broker:        BrokerConfig{ConnectTimeout: 30 * time.Second, DefaultPrefetch: 64},
-		Topology:      TopologyConfig{VerifyOnStart: true, PartitionsDefault: 12, RetentionDefault: 7 * 24 * time.Hour, DLQRetention: 30 * 24 * time.Hour, Priorities: []Priority{PriorityHigh, PriorityNormal, PriorityLow}},
+		Topology:      TopologyConfig{VerifyOnStart: true, Priorities: []Priority{PriorityHigh, PriorityNormal, PriorityLow}},
 		Codec:         CodecConfig{Default: "json", ContentMode: "binary", MaxHeaderBytes: CoreMaxHeaderBytes, MaxBodyBytes: 1024 * 1024},
 		Lifecycle:     LifecycleConfig{PreStopDelay: 5 * time.Second, DrainTimeout: time.Minute, HandlerGrace: 5 * time.Second, FlushTimeout: 20 * time.Second, CloseTimeout: 10 * time.Second, RebalanceDrainTimeout: 25 * time.Second},
-		Observability: ObservabilityConfig{LogLevel: "info", LogFormat: "json", LogSampling: LogSamplingConfig{Enabled: true, Burst: 10, Thereafter: 100}, Metrics: MetricsConfig{Enabled: true}, Tracing: TracingConfig{Enabled: true, SampleRatio: 0.01, AlwaysSampleRetries: true, AlwaysSampleFailures: true}},
 		Subscriptions: map[string]SubscriptionConfig{},
 	}
+}
+
+func normalizeConfig(cfg Config) Config {
+	defaults := defaultConfig()
+	if cfg.Codec.ContentMode == "" {
+		cfg.Codec.ContentMode = defaults.Codec.ContentMode
+	}
+	if cfg.Codec.MaxBodyBytes == 0 {
+		cfg.Codec.MaxBodyBytes = defaults.Codec.MaxBodyBytes
+	}
+	if len(cfg.Topology.Priorities) == 0 {
+		cfg.Topology.Priorities = append([]Priority(nil), defaults.Topology.Priorities...)
+	}
+	if cfg.Lifecycle.PreStopDelay == 0 {
+		cfg.Lifecycle.PreStopDelay = defaults.Lifecycle.PreStopDelay
+	}
+	if cfg.Lifecycle.DrainTimeout == 0 {
+		cfg.Lifecycle.DrainTimeout = defaults.Lifecycle.DrainTimeout
+	}
+	if cfg.Lifecycle.HandlerGrace == 0 {
+		cfg.Lifecycle.HandlerGrace = defaults.Lifecycle.HandlerGrace
+	}
+	if cfg.Lifecycle.FlushTimeout == 0 {
+		cfg.Lifecycle.FlushTimeout = defaults.Lifecycle.FlushTimeout
+	}
+	if cfg.Lifecycle.CloseTimeout == 0 {
+		cfg.Lifecycle.CloseTimeout = defaults.Lifecycle.CloseTimeout
+	}
+	if cfg.Lifecycle.RebalanceDrainTimeout == 0 {
+		cfg.Lifecycle.RebalanceDrainTimeout = defaults.Lifecycle.RebalanceDrainTimeout
+	}
+	if cfg.Subscriptions == nil {
+		return cfg
+	}
+	subscriptions := make(map[string]SubscriptionConfig, len(cfg.Subscriptions))
+	subDefaults := defaultSubscription()
+	for name, subscription := range cfg.Subscriptions {
+		if subscription.Concurrency == 0 {
+			subscription.Concurrency = subDefaults.Concurrency
+		}
+		if subscription.Prefetch == 0 {
+			subscription.Prefetch = cfg.Broker.DefaultPrefetch
+			if subscription.Prefetch == 0 {
+				subscription.Prefetch = defaults.Broker.DefaultPrefetch
+			}
+		}
+		if len(subscription.Priorities) == 0 {
+			subscription.Priorities = append([]Priority(nil), subDefaults.Priorities...)
+		}
+		if subscription.Retry.MaxAttempts == 0 {
+			subscription.Retry.MaxAttempts = subDefaults.Retry.MaxAttempts
+		}
+		if subscription.HandlerTimeout == 0 {
+			subscription.HandlerTimeout = subDefaults.HandlerTimeout
+		}
+		subscriptions[name] = subscription
+	}
+	cfg.Subscriptions = subscriptions
+	return cfg
 }
 
 func decodeConfig(data []byte, cfg *Config) error {
@@ -264,9 +289,15 @@ func validateConfig(cfg Config) error {
 	if err := validateLifecycleConfig(cfg.Lifecycle); err != nil {
 		return err
 	}
+	if err := validatePriorityList("topology.priorities", cfg.Topology.Priorities); err != nil {
+		return err
+	}
 	for name, subscription := range cfg.Subscriptions {
 		if len(subscription.Topics) == 0 {
 			return fmt.Errorf("f1: subscriptions.%s.topics must not be empty", name)
+		}
+		if err := validatePriorityList("subscriptions."+name+".priorities", subscription.Priorities); err != nil {
+			return err
 		}
 		if subscription.Concurrency < 1 || subscription.Concurrency > 1024 {
 			return fmt.Errorf("f1: subscriptions.%s.concurrency must be between 1 and 1024", name)
@@ -308,6 +339,23 @@ func validateConfig(cfg Config) error {
 				return fmt.Errorf("f1: broker.rabbitmq.consumerTimeout must be at least subscriptions.%s.handlerTimeout x 3", name)
 			}
 		}
+	}
+	return nil
+}
+
+func validatePriorityList(path string, priorities []Priority) error {
+	if len(priorities) == 0 {
+		return fmt.Errorf("f1: %s must not be empty", path)
+	}
+	seen := make(map[Priority]struct{}, len(priorities))
+	for _, priority := range priorities {
+		if !priority.Valid() {
+			return fmt.Errorf("f1: %s contains invalid priority %d", path, priority)
+		}
+		if _, ok := seen[priority]; ok {
+			return fmt.Errorf("f1: %s contains duplicate priority %s", path, priority.String())
+		}
+		seen[priority] = struct{}{}
 	}
 	return nil
 }
@@ -392,7 +440,6 @@ type rawF1 struct {
 	Topology      rawTopology                `yaml:"topology"`
 	Codec         CodecConfig                `yaml:"codec"`
 	Lifecycle     LifecycleConfig            `yaml:"lifecycle"`
-	Observability ObservabilityConfig        `yaml:"observability"`
 	Subscriptions map[string]rawSubscription `yaml:"subscriptions"`
 }
 
@@ -408,8 +455,8 @@ func rawFromConfig(cfg Config) *rawF1 {
 	return &rawF1{
 		Env: cfg.Env, Service: cfg.Service, InstanceID: cfg.InstanceID,
 		Broker:   rawBroker(cfg.Broker),
-		Topology: rawTopology{AutoCreate: cfg.Topology.AutoCreate, VerifyOnStart: cfg.Topology.VerifyOnStart, PartitionsDefault: cfg.Topology.PartitionsDefault, RetentionDefault: cfg.Topology.RetentionDefault, DLQRetention: cfg.Topology.DLQRetention, Priorities: topologyPriorities},
-		Codec:    cfg.Codec, Lifecycle: cfg.Lifecycle, Observability: cfg.Observability, Subscriptions: subscriptions,
+		Topology: rawTopology{AutoCreate: cfg.Topology.AutoCreate, VerifyOnStart: cfg.Topology.VerifyOnStart, Priorities: topologyPriorities},
+		Codec:    cfg.Codec, Lifecycle: cfg.Lifecycle, Subscriptions: subscriptions,
 	}
 }
 
@@ -417,7 +464,7 @@ func (y rawF1) config() (Config, error) {
 	cfg := Config{
 		Env: y.Env, Service: y.Service, InstanceID: y.InstanceID,
 		Broker: y.Broker.config(), Topology: y.Topology.config(), Codec: y.Codec,
-		Lifecycle: y.Lifecycle, Observability: y.Observability,
+		Lifecycle:     y.Lifecycle,
 		Subscriptions: map[string]SubscriptionConfig{},
 	}
 	if y.Subscriptions != nil {
@@ -500,12 +547,9 @@ func (r *rawRetry) UnmarshalYAML(value *yaml.Node) error {
 }
 
 type rawTopology struct {
-	AutoCreate        bool          `yaml:"autoCreate"`
-	VerifyOnStart     bool          `yaml:"verifyOnStart"`
-	PartitionsDefault int           `yaml:"partitionsDefault"`
-	RetentionDefault  time.Duration `yaml:"retentionDefault"`
-	DLQRetention      time.Duration `yaml:"dlqRetention"`
-	Priorities        []rawPriority `yaml:"priorities"`
+	AutoCreate    bool          `yaml:"autoCreate"`
+	VerifyOnStart bool          `yaml:"verifyOnStart"`
+	Priorities    []rawPriority `yaml:"priorities"`
 }
 
 func (y rawTopology) config() TopologyConfig {
@@ -513,7 +557,7 @@ func (y rawTopology) config() TopologyConfig {
 	for i, priority := range y.Priorities {
 		priorities[i] = Priority(priority)
 	}
-	return TopologyConfig{AutoCreate: y.AutoCreate, VerifyOnStart: y.VerifyOnStart, PartitionsDefault: y.PartitionsDefault, RetentionDefault: y.RetentionDefault, DLQRetention: y.DLQRetention, Priorities: priorities}
+	return TopologyConfig{AutoCreate: y.AutoCreate, VerifyOnStart: y.VerifyOnStart, Priorities: priorities}
 }
 
 type rawSubscription struct {

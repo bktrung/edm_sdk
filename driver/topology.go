@@ -84,10 +84,12 @@ type TopologyState struct {
 
 // TopologyDiff reports topology changes and orphaned destinations.
 type TopologyDiff struct {
-	CreatedExchanges    []string
-	CreatedDestinations []string
-	CreatedBindings     []string
-	Existing            []string
+	CreatedExchanges     []string
+	CreatedDestinations  []string
+	CreatedBindings      []BindingSpec
+	ExistingExchanges    []string
+	ExistingDestinations []string
+	ExistingBindings     []BindingSpec
 	// Orphaned lists core-owned destinations that exist but are absent from the
 	// spec. Include auxiliary message counts in their parent; report an
 	// auxiliary by name when its parent is absent.

@@ -1,7 +1,5 @@
 package f1
 
-import "encoding/json"
-
 // Priority identifies a delivery lane. Its zero value is PriorityNormal;
 // numeric values are identifiers, not an ordering.
 type Priority int
@@ -52,23 +50,4 @@ func ParsePriority(s string) (Priority, error) {
 	default:
 		return 0, &UnrecognisedValueError{Attribute: "f1priority", Value: s}
 	}
-}
-
-// MarshalJSON encodes p as its wire name.
-func (p Priority) MarshalJSON() ([]byte, error) {
-	return json.Marshal(p.String())
-}
-
-// UnmarshalJSON decodes a wire name into p.
-func (p *Priority) UnmarshalJSON(b []byte) error {
-	var s string
-	if err := json.Unmarshal(b, &s); err != nil {
-		return err
-	}
-	v, err := ParsePriority(s)
-	if err != nil {
-		return err
-	}
-	*p = v
-	return nil
 }

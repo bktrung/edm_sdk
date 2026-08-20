@@ -2,9 +2,11 @@ package f1
 
 import (
 	"fmt"
+	"maps"
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 )
 
 // Envelope contains the canonical message headers.
@@ -64,7 +66,7 @@ func (e Envelope) EncodeHeaders(driverMaxBytes int) (map[string]string, error) {
 		return nil, ErrInvalidPriority
 	}
 	for k := range e.Extensions {
-		if isReservedExtensionKey(k) {
+		if isReservedExtensionKey(k) || isBrokerReserved(k) {
 			return nil, ErrReservedExtension
 		}
 	}
@@ -75,9 +77,7 @@ func (e Envelope) EncodeHeaders(driverMaxBytes int) (map[string]string, error) {
 	}
 
 	h := make(map[string]string, len(e.Forwarded)+32)
-	for k, v := range e.Forwarded {
-		h[k] = v
-	}
+	maps.Copy(h, e.Forwarded)
 	h["specversion"] = e.SpecVersion
 	h["id"] = e.ID
 	h["source"] = e.Source
@@ -111,9 +111,7 @@ func (e Envelope) EncodeHeaders(driverMaxBytes int) (map[string]string, error) {
 	setOpt(h, "traceparent", e.TraceParent)
 	setOpt(h, "tracestate", e.TraceState)
 
-	for k, v := range e.Extensions {
-		h[k] = v
-	}
+	maps.Copy(h, e.Extensions)
 
 	if headerBytes(h) <= limit {
 		return h, nil
@@ -156,9 +154,9 @@ func shrinkDeathError(h map[string]string, limit int) {
 			return // There is no remaining field to shrink.
 		}
 		over := headerBytes(h) - limit
-		cut := len(v) - over
-		if cut < 0 {
-			cut = 0
+		cut := max(len(v)-over, 0)
+		for cut > 0 && cut < len(v) && !utf8.RuneStart(v[cut]) {
+			cut--
 		}
 		h["f1deatherror"] = v[:cut]
 	}
@@ -174,6 +172,21 @@ func DecodeHeaders(h map[string]string) (Envelope, error) {
 	e.ID = h["id"]
 	e.Source = h["source"]
 	e.Type = h["type"]
+	if e.SpecVersion == "" {
+		return Envelope{}, fmt.Errorf("f1: header specversion must not be empty")
+	}
+	if e.SpecVersion != "1.0" {
+		return Envelope{}, fmt.Errorf("f1: header specversion must be \"1.0\", got %q", e.SpecVersion)
+	}
+	if e.ID == "" {
+		return Envelope{}, fmt.Errorf("f1: header id must not be empty")
+	}
+	if e.Source == "" {
+		return Envelope{}, fmt.Errorf("f1: header source must not be empty")
+	}
+	if e.Type == "" {
+		return Envelope{}, fmt.Errorf("f1: header type must not be empty")
+	}
 	if v, ok := h["time"]; ok {
 		t, err := time.Parse(timeLayout, v)
 		if err != nil {
