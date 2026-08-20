@@ -446,7 +446,7 @@ func checkFanoutDeclaration(group *groupContext) {
 			Destinations: []string{secondDestination}, Prefetch: 1, Effective: group.effective,
 		})
 		if err := producer.Publish(group.ctx, driver.OutboundMessage{
-			Destination: exchange, Body: []byte("fanout-copy"),
+			Destination: exchange, EntryPoint: true, Body: []byte("fanout-copy"),
 		}); err != nil {
 			t.Fatalf("fanout publish: %v", err)
 		}
