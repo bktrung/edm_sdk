@@ -316,11 +316,12 @@ func runTopology(group *groupContext) {
 				}
 			}
 		})
-		producer := newDeferredProducer(t, group, dropped, deferredDelay)
-		if err := producer.Publish(group.ctx,
-			driver.OutboundMessage{Destination: dropped},
-			driver.OutboundMessage{Destination: dropped, DelayUntil: farFuture},
-		); err != nil {
+		producer := newProducer(t, group, dropped, driver.ProducerConfig{Effective: group.effective})
+		if err := producer.Publish(group.ctx, driver.OutboundMessage{Destination: dropped}); err != nil {
+			t.Fatalf("Publish(%q): %v", dropped, err)
+		}
+		deferredProducer := newDeferredProducer(t, group, dropped, deferredDelay)
+		if err := deferredProducer.Publish(group.ctx, driver.OutboundMessage{Destination: dropped, DelayUntil: farFuture}); err != nil {
 			t.Fatalf("Publish(%q): %v", dropped, err)
 		}
 		waitFor(t, group, "seeded messages to land on the dropped destination", func() (bool, string) {
@@ -351,9 +352,12 @@ func runTopology(group *groupContext) {
 	group.Check("DescribeTopology reports depth including deferred messages", func(t *testing.T) {
 		admin := group.conn.Admin()
 		name := "topology.describe.depth"
-		producer := newDeferredProducer(t, group, name, deferredDelay)
-		if err := producer.Publish(group.ctx,
-			driver.OutboundMessage{Destination: name},
+		producer := newProducer(t, group, name, driver.ProducerConfig{Effective: group.effective})
+		if err := producer.Publish(group.ctx, driver.OutboundMessage{Destination: name}); err != nil {
+			t.Fatalf("Publish(%q): %v", name, err)
+		}
+		deferredProducer := newDeferredProducer(t, group, name, deferredDelay)
+		if err := deferredProducer.Publish(group.ctx,
 			driver.OutboundMessage{Destination: name, DelayUntil: farFuture},
 			driver.OutboundMessage{Destination: name, DelayUntil: farFuture},
 		); err != nil {
