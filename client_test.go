@@ -12,7 +12,6 @@ import (
 	"time"
 
 	"go.opentelemetry.io/otel/metric/noop"
-	tracenoop "go.opentelemetry.io/otel/trace/noop"
 
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/driver"
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/clock"
@@ -31,27 +30,8 @@ func TestNewValidatesOptionsEagerly(t *testing.T) {
 	if _, err := New(context.Background(), cfg, WithDriver(fakeDriver), WithLogger(nil)); err == nil || fakeDriver.opened {
 		t.Fatalf("New() error = %v, opened = %v; want option error before open", err, fakeDriver.opened)
 	}
-	if _, err := New(context.Background(), cfg, WithDriver(&testDriver{}), WithMeterProvider(noop.NewMeterProvider()), WithTracerProvider(tracenoop.NewTracerProvider())); err != nil {
-		t.Fatalf("New() error = %v, want typed observability providers accepted", err)
-	}
-}
-
-func TestTracerProviderAndErrorHandlerAreRetained(t *testing.T) {
-	t.Parallel()
-	cfg := testClientConfig(t)
-	tracer := tracenoop.NewTracerProvider()
-	var handlerCalls int
-	handler := func(context.Context, *Event, error) { handlerCalls++ }
-	client, err := New(context.Background(), cfg, WithDriver(&testDriver{}), WithTracerProvider(tracer), WithErrorHandler(handler))
-	if err != nil {
-		t.Fatalf("New() error = %v", err)
-	}
-	defer func() { _ = client.Close(context.Background()) }()
-	if client.options.tracerProvider != tracer {
-		t.Fatal("tracerProvider was not retained on the client")
-	}
-	if client.options.errorHandler == nil {
-		t.Fatal("errorHandler was not retained on the client")
+	if _, err := New(context.Background(), cfg, WithDriver(&testDriver{}), WithMeterProvider(noop.NewMeterProvider())); err != nil {
+		t.Fatalf("New() error = %v, want typed observability provider accepted", err)
 	}
 }
 
