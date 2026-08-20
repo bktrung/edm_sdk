@@ -98,3 +98,42 @@ func TestClassify_NilErrorStaysNil(t *testing.T) {
 	require.Nil(t, f1.RetryAfter(nil, time.Second))
 	require.Nil(t, f1.Drop(nil))
 }
+
+func TestClassify_ErrorTrees(t *testing.T) {
+	t.Parallel()
+	base := errors.New("failure")
+	tests := []struct {
+		name     string
+		err      error
+		terminal bool
+		dropped  bool
+		delay    time.Duration
+		hasDelay bool
+	}{
+		{name: "retry after around drop", err: f1.RetryAfter(f1.Drop(base), time.Second), delay: time.Second, hasDelay: true},
+		{name: "drop around retry after", err: f1.Drop(f1.RetryAfter(base, time.Second)), dropped: true},
+		{name: "terminal around retry after", err: f1.Terminal(f1.RetryAfter(base, time.Second)), terminal: true},
+		{name: "retry after around terminal", err: f1.RetryAfter(f1.Terminal(base), time.Second), terminal: true, delay: time.Second, hasDelay: true},
+		{name: "join retry after and terminal", err: errors.Join(f1.RetryAfter(base, time.Second), f1.Terminal(base)), terminal: true, delay: time.Second, hasDelay: true},
+		{name: "join retry after and drop", err: errors.Join(f1.RetryAfter(base, time.Second), f1.Drop(base)), delay: time.Second, hasDelay: true},
+		{name: "join plain and terminal", err: errors.Join(errors.New("plain"), f1.Terminal(base)), terminal: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			require.Equal(t, test.terminal, f1.IsTerminal(test.err))
+			require.Equal(t, test.dropped, f1.IsDropped(test.err))
+			got, ok := f1.RetryDelay(test.err)
+			require.Equal(t, test.hasDelay, ok)
+			require.Equal(t, test.delay, got)
+		})
+	}
+
+	threeDeep := errors.Join(
+		errors.New("outer"),
+		errors.Join(
+			f1.RetryAfter(base, time.Second),
+			errors.Join(errors.New("inner"), f1.Terminal(base)),
+		),
+	)
+	require.True(t, f1.IsTerminal(threeDeep))
+}

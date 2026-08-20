@@ -46,28 +46,36 @@ func Drop(err error) error {
 	return &classifiedError{err: err, dropped: true}
 }
 
-// IsTerminal reports whether err or an error it wraps is terminal.
+// IsTerminal reports whether any node in err's error tree is terminal.
 func IsTerminal(err error) bool {
-	for current := err; current != nil; {
-		var classified *classifiedError
-		if !errors.As(current, &classified) {
-			return false
+	if err == nil {
+		return false
+	}
+	var classified *classifiedError
+	if errors.As(err, &classified) && classified.terminal {
+		return true
+	}
+	if joined, ok := err.(interface{ Unwrap() []error }); ok {
+		for _, child := range joined.Unwrap() {
+			if IsTerminal(child) {
+				return true
+			}
 		}
-		if classified.terminal {
-			return true
-		}
-		current = classified.err
+		return false
+	}
+	if wrapped, ok := err.(interface{ Unwrap() error }); ok {
+		return IsTerminal(wrapped.Unwrap())
 	}
 	return false
 }
 
-// IsDropped reports whether err or an error it wraps is dropped.
+// IsDropped reports whether the outermost classified error is dropped.
 func IsDropped(err error) bool {
 	var classified *classifiedError
 	return errors.As(err, &classified) && classified.dropped
 }
 
-// RetryDelay returns an explicit retry delay carried by err.
+// RetryDelay returns an explicit retry delay from the outermost classified error.
 func RetryDelay(err error) (time.Duration, bool) {
 	var classified *classifiedError
 	if !errors.As(err, &classified) || !classified.hasDelay {
