@@ -29,12 +29,9 @@ type Config struct {
 
 // TopologyConfig configures the destinations a Client verifies or creates.
 type TopologyConfig struct {
-	AutoCreate        bool          `yaml:"autoCreate"`
-	VerifyOnStart     bool          `yaml:"verifyOnStart"`
-	PartitionsDefault int           `yaml:"partitionsDefault"`
-	RetentionDefault  time.Duration `yaml:"retentionDefault"`
-	DLQRetention      time.Duration `yaml:"dlqRetention"`
-	Priorities        []Priority    `yaml:"priorities"`
+	AutoCreate    bool       `yaml:"autoCreate"`
+	VerifyOnStart bool       `yaml:"verifyOnStart"`
+	Priorities    []Priority `yaml:"priorities"`
 }
 
 // CodecConfig configures the codec selection and envelope size limits.
@@ -158,7 +155,7 @@ func LoadConfig(path string) (Config, error) {
 func defaultConfig() Config {
 	return Config{
 		Broker:        BrokerConfig{ConnectTimeout: 30 * time.Second, DefaultPrefetch: 64},
-		Topology:      TopologyConfig{VerifyOnStart: true, PartitionsDefault: 12, RetentionDefault: 7 * 24 * time.Hour, DLQRetention: 30 * 24 * time.Hour, Priorities: []Priority{PriorityHigh, PriorityNormal, PriorityLow}},
+		Topology:      TopologyConfig{VerifyOnStart: true, Priorities: []Priority{PriorityHigh, PriorityNormal, PriorityLow}},
 		Codec:         CodecConfig{Default: "json", ContentMode: "binary", MaxHeaderBytes: CoreMaxHeaderBytes, MaxBodyBytes: 1024 * 1024},
 		Lifecycle:     LifecycleConfig{PreStopDelay: 5 * time.Second, DrainTimeout: time.Minute, HandlerGrace: 5 * time.Second, FlushTimeout: 20 * time.Second, CloseTimeout: 10 * time.Second, RebalanceDrainTimeout: 25 * time.Second},
 		Subscriptions: map[string]SubscriptionConfig{},
@@ -375,7 +372,7 @@ func rawFromConfig(cfg Config) *rawF1 {
 	return &rawF1{
 		Env: cfg.Env, Service: cfg.Service, InstanceID: cfg.InstanceID,
 		Broker:   rawBroker(cfg.Broker),
-		Topology: rawTopology{AutoCreate: cfg.Topology.AutoCreate, VerifyOnStart: cfg.Topology.VerifyOnStart, PartitionsDefault: cfg.Topology.PartitionsDefault, RetentionDefault: cfg.Topology.RetentionDefault, DLQRetention: cfg.Topology.DLQRetention, Priorities: topologyPriorities},
+		Topology: rawTopology{AutoCreate: cfg.Topology.AutoCreate, VerifyOnStart: cfg.Topology.VerifyOnStart, Priorities: topologyPriorities},
 		Codec:    cfg.Codec, Lifecycle: cfg.Lifecycle, Subscriptions: subscriptions,
 	}
 }
@@ -467,12 +464,9 @@ func (r *rawRetry) UnmarshalYAML(value *yaml.Node) error {
 }
 
 type rawTopology struct {
-	AutoCreate        bool          `yaml:"autoCreate"`
-	VerifyOnStart     bool          `yaml:"verifyOnStart"`
-	PartitionsDefault int           `yaml:"partitionsDefault"`
-	RetentionDefault  time.Duration `yaml:"retentionDefault"`
-	DLQRetention      time.Duration `yaml:"dlqRetention"`
-	Priorities        []rawPriority `yaml:"priorities"`
+	AutoCreate    bool          `yaml:"autoCreate"`
+	VerifyOnStart bool          `yaml:"verifyOnStart"`
+	Priorities    []rawPriority `yaml:"priorities"`
 }
 
 func (y rawTopology) config() TopologyConfig {
@@ -480,7 +474,7 @@ func (y rawTopology) config() TopologyConfig {
 	for i, priority := range y.Priorities {
 		priorities[i] = Priority(priority)
 	}
-	return TopologyConfig{AutoCreate: y.AutoCreate, VerifyOnStart: y.VerifyOnStart, PartitionsDefault: y.PartitionsDefault, RetentionDefault: y.RetentionDefault, DLQRetention: y.DLQRetention, Priorities: priorities}
+	return TopologyConfig{AutoCreate: y.AutoCreate, VerifyOnStart: y.VerifyOnStart, Priorities: priorities}
 }
 
 type rawSubscription struct {
