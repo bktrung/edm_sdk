@@ -65,10 +65,9 @@ const (
 	FeatureUnavailable
 )
 
-// New applies opts, validates them, and opens the supplied driver before
-// returning. Startup errors are returned before any publish or subscribe call.
-// Until subscription construction supplies Go-side defaults, cfg is expected
-// to come from LoadConfig; hand-built Config values are validated as supplied.
+// New applies opts, normalizes and validates cfg, and opens the supplied driver
+// before returning. Startup errors are returned before any publish or subscribe
+// call. Env and Service remain required for hand-built configurations.
 func New(ctx context.Context, cfg Config, opts ...Option) (*Client, error) {
 	options := clientOptions{codec: codec.JSON{}, clock: clock.NewReal(), logger: slog.Default()}
 	for _, option := range opts {
@@ -82,6 +81,7 @@ func New(ctx context.Context, cfg Config, opts ...Option) (*Client, error) {
 	if options.driver == nil {
 		return nil, fmt.Errorf("f1: New requires WithDriver")
 	}
+	cfg = normalizeConfig(cfg)
 	if err := validateConfig(cfg); err != nil {
 		return nil, err
 	}

@@ -4,6 +4,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -486,4 +487,50 @@ func TestValidateConfigRejectsInvalidPriorityLists(t *testing.T) {
 func withPriorities(sub SubscriptionConfig, priorities []Priority) SubscriptionConfig {
 	sub.Priorities = priorities
 	return sub
+}
+
+func TestNormalizeConfigAcceptsMinimalHandBuiltConfig(t *testing.T) {
+	t.Parallel()
+	cfg := normalizeConfig(Config{
+		Env:     "test",
+		Service: "orders",
+		Broker:  BrokerConfig{Driver: "inmem"},
+		Subscriptions: map[string]SubscriptionConfig{
+			"orders": {Topics: []string{"orders.created"}},
+		},
+	})
+	if err := validateConfig(cfg); err != nil {
+		t.Fatalf("validateConfig() after normalization: %v", err)
+	}
+	defaults := defaultConfig()
+	if cfg.Codec.ContentMode != defaults.Codec.ContentMode || cfg.Codec.MaxBodyBytes != defaults.Codec.MaxBodyBytes {
+		t.Fatalf("codec defaults = %#v, want %#v", cfg.Codec, defaults.Codec)
+	}
+	if !reflect.DeepEqual(cfg.Topology.Priorities, defaults.Topology.Priorities) || cfg.Lifecycle != defaults.Lifecycle {
+		t.Fatalf("topology/lifecycle defaults = %#v/%#v", cfg.Topology, cfg.Lifecycle)
+	}
+	sub := cfg.Subscriptions["orders"]
+	subDefaults := defaultSubscription()
+	if sub.Concurrency != subDefaults.Concurrency || sub.Prefetch != defaults.Broker.DefaultPrefetch || !reflect.DeepEqual(sub.Priorities, subDefaults.Priorities) || sub.Retry.MaxAttempts != subDefaults.Retry.MaxAttempts || sub.HandlerTimeout != subDefaults.HandlerTimeout {
+		t.Fatalf("subscription defaults = %#v, want concurrency=%d prefetch=%d priorities=%v maxAttempts=%d handlerTimeout=%s", sub, subDefaults.Concurrency, defaults.Broker.DefaultPrefetch, subDefaults.Priorities, subDefaults.Retry.MaxAttempts, subDefaults.HandlerTimeout)
+	}
+}
+
+func TestNormalizeConfigPreservesVerifyOnStartFalse(t *testing.T) {
+	cfg := normalizeConfig(Config{Topology: TopologyConfig{VerifyOnStart: false}})
+	if cfg.Topology.VerifyOnStart {
+		t.Fatal("VerifyOnStart = true after normalization, want false")
+	}
+}
+
+func TestLoadConfigNormalizationIsNoOp(t *testing.T) {
+	t.Parallel()
+	path := writeConfig(t, "f1:\n  env: test\n  service: orders\n  broker:\n    driver: inmem\n  subscriptions:\n    orders:\n      topics: [orders.created]\n")
+	cfg, err := LoadConfig(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if normalized := normalizeConfig(cfg); !reflect.DeepEqual(normalized, cfg) {
+		t.Fatalf("normalization changed LoadConfig result: %#v -> %#v", cfg, normalized)
+	}
 }

@@ -146,6 +146,7 @@ func LoadConfig(path string) (Config, error) {
 		}
 	}
 	applyEnvironment(&cfg)
+	cfg = normalizeConfig(cfg)
 	if err := validateConfig(cfg); err != nil {
 		return Config{}, err
 	}
@@ -160,6 +161,65 @@ func defaultConfig() Config {
 		Lifecycle:     LifecycleConfig{PreStopDelay: 5 * time.Second, DrainTimeout: time.Minute, HandlerGrace: 5 * time.Second, FlushTimeout: 20 * time.Second, CloseTimeout: 10 * time.Second, RebalanceDrainTimeout: 25 * time.Second},
 		Subscriptions: map[string]SubscriptionConfig{},
 	}
+}
+
+func normalizeConfig(cfg Config) Config {
+	defaults := defaultConfig()
+	if cfg.Codec.ContentMode == "" {
+		cfg.Codec.ContentMode = defaults.Codec.ContentMode
+	}
+	if cfg.Codec.MaxBodyBytes == 0 {
+		cfg.Codec.MaxBodyBytes = defaults.Codec.MaxBodyBytes
+	}
+	if len(cfg.Topology.Priorities) == 0 {
+		cfg.Topology.Priorities = append([]Priority(nil), defaults.Topology.Priorities...)
+	}
+	if cfg.Lifecycle.PreStopDelay == 0 {
+		cfg.Lifecycle.PreStopDelay = defaults.Lifecycle.PreStopDelay
+	}
+	if cfg.Lifecycle.DrainTimeout == 0 {
+		cfg.Lifecycle.DrainTimeout = defaults.Lifecycle.DrainTimeout
+	}
+	if cfg.Lifecycle.HandlerGrace == 0 {
+		cfg.Lifecycle.HandlerGrace = defaults.Lifecycle.HandlerGrace
+	}
+	if cfg.Lifecycle.FlushTimeout == 0 {
+		cfg.Lifecycle.FlushTimeout = defaults.Lifecycle.FlushTimeout
+	}
+	if cfg.Lifecycle.CloseTimeout == 0 {
+		cfg.Lifecycle.CloseTimeout = defaults.Lifecycle.CloseTimeout
+	}
+	if cfg.Lifecycle.RebalanceDrainTimeout == 0 {
+		cfg.Lifecycle.RebalanceDrainTimeout = defaults.Lifecycle.RebalanceDrainTimeout
+	}
+	if cfg.Subscriptions == nil {
+		return cfg
+	}
+	subscriptions := make(map[string]SubscriptionConfig, len(cfg.Subscriptions))
+	subDefaults := defaultSubscription()
+	for name, subscription := range cfg.Subscriptions {
+		if subscription.Concurrency == 0 {
+			subscription.Concurrency = subDefaults.Concurrency
+		}
+		if subscription.Prefetch == 0 {
+			subscription.Prefetch = cfg.Broker.DefaultPrefetch
+			if subscription.Prefetch == 0 {
+				subscription.Prefetch = defaults.Broker.DefaultPrefetch
+			}
+		}
+		if len(subscription.Priorities) == 0 {
+			subscription.Priorities = append([]Priority(nil), subDefaults.Priorities...)
+		}
+		if subscription.Retry.MaxAttempts == 0 {
+			subscription.Retry.MaxAttempts = subDefaults.Retry.MaxAttempts
+		}
+		if subscription.HandlerTimeout == 0 {
+			subscription.HandlerTimeout = subDefaults.HandlerTimeout
+		}
+		subscriptions[name] = subscription
+	}
+	cfg.Subscriptions = subscriptions
+	return cfg
 }
 
 func decodeConfig(data []byte, cfg *Config) error {
