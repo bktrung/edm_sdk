@@ -121,6 +121,25 @@ type Consumer interface {
 	// ErrDrainTimeout.
 	Stop(ctx context.Context) error
 
+	// Release abandons every outstanding delivery WITHOUT settling it and then
+	// closes the consumer. The broker redelivers, to the same consumer group,
+	// whatever this consumer was given and did not settle. Release is the port
+	// verb for "give these back"; Stop is the verb for "I am finished with
+	// these", and the two must not be conflated.
+	//
+	// Release makes NO durability promise about committed positions. That is the
+	// difference from Stop, and it is why it is a separate verb rather than a
+	// flag: a driver that flushed positions here would commit past a message it
+	// is deliberately handing back.
+	//
+	// On a consumer with nothing outstanding Release behaves as Stop does.
+	// Release is idempotent, and on an already-released or already-stopped
+	// consumer it returns nil.
+	//
+	// A driver that genuinely cannot return unsettled deliveries returns
+	// ErrUnsupported.
+	Release(ctx context.Context) error
+
 	// Lag reports per-destination backlog. Drivers that cannot determine lag
 	// return ErrUnsupported.
 	Lag(ctx context.Context) (map[string]int64, error)

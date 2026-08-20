@@ -184,13 +184,15 @@ func (c *runTestConn) Consumer(_ context.Context, cfg driver.ConsumerConfig) (dr
 		conn:     c,
 		messages: make(chan driver.InboundMessage, capacity),
 		errs:     make(chan error, 1),
+		settlers: make(map[*runTestSettler]struct{}),
 	}
 	for _, destination := range cfg.Destinations {
 		queued := c.queues[destination]
 		for len(queued) > 0 && consumer.outstanding < capacity {
 			message := queued[0]
 			queued = queued[1:]
-			settler := &runTestSettler{conn: c, consumer: consumer, destination: destination}
+			settler := &runTestSettler{conn: c, consumer: consumer, destination: destination, message: message}
+			consumer.settlers[settler] = struct{}{}
 			consumer.messages <- driver.InboundMessage{
 				Destination: destination,
 				Body:        message.Body,
@@ -234,6 +236,7 @@ type runTestConsumer struct {
 	errs        chan error
 	outstanding int
 	stopped     bool
+	settlers    map[*runTestSettler]struct{}
 }
 
 func (c *runTestConsumer) Messages() <-chan driver.InboundMessage { return c.messages }
@@ -252,12 +255,34 @@ func (c *runTestConsumer) Stop(context.Context) error {
 	}
 	return nil
 }
+
+func (c *runTestConsumer) Release(context.Context) error {
+	if c.stopped {
+		return nil
+	}
+	for settler := range c.settlers {
+		if settler.settled {
+			continue
+		}
+		settler.settled = true
+		delete(c.settlers, settler)
+		c.outstanding--
+		c.conn.unsettled[settler.destination]--
+		c.conn.queues[settler.destination] = append([]driver.OutboundMessage{settler.message}, c.conn.queues[settler.destination]...)
+	}
+	c.stopped = true
+	close(c.messages)
+	close(c.errs)
+	return nil
+}
+
 func (*runTestConsumer) Lag(context.Context) (map[string]int64, error) { return nil, nil }
 
 type runTestSettler struct {
 	conn        *runTestConn
 	consumer    *runTestConsumer
 	destination string
+	message     driver.OutboundMessage
 	settled     bool
 }
 
@@ -268,6 +293,7 @@ func (s *runTestSettler) settle() error {
 		return errors.New("already settled")
 	}
 	s.settled = true
+	delete(s.consumer.settlers, s)
 	s.consumer.outstanding--
 	s.conn.unsettled[s.destination]--
 	return nil

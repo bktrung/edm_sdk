@@ -447,6 +447,7 @@ type dispatchConsumer struct {
 	errs     chan error
 	drained  bool
 	stopped  bool
+	released bool
 	open     int
 }
 
@@ -472,6 +473,21 @@ func (c *dispatchConsumer) Stop(context.Context) error {
 		return errors.New("outstanding dispatch message")
 	}
 	if !c.stopped {
+		c.stopped = true
+		close(c.messages)
+		close(c.errs)
+	}
+	return nil
+}
+
+func (c *dispatchConsumer) Release(context.Context) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.open != 0 {
+		return errors.New("outstanding dispatch message")
+	}
+	if !c.stopped {
+		c.released = true
 		c.stopped = true
 		close(c.messages)
 		close(c.errs)

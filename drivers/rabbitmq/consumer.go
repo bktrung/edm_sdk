@@ -529,6 +529,34 @@ func (c *consumer) Stop(ctx context.Context) error {
 	return nil
 }
 
+func (c *consumer) Release(ctx context.Context) error {
+	c.mu.Lock()
+	if c.stopped {
+		c.mu.Unlock()
+		return nil
+	}
+	if err := ctx.Err(); err != nil {
+		c.mu.Unlock()
+		return classify("release", driver.KindTransient, err)
+	}
+	c.stopped = true
+	close(c.stoppedC)
+	c.mu.Unlock()
+
+	// Closing the AMQP channels requeues their unacked deliveries. Do this
+	// before waiting for local goroutines so a blocked forwarder can observe
+	// stoppedC rather than waiting for the application to consume an abandoned
+	// message.
+	c.closeLanes()
+	c.readers.Wait()
+	c.forward.Wait()
+	c.events.Wait()
+	c.conn.removeConsumer(c)
+	close(c.messages)
+	close(c.errors)
+	return nil
+}
+
 func (c *consumer) Lag(ctx context.Context) (map[string]int64, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, classify("lag", driver.KindTransient, err)

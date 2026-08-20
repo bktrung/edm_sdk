@@ -263,4 +263,62 @@ func runDrain(group *groupContext) {
 		})
 		group.vector.Add(BehaviorEvent{ID: "drain-messages-closed", Outcome: "closed", FinalDestination: "drain.messages-closed"})
 	})
+
+	group.Check("release redelivers outstanding work", func(t *testing.T) {
+		producer := newProducer(t, group, "drain.release", driver.ProducerConfig{Effective: group.effective})
+		consumer := newConsumer(t, group, "drain.release", 1)
+		if err := producer.Publish(group.ctx, driver.OutboundMessage{Destination: "drain.release", Body: []byte("release")}); err != nil {
+			t.Fatal(err)
+		}
+		message := receiveMessage(t, group, consumer)
+		if err := consumer.Release(group.ctx); err != nil {
+			t.Fatalf("Release() error = %v", err)
+		}
+		receiver := newConsumer(t, group, "drain.release", 1)
+		redelivered := receiveMessage(t, group, receiver)
+		if string(redelivered.Body) != string(message.Body) {
+			t.Fatalf("redelivered body = %q, want %q", redelivered.Body, message.Body)
+		}
+		ackMessage(t, group, redelivered)
+		group.vector.Add(BehaviorEvent{ID: "drain-release-redelivery", Outcome: "redelivered", FinalDestination: "drain.release"})
+	})
+
+	group.Check("release with no outstanding work closes Messages", func(t *testing.T) {
+		_ = newProducer(t, group, "drain.release-closed", driver.ProducerConfig{Effective: group.effective})
+		consumer := newConsumer(t, group, "drain.release-closed", 1)
+		if err := consumer.Release(group.ctx); err != nil {
+			t.Fatalf("Release() error = %v", err)
+		}
+		waitFor(t, group, "Messages to close after Release", func() (bool, string) {
+			select {
+			case _, ok := <-consumer.Messages():
+				return !ok, "Messages channel remains open"
+			default:
+				return false, "Messages channel remains open"
+			}
+		})
+		group.vector.Add(BehaviorEvent{ID: "drain-release-closed", Outcome: "closed", FinalDestination: "drain.release-closed"})
+	})
+
+	group.Check("release is idempotent", func(t *testing.T) {
+		_ = newProducer(t, group, "drain.release-idempotent", driver.ProducerConfig{Effective: group.effective})
+		consumer := newConsumer(t, group, "drain.release-idempotent", 1)
+		if err := consumer.Release(group.ctx); err != nil {
+			t.Fatalf("first Release() error = %v", err)
+		}
+		if err := consumer.Release(group.ctx); err != nil {
+			t.Fatalf("second Release() error = %v", err)
+		}
+		if err := consumer.Stop(group.ctx); err != nil {
+			t.Fatalf("Stop() after Release error = %v", err)
+		}
+		stopped := newConsumer(t, group, "drain.release-idempotent", 1)
+		if err := stopped.Stop(group.ctx); err != nil {
+			t.Fatalf("Stop() error = %v", err)
+		}
+		if err := stopped.Release(group.ctx); err != nil {
+			t.Fatalf("Release() after Stop error = %v", err)
+		}
+		group.vector.Add(BehaviorEvent{ID: "drain-release-idempotent", Outcome: "ok", FinalDestination: "drain.release-idempotent"})
+	})
 }

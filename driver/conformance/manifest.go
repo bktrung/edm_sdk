@@ -19,7 +19,7 @@ var groupManifest = []manifestEntry{
 	{name: "settle", declared: 16},
 	{name: "ordering", declared: 8},
 	{name: "deferred", declared: 9},
-	{name: "drain", declared: 13},
+	{name: "drain", declared: 16},
 	{name: "rebalance", declared: 11},
 	{name: "failure", declared: 15},
 	{name: "topology", declared: 18},
