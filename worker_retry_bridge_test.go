@@ -319,8 +319,8 @@ func TestFailedSuccessorHandoffsDoNotBareRequeue(t *testing.T) {
 // possible successor is confirmed durable. When the successor publish keeps
 // failing, the original must stay completely unsettled - no ack, no nack of
 // any kind, including the requeue=false form the SDK previously used - and
-// the runner's consumer must be stopped so the broker redelivers the
-// still-unacked delivery once the channel closes.
+// the runner's consumer must be closed so the broker redelivers the
+// still-unacked delivery.
 func TestFailedSuccessorHandoffLeavesOriginalUnsettled(t *testing.T) {
 	cases := []struct {
 		name    string

@@ -1224,9 +1224,9 @@ func eventFromDelivery(r *Runner, message driver.InboundMessage, envelope Envelo
 // be published within its bounded republish budget. The consume-side
 // ordering invariant only allows releasing the original delivery once every
 // possible successor is confirmed durable, so this never settles the
-// delivery: it stops the runner's consumer instead, and the broker
-// redelivers the still-unacked message once the channel closes, the same
-// mechanism relied on for a crash.
+// delivery: it releases the runner's consumer instead. Release leaves the
+// delivery unsettled, closes the consumer, and lets the broker redeliver the
+// message, the same mechanism relied on for a crash.
 func failSuccessorHandoff(r *Runner, ctx context.Context, op string, event *Event, cause error) {
 	kind, _ := driver.Classify(cause)
 	classified := &driver.Error{Driver: r.client.options.driver.Name(), Op: op, K: kind, Err: cause}
