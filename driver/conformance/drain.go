@@ -218,6 +218,18 @@ func runDrain(group *groupContext) {
 		group.vector.Add(BehaviorEvent{ID: "drain-idempotent", Outcome: "ok", FinalDestination: "drain.idempotent"})
 	})
 
+	group.Check("stop is idempotent", func(t *testing.T) {
+		_ = newProducer(t, group, "drain.stop-idempotent", driver.ProducerConfig{Effective: group.effective})
+		consumer := newConsumer(t, group, "drain.stop-idempotent", 1)
+		if err := consumer.Stop(group.ctx); err != nil {
+			t.Fatalf("first Stop() error = %v", err)
+		}
+		if err := consumer.Stop(group.ctx); err != nil {
+			t.Fatalf("second Stop() error = %v", err)
+		}
+		group.vector.Add(BehaviorEvent{ID: "drain-stop-idempotent", Outcome: "ok", FinalDestination: "drain.stop-idempotent"})
+	})
+
 	group.Check("stop completes a settled drain cycle", func(t *testing.T) {
 		producer := newProducer(t, group, "drain.stop", driver.ProducerConfig{Effective: group.effective})
 		consumer := newConsumer(t, group, "drain.stop", 1)

@@ -699,6 +699,61 @@ func runTopologyPolicyChecks(group *groupContext) {
 		group.vector.Add(BehaviorEvent{ID: "topology-verify-missing", Outcome: "not-found", FinalDestination: "topology.verify.missing"})
 	})
 
+	group.Check("FanoutAtConsume ignores bindings", func(t *testing.T) {
+		effective := group.effective
+		effective.Fanout = driver.FanoutAtConsume
+		prefix := "topology.consume-fanout." + group.profile.String()
+		first := prefix + ".first"
+		second := prefix + ".second"
+		diff, err := group.conn.Admin().EnsureTopology(group.ctx, driver.TopologySpec{
+			Destinations: []driver.DestinationSpec{{Name: first}, {Name: second}},
+			Bindings:     []driver.BindingSpec{{Source: prefix + ".exchange", Destination: first}},
+			Effective:    effective,
+		})
+		if err != nil {
+			t.Fatalf("FanoutAtConsume EnsureTopology: %v", err)
+		}
+		t.Cleanup(func() {
+			for _, name := range []string{first, second} {
+				if _, err := group.conn.Admin().Purge(group.ctx, name); err != nil {
+					t.Errorf("purge FanoutAtConsume destination %q: %v", name, err)
+				}
+			}
+		})
+		if !containsName(diff.CreatedDestinations, first) || !containsName(diff.CreatedDestinations, second) {
+			t.Fatalf("FanoutAtConsume CreatedDestinations=%v, want %q and %q", diff.CreatedDestinations, first, second)
+		}
+		producer, err := group.conn.Producer(group.ctx, driver.ProducerConfig{Effective: effective})
+		if err != nil {
+			t.Fatalf("FanoutAtConsume producer: %v", err)
+		}
+		t.Cleanup(func() {
+			if err := producer.Close(group.ctx); err != nil {
+				t.Errorf("close FanoutAtConsume producer: %v", err)
+			}
+		})
+		consumer, err := group.conn.Consumer(group.ctx, driver.ConsumerConfig{
+			Destinations: []string{first}, Prefetch: 1, Effective: effective,
+		})
+		if err != nil {
+			t.Fatalf("FanoutAtConsume consumer: %v", err)
+		}
+		t.Cleanup(func() {
+			if err := consumer.Stop(group.ctx); err != nil {
+				t.Errorf("stop FanoutAtConsume consumer: %v", err)
+			}
+		})
+		if err := producer.Publish(group.ctx, driver.OutboundMessage{Destination: first, Body: []byte("consume-fanout")}); err != nil {
+			t.Fatalf("FanoutAtConsume publish: %v", err)
+		}
+		message := receiveMessage(t, group, consumer)
+		if string(message.Body) != "consume-fanout" {
+			t.Fatalf("FanoutAtConsume body=%q, want consume-fanout", message.Body)
+		}
+		ackMessage(t, group, message)
+		group.vector.Add(BehaviorEvent{ID: "topology-fanout-consume", Outcome: "ignored", FinalDestination: "topology.consume-fanout"})
+	})
+
 	group.Check("TopologyNone leaves missing topology untouched", func(t *testing.T) {
 		admin := group.conn.Admin()
 		name := "topology.none." + group.profile.String()
@@ -710,7 +765,7 @@ func runTopologyPolicyChecks(group *groupContext) {
 		if err != nil {
 			t.Fatalf("TopologyNone: %v", err)
 		}
-		if len(diff.CreatedDestinations) != 0 || len(diff.ExistingExchanges) != 0 || len(diff.ExistingDestinations) != 0 || len(diff.ExistingBindings) != 0 || len(diff.Orphaned) != 0 {
+		if len(diff.CreatedExchanges) != 0 || len(diff.CreatedDestinations) != 0 || len(diff.CreatedBindings) != 0 || len(diff.ExistingExchanges) != 0 || len(diff.ExistingDestinations) != 0 || len(diff.ExistingBindings) != 0 || len(diff.Orphaned) != 0 {
 			t.Fatalf("TopologyNone diff = %+v, want empty", diff)
 		}
 		producer, err := group.conn.Producer(group.ctx, driver.ProducerConfig{Effective: group.effective})

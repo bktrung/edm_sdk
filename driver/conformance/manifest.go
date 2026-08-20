@@ -19,11 +19,11 @@ var groupManifest = []manifestEntry{
 	{name: "settle", declared: 16},
 	{name: "ordering", declared: 8},
 	{name: "deferred", declared: 9},
-	{name: "drain", declared: 12},
+	{name: "drain", declared: 13},
 	{name: "rebalance", declared: 11},
 	{name: "failure", declared: 15},
-	{name: "topology", declared: 17},
-	{name: "capability", declared: 26},
+	{name: "topology", declared: 18},
+	{name: "capability", declared: 27},
 	{name: "lag", declared: 5},
 }
 
@@ -31,19 +31,20 @@ var groupManifest = []manifestEntry{
 var pendingGroups []string
 
 type groupContext struct {
-	t          *testing.T
-	ctx        context.Context
-	conn       driver.Conn
-	inspect    Inspect
-	profile    Profile
-	effective  driver.Capabilities
-	vector     BehaviorVector
-	checks     int
-	checkNames map[string]struct{}
-	skips      map[string]string
-	inject     FaultInjector
-	deadline   DeadlineFixture
-	report     *Report
+	t                   *testing.T
+	ctx                 context.Context
+	conn                driver.Conn
+	inspect             Inspect
+	profile             Profile
+	effective           driver.Capabilities
+	factoryCapabilities driver.Capabilities
+	vector              BehaviorVector
+	checks              int
+	checkNames          map[string]struct{}
+	skips               map[string]string
+	inject              FaultInjector
+	deadline            DeadlineFixture
+	report              *Report
 }
 
 func (g *groupContext) capability(capability, declared, status, evidence string) {

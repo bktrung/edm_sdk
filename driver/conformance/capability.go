@@ -15,6 +15,28 @@ func init() { registerGroup("capability", runCapability) }
 
 func runCapability(group *groupContext) {
 	capabilityDeclarationChecks(group)
+	group.Check("connection capabilities do not widen factory capabilities", func(t *testing.T) {
+		factory := group.factoryCapabilities
+		connection := group.conn.Capabilities()
+		if !factory.PerMessageAck && connection.PerMessageAck {
+			t.Fatalf("PerMessageAck widened from false to true")
+		}
+		if !factory.OrderedByKey && connection.OrderedByKey {
+			t.Fatalf("OrderedByKey widened from false to true")
+		}
+		if !factory.NativeDelay && connection.NativeDelay {
+			t.Fatalf("NativeDelay widened from false to true")
+		}
+		if !factory.NativeDeliveryCount && connection.NativeDeliveryCount {
+			t.Fatalf("NativeDeliveryCount widened from false to true")
+		}
+		if !factory.NativeDLQ && connection.NativeDLQ {
+			t.Fatalf("NativeDLQ widened from false to true")
+		}
+		if !factory.LagQueryable && connection.LagQueryable {
+			t.Fatalf("LagQueryable widened from false to true")
+		}
+	})
 
 	group.Check("per-message settlement leaves sibling deliveries unsettled", func(t *testing.T) {
 		name := "capability.ack.independent"
