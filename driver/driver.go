@@ -182,10 +182,6 @@ type SASLConfig struct {
 type ProducerConfig struct {
 	// RequireDurableAck must be honored. The core always sets it true in v1.
 	RequireDurableAck bool
-	MaxInFlight       int           // maximum buffered messages
-	Compression       string        // "none" | "snappy" | "lz4" | "zstd"
-	BatchLinger       time.Duration // maximum batch wait
-	PublishTimeout    time.Duration // per-publish deadline
 
 	// Effective is the capability set selected by the core.
 	Effective Capabilities
