@@ -94,3 +94,18 @@ func TestSampledGaugeSetObservationDoesNotAllocate(t *testing.T) {
 		t.Fatalf("gauge set observation allocations = %v, want 0", allocs)
 	}
 }
+
+func TestSampledCounterLoadDoesNotReset(t *testing.T) {
+	var counter SampledCounter
+	counter.Add(3)
+	if got := counter.Load(); got != 3 {
+		t.Fatalf("Load() = %d, want 3", got)
+	}
+	counter.Add(2)
+	if got := counter.Load(); got != 5 {
+		t.Fatalf("Load() after Add = %d, want 5", got)
+	}
+	if got := counter.Sample(); got != 5 {
+		t.Fatalf("Sample() = %d, want 5", got)
+	}
+}

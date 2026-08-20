@@ -113,7 +113,7 @@ func (m *deliveryMetrics) recordRetryAfterClamped(eventType string) {
 func (m *deliveryMetrics) sampleRetryAfterClamped() map[string]uint64 {
 	values := make(map[string]uint64, len(m.topics))
 	for index, topic := range m.topics {
-		if value := m.retryAfterClamped[index].Sample(); value > 0 {
+		if value := m.retryAfterClamped[index].Load(); value > 0 {
 			values[topic] = value
 		}
 	}
