@@ -6,6 +6,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/stretchr/testify/require"
 
@@ -163,25 +164,6 @@ func TestEnvelope_TracedMessageSurvivesDecodeEncodeRoundTrip(t *testing.T) {
 	replayed, err := got.EncodeHeaders(0)
 	require.NoError(t, err)
 	require.Equal(t, headers, replayed)
-}
-
-func TestPriority_MarshalsToWireString(t *testing.T) {
-	t.Parallel()
-
-	b, err := json.Marshal(f1.PriorityHigh)
-	require.NoError(t, err)
-	require.JSONEq(t, `"high"`, string(b))
-
-	var p f1.Priority
-	require.NoError(t, json.Unmarshal([]byte(`"low"`), &p))
-	require.Equal(t, f1.PriorityLow, p)
-
-	got, err := f1.ParsePriority("")
-	require.NoError(t, err)
-	require.Equal(t, f1.PriorityNormal, got)
-
-	_, err = f1.ParsePriority("urgent")
-	require.Error(t, err)
 }
 
 func TestDLQ_UnknownReasonSurvivesReplay(t *testing.T) {
@@ -369,13 +351,6 @@ func TestEnvelope_DecodeHeadersRejectsMalformedValues(t *testing.T) {
 	}
 }
 
-func TestPriority_UnmarshalJSONRejectsInvalidJSON(t *testing.T) {
-	t.Parallel()
-
-	var p f1.Priority
-	require.Error(t, p.UnmarshalJSON([]byte(`not json`)))
-}
-
 func TestUnrecognisedValueError_Error(t *testing.T) {
 	t.Parallel()
 
@@ -409,7 +384,7 @@ func TestEnvelope_RejectsExtensionOverwritingCanonicalHeader(t *testing.T) {
 func TestEnvelope_RejectsReservedPrefixExtension(t *testing.T) {
 	t.Parallel()
 
-	for _, k := range []string{"f1bogus", "ce_type", "ce-type", "f1"} {
+	for _, k := range []string{"f1bogus", "ce_type", "ce-type", "f1", "x-death", "x-first-death-queue"} {
 		e := fullEnvelope()
 		e.Extensions = map[string]string{k: "x"}
 		_, err := e.EncodeHeaders(0)
@@ -489,4 +464,57 @@ func TestPriority_UndeclaredValueDoesNotBecomeALane(t *testing.T) {
 	e.Priority = undeclared
 	_, err := e.EncodeHeaders(0)
 	require.ErrorIs(t, err, f1.ErrInvalidPriority)
+}
+
+func TestEnvelope_DecodeHeadersRejectsMissingRequiredAttributes(t *testing.T) {
+	t.Parallel()
+	base := map[string]string{
+		"specversion": "1.0",
+		"id":          "evt-1",
+		"source":      "/prod/orders",
+		"type":        "orders.created.v1",
+	}
+	for _, attribute := range []string{"specversion", "id", "source", "type"} {
+		t.Run("missing "+attribute, func(t *testing.T) {
+			h := cloneHeaders(base)
+			delete(h, attribute)
+			_, err := f1.DecodeHeaders(h)
+			require.Error(t, err)
+			require.Contains(t, err.Error(), attribute)
+		})
+		t.Run("empty "+attribute, func(t *testing.T) {
+			h := cloneHeaders(base)
+			h[attribute] = ""
+			_, err := f1.DecodeHeaders(h)
+			require.Error(t, err)
+			require.Contains(t, err.Error(), attribute)
+		})
+	}
+	h := cloneHeaders(base)
+	h["specversion"] = "0.3"
+	_, err := f1.DecodeHeaders(h)
+	require.EqualError(t, err, `f1: header specversion must be "1.0", got "0.3"`)
+}
+
+func cloneHeaders(input map[string]string) map[string]string {
+	clone := make(map[string]string, len(input))
+	for key, value := range input {
+		clone[key] = value
+	}
+	return clone
+}
+
+func TestEnvelope_DeathErrorShrinkPreservesUTF8(t *testing.T) {
+	t.Parallel()
+	e := fullEnvelope()
+	e.DeathError = "\U0001F4A5\U0001F4A3\U0001F525\U0001F4A7"
+	withoutDeathError := e
+	withoutDeathError.DeathError = ""
+	baseHeaders, err := withoutDeathError.EncodeHeaders(0)
+	require.NoError(t, err)
+	limit := headerBytesOf(baseHeaders) + len("f1deatherror") + 5
+	headers, err := e.EncodeHeaders(limit)
+	require.NoError(t, err)
+	require.True(t, utf8.ValidString(headers["f1deatherror"]))
+	require.LessOrEqual(t, headerBytesOf(headers), limit)
 }

@@ -546,3 +546,44 @@ func TestRunnerAccountingAxesSumAfterMixedOutcomes(t *testing.T) {
 		t.Fatalf("read-only accounting = %#v, registry dispositions = %#v", got, disposition)
 	}
 }
+
+func TestMalformedHeadersDeadLetterAsDecodeBeforeHandlerRuns(t *testing.T) {
+	producer := &dispatchProducer{}
+	client, err := New(context.Background(), testClientConfig(t), WithDriver(&dispatchDriver{conn: &dispatchConn{producer: producer}}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = client.Close(context.Background()) }()
+	handled := false
+	runner := &Runner{client: client, subscription: Subscription{
+		Name:           "orders",
+		HandlerTimeout: time.Second,
+		Handlers: map[string]Handler{"orders.created": HandlerFunc(func(context.Context, *Event) error {
+			handled = true
+			return nil
+		})},
+	}}
+	settler := &dispatchSettler{}
+	message := driver.InboundMessage{
+		Destination: "f1.test.orders.created.normal",
+		Headers: headerSlice(map[string]string{
+			"specversion": "1.0",
+			"source":      "/test/orders",
+			"type":        "orders.created",
+		}),
+		Body:   []byte(`{"id":"evt-1"}`),
+		Settle: settler,
+	}
+	if !dispatchMessage(runner, context.Background(), message, &Envelope{}, new(bool)) {
+		t.Fatal("malformed message was not settled")
+	}
+	if handled {
+		t.Fatal("handler ran for a malformed envelope")
+	}
+	if !settler.acked {
+		t.Fatal("malformed message was not acked after DLQ publish")
+	}
+	if len(producer.messages) != 1 || headerValue(producer.messages[0].Headers, "f1deathreason") != ReasonDecode.String() {
+		t.Fatalf("DLQ messages = %#v, want one decode message", producer.messages)
+	}
+}

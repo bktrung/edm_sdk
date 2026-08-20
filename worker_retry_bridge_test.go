@@ -372,3 +372,40 @@ func TestFailedSuccessorHandoffLeavesOriginalUnsettled(t *testing.T) {
 		})
 	}
 }
+
+func TestRetryAfterClampMetricIsCumulative(t *testing.T) {
+	metrics := newDeliveryMetrics([]string{"orders.retry.created", "payments.retry.created"})
+	metrics.recordRetryAfterClamped("orders.retry.created.v1")
+	values := metrics.sampleRetryAfterClamped()
+	if got := values["orders.retry.created"]; got != 1 {
+		t.Fatalf("first clamp sample = %d, want 1", got)
+	}
+	if _, ok := values["payments.retry.created"]; ok {
+		t.Fatal("never-clamped topic must remain absent from the metric source")
+	}
+	metrics.recordRetryAfterClamped("orders.retry.created.v1")
+	if got := metrics.sampleRetryAfterClamped()["orders.retry.created"]; got != 2 {
+		t.Fatalf("second clamp sample = %d, want cumulative 2", got)
+	}
+	if got := metrics.sampleRetryAfterClamped()["orders.retry.created"]; got != 2 {
+		t.Fatalf("third clamp sample = %d, want unchanged cumulative 2", got)
+	}
+}
+
+func TestDeliveryLaneMalformedHeadersUsesDefaultLane(t *testing.T) {
+	client, runner := newRetryBridgeRunner(t, &dispatchProducer{}, "orders.created")
+	defer func() { _ = client.Close(context.Background()) }()
+	message := driver.InboundMessage{
+		Destination: consumeDestination(runner.client.effective, runner.client.source, "orders.created", PriorityLow, runner.subscription.Name),
+		Headers: headerSlice(map[string]string{
+			"specversion": "1.0",
+			"source":      "/test/orders",
+			"type":        "orders.created.v1",
+			"f1priority":  "low",
+		}),
+	}
+	want := schedulerLaneID("orders.created", runner.subscription.Priorities[0], 0)
+	if got := deliveryLane(runner, message); got != want {
+		t.Fatalf("delivery lane = %q, want malformed-header fallback %q", got, want)
+	}
+}
