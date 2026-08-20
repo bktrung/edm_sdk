@@ -150,9 +150,8 @@ func (c *Client) ensurePublisherTopology(ctx context.Context) error {
 }
 
 // Publisher returns a publisher using this client's connected driver and
-// configured codec. Publisher options are reserved for future per-publisher
-// controls and currently have no effect.
-func (c *Client) Publisher(_ ...PublisherOption) *Publisher {
+// configured codec.
+func (c *Client) Publisher() *Publisher {
 	return &Publisher{client: c}
 }
 

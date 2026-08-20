@@ -30,10 +30,6 @@ const (
 	TopologyNone = driver.TopologyNone
 )
 
-// PublisherOption configures a Publisher. No per-publisher controls are
-// defined in this version; the type reserves the API extension point.
-type PublisherOption struct{}
-
 type clientOptions struct {
 	driver            driver.Driver
 	codec             codec.Codec
