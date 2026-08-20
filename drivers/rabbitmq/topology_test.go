@@ -47,6 +47,7 @@ func TestEnsureTopologyDeclaresFanoutAndBinding(t *testing.T) {
 		Destinations: []driver.DestinationSpec{{Name: queue, Durable: true}},
 		Bindings:     []driver.BindingSpec{{Source: exchange, Destination: queue}},
 	}
+	wantBinding := driver.BindingSpec{Source: exchange, Destination: queue}
 	first, err := conn.Admin().EnsureTopology(ctx, spec)
 	if err != nil {
 		t.Fatalf("first EnsureTopology: %v", err)
@@ -57,19 +58,19 @@ func TestEnsureTopologyDeclaresFanoutAndBinding(t *testing.T) {
 	if !containsString(first.CreatedDestinations, queue) {
 		t.Fatalf("first CreatedDestinations = %v, want %q", first.CreatedDestinations, queue)
 	}
-	if !containsString(first.CreatedBindings, queue) {
-		t.Fatalf("first CreatedBindings = %v, want %q", first.CreatedBindings, queue)
+	if !containsBinding(first.CreatedBindings, wantBinding) {
+		t.Fatalf("first CreatedBindings = %v, want binding %q -> %q", first.CreatedBindings, exchange, queue)
 	}
 
 	second, err := conn.Admin().EnsureTopology(ctx, spec)
 	if err != nil {
 		t.Fatalf("second EnsureTopology: %v", err)
 	}
-	if containsString(second.CreatedExchanges, exchange) || containsString(second.CreatedDestinations, queue) || containsString(second.CreatedBindings, queue) {
+	if containsString(second.CreatedExchanges, exchange) || containsString(second.CreatedDestinations, queue) || containsBinding(second.CreatedBindings, wantBinding) {
 		t.Fatalf("second diff reports creation: %#v", second)
 	}
-	if !containsString(second.Existing, exchange) || !containsString(second.Existing, queue) || !containsString(second.Existing, queue) {
-		t.Fatalf("second Existing = %v, want exchange, queue, and binding", second.Existing)
+	if !containsString(second.ExistingExchanges, exchange) || !containsString(second.ExistingDestinations, queue) || !containsBinding(second.ExistingBindings, wantBinding) {
+		t.Fatalf("second topology diff = %#v, want exchange, queue, and binding", second)
 	}
 
 	deliveries, err := rawChannel.Consume(queue, "topology-test", false, false, false, false, nil)
@@ -127,6 +128,7 @@ func TestVerifyTopologyReportsDeletedBinding(t *testing.T) {
 		Destinations: []driver.DestinationSpec{{Name: queue, Durable: true}},
 		Bindings:     []driver.BindingSpec{{Source: exchange, Destination: queue}},
 	}
+	wantBinding := driver.BindingSpec{Source: exchange, Destination: queue}
 	if _, err := conn.Admin().EnsureTopology(ctx, spec); err != nil {
 		t.Fatalf("EnsureTopology: %v", err)
 	}
@@ -149,8 +151,8 @@ func TestVerifyTopologyReportsDeletedBinding(t *testing.T) {
 	if err != nil {
 		t.Fatalf("EnsureTopology after binding deletion: %v", err)
 	}
-	if !containsString(repaired.CreatedBindings, queue) {
-		t.Fatalf("EnsureTopology after binding deletion CreatedBindings = %v, want %q", repaired.CreatedBindings, queue)
+	if !containsBinding(repaired.CreatedBindings, wantBinding) {
+		t.Fatalf("EnsureTopology after binding deletion CreatedBindings = %v, want binding %q -> %q", repaired.CreatedBindings, exchange, queue)
 	}
 }
 
@@ -462,6 +464,15 @@ func TestEnsureTopologyParkQueueArgumentsClassicKind(t *testing.T) {
 }
 
 func containsString(values []string, want string) bool {
+	for _, value := range values {
+		if value == want {
+			return true
+		}
+	}
+	return false
+}
+
+func containsBinding(values []driver.BindingSpec, want driver.BindingSpec) bool {
 	for _, value := range values {
 		if value == want {
 			return true

@@ -37,8 +37,8 @@ func runTopology(group *groupContext) {
 		if !containsName(diff.CreatedDestinations, name) {
 			t.Fatalf("CreatedDestinations=%v, want %q", diff.CreatedDestinations, name)
 		}
-		if containsName(diff.Existing, name) {
-			t.Fatalf("Existing=%v, want %q absent on first creation", diff.Existing, name)
+		if containsName(diff.ExistingDestinations, name) {
+			t.Fatalf("ExistingDestinations=%v, want %q absent on first creation", diff.ExistingDestinations, name)
 		}
 		cleanupTopologyDestinations(t, admin, group.ctx, name)
 		// FinalDestination is the profile-independent label: the two profile
@@ -69,8 +69,8 @@ func runTopology(group *groupContext) {
 		if containsName(diff.CreatedDestinations, name) {
 			t.Fatalf("CreatedDestinations=%v on repeat, want %q reported existing only", diff.CreatedDestinations, name)
 		}
-		if !containsName(diff.Existing, name) {
-			t.Fatalf("Existing=%v, want %q", diff.Existing, name)
+		if !containsName(diff.ExistingDestinations, name) {
+			t.Fatalf("ExistingDestinations=%v, want %q", diff.ExistingDestinations, name)
 		}
 		// Positive control: the destination still functions after the repeat
 		// call, proving idempotency did not tear anything down.
@@ -105,8 +105,8 @@ func runTopology(group *groupContext) {
 		if err != nil {
 			t.Fatalf("EnsureTopology(mixed): %v", err)
 		}
-		if !containsName(diff.Existing, existing) {
-			t.Fatalf("Existing=%v, want %q", diff.Existing, existing)
+		if !containsName(diff.ExistingDestinations, existing) {
+			t.Fatalf("ExistingDestinations=%v, want %q", diff.ExistingDestinations, existing)
 		}
 		if !containsName(diff.CreatedDestinations, created) {
 			t.Fatalf("CreatedDestinations=%v, want %q", diff.CreatedDestinations, created)
@@ -710,7 +710,7 @@ func runTopologyPolicyChecks(group *groupContext) {
 		if err != nil {
 			t.Fatalf("TopologyNone: %v", err)
 		}
-		if len(diff.CreatedDestinations) != 0 || len(diff.Existing) != 0 || len(diff.Orphaned) != 0 {
+		if len(diff.CreatedDestinations) != 0 || len(diff.ExistingExchanges) != 0 || len(diff.ExistingDestinations) != 0 || len(diff.ExistingBindings) != 0 || len(diff.Orphaned) != 0 {
 			t.Fatalf("TopologyNone diff = %+v, want empty", diff)
 		}
 		producer, err := group.conn.Producer(group.ctx, driver.ProducerConfig{Effective: group.effective})

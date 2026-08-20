@@ -279,7 +279,7 @@ func (a runTestAdmin) EnsureTopology(_ context.Context, spec driver.TopologySpec
 	var diff driver.TopologyDiff
 	for _, destination := range spec.Destinations {
 		if _, exists := a.conn.queues[destination.Name]; exists {
-			diff.Existing = append(diff.Existing, destination.Name)
+			diff.ExistingDestinations = append(diff.ExistingDestinations, destination.Name)
 			continue
 		}
 		a.conn.queues[destination.Name] = nil
