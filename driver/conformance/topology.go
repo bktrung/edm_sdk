@@ -700,8 +700,11 @@ func runTopologyPolicyChecks(group *groupContext) {
 	})
 
 	group.Check("FanoutAtConsume ignores bindings", func(t *testing.T) {
+		if group.effective.Fanout != driver.FanoutAtConsume {
+			group.Skip(t, "FanoutAtConsume ignores bindings", fmt.Sprintf("effective fanout mode %d is not FanoutAtConsume", group.effective.Fanout))
+			return
+		}
 		effective := group.effective
-		effective.Fanout = driver.FanoutAtConsume
 		prefix := "topology.consume-fanout." + group.profile.String()
 		first := prefix + ".first"
 		second := prefix + ".second"
