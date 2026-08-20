@@ -24,7 +24,6 @@ type Config struct {
 	Topology      TopologyConfig                `yaml:"topology"`
 	Codec         CodecConfig                   `yaml:"codec"`
 	Lifecycle     LifecycleConfig               `yaml:"lifecycle"`
-	Observability ObservabilityConfig           `yaml:"observability"`
 	Subscriptions map[string]SubscriptionConfig `yaml:"subscriptions"`
 }
 
@@ -57,36 +56,6 @@ type LifecycleConfig struct {
 	FlushTimeout          time.Duration `yaml:"flushTimeout"`
 	CloseTimeout          time.Duration `yaml:"closeTimeout"`
 	RebalanceDrainTimeout time.Duration `yaml:"rebalanceDrainTimeout"`
-}
-
-// ObservabilityConfig configures the client logs, metrics, and tracing.
-type ObservabilityConfig struct {
-	LogLevel    string            `yaml:"logLevel"`
-	LogFormat   string            `yaml:"logFormat"`
-	LogSampling LogSamplingConfig `yaml:"logSampling"`
-	Metrics     MetricsConfig     `yaml:"metrics"`
-	Tracing     TracingConfig     `yaml:"tracing"`
-}
-
-// LogSamplingConfig bounds the log volume emitted during a failure storm.
-type LogSamplingConfig struct {
-	Enabled    bool `yaml:"enabled"`
-	Burst      int  `yaml:"burst"`
-	Thereafter int  `yaml:"thereafter"`
-}
-
-// MetricsConfig configures whether the client emits metrics and their schema mode.
-type MetricsConfig struct {
-	Enabled      bool   `yaml:"enabled"`
-	SemconvOptIn string `yaml:"semconvOptIn"`
-}
-
-// TracingConfig configures whether the client emits traces and their sampling.
-type TracingConfig struct {
-	Enabled              bool    `yaml:"enabled"`
-	SampleRatio          float64 `yaml:"sampleRatio"`
-	AlwaysSampleRetries  bool    `yaml:"alwaysSampleRetries"`
-	AlwaysSampleFailures bool    `yaml:"alwaysSampleFailures"`
 }
 
 // Mode selects whether a Subscription preserves per-key delivery order.
@@ -192,7 +161,6 @@ func defaultConfig() Config {
 		Topology:      TopologyConfig{VerifyOnStart: true, PartitionsDefault: 12, RetentionDefault: 7 * 24 * time.Hour, DLQRetention: 30 * 24 * time.Hour, Priorities: []Priority{PriorityHigh, PriorityNormal, PriorityLow}},
 		Codec:         CodecConfig{Default: "json", ContentMode: "binary", MaxHeaderBytes: CoreMaxHeaderBytes, MaxBodyBytes: 1024 * 1024},
 		Lifecycle:     LifecycleConfig{PreStopDelay: 5 * time.Second, DrainTimeout: time.Minute, HandlerGrace: 5 * time.Second, FlushTimeout: 20 * time.Second, CloseTimeout: 10 * time.Second, RebalanceDrainTimeout: 25 * time.Second},
-		Observability: ObservabilityConfig{LogLevel: "info", LogFormat: "json", LogSampling: LogSamplingConfig{Enabled: true, Burst: 10, Thereafter: 100}, Metrics: MetricsConfig{Enabled: true}, Tracing: TracingConfig{Enabled: true, SampleRatio: 0.01, AlwaysSampleRetries: true, AlwaysSampleFailures: true}},
 		Subscriptions: map[string]SubscriptionConfig{},
 	}
 }
@@ -392,7 +360,6 @@ type rawF1 struct {
 	Topology      rawTopology                `yaml:"topology"`
 	Codec         CodecConfig                `yaml:"codec"`
 	Lifecycle     LifecycleConfig            `yaml:"lifecycle"`
-	Observability ObservabilityConfig        `yaml:"observability"`
 	Subscriptions map[string]rawSubscription `yaml:"subscriptions"`
 }
 
@@ -409,7 +376,7 @@ func rawFromConfig(cfg Config) *rawF1 {
 		Env: cfg.Env, Service: cfg.Service, InstanceID: cfg.InstanceID,
 		Broker:   rawBroker(cfg.Broker),
 		Topology: rawTopology{AutoCreate: cfg.Topology.AutoCreate, VerifyOnStart: cfg.Topology.VerifyOnStart, PartitionsDefault: cfg.Topology.PartitionsDefault, RetentionDefault: cfg.Topology.RetentionDefault, DLQRetention: cfg.Topology.DLQRetention, Priorities: topologyPriorities},
-		Codec:    cfg.Codec, Lifecycle: cfg.Lifecycle, Observability: cfg.Observability, Subscriptions: subscriptions,
+		Codec:    cfg.Codec, Lifecycle: cfg.Lifecycle, Subscriptions: subscriptions,
 	}
 }
 
@@ -417,7 +384,7 @@ func (y rawF1) config() (Config, error) {
 	cfg := Config{
 		Env: y.Env, Service: y.Service, InstanceID: y.InstanceID,
 		Broker: y.Broker.config(), Topology: y.Topology.config(), Codec: y.Codec,
-		Lifecycle: y.Lifecycle, Observability: y.Observability,
+		Lifecycle:     y.Lifecycle,
 		Subscriptions: map[string]SubscriptionConfig{},
 	}
 	if y.Subscriptions != nil {

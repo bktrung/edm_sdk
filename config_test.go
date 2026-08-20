@@ -29,6 +29,27 @@ f1:
 	}
 }
 
+// TestLoadConfigObservabilityBlockIsStartupError documents that the removed
+// observability configuration tree is a strict-decode unknown key, not a
+// silently ignored one: an old YAML file that still carries an
+// "observability:" block now fails LoadConfig instead of round-tripping.
+func TestLoadConfigObservabilityBlockIsStartupError(t *testing.T) {
+	t.Parallel()
+	path := writeConfig(t, `
+f1:
+  env: test
+  service: orders
+  broker:
+    driver: inmem
+  observability:
+    logLevel: info
+`)
+	_, err := LoadConfig(path)
+	if err == nil || !strings.Contains(err.Error(), "observability") {
+		t.Fatalf("LoadConfig() error = %v, want observability unknown-key error", err)
+	}
+}
+
 func TestLoadConfigRejectsUnsupportedKnownValue(t *testing.T) {
 	t.Parallel()
 	path := writeConfig(t, `
@@ -136,7 +157,7 @@ func TestLoadConfigAppliesNestedDefaults(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !cfg.Topology.VerifyOnStart || cfg.Codec.MaxBodyBytes != 1024*1024 || !cfg.Observability.Metrics.Enabled {
+	if !cfg.Topology.VerifyOnStart || cfg.Codec.MaxBodyBytes != 1024*1024 {
 		t.Fatalf("defaults = %#v", cfg)
 	}
 }
