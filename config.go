@@ -229,9 +229,15 @@ func validateConfig(cfg Config) error {
 	if err := validateLifecycleConfig(cfg.Lifecycle); err != nil {
 		return err
 	}
+	if err := validatePriorityList("topology.priorities", cfg.Topology.Priorities); err != nil {
+		return err
+	}
 	for name, subscription := range cfg.Subscriptions {
 		if len(subscription.Topics) == 0 {
 			return fmt.Errorf("f1: subscriptions.%s.topics must not be empty", name)
+		}
+		if err := validatePriorityList("subscriptions."+name+".priorities", subscription.Priorities); err != nil {
+			return err
 		}
 		if subscription.Concurrency < 1 || subscription.Concurrency > 1024 {
 			return fmt.Errorf("f1: subscriptions.%s.concurrency must be between 1 and 1024", name)
@@ -273,6 +279,23 @@ func validateConfig(cfg Config) error {
 				return fmt.Errorf("f1: broker.rabbitmq.consumerTimeout must be at least subscriptions.%s.handlerTimeout x 3", name)
 			}
 		}
+	}
+	return nil
+}
+
+func validatePriorityList(path string, priorities []Priority) error {
+	if len(priorities) == 0 {
+		return fmt.Errorf("f1: %s must not be empty", path)
+	}
+	seen := make(map[Priority]struct{}, len(priorities))
+	for _, priority := range priorities {
+		if !priority.Valid() {
+			return fmt.Errorf("f1: %s contains invalid priority %d", path, priority)
+		}
+		if _, ok := seen[priority]; ok {
+			return fmt.Errorf("f1: %s contains duplicate priority %s", path, priority.String())
+		}
+		seen[priority] = struct{}{}
 	}
 	return nil
 }

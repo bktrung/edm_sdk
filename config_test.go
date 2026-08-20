@@ -454,3 +454,36 @@ func writeConfig(t *testing.T, content string) string {
 	}
 	return path
 }
+
+func TestValidateConfigRejectsInvalidPriorityLists(t *testing.T) {
+	tests := []struct {
+		name string
+		set  func(*Config)
+		want string
+	}{
+		{name: "empty topology", set: func(cfg *Config) { cfg.Topology.Priorities = nil }, want: "topology.priorities"},
+		{name: "invalid topology", set: func(cfg *Config) { cfg.Topology.Priorities = []Priority{Priority(99)} }, want: "topology.priorities"},
+		{name: "duplicate topology", set: func(cfg *Config) { cfg.Topology.Priorities = []Priority{PriorityHigh, PriorityHigh} }, want: "topology.priorities"},
+		{name: "empty subscription", set: func(cfg *Config) { cfg.Subscriptions["orders"] = withPriorities(cfg.Subscriptions["orders"], nil) }, want: "subscriptions.orders.priorities"},
+		{name: "invalid subscription", set: func(cfg *Config) {
+			cfg.Subscriptions["orders"] = withPriorities(cfg.Subscriptions["orders"], []Priority{Priority(99)})
+		}, want: "subscriptions.orders.priorities"},
+		{name: "duplicate subscription", set: func(cfg *Config) {
+			cfg.Subscriptions["orders"] = withPriorities(cfg.Subscriptions["orders"], []Priority{PriorityNormal, PriorityNormal})
+		}, want: "subscriptions.orders.priorities"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			cfg := validValidationConfig()
+			test.set(&cfg)
+			if err := validateConfig(cfg); err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("validateConfig() error = %v, want %s validation", err, test.want)
+			}
+		})
+	}
+}
+
+func withPriorities(sub SubscriptionConfig, priorities []Priority) SubscriptionConfig {
+	sub.Priorities = priorities
+	return sub
+}
