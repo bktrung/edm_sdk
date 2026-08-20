@@ -260,7 +260,7 @@ func runPublish(group *groupContext) {
 				<-start
 				errs <- producer.Publish(group.ctx, driver.OutboundMessage{
 					Destination: "publish.concurrent",
-					Body:        []byte(fmt.Sprintf("message-%d", i)),
+					Body:        fmt.Appendf(nil, "message-%d", i),
 				})
 			}()
 		}

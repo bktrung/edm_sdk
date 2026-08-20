@@ -49,9 +49,9 @@ func runCapability(group *groupContext) {
 		}
 		producer := newProducer(t, group, name, driver.ProducerConfig{Effective: group.effective})
 		consumer := newConsumer(t, group, name, 3)
-		for i := 0; i < 3; i++ {
+		for i := range 3 {
 			if err := producer.Publish(group.ctx, driver.OutboundMessage{
-				Destination: name, Key: []byte("same"), Body: []byte(fmt.Sprintf("order-%d", i)),
+				Destination: name, Key: []byte("same"), Body: fmt.Appendf(nil, "order-%d", i),
 			}); err != nil {
 				t.Fatal(err)
 			}

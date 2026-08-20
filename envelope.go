@@ -2,6 +2,7 @@ package f1
 
 import (
 	"fmt"
+	"maps"
 	"strconv"
 	"strings"
 	"time"
@@ -75,9 +76,7 @@ func (e Envelope) EncodeHeaders(driverMaxBytes int) (map[string]string, error) {
 	}
 
 	h := make(map[string]string, len(e.Forwarded)+32)
-	for k, v := range e.Forwarded {
-		h[k] = v
-	}
+	maps.Copy(h, e.Forwarded)
 	h["specversion"] = e.SpecVersion
 	h["id"] = e.ID
 	h["source"] = e.Source
@@ -111,9 +110,7 @@ func (e Envelope) EncodeHeaders(driverMaxBytes int) (map[string]string, error) {
 	setOpt(h, "traceparent", e.TraceParent)
 	setOpt(h, "tracestate", e.TraceState)
 
-	for k, v := range e.Extensions {
-		h[k] = v
-	}
+	maps.Copy(h, e.Extensions)
 
 	if headerBytes(h) <= limit {
 		return h, nil
@@ -156,10 +153,7 @@ func shrinkDeathError(h map[string]string, limit int) {
 			return // There is no remaining field to shrink.
 		}
 		over := headerBytes(h) - limit
-		cut := len(v) - over
-		if cut < 0 {
-			cut = 0
-		}
+		cut := max(len(v)-over, 0)
 		h["f1deatherror"] = v[:cut]
 	}
 }

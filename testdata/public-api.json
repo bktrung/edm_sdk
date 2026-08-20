@@ -59,14 +59,11 @@
     "LifecycleConfig",
     "Limits",
     "LoadConfig",
-    "LogSamplingConfig",
     "Message",
     "MessageResult",
-    "MetricsConfig",
     "Middleware",
     "Mode",
     "New",
-    "ObservabilityConfig",
     "Option",
     "OrderedByKey",
     "ParsePriority",
@@ -83,7 +80,6 @@
     "Publisher",
     "Publisher.Publish",
     "Publisher.PublishBatch",
-    "PublisherOption",
     "ReasonDecode",
     "ReasonExpired",
     "ReasonMaxAttempts",
@@ -107,7 +103,6 @@
     "TopologyNone",
     "TopologyPolicy",
     "TopologyVerify",
-    "TracingConfig",
     "UnmatchedPolicy",
     "Unordered",
     "UnrecognisedValueError",
@@ -131,8 +126,7 @@
     "WithStrictPortability",
     "WithSubject",
     "WithTopic",
-    "WithTopology",
-    "WithTracerProvider"
+    "WithTopology"
   ],
   "documented-not-built": [
     "Translator"

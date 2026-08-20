@@ -470,7 +470,7 @@ func publishCount(t *testing.T, group *groupContext, producer driver.Producer, d
 	t.Helper()
 	messages := make([]driver.OutboundMessage, count)
 	for i := range messages {
-		messages[i] = driver.OutboundMessage{Destination: destination, Body: []byte(fmt.Sprintf("%s-%d", destination, i))}
+		messages[i] = driver.OutboundMessage{Destination: destination, Body: fmt.Appendf(nil, "%s-%d", destination, i)}
 	}
 	if err := producer.Publish(group.ctx, messages...); err != nil {
 		t.Fatalf("Publish(%q, %d messages) error = %v", destination, count, err)
