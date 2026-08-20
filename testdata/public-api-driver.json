@@ -2,6 +2,7 @@
   "package": "driver",
   "symbols": [
     "Admin",
+    "ArgumentDrift",
     "BrokerInfo",
     "BrokerInfo.Display",
     "BrokerRef",
