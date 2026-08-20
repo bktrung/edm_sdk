@@ -234,15 +234,17 @@ func (c *Client) Limits() Limits {
 	return result
 }
 
-// Close flushes and releases the driver resources. It is safe to call
-// repeatedly after a successful close; flush, producer-close, or connection
-// errors leave the Client open so the caller can retry. The connection is
-// never closed until the shared producer's own Close call has genuinely
-// returned: if that call does not return within its close timeout, Close
-// reports the failure and leaves the connection untouched, and a retried
-// Close rejoins the same pending producer close rather than starting a new
-// one. A concurrent Close call returns an error stating that shutdown is
-// already in progress.
+// Close flushes and releases the driver resources. A flush error leaves the
+// Client open so the caller can retry. If the producer Close call does not
+// return within the close timeout, the Client also stays open, the connection
+// is untouched, and a retried Close rejoins the same pending call rather than
+// starting another one. If producer Close returns an error, shutdown
+// continues: the producer has finished, the Client closes, and the error is
+// logged and returned. If connection Close fails, the Client stays open so a
+// retried Close can attempt it again. In short, Close keeps the Client open
+// while something is pending and closes it when everything has finished,
+// successfully or not. A concurrent Close call returns an error stating that
+// shutdown is already in progress.
 func (c *Client) Close(ctx context.Context) error {
 	if c == nil {
 		return nil
