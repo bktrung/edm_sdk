@@ -137,3 +137,16 @@ func TestClassify_ErrorTrees(t *testing.T) {
 	)
 	require.True(t, f1.IsTerminal(threeDeep))
 }
+
+func TestClassify_JoinedFlagsUseFirstClassifiedError(t *testing.T) {
+	t.Parallel()
+	plain := errors.New("plain")
+	if !f1.IsDropped(errors.Join(plain, f1.Drop(errors.New("drop")))) {
+		t.Fatal("IsDropped did not find a dropped classification in a joined error")
+	}
+	delay := 5 * time.Second
+	got, ok := f1.RetryDelay(errors.Join(plain, f1.RetryAfter(errors.New("retry"), delay)))
+	if !ok || got != delay {
+		t.Fatalf("RetryDelay() = %s, %t; want %s, true", got, ok, delay)
+	}
+}

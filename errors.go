@@ -69,13 +69,13 @@ func IsTerminal(err error) bool {
 	return false
 }
 
-// IsDropped reports whether the outermost classified error is dropped.
+// IsDropped reports the dropped flag on the first classified error errors.As finds in err's error tree.
 func IsDropped(err error) bool {
 	var classified *classifiedError
 	return errors.As(err, &classified) && classified.dropped
 }
 
-// RetryDelay returns an explicit retry delay from the outermost classified error.
+// RetryDelay reports the explicit delay on the first classified error errors.As finds in err's error tree.
 func RetryDelay(err error) (time.Duration, bool) {
 	var classified *classifiedError
 	if !errors.As(err, &classified) || !classified.hasDelay {
