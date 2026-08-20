@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/driver"
+	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/clock"
 )
 
 func newRetryBridgeRunner(t *testing.T, producer *dispatchProducer, topic string) (*Client, *Runner) {
@@ -370,6 +371,81 @@ func TestFailedSuccessorHandoffLeavesOriginalUnsettled(t *testing.T) {
 				t.Fatal("consumer was not stopped after the successor publish exhausted its budget")
 			}
 		})
+	}
+}
+
+func TestRunnerReleasesDeliveryAfterSuccessorPublishExhaustsBudget(t *testing.T) {
+	producer := &dispatchProducer{}
+	consumer := newDispatchConsumer()
+	consumer.releasedMessages = make(chan driver.InboundMessage, 1)
+	conn := &dispatchConn{producer: producer, consumer: consumer, admin: &dispatchAdmin{}}
+	client, err := New(context.Background(), testClientConfig(t), WithDriver(&dispatchDriver{conn: conn}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = client.Close(context.Background()) })
+
+	settler := &retryBridgeSettler{}
+	envelope := Envelope{
+		SpecVersion: "1.0",
+		ID:          "release-on-handoff-failure",
+		Source:      "/test/orders",
+		Type:        "orders.created.v1",
+		Priority:    PriorityHigh,
+		Attempt:     1,
+	}
+	message := retryBridgeMessage(t, envelope, settler)
+	consumer.open = 1
+	consumer.outstanding = []driver.InboundMessage{message}
+	consumer.messages <- message
+
+	runner, err := client.Subscribe(context.Background(), Subscription{
+		Name:       "orders",
+		Topics:     []string{"orders.created"},
+		Priorities: []Priority{PriorityHigh},
+		Retry:      RetryConfig{MaxAttempts: 3, Tiers: []time.Duration{time.Second}},
+		Handlers: map[string]Handler{
+			"orders.created.v1": HandlerFunc(func(context.Context, *Event) error {
+				return errors.New("temporary handler failure")
+			}),
+		},
+		HandlerTimeout: time.Second,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	client.producerHandle = &retryBridgeFailingProducer{}
+
+	runDone := make(chan error, 1)
+	go func() { runDone <- runner.Run(context.Background()) }()
+
+	releaseTimer := clock.NewReal().Timer(time.Second)
+	defer releaseTimer.Stop()
+	select {
+	case released := <-consumer.releasedMessages:
+		got, err := DecodeHeaders(inboundHeaders(released.Headers))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got.ID != envelope.ID {
+			t.Fatalf("released delivery ID = %q, want %q", got.ID, envelope.ID)
+		}
+	case <-releaseTimer.C:
+		t.Fatal("delivery was not released back to the broker after successor publish exhaustion")
+	}
+
+	runTimer := clock.NewReal().Timer(time.Second)
+	defer runTimer.Stop()
+	select {
+	case err := <-runDone:
+		if err == nil {
+			t.Fatal("runner stopped without reporting the successor handoff failure")
+		}
+	case <-runTimer.C:
+		t.Fatal("runner continued consuming after releasing the failed successor delivery")
+	}
+	if !consumer.stopped {
+		t.Fatal("consumer was not closed after Release")
 	}
 }
 

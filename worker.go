@@ -1232,11 +1232,11 @@ func failSuccessorHandoff(r *Runner, ctx context.Context, op string, event *Even
 	classified := &driver.Error{Driver: r.client.options.driver.Name(), Op: op, K: kind, Err: cause}
 	setRunnerError(r, classified)
 	runnerNotifyError(r, ctx, event, classified)
-	if err := stopRunnerConsumer(r, ctx); err != nil {
-		runnerLogger(r).Error("f1 failed to stop consumer after a successor publish exhausted its republish budget", "op", op, "cause", classified, "stop_error", err)
+	if err := releaseRunnerConsumer(r, ctx); err != nil {
+		runnerLogger(r).Error("f1 failed to release consumer after a successor publish exhausted its republish budget", "op", op, "cause", classified, "release_error", err)
 		return
 	}
-	runnerLogger(r).Error("f1 successor publish exhausted its republish budget; consumer stopped", "op", op, "cause", classified)
+	runnerLogger(r).Error("f1 successor publish exhausted its republish budget; consumer released", "op", op, "cause", classified)
 }
 
 // retryAndSettle republishes message to its retry destination, carrying the
@@ -1309,6 +1309,24 @@ func stopRunnerConsumer(r *Runner, ctx context.Context) error {
 		return err
 	}
 	return nil
+}
+
+func releaseRunnerConsumer(r *Runner, ctx context.Context) error {
+	r.mu.Lock()
+	consumer := r.consumer
+	r.mu.Unlock()
+	if consumer == nil {
+		return nil
+	}
+	if err := consumer.Release(ctx); err == nil {
+		return nil
+	} else if !errors.Is(err, driver.ErrUnsupported) {
+		return err
+	} else if stopErr := consumer.Stop(ctx); stopErr != nil {
+		return errors.Join(err, stopErr)
+	} else {
+		return err
+	}
 }
 
 func matchHandler(handlers map[string]Handler, eventType string) Handler {

@@ -442,13 +442,15 @@ func (s *dispatchSettler) Nack(context.Context, driver.NackOptions) error {
 }
 
 type dispatchConsumer struct {
-	mu       sync.Mutex
-	messages chan driver.InboundMessage
-	errs     chan error
-	drained  bool
-	stopped  bool
-	released bool
-	open     int
+	mu               sync.Mutex
+	messages         chan driver.InboundMessage
+	errs             chan error
+	drained          bool
+	stopped          bool
+	released         bool
+	open             int
+	outstanding      []driver.InboundMessage
+	releasedMessages chan driver.InboundMessage
 }
 
 func newDispatchConsumer() *dispatchConsumer {
@@ -485,6 +487,12 @@ func (c *dispatchConsumer) Release(context.Context) error {
 	defer c.mu.Unlock()
 	if !c.stopped {
 		c.released = true
+		if c.releasedMessages != nil {
+			for _, message := range c.outstanding {
+				c.releasedMessages <- message
+			}
+		}
+		c.outstanding = nil
 		c.open = 0
 		c.stopped = true
 		close(c.messages)
