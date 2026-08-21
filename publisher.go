@@ -330,7 +330,7 @@ func buildOutbound(ctx context.Context, options clientOptions, effective driver.
 		topicInput = publish.topic
 	}
 	topic := topicFor(topicInput)
-	if err := validatePublishTopic(options, topic, message.EventType); err != nil {
+	if err := validatePublishTopic(options, topic, topicInput); err != nil {
 		return driver.OutboundMessage{}, "", err
 	}
 	partitionKey := publish.key
@@ -408,7 +408,7 @@ func topicFor(eventType string) string {
 	return eventType[:index]
 }
 
-func validatePublishTopic(options clientOptions, topic, eventType string) error {
+func validatePublishTopic(options clientOptions, topic, topicInput string) error {
 	if !options.publishTopicsSet {
 		return nil
 	}
@@ -417,7 +417,7 @@ func validatePublishTopic(options clientOptions, topic, eventType string) error 
 			return nil
 		}
 	}
-	return fmt.Errorf("topic %q derived from event type %q was not listed in WithPublishTopics; listed topics: %v", topic, eventType, options.publishTopics)
+	return fmt.Errorf("topic %q derived from input %q was not listed in WithPublishTopics; listed topics: %v", topic, topicInput, options.publishTopics)
 }
 
 func priorityHint(priority Priority) uint8 {

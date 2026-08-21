@@ -22,6 +22,9 @@ func TestPublishTopicsOptionRejectsEmptyAndDuplicate(t *testing.T) {
 			err := option(&options)
 			require.Error(t, err)
 			require.Contains(t, err.Error(), "WithPublishTopics")
+			if name == "whitespace" {
+				require.EqualError(t, err, "f1: WithPublishTopics topic must not be empty or whitespace-only")
+			}
 		})
 	}
 

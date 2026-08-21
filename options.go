@@ -160,7 +160,7 @@ func WithPublishTopics(topics ...string) Option {
 		canonical := make([]string, 0, len(topics))
 		for _, topic := range topics {
 			if strings.TrimSpace(topic) == "" {
-				return fmt.Errorf("f1: WithPublishTopics topic must not be empty")
+				return fmt.Errorf("f1: WithPublishTopics topic must not be empty or whitespace-only")
 			}
 			logical := topicFor(topic)
 			if _, ok := seen[logical]; ok {
