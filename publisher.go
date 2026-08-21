@@ -172,7 +172,7 @@ func (p *Publisher) PublishBatch(ctx context.Context, messages []Message) (Batch
 	// is rejected immediately; it is never given the chance to slip through
 	// a later check while Close is already tearing the connection down.
 	p.client.mu.Lock()
-	if p.client.closed || p.client.closing || p.client.conn == nil {
+	if p.client.closed || p.client.shutdownStarted || p.client.conn == nil {
 		p.client.mu.Unlock()
 		return result, errors.New("f1: client is closed")
 	}

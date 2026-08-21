@@ -187,7 +187,7 @@ func (r *Runner) Run(ctx context.Context) error {
 		return err
 	}
 	r.client.mu.Lock()
-	if r.client.closed || r.client.closing || r.client.conn == nil {
+	if r.client.closed || r.client.shutdownStarted || r.client.conn == nil {
 		r.client.mu.Unlock()
 		return errors.New("f1: client is closing")
 	}

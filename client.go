@@ -25,9 +25,15 @@ type Client struct {
 	producerHandle driver.Producer
 	metrics        *obs.Metrics
 
-	mu              sync.Mutex
-	closed          bool
-	closing         bool
+	mu     sync.Mutex
+	closed bool
+	// closing tracks only a Close attempt currently executing. It is cleared
+	// on failure so a retried Close can rejoin pending work.
+	closing bool
+	// shutdownStarted is guarded by mu, set once when Close is entered, and
+	// never cleared. closed is terminal. It is separate from closing because
+	// admission must stay closed after shutdown begins while Close remains retryable.
+	shutdownStarted bool
 	activePublishes int
 	publishIdle     chan struct{}
 	runners         map[*Runner]struct{}
@@ -215,7 +221,7 @@ func (c *Client) Health(ctx context.Context) error {
 		c.mu.Unlock()
 		return fmt.Errorf("f1: client is closed")
 	}
-	if c.closing {
+	if c.shutdownStarted {
 		c.mu.Unlock()
 		return fmt.Errorf("f1: client is closing")
 	}
@@ -259,6 +265,7 @@ func (c *Client) Close(ctx context.Context) error {
 		return fmt.Errorf("f1: client is closing")
 	}
 	c.closing = true
+	c.shutdownStarted = true
 	idle := c.publishIdle
 	runners := make([]*Runner, 0, len(c.runners))
 	for runner := range c.runners {
@@ -381,7 +388,7 @@ func publishMessages(c *Client, ctx context.Context, allowClosing bool, messages
 		return nil
 	}
 	c.mu.Lock()
-	if c.closed || c.conn == nil || (!allowClosing && c.closing) {
+	if c.closed || c.conn == nil || (!allowClosing && c.shutdownStarted) {
 		c.mu.Unlock()
 		return errors.New("f1: client is closed")
 	}
