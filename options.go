@@ -7,8 +7,6 @@ import (
 	"reflect"
 	"strings"
 
-	"go.opentelemetry.io/otel/metric"
-
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/codec"
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/driver"
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/clock"
@@ -37,7 +35,6 @@ type clientOptions struct {
 	codecsByContentType map[string]codec.Codec
 	codecsByName        map[string]codec.Codec
 	logger              *slog.Logger
-	meterProvider       metric.MeterProvider
 	clock               clock.Clock
 	strictPortability   bool
 	middleware          []Middleware
@@ -93,18 +90,6 @@ func WithLogger(logger *slog.Logger) Option {
 			return fmt.Errorf("f1: WithLogger requires a non-nil logger")
 		}
 		options.logger = logger
-		return nil
-	}
-}
-
-// WithMeterProvider configures the meter provider used by the observability
-// layer.
-func WithMeterProvider(provider metric.MeterProvider) Option {
-	return func(options *clientOptions) error {
-		if isNil(provider) {
-			return fmt.Errorf("f1: WithMeterProvider requires a non-nil provider")
-		}
-		options.meterProvider = provider
 		return nil
 	}
 }

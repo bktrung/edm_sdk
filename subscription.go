@@ -104,7 +104,6 @@ type Runner struct {
 	reconnectCause        error
 	inflight              *inflightRegistry
 	retryDestinationTiers map[string]int
-	metrics               deliveryMetrics
 	lifecycle             *lifecycle.Machine
 	accounting            *lifecycle.Accounting
 	dispatchPool          *dispatch.Pool
@@ -259,16 +258,13 @@ func (c *Client) Subscribe(ctx context.Context, sub Subscription) (*Runner, erro
 	effective.HandlerTimeout = resolved.HandlerTimeout
 	effective.UnmatchedPolicy = resolved.UnmatchedPolicy
 	effective.Handlers = wrapHandlers(c.options.middleware, sub.Handlers)
-	runner := &Runner{client: c, subscription: effective, config: resolved, metrics: newDeliveryMetrics(effective.Topics)}
+	runner := &Runner{client: c, subscription: effective, config: resolved}
 	c.mu.Lock()
 	if c.closed || c.shutdownStarted || c.conn == nil {
 		c.mu.Unlock()
 		return nil, errors.New("f1: client is closing")
 	}
 	c.runners[runner] = struct{}{}
-	if c.metrics != nil {
-		runner.metrics.unregister = c.metrics.Register(effective.Name, runner.metrics.sampleAttemptDivergenceByTopic, runner.metrics.currentStuckWorkers, runner.metrics.sampleRetryAfterClamped)
-	}
 	c.mu.Unlock()
 	return runner, nil
 }

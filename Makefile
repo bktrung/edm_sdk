@@ -15,7 +15,7 @@ API_DIFF_BASELINE_DIR := $(CURDIR)/testdata/api-diff
 API_DIFF_BREAKING_CHANGE ?= 0
 API_DIFF_ENFORCE ?= 0
 
-.PHONY: build test-fast test test-chaos kpi lint verify-agnostic verify-self-contained check-cardinality swap-report check-fixture check-api-surface check-api-surface-codec check-api-surface-driver check-api-surface-f1test check-api-diff record-api-diff-baseline
+.PHONY: build test-fast test lint verify-agnostic verify-self-contained check-fixture check-api-surface check-api-surface-codec check-api-surface-driver check-api-surface-f1test check-api-diff record-api-diff-baseline
 
 ## build: compile all packages with reproducible build flags.
 build:
@@ -30,13 +30,6 @@ test-fast:
 test:
 	go test -count=1 ./...
 
-## test-chaos: run the chaos test matrix when it exists.
-test-chaos:
-	@echo "test-chaos: chaos matrix is not available yet"
-
-## kpi: run the performance and delivery KPI harness when it exists.
-kpi:
-	@echo "kpi: performance harness is not available yet"
 
 ## lint: run the pinned golangci-lint configuration.
 $(GOLANGCI_LINT):
@@ -49,10 +42,6 @@ lint: $(GOLANGCI_LINT)
 verify-agnostic: $(GOLANGCI_LINT)
 	$(GOLANGCI_LINT) run --enable-only depguard ./...
 
-## check-cardinality: enforce the bounded metric label registry.
-check-cardinality:
-	go run ./tools/cardinality
-
 ## verify-self-contained: fail on citations no reader of this repository can resolve.
 # Design records live elsewhere. A reader here - a broker vendor, an auditor, a
 # future maintainer - cannot follow a decision or task identifier into a tree
@@ -62,10 +51,6 @@ verify-self-contained:
 	@! git grep -nIE '(ADR-[0-9]{4}|F-P[0-9]+|M1-[0-9]+)' -- . ':!Makefile' \
 	  || { echo "verify-self-contained: citation above cannot be resolved from this repository"; exit 1; }
 	@echo "verify-self-contained: 0 issues."
-
-## swap-report: verify driver replacement when the migration suite exists.
-swap-report:
-	@echo "swap-report: migration suite is not available yet"
 
 ## check-fixture: validate the local fixtures used by tests and tooling.
 check-fixture:

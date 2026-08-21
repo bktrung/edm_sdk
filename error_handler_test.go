@@ -90,7 +90,6 @@ func newErrorHandlerRunner(t *testing.T, producer driver.Producer, consumer *dis
 		},
 		consumer:   consumer,
 		asyncGroup: new(errgroup.Group),
-		metrics:    newDeliveryMetrics([]string{"orders.created"}),
 	}
 	return client, runner
 }

@@ -134,7 +134,6 @@ func (c *Client) reconnectOnce(ctx context.Context, cause error) error {
 					c.producerHandle = nil
 					c.mu.Unlock()
 					c.retireConnection(ctx, oldProducer, oldConn, connection)
-					c.metrics.RecordReconnect(ctx, c.options.driver.Name(), "recovered")
 					return nil
 				}
 			}
@@ -150,7 +149,6 @@ func (c *Client) reconnectOnce(ctx context.Context, cause error) error {
 			return err
 		}
 		if c.config.Broker.MaxReconnectAttempts > 0 && attempt >= c.config.Broker.MaxReconnectAttempts {
-			c.metrics.RecordReconnect(ctx, c.options.driver.Name(), "exhausted")
 			return &driver.Error{
 				Driver: c.options.driver.Name(),
 				Op:     "reconnect",

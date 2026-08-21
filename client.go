@@ -12,7 +12,6 @@ import (
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/codec"
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/driver"
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/clock"
-	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/obs"
 )
 
 var errClientReconnecting = errors.New("f1: client is reconnecting")
@@ -40,7 +39,6 @@ type Client struct {
 	source         string
 	producer       string
 	producerHandle driver.Producer
-	metrics        *obs.Metrics
 
 	mu     sync.Mutex
 	closed bool
@@ -144,11 +142,6 @@ func New(ctx context.Context, cfg Config, opts ...Option) (*Client, error) {
 	if options.strictPortability {
 		effective = effective.Strict()
 	}
-	metrics, err := obs.NewMetrics(options.meterProvider)
-	if err != nil {
-		_ = connection.Close(ctx)
-		return nil, fmt.Errorf("f1: initialize metrics: %w", err)
-	}
 	supervisorCtx, supervisorCancel := context.WithCancel(context.Background())
 	client := &Client{
 		conn:              connection,
@@ -162,7 +155,6 @@ func New(ctx context.Context, cfg Config, opts ...Option) (*Client, error) {
 		supervisorCtx:     supervisorCtx,
 		supervisorCancel:  supervisorCancel,
 		supervisorDone:    make(chan struct{}),
-		metrics:           metrics,
 		runners:           make(map[*Runner]struct{}),
 	}
 	client.limits = limitsFor(options.driver.Name(), connection.BrokerInfo(), effective)
@@ -170,8 +162,7 @@ func New(ctx context.Context, cfg Config, opts ...Option) (*Client, error) {
 	if err := client.ensurePublisherTopology(ctx); err != nil {
 		supervisorCancel()
 		closeErr := connection.Close(ctx)
-		metricsErr := metrics.Close()
-		return nil, errors.Join(err, closeErr, metricsErr)
+		return nil, errors.Join(err, closeErr)
 	}
 	go client.reconnectSupervisor()
 	return client, nil
@@ -412,7 +403,7 @@ func (c *Client) Close(ctx context.Context) error {
 		if producerCloseWait == nil {
 			if flushWait == nil {
 				//nolint:contextcheck // this shutdown call must outlive the attempt and is rejoined on retry.
-				flushWait = startShutdownPhase(context.Background(), nil, producer.Flush)
+				flushWait = startShutdownPhase(context.Background(), producer.Flush)
 				c.mu.Lock()
 				c.flushWait = flushWait
 				c.mu.Unlock()
@@ -431,7 +422,7 @@ func (c *Client) Close(ctx context.Context) error {
 
 		if producerCloseWait == nil {
 			//nolint:contextcheck // this shutdown call must outlive the attempt and is rejoined on retry.
-			producerCloseWait = startShutdownPhase(context.Background(), nil, producer.Close)
+			producerCloseWait = startShutdownPhase(context.Background(), producer.Close)
 			c.mu.Lock()
 			c.producerCloseWait = producerCloseWait
 			c.mu.Unlock()
@@ -459,7 +450,7 @@ func (c *Client) Close(ctx context.Context) error {
 		}
 		if connCloseWait == nil {
 			//nolint:contextcheck // this shutdown call must outlive the attempt and is rejoined on retry.
-			connCloseWait = startShutdownPhase(context.Background(), nil, conn.Close)
+			connCloseWait = startShutdownPhase(context.Background(), conn.Close)
 			c.mu.Lock()
 			c.connCloseWait = connCloseWait
 			c.mu.Unlock()
@@ -478,11 +469,11 @@ func (c *Client) Close(ctx context.Context) error {
 		c.closed = true
 		c.closing = false
 		c.mu.Unlock()
-		return errors.Join(producerCloseErr, c.metrics.Close())
+		return producerCloseErr
 	}
 	if connCloseWait == nil {
 		//nolint:contextcheck // this shutdown call must outlive the attempt and is rejoined on retry.
-		connCloseWait = startShutdownPhase(context.Background(), nil, conn.Close)
+		connCloseWait = startShutdownPhase(context.Background(), conn.Close)
 		c.mu.Lock()
 		c.connCloseWait = connCloseWait
 		c.mu.Unlock()
@@ -501,15 +492,12 @@ func (c *Client) Close(ctx context.Context) error {
 	c.closed = true
 	c.closing = false
 	c.mu.Unlock()
-	return c.metrics.Close()
+	return nil
 }
 
 // startShutdownPhase starts a shutdown call with the context supplied by
 // Close. Close supplies Background so the call can outlive the attempt.
-func startShutdownPhase(ctx context.Context, pending <-chan error, fn func(context.Context) error) <-chan error {
-	if pending != nil {
-		return pending
-	}
+func startShutdownPhase(ctx context.Context, fn func(context.Context) error) <-chan error {
 	return startPhase(ctx, fn)
 }
 

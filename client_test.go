@@ -11,8 +11,6 @@ import (
 	"testing"
 	"time"
 
-	"go.opentelemetry.io/otel/metric/noop"
-
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/driver"
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/clock"
 )
@@ -29,9 +27,6 @@ func TestNewValidatesOptionsEagerly(t *testing.T) {
 	fakeDriver := &testDriver{}
 	if _, err := New(context.Background(), cfg, WithDriver(fakeDriver), WithLogger(nil)); err == nil || fakeDriver.opened {
 		t.Fatalf("New() error = %v, opened = %v; want option error before open", err, fakeDriver.opened)
-	}
-	if _, err := New(context.Background(), cfg, WithDriver(&testDriver{}), WithMeterProvider(noop.NewMeterProvider())); err != nil {
-		t.Fatalf("New() error = %v, want typed observability provider accepted", err)
 	}
 }
 

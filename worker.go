@@ -5,12 +5,9 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"runtime"
 	"runtime/debug"
 	"sort"
 	"strings"
-	"sync"
-	"sync/atomic"
 	"time"
 
 	"golang.org/x/sync/errgroup"
@@ -19,7 +16,6 @@ import (
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/clock"
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/dispatch"
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/lifecycle"
-	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/obs"
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/retry"
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/sched"
 )
@@ -37,144 +33,6 @@ type deliveryState struct {
 	// one can be retried in kind rather than guessed at.
 	operation   settlementOperation
 	nackOptions driver.NackOptions
-}
-
-type deliveryMetrics struct {
-	attemptDivergence obs.SampledGaugeSet
-	topics            []string
-	retryAfterClamped []obs.SampledCounter
-	stuckWorkers      atomic.Int64
-	activeHandlers    atomic.Int64
-	retired           atomic.Bool
-	unregisterOnce    sync.Once
-	unregister        func()
-}
-
-const deliveryPriorityLanes = 3
-
-func newDeliveryMetrics(topics []string) deliveryMetrics {
-	names := make([]string, len(topics))
-	for i, topic := range topics {
-		names[i] = topicFor(topic)
-	}
-	sort.Strings(names)
-	unique := names[:0]
-	for _, name := range names {
-		if len(unique) == 0 || unique[len(unique)-1] != name {
-			unique = append(unique, name)
-		}
-	}
-	return deliveryMetrics{
-		attemptDivergence: obs.NewSampledGaugeSet(unique, deliveryPriorityLanes),
-		topics:            append([]string(nil), unique...),
-		retryAfterClamped: make([]obs.SampledCounter, len(unique)),
-	}
-}
-
-func (m *deliveryMetrics) observeAttemptDivergence(eventType string, priority Priority, value uint64) {
-	if priority.Valid() {
-		m.attemptDivergence.Observe(topicFor(eventType), int(priority), value)
-	}
-}
-
-func (m *deliveryMetrics) sampleAttemptDivergence(topic string, priority Priority) uint64 {
-	if !priority.Valid() {
-		return 0
-	}
-	return m.attemptDivergence.Sample(topic, int(priority))
-}
-
-func (m *deliveryMetrics) sampleAttemptDivergenceByTopic() map[string]int64 {
-	values := make(map[string]int64, len(m.topics))
-	for _, topic := range m.topics {
-		var highWater uint64
-		for lane := 0; lane < deliveryPriorityLanes; lane++ {
-			if value := m.attemptDivergence.Sample(topic, lane); value > highWater {
-				highWater = value
-			}
-		}
-		values[topic] = int64(highWater)
-	}
-	return values
-}
-
-func (m *deliveryMetrics) currentStuckWorkers() int64 {
-	return m.stuckWorkers.Load()
-}
-
-func (m *deliveryMetrics) recordRetryAfterClamped(eventType string) {
-	topic := topicFor(eventType)
-	index := sort.SearchStrings(m.topics, topic)
-	if index < len(m.topics) && m.topics[index] == topic {
-		m.retryAfterClamped[index].Add(1)
-	}
-}
-
-func (m *deliveryMetrics) sampleRetryAfterClamped() map[string]uint64 {
-	values := make(map[string]uint64, len(m.topics))
-	for index, topic := range m.topics {
-		if value := m.retryAfterClamped[index].Load(); value > 0 {
-			values[topic] = value
-		}
-	}
-	return values
-}
-
-type handlerActivity struct {
-	metrics *deliveryMetrics
-	mu      sync.Mutex
-	stuck   bool
-	done    bool
-}
-
-func (m *deliveryMetrics) beginHandler() *handlerActivity {
-	m.activeHandlers.Add(1)
-	return &handlerActivity{metrics: m}
-}
-
-func (a *handlerActivity) markStuck() {
-	a.mu.Lock()
-	if !a.done && !a.stuck {
-		a.stuck = true
-		a.metrics.stuckWorkers.Add(1)
-	}
-	a.mu.Unlock()
-}
-
-func (a *handlerActivity) finish() {
-	a.mu.Lock()
-	if a.done {
-		a.mu.Unlock()
-		return
-	}
-	a.done = true
-	if a.stuck {
-		a.metrics.stuckWorkers.Add(-1)
-	}
-	a.mu.Unlock()
-	a.metrics.endHandler()
-}
-
-func (m *deliveryMetrics) endHandler() {
-	if m.activeHandlers.Add(-1) == 0 {
-		m.unregisterIfReady()
-	}
-}
-
-func (m *deliveryMetrics) retire() {
-	m.retired.Store(true)
-	m.unregisterIfReady()
-}
-
-func (m *deliveryMetrics) unregisterIfReady() {
-	if !m.retired.Load() || m.activeHandlers.Load() != 0 {
-		return
-	}
-	m.unregisterOnce.Do(func() {
-		if m.unregister != nil {
-			m.unregister()
-		}
-	})
 }
 
 // Run starts the consumer, owns its fetcher and workers, and returns when the
@@ -609,7 +467,6 @@ func finishRunner(r *Runner) {
 		delete(r.client.runners, r)
 		r.client.mu.Unlock()
 	}
-	r.metrics.retire()
 }
 
 func runnerError(r *Runner) error {
@@ -988,9 +845,6 @@ func dispatchMessage(r *Runner, ctx context.Context, message driver.InboundMessa
 	if retry.CounterRunaway(envelope.Attempt, maxAttempts) {
 		return deadLetterAndSettle(r, ctx, message, envelope, ReasonPoison, errors.New("retry counter exceeded sanity margin"), state)
 	}
-	// Record at receipt, before handler work or settlement: a failed settlement
-	// can cause the broker to redeliver this delivery.
-	recordAttemptDivergence(r, envelope.Type, envelope.Priority, envelope.Attempt, message.DeliveryCount)
 	if max := r.client.config.Codec.MaxBodyBytes; max > 0 && len(message.Body) > max {
 		return deadLetterAndSettle(r, ctx, message, envelope, ReasonDecode, fmt.Errorf("body exceeds codec.maxBodyBytes (%d)", max), state)
 	}
@@ -1047,19 +901,6 @@ func classifyRetryError(err error) retry.Outcome {
 	return retry.Classify(err)
 }
 
-func recordAttemptDivergence(r *Runner, eventType string, priority Priority, attempt, deliveryCount int) {
-	if r == nil || deliveryCount < 0 {
-		return
-	}
-	var difference int
-	if attempt >= deliveryCount {
-		difference = attempt - deliveryCount
-	} else {
-		difference = deliveryCount - attempt
-	}
-	r.metrics.observeAttemptDivergence(eventType, priority, uint64(uint(difference)))
-}
-
 func stateFor(states []*deliveryState) *deliveryState {
 	if len(states) > 0 && states[0] != nil {
 		return states[0]
@@ -1098,9 +939,7 @@ func invokeHandler(r *Runner, parent context.Context, handler Handler, event *Ev
 		group = new(errgroup.Group)
 	}
 	r.mu.Unlock()
-	activity := r.metrics.beginHandler()
 	group.Go(func() error {
-		defer activity.finish()
 		result := handlerResult{}
 		func() {
 			defer func() {
@@ -1136,8 +975,7 @@ func invokeHandler(r *Runner, parent context.Context, handler Handler, event *Ev
 	case <-shutdownDone:
 		return handlerResult{stuck: true}
 	case <-stuck.C:
-		activity.markStuck()
-		runnerLogger(r).Warn("f1 stuck worker", "metric", "f1_stuck_workers", "subscription", r.subscription.Name, "threshold", 2*timeout)
+		runnerLogger(r).Warn("f1 stuck worker", "subscription", r.subscription.Name, "threshold", 2*timeout)
 	}
 	stackTimer := r.client.options.clock.Timer(timeout * 2)
 	defer stackTimer.Stop()
@@ -1149,9 +987,7 @@ func invokeHandler(r *Runner, parent context.Context, handler Handler, event *Ev
 	case <-shutdownDone:
 		return handlerResult{stuck: true}
 	case <-stackTimer.C:
-		buffer := make([]byte, 64<<10)
-		n := runtime.Stack(buffer, true)
-		runnerLogger(r).Error("f1 worker exceeded stuck threshold", "metric", "f1_stuck_workers", "subscription", r.subscription.Name, "threshold", 4*timeout, "stack", string(buffer[:n]))
+		runnerLogger(r).Error("f1 worker exceeded stuck threshold", "subscription", r.subscription.Name, "threshold", 4*timeout)
 		return handlerResult{stuck: true}
 	}
 }
@@ -1349,10 +1185,7 @@ func retryAndSettle(r *Runner, ctx context.Context, message driver.InboundMessag
 	tier := retry.ResolveTier(retryConfig, envelope.Attempt)
 	delay := retryConfig.DelayFor(tier)
 	if requested, ok := RetryDelay(lastErr); ok {
-		resolvedTier, resolvedDelay, clamped := retry.ResolveRetryAfter(retryConfig, requested)
-		if clamped {
-			r.metrics.recordRetryAfterClamped(envelope.Type)
-		}
+		resolvedTier, resolvedDelay, _ := retry.ResolveRetryAfter(retryConfig, requested)
 		tier, delay = resolvedTier, resolvedDelay
 	}
 	now := r.client.options.clock.Now().UTC()
