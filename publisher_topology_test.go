@@ -13,8 +13,9 @@ import (
 
 func TestPublishTopicsOptionRejectsEmptyAndDuplicate(t *testing.T) {
 	for name, option := range map[string]Option{
-		"empty":     WithPublishTopics("orders.created", ""),
-		"duplicate": WithPublishTopics("orders.created", "orders.created"),
+		"empty":      WithPublishTopics("orders.created", ""),
+		"duplicate":  WithPublishTopics("orders.created", "orders.created"),
+		"whitespace": WithPublishTopics(" "),
 	} {
 		t.Run(name, func(t *testing.T) {
 			options := clientOptions{}

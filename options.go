@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"reflect"
+	"strings"
 
 	"go.opentelemetry.io/otel/metric"
 
@@ -158,7 +159,7 @@ func WithPublishTopics(topics ...string) Option {
 		}
 		canonical := make([]string, 0, len(topics))
 		for _, topic := range topics {
-			if topic == "" {
+			if strings.TrimSpace(topic) == "" {
 				return fmt.Errorf("f1: WithPublishTopics topic must not be empty")
 			}
 			logical := topicFor(topic)
