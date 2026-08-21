@@ -24,10 +24,12 @@ func (a *admin) EnsureTopology(ctx context.Context, spec driver.TopologySpec) (d
 	var diff driver.TopologyDiff
 	if spec.Policy == driver.TopologyVerify {
 		for _, item := range spec.Destinations {
-			if _, ok := a.conn.destinations[item.Name]; !ok {
+			stored, ok := a.conn.destinations[item.Name]
+			if !ok {
 				return diff, classify("ensure_topology", driver.KindNotFound, fmt.Errorf("%s: %w", item.Name, driver.ErrDestinationMissing))
 			}
 			diff.ExistingDestinations = append(diff.ExistingDestinations, item.Name)
+			diff.Drifted = append(diff.Drifted, destinationArgumentDrift(item, stored.spec)...)
 		}
 		return diff, nil
 	}
@@ -62,6 +64,41 @@ func (a *admin) EnsureTopology(ctx context.Context, spec driver.TopologySpec) (d
 		}
 	}
 	return diff, nil
+}
+
+func destinationArgumentDrift(want, got driver.DestinationSpec) []driver.ArgumentDrift {
+	var drifted []driver.ArgumentDrift
+	if want.Delay > 0 && want.Delay != got.Delay {
+		drifted = append(drifted, driver.ArgumentDrift{
+			Name: want.Name, Argument: "delay", Want: want.Delay.String(), Got: got.Delay.String(),
+		})
+	}
+	if want.DeliveryLimit > 0 && want.DeliveryLimit != got.DeliveryLimit {
+		gotValue := "<absent>"
+		if got.DeliveryLimit > 0 {
+			gotValue = fmt.Sprint(got.DeliveryLimit)
+		}
+		drifted = append(drifted, driver.ArgumentDrift{
+			Name: want.Name, Argument: "x-delivery-limit", Want: fmt.Sprint(want.DeliveryLimit), Got: gotValue,
+		})
+	}
+	if want.DeadLetter != nil {
+		gotExchange, gotKey := "<absent>", "<absent>"
+		if got.DeadLetter != nil {
+			gotExchange, gotKey = got.DeadLetter.Exchange, got.DeadLetter.Key
+		}
+		if want.DeadLetter.Exchange != gotExchange {
+			drifted = append(drifted, driver.ArgumentDrift{
+				Name: want.Name, Argument: "x-dead-letter-exchange", Want: want.DeadLetter.Exchange, Got: gotExchange,
+			})
+		}
+		if want.DeadLetter.Key != gotKey {
+			drifted = append(drifted, driver.ArgumentDrift{
+				Name: want.Name, Argument: "x-dead-letter-routing-key", Want: want.DeadLetter.Key, Got: gotKey,
+			})
+		}
+	}
+	return drifted
 }
 
 func (a *admin) DescribeTopology(ctx context.Context, names []string) (driver.TopologyState, error) {

@@ -703,6 +703,40 @@ func runTopologyPolicyChecks(group *groupContext) {
 		group.vector.Add(BehaviorEvent{ID: "topology-verify-missing", Outcome: "not-found", FinalDestination: "topology.verify.missing"})
 	})
 
+	group.Check("TopologyVerify reports argument drift or fails verification", func(t *testing.T) {
+		admin := group.conn.Admin()
+		name := "topology.verify.drift." + group.profile.String()
+		declared := driver.DestinationSpec{Name: name, DeliveryLimit: 7}
+		if _, err := admin.EnsureTopology(group.ctx, driver.TopologySpec{
+			Destinations: []driver.DestinationSpec{declared},
+			Effective:    group.effective,
+		}); err != nil {
+			t.Fatalf("EnsureTopology(seed): %v", err)
+		}
+		requested := declared
+		requested.DeliveryLimit = 9
+		diff, err := admin.EnsureTopology(group.ctx, driver.TopologySpec{
+			Destinations: []driver.DestinationSpec{requested},
+			Policy:       driver.TopologyVerify,
+			Effective:    group.effective,
+		})
+		if err != nil {
+			group.vector.Add(BehaviorEvent{ID: "topology-argument-drift", Outcome: "failed", FinalDestination: "topology.verify.drift"})
+			return
+		}
+		var found bool
+		for _, drift := range diff.Drifted {
+			if drift.Name == name && drift.Argument == "x-delivery-limit" {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Fatalf("TopologyVerify returned clean successful diff=%+v for changed delivery limit", diff)
+		}
+		group.vector.Add(BehaviorEvent{ID: "topology-argument-drift", Outcome: "reported", FinalDestination: "topology.verify.drift"})
+	})
+
 	group.Check("FanoutAtConsume ignores bindings", func(t *testing.T) {
 		if group.effective.Fanout != driver.FanoutAtConsume {
 			group.Skip(t, "FanoutAtConsume ignores bindings", fmt.Sprintf("effective fanout mode %d is not FanoutAtConsume", group.effective.Fanout))
