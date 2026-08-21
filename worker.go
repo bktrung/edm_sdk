@@ -903,6 +903,10 @@ func dispatchMessage(r *Runner, ctx context.Context, message driver.InboundMessa
 	if envelope.Attempt < 1 {
 		envelope.Attempt = 1
 	}
+	eventCodec, err := r.client.codecForContentType(envelope.DataContentType)
+	if err != nil {
+		return deadLetterAndSettle(r, ctx, message, envelope, ReasonDecode, err, state)
+	}
 	*envelopeOut = envelope
 	maxAttempts := envelope.MaxAttempts
 	if maxAttempts <= 0 {
@@ -928,7 +932,7 @@ func dispatchMessage(r *Runner, ctx context.Context, message driver.InboundMessa
 		runnerNotifyDiscarded(r, runnerSettlementContext(r, ctx), discardUnmatched(envelope, append([]byte(nil), message.Body...)))
 		return ackDelivery(r, runnerSettlementContext(r, ctx), message, state)
 	}
-	event := &Event{envelope: envelope, raw: append([]byte(nil), message.Body...), codec: r.client.options.codec, headers: headers}
+	event := &Event{envelope: envelope, raw: append([]byte(nil), message.Body...), codec: eventCodec, headers: headers}
 	result := invokeHandler(r, ctx, handler, event)
 	if result.stuck {
 		*abandoned = true
@@ -1217,7 +1221,11 @@ func publishSuccessor(r *Runner, ctx context.Context, messages ...driver.Outboun
 // error handler) that still needs to identify which message an async
 // failure is about.
 func eventFromDelivery(r *Runner, message driver.InboundMessage, envelope Envelope) *Event {
-	return &Event{envelope: envelope, raw: append([]byte(nil), message.Body...), codec: r.client.options.codec, headers: inboundHeaders(message.Headers)}
+	eventCodec, err := r.client.codecForContentType(envelope.DataContentType)
+	if err != nil {
+		return nil
+	}
+	return &Event{envelope: envelope, raw: append([]byte(nil), message.Body...), codec: eventCodec, headers: inboundHeaders(message.Headers)}
 }
 
 // failSuccessorHandoff runs once a retry or dead-letter successor could not

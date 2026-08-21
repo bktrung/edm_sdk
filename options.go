@@ -32,18 +32,20 @@ const (
 )
 
 type clientOptions struct {
-	driver            driver.Driver
-	codec             codec.Codec
-	logger            *slog.Logger
-	meterProvider     metric.MeterProvider
-	clock             clock.Clock
-	strictPortability bool
-	middleware        []Middleware
-	errorHandler      func(context.Context, *Event, error)
-	publishTopics     []string
-	publishTopicsSet  bool
-	topologyPolicy    driver.TopologyPolicy
-	topologyPolicySet bool
+	driver              driver.Driver
+	codec               codec.Codec
+	codecsByContentType map[string]codec.Codec
+	codecsByName        map[string]codec.Codec
+	logger              *slog.Logger
+	meterProvider       metric.MeterProvider
+	clock               clock.Clock
+	strictPortability   bool
+	middleware          []Middleware
+	errorHandler        func(context.Context, *Event, error)
+	publishTopics       []string
+	publishTopicsSet    bool
+	topologyPolicy      driver.TopologyPolicy
+	topologyPolicySet   bool
 }
 
 // WithDriver supplies the broker driver New opens eagerly.
@@ -57,13 +59,29 @@ func WithDriver(d driver.Driver) Option {
 	}
 }
 
-// WithCodec selects the codec used by publishers and consumers.
-func WithCodec(c codec.Codec) Option {
+// WithCodec registers codecs for inbound decoding. The first codec is used
+// for publishing; all codecs are selected by their content type on reads.
+func WithCodec(codecs ...codec.Codec) Option {
 	return func(options *clientOptions) error {
-		if isNil(c) {
-			return fmt.Errorf("f1: WithCodec requires a non-nil codec")
+		for _, c := range codecs {
+			if isNil(c) {
+				return fmt.Errorf("f1: WithCodec requires a non-nil codec")
+			}
 		}
-		options.codec = c
+		if len(codecs) == 0 {
+			return nil
+		}
+		if options.codecsByContentType == nil {
+			options.codecsByContentType = make(map[string]codec.Codec)
+		}
+		if options.codecsByName == nil {
+			options.codecsByName = make(map[string]codec.Codec)
+		}
+		options.codec = codecs[0]
+		for _, c := range codecs {
+			options.codecsByContentType[c.ContentType()] = c
+			options.codecsByName[c.Name()] = c
+		}
 		return nil
 	}
 }
