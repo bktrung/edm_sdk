@@ -20,16 +20,10 @@ func rabbitFaultInjector(raw driver.Conn) (conformance.FaultInjector, error) {
 		}
 		switch kind {
 		case conformance.FaultPublishFailure:
-			conn.mu.Lock()
-			conn.publishFault = driver.KindTransient
-			conn.publishFaultSet = true
-			conn.mu.Unlock()
+			conn.publishFault.Store(int32(driver.KindTransient) + 1)
 			return nil
 		case conformance.FaultFatalPublish:
-			conn.mu.Lock()
-			conn.publishFault = driver.KindFatal
-			conn.publishFaultSet = true
-			conn.mu.Unlock()
+			conn.publishFault.Store(int32(driver.KindFatal) + 1)
 			return nil
 		case conformance.FaultConnectionDrop:
 			return rabbitRequeueActive(ctx, conn, kind)
