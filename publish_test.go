@@ -193,7 +193,7 @@ func TestPublishRejectedWhenClientIsClosing(t *testing.T) {
 	producer := &recordingProducer{}
 	client := newPublishClient(t, producer)
 	client.mu.Lock()
-	client.closing = true
+	client.shutdownStarted = true
 	client.mu.Unlock()
 
 	_, err := client.Publisher().Publish(context.Background(), "orders.created", "payload")
@@ -204,7 +204,7 @@ func TestPublishRejectedWhenClientIsClosing(t *testing.T) {
 		t.Fatalf("producer received %d messages while client was closing", got)
 	}
 	client.mu.Lock()
-	client.closing = false
+	client.shutdownStarted = false
 	client.mu.Unlock()
 }
 

@@ -121,7 +121,7 @@ func (e *Event) Raw() []byte {
 	return append([]byte(nil), e.raw...)
 }
 
-// Decode unmarshals the payload using the client's configured codec.
+// Decode unmarshals the payload using the codec selected for this event.
 func (e *Event) Decode(value any) error {
 	if e == nil || e.codec == nil {
 		return fmt.Errorf("f1: event codec is unavailable")

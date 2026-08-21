@@ -36,6 +36,25 @@ func TestRunRejectsUnrecordedSkippedCheck(t *testing.T) {
 	assertRunFailure(t, "unrecorded-group", "skipped without an explicit fixture record")
 }
 
+func TestRunReportsMultipleFailedGroups(t *testing.T) {
+	output := runFailureOutput(t, "two-failed-groups")
+	for _, want := range []string{
+		"conformance group publish failed",
+		"conformance group consume failed",
+	} {
+		if !strings.Contains(string(output), want) {
+			t.Fatalf("Run failure omitted %q:\n%s", want, output)
+		}
+	}
+}
+
+func TestRunValidatesCountAfterFailedGroup(t *testing.T) {
+	output := runFailureOutput(t, "failed-short-group")
+	if !strings.Contains(string(output), `conformance group "publish" ran 1 checks; manifest declares 2`) {
+		t.Fatalf("Run failure omitted count validation:\n%s", output)
+	}
+}
+
 func TestRunUsesOneConnectionAndInspector(t *testing.T) {
 	manifest := groupManifest
 	pending := pendingGroups
@@ -71,15 +90,21 @@ func TestRunUsesOneConnectionAndInspector(t *testing.T) {
 
 func assertRunFailure(t *testing.T, mode, want string) {
 	t.Helper()
+	output := runFailureOutput(t, mode)
+	if !strings.Contains(string(output), want) {
+		t.Fatalf("Run failure for %s omitted %q:\n%s", mode, want, output)
+	}
+}
+
+func runFailureOutput(t *testing.T, mode string) []byte {
+	t.Helper()
 	cmd := exec.Command(os.Args[0], "-test.run=TestRunFailureHelper", "-test.v") //nolint:gosec // the harness intentionally re-executes its own test binary.
 	cmd.Env = append(os.Environ(), "CONFORMANCE_FAILURE_MODE="+mode)
 	output, err := cmd.CombinedOutput()
 	if err == nil {
 		t.Fatalf("Run unexpectedly passed for %s:\n%s", mode, output)
 	}
-	if !strings.Contains(string(output), want) {
-		t.Fatalf("Run failure for %s omitted %q:\n%s", mode, want, output)
-	}
+	return output
 }
 
 func TestRunFailureHelper(t *testing.T) {
@@ -133,6 +158,31 @@ func TestRunFailureHelper(t *testing.T) {
 		registerGroup("publish", func(group *groupContext) {
 			group.Check("unrecorded skip", func(checkTest *testing.T) {
 				checkTest.Skip("fixture pending")
+			})
+		})
+		factory = runTestInspector
+	case "two-failed-groups":
+		groupManifest = []manifestEntry{{name: "publish", declared: 1}, {name: "consume", declared: 1}}
+		pendingGroups = nil
+		groupRunners = map[string]groupRunner{}
+		registerGroup("publish", func(group *groupContext) {
+			group.Check("deliberate publish failure", func(checkTest *testing.T) {
+				checkTest.Fatal("deliberate publish failure")
+			})
+		})
+		registerGroup("consume", func(group *groupContext) {
+			group.Check("deliberate consume failure", func(checkTest *testing.T) {
+				checkTest.Fatal("deliberate consume failure")
+			})
+		})
+		factory = runTestInspector
+	case "failed-short-group":
+		groupManifest = []manifestEntry{{name: "publish", declared: 2}}
+		pendingGroups = nil
+		groupRunners = map[string]groupRunner{}
+		registerGroup("publish", func(group *groupContext) {
+			group.Check("deliberate short failure", func(checkTest *testing.T) {
+				checkTest.Fatal("deliberate short failure")
 			})
 		})
 		factory = runTestInspector

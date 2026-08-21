@@ -218,7 +218,7 @@ func (c *Client) Subscribe(ctx context.Context, sub Subscription) (*Runner, erro
 		c.mu.Unlock()
 		return nil, errors.New("f1: client is closed")
 	}
-	if c.closing {
+	if c.shutdownStarted {
 		c.mu.Unlock()
 		return nil, errors.New("f1: client is closing")
 	}
@@ -239,7 +239,7 @@ func (c *Client) Subscribe(ctx context.Context, sub Subscription) (*Runner, erro
 		c.mu.Unlock()
 		return nil, errors.New("f1: client is closed")
 	}
-	if c.closing {
+	if c.shutdownStarted {
 		c.mu.Unlock()
 		return nil, errors.New("f1: client is closing")
 	}
@@ -257,7 +257,7 @@ func (c *Client) Subscribe(ctx context.Context, sub Subscription) (*Runner, erro
 	effective.Handlers = wrapHandlers(c.options.middleware, sub.Handlers)
 	runner := &Runner{client: c, subscription: effective, config: resolved, metrics: newDeliveryMetrics(effective.Topics)}
 	c.mu.Lock()
-	if c.closed || c.closing || c.conn == nil {
+	if c.closed || c.shutdownStarted || c.conn == nil {
 		c.mu.Unlock()
 		return nil, errors.New("f1: client is closing")
 	}
@@ -291,10 +291,7 @@ func resolveSubscription(c *Client, sub Subscription) (SubscriptionConfig, error
 	}
 	overlayExplicitSubscription(&resolved, sub)
 	if resolved.Prefetch == 0 {
-		resolved.Prefetch = c.config.Broker.DefaultPrefetch
-		if resolved.Prefetch == 0 {
-			resolved.Prefetch = defaultConfig().Broker.DefaultPrefetch
-		}
+		resolved.Prefetch = resolvePrefetch(resolved.Prefetch, c.config.Broker.DefaultPrefetch)
 	}
 	return resolved, nil
 }

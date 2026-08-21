@@ -25,9 +25,15 @@ type Client struct {
 	producerHandle driver.Producer
 	metrics        *obs.Metrics
 
-	mu              sync.Mutex
-	closed          bool
-	closing         bool
+	mu     sync.Mutex
+	closed bool
+	// closing tracks only a Close attempt currently executing. It is cleared
+	// on failure so a retried Close can rejoin pending work.
+	closing bool
+	// shutdownStarted is guarded by mu, set once when Close is entered, and
+	// never cleared. closed is terminal. It is separate from closing because
+	// admission must stay closed after shutdown begins while Close remains retryable.
+	shutdownStarted bool
 	activePublishes int
 	publishIdle     chan struct{}
 	runners         map[*Runner]struct{}
@@ -69,7 +75,14 @@ const (
 // before returning. Startup errors are returned before any publish or subscribe
 // call. Env and Service remain required for hand-built configurations.
 func New(ctx context.Context, cfg Config, opts ...Option) (*Client, error) {
-	options := clientOptions{codec: codec.JSON{}, clock: clock.NewReal(), logger: slog.Default()}
+	jsonCodec := codec.JSON{}
+	options := clientOptions{
+		codec:               jsonCodec,
+		codecsByContentType: map[string]codec.Codec{jsonCodec.ContentType(): jsonCodec},
+		codecsByName:        map[string]codec.Codec{jsonCodec.Name(): jsonCodec},
+		clock:               clock.NewReal(),
+		logger:              slog.Default(),
+	}
 	for _, option := range opts {
 		if option == nil {
 			return nil, fmt.Errorf("f1: nil option")
@@ -84,6 +97,9 @@ func New(ctx context.Context, cfg Config, opts ...Option) (*Client, error) {
 	cfg = normalizeConfig(cfg)
 	if err := validateConfig(cfg); err != nil {
 		return nil, err
+	}
+	if _, ok := options.codecsByName[cfg.Codec.Default]; !ok {
+		return nil, fmt.Errorf("f1: codec.default %q is not registered", cfg.Codec.Default)
 	}
 	connection, err := options.driver.Open(ctx, driverConfig(cfg))
 	if err != nil {
@@ -155,6 +171,21 @@ func (c *Client) Publisher() *Publisher {
 	return &Publisher{client: c}
 }
 
+func (c *Client) codecForContentType(contentType string) (codec.Codec, error) {
+	if contentType == "" {
+		selected, ok := c.options.codecsByName[c.config.Codec.Default]
+		if !ok {
+			return nil, fmt.Errorf("f1: codec.default %q is not registered", c.config.Codec.Default)
+		}
+		return selected, nil
+	}
+	selected, ok := c.options.codecsByContentType[contentType]
+	if !ok {
+		return nil, fmt.Errorf("f1: no codec registered for datacontenttype %q", contentType)
+	}
+	return selected, nil
+}
+
 func logCapabilities(c *Client) {
 	if c.options.logger == nil {
 		return
@@ -215,7 +246,7 @@ func (c *Client) Health(ctx context.Context) error {
 		c.mu.Unlock()
 		return fmt.Errorf("f1: client is closed")
 	}
-	if c.closing {
+	if c.shutdownStarted {
 		c.mu.Unlock()
 		return fmt.Errorf("f1: client is closing")
 	}
@@ -259,6 +290,7 @@ func (c *Client) Close(ctx context.Context) error {
 		return fmt.Errorf("f1: client is closing")
 	}
 	c.closing = true
+	c.shutdownStarted = true
 	idle := c.publishIdle
 	runners := make([]*Runner, 0, len(c.runners))
 	for runner := range c.runners {
@@ -381,7 +413,7 @@ func publishMessages(c *Client, ctx context.Context, allowClosing bool, messages
 		return nil
 	}
 	c.mu.Lock()
-	if c.closed || c.conn == nil || (!allowClosing && c.closing) {
+	if c.closed || c.conn == nil || (!allowClosing && c.shutdownStarted) {
 		c.mu.Unlock()
 		return errors.New("f1: client is closed")
 	}

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"reflect"
+	"strings"
 
 	"go.opentelemetry.io/otel/metric"
 
@@ -31,18 +32,20 @@ const (
 )
 
 type clientOptions struct {
-	driver            driver.Driver
-	codec             codec.Codec
-	logger            *slog.Logger
-	meterProvider     metric.MeterProvider
-	clock             clock.Clock
-	strictPortability bool
-	middleware        []Middleware
-	errorHandler      func(context.Context, *Event, error)
-	publishTopics     []string
-	publishTopicsSet  bool
-	topologyPolicy    driver.TopologyPolicy
-	topologyPolicySet bool
+	driver              driver.Driver
+	codec               codec.Codec
+	codecsByContentType map[string]codec.Codec
+	codecsByName        map[string]codec.Codec
+	logger              *slog.Logger
+	meterProvider       metric.MeterProvider
+	clock               clock.Clock
+	strictPortability   bool
+	middleware          []Middleware
+	errorHandler        func(context.Context, *Event, error)
+	publishTopics       []string
+	publishTopicsSet    bool
+	topologyPolicy      driver.TopologyPolicy
+	topologyPolicySet   bool
 }
 
 // WithDriver supplies the broker driver New opens eagerly.
@@ -56,13 +59,29 @@ func WithDriver(d driver.Driver) Option {
 	}
 }
 
-// WithCodec selects the codec used by publishers and consumers.
-func WithCodec(c codec.Codec) Option {
+// WithCodec registers codecs for inbound decoding. The first codec is used
+// for publishing; all codecs are selected by their content type on reads.
+func WithCodec(codecs ...codec.Codec) Option {
 	return func(options *clientOptions) error {
-		if isNil(c) {
-			return fmt.Errorf("f1: WithCodec requires a non-nil codec")
+		if len(codecs) == 0 {
+			return fmt.Errorf("f1: WithCodec requires at least one codec")
 		}
-		options.codec = c
+		for _, c := range codecs {
+			if isNil(c) {
+				return fmt.Errorf("f1: WithCodec requires a non-nil codec")
+			}
+		}
+		if options.codecsByContentType == nil {
+			options.codecsByContentType = make(map[string]codec.Codec)
+		}
+		if options.codecsByName == nil {
+			options.codecsByName = make(map[string]codec.Codec)
+		}
+		options.codec = codecs[0]
+		for _, c := range codecs {
+			options.codecsByContentType[c.ContentType()] = c
+			options.codecsByName[c.Name()] = c
+		}
 		return nil
 	}
 }
@@ -144,7 +163,12 @@ func WithErrorHandler(handler func(context.Context, *Event, error)) Option {
 	}
 }
 
-// WithPublishTopics names the logical topics this client publishes.
+// WithPublishTopics names the logical topics this client publishes. New
+// declares an entry point for each topic and declared priority, and Publish
+// rejects a topic that was not named here.
+//
+// Each value goes through the same derivation Publish applies to an event
+// type, so "order.created.v1" and "order.created" name the same topic.
 func WithPublishTopics(topics ...string) Option {
 	return func(options *clientOptions) error {
 		seen := make(map[string]struct{}, len(options.publishTopics)+len(topics))
@@ -153,8 +177,8 @@ func WithPublishTopics(topics ...string) Option {
 		}
 		canonical := make([]string, 0, len(topics))
 		for _, topic := range topics {
-			if topic == "" {
-				return fmt.Errorf("f1: WithPublishTopics topic must not be empty")
+			if strings.TrimSpace(topic) == "" {
+				return fmt.Errorf("f1: WithPublishTopics topic must not be empty or whitespace-only")
 			}
 			logical := topicFor(topic)
 			if _, ok := seen[logical]; ok {

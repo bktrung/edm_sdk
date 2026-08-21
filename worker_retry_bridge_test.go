@@ -468,6 +468,41 @@ func TestRetryAfterClampMetricIsCumulative(t *testing.T) {
 	}
 }
 
+type unsupportedReleaseConsumer struct {
+	stopCalls int
+}
+
+func (*unsupportedReleaseConsumer) Messages() <-chan driver.InboundMessage { return nil }
+func (*unsupportedReleaseConsumer) Errors() <-chan error                   { return nil }
+func (*unsupportedReleaseConsumer) Pause(...string) error                  { return nil }
+func (*unsupportedReleaseConsumer) Resume(...string) error                 { return nil }
+func (*unsupportedReleaseConsumer) Drain(context.Context) error            { return nil }
+func (c *unsupportedReleaseConsumer) Stop(context.Context) error {
+	c.stopCalls++
+	return nil
+}
+
+func (*unsupportedReleaseConsumer) Release(context.Context) error {
+	return driver.ErrUnsupported
+}
+
+func (*unsupportedReleaseConsumer) Lag(context.Context) (map[string]int64, error) {
+	return nil, driver.ErrUnsupported
+}
+
+func TestReleaseRunnerConsumerSurfacesUnsupportedWithoutStop(t *testing.T) {
+	consumer := &unsupportedReleaseConsumer{}
+	runner := &Runner{consumer: consumer}
+
+	err := releaseRunnerConsumer(runner, context.Background())
+	if !errors.Is(err, driver.ErrUnsupported) {
+		t.Fatalf("releaseRunnerConsumer() error = %v, want ErrUnsupported", err)
+	}
+	if consumer.stopCalls != 0 {
+		t.Fatalf("Stop calls = %d, want 0", consumer.stopCalls)
+	}
+}
+
 func TestDeliveryLaneMalformedHeadersUsesDefaultLane(t *testing.T) {
 	client, runner := newRetryBridgeRunner(t, &dispatchProducer{}, "orders.created")
 	defer func() { _ = client.Close(context.Background()) }()

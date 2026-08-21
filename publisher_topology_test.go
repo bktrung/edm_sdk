@@ -13,14 +13,18 @@ import (
 
 func TestPublishTopicsOptionRejectsEmptyAndDuplicate(t *testing.T) {
 	for name, option := range map[string]Option{
-		"empty":     WithPublishTopics("orders.created", ""),
-		"duplicate": WithPublishTopics("orders.created", "orders.created"),
+		"empty":      WithPublishTopics("orders.created", ""),
+		"duplicate":  WithPublishTopics("orders.created", "orders.created"),
+		"whitespace": WithPublishTopics(" "),
 	} {
 		t.Run(name, func(t *testing.T) {
 			options := clientOptions{}
 			err := option(&options)
 			require.Error(t, err)
 			require.Contains(t, err.Error(), "WithPublishTopics")
+			if name == "whitespace" {
+				require.EqualError(t, err, "f1: WithPublishTopics topic must not be empty or whitespace-only")
+			}
 		})
 	}
 
@@ -243,4 +247,55 @@ func (a *topologyRecordingAdmin) snapshot() []driver.TopologySpec {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	return append([]driver.TopologySpec(nil), a.specs...)
+}
+
+func TestWithTopicMatchesDerivedWhitelist(t *testing.T) {
+	producer := &recordingProducer{}
+	admin := &topologyRecordingAdmin{}
+	conn := &topologyTestConn{
+		testConn: &testConn{caps: driver.Capabilities{MaxHeaderBytes: CoreMaxHeaderBytes}},
+		admin:    admin,
+		producer: producer,
+	}
+	client, err := New(context.Background(), testClientConfig(t),
+		WithDriver(&topologyTestDriver{conn: conn}),
+		WithPublishTopics("orders.created.v1"),
+	)
+	require.NoError(t, err)
+	defer func() { require.NoError(t, client.Close(context.Background())) }()
+
+	_, err = client.Publisher().Publish(context.Background(), "orders.created.v1", map[string]string{"id": "o1"}, WithTopic("orders.created.v1"))
+	require.NoError(t, err)
+}
+
+func TestExplicitVersionedTopicMatchesDeclaredPublisherDestination(t *testing.T) {
+	producer := &recordingProducer{}
+	client := newPublishClient(t, producer)
+	topic := "orders.created.v1"
+
+	_, err := client.Publisher().Publish(context.Background(), topic, map[string]string{"id": "o1"}, WithTopic(topic))
+	require.NoError(t, err)
+	require.Len(t, producer.messages, 1)
+
+	spec := publisherTopologySpec(client.effective, client.source, []string{topicFor(topic)}, []Priority{PriorityNormal})
+	require.Contains(t, destinationNames(spec.Destinations), producer.messages[0].Destination)
+}
+
+func TestVersionedConfiguredTopicPublisherSubscriberRoundTrip(t *testing.T) {
+	producer := &recordingProducer{}
+	client := newPublishClient(t, producer)
+	topic := "orders.created.v1"
+	subscription := Subscription{
+		Name:       "orders-worker",
+		Topics:     []string{topic},
+		Priorities: []Priority{PriorityNormal},
+		Retry:      RetryConfig{MaxAttempts: 1},
+	}
+
+	_, err := client.Publisher().Publish(context.Background(), topic, map[string]string{"id": "o1"}, WithTopic(topic))
+	require.NoError(t, err)
+	require.Len(t, producer.messages, 1)
+
+	spec := subscriptionTopologySpecs(client.effective, client.source, subscription)
+	require.Contains(t, destinationNames(spec.Destinations), producer.messages[0].Destination)
 }

@@ -58,7 +58,7 @@ func runRebalance(group *groupContext) {
 		if err := producer.Publish(group.ctx, driver.OutboundMessage{Destination: "rebalance.in-flight", Body: []byte("once")}); err != nil {
 			t.Fatal(err)
 		}
-		inFlight, departing, survivor := receiveFromEither(t, group, first, second)
+		inFlight, departing, survivor := receiveFromEither(t, group, "in-flight message", first, second)
 		if err := departing.Drain(group.ctx); err != nil {
 			t.Fatal(err)
 		}
@@ -92,7 +92,7 @@ func runRebalance(group *groupContext) {
 		if err := producer.Publish(group.ctx, driver.OutboundMessage{Destination: "rebalance.delivery-count"}); err != nil {
 			t.Fatal(err)
 		}
-		first, departing, survivor := receiveFromEither(t, group, firstConsumer, secondConsumer)
+		first, departing, survivor := receiveFromEither(t, group, "delivery-count message", firstConsumer, secondConsumer)
 		if err := departing.Drain(group.ctx); err != nil {
 			t.Fatal(err)
 		}
@@ -113,17 +113,45 @@ func runRebalance(group *groupContext) {
 
 	group.Check("each consumer keeps its own prefetch budget after joining", func(t *testing.T) {
 		producer := newProducer(t, group, "rebalance.prefetch", driver.ProducerConfig{Effective: group.effective})
-		first := newConsumer(t, group, "rebalance.prefetch", 1)
-		second := newConsumer(t, group, "rebalance.prefetch", 2)
+		const firstPrefetch = 1
+		const secondPrefetch = 2
+		first := newConsumer(t, group, "rebalance.prefetch", firstPrefetch)
+		second := newConsumer(t, group, "rebalance.prefetch", secondPrefetch)
 		publishCount(t, group, producer, "rebalance.prefetch", 4)
 		waitFor(t, group, "per-consumer prefetch budgets to saturate", func() (bool, string) {
 			view := inspectDestination(t, group, "rebalance.prefetch")
 			return view.Unsettled == 3 && view.Ready == 1, fmt.Sprintf("view=%+v", view)
 		})
-		ackMessage(t, group, receiveMessage(t, group, first))
-		ackMessage(t, group, receiveMessage(t, group, second))
-		ackMessage(t, group, receiveMessage(t, group, second))
-		ackMessage(t, group, receiveMessage(t, group, first))
+
+		initial := make([]driver.InboundMessage, 0, firstPrefetch+secondPrefetch)
+		firstOutstanding, secondOutstanding := 0, 0
+		for i := 0; i < firstPrefetch+secondPrefetch; i++ {
+			message, owner, _ := receiveFromEither(t, group, "prefetch delivery", first, second)
+			initial = append(initial, message)
+			switch owner {
+			case first:
+				firstOutstanding++
+			case second:
+				secondOutstanding++
+			default:
+				t.Fatalf("prefetch delivery came from an unknown consumer")
+			}
+		}
+		if firstOutstanding > firstPrefetch {
+			t.Fatalf("first consumer held %d unsettled messages, prefetch=%d", firstOutstanding, firstPrefetch)
+		}
+		if secondOutstanding > secondPrefetch {
+			t.Fatalf("second consumer held %d unsettled messages, prefetch=%d", secondOutstanding, secondPrefetch)
+		}
+		for _, message := range initial {
+			ackMessage(t, group, message)
+		}
+		last, _, _ := receiveFromEither(t, group, "prefetch delivery", first, second)
+		ackMessage(t, group, last)
+		waitFor(t, group, "prefetch destination to drain after all messages are acknowledged", func() (bool, string) {
+			view := inspectDestination(t, group, "rebalance.prefetch")
+			return view.Ready == 0 && view.Unsettled == 0, fmt.Sprintf("view=%+v", view)
+		})
 		group.vector.Add(BehaviorEvent{ID: "rebalance-prefetch", Outcome: "bounded", FinalDestination: "rebalance.prefetch"})
 	})
 
@@ -311,12 +339,13 @@ func isAlreadySettled(err error) bool {
 func receiveFromEither(
 	t *testing.T,
 	group *groupContext,
+	what string,
 	first, second driver.Consumer,
 ) (driver.InboundMessage, driver.Consumer, driver.Consumer) {
 	t.Helper()
 	var received driver.InboundMessage
 	var owner, other driver.Consumer
-	waitFor(t, group, "keyed message", func() (bool, string) {
+	waitFor(t, group, what, func() (bool, string) {
 		select {
 		case message, ok := <-first.Messages():
 			if !ok {

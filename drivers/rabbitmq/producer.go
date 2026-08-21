@@ -63,6 +63,14 @@ func (p *producer) Publish(ctx context.Context, msgs ...driver.OutboundMessage) 
 	if p.closed {
 		return classify("publish", driver.KindTransient, amqp.ErrClosed)
 	}
+	if raw := p.conn.publishFault.Swap(0); raw != 0 {
+		kind := driver.Kind(raw - 1)
+		failed := make(map[int]error, len(msgs))
+		for index := range msgs {
+			failed[index] = classify("publish", kind, errors.New("injected publish fault"))
+		}
+		return &driver.PublishError{Failed: failed}
+	}
 
 	failed := make(map[int]error)
 	for index, message := range msgs {

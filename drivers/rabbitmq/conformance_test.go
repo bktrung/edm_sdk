@@ -12,9 +12,10 @@ import (
 func TestConformance(t *testing.T) {
 	requireBroker(t)
 	conformance.Run(t, conformance.Suite{
-		Driver:       Driver{},
-		Config:       driver.Config{},
-		NewInspector: rabbitInspector,
+		Driver:           Driver{},
+		Config:           driver.Config{},
+		NewInspector:     rabbitInspector,
+		NewFaultInjector: rabbitFaultInjector,
 	})
 }
 

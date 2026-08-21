@@ -52,7 +52,6 @@ func (k Kind) String() string {
 type ClassifiedError interface {
 	error
 	Kind() Kind
-	Retryable() bool
 }
 
 // Error is the standard ClassifiedError implementation. Drivers may return
