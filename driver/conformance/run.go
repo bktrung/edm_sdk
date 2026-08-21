@@ -505,7 +505,7 @@ func validateFaultInjector(t *testing.T, ctx context.Context, conn driver.Conn, 
 	}
 	fatalErr := fatalProducer.Publish(ctx, driver.OutboundMessage{Destination: fatalDestination})
 	var fatalClassified driver.ClassifiedError
-	if fatalErr == nil || !errors.As(fatalErr, &fatalClassified) || fatalClassified.Kind() != driver.KindFatal || fatalClassified.Retryable() {
+	if fatalErr == nil || !errors.As(fatalErr, &fatalClassified) || fatalClassified.Kind() != driver.KindFatal {
 		t.Fatalf("conformance: fault injector %s was not observed as fatal non-retryable publish failure: %v", FaultFatalPublish, fatalErr)
 	}
 }

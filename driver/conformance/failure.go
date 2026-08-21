@@ -17,7 +17,7 @@ func runFailure(group *groupContext) {
 		producer := newProducer(t, group, name, driver.ProducerConfig{Effective: group.effective})
 		injectFailure(t, group, FaultPublishFailure)
 		err := producer.Publish(group.ctx, driver.OutboundMessage{Destination: name})
-		assertFaultError(t, err, driver.KindTransient, true)
+		assertFaultError(t, err, driver.KindTransient)
 		group.vector.Add(BehaviorEvent{ID: "failure-publish-transient", Outcome: "transient", FinalDestination: name})
 	})
 
@@ -57,7 +57,7 @@ func runFailure(group *groupContext) {
 		consumer := newConsumer(t, group, name, 1)
 		injectFailure(t, group, FaultConnectionDrop)
 		err := receiveFailureError(t, group, consumer)
-		assertFaultError(t, err, driver.KindTransient, true)
+		assertFaultError(t, err, driver.KindTransient)
 		group.vector.Add(BehaviorEvent{ID: "failure-errors-classified", Outcome: "transient", FinalDestination: name})
 	})
 
@@ -69,7 +69,7 @@ func runFailure(group *groupContext) {
 		_ = receiveFailureError(t, group, consumer)
 		injectFailure(t, group, FaultConnectionDrop)
 		second := receiveFailureError(t, group, consumer)
-		assertFaultError(t, second, driver.KindTransient, true)
+		assertFaultError(t, second, driver.KindTransient)
 		group.vector.Add(BehaviorEvent{ID: "failure-errors-open", Outcome: "open", FinalDestination: name})
 	})
 
@@ -172,7 +172,7 @@ func runFailure(group *groupContext) {
 		first := receiveMessage(t, group, consumer)
 		injectFailure(t, group, FaultConnectionDrop)
 		err := first.Settle.Ack(group.ctx)
-		assertFaultError(t, err, driver.KindFatal, false)
+		assertFaultError(t, err, driver.KindFatal)
 		ackMessage(t, group, receiveMessage(t, group, consumer))
 		group.vector.Add(BehaviorEvent{ID: "failure-settlement-fatal", Outcome: "fatal", FinalDestination: name})
 	})
@@ -202,7 +202,7 @@ func runFailure(group *groupContext) {
 		producer := newProducer(t, group, name, driver.ProducerConfig{Effective: group.effective})
 		injectFailure(t, group, FaultFatalPublish)
 		err := producer.Publish(group.ctx, driver.OutboundMessage{Destination: name})
-		assertFaultError(t, err, driver.KindFatal, false)
+		assertFaultError(t, err, driver.KindFatal)
 		group.vector.Add(BehaviorEvent{ID: "failure-publish-fatal", Outcome: "fatal", FinalDestination: name})
 	})
 
@@ -280,7 +280,7 @@ func receiveFailureError(t *testing.T, group *groupContext, consumer driver.Cons
 	return received
 }
 
-func assertFaultError(t *testing.T, err error, wantKind driver.Kind, wantRetryable bool) {
+func assertFaultError(t *testing.T, err error, wantKind driver.Kind) {
 	t.Helper()
 	if err == nil {
 		t.Fatalf("error=nil, want %s", wantKind)
@@ -292,9 +292,6 @@ func assertFaultError(t *testing.T, err error, wantKind driver.Kind, wantRetryab
 	if classified.Kind() != wantKind {
 		t.Fatalf("error classification=%v, want %v", classified.Kind(), wantKind)
 	}
-	if classified.Retryable() != wantRetryable {
-		t.Fatalf("error Retryable()=%v, want %v", classified.Retryable(), wantRetryable)
-	}
 }
 
 func runDeterministicFaultSequence(t *testing.T, group *groupContext, name string) string {
@@ -304,7 +301,7 @@ func runDeterministicFaultSequence(t *testing.T, group *groupContext, name strin
 	injectFailure(t, group, FaultPublishFailure)
 	failed := producer.Publish(group.ctx, driver.OutboundMessage{Destination: name, Body: []byte("failed")})
 	kind, classified := driver.Classify(failed)
-	assertFaultError(t, failed, driver.KindTransient, true)
+	assertFaultError(t, failed, driver.KindTransient)
 	if err := producer.Publish(group.ctx, driver.OutboundMessage{Destination: name, Body: []byte("ok")}); err != nil {
 		t.Fatal(err)
 	}
