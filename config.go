@@ -175,6 +175,9 @@ func resolvePrefetch(prefetch, brokerDefault int) int {
 
 func normalizeConfig(cfg Config) Config {
 	defaults := defaultConfig()
+	if cfg.Codec.Default == "" {
+		cfg.Codec.Default = defaults.Codec.Default
+	}
 	if cfg.Codec.ContentMode == "" {
 		cfg.Codec.ContentMode = defaults.Codec.ContentMode
 	}

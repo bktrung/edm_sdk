@@ -155,6 +155,35 @@ func TestDispatchUsesConfiguredDefaultForEmptyContentType(t *testing.T) {
 	}
 }
 
+func TestHandBuiltConfigUsesJSONDefaultForEmptyContentType(t *testing.T) {
+	cfg := Config{Env: "test", Service: "orders", Broker: BrokerConfig{Driver: "inmem"}}
+	cfg.Topology.AutoCreate = true
+	client, runner, _ := newCodecSelectionRunner(t, cfg)
+	defer func() { _ = client.Close(context.Background()) }()
+
+	var got struct {
+		Value string `json:"value"`
+	}
+	var decodeErr error
+	runner.subscription.Handlers = map[string]Handler{
+		"orders.created.v1": HandlerFunc(func(_ context.Context, event *Event) error {
+			decodeErr = event.Decode(&got)
+			return decodeErr
+		}),
+	}
+	settler := &dispatchSettler{}
+	message := codecSelectionMessage(t, codecSelectionEnvelope(""), []byte(`{"value":"hand-built"}`), settler)
+	if !dispatchMessage(runner, context.Background(), message, &Envelope{}, new(bool)) {
+		t.Fatal("hand-built config message was not settled")
+	}
+	if decodeErr != nil {
+		t.Fatalf("hand-built config decode error = %v", decodeErr)
+	}
+	if got.Value != "hand-built" {
+		t.Fatalf("decoded value = %q, want hand-built", got.Value)
+	}
+}
+
 func TestUnknownContentTypeDeadLettersBeforeHandler(t *testing.T) {
 	cfg := testClientConfig(t)
 	client, runner, producer := newCodecSelectionRunner(t, cfg)
@@ -196,6 +225,20 @@ func TestNewRejectsUnregisteredCodecDefault(t *testing.T) {
 	}
 	if drv.opened {
 		t.Fatal("driver opened before rejecting unregistered default codec")
+	}
+}
+
+func TestWithCodecRequiresAtLeastOneCodec(t *testing.T) {
+	client, err := New(context.Background(), testClientConfig(t),
+		WithDriver(&dispatchDriver{conn: &dispatchConn{producer: &dispatchProducer{}}}),
+		WithCodec(),
+	)
+	if err == nil {
+		_ = client.Close(context.Background())
+		t.Fatal("WithCodec() was accepted without a codec")
+	}
+	if got, want := err.Error(), "f1: WithCodec requires at least one codec"; got != want {
+		t.Fatalf("WithCodec() error = %q, want %q", got, want)
 	}
 }
 

@@ -1221,10 +1221,7 @@ func publishSuccessor(r *Runner, ctx context.Context, messages ...driver.Outboun
 // error handler) that still needs to identify which message an async
 // failure is about.
 func eventFromDelivery(r *Runner, message driver.InboundMessage, envelope Envelope) *Event {
-	eventCodec, err := r.client.codecForContentType(envelope.DataContentType)
-	if err != nil {
-		return nil
-	}
+	eventCodec, _ := r.client.codecForContentType(envelope.DataContentType)
 	return &Event{envelope: envelope, raw: append([]byte(nil), message.Body...), codec: eventCodec, headers: inboundHeaders(message.Headers)}
 }
 

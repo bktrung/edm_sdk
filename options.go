@@ -63,13 +63,13 @@ func WithDriver(d driver.Driver) Option {
 // for publishing; all codecs are selected by their content type on reads.
 func WithCodec(codecs ...codec.Codec) Option {
 	return func(options *clientOptions) error {
+		if len(codecs) == 0 {
+			return fmt.Errorf("f1: WithCodec requires at least one codec")
+		}
 		for _, c := range codecs {
 			if isNil(c) {
 				return fmt.Errorf("f1: WithCodec requires a non-nil codec")
 			}
-		}
-		if len(codecs) == 0 {
-			return nil
 		}
 		if options.codecsByContentType == nil {
 			options.codecsByContentType = make(map[string]codec.Codec)

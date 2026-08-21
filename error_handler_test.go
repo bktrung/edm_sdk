@@ -154,12 +154,13 @@ func TestErrorHandlerReceivesSuccessorHandoffFailure(t *testing.T) {
 
 	settler := &retryBridgeSettler{}
 	envelope := Envelope{
-		SpecVersion: "1.0",
-		ID:          "handoff-failure",
-		Source:      "/test/orders",
-		Type:        "orders.created.v1",
-		Priority:    PriorityHigh,
-		Attempt:     1,
+		SpecVersion:     "1.0",
+		ID:              "handoff-failure",
+		Source:          "/test/orders",
+		Type:            "orders.created.v1",
+		DataContentType: "application/protobuf",
+		Priority:        PriorityHigh,
+		Attempt:         1,
 	}
 	message := retryBridgeMessage(t, envelope, settler)
 	if retryAndSettle(runner, context.Background(), message, envelope, errors.New("temporary")) {
@@ -177,6 +178,9 @@ func TestErrorHandlerReceivesSuccessorHandoffFailure(t *testing.T) {
 	}
 	if got := call.event.ID(); got != envelope.ID {
 		t.Fatalf("event ID = %q, want %q", got, envelope.ID)
+	}
+	if err := call.event.Decode(&map[string]any{}); err == nil || err.Error() != "f1: event codec is unavailable" {
+		t.Fatalf("event.Decode() error = %v, want unavailable-codec error", err)
 	}
 	var classified *driver.Error
 	if !errors.As(call.err, &classified) {
