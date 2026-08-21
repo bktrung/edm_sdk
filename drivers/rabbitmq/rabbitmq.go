@@ -128,19 +128,21 @@ func (Driver) Open(ctx context.Context, cfg driver.Config) (driver.Conn, error) 
 }
 
 type conn struct {
-	mu         sync.RWMutex
-	topologyMu sync.Mutex
-	amqp       *amqp.Connection
-	caps       driver.Capabilities
-	info       driver.BrokerInfo
-	queueKind  queueKind
-	management *managementClient
-	closed     bool
-	closing    bool
-	active     map[*consumer]struct{}
-	producers  map[*producer]struct{}
-	deferred   map[string]time.Duration
-	ephemeral  map[string]*amqp.Channel
+	mu              sync.RWMutex
+	topologyMu      sync.Mutex
+	amqp            *amqp.Connection
+	caps            driver.Capabilities
+	info            driver.BrokerInfo
+	queueKind       queueKind
+	management      *managementClient
+	closed          bool
+	closing         bool
+	active          map[*consumer]struct{}
+	producers       map[*producer]struct{}
+	publishFault    driver.Kind
+	publishFaultSet bool
+	deferred        map[string]time.Duration
+	ephemeral       map[string]*amqp.Channel
 }
 
 var _ driver.Conn = (*conn)(nil)

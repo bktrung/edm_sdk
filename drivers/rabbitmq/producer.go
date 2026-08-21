@@ -63,6 +63,13 @@ func (p *producer) Publish(ctx context.Context, msgs ...driver.OutboundMessage) 
 	if p.closed {
 		return classify("publish", driver.KindTransient, amqp.ErrClosed)
 	}
+	if kind, ok := p.takeInjectedPublishFault(); ok {
+		failed := make(map[int]error, len(msgs))
+		for index := range msgs {
+			failed[index] = classify("publish", kind, errors.New("injected publish fault"))
+		}
+		return &driver.PublishError{Failed: failed}
+	}
 
 	failed := make(map[int]error)
 	for index, message := range msgs {
@@ -264,4 +271,15 @@ func (p *producer) Close(ctx context.Context) error {
 		return classifyAMQP("producer.close", driver.KindTransient, err)
 	}
 	return nil
+}
+
+func (p *producer) takeInjectedPublishFault() (driver.Kind, bool) {
+	p.conn.mu.Lock()
+	defer p.conn.mu.Unlock()
+	if !p.conn.publishFaultSet {
+		return driver.KindTransient, false
+	}
+	kind := p.conn.publishFault
+	p.conn.publishFaultSet = false
+	return kind, true
 }
