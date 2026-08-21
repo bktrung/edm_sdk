@@ -215,6 +215,9 @@ func TestPublishAttemptDuringCloseIsRefused(t *testing.T) {
 		flushRelease: make(chan struct{}),
 	}
 	client := newPublishClient(t, producer)
+	var release sync.Once
+	releaseFlush := func() { release.Do(func() { close(producer.flushRelease) }) }
+	t.Cleanup(releaseFlush)
 	if _, err := client.Publisher().Publish(context.Background(), "orders.created", "first"); err != nil {
 		t.Fatal(err)
 	}
@@ -223,18 +226,20 @@ func TestPublishAttemptDuringCloseIsRefused(t *testing.T) {
 	go func() { closeDone <- client.Close(context.Background()) }()
 	<-producer.flushStarted
 	publishDone := make(chan error, 1)
+	publishReturned := make(chan struct{})
 	go func() {
 		_, err := client.Publisher().Publish(context.Background(), "orders.created", "during-close")
+		close(publishReturned)
 		publishDone <- err
 	}()
-	timer := client.options.clock.Timer(50 * time.Millisecond)
-	defer timer.Stop()
+	waitTimer := client.options.clock.Timer(100 * time.Millisecond)
+	defer waitTimer.Stop()
 	select {
-	case err := <-publishDone:
-		t.Fatalf("Publish returned while Close was flushing: %v", err)
-	case <-timer.C:
+	case <-publishReturned:
+	case <-waitTimer.C:
+		t.Fatal("Publish did not refuse admission while Close was flushing")
 	}
-	close(producer.flushRelease)
+	releaseFlush()
 	if err := <-closeDone; err != nil {
 		t.Fatalf("Close() = %v", err)
 	}

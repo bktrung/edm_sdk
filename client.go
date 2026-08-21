@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"sync"
+	"time"
 
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/codec"
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/driver"
@@ -43,6 +44,14 @@ type Client struct {
 	// retried Close rejoins this same call instead of starting a second one
 	// against the same producer.
 	producerCloseWait <-chan error
+	// flushWait holds a still-running producer Flush call from a prior Close
+	// attempt. A retried Close rejoins this same call instead of starting a
+	// second one against the same producer.
+	flushWait <-chan error
+	// connCloseWait holds a still-running connection Close call from a prior
+	// Close attempt. A retried Close rejoins this same call instead of starting
+	// a second one against the same connection.
+	connCloseWait <-chan error
 }
 
 // Limits describes how the connected broker provides each SDK feature.
@@ -265,17 +274,16 @@ func (c *Client) Limits() Limits {
 	return result
 }
 
-// Close flushes and releases the driver resources. A flush error leaves the
-// Client open so the caller can retry. If the producer Close call does not
-// return within the close timeout, the Client also stays open, the connection
-// is untouched, and a retried Close rejoins the same pending call rather than
-// starting another one. If producer Close returns an error, shutdown
-// continues: the producer has finished, the Client closes, and the error is
-// logged and returned. If connection Close fails, the Client stays open so a
-// retried Close can attempt it again. In short, Close keeps the Client open
-// while something is pending and closes it when everything has finished,
-// successfully or not. A concurrent Close call returns an error stating that
-// shutdown is already in progress.
+// Close drains active work and releases the driver resources. It keeps the
+// Client retryable when a shutdown phase is still pending, while refusing new
+// work after shutdown has begun. A timed-out phase continues in the
+// background, and a retried Close rejoins it rather than starting a second
+// driver call. A resolved producer-close error is logged, joined into the
+// returned error, and does not prevent connection shutdown. A resolved
+// connection-close error leaves the Client retryable so a later Close can
+// attempt it again. Once all phases have finished, the Client is closed even
+// when one of them returned an error. A concurrent Close call returns an error
+// stating that shutdown is already in progress.
 func (c *Client) Close(ctx context.Context) error {
 	if c == nil {
 		return nil
@@ -305,17 +313,17 @@ func (c *Client) Close(ctx context.Context) error {
 		return err
 	}
 	runnerErrors := make(chan error, len(runners))
-	var group sync.WaitGroup
-	group.Add(len(runners))
+	var drain sync.WaitGroup
+	drain.Add(len(runners))
 	for _, runner := range runners {
 		go func(runner *Runner) {
-			defer group.Done()
+			defer drain.Done()
 			if err := runner.Drain(ctx); err != nil {
 				runnerErrors <- err
 			}
 		}(runner)
 	}
-	group.Wait()
+	drain.Wait()
 	close(runnerErrors)
 	var drainErrors []error
 	for err := range runnerErrors {
@@ -342,25 +350,39 @@ func (c *Client) Close(ctx context.Context) error {
 	c.mu.Lock()
 	producer := c.producerHandle
 	conn := c.conn
+	flushWait := c.flushWait
 	producerCloseWait := c.producerCloseWait
+	connCloseWait := c.connCloseWait
 	c.mu.Unlock()
 	if producer != nil {
 		if producerCloseWait == nil {
+			if flushWait == nil {
+				//nolint:contextcheck // this shutdown call must outlive the attempt and is rejoined on retry.
+				flushWait = startShutdownPhase(context.Background(), nil, producer.Flush)
+				c.mu.Lock()
+				c.flushWait = flushWait
+				c.mu.Unlock()
+			}
+			flushErr, resolved := c.joinShutdownPhase(ctx, c.config.Lifecycle.FlushTimeout, "flush", flushWait)
+			if !resolved {
+				return fail(flushErr)
+			}
 			c.mu.Lock()
-			flushErr := runWithClockTimeout(ctx, c.options.clock, c.config.Lifecycle.FlushTimeout, "flush", producer.Flush)
+			c.flushWait = nil
 			c.mu.Unlock()
 			if flushErr != nil {
 				return fail(flushErr)
 			}
-			// producer.Close runs against context.Background, not ctx: this
-			// call may outlive the current Close attempt (see below), and a
-			// retried Close must be able to rejoin it rather than have it
-			// rejected up front by a context this attempt already owns.
-			//nolint:contextcheck // deliberately decoupled from this attempt's ctx; see comment above.
-			producerCloseWait = startPhase(context.Background(), producer.Close)
 		}
 
-		producerCloseErr, resolved := joinPhase(ctx, c.options.clock, c.config.Lifecycle.CloseTimeout, "close", producerCloseWait)
+		if producerCloseWait == nil {
+			//nolint:contextcheck // this shutdown call must outlive the attempt and is rejoined on retry.
+			producerCloseWait = startShutdownPhase(context.Background(), nil, producer.Close)
+			c.mu.Lock()
+			c.producerCloseWait = producerCloseWait
+			c.mu.Unlock()
+		}
+		producerCloseErr, resolved := c.joinShutdownPhase(ctx, c.config.Lifecycle.CloseTimeout, "close", producerCloseWait)
 		if !resolved {
 			// producer.Close has not returned. The driver's Close contract
 			// requires every Producer created from a connection to be closed
@@ -369,9 +391,6 @@ func (c *Client) Close(ctx context.Context) error {
 			// pending call so a retried Close rejoins it instead of starting
 			// a second one, and report the failure without ever touching
 			// the connection.
-			c.mu.Lock()
-			c.producerCloseWait = producerCloseWait
-			c.mu.Unlock()
 			if c.options.logger != nil {
 				c.options.logger.Warn("f1 producer close did not return in time", "error", producerCloseErr)
 			}
@@ -384,7 +403,20 @@ func (c *Client) Close(ctx context.Context) error {
 		if producerCloseErr != nil && c.options.logger != nil {
 			c.options.logger.Warn("f1 producer close failed", "error", producerCloseErr)
 		}
-		connErr := runWithClockTimeout(ctx, c.options.clock, c.config.Lifecycle.CloseTimeout, "close", conn.Close)
+		if connCloseWait == nil {
+			//nolint:contextcheck // this shutdown call must outlive the attempt and is rejoined on retry.
+			connCloseWait = startShutdownPhase(context.Background(), nil, conn.Close)
+			c.mu.Lock()
+			c.connCloseWait = connCloseWait
+			c.mu.Unlock()
+		}
+		connErr, resolved := c.joinShutdownPhase(ctx, c.config.Lifecycle.CloseTimeout, "close", connCloseWait)
+		if !resolved {
+			return fail(errors.Join(producerCloseErr, connErr))
+		}
+		c.mu.Lock()
+		c.connCloseWait = nil
+		c.mu.Unlock()
 		if connErr != nil {
 			return fail(errors.Join(producerCloseErr, connErr))
 		}
@@ -394,7 +426,20 @@ func (c *Client) Close(ctx context.Context) error {
 		c.mu.Unlock()
 		return errors.Join(producerCloseErr, c.metrics.Close())
 	}
-	connErr := runWithClockTimeout(ctx, c.options.clock, c.config.Lifecycle.CloseTimeout, "close", conn.Close)
+	if connCloseWait == nil {
+		//nolint:contextcheck // this shutdown call must outlive the attempt and is rejoined on retry.
+		connCloseWait = startShutdownPhase(context.Background(), nil, conn.Close)
+		c.mu.Lock()
+		c.connCloseWait = connCloseWait
+		c.mu.Unlock()
+	}
+	connErr, resolved := c.joinShutdownPhase(ctx, c.config.Lifecycle.CloseTimeout, "close", connCloseWait)
+	if !resolved {
+		return fail(connErr)
+	}
+	c.mu.Lock()
+	c.connCloseWait = nil
+	c.mu.Unlock()
 	if connErr != nil {
 		return fail(connErr)
 	}
@@ -403,6 +448,19 @@ func (c *Client) Close(ctx context.Context) error {
 	c.closing = false
 	c.mu.Unlock()
 	return c.metrics.Close()
+}
+
+// startShutdownPhase starts a shutdown call with the context supplied by
+// Close. Close supplies Background so the call can outlive the attempt.
+func startShutdownPhase(ctx context.Context, pending <-chan error, fn func(context.Context) error) <-chan error {
+	if pending != nil {
+		return pending
+	}
+	return startPhase(ctx, fn)
+}
+
+func (c *Client) joinShutdownPhase(ctx context.Context, timeout time.Duration, phase string, done <-chan error) (error, bool) {
+	return joinPhase(ctx, c.options.clock, timeout, phase, done)
 }
 
 // publishMessages sends core-generated successor messages through the client's
