@@ -202,7 +202,7 @@ func (c *recordingClock) sleepAt(index int) time.Duration {
 	return c.sleeps[index]
 }
 
-func newReconnectTestClient(t *testing.T, d *reconnectTestDriver, c clock.Clock, maxAttempts int) *Client {
+func newReconnectTestClient(t *testing.T, d *reconnectTestDriver, c clock.Clock, maxAttempts int, extra ...Option) *Client {
 	t.Helper()
 	cfg := testClientConfig(t)
 	cfg.Broker.MaxReconnectAttempts = maxAttempts
@@ -214,6 +214,7 @@ func newReconnectTestClient(t *testing.T, d *reconnectTestDriver, c clock.Clock,
 		WithDriver(d),
 		WithLogger(slog.New(slog.NewTextHandler(io.Discard, nil))),
 	}
+	options = append(options, extra...)
 	if c != nil {
 		options = append(options, WithClock(c))
 	}
@@ -334,6 +335,95 @@ func TestRunnerReconnectsAndResumesDelivery(t *testing.T) {
 	client.mu.Unlock()
 	if !shutdownStarted {
 		t.Fatal("Close did not set shutdownStarted")
+	}
+}
+
+func TestPublishFailsFastDuringReconnect(t *testing.T) {
+	fake := clock.NewFake(time.Unix(150, 0))
+	recorded := &recordingClock{Fake: fake}
+	d := &reconnectTestDriver{created: make(chan *reconnectTestConsumer, 8)}
+	client := newReconnectTestClient(t, d, recorded, 0)
+	client.reconnectRandom = func() float64 { return 1 }
+	if _, err := client.requestReconnect(errors.New("transient")); err != nil {
+		t.Fatal(err)
+	}
+	waitReconnectCondition(t, func() bool { return recorded.sleepCount() == 1 })
+
+	publishDone := make(chan error, 1)
+	go func() {
+		_, err := client.Publisher().Publish(context.Background(), "orders.created", map[string]string{"value": "during-reconnect"})
+		publishDone <- err
+	}()
+	timer := clock.NewReal().Timer(100 * time.Millisecond)
+	defer timer.Stop()
+	select {
+	case err := <-publishDone:
+		if kind, classified := driver.Classify(err); !classified || kind != driver.KindTransient {
+			t.Fatalf("Publish() = %v, want classified transient", err)
+		}
+		if !errors.Is(err, errClientReconnecting) {
+			t.Fatalf("Publish() = %v, want errClientReconnecting", err)
+		}
+	case <-timer.C:
+		t.Fatal("Publish() blocked while reconnect was in progress")
+	}
+	if !client.isReconnecting() {
+		t.Fatal("reconnect completed before the fail-fast publish returned")
+	}
+	if got := d.connections[0].producer.Load(); got != 0 {
+		t.Fatalf("old connection producer count = %d, want 0", got)
+	}
+}
+
+func TestPublishRefusesStaleConnection(t *testing.T) {
+	codecFixture := blockingCodec{
+		encodeStarted:     make(chan struct{}),
+		encodeStartedOnce: make(chan struct{}),
+		encodeRelease:     make(chan struct{}),
+	}
+	d := &reconnectTestDriver{created: make(chan *reconnectTestConsumer, 8)}
+	client := newReconnectTestClient(t, d, nil, 0, WithCodec(codecFixture))
+	oldConn := d.connections[0]
+	publishDone := make(chan error, 1)
+	go func() {
+		_, err := client.Publisher().Publish(context.Background(), "orders.created", map[string]string{"value": "stale"})
+		publishDone <- err
+	}()
+	codecTimer := clock.NewReal().Timer(time.Second)
+	defer codecTimer.Stop()
+	select {
+	case <-codecFixture.encodeStarted:
+	case <-codecTimer.C:
+		t.Fatal("publish did not reach the codec")
+	}
+
+	replacement := &reconnectTestConn{driver: d, admin: &reconnectTestAdmin{}}
+	client.mu.Lock()
+	client.conn = replacement
+	client.mu.Unlock()
+	if err := oldConn.Close(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	close(codecFixture.encodeRelease)
+
+	timer := clock.NewReal().Timer(time.Second)
+	defer timer.Stop()
+	select {
+	case err := <-publishDone:
+		if kind, classified := driver.Classify(err); !classified || kind != driver.KindTransient {
+			t.Fatalf("Publish() = %v, want classified transient", err)
+		}
+		if !errors.Is(err, errClientReconnecting) {
+			t.Fatalf("Publish() = %v, want errClientReconnecting", err)
+		}
+	case <-timer.C:
+		t.Fatal("stale publish did not return")
+	}
+	if got := oldConn.producer.Load(); got != 0 {
+		t.Fatalf("retired connection producer count = %d, want 0", got)
+	}
+	if got := replacement.producer.Load(); got != 0 {
+		t.Fatalf("replacement connection producer count = %d, want 0", got)
 	}
 }
 
