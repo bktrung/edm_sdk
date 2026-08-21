@@ -42,7 +42,7 @@ func (m *Machine) Drain(ctx context.Context, cfg Config, hooks Hooks) error {
 		phaseClock = clock.NewReal()
 	}
 	state := m.State()
-	if state == Ready {
+	if state == Ready || state == Reconnecting {
 		if err := m.Transition(Draining); err != nil {
 			return err
 		}

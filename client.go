@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math/rand/v2"
 	"sync"
 	"time"
 
@@ -13,6 +14,21 @@ import (
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/clock"
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/obs"
 )
+
+var errClientReconnecting = errors.New("f1: client is reconnecting")
+
+const reconnectDriverInitialInterval = 500 * time.Millisecond
+
+const reconnectDriverMaxInterval = 30 * time.Second
+
+type reconnectAttempt struct {
+	done chan struct{}
+	err  error
+}
+
+type reconnectRequest struct {
+	cause error
+}
 
 // Client is an eagerly connected messaging client.
 type Client struct {
@@ -38,6 +54,15 @@ type Client struct {
 	activePublishes int
 	publishIdle     chan struct{}
 	runners         map[*Runner]struct{}
+
+	// reconnecting reports connection usability, independently of shutdownStarted.
+	reconnecting      bool
+	reconnect         *reconnectAttempt
+	reconnectRequests chan reconnectRequest
+	reconnectRandom   func() float64
+	supervisorCtx     context.Context
+	supervisorCancel  context.CancelFunc
+	supervisorDone    chan struct{}
 
 	// producerCloseWait holds a still-running producer Close call from a
 	// prior Close attempt that did not return within its close timeout. A
@@ -124,23 +149,31 @@ func New(ctx context.Context, cfg Config, opts ...Option) (*Client, error) {
 		_ = connection.Close(ctx)
 		return nil, fmt.Errorf("f1: initialize metrics: %w", err)
 	}
+	supervisorCtx, supervisorCancel := context.WithCancel(context.Background())
 	client := &Client{
-		conn:      connection,
-		effective: effective,
-		options:   options,
-		config:    cfg,
-		source:    fmt.Sprintf("/%s/%s", cfg.Env, cfg.Service),
-		producer:  fmt.Sprintf("%s/unknown/%s", cfg.Service, cfg.InstanceID),
-		metrics:   metrics,
-		runners:   make(map[*Runner]struct{}),
+		conn:              connection,
+		effective:         effective,
+		options:           options,
+		config:            cfg,
+		source:            fmt.Sprintf("/%s/%s", cfg.Env, cfg.Service),
+		producer:          fmt.Sprintf("%s/unknown/%s", cfg.Service, cfg.InstanceID),
+		reconnectRequests: make(chan reconnectRequest, 1),
+		reconnectRandom:   rand.Float64,
+		supervisorCtx:     supervisorCtx,
+		supervisorCancel:  supervisorCancel,
+		supervisorDone:    make(chan struct{}),
+		metrics:           metrics,
+		runners:           make(map[*Runner]struct{}),
 	}
 	client.limits = limitsFor(options.driver.Name(), connection.BrokerInfo(), effective)
 	logCapabilities(client)
 	if err := client.ensurePublisherTopology(ctx); err != nil {
+		supervisorCancel()
 		closeErr := connection.Close(ctx)
 		metricsErr := metrics.Close()
 		return nil, errors.Join(err, closeErr, metricsErr)
 	}
+	go client.reconnectSupervisor()
 	return client, nil
 }
 
@@ -158,15 +191,26 @@ func (c *Client) topologyPolicy() driver.TopologyPolicy {
 }
 
 func (c *Client) ensurePublisherTopology(ctx context.Context) error {
+	c.mu.Lock()
+	conn := c.conn
+	effective := c.effective
+	c.mu.Unlock()
+	return c.ensurePublisherTopologyOn(ctx, conn, effective)
+}
+
+func (c *Client) ensurePublisherTopologyOn(ctx context.Context, conn driver.Conn, effective driver.Capabilities) error {
 	policy := c.topologyPolicy()
 	if !c.options.publishTopicsSet || policy == driver.TopologyNone {
 		return nil
 	}
-	admin := c.conn.Admin()
+	if conn == nil {
+		return errors.New("f1: publisher topology requires a connected driver")
+	}
+	admin := conn.Admin()
 	if admin == nil {
 		return errors.New("f1: publisher topology requires driver admin")
 	}
-	spec := publisherTopologySpec(c.effective, c.source, c.options.publishTopics, c.config.Topology.Priorities)
+	spec := publisherTopologySpec(effective, c.source, c.options.publishTopics, c.config.Topology.Priorities)
 	spec.Policy = policy
 	if _, err := admin.EnsureTopology(ctx, spec); err != nil {
 		return fmt.Errorf("f1: ensure publisher topology: %w", err)
@@ -255,6 +299,10 @@ func (c *Client) Health(ctx context.Context) error {
 		c.mu.Unlock()
 		return fmt.Errorf("f1: client is closed")
 	}
+	if c.reconnecting {
+		c.mu.Unlock()
+		return fmt.Errorf("f1: client is reconnecting")
+	}
 	if c.shutdownStarted {
 		c.mu.Unlock()
 		return fmt.Errorf("f1: client is closing")
@@ -269,6 +317,8 @@ func (c *Client) Limits() Limits {
 	if c == nil {
 		return Limits{}
 	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	result := c.limits
 	result.Features = append([]FeatureStatus(nil), c.limits.Features...)
 	return result
@@ -301,8 +351,12 @@ func (c *Client) Close(ctx context.Context) error {
 	c.shutdownStarted = true
 	idle := c.publishIdle
 	runners := make([]*Runner, 0, len(c.runners))
+	supervisorCancel := c.supervisorCancel
 	for runner := range c.runners {
 		runners = append(runners, runner)
+	}
+	if supervisorCancel != nil {
+		supervisorCancel()
 	}
 	c.mu.Unlock()
 
@@ -475,6 +529,10 @@ func publishMessages(c *Client, ctx context.Context, allowClosing bool, messages
 		c.mu.Unlock()
 		return errors.New("f1: client is closed")
 	}
+	if c.reconnecting {
+		c.mu.Unlock()
+		return c.reconnectingError("publish")
+	}
 	producer := c.producerHandle
 	var err error
 	if producer == nil {
@@ -491,10 +549,23 @@ func publishMessages(c *Client, ctx context.Context, allowClosing bool, messages
 	}
 	c.mu.Unlock()
 	if err != nil {
+		requestReconnectOnTransient(c, err)
 		return err
 	}
 	defer endPublish(c)
-	return producer.Publish(ctx, messages...)
+	err = producer.Publish(ctx, messages...)
+	requestReconnectOnTransient(c, err)
+	return err
+}
+
+func requestReconnectOnTransient(c *Client, err error) {
+	if c == nil || err == nil {
+		return
+	}
+	if kind, classified := driver.Classify(err); !classified || kind != driver.KindTransient {
+		return
+	}
+	_, _ = c.requestReconnect(err)
 }
 
 func beginPublish(c *Client) {

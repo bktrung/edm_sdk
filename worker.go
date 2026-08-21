@@ -202,58 +202,112 @@ func (r *Runner) Run(ctx context.Context) error {
 	r.inflight = newInflightRegistry()
 	r.lifecycle = lifecycle.New()
 	r.accounting = lifecycle.NewAccounting(r.inflight.registry)
-	runCtx, cancel := context.WithCancel(ctx)
-	r.runCtx, r.cancel = runCtx, cancel
 	handlerCtx, handlerCancel := context.WithCancel(ctx)
 	r.handlerCtx, r.handlerCancel = handlerCtx, handlerCancel
 	handlerShutdownCtx, handlerShutdownCancel := context.WithCancel(context.Background())
 	r.handlerShutdownCtx, r.handlerShutdownCancel = handlerShutdownCtx, handlerShutdownCancel
 	r.asyncGroup = new(errgroup.Group)
-	group := new(errgroup.Group)
-	r.group = group
 	r.mu.Unlock()
 	r.client.mu.Unlock()
 
 	defer finishRunner(r)
-	consumer, err := openRunnerConsumer(r, runCtx)
-	if err != nil {
-		return err
-	}
-	r.mu.Lock()
-	r.consumer = consumer
-	r.mu.Unlock()
+	var runErr error
+	var runCtx context.Context
+	generation := 0
+	for {
+		runCtx, cancel := context.WithCancel(ctx)
+		r.mu.Lock()
+		r.runCtx = runCtx
+		r.cancel = cancel
+		r.reconnectCause = nil
+		group := new(errgroup.Group)
+		r.group = group
+		r.mu.Unlock()
 
-	if err := r.lifecycle.Transition(lifecycle.Ready); err != nil {
-		return err
+		consumer, err := openRunnerConsumer(r, runCtx)
+		if err != nil {
+			if generation == 0 {
+				return err
+			}
+			kind, classified := driver.Classify(err)
+			if classified && kind != driver.KindTransient {
+				runErr = err
+				break
+			}
+			r.mu.Lock()
+			r.reconnectCause = err
+			r.mu.Unlock()
+			r.transitionToReconnecting()
+			attempt, requestErr := r.client.requestReconnect(err)
+			if requestErr != nil {
+				runErr = requestErr
+				break
+			}
+			if waitErr := r.client.waitReconnect(ctx, attempt); waitErr != nil {
+				runErr = waitErr
+				break
+			}
+			continue
+		}
+		generation++
+		r.mu.Lock()
+		r.consumer = consumer
+		r.mu.Unlock()
+
+		switch r.lifecycle.State() {
+		case lifecycle.Starting, lifecycle.Reconnecting:
+			if err := r.lifecycle.Transition(lifecycle.Ready); err != nil {
+				runErr = err
+			}
+		case lifecycle.Ready:
+		default:
+			runErr = fmt.Errorf("f1: runner cannot start from lifecycle state %s", r.lifecycle.State())
+		}
+		if runErr != nil {
+			break
+		}
+
+		deliveries := make(chan delivery, r.subscription.Concurrency)
+		group.Go(func() error { return fetchRunner(r, runCtx, deliveries) })
+		group.Go(func() error { return runDispatchPipeline(r, runCtx, deliveries) })
+		group.Go(func() error { return consumeRunnerErrors(r, runCtx) })
+		generationErr := group.Wait()
+		if generationErr == nil {
+			generationErr = runnerError(r)
+		}
+		r.mu.Lock()
+		reconnectCause := r.reconnectCause
+		draining := r.draining
+		r.mu.Unlock()
+		if ctx.Err() != nil || draining || (!r.client.isReconnecting() && reconnectCause == nil) {
+			runErr = generationErr
+			break
+		}
+		if reconnectCause == nil {
+			reconnectCause = generationErr
+		}
+		if reconnectCause == nil {
+			reconnectCause = errClientReconnecting
+		}
+		r.transitionToReconnecting()
+		attempt, requestErr := r.client.requestReconnect(reconnectCause)
+		if requestErr != nil {
+			runErr = requestErr
+			break
+		}
+		if waitErr := r.client.waitReconnect(ctx, attempt); waitErr != nil {
+			runErr = waitErr
+			break
+		}
 	}
-	deliveries := make(chan delivery, r.subscription.Concurrency)
-	group.Go(func() error { return fetchRunner(r, runCtx, deliveries) })
-	group.Go(func() error { return runDispatchPipeline(r, runCtx, deliveries) })
-	group.Go(func() error { return consumeRunnerErrors(r, runCtx) })
-	err = group.Wait()
-	if err == nil {
-		err = runnerError(r)
-	}
-	shutdownCtx := context.WithoutCancel(runnerSettlementContext(r, runCtx))
-	shutdownErr := r.lifecycle.Drain(shutdownCtx, lifecycle.Config{
-		Clock:        r.client.options.clock,
-		DrainTimeout: r.client.config.Lifecycle.DrainTimeout,
-		FlushTimeout: r.client.config.Lifecycle.FlushTimeout,
-		CloseTimeout: r.client.config.Lifecycle.CloseTimeout,
-	}, lifecycle.Hooks{
-		WaitSettled: func(ctx context.Context) error {
-			return r.inflight.WaitZero(ctx)
-		},
-		Close: func(ctx context.Context) error {
-			return stopRunnerConsumer(r, ctx)
-		},
-	})
-	if err == nil {
-		err = shutdownErr
+
+	shutdownErr := r.drainAfterRun(runCtx) //nolint:contextcheck // drain preserves settlement context across generation cancellation.
+	if runErr == nil {
+		runErr = shutdownErr
 	} else if shutdownErr != nil {
-		err = errors.Join(err, shutdownErr)
+		runErr = errors.Join(runErr, shutdownErr)
 	}
-	return err
+	return runErr
 }
 
 func runDispatchPipeline(r *Runner, ctx context.Context, deliveries <-chan delivery) error {
@@ -408,17 +462,20 @@ func deliveryLane(r *Runner, message driver.InboundMessage) string {
 		tier := r.retryDestinationTiers[message.Destination]
 		r.mu.Unlock()
 		topic := topicFor(envelope.Type)
+		r.client.mu.Lock()
 		effective := r.client.effective
+		source := r.client.source
+		r.client.mu.Unlock()
 		for _, configured := range r.subscription.Topics {
 			logical := topicFor(configured)
 			if tier == 0 {
-				if consumeDestination(effective, r.client.source, logical, envelope.Priority, r.subscription.Name) == message.Destination {
+				if consumeDestination(effective, source, logical, envelope.Priority, r.subscription.Name) == message.Destination {
 					topic = logical
 					break
 				}
 				continue
 			}
-			if retryDestinationFor(r.client.source, logical, envelope.Priority, tier, r.subscription.Name) == message.Destination {
+			if retryDestinationFor(source, logical, envelope.Priority, tier, r.subscription.Name) == message.Destination {
 				topic = logical
 				break
 			}
@@ -449,6 +506,11 @@ func (r *Runner) Drain(ctx context.Context) error {
 	if r.lifecycle != nil {
 		switch r.lifecycle.State() {
 		case lifecycle.Ready:
+			if err := r.lifecycle.Transition(lifecycle.Draining); err != nil {
+				r.mu.Unlock()
+				return err
+			}
+		case lifecycle.Reconnecting:
 			if err := r.lifecycle.Transition(lifecycle.Draining); err != nil {
 				r.mu.Unlock()
 				return err
@@ -757,14 +819,25 @@ func consumeRunnerErrors(r *Runner, ctx context.Context) error {
 				continue
 			}
 			runnerLogger(r).Error("f1 consumer error", "subscription", r.subscription.Name, "error", err)
-			setRunnerError(r, err)
+			kind, classified := driver.Classify(err)
+			var cancel context.CancelFunc
+			if !classified || kind == driver.KindTransient {
+				r.mu.Lock()
+				if r.reconnectCause == nil {
+					r.reconnectCause = err
+				}
+				cancel = r.cancel
+				r.mu.Unlock()
+			} else {
+				setRunnerError(r, err)
+			}
 			// r.cancel below is about to cancel ctx, so the notification gets its
 			// own detached context: the handler's terminalNotificationTimeout
 			// budget must not collapse to zero just because the same error that
 			// is being reported is also what triggers shutdown.
 			runnerNotifyError(r, context.WithoutCancel(ctx), nil, err)
-			if r.cancel != nil {
-				r.cancel()
+			if cancel != nil {
+				cancel()
 			}
 			return nil
 		}

@@ -36,6 +36,25 @@ func TestMachineRejectsIllegalTransitions(t *testing.T) {
 	}
 }
 
+func TestMachineReconnectingProbesAndTransitions(t *testing.T) {
+	machine := New()
+	if err := machine.Transition(Ready); err != nil {
+		t.Fatal(err)
+	}
+	if err := machine.Transition(Reconnecting); err != nil {
+		t.Fatal(err)
+	}
+	if machine.Ready() || !machine.Live() {
+		t.Fatalf("reconnecting probes = ready %t live %t", machine.Ready(), machine.Live())
+	}
+	if err := machine.Transition(Ready); err != nil {
+		t.Fatal(err)
+	}
+	if !machine.Ready() {
+		t.Fatal("reconnected machine must become ready")
+	}
+}
+
 func TestMachineAbortIsTerminal(t *testing.T) {
 	machine := New()
 	if err := machine.Transition(Aborted); err != nil {
@@ -64,7 +83,7 @@ func TestStateStringsAndNilMachine(t *testing.T) {
 
 func TestAllStateStrings(t *testing.T) {
 	for state, want := range map[State]string{
-		Starting: "starting", Ready: "ready", Draining: "draining", Settling: "settling",
+		Starting: "starting", Ready: "ready", Reconnecting: "reconnecting", Draining: "draining", Settling: "settling",
 		Flushing: "flushing", Closed: "closed", Aborted: "aborted",
 	} {
 		if got := state.String(); got != want {

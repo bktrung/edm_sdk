@@ -1,6 +1,9 @@
 package retry
 
-import "time"
+import (
+	"math"
+	"time"
+)
 
 // Config is the retry-ladder data needed by the decision package. It mirrors
 // the public retry configuration without importing the root package.
@@ -35,12 +38,34 @@ func (c Config) DelayFor(attempt int) time.Duration {
 	}
 	delay := initial
 	for i := 1; i < attempt; i++ {
-		delay = time.Duration(float64(delay) * multiplier)
+		if c.MaxInterval > 0 && delay >= c.MaxInterval {
+			return c.MaxInterval
+		}
+		next := float64(delay) * multiplier
+		if next <= 0 || next >= float64(time.Duration(1<<63-1)) {
+			return c.MaxInterval
+		}
+		delay = time.Duration(next)
 	}
 	if c.MaxInterval > 0 && delay > c.MaxInterval {
 		return c.MaxInterval
 	}
 	return delay
+}
+
+// FullJitter returns a delay uniformly sampled from zero through nominal.
+// sample must be in [0, 1]; values outside that range are clamped.
+func FullJitter(nominal time.Duration, sample float64) time.Duration {
+	if nominal <= 0 {
+		return 0
+	}
+	if math.IsNaN(sample) || sample < 0 {
+		sample = 0
+	}
+	if sample > 1 {
+		sample = 1
+	}
+	return time.Duration(float64(nominal) * sample)
 }
 
 // TierCount returns the number of retry destinations represented by c.

@@ -13,6 +13,9 @@ const (
 	Starting State = iota
 	// Ready means the consumer accepts work and may report ready.
 	Ready
+	// Reconnecting means the broker connection is being rebuilt. The process
+	// remains live, but the consumer is not ready for traffic.
+	Reconnecting
 	// Draining means new fetches are stopped and accepted work is finishing.
 	Draining
 	// Settling means in-flight deliveries are being settled.
@@ -32,6 +35,8 @@ func (s State) String() string {
 		return "starting"
 	case Ready:
 		return "ready"
+	case Reconnecting:
+		return "reconnecting"
 	case Draining:
 		return "draining"
 	case Settling:
@@ -98,7 +103,9 @@ func allowed(from, to State) bool {
 	case Starting:
 		return to == Ready
 	case Ready:
-		return to == Draining
+		return to == Reconnecting || to == Draining
+	case Reconnecting:
+		return to == Ready || to == Draining
 	case Draining:
 		return to == Settling
 	case Settling:

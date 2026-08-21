@@ -29,6 +29,7 @@ type Metrics struct {
 	divergence   metric.Int64ObservableGauge
 	stuck        metric.Int64ObservableGauge
 	clamped      metric.Int64ObservableCounter
+	reconnects   metric.Int64Counter
 }
 
 // NewMetrics creates the SDK metric publisher. A nil provider leaves the
@@ -60,15 +61,37 @@ func NewMetrics(provider metric.MeterProvider) (*Metrics, error) {
 	if err != nil {
 		return nil, err
 	}
+	reconnects, err := meter.Int64Counter(
+		"f1_driver_reconnects_total",
+		metric.WithDescription("Client connection reconnection outcomes."),
+	)
+	if err != nil {
+		return nil, err
+	}
 	metrics.divergence = divergence
 	metrics.stuck = stuck
 	metrics.clamped = clamped
+	metrics.reconnects = reconnects
 	registration, err := meter.RegisterCallback(metrics.observe, divergence, stuck, clamped)
 	if err != nil {
 		return nil, err
 	}
 	metrics.registration = registration
 	return metrics, nil
+}
+
+// RecordReconnect records one completed reconnect outcome.
+func (m *Metrics) RecordReconnect(ctx context.Context, driverName, reason string) {
+	if m == nil || m.reconnects == nil {
+		return
+	}
+	if ctx == nil {
+		return
+	}
+	m.reconnects.Add(ctx, 1, metric.WithAttributes(
+		attribute.String("driver", driverName),
+		attribute.String("reason", reason),
+	))
 }
 
 // Register connects one subscription's sampled sources to the collection

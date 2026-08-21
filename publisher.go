@@ -218,6 +218,10 @@ func (p *Publisher) PublishBatch(ctx context.Context, messages []Message) (Batch
 		p.client.mu.Unlock()
 		return result, errors.New("f1: client is closed")
 	}
+	if p.client.reconnecting || !sameConnection(p.client.conn, conn) {
+		p.client.mu.Unlock()
+		return result, p.client.reconnectingError("publish")
+	}
 	producer := p.client.producerHandle
 	var err error
 	if producer == nil {
@@ -232,6 +236,7 @@ func (p *Publisher) PublishBatch(ctx context.Context, messages []Message) (Batch
 	p.client.mu.Unlock()
 	if err != nil {
 		warnUnclassified(p.client.options.logger, err)
+		requestReconnectOnTransient(p.client, err)
 		return result, fmt.Errorf("f1: create publisher: %w", err)
 	}
 	publishErr := producer.Publish(ctx, outbound...)
@@ -243,6 +248,7 @@ func (p *Publisher) PublishBatch(ctx context.Context, messages []Message) (Batch
 	}
 
 	warnPublishError(p.client.options.logger, publishErr)
+	requestReconnectOnTransient(p.client, publishErr)
 	var partial *driver.PublishError
 	if errors.As(publishErr, &partial) && len(partial.Failed) > 0 {
 		for i, id := range ids {

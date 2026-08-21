@@ -281,6 +281,9 @@ func validateConfig(cfg Config) error {
 	if cfg.Broker.Driver == "inmem" && cfg.Env == "prod" {
 		return fmt.Errorf("f1: broker.driver inmem is not allowed in prod")
 	}
+	if cfg.Broker.MaxReconnectAttempts < 0 {
+		return fmt.Errorf("f1: broker.maxReconnectAttempts must not be negative")
+	}
 	if cfg.Env == "prod" && cfg.Broker.TLS.InsecureSkipVerify {
 		return fmt.Errorf("f1: broker.tls.insecureSkipVerify must be false in prod")
 	}

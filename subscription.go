@@ -101,6 +101,7 @@ type Runner struct {
 	draining              bool
 	finished              bool
 	runErr                error
+	reconnectCause        error
 	inflight              *inflightRegistry
 	retryDestinationTiers map[string]int
 	metrics               deliveryMetrics
@@ -231,7 +232,10 @@ func (c *Client) Subscribe(ctx context.Context, sub Subscription) (*Runner, erro
 	if err := validateSubscription(c.config, sub.Name, resolved); err != nil {
 		return nil, err
 	}
-	if resolved.Mode == OrderedByKey && !c.effective.OrderedByKey {
+	c.mu.Lock()
+	effectiveCapabilities := c.effective
+	c.mu.Unlock()
+	if resolved.Mode == OrderedByKey && !effectiveCapabilities.OrderedByKey {
 		return nil, fmt.Errorf("f1: subscription %s requests ordered_by_key, but feature is unavailable", sub.Name)
 	}
 	c.mu.Lock()
