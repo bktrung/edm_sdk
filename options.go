@@ -144,7 +144,12 @@ func WithErrorHandler(handler func(context.Context, *Event, error)) Option {
 	}
 }
 
-// WithPublishTopics names the logical topics this client publishes.
+// WithPublishTopics names the logical topics this client publishes. New
+// declares an entry point for each topic and declared priority, and Publish
+// rejects a topic that was not named here.
+//
+// Each value goes through the same derivation Publish applies to an event
+// type, so "order.created.v1" and "order.created" name the same topic.
 func WithPublishTopics(topics ...string) Option {
 	return func(options *clientOptions) error {
 		seen := make(map[string]struct{}, len(options.publishTopics)+len(topics))

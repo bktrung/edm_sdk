@@ -70,7 +70,8 @@ func (r BatchResult) Failed() []int {
 	return failed
 }
 
-// WithTopic overrides the destination topic derived from the event type.
+// WithTopic overrides what the topic is derived from. The value goes through
+// the same derivation as an event type.
 func WithTopic(topic string) PublishOption {
 	return publishOption(func(options *publishOptions) error { options.topic = topic; return nil })
 }
@@ -135,9 +136,9 @@ func publishOption(apply func(*publishOptions) error) PublishOption {
 // Publish encodes payload, builds its envelope, and waits for durable broker
 // acknowledgement before returning the event ID.
 //
-// The topic is derived from eventType when WithTopic is absent. A trailing
-// version segment of the form .v<N> is stripped, an event type without that
-// suffix is used as-is, and WithTopic provides an explicit override.
+// The topic is derived from eventType, unless WithTopic supplies a value to
+// derive instead. A trailing version segment of the form .v<N> is stripped,
+// and a value without that suffix is used as-is.
 func (p *Publisher) Publish(ctx context.Context, eventType string, payload any, opts ...PublishOption) (string, error) {
 	result, err := p.PublishBatch(ctx, []Message{{EventType: eventType, Payload: payload, Opts: opts}})
 	if err != nil {
@@ -324,11 +325,12 @@ func buildOutbound(ctx context.Context, options clientOptions, effective driver.
 	if err != nil {
 		return driver.OutboundMessage{}, "", fmt.Errorf("encode payload: %w", err)
 	}
-	topic := publish.topic
-	if topic == "" {
-		topic = topicFor(message.EventType)
+	topicInput := message.EventType
+	if publish.topic != "" {
+		topicInput = publish.topic
 	}
-	if err := validatePublishTopic(options, topic); err != nil {
+	topic := topicFor(topicInput)
+	if err := validatePublishTopic(options, topic, message.EventType); err != nil {
 		return driver.OutboundMessage{}, "", err
 	}
 	partitionKey := publish.key
@@ -406,7 +408,7 @@ func topicFor(eventType string) string {
 	return eventType[:index]
 }
 
-func validatePublishTopic(options clientOptions, topic string) error {
+func validatePublishTopic(options clientOptions, topic, eventType string) error {
 	if !options.publishTopicsSet {
 		return nil
 	}
@@ -415,7 +417,7 @@ func validatePublishTopic(options clientOptions, topic string) error {
 			return nil
 		}
 	}
-	return fmt.Errorf("topic %q was not listed in WithPublishTopics", topic)
+	return fmt.Errorf("topic %q derived from event type %q was not listed in WithPublishTopics; listed topics: %v", topic, eventType, options.publishTopics)
 }
 
 func priorityHint(priority Priority) uint8 {
@@ -459,9 +461,8 @@ func isFanoutEntryPoint(effective driver.Capabilities) bool {
 func publisherTopologySpec(effective driver.Capabilities, source string, topics []string, priorities []Priority) driver.TopologySpec {
 	result := driver.TopologySpec{Effective: effective}
 	for _, topic := range topics {
-		logical := topicFor(topic)
 		for _, priority := range priorities {
-			entryPoint := publishEntryPoint(source, logical, priority)
+			entryPoint := publishEntryPoint(source, topic, priority)
 			if isFanoutEntryPoint(effective) {
 				result.Exchanges = append(result.Exchanges, driver.ExchangeSpec{Name: entryPoint, Kind: "fanout", Durable: true})
 			} else {
