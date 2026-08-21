@@ -163,6 +163,16 @@ func defaultConfig() Config {
 	}
 }
 
+func resolvePrefetch(prefetch, brokerDefault int) int {
+	if prefetch != 0 {
+		return prefetch
+	}
+	if brokerDefault != 0 {
+		return brokerDefault
+	}
+	return defaultConfig().Broker.DefaultPrefetch
+}
+
 func normalizeConfig(cfg Config) Config {
 	defaults := defaultConfig()
 	if cfg.Codec.ContentMode == "" {
@@ -201,11 +211,8 @@ func normalizeConfig(cfg Config) Config {
 		if subscription.Concurrency == 0 {
 			subscription.Concurrency = subDefaults.Concurrency
 		}
-		if subscription.Prefetch == 0 {
-			subscription.Prefetch = cfg.Broker.DefaultPrefetch
-			if subscription.Prefetch == 0 {
-				subscription.Prefetch = defaults.Broker.DefaultPrefetch
-			}
+		if !subscription.presence.Prefetch {
+			subscription.Prefetch = resolvePrefetch(subscription.Prefetch, cfg.Broker.DefaultPrefetch)
 		}
 		if len(subscription.Priorities) == 0 {
 			subscription.Priorities = append([]Priority(nil), subDefaults.Priorities...)
@@ -475,12 +482,6 @@ func (y rawF1) config() (Config, error) {
 				return Config{}, fmt.Errorf("f1: subscriptions.%s: %w", name, err)
 			}
 			cfg.Subscriptions[name] = subscriptionConfig
-		}
-	}
-	for name, subscription := range cfg.Subscriptions {
-		if subscription.Prefetch == 0 {
-			subscription.Prefetch = cfg.Broker.DefaultPrefetch
-			cfg.Subscriptions[name] = subscription
 		}
 	}
 	return cfg, nil

@@ -207,6 +207,28 @@ func TestLoadConfigSubscriptionUsesBrokerPrefetchFallback(t *testing.T) {
 	}
 }
 
+func TestLoadConfigRejectsExplicitZeroPrefetch(t *testing.T) {
+	t.Parallel()
+	path := writeConfig(t, "f1:\n  env: test\n  service: orders\n  broker:\n    driver: inmem\n  subscriptions:\n    orders:\n      topics: [orders]\n      prefetch: 0\n")
+	_, err := LoadConfig(path)
+	want := "f1: subscriptions.orders.prefetch 0 must be at least lane count 12 (topics x priorities x (1 + retryTiers))"
+	if err == nil || err.Error() != want {
+		t.Fatalf("LoadConfig() error = %v, want %q", err, want)
+	}
+}
+
+func TestLoadConfigSubscriptionUsesPackagePrefetchFallback(t *testing.T) {
+	t.Parallel()
+	path := writeConfig(t, "f1:\n  env: test\n  service: orders\n  broker:\n    driver: inmem\n  subscriptions:\n    orders:\n      topics: [orders]\n")
+	cfg, err := LoadConfig(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := cfg.Subscriptions["orders"].Prefetch, defaultConfig().Broker.DefaultPrefetch; got != want {
+		t.Fatalf("Prefetch = %d, want package default %d", got, want)
+	}
+}
+
 func TestLoadConfigPreservesExplicitFalseAging(t *testing.T) {
 	t.Parallel()
 	path := writeConfig(t, "f1:\n  env: test\n  service: orders\n  broker:\n    driver: inmem\n  subscriptions:\n    orders:\n      topics: [orders]\n      fairness:\n        agingEnabled: false\n")
@@ -513,6 +535,19 @@ func TestNormalizeConfigAcceptsMinimalHandBuiltConfig(t *testing.T) {
 	subDefaults := defaultSubscription()
 	if sub.Concurrency != subDefaults.Concurrency || sub.Prefetch != defaults.Broker.DefaultPrefetch || !reflect.DeepEqual(sub.Priorities, subDefaults.Priorities) || sub.Retry.MaxAttempts != subDefaults.Retry.MaxAttempts || sub.HandlerTimeout != subDefaults.HandlerTimeout {
 		t.Fatalf("subscription defaults = %#v, want concurrency=%d prefetch=%d priorities=%v maxAttempts=%d handlerTimeout=%s", sub, subDefaults.Concurrency, defaults.Broker.DefaultPrefetch, subDefaults.Priorities, subDefaults.Retry.MaxAttempts, subDefaults.HandlerTimeout)
+	}
+}
+
+func TestNormalizeConfigUsesDefaultForGoBuiltZeroPrefetch(t *testing.T) {
+	t.Parallel()
+	cfg := normalizeConfig(Config{
+		Broker: BrokerConfig{DefaultPrefetch: 128},
+		Subscriptions: map[string]SubscriptionConfig{
+			"orders": {Prefetch: 0},
+		},
+	})
+	if got, want := cfg.Subscriptions["orders"].Prefetch, 128; got != want {
+		t.Fatalf("Prefetch = %d, want broker default %d", got, want)
 	}
 }
 

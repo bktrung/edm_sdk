@@ -291,10 +291,7 @@ func resolveSubscription(c *Client, sub Subscription) (SubscriptionConfig, error
 	}
 	overlayExplicitSubscription(&resolved, sub)
 	if resolved.Prefetch == 0 {
-		resolved.Prefetch = c.config.Broker.DefaultPrefetch
-		if resolved.Prefetch == 0 {
-			resolved.Prefetch = defaultConfig().Broker.DefaultPrefetch
-		}
+		resolved.Prefetch = resolvePrefetch(resolved.Prefetch, c.config.Broker.DefaultPrefetch)
 	}
 	return resolved, nil
 }
