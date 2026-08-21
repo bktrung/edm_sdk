@@ -1322,9 +1322,9 @@ func releaseRunnerConsumer(r *Runner, ctx context.Context) error {
 		return nil
 	} else if !errors.Is(err, driver.ErrUnsupported) {
 		return err
-	} else if stopErr := consumer.Stop(ctx); stopErr != nil {
-		return errors.Join(err, stopErr)
 	} else {
+		// There is no safe fallback: this path has an unsettled delivery, so
+		// Stop is forbidden. A driver without Release support cannot recover it.
 		return err
 	}
 }
