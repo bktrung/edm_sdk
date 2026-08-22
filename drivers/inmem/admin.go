@@ -9,12 +9,30 @@ import (
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/driver"
 )
 
-type admin struct{ conn *conn }
+type adminOperations struct{ conn *conn }
+
+type admin struct{ operations *adminOperations }
 
 var _ driver.Admin = (*admin)(nil)
 
+func (a *admin) EnsureTopology(ctx context.Context, spec driver.TopologySpec) (driver.TopologyDiff, error) {
+	return a.operations.EnsureTopology(ctx, spec)
+}
+
+func (a *admin) DescribeTopology(ctx context.Context, names []string) (driver.TopologyState, error) {
+	return a.operations.DescribeTopology(ctx, names)
+}
+
+func (a *admin) Purge(ctx context.Context, name string) (int64, error) {
+	return a.operations.Purge(ctx, name)
+}
+
+func (a *admin) Prune(ctx context.Context, names []string) ([]driver.PruneResult, error) {
+	return a.operations.Prune(ctx, names)
+}
+
 // begin is the Admin facade gate. It holds the connection lock so lifecycle admission and the operation cannot be separated.
-func (a *admin) begin(ctx context.Context, operation string) error {
+func (a *adminOperations) begin(ctx context.Context, operation string) error {
 	if err := ctx.Err(); err != nil {
 		return classify(operation, driver.KindTransient, err)
 	}
@@ -26,7 +44,7 @@ func (a *admin) begin(ctx context.Context, operation string) error {
 	return nil
 }
 
-func (a *admin) EnsureTopology(ctx context.Context, spec driver.TopologySpec) (driver.TopologyDiff, error) {
+func (a *adminOperations) EnsureTopology(ctx context.Context, spec driver.TopologySpec) (driver.TopologyDiff, error) {
 	if err := a.begin(ctx, "ensure_topology"); err != nil {
 		return driver.TopologyDiff{}, err
 	}
@@ -114,7 +132,7 @@ func destinationArgumentDrift(want, got driver.DestinationSpec) []driver.Argumen
 	return drifted
 }
 
-func (a *admin) DescribeTopology(ctx context.Context, names []string) (driver.TopologyState, error) {
+func (a *adminOperations) DescribeTopology(ctx context.Context, names []string) (driver.TopologyState, error) {
 	if err := a.begin(ctx, "describe_topology"); err != nil {
 		return driver.TopologyState{}, err
 	}
@@ -131,7 +149,7 @@ func (a *admin) DescribeTopology(ctx context.Context, names []string) (driver.To
 	return state, nil
 }
 
-func (a *admin) Purge(ctx context.Context, name string) (int64, error) {
+func (a *adminOperations) Purge(ctx context.Context, name string) (int64, error) {
 	if err := a.begin(ctx, "purge"); err != nil {
 		return 0, err
 	}
@@ -145,7 +163,7 @@ func (a *admin) Purge(ctx context.Context, name string) (int64, error) {
 	return n, nil
 }
 
-func (a *admin) Prune(ctx context.Context, names []string) ([]driver.PruneResult, error) {
+func (a *adminOperations) Prune(ctx context.Context, names []string) ([]driver.PruneResult, error) {
 	if err := a.begin(ctx, "prune"); err != nil {
 		return nil, err
 	}

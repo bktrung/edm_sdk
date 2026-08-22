@@ -564,7 +564,7 @@ func (c *consumer) Lag(ctx context.Context) (map[string]int64, error) {
 	if !c.cfg.Effective.LagQueryable {
 		return nil, classify("lag", driver.KindFatal, driver.ErrUnsupported)
 	}
-	admin := &admin{conn: c.conn}
+	admin := &adminOperations{conn: c.conn}
 	lag := make(map[string]int64, len(c.lanes))
 	for _, lane := range c.lanes {
 		if err := ctx.Err(); err != nil {

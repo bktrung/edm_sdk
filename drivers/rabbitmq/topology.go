@@ -17,7 +17,7 @@ type bindingKey struct {
 	destination string
 }
 
-func (a *admin) ensureTopology(ctx context.Context, spec driver.TopologySpec) (driver.TopologyDiff, error) {
+func (a *adminOperations) ensureTopology(ctx context.Context, spec driver.TopologySpec) (driver.TopologyDiff, error) {
 	if spec.Policy == driver.TopologyNone {
 		return driver.TopologyDiff{}, nil
 	}
@@ -138,7 +138,7 @@ func (a *admin) ensureTopology(ctx context.Context, spec driver.TopologySpec) (d
 	return diff, nil
 }
 
-func (a *admin) verifyTopology(ctx context.Context, spec driver.TopologySpec) (driver.TopologyDiff, error) {
+func (a *adminOperations) verifyTopology(ctx context.Context, spec driver.TopologySpec) (driver.TopologyDiff, error) {
 	a.conn.topologyMu.Lock()
 	defer a.conn.topologyMu.Unlock()
 	var diff driver.TopologyDiff
@@ -226,7 +226,7 @@ func (a *admin) verifyTopology(ctx context.Context, spec driver.TopologySpec) (d
 	return diff, nil
 }
 
-func (a *admin) currentBindings(ctx context.Context) (map[bindingKey]struct{}, error) {
+func (a *adminOperations) currentBindings(ctx context.Context) (map[bindingKey]struct{}, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -257,7 +257,7 @@ func (a *admin) currentBindings(ctx context.Context) (map[bindingKey]struct{}, e
 // A nil management client, or any failure reaching it, is returned as an
 // error rather than folded into an empty result: TopologyVerify must be able
 // to say "this was not checked" instead of silently reporting a clean diff.
-func (a *admin) argumentDrift(ctx context.Context, name string, want amqp.Table) ([]driver.ArgumentDrift, error) {
+func (a *adminOperations) argumentDrift(ctx context.Context, name string, want amqp.Table) ([]driver.ArgumentDrift, error) {
 	if a.conn.management == nil {
 		return nil, errors.New("rabbitmq: argument drift verification unsupported: management client is unavailable")
 	}
@@ -336,7 +336,7 @@ func validateBinding(binding driver.BindingSpec) error {
 	return nil
 }
 
-func (a *admin) scanOrphans(ctx context.Context, spec driver.TopologySpec, diff *driver.TopologyDiff) {
+func (a *adminOperations) scanOrphans(ctx context.Context, spec driver.TopologySpec, diff *driver.TopologyDiff) {
 	if len(spec.Scope) == 0 {
 		diff.OrphanScanError = "orphan scan disabled because no scope was supplied"
 		return
@@ -385,7 +385,7 @@ func (a *admin) scanOrphans(ctx context.Context, spec driver.TopologySpec, diff 
 	}
 }
 
-func (a *admin) freshQueueList(ctx context.Context, scopes []string) ([]managementQueue, error) {
+func (a *adminOperations) freshQueueList(ctx context.Context, scopes []string) ([]managementQueue, error) {
 	queues, err := a.conn.management.listQueues(ctx)
 	if err != nil {
 		return nil, err
@@ -486,7 +486,7 @@ func parkingArguments(destination string, kind queueKind) amqp.Table {
 	return args
 }
 
-func (a *admin) exchangeExists(ctx context.Context, spec driver.ExchangeSpec) (bool, error) {
+func (a *adminOperations) exchangeExists(ctx context.Context, spec driver.ExchangeSpec) (bool, error) {
 	channel, err := a.openChannel(ctx)
 	if err != nil {
 		return false, err
@@ -502,7 +502,7 @@ func (a *admin) exchangeExists(ctx context.Context, spec driver.ExchangeSpec) (b
 	return false, classifyAMQP("ensure_topology", driver.KindFatal, err)
 }
 
-func (a *admin) declareExchange(ctx context.Context, spec driver.ExchangeSpec) error {
+func (a *adminOperations) declareExchange(ctx context.Context, spec driver.ExchangeSpec) error {
 	channel, err := a.openChannel(ctx)
 	if err != nil {
 		return err
@@ -514,7 +514,7 @@ func (a *admin) declareExchange(ctx context.Context, spec driver.ExchangeSpec) e
 	return nil
 }
 
-func (a *admin) queueExists(ctx context.Context, name string, durable bool, args amqp.Table) (bool, error) {
+func (a *adminOperations) queueExists(ctx context.Context, name string, durable bool, args amqp.Table) (bool, error) {
 	channel, err := a.openChannel(ctx)
 	if err != nil {
 		return false, err
@@ -531,7 +531,7 @@ func (a *admin) queueExists(ctx context.Context, name string, durable bool, args
 	return false, classifyAMQP("ensure_topology", driver.KindFatal, err)
 }
 
-func (a *admin) declareQueue(ctx context.Context, name string, durable bool, args amqp.Table) error {
+func (a *adminOperations) declareQueue(ctx context.Context, name string, durable bool, args amqp.Table) error {
 	channel, err := a.openChannel(ctx)
 	if err != nil {
 		return err
@@ -565,7 +565,7 @@ func queueFlags(durable bool, kind queueKind) (bool, bool, bool) {
 	return false, false, true
 }
 
-func (a *admin) bindQueue(ctx context.Context, binding driver.BindingSpec) error {
+func (a *adminOperations) bindQueue(ctx context.Context, binding driver.BindingSpec) error {
 	channel, err := a.openChannel(ctx)
 	if err != nil {
 		return err
@@ -577,7 +577,7 @@ func (a *admin) bindQueue(ctx context.Context, binding driver.BindingSpec) error
 	return nil
 }
 
-func (a *admin) openChannel(ctx context.Context) (*amqp.Channel, error) {
+func (a *adminOperations) openChannel(ctx context.Context) (*amqp.Channel, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, classify("ensure_topology", driver.KindTransient, err)
 	}

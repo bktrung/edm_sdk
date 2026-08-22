@@ -239,7 +239,7 @@ func (c *conn) Consumer(ctx context.Context, cfg driver.ConsumerConfig) (driver.
 	return consumer, nil
 }
 
-func (c *conn) Admin() driver.Admin { return &admin{conn: c} }
+func (c *conn) Admin() driver.Admin { return &admin{operations: &adminOperations{conn: c}} }
 
 func (c *conn) removeConsumer(consumer *consumer) {
 	c.mu.Lock()

@@ -28,7 +28,7 @@ func rabbitInspector(raw driver.Conn) (conformance.Inspect, error) {
 		if err := ctx.Err(); err != nil {
 			return conformance.BrokerView{}, err
 		}
-		admin := &admin{conn: conn}
+		admin := &adminOperations{conn: conn}
 		ready, err := admin.inspectQueue(ctx, destination)
 		if err != nil {
 			return conformance.BrokerView{}, errors.Join(driver.ErrDestinationMissing, err)
