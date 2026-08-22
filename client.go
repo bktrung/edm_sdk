@@ -209,10 +209,37 @@ func (c *Client) ensurePublisherTopologyOn(ctx context.Context, conn driver.Conn
 	}
 	spec := publisherTopologySpec(effective, c.source, c.options.publishTopics, c.config.Topology.Priorities)
 	spec.Policy = policy
-	if _, err := admin.EnsureTopology(ctx, spec); err != nil {
+	diff, err := admin.EnsureTopology(ctx, spec)
+	if err != nil {
 		return fmt.Errorf("f1: ensure publisher topology: %w", err)
 	}
+	logTopologyDrift(lastResortClientLogger(c), diff)
 	return nil
+}
+
+func configuredClientLogger(c *Client) *slog.Logger {
+	if c == nil {
+		return nil
+	}
+	return c.options.logger
+}
+
+func lastResortClientLogger(c *Client) *slog.Logger {
+	if logger := configuredClientLogger(c); logger != nil {
+		return logger
+	}
+	return slog.Default()
+}
+
+func logTopologyDrift(logger *slog.Logger, diff driver.TopologyDiff) {
+	for _, drift := range diff.Drifted {
+		logger.Warn("f1 topology argument drift",
+			"destination", drift.Name,
+			"argument", drift.Argument,
+			"want", drift.Want,
+			"got", drift.Got,
+		)
+	}
 }
 
 // Publisher returns a publisher using this client's connected driver and

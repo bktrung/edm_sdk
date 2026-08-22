@@ -598,7 +598,7 @@ func configuredRunnerLogger(r *Runner) *slog.Logger {
 	if r == nil || r.client == nil {
 		return nil
 	}
-	return r.client.options.logger
+	return configuredClientLogger(r.client)
 }
 
 func lastResortRunnerLogger(r *Runner) *slog.Logger {
@@ -630,9 +630,11 @@ func openRunnerConsumer(r *Runner, ctx context.Context) (driver.Consumer, error)
 		}
 		topology := subscriptionTopologySpecs(effective, source, r.subscription)
 		topology.Policy = policy
-		if _, err := admin.EnsureTopology(ctx, topology); err != nil {
+		diff, err := admin.EnsureTopology(ctx, topology)
+		if err != nil {
 			return nil, fmt.Errorf("f1: ensure subscription topology: %w", err)
 		}
+		logTopologyDrift(lastResortRunnerLogger(r), diff)
 	}
 	perDestination := make(map[string]int, len(destinations))
 	remaining := r.config.Prefetch
