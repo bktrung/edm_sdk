@@ -298,18 +298,22 @@ func TestErrorHandlerNotificationsAreBoundedAndDroppable(t *testing.T) {
 	runnerNotifyError(runner, context.Background(), nil, errors.New("first"))
 	runnerNotifyError(runner, context.Background(), nil, errors.New("second"))
 	for i := 0; i < 2; i++ {
+		timer := clock.NewReal().Timer(time.Second)
 		select {
 		case <-started:
-		case <-time.After(time.Second):
+		case <-timer.C:
 			t.Fatal("error handler did not fill its concurrency bound")
 		}
+		timer.Stop()
 	}
 	runnerNotifyError(runner, context.Background(), nil, errors.New("dropped"))
+	timer := clock.NewReal().Timer(50 * time.Millisecond)
 	select {
 	case <-started:
 		t.Fatal("error handler exceeded its concurrency bound")
-	case <-time.After(50 * time.Millisecond):
+	case <-timer.C:
 	}
+	timer.Stop()
 	if got := active.Load(); got != 2 {
 		t.Fatalf("active error handlers = %d, want 2", got)
 	}
@@ -319,10 +323,12 @@ func TestErrorHandlerNotificationsAreBoundedAndDroppable(t *testing.T) {
 
 	releaseOnce.Do(func() { close(release) })
 	for i := 0; i < 2; i++ {
+		timer := clock.NewReal().Timer(time.Second)
 		select {
 		case <-finished:
-		case <-time.After(time.Second):
+		case <-timer.C:
 			t.Fatal("error handler did not finish after release")
 		}
+		timer.Stop()
 	}
 }

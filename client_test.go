@@ -320,10 +320,8 @@ type testDriver struct {
 
 type nilConnectionDriver struct{}
 
-func (nilConnectionDriver) Name() string { return "nil-connection" }
-func (nilConnectionDriver) Capabilities() driver.Capabilities {
-	return driver.Capabilities{}
-}
+func (nilConnectionDriver) Name() string                      { return "nil-connection" }
+func (nilConnectionDriver) Capabilities() driver.Capabilities { return driver.Capabilities{} }
 func (nilConnectionDriver) Open(context.Context, driver.Config) (driver.Conn, error) {
 	return nil, nil
 }
