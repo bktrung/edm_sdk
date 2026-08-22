@@ -353,9 +353,7 @@ func runSettle(group *groupContext) {
 		message := receiveMessage(t, group, consumer)
 		ctx, cancel := context.WithCancel(group.ctx)
 		cancel()
-		if err := message.Settle.Ack(ctx); !errors.Is(err, context.Canceled) {
-			t.Fatalf("Ack() error=%v, want context.Canceled", err)
-		}
+		assertCancelled(t, "Ack", message.Settle.Ack(ctx))
 		waitForStable(t, group, "cancelled ack to leave the message unsettled", func() (bool, string) {
 			view := inspectDestination(t, group, "settle.cancel-ack")
 			return view.Unsettled == 1, fmt.Sprintf("view=%+v", view)
@@ -377,9 +375,7 @@ func runSettle(group *groupContext) {
 		message := receiveMessage(t, group, consumer)
 		ctx, cancel := context.WithCancel(group.ctx)
 		cancel()
-		if err := message.Settle.Nack(ctx, driver.NackOptions{Requeue: true}); !errors.Is(err, context.Canceled) {
-			t.Fatalf("Nack() error=%v, want context.Canceled", err)
-		}
+		assertCancelled(t, "Nack", message.Settle.Nack(ctx, driver.NackOptions{Requeue: true}))
 		waitForStable(t, group, "cancelled nack to leave the message unsettled", func() (bool, string) {
 			view := inspectDestination(t, group, "settle.cancel-nack")
 			return view.Unsettled == 1, fmt.Sprintf("view=%+v", view)

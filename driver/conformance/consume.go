@@ -407,9 +407,7 @@ func runConsume(group *groupContext) {
 		consumer := newConsumer(t, group, "consume.cancel-drain", 1)
 		ctx, cancel := context.WithCancel(group.ctx)
 		cancel()
-		if err := consumer.Drain(ctx); !errors.Is(err, context.Canceled) {
-			t.Fatalf("Drain() error = %v, want context.Canceled", err)
-		}
+		assertCancelled(t, "Drain", consumer.Drain(ctx))
 		if err := producer.Publish(group.ctx, driver.OutboundMessage{Destination: "consume.cancel-drain", Body: []byte("after-cancel")}); err != nil {
 			t.Fatalf("Publish() after canceled Drain() error = %v", err)
 		}
@@ -426,9 +424,8 @@ func runConsume(group *groupContext) {
 		consumer := newConsumer(t, group, "consume.cancel-lag", 1)
 		ctx, cancel := context.WithCancel(group.ctx)
 		cancel()
-		if _, err := consumer.Lag(ctx); !errors.Is(err, context.Canceled) {
-			t.Fatalf("Lag() error = %v, want context.Canceled", err)
-		}
+		_, err := consumer.Lag(ctx)
+		assertCancelled(t, "Lag", err)
 		group.vector.Add(BehaviorEvent{ID: "cancel-lag", Outcome: "cancelled", FinalDestination: "consume.cancel-lag"})
 	})
 
@@ -437,9 +434,7 @@ func runConsume(group *groupContext) {
 		consumer := newConsumer(t, group, "consume.cancel-stop", 1)
 		ctx, cancel := context.WithCancel(group.ctx)
 		cancel()
-		if err := consumer.Stop(ctx); !errors.Is(err, context.Canceled) {
-			t.Fatalf("Stop() error = %v, want context.Canceled", err)
-		}
+		assertCancelled(t, "Stop", consumer.Stop(ctx))
 		if err := producer.Publish(group.ctx, driver.OutboundMessage{Destination: "consume.cancel-stop", Body: []byte("after-cancel")}); err != nil {
 			t.Fatalf("Publish() after canceled Stop() error = %v", err)
 		}
@@ -449,6 +444,23 @@ func runConsume(group *groupContext) {
 		}
 		ackMessage(t, group, message)
 		group.vector.Add(BehaviorEvent{ID: "cancel-stop", Outcome: "cancelled", FinalDestination: "consume.cancel-stop"})
+	})
+	group.Check("canceled Release returns transient and leaves consumer usable", func(t *testing.T) {
+		name := "consume.cancel-release"
+		producer := newProducer(t, group, name, driver.ProducerConfig{Effective: group.effective})
+		consumer := newConsumer(t, group, name, 1)
+		ctx, cancel := context.WithCancel(group.ctx)
+		cancel()
+		assertCancelled(t, "Release", consumer.Release(ctx))
+		if err := producer.Publish(group.ctx, driver.OutboundMessage{Destination: name, Body: []byte("after-cancel")}); err != nil {
+			t.Fatalf("Publish() after cancelled Release() = %v", err)
+		}
+		message := receiveMessage(t, group, consumer)
+		if string(message.Body) != "after-cancel" {
+			t.Fatalf("message after cancelled Release() = %q, want %q", message.Body, "after-cancel")
+		}
+		ackMessage(t, group, message)
+		group.vector.Add(BehaviorEvent{ID: "cancel-release", Outcome: "cancelled", FinalDestination: name})
 	})
 }
 

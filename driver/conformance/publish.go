@@ -54,6 +54,55 @@ func runPublish(group *groupContext) {
 		group.vector.Add(BehaviorEvent{ID: "flush-safe", Outcome: "ok", FinalDestination: "publish.flush"})
 	})
 
+	group.Check("canceled Producer creation returns transient without a producer", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(group.ctx)
+		cancel()
+		producer, err := group.conn.Producer(ctx, driver.ProducerConfig{Effective: group.effective})
+		assertCancelled(t, "Producer", err)
+		if producer != nil {
+			_ = producer.Close(group.ctx)
+			t.Fatal("Producer() returned a producer after cancellation")
+		}
+		next, err := group.conn.Producer(group.ctx, driver.ProducerConfig{Effective: group.effective})
+		if err != nil {
+			t.Fatalf("Producer() after cancelled construction = %v", err)
+		}
+		if err := next.Close(group.ctx); err != nil {
+			t.Fatalf("Producer.Close() after cancelled construction = %v", err)
+		}
+		group.vector.Add(BehaviorEvent{ID: "cancel-producer", Outcome: "cancelled", FinalDestination: "producer"})
+	})
+
+	group.Check("cancelled Flush returns transient and leaves the producer usable", func(t *testing.T) {
+		name := "publish.cancel-flush"
+		producer := newProducer(t, group, name, driver.ProducerConfig{Effective: group.effective})
+		ctx, cancel := context.WithCancel(group.ctx)
+		cancel()
+		assertCancelled(t, "Flush", producer.Flush(ctx))
+		if err := producer.Publish(group.ctx, driver.OutboundMessage{Destination: name}); err != nil {
+			t.Fatalf("Publish() after cancelled Flush() = %v", err)
+		}
+		if got := inspectDestination(t, group, name).Ready; got != 1 {
+			t.Fatalf("Ready after cancelled Flush = %d, want 1", got)
+		}
+		group.vector.Add(BehaviorEvent{ID: "cancel-flush", Outcome: "cancelled", FinalDestination: name})
+	})
+
+	group.Check("cancelled producer Close returns transient and leaves the producer usable", func(t *testing.T) {
+		name := "publish.cancel-close"
+		producer := newProducer(t, group, name, driver.ProducerConfig{Effective: group.effective})
+		ctx, cancel := context.WithCancel(group.ctx)
+		cancel()
+		assertCancelled(t, "Producer.Close", producer.Close(ctx))
+		if err := producer.Publish(group.ctx, driver.OutboundMessage{Destination: name}); err != nil {
+			t.Fatalf("Publish() after cancelled producer Close() = %v", err)
+		}
+		if got := inspectDestination(t, group, name).Ready; got != 1 {
+			t.Fatalf("Ready after cancelled producer Close = %d, want 1", got)
+		}
+		group.vector.Add(BehaviorEvent{ID: "cancel-producer-close", Outcome: "cancelled", FinalDestination: name})
+	})
+
 	group.Check("partial publish reports only the missing message", func(t *testing.T) {
 		producer := newProducer(t, group, "publish.partial", driver.ProducerConfig{RequireDurableAck: true, Effective: group.effective})
 		err := producer.Publish(group.ctx,

@@ -15,6 +15,47 @@ const privateCloseDestination = "failure.close.private"
 func init() { registerGroup("failure", runFailure) }
 
 func runFailure(group *groupContext) {
+	group.Check("cancelled Driver Open returns transient without a connection", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(group.ctx)
+		cancel()
+		conn, err := group.drv.Open(ctx, group.cfg)
+		assertCancelled(t, "Driver.Open", err)
+		if conn != nil {
+			_ = conn.Close(group.ctx)
+			t.Fatal("Driver.Open() returned a connection after cancellation")
+		}
+		group.vector.Add(BehaviorEvent{ID: "cancel-open", Outcome: "cancelled", FinalDestination: "driver"})
+	})
+
+	group.Check("cancelled Ping returns transient", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(group.ctx)
+		cancel()
+		assertCancelled(t, "Ping", group.conn.Ping(ctx))
+		group.vector.Add(BehaviorEvent{ID: "cancel-ping", Outcome: "cancelled", FinalDestination: "connection"})
+	})
+
+	group.Check("cancelled Conn Close returns transient and leaves admission open", func(t *testing.T) {
+		conn, err := group.drv.Open(group.ctx, group.cfg)
+		if err != nil {
+			t.Fatalf("Driver.Open(): %v", err)
+		}
+		defer func() { _ = conn.Close(group.ctx) }()
+		ctx, cancel := context.WithCancel(group.ctx)
+		cancel()
+		assertCancelled(t, "Conn.Close", conn.Close(ctx))
+		producer, err := conn.Producer(group.ctx, driver.ProducerConfig{})
+		if err != nil {
+			t.Fatalf("Producer() after cancelled Conn.Close() = %v", err)
+		}
+		if err := producer.Close(group.ctx); err != nil {
+			t.Fatalf("Producer.Close() after cancelled Conn.Close() = %v", err)
+		}
+		if err := conn.Close(group.ctx); err != nil {
+			t.Fatalf("Conn.Close() cleanup = %v", err)
+		}
+		group.vector.Add(BehaviorEvent{ID: "cancel-conn-close", Outcome: "cancelled", FinalDestination: "connection"})
+	})
+
 	group.Check("failed Close keeps admission closed and remains retryable", func(t *testing.T) {
 		conn, inject := newPrivateFailureConnection(t, group)
 		closeCtx, cancel := context.WithTimeout(group.ctx, 100*time.Millisecond)

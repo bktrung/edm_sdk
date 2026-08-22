@@ -570,26 +570,22 @@ func runTopology(group *groupContext) {
 		// newName is unseen by any earlier call: a driver that creates it and
 		// only afterward checks ctx.Err() would still leave it behind despite
 		// returning context.Canceled here.
-		if _, err := admin.EnsureTopology(ctx, driver.TopologySpec{
+		_, err := admin.EnsureTopology(ctx, driver.TopologySpec{
 			Destinations: []driver.DestinationSpec{{Name: newName}},
 			Effective:    group.effective,
-		}); !errors.Is(err, context.Canceled) {
-			t.Fatalf("EnsureTopology() with cancelled ctx error=%v, want context.Canceled", err)
-		}
-		if _, err := admin.DescribeTopology(ctx, []string{name}); !errors.Is(err, context.Canceled) {
-			t.Fatalf("DescribeTopology() with cancelled ctx error=%v, want context.Canceled", err)
-		}
-		if _, err := admin.Purge(ctx, name); !errors.Is(err, context.Canceled) {
-			t.Fatalf("Purge() with cancelled ctx error=%v, want context.Canceled", err)
-		}
-		if _, err := admin.Prune(ctx, []string{name}); !errors.Is(err, context.Canceled) {
-			t.Fatalf("Prune() with cancelled ctx error=%v, want context.Canceled", err)
-		}
+		})
+		assertCancelled(t, "EnsureTopology", err)
+		_, err = admin.DescribeTopology(ctx, []string{name})
+		assertCancelled(t, "DescribeTopology", err)
+		_, err = admin.Purge(ctx, name)
+		assertCancelled(t, "Purge", err)
+		_, err = admin.Prune(ctx, []string{name})
+		assertCancelled(t, "Prune", err)
 
 		// Positive control: newName must never have been created. This is also
 		// the group's coverage for DescribeTopology's classified not-found
 		// error, since observing "never created" needs exactly this lookup.
-		_, err := admin.DescribeTopology(group.ctx, []string{newName})
+		_, err = admin.DescribeTopology(group.ctx, []string{newName})
 		if !errors.Is(err, driver.ErrDestinationMissing) {
 			t.Fatalf("DescribeTopology(%q) error=%v, want ErrDestinationMissing", newName, err)
 		}

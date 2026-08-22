@@ -2,12 +2,23 @@ package conformance
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"testing"
 	"time"
 
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/driver"
 )
+
+func assertCancelled(t *testing.T, operation string, err error) {
+	t.Helper()
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("%s() error=%v, want context.Canceled", operation, err)
+	}
+	if kind, ok := driver.Classify(err); !ok || kind != driver.KindTransient {
+		t.Fatalf("%s() classification=(%v,%t), want transient,true", operation, kind, ok)
+	}
+}
 
 const (
 	waitTimeout  = 5 * time.Second
