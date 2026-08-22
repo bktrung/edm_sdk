@@ -10,6 +10,8 @@ import (
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/driver"
 )
 
+const privateCloseDestination = "failure.close.private"
+
 func init() { registerGroup("failure", runFailure) }
 
 func runFailure(group *groupContext) {
@@ -26,6 +28,14 @@ func runFailure(group *groupContext) {
 
 	group.Check("rejected Close leaves admission open", func(t *testing.T) {
 		conn, _ := newPrivateFailureConnection(t, group)
+		admin := conn.Admin()
+		if _, err := admin.EnsureTopology(group.ctx, driver.TopologySpec{
+			Destinations: []driver.DestinationSpec{{Name: privateCloseDestination}},
+			Scope:        []string{"failure.close."},
+			Effective:    group.effective,
+		}); err != nil {
+			t.Fatalf("declare precondition destination: %v", err)
+		}
 		producer, err := conn.Producer(group.ctx, driver.ProducerConfig{})
 		if err != nil {
 			t.Fatalf("Producer() before precondition Close: %v", err)
@@ -37,6 +47,9 @@ func runFailure(group *groupContext) {
 			t.Fatalf("Producer() after rejected Close: %v", err)
 		} else {
 			_ = next.Close(group.ctx)
+		}
+		if _, err := admin.DescribeTopology(group.ctx, []string{privateCloseDestination}); err != nil {
+			t.Fatalf("Admin.DescribeTopology() after rejected Close: %v", err)
 		}
 		if err := producer.Close(group.ctx); err != nil {
 			t.Fatalf("close precondition producer: %v", err)
@@ -318,6 +331,14 @@ func runFailure(group *groupContext) {
 
 func assertPrivateCloseFailure(t *testing.T, group *groupContext, conn driver.Conn, inject FaultInjector, closeCtx, activeCtx context.Context) {
 	t.Helper()
+	admin := conn.Admin()
+	if _, err := admin.EnsureTopology(activeCtx, driver.TopologySpec{
+		Destinations: []driver.DestinationSpec{{Name: privateCloseDestination}},
+		Scope:        []string{"failure.close."},
+		Effective:    group.effective,
+	}); err != nil {
+		t.Fatalf("declare close destination: %v", err)
+	}
 	if err := inject(activeCtx, FaultCloseFailure); err != nil {
 		t.Fatalf("inject %s: %v", FaultCloseFailure, err)
 	}
@@ -328,8 +349,11 @@ func assertPrivateCloseFailure(t *testing.T, group *groupContext, conn driver.Co
 		_ = producer.Close(activeCtx)
 		t.Fatal("Producer() succeeded after Close teardown began")
 	}
+	if _, err := admin.DescribeTopology(activeCtx, []string{privateCloseDestination}); err == nil {
+		t.Error("Admin.DescribeTopology() succeeded after Close teardown began")
+	}
 	if consumer, err := conn.Consumer(activeCtx, driver.ConsumerConfig{
-		Destinations: []string{"failure.close.private.consumer"},
+		Destinations: []string{privateCloseDestination},
 	}); err == nil {
 		_ = consumer.Stop(activeCtx)
 		t.Fatal("Consumer() succeeded after Close teardown began")

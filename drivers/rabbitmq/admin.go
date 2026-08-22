@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 
+	amqp "github.com/rabbitmq/amqp091-go"
+
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/driver"
 )
 
@@ -12,16 +14,30 @@ type admin struct{ conn *conn }
 
 var _ driver.Admin = (*admin)(nil)
 
-func (a *admin) EnsureTopology(ctx context.Context, spec driver.TopologySpec) (driver.TopologyDiff, error) {
+// admission is the shared Admin facade gate. Channel-creating internals retain openChannel as a second boundary.
+func (a *admin) admission(ctx context.Context, operation string) error {
 	if err := ctx.Err(); err != nil {
-		return driver.TopologyDiff{}, classify("ensure_topology", driver.KindTransient, err)
+		return classify(operation, driver.KindTransient, err)
+	}
+	a.conn.mu.RLock()
+	closed := a.conn.closed || a.conn.closing || a.conn.amqp.IsClosed()
+	a.conn.mu.RUnlock()
+	if closed {
+		return classify(operation, driver.KindTransient, amqp.ErrClosed)
+	}
+	return nil
+}
+
+func (a *admin) EnsureTopology(ctx context.Context, spec driver.TopologySpec) (driver.TopologyDiff, error) {
+	if err := a.admission(ctx, "ensure_topology"); err != nil {
+		return driver.TopologyDiff{}, err
 	}
 	return a.ensureTopology(ctx, spec)
 }
 
 func (a *admin) DescribeTopology(ctx context.Context, names []string) (driver.TopologyState, error) {
-	if err := ctx.Err(); err != nil {
-		return driver.TopologyState{}, classify("describe_topology", driver.KindTransient, err)
+	if err := a.admission(ctx, "describe_topology"); err != nil {
+		return driver.TopologyState{}, err
 	}
 	a.conn.mu.RLock()
 	deferred := make(map[string]struct{}, len(a.conn.deferred))
@@ -53,8 +69,8 @@ func (a *admin) DescribeTopology(ctx context.Context, names []string) (driver.To
 }
 
 func (a *admin) Purge(ctx context.Context, destination string) (int64, error) {
-	if err := ctx.Err(); err != nil {
-		return 0, classify("purge", driver.KindTransient, err)
+	if err := a.admission(ctx, "purge"); err != nil {
+		return 0, err
 	}
 	channel, err := a.openChannel(ctx)
 	if err != nil {
@@ -82,8 +98,8 @@ func (a *admin) Purge(ctx context.Context, destination string) (int64, error) {
 }
 
 func (a *admin) Prune(ctx context.Context, names []string) ([]driver.PruneResult, error) {
-	if err := ctx.Err(); err != nil {
-		return nil, classify("prune", driver.KindTransient, err)
+	if err := a.admission(ctx, "prune"); err != nil {
+		return nil, err
 	}
 	queues, err := a.conn.management.listQueues(ctx)
 	if err != nil {
