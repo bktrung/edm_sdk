@@ -54,7 +54,7 @@ verify-self-contained:
 
 ## check-fixture: validate the local fixtures used by tests and tooling.
 check-fixture:
-	go test ./...
+	go test -count=1 ./...
 	$(MAKE) check-api-surface check-api-surface-codec check-api-surface-driver check-api-surface-f1test check-api-diff
 
 ## check-api-surface: verify exported symbols against the f1 public API fixture.
