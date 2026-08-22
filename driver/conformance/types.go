@@ -48,6 +48,9 @@ const (
 	// FaultConnectionDrop makes current deliveries transiently unavailable and
 	// emits a connection error without closing consumer channels.
 	FaultConnectionDrop FaultKind = "connection-drop"
+	// FaultLaneChannelClose closes one transport lane while leaving the
+	// connection and other lanes available.
+	FaultLaneChannelClose FaultKind = "lane-channel-close"
 	// FaultDeliveryFailure returns current deliveries for redelivery.
 	FaultDeliveryFailure FaultKind = "delivery-failure"
 	// FaultFatalPublish makes the next Publish fail with a non-retryable error.

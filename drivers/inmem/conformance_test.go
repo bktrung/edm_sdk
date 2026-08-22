@@ -64,6 +64,11 @@ func newFaultInjector(raw driver.Conn) (conformance.FaultInjector, error) {
 				conn.dropInFlightLocked("connection")
 				conn.mu.Unlock()
 				return nil
+			case conformance.FaultLaneChannelClose:
+				conn.mu.Lock()
+				conn.dropLaneLocked("lane channel")
+				conn.mu.Unlock()
+				return nil
 			case conformance.FaultDeliveryFailure:
 				conn.mu.Lock()
 				conn.dropInFlightLocked("delivery")
@@ -83,6 +88,49 @@ func newFaultInjector(raw driver.Conn) (conformance.FaultInjector, error) {
 		conn.failPublish = true
 		return nil
 	}, nil
+}
+
+func (c *conn) dropLaneLocked(op string) {
+	var target *consumer
+	var destination string
+	for item := range c.consumers {
+		if len(item.destinations) < 2 {
+			continue
+		}
+		for _, name := range item.destinations {
+			if destination == "" || name < destination {
+				target = item
+				destination = name
+			}
+		}
+	}
+	if target == nil {
+		return
+	}
+	now := c.clock.Now()
+	for delivery := range target.inflight {
+		if delivery.message.message.Destination == destination {
+			c.requeueDeliveryLocked(delivery, now)
+		}
+	}
+	if dest, ok := c.destinations[destination]; ok {
+		delete(dest.consumers, target)
+		for i, item := range dest.order {
+			if item == target {
+				dest.order = append(dest.order[:i], dest.order[i+1:]...)
+				break
+			}
+		}
+		if len(dest.consumers) == 0 {
+			c.history[destination] = nil
+		}
+	}
+	select {
+	case target.errs <- classify(op, driver.KindTransient, errors.New("injected lane channel closure")):
+	default:
+	}
+	c.dispatchLocked()
+	c.signalWake()
 }
 
 type deadlineFixture struct {

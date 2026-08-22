@@ -484,6 +484,7 @@ func validateFaultInjector(t *testing.T, ctx context.Context, conn driver.Conn, 
 	for _, fault := range []FaultKind{FaultConnectionDrop, FaultDeliveryFailure} {
 		validateFaultRedelivery(t, ctx, conn, inject, fault)
 	}
+	validateFaultLaneClose(t, ctx, conn, inject)
 	const fatalDestination = "conformance.fault-fatal-probe"
 	if _, err := conn.Admin().EnsureTopology(ctx, driver.TopologySpec{Destinations: []driver.DestinationSpec{{Name: fatalDestination}}}); err != nil {
 		t.Fatalf("conformance: fatal fault topology: %v", err)
@@ -507,6 +508,98 @@ func validateFaultInjector(t *testing.T, ctx context.Context, conn driver.Conn, 
 	var fatalClassified driver.ClassifiedError
 	if fatalErr == nil || !errors.As(fatalErr, &fatalClassified) || fatalClassified.Kind() != driver.KindFatal {
 		t.Fatalf("conformance: fault injector %s was not observed as fatal non-retryable publish failure: %v", FaultFatalPublish, fatalErr)
+	}
+}
+
+func validateFaultLaneClose(t *testing.T, ctx context.Context, conn driver.Conn, inject FaultInjector) {
+	t.Helper()
+	const firstDestination = "conformance.fault-lane-close.first"
+	const secondDestination = "conformance.fault-lane-close.second"
+	if _, err := conn.Admin().EnsureTopology(ctx, driver.TopologySpec{Destinations: []driver.DestinationSpec{
+		{Name: firstDestination}, {Name: secondDestination},
+	}}); err != nil {
+		t.Fatalf("conformance: lane close topology: %v", err)
+	}
+	producer, err := conn.Producer(ctx, driver.ProducerConfig{Effective: conn.Capabilities()})
+	if err != nil {
+		t.Fatalf("conformance: lane close producer: %v", err)
+	}
+	consumer, err := conn.Consumer(ctx, driver.ConsumerConfig{
+		Destinations: []string{firstDestination, secondDestination},
+		Prefetch:     2,
+		PerDestination: map[string]int{
+			firstDestination:  1,
+			secondDestination: 1,
+		},
+		Effective: conn.Capabilities(),
+	})
+	if err != nil {
+		_ = producer.Close(ctx)
+		t.Fatalf("conformance: lane close consumer: %v", err)
+	}
+	defer func() {
+		if err := consumer.Stop(ctx); err != nil {
+			t.Errorf("conformance: lane close consumer stop: %v", err)
+		}
+		if err := producer.Close(ctx); err != nil {
+			t.Errorf("conformance: lane close producer close: %v", err)
+		}
+		for _, destination := range []string{firstDestination, secondDestination} {
+			if _, err := conn.Admin().Purge(ctx, destination); err != nil {
+				t.Errorf("conformance: lane close purge %q: %v", destination, err)
+			}
+		}
+	}()
+	if err := producer.Publish(ctx, driver.OutboundMessage{Destination: firstDestination, Body: []byte("first-before")}); err != nil {
+		t.Fatalf("conformance: lane close first publish: %v", err)
+	}
+	first := receiveFaultProbe(t, ctx, consumer, FaultLaneChannelClose+" first lane")
+	if first.Destination != firstDestination {
+		t.Fatalf("conformance: first lane destination=%q, want %q", first.Destination, firstDestination)
+	}
+	if err := first.Settle.Ack(ctx); err != nil {
+		t.Fatalf("conformance: first lane ack: %v", err)
+	}
+	if err := producer.Publish(ctx, driver.OutboundMessage{Destination: secondDestination, Body: []byte("second-before")}); err != nil {
+		t.Fatalf("conformance: lane close second publish: %v", err)
+	}
+	second := receiveFaultProbe(t, ctx, consumer, FaultLaneChannelClose+" second lane")
+	if second.Destination != secondDestination {
+		t.Fatalf("conformance: second lane destination=%q, want %q", second.Destination, secondDestination)
+	}
+	if err := second.Settle.Ack(ctx); err != nil {
+		t.Fatalf("conformance: second lane ack: %v", err)
+	}
+	if err := inject(ctx, FaultLaneChannelClose); err != nil {
+		t.Fatalf("conformance: inject %s: %v", FaultLaneChannelClose, err)
+	}
+	faultErr := receiveFaultErrorProbe(t, ctx, consumer, FaultLaneChannelClose+" error")
+	kind, classified := driver.Classify(faultErr)
+	if !classified || kind != driver.KindTransient {
+		t.Fatalf("conformance: lane close error classification=(%v,%t), want transient", kind, classified)
+	}
+	if err := producer.Publish(ctx, driver.OutboundMessage{Destination: secondDestination, Body: []byte("second-after")}); err != nil {
+		t.Fatalf("conformance: surviving lane publish: %v", err)
+	}
+	survivor := receiveFaultProbe(t, ctx, consumer, FaultLaneChannelClose+" surviving lane")
+	if survivor.Destination != secondDestination {
+		t.Fatalf("conformance: surviving lane destination=%q, want %q", survivor.Destination, secondDestination)
+	}
+	if err := survivor.Settle.Ack(ctx); err != nil {
+		t.Fatalf("conformance: surviving lane ack: %v", err)
+	}
+	openCtx, cancel := context.WithTimeout(ctx, 250*time.Millisecond)
+	defer cancel()
+	select {
+	case message, ok := <-consumer.Messages():
+		if !ok {
+			t.Fatal("conformance: lane close Messages channel closed before Stop")
+		}
+		t.Fatalf("conformance: lane close unexpected message from %q", message.Destination)
+	case <-openCtx.Done():
+	}
+	if err := consumer.Stop(ctx); err != nil {
+		t.Fatalf("conformance: lane close Stop: %v", err)
 	}
 }
 

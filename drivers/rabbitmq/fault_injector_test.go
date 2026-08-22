@@ -4,6 +4,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sort"
+	"time"
+
+	amqp "github.com/rabbitmq/amqp091-go"
 
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/driver"
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/driver/conformance"
@@ -25,6 +29,8 @@ func rabbitFaultInjector(raw driver.Conn) (conformance.FaultInjector, error) {
 		case conformance.FaultFatalPublish:
 			conn.publishFault.Store(int32(driver.KindFatal) + 1)
 			return nil
+		case conformance.FaultLaneChannelClose:
+			return rabbitCloseLane(ctx, conn)
 		case conformance.FaultConnectionDrop:
 			return rabbitRequeueActive(ctx, conn, kind)
 		case conformance.FaultDeliveryFailure:
@@ -33,6 +39,54 @@ func rabbitFaultInjector(raw driver.Conn) (conformance.FaultInjector, error) {
 			return fmt.Errorf("unsupported conformance fault %q", kind)
 		}
 	}, nil
+}
+
+type rabbitLaneCandidate struct {
+	lane        *lane
+	destination string
+	tag         string
+}
+
+func rabbitCloseLane(ctx context.Context, conn *conn) error {
+	conn.mu.RLock()
+	candidates := make([]rabbitLaneCandidate, 0)
+	for item := range conn.active {
+		if len(item.lanes) < 2 {
+			continue
+		}
+		for _, lane := range item.lanes {
+			if lane.channel.IsClosed() {
+				continue
+			}
+			candidates = append(candidates, rabbitLaneCandidate{
+				lane: lane, destination: lane.destination, tag: lane.tag,
+			})
+		}
+	}
+	conn.mu.RUnlock()
+	if len(candidates) == 0 {
+		return errors.New("lane channel close has no live consumer lane")
+	}
+	sort.Slice(candidates, func(i, j int) bool {
+		if candidates[i].destination != candidates[j].destination {
+			return candidates[i].destination < candidates[j].destination
+		}
+		return candidates[i].tag < candidates[j].tag
+	})
+	candidate := candidates[0]
+	if err := candidate.lane.channel.Ack(0, false); err != nil && !errors.Is(err, amqp.ErrClosed) {
+		return fmt.Errorf("close lane %q: %w", candidate.destination, err)
+	}
+	ticker := time.NewTicker(5 * time.Millisecond) //nolint:forbidigo // the live fixture waits for a broker event
+	defer ticker.Stop()
+	for !candidate.lane.channel.IsClosed() {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ticker.C:
+		}
+	}
+	return nil
 }
 
 func rabbitRequeueActive(ctx context.Context, conn *conn, kind conformance.FaultKind) error {

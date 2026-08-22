@@ -231,6 +231,121 @@ func runFailure(group *groupContext) {
 		}
 		group.vector.Add(BehaviorEvent{ID: "failure-deterministic", Outcome: "stable", FinalDestination: "failure.deterministic"})
 	})
+
+	group.Check("lane channel closure reports a transient error", func(t *testing.T) {
+		producer, consumer, first, second := newLaneCloseFixture(t, group, "errors")
+		primeLaneClose(t, group, producer, consumer, first, second)
+		injectFailure(t, group, FaultLaneChannelClose)
+		err := receiveFailureError(t, group, consumer)
+		assertFaultError(t, err, driver.KindTransient)
+		assertLaneClosed(t, group, producer, consumer, first)
+		group.vector.Add(BehaviorEvent{ID: "failure-lane-close-errors", Outcome: "transient", FinalDestination: first})
+	})
+
+	group.Check("lane channel closure leaves Messages open", func(t *testing.T) {
+		producer, consumer, first, second := newLaneCloseFixture(t, group, "messages")
+		primeLaneClose(t, group, producer, consumer, first, second)
+		injectFailure(t, group, FaultLaneChannelClose)
+		err := receiveFailureError(t, group, consumer)
+		assertFaultError(t, err, driver.KindTransient)
+		assertLaneClosed(t, group, producer, consumer, first)
+		if err := producer.Publish(group.ctx, driver.OutboundMessage{Destination: second, Body: []byte("survivor")}); err != nil {
+			t.Fatalf("surviving lane publish: %v", err)
+		}
+		message := receiveMessage(t, group, consumer)
+		if message.Destination != second {
+			t.Fatalf("surviving lane destination=%q, want %q", message.Destination, second)
+		}
+		ackMessage(t, group, message)
+		assertNoDelivery(t, group, consumer, "lane close Messages after surviving delivery")
+		group.vector.Add(BehaviorEvent{ID: "failure-lane-close-messages", Outcome: "open-survivor", FinalDestination: second})
+	})
+
+	group.Check("lane channel closure permits clean Stop", func(t *testing.T) {
+		producer, consumer, first, second := newLaneCloseFixture(t, group, "stop")
+		primeLaneClose(t, group, producer, consumer, first, second)
+		injectFailure(t, group, FaultLaneChannelClose)
+		err := receiveFailureError(t, group, consumer)
+		assertFaultError(t, err, driver.KindTransient)
+		assertLaneClosed(t, group, producer, consumer, first)
+		if err := consumer.Stop(group.ctx); err != nil {
+			t.Fatalf("lane close Stop: %v", err)
+		}
+		if _, ok := <-consumer.Messages(); ok {
+			t.Fatal("lane close Messages remained open after Stop")
+		}
+		if _, ok := <-consumer.Errors(); ok {
+			t.Fatal("lane close Errors remained open after Stop")
+		}
+		group.vector.Add(BehaviorEvent{ID: "failure-lane-close-stop", Outcome: "stopped", FinalDestination: first})
+	})
+}
+
+func assertLaneClosed(t *testing.T, group *groupContext, producer driver.Producer, consumer driver.Consumer, destination string) {
+	t.Helper()
+	if err := producer.Publish(group.ctx, driver.OutboundMessage{Destination: destination, Body: []byte("closed")}); err != nil {
+		t.Fatalf("closed lane publish: %v", err)
+	}
+	assertNoDelivery(t, group, consumer, fmt.Sprintf("closed lane %q after channel closure", destination))
+}
+
+func newLaneCloseFixture(t *testing.T, group *groupContext, suffix string) (driver.Producer, driver.Consumer, string, string) {
+	t.Helper()
+	first := "failure.lane-close." + suffix + ".first"
+	second := "failure.lane-close." + suffix + ".second"
+	if _, err := group.conn.Admin().EnsureTopology(group.ctx, driver.TopologySpec{
+		Destinations: []driver.DestinationSpec{{Name: first}, {Name: second}},
+		Effective:    group.effective,
+	}); err != nil {
+		t.Fatalf("EnsureTopology lane close: %v", err)
+	}
+	producer, err := group.conn.Producer(group.ctx, driver.ProducerConfig{Effective: group.effective})
+	if err != nil {
+		t.Fatalf("Producer lane close: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := producer.Close(group.ctx); err != nil {
+			t.Errorf("close lane close producer: %v", err)
+		}
+	})
+	for _, destination := range []string{first, second} {
+		destination := destination
+		t.Cleanup(func() {
+			if _, err := group.conn.Admin().Purge(group.ctx, destination); err != nil {
+				t.Errorf("purge lane close destination %q: %v", destination, err)
+			}
+		})
+	}
+	consumer := newConsumerFor(t, group, driver.ConsumerConfig{
+		Destinations: []string{first, second},
+		Prefetch:     2,
+		PerDestination: map[string]int{
+			first:  1,
+			second: 1,
+		},
+		Effective: group.effective,
+	})
+	return producer, consumer, first, second
+}
+
+func primeLaneClose(t *testing.T, group *groupContext, producer driver.Producer, consumer driver.Consumer, first, second string) {
+	t.Helper()
+	if err := producer.Publish(group.ctx, driver.OutboundMessage{Destination: first, Body: []byte("first-before")}); err != nil {
+		t.Fatalf("lane close first publish: %v", err)
+	}
+	firstMessage := receiveMessage(t, group, consumer)
+	if firstMessage.Destination != first {
+		t.Fatalf("first lane destination=%q, want %q", firstMessage.Destination, first)
+	}
+	ackMessage(t, group, firstMessage)
+	if err := producer.Publish(group.ctx, driver.OutboundMessage{Destination: second, Body: []byte("second-before")}); err != nil {
+		t.Fatalf("lane close second publish: %v", err)
+	}
+	secondMessage := receiveMessage(t, group, consumer)
+	if secondMessage.Destination != second {
+		t.Fatalf("second lane destination=%q, want %q", secondMessage.Destination, second)
+	}
+	ackMessage(t, group, secondMessage)
 }
 
 func injectFailure(t *testing.T, group *groupContext, kind FaultKind) {
