@@ -264,7 +264,13 @@ func applyEnvironment(cfg *Config) {
 		cfg.Broker.Driver = v
 	}
 	if v, ok := os.LookupEnv("F1_BROKER_ENDPOINTS"); ok {
-		cfg.Broker.Endpoints = strings.Split(v, ",")
+		parts := strings.Split(v, ",")
+		cfg.Broker.Endpoints = make([]string, 0, len(parts))
+		for _, part := range parts {
+			if endpoint := strings.TrimSpace(part); endpoint != "" {
+				cfg.Broker.Endpoints = append(cfg.Broker.Endpoints, endpoint)
+			}
+		}
 	}
 }
 
@@ -280,6 +286,9 @@ func validateConfig(cfg Config) error {
 	}
 	if cfg.Broker.Driver == "inmem" && cfg.Env == "prod" {
 		return fmt.Errorf("f1: broker.driver inmem is not allowed in prod")
+	}
+	if cfg.Broker.MaxReconnectAttempts < 0 {
+		return fmt.Errorf("f1: broker.maxReconnectAttempts must not be negative")
 	}
 	if cfg.Env == "prod" && cfg.Broker.TLS.InsecureSkipVerify {
 		return fmt.Errorf("f1: broker.tls.insecureSkipVerify must be false in prod")
@@ -311,6 +320,9 @@ func validateConfig(cfg Config) error {
 		}
 		if subscription.Concurrency < 1 || subscription.Concurrency > 1024 {
 			return fmt.Errorf("f1: subscriptions.%s.concurrency must be between 1 and 1024", name)
+		}
+		if err := validateSubscriptionModeAndPolicy(name, subscription.Mode, subscription.UnmatchedPolicy); err != nil {
+			return err
 		}
 		if err := validateRetryConfig("subscriptions."+name+".retry", subscription.Retry); err != nil {
 			return err

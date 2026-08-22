@@ -11,11 +11,12 @@ export GOPRIVATE := fgit.zapps.vn
 
 APISURFACE := $(CURDIR)/.tools/bin/apisurface
 APIDIFF := $(CURDIR)/.tools/bin/apidiff
+APIDIFF_NORMALIZE := $(CURDIR)/.tools/bin/apidiff-normalize
 API_DIFF_BASELINE_DIR := $(CURDIR)/testdata/api-diff
 API_DIFF_BREAKING_CHANGE ?= 0
 API_DIFF_ENFORCE ?= 0
 
-.PHONY: build test-fast test test-chaos kpi lint verify-agnostic verify-self-contained check-cardinality swap-report check-fixture check-api-surface check-api-surface-codec check-api-surface-driver check-api-surface-f1test check-api-diff record-api-diff-baseline
+.PHONY: build test-fast test lint verify-agnostic verify-self-contained check-fixture check-api-surface check-api-surface-codec check-api-surface-driver check-api-surface-f1test check-api-diff record-api-diff-baseline
 
 ## build: compile all packages with reproducible build flags.
 build:
@@ -30,13 +31,6 @@ test-fast:
 test:
 	go test -count=1 ./...
 
-## test-chaos: run the chaos test matrix when it exists.
-test-chaos:
-	@echo "test-chaos: chaos matrix is not available yet"
-
-## kpi: run the performance and delivery KPI harness when it exists.
-kpi:
-	@echo "kpi: performance harness is not available yet"
 
 ## lint: run the pinned golangci-lint configuration.
 $(GOLANGCI_LINT):
@@ -49,10 +43,6 @@ lint: $(GOLANGCI_LINT)
 verify-agnostic: $(GOLANGCI_LINT)
 	$(GOLANGCI_LINT) run --enable-only depguard ./...
 
-## check-cardinality: enforce the bounded metric label registry.
-check-cardinality:
-	go run ./tools/cardinality
-
 ## verify-self-contained: fail on citations no reader of this repository can resolve.
 # Design records live elsewhere. A reader here - a broker vendor, an auditor, a
 # future maintainer - cannot follow a decision or task identifier into a tree
@@ -63,13 +53,9 @@ verify-self-contained:
 	  || { echo "verify-self-contained: citation above cannot be resolved from this repository"; exit 1; }
 	@echo "verify-self-contained: 0 issues."
 
-## swap-report: verify driver replacement when the migration suite exists.
-swap-report:
-	@echo "swap-report: migration suite is not available yet"
-
 ## check-fixture: validate the local fixtures used by tests and tooling.
 check-fixture:
-	go test ./...
+	go test -count=1 ./...
 	$(MAKE) check-api-surface check-api-surface-codec check-api-surface-driver check-api-surface-f1test check-api-diff
 
 ## check-api-surface: verify exported symbols against the f1 public API fixture.
@@ -93,16 +79,19 @@ check-api-surface-f1test: $(APISURFACE)
 ## Enforcement is off while the first real broker driver is being built. The port has not yet met a
 ## non-memory client, so an incompatible change is expected work rather than an accident. Set
 ## API_DIFF_ENFORCE=1 once the RabbitMQ driver passes acceptance and the port is genuinely frozen.
-check-api-diff: $(APIDIFF)
+check-api-diff: $(APIDIFF) $(APIDIFF_NORMALIZE)
 	@set -e; \
 	for spec in \
 		"f1:$(MODULE):f1.export" \
 		"driver:$(MODULE)/driver:driver.export" \
 		"codec:$(MODULE)/codec:codec.export"; do \
 		package=$${spec%%:*}; rest=$${spec#*:}; import_path=$${rest%%:*}; baseline=$${rest#*:}; \
-		report=$$(mktemp); \
-		trap 'rm -f "$$report"' EXIT; \
-		$(APIDIFF) "$(API_DIFF_BASELINE_DIR)/$$baseline" "$$import_path" >"$$report"; \
+		report=$$(mktemp); current=$$(mktemp); normalized_old=$$(mktemp); normalized_new=$$(mktemp); \
+		trap 'rm -f "$$report" "$$current" "$$normalized_old" "$$normalized_new"' EXIT; \
+		$(APIDIFF) -w "$$current" "$$import_path"; \
+		$(APIDIFF_NORMALIZE) "$(API_DIFF_BASELINE_DIR)/$$baseline" "$$normalized_old"; \
+		$(APIDIFF_NORMALIZE) "$$current" "$$normalized_new"; \
+		$(APIDIFF) "$$normalized_old" "$$normalized_new" >"$$report"; \
 		cat "$$report"; \
 		if grep -q '^Incompatible changes:' "$$report"; then \
 			if [ "$(API_DIFF_ENFORCE)" = "1" ]; then \
@@ -113,11 +102,11 @@ check-api-diff: $(APIDIFF)
 		elif [ ! -s "$$report" ]; then \
 			echo "api-diff: $$package unchanged"; \
 		fi; \
-		rm -f "$$report"; \
+		rm -f "$$report" "$$current" "$$normalized_old" "$$normalized_new"; \
 	done
 
 ## record-api-diff-baseline: refresh committed snapshots; breaking changes require explicit approval.
-record-api-diff-baseline: $(APIDIFF)
+record-api-diff-baseline: $(APIDIFF) $(APIDIFF_NORMALIZE)
 	@if [ -f "$(API_DIFF_BASELINE_DIR)/f1.export" ] && \
 		[ -f "$(API_DIFF_BASELINE_DIR)/driver.export" ] && \
 		[ -f "$(API_DIFF_BASELINE_DIR)/codec.export" ] && \
@@ -129,15 +118,28 @@ record-api-diff-baseline: $(APIDIFF)
 		echo "api-diff: creating initial baseline"; \
 	fi
 	@mkdir -p "$(API_DIFF_BASELINE_DIR)"
-	$(APIDIFF) -w "$(API_DIFF_BASELINE_DIR)/f1.export" $(MODULE)
-	$(APIDIFF) -w "$(API_DIFF_BASELINE_DIR)/driver.export" $(MODULE)/driver
-	$(APIDIFF) -w "$(API_DIFF_BASELINE_DIR)/codec.export" $(MODULE)/codec
+	@set -e; \
+	raw=; \
+	trap 'rm -f "$$raw"' EXIT; \
+	for spec in \
+		"$(MODULE):f1.export" \
+		"$(MODULE)/driver:driver.export" \
+		"$(MODULE)/codec:codec.export"; do \
+		import_path=$${spec%%:*}; baseline=$${spec#*:}; \
+		raw=$$(mktemp); \
+		$(APIDIFF) -w "$$raw" "$$import_path"; \
+		$(APIDIFF_NORMALIZE) "$$raw" "$(API_DIFF_BASELINE_DIR)/$$baseline"; \
+		rm -f "$$raw"; \
+	done
 
 $(APISURFACE): tools/apisurface/main.go tools/apisurface/go.mod
 	cd tools/apisurface && go build -o ../../.tools/bin/apisurface .
 
 $(APIDIFF): tools/apidiff/go.mod tools/apidiff/go.sum
 	cd tools/apidiff && go build -o ../../.tools/bin/apidiff golang.org/x/exp/cmd/apidiff
+
+$(APIDIFF_NORMALIZE): tools/apidiff/normalize.go tools/apidiff/go.mod tools/apidiff/go.sum
+	cd tools/apidiff && go build -o ../../.tools/bin/apidiff-normalize .
 
 .PHONY: broker-up broker-down broker-reset broker-smoke test-rabbitmq
 

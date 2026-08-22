@@ -5,12 +5,9 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"runtime"
 	"runtime/debug"
 	"sort"
 	"strings"
-	"sync"
-	"sync/atomic"
 	"time"
 
 	"golang.org/x/sync/errgroup"
@@ -19,7 +16,6 @@ import (
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/clock"
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/dispatch"
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/lifecycle"
-	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/obs"
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/retry"
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/sched"
 )
@@ -37,144 +33,6 @@ type deliveryState struct {
 	// one can be retried in kind rather than guessed at.
 	operation   settlementOperation
 	nackOptions driver.NackOptions
-}
-
-type deliveryMetrics struct {
-	attemptDivergence obs.SampledGaugeSet
-	topics            []string
-	retryAfterClamped []obs.SampledCounter
-	stuckWorkers      atomic.Int64
-	activeHandlers    atomic.Int64
-	retired           atomic.Bool
-	unregisterOnce    sync.Once
-	unregister        func()
-}
-
-const deliveryPriorityLanes = 3
-
-func newDeliveryMetrics(topics []string) deliveryMetrics {
-	names := make([]string, len(topics))
-	for i, topic := range topics {
-		names[i] = topicFor(topic)
-	}
-	sort.Strings(names)
-	unique := names[:0]
-	for _, name := range names {
-		if len(unique) == 0 || unique[len(unique)-1] != name {
-			unique = append(unique, name)
-		}
-	}
-	return deliveryMetrics{
-		attemptDivergence: obs.NewSampledGaugeSet(unique, deliveryPriorityLanes),
-		topics:            append([]string(nil), unique...),
-		retryAfterClamped: make([]obs.SampledCounter, len(unique)),
-	}
-}
-
-func (m *deliveryMetrics) observeAttemptDivergence(eventType string, priority Priority, value uint64) {
-	if priority.Valid() {
-		m.attemptDivergence.Observe(topicFor(eventType), int(priority), value)
-	}
-}
-
-func (m *deliveryMetrics) sampleAttemptDivergence(topic string, priority Priority) uint64 {
-	if !priority.Valid() {
-		return 0
-	}
-	return m.attemptDivergence.Sample(topic, int(priority))
-}
-
-func (m *deliveryMetrics) sampleAttemptDivergenceByTopic() map[string]int64 {
-	values := make(map[string]int64, len(m.topics))
-	for _, topic := range m.topics {
-		var highWater uint64
-		for lane := 0; lane < deliveryPriorityLanes; lane++ {
-			if value := m.attemptDivergence.Sample(topic, lane); value > highWater {
-				highWater = value
-			}
-		}
-		values[topic] = int64(highWater)
-	}
-	return values
-}
-
-func (m *deliveryMetrics) currentStuckWorkers() int64 {
-	return m.stuckWorkers.Load()
-}
-
-func (m *deliveryMetrics) recordRetryAfterClamped(eventType string) {
-	topic := topicFor(eventType)
-	index := sort.SearchStrings(m.topics, topic)
-	if index < len(m.topics) && m.topics[index] == topic {
-		m.retryAfterClamped[index].Add(1)
-	}
-}
-
-func (m *deliveryMetrics) sampleRetryAfterClamped() map[string]uint64 {
-	values := make(map[string]uint64, len(m.topics))
-	for index, topic := range m.topics {
-		if value := m.retryAfterClamped[index].Load(); value > 0 {
-			values[topic] = value
-		}
-	}
-	return values
-}
-
-type handlerActivity struct {
-	metrics *deliveryMetrics
-	mu      sync.Mutex
-	stuck   bool
-	done    bool
-}
-
-func (m *deliveryMetrics) beginHandler() *handlerActivity {
-	m.activeHandlers.Add(1)
-	return &handlerActivity{metrics: m}
-}
-
-func (a *handlerActivity) markStuck() {
-	a.mu.Lock()
-	if !a.done && !a.stuck {
-		a.stuck = true
-		a.metrics.stuckWorkers.Add(1)
-	}
-	a.mu.Unlock()
-}
-
-func (a *handlerActivity) finish() {
-	a.mu.Lock()
-	if a.done {
-		a.mu.Unlock()
-		return
-	}
-	a.done = true
-	if a.stuck {
-		a.metrics.stuckWorkers.Add(-1)
-	}
-	a.mu.Unlock()
-	a.metrics.endHandler()
-}
-
-func (m *deliveryMetrics) endHandler() {
-	if m.activeHandlers.Add(-1) == 0 {
-		m.unregisterIfReady()
-	}
-}
-
-func (m *deliveryMetrics) retire() {
-	m.retired.Store(true)
-	m.unregisterIfReady()
-}
-
-func (m *deliveryMetrics) unregisterIfReady() {
-	if !m.retired.Load() || m.activeHandlers.Load() != 0 {
-		return
-	}
-	m.unregisterOnce.Do(func() {
-		if m.unregister != nil {
-			m.unregister()
-		}
-	})
 }
 
 // Run starts the consumer, owns its fetcher and workers, and returns when the
@@ -202,58 +60,152 @@ func (r *Runner) Run(ctx context.Context) error {
 	r.inflight = newInflightRegistry()
 	r.lifecycle = lifecycle.New()
 	r.accounting = lifecycle.NewAccounting(r.inflight.registry)
-	runCtx, cancel := context.WithCancel(ctx)
-	r.runCtx, r.cancel = runCtx, cancel
 	handlerCtx, handlerCancel := context.WithCancel(ctx)
 	r.handlerCtx, r.handlerCancel = handlerCtx, handlerCancel
 	handlerShutdownCtx, handlerShutdownCancel := context.WithCancel(context.Background())
 	r.handlerShutdownCtx, r.handlerShutdownCancel = handlerShutdownCtx, handlerShutdownCancel
 	r.asyncGroup = new(errgroup.Group)
-	group := new(errgroup.Group)
-	r.group = group
+	r.errorGroup = newErrorHandlerGroup(r.subscription.Concurrency)
 	r.mu.Unlock()
 	r.client.mu.Unlock()
 
 	defer finishRunner(r)
-	consumer, err := openRunnerConsumer(r, runCtx)
-	if err != nil {
-		return err
-	}
-	r.mu.Lock()
-	r.consumer = consumer
-	r.mu.Unlock()
+	var runErr error
+	var runCtx context.Context
+	generation := 0
+	var repairCause error
+	for {
+		runCtx, cancel := context.WithCancel(ctx)
+		r.mu.Lock()
+		r.runCtx = runCtx
+		r.cancel = cancel
+		r.reconnectCause = nil
+		r.consumerError = false
+		r.successfulDelivery = false
+		group := new(errgroup.Group)
+		r.group = group
+		r.mu.Unlock()
 
-	if err := r.lifecycle.Transition(lifecycle.Ready); err != nil {
-		return err
+		consumer, err := openRunnerConsumer(r, runCtx)
+		if err != nil {
+			repairCause = nil
+			if generation == 0 {
+				return err
+			}
+			kind, classified := driver.Classify(err)
+			if classified && kind != driver.KindTransient {
+				runErr = err
+				break
+			}
+			r.mu.Lock()
+			r.reconnectCause = err
+			r.mu.Unlock()
+			r.transitionToReconnecting()
+			attempt, requestErr := r.client.requestReconnect(err)
+			if requestErr != nil {
+				runErr = requestErr
+				break
+			}
+			if waitErr := r.client.waitReconnect(ctx, attempt); waitErr != nil {
+				runErr = waitErr
+				break
+			}
+			continue
+		}
+		generation++
+		if repairCause != nil {
+			lastResortRunnerLogger(r).Info("f1 consumer repaired", "subscription", r.subscription.Name, "cause", repairCause)
+			repairCause = nil
+		}
+		r.mu.Lock()
+		r.consumer = consumer
+		r.mu.Unlock()
+
+		switch r.lifecycle.State() {
+		case lifecycle.Starting, lifecycle.Reconnecting:
+			r.mu.Lock()
+			r.repairCycleActive = false
+			r.failedRepairCycles = 0
+			r.mu.Unlock()
+			if err := r.lifecycle.Transition(lifecycle.Ready); err != nil {
+				runErr = err
+			}
+		case lifecycle.Ready:
+		default:
+			runErr = fmt.Errorf("f1: runner cannot start from lifecycle state %s", r.lifecycle.State())
+		}
+		if runErr != nil {
+			break
+		}
+
+		deliveries := make(chan delivery, r.subscription.Concurrency)
+		group.Go(func() error { return fetchRunner(r, runCtx, deliveries) })
+		group.Go(func() error { return runDispatchPipeline(r, runCtx, deliveries) })
+		group.Go(func() error { return consumeRunnerErrors(r, runCtx) })
+		generationErr := group.Wait()
+		if generationErr == nil {
+			generationErr = runnerError(r)
+		}
+		r.mu.Lock()
+		reconnectCause := r.reconnectCause
+		consumerError := r.consumerError
+		successfulDelivery := r.successfulDelivery
+		repairCycleActive := r.repairCycleActive
+		failedRepairCycles := r.failedRepairCycles
+		draining := r.draining
+		r.mu.Unlock()
+		clientReconnecting := r.client.isReconnecting()
+		if ctx.Err() != nil || draining || (!clientReconnecting && reconnectCause == nil) {
+			runErr = generationErr
+			break
+		}
+		if consumerError && !clientReconnecting {
+			if successfulDelivery {
+				failedRepairCycles = 0
+				repairCycleActive = false
+			}
+			if repairCycleActive {
+				failedRepairCycles++
+			}
+			repairCycleActive = true
+			r.mu.Lock()
+			r.repairCycleActive = repairCycleActive
+			r.failedRepairCycles = failedRepairCycles
+			r.mu.Unlock()
+			if failedRepairCycles < 2 {
+				if releaseErr := releaseRunnerConsumer(r, context.WithoutCancel(runCtx)); releaseErr == nil {
+					repairCause = reconnectCause
+					continue
+				} else {
+					reconnectCause = errors.Join(reconnectCause, releaseErr)
+				}
+			}
+		}
+		if reconnectCause == nil {
+			reconnectCause = generationErr
+		}
+		if reconnectCause == nil {
+			reconnectCause = errClientReconnecting
+		}
+		r.transitionToReconnecting()
+		attempt, requestErr := r.client.requestReconnect(reconnectCause)
+		if requestErr != nil {
+			runErr = requestErr
+			break
+		}
+		if waitErr := r.client.waitReconnect(ctx, attempt); waitErr != nil {
+			runErr = waitErr
+			break
+		}
 	}
-	deliveries := make(chan delivery, r.subscription.Concurrency)
-	group.Go(func() error { return fetchRunner(r, runCtx, deliveries) })
-	group.Go(func() error { return runDispatchPipeline(r, runCtx, deliveries) })
-	group.Go(func() error { return consumeRunnerErrors(r, runCtx) })
-	err = group.Wait()
-	if err == nil {
-		err = runnerError(r)
-	}
-	shutdownCtx := context.WithoutCancel(runnerSettlementContext(r, runCtx))
-	shutdownErr := r.lifecycle.Drain(shutdownCtx, lifecycle.Config{
-		Clock:        r.client.options.clock,
-		DrainTimeout: r.client.config.Lifecycle.DrainTimeout,
-		FlushTimeout: r.client.config.Lifecycle.FlushTimeout,
-		CloseTimeout: r.client.config.Lifecycle.CloseTimeout,
-	}, lifecycle.Hooks{
-		WaitSettled: func(ctx context.Context) error {
-			return r.inflight.WaitZero(ctx)
-		},
-		Close: func(ctx context.Context) error {
-			return stopRunnerConsumer(r, ctx)
-		},
-	})
-	if err == nil {
-		err = shutdownErr
+
+	shutdownErr := r.drainAfterRun(runCtx) //nolint:contextcheck // drain preserves settlement context across generation cancellation.
+	if runErr == nil {
+		runErr = shutdownErr
 	} else if shutdownErr != nil {
-		err = errors.Join(err, shutdownErr)
+		runErr = errors.Join(runErr, shutdownErr)
 	}
-	return err
+	return runErr
 }
 
 func runDispatchPipeline(r *Runner, ctx context.Context, deliveries <-chan delivery) error {
@@ -408,17 +360,20 @@ func deliveryLane(r *Runner, message driver.InboundMessage) string {
 		tier := r.retryDestinationTiers[message.Destination]
 		r.mu.Unlock()
 		topic := topicFor(envelope.Type)
+		r.client.mu.Lock()
 		effective := r.client.effective
+		source := r.client.source
+		r.client.mu.Unlock()
 		for _, configured := range r.subscription.Topics {
 			logical := topicFor(configured)
 			if tier == 0 {
-				if consumeDestination(effective, r.client.source, logical, envelope.Priority, r.subscription.Name) == message.Destination {
+				if consumeDestination(effective, source, logical, envelope.Priority, r.subscription.Name) == message.Destination {
 					topic = logical
 					break
 				}
 				continue
 			}
-			if retryDestinationFor(r.client.source, logical, envelope.Priority, tier, r.subscription.Name) == message.Destination {
+			if retryDestinationFor(source, logical, envelope.Priority, tier, r.subscription.Name) == message.Destination {
 				topic = logical
 				break
 			}
@@ -449,6 +404,11 @@ func (r *Runner) Drain(ctx context.Context) error {
 	if r.lifecycle != nil {
 		switch r.lifecycle.State() {
 		case lifecycle.Ready:
+			if err := r.lifecycle.Transition(lifecycle.Draining); err != nil {
+				r.mu.Unlock()
+				return err
+			}
+		case lifecycle.Reconnecting:
 			if err := r.lifecycle.Transition(lifecycle.Draining); err != nil {
 				r.mu.Unlock()
 				return err
@@ -547,7 +507,6 @@ func finishRunner(r *Runner) {
 		delete(r.client.runners, r)
 		r.client.mu.Unlock()
 	}
-	r.metrics.retire()
 }
 
 func runnerError(r *Runner) error {
@@ -674,11 +633,18 @@ func runnerSettlementContext(r *Runner, fallback context.Context) context.Contex
 	return fallback
 }
 
-func runnerLogger(r *Runner) *slog.Logger {
-	if r == nil || r.client == nil || r.client.options.logger == nil {
-		return slog.Default()
+func configuredRunnerLogger(r *Runner) *slog.Logger {
+	if r == nil || r.client == nil {
+		return nil
 	}
-	return r.client.options.logger
+	return configuredClientLogger(r.client)
+}
+
+func lastResortRunnerLogger(r *Runner) *slog.Logger {
+	if logger := configuredRunnerLogger(r); logger != nil {
+		return logger
+	}
+	return slog.Default()
 }
 
 func openRunnerConsumer(r *Runner, ctx context.Context) (driver.Consumer, error) {
@@ -703,9 +669,11 @@ func openRunnerConsumer(r *Runner, ctx context.Context) (driver.Consumer, error)
 		}
 		topology := subscriptionTopologySpecs(effective, source, r.subscription)
 		topology.Policy = policy
-		if _, err := admin.EnsureTopology(ctx, topology); err != nil {
+		diff, err := admin.EnsureTopology(ctx, topology)
+		if err != nil {
 			return nil, fmt.Errorf("f1: ensure subscription topology: %w", err)
 		}
+		logTopologyDrift(lastResortRunnerLogger(r), diff)
 	}
 	perDestination := make(map[string]int, len(destinations))
 	remaining := r.config.Prefetch
@@ -756,15 +724,31 @@ func consumeRunnerErrors(r *Runner, ctx context.Context) error {
 			if err == nil {
 				continue
 			}
-			runnerLogger(r).Error("f1 consumer error", "subscription", r.subscription.Name, "error", err)
-			setRunnerError(r, err)
+			if r.client.options.errorHandler == nil {
+				lastResortRunnerLogger(r).Error("f1 consumer error", "subscription", r.subscription.Name, "error", err)
+			}
+			kind, classified := driver.Classify(err)
+			var cancel context.CancelFunc
+			if !classified || kind == driver.KindTransient {
+				r.mu.Lock()
+				if kind == driver.KindTransient {
+					r.consumerError = true
+				}
+				if r.reconnectCause == nil {
+					r.reconnectCause = err
+				}
+				cancel = r.cancel
+				r.mu.Unlock()
+			} else {
+				setRunnerError(r, err)
+			}
 			// r.cancel below is about to cancel ctx, so the notification gets its
 			// own detached context: the handler's terminalNotificationTimeout
 			// budget must not collapse to zero just because the same error that
 			// is being reported is also what triggers shutdown.
 			runnerNotifyError(r, context.WithoutCancel(ctx), nil, err)
-			if r.cancel != nil {
-				r.cancel()
+			if cancel != nil {
+				cancel()
 			}
 			return nil
 		}
@@ -915,9 +899,6 @@ func dispatchMessage(r *Runner, ctx context.Context, message driver.InboundMessa
 	if retry.CounterRunaway(envelope.Attempt, maxAttempts) {
 		return deadLetterAndSettle(r, ctx, message, envelope, ReasonPoison, errors.New("retry counter exceeded sanity margin"), state)
 	}
-	// Record at receipt, before handler work or settlement: a failed settlement
-	// can cause the broker to redeliver this delivery.
-	recordAttemptDivergence(r, envelope.Type, envelope.Priority, envelope.Attempt, message.DeliveryCount)
 	if max := r.client.config.Codec.MaxBodyBytes; max > 0 && len(message.Body) > max {
 		return deadLetterAndSettle(r, ctx, message, envelope, ReasonDecode, fmt.Errorf("body exceeds codec.maxBodyBytes (%d)", max), state)
 	}
@@ -974,19 +955,6 @@ func classifyRetryError(err error) retry.Outcome {
 	return retry.Classify(err)
 }
 
-func recordAttemptDivergence(r *Runner, eventType string, priority Priority, attempt, deliveryCount int) {
-	if r == nil || deliveryCount < 0 {
-		return
-	}
-	var difference int
-	if attempt >= deliveryCount {
-		difference = attempt - deliveryCount
-	} else {
-		difference = deliveryCount - attempt
-	}
-	r.metrics.observeAttemptDivergence(eventType, priority, uint64(uint(difference)))
-}
-
 func stateFor(states []*deliveryState) *deliveryState {
 	if len(states) > 0 && states[0] != nil {
 		return states[0]
@@ -1025,9 +993,7 @@ func invokeHandler(r *Runner, parent context.Context, handler Handler, event *Ev
 		group = new(errgroup.Group)
 	}
 	r.mu.Unlock()
-	activity := r.metrics.beginHandler()
 	group.Go(func() error {
-		defer activity.finish()
 		result := handlerResult{}
 		func() {
 			defer func() {
@@ -1063,8 +1029,7 @@ func invokeHandler(r *Runner, parent context.Context, handler Handler, event *Ev
 	case <-shutdownDone:
 		return handlerResult{stuck: true}
 	case <-stuck.C:
-		activity.markStuck()
-		runnerLogger(r).Warn("f1 stuck worker", "metric", "f1_stuck_workers", "subscription", r.subscription.Name, "threshold", 2*timeout)
+		lastResortRunnerLogger(r).Warn("f1 stuck worker", "subscription", r.subscription.Name, "threshold", 2*timeout)
 	}
 	stackTimer := r.client.options.clock.Timer(timeout * 2)
 	defer stackTimer.Stop()
@@ -1076,9 +1041,7 @@ func invokeHandler(r *Runner, parent context.Context, handler Handler, event *Ev
 	case <-shutdownDone:
 		return handlerResult{stuck: true}
 	case <-stackTimer.C:
-		buffer := make([]byte, 64<<10)
-		n := runtime.Stack(buffer, true)
-		runnerLogger(r).Error("f1 worker exceeded stuck threshold", "metric", "f1_stuck_workers", "subscription", r.subscription.Name, "threshold", 4*timeout, "stack", string(buffer[:n]))
+		lastResortRunnerLogger(r).Error("f1 worker exceeded stuck threshold", "subscription", r.subscription.Name, "threshold", 4*timeout)
 		return handlerResult{stuck: true}
 	}
 }
@@ -1099,6 +1062,11 @@ func ackDeliveryAs(r *Runner, ctx context.Context, message driver.InboundMessage
 	err := message.Settle.Ack(ctx)
 	state.attempted = true
 	state.settled = err == nil
+	if r != nil && state.settled && disposition == lifecycle.Handled {
+		r.mu.Lock()
+		r.successfulDelivery = true
+		r.mu.Unlock()
+	}
 	return state.settled
 }
 
@@ -1238,10 +1206,14 @@ func failSuccessorHandoff(r *Runner, ctx context.Context, op string, event *Even
 	setRunnerError(r, classified)
 	runnerNotifyError(r, ctx, event, classified)
 	if err := releaseRunnerConsumer(r, ctx); err != nil {
-		runnerLogger(r).Error("f1 failed to release consumer after a successor publish exhausted its republish budget", "op", op, "cause", classified, "release_error", err)
+		if r.client.options.errorHandler == nil {
+			lastResortRunnerLogger(r).Error("f1 failed to release consumer after a successor publish exhausted its republish budget", "op", op, "cause", classified, "release_error", err)
+		}
 		return
 	}
-	runnerLogger(r).Error("f1 successor publish exhausted its republish budget; consumer released", "op", op, "cause", classified)
+	if r.client.options.errorHandler == nil {
+		lastResortRunnerLogger(r).Error("f1 successor publish exhausted its republish budget; consumer released", "op", op, "cause", classified)
+	}
 }
 
 // retryAndSettle republishes message to its retry destination, carrying the
@@ -1276,10 +1248,7 @@ func retryAndSettle(r *Runner, ctx context.Context, message driver.InboundMessag
 	tier := retry.ResolveTier(retryConfig, envelope.Attempt)
 	delay := retryConfig.DelayFor(tier)
 	if requested, ok := RetryDelay(lastErr); ok {
-		resolvedTier, resolvedDelay, clamped := retry.ResolveRetryAfter(retryConfig, requested)
-		if clamped {
-			r.metrics.recordRetryAfterClamped(envelope.Type)
-		}
+		resolvedTier, resolvedDelay, _ := retry.ResolveRetryAfter(retryConfig, requested)
 		tier, delay = resolvedTier, resolvedDelay
 	}
 	now := r.client.options.clock.Now().UTC()

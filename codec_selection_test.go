@@ -64,7 +64,6 @@ func newCodecSelectionRunner(t *testing.T, cfg Config, opts ...Option) (*Client,
 			Retry:          RetryConfig{MaxAttempts: 3, Tiers: []time.Duration{time.Second}},
 			HandlerTimeout: time.Second,
 		},
-		metrics: newDeliveryMetrics([]string{"orders.created"}),
 	}
 	return client, runner, producer
 }

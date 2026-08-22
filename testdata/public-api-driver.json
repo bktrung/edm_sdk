@@ -3,10 +3,10 @@
   "symbols": [
     "Admin",
     "ArgumentDrift",
+    "BindingSpec",
     "BrokerInfo",
     "BrokerInfo.Display",
     "BrokerRef",
-    "BindingSpec",
     "Capabilities",
     "Capabilities.Strict",
     "ClassifiedError",

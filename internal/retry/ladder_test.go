@@ -146,3 +146,25 @@ func TestResolveRetryAfterClampsNegativeAndJitterBounds(t *testing.T) {
 		t.Fatalf("wide jitter request = %d, %s, %v", tier, delay, clamped)
 	}
 }
+
+func TestDelayForCapsBeforeDurationOverflow(t *testing.T) {
+	cfg := Config{InitialInterval: time.Second, Multiplier: 2, MaxInterval: 30 * time.Second}
+	if got := cfg.DelayFor(1000); got != 30*time.Second {
+		t.Fatalf("DelayFor(1000) = %s, want 30s", got)
+	}
+}
+
+func TestFullJitterClampsSample(t *testing.T) {
+	for _, test := range []struct {
+		sample float64
+		want   time.Duration
+	}{
+		{sample: -1, want: 0},
+		{sample: 0.5, want: 500 * time.Millisecond},
+		{sample: 2, want: time.Second},
+	} {
+		if got := FullJitter(time.Second, test.sample); got != test.want {
+			t.Errorf("FullJitter(1s, %v) = %s, want %s", test.sample, got, test.want)
+		}
+	}
+}

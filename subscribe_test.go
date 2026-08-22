@@ -33,6 +33,19 @@ func TestSubscribeRejectsOrderedByKeyWhenUnavailable(t *testing.T) {
 	}
 }
 
+func TestSubscribeRejectsUnsupportedMode(t *testing.T) {
+	client := newPublishClient(t, &recordingProducer{})
+	_, err := client.Subscribe(context.Background(), Subscription{
+		Name:        "orders",
+		Topics:      []string{"orders.created"},
+		Mode:        Mode(99),
+		Concurrency: 1,
+	})
+	if err == nil || !strings.Contains(err.Error(), "subscriptions.orders.mode") {
+		t.Fatalf("Subscribe() error = %v, want unsupported mode", err)
+	}
+}
+
 func TestSubscribeAcceptsOrderedByKeyWhenNative(t *testing.T) {
 	t.Parallel()
 	conn := &testConn{caps: driver.Capabilities{OrderedByKey: true}, info: testBrokerInfo()}

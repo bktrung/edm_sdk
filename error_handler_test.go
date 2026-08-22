@@ -3,7 +3,9 @@ package f1
 import (
 	"context"
 	"errors"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -90,7 +92,6 @@ func newErrorHandlerRunner(t *testing.T, producer driver.Producer, consumer *dis
 		},
 		consumer:   consumer,
 		asyncGroup: new(errgroup.Group),
-		metrics:    newDeliveryMetrics([]string{"orders.created"}),
 	}
 	return client, runner
 }
@@ -272,4 +273,62 @@ func TestErrorHandlerDoesNotBlockRunner(t *testing.T) {
 
 	close(release)
 	recorder.waitForCall(t, 2*time.Second)
+}
+
+func TestErrorHandlerNotificationsAreBoundedAndDroppable(t *testing.T) {
+	defaultOutput := captureProcessDefault(t)
+	started := make(chan struct{}, 4)
+	finished := make(chan struct{}, 4)
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	var active atomic.Int32
+	client, runner := newLoggerHandoffRunner(t, nil, func(context.Context, *Event, error) {
+		active.Add(1)
+		started <- struct{}{}
+		<-release
+		active.Add(-1)
+		finished <- struct{}{}
+	})
+	defer func() {
+		releaseOnce.Do(func() { close(release) })
+		_ = client.Close(context.Background())
+	}()
+	runner.subscription.Concurrency = 2
+
+	runnerNotifyError(runner, context.Background(), nil, errors.New("first"))
+	runnerNotifyError(runner, context.Background(), nil, errors.New("second"))
+	for i := 0; i < 2; i++ {
+		timer := clock.NewReal().Timer(time.Second)
+		select {
+		case <-started:
+		case <-timer.C:
+			t.Fatal("error handler did not fill its concurrency bound")
+		}
+		timer.Stop()
+	}
+	runnerNotifyError(runner, context.Background(), nil, errors.New("dropped"))
+	timer := clock.NewReal().Timer(50 * time.Millisecond)
+	select {
+	case <-started:
+		t.Fatal("error handler exceeded its concurrency bound")
+	case <-timer.C:
+	}
+	timer.Stop()
+	if got := active.Load(); got != 2 {
+		t.Fatalf("active error handlers = %d, want 2", got)
+	}
+	if got := defaultOutput.String(); !strings.Contains(got, "error handler notification dropped") || !strings.Contains(got, "dropped") {
+		t.Fatalf("process default output = %q, want dropped notification", got)
+	}
+
+	releaseOnce.Do(func() { close(release) })
+	for i := 0; i < 2; i++ {
+		timer := clock.NewReal().Timer(time.Second)
+		select {
+		case <-finished:
+		case <-timer.C:
+			t.Fatal("error handler did not finish after release")
+		}
+		timer.Stop()
+	}
 }

@@ -25,7 +25,6 @@ func newRetryBridgeRunner(t *testing.T, producer *dispatchProducer, topic string
 			Retry:          RetryConfig{MaxAttempts: 3, Tiers: []time.Duration{time.Second, 2 * time.Second}, Jitter: 0.2},
 			HandlerTimeout: time.Second,
 		},
-		metrics: newDeliveryMetrics([]string{topic}),
 	}
 	return client, runner
 }
@@ -73,7 +72,7 @@ func TestDispatchDeadLettersRunawayCounter(t *testing.T) {
 	}
 }
 
-func TestRetryAfterClampRecordsMetricAndCarriesTier(t *testing.T) {
+func TestRetryAfterClampCarriesTier(t *testing.T) {
 	producer := &dispatchProducer{}
 	client, runner := newRetryBridgeRunner(t, producer, "orders.retry.created")
 	defer func() { _ = client.Close(context.Background()) }()
@@ -90,9 +89,6 @@ func TestRetryAfterClampRecordsMetricAndCarriesTier(t *testing.T) {
 	message := retryBridgeMessage(t, envelope, settler)
 	if !retryAndSettle(runner, context.Background(), message, envelope, RetryAfter(errors.New("slow"), 5*time.Minute)) {
 		t.Fatal("retry successor was not published and settled")
-	}
-	if got := runner.metrics.sampleRetryAfterClamped()["orders.retry.created"]; got != 1 {
-		t.Fatalf("clamp samples = %d, want 1", got)
 	}
 	retryDestination := producer.messages[0].Destination
 	runner.retryDestinationTiers = map[string]int{retryDestination: 2}
@@ -446,25 +442,6 @@ func TestRunnerReleasesDeliveryAfterSuccessorPublishExhaustsBudget(t *testing.T)
 	}
 	if !consumer.stopped {
 		t.Fatal("consumer was not closed after Release")
-	}
-}
-
-func TestRetryAfterClampMetricIsCumulative(t *testing.T) {
-	metrics := newDeliveryMetrics([]string{"orders.retry.created", "payments.retry.created"})
-	metrics.recordRetryAfterClamped("orders.retry.created.v1")
-	values := metrics.sampleRetryAfterClamped()
-	if got := values["orders.retry.created"]; got != 1 {
-		t.Fatalf("first clamp sample = %d, want 1", got)
-	}
-	if _, ok := values["payments.retry.created"]; ok {
-		t.Fatal("never-clamped topic must remain absent from the metric source")
-	}
-	metrics.recordRetryAfterClamped("orders.retry.created.v1")
-	if got := metrics.sampleRetryAfterClamped()["orders.retry.created"]; got != 2 {
-		t.Fatalf("second clamp sample = %d, want cumulative 2", got)
-	}
-	if got := metrics.sampleRetryAfterClamped()["orders.retry.created"]; got != 2 {
-		t.Fatalf("third clamp sample = %d, want unchanged cumulative 2", got)
 	}
 }
 

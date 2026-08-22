@@ -87,7 +87,11 @@ type Runner struct {
 	// asyncGroup owns handler and terminal-callback goroutines. finishRunner
 	// cancels their contexts but does not wait: a non-cooperative handler or
 	// callback cannot be force-stopped, and waiting would violate drain's bound.
-	asyncGroup            *errgroup.Group
+	asyncGroup *errgroup.Group
+	// errorGroup owns only error-handler notifications. It is bounded and is
+	// never waited by the runner, because a non-cooperative callback cannot be
+	// force-stopped without extending shutdown.
+	errorGroup            *errgroup.Group
 	runCtx                context.Context
 	handlerCtx            context.Context
 	handlerCancel         context.CancelFunc
@@ -101,15 +105,34 @@ type Runner struct {
 	draining              bool
 	finished              bool
 	runErr                error
+	reconnectCause        error
+	// consumerError identifies a transient failure from Consumer.Errors in this generation.
+	consumerError bool
+	// successfulDelivery means this generation completed at least one handled delivery.
+	successfulDelivery bool
+	// repairCycleActive means a replacement consumer has been built and the next
+	// transient consumer failure can complete a failed repair cycle.
+	repairCycleActive bool
+	// failedRepairCycles counts consecutive replacement consumers that fail before
+	// any handled delivery; a handled delivery resets it.
+	failedRepairCycles    int
 	inflight              *inflightRegistry
 	retryDestinationTiers map[string]int
-	metrics               deliveryMetrics
 	lifecycle             *lifecycle.Machine
 	accounting            *lifecycle.Accounting
 	dispatchPool          *dispatch.Pool
 }
 
 const terminalNotificationTimeout = time.Second
+
+func newErrorHandlerGroup(concurrency int) *errgroup.Group {
+	if concurrency < 1 {
+		concurrency = 1
+	}
+	group := new(errgroup.Group)
+	group.SetLimit(concurrency)
+	return group
+}
 
 func runnerNotifyDeadLetter(r *Runner, parent context.Context, payload DeadLettered) {
 	if r == nil || r.subscription.OnDeadLetter == nil {
@@ -132,7 +155,7 @@ func runnerNotifyDiscarded(r *Runner, parent context.Context, payload Discarded)
 // Unlike runnerNotify above, this call never waits on the handler: one of
 // its two call sites is failSuccessorHandoff, on the synchronous
 // delivery/settlement path, so waiting even briefly here would let a slow
-// handler stall a delivery. The handler runs on r.asyncGroup, on its own
+// handler stall a delivery. The handler runs on r.errorGroup, on its own
 // goroutine, with panic recovery and a terminalNotificationTimeout deadline
 // passed through its context; the deadline is advisory (Go cannot force-stop
 // a goroutine that ignores ctx), but the caller itself never blocks on it.
@@ -142,13 +165,14 @@ func runnerNotifyError(r *Runner, parent context.Context, event *Event, cause er
 	}
 	handler := r.client.options.errorHandler
 	r.mu.Lock()
-	group := r.asyncGroup
-	r.mu.Unlock()
+	group := r.errorGroup
 	if group == nil {
-		group = new(errgroup.Group)
+		group = newErrorHandlerGroup(r.subscription.Concurrency)
+		r.errorGroup = group
 	}
-	logger := runnerLogger(r)
-	group.Go(func() (err error) {
+	r.mu.Unlock()
+	logger := lastResortRunnerLogger(r)
+	if !group.TryGo(func() (err error) {
 		defer func() {
 			if recovered := recover(); recovered != nil {
 				logger.Warn("f1 error handler panicked", "panic", recovered)
@@ -158,7 +182,9 @@ func runnerNotifyError(r *Runner, parent context.Context, event *Event, cause er
 		defer cancel()
 		handler(ctx, event, cause)
 		return nil
-	})
+	}) {
+		logger.Error("f1 error handler notification dropped", "subscription", r.subscription.Name, "cause", cause)
+	}
 }
 
 func runnerNotify(r *Runner, parent context.Context, callback func(context.Context), kind string) {
@@ -171,7 +197,7 @@ func runnerNotify(r *Runner, parent context.Context, callback func(context.Conte
 	if parent == nil {
 		return
 	}
-	notifyOwned(parent, callback, group, runnerLogger(r), kind)
+	notifyOwned(parent, callback, group, lastResortRunnerLogger(r), kind)
 }
 
 func notifyOwned(parent context.Context, callback func(context.Context), group *errgroup.Group, logger *slog.Logger, kind string) {
@@ -180,9 +206,6 @@ func notifyOwned(parent context.Context, callback func(context.Context), group *
 	}
 	if group == nil {
 		group = new(errgroup.Group)
-	}
-	if logger == nil {
-		logger = slog.Default()
 	}
 	ctx, cancel := context.WithTimeout(parent, terminalNotificationTimeout)
 	defer cancel()
@@ -231,7 +254,10 @@ func (c *Client) Subscribe(ctx context.Context, sub Subscription) (*Runner, erro
 	if err := validateSubscription(c.config, sub.Name, resolved); err != nil {
 		return nil, err
 	}
-	if resolved.Mode == OrderedByKey && !c.effective.OrderedByKey {
+	c.mu.Lock()
+	effectiveCapabilities := c.effective
+	c.mu.Unlock()
+	if resolved.Mode == OrderedByKey && !effectiveCapabilities.OrderedByKey {
 		return nil, fmt.Errorf("f1: subscription %s requests ordered_by_key, but feature is unavailable", sub.Name)
 	}
 	c.mu.Lock()
@@ -255,16 +281,13 @@ func (c *Client) Subscribe(ctx context.Context, sub Subscription) (*Runner, erro
 	effective.HandlerTimeout = resolved.HandlerTimeout
 	effective.UnmatchedPolicy = resolved.UnmatchedPolicy
 	effective.Handlers = wrapHandlers(c.options.middleware, sub.Handlers)
-	runner := &Runner{client: c, subscription: effective, config: resolved, metrics: newDeliveryMetrics(effective.Topics)}
+	runner := &Runner{client: c, subscription: effective, config: resolved}
 	c.mu.Lock()
 	if c.closed || c.shutdownStarted || c.conn == nil {
 		c.mu.Unlock()
 		return nil, errors.New("f1: client is closing")
 	}
 	c.runners[runner] = struct{}{}
-	if c.metrics != nil {
-		runner.metrics.unregister = c.metrics.Register(effective.Name, runner.metrics.sampleAttemptDivergenceByTopic, runner.metrics.currentStuckWorkers, runner.metrics.sampleRetryAfterClamped)
-	}
 	c.mu.Unlock()
 	return runner, nil
 }
@@ -374,11 +397,8 @@ func validateSubscription(cfg Config, name string, sub SubscriptionConfig) error
 	if sub.Concurrency < 1 || sub.Concurrency > 1024 {
 		return fmt.Errorf("f1: subscriptions.%s.concurrency must be between 1 and 1024", name)
 	}
-	if sub.Mode != Unordered && sub.Mode != OrderedByKey {
-		return fmt.Errorf("f1: subscriptions.%s.mode is unsupported", name)
-	}
-	if sub.UnmatchedPolicy != Ignore && sub.UnmatchedPolicy != DeadLetter {
-		return fmt.Errorf("f1: subscriptions.%s.unmatchedPolicy is unsupported", name)
+	if err := validateSubscriptionModeAndPolicy(name, sub.Mode, sub.UnmatchedPolicy); err != nil {
+		return err
 	}
 	if len(sub.Priorities) == 0 {
 		return fmt.Errorf("f1: subscriptions.%s.priorities must not be empty", name)
@@ -425,6 +445,16 @@ func validateSubscription(cfg Config, name string, sub SubscriptionConfig) error
 		if consumerTimeout < sub.HandlerTimeout*3 {
 			return fmt.Errorf("f1: broker.rabbitmq.consumerTimeout must be at least subscriptions.%s.handlerTimeout x 3", name)
 		}
+	}
+	return nil
+}
+
+func validateSubscriptionModeAndPolicy(name string, mode Mode, policy UnmatchedPolicy) error {
+	if mode != Unordered && mode != OrderedByKey {
+		return fmt.Errorf("f1: subscriptions.%s.mode is unsupported", name)
+	}
+	if policy != Ignore && policy != DeadLetter {
+		return fmt.Errorf("f1: subscriptions.%s.unmatchedPolicy is unsupported", name)
 	}
 	return nil
 }

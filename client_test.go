@@ -11,8 +11,6 @@ import (
 	"testing"
 	"time"
 
-	"go.opentelemetry.io/otel/metric/noop"
-
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/driver"
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/clock"
 )
@@ -30,8 +28,15 @@ func TestNewValidatesOptionsEagerly(t *testing.T) {
 	if _, err := New(context.Background(), cfg, WithDriver(fakeDriver), WithLogger(nil)); err == nil || fakeDriver.opened {
 		t.Fatalf("New() error = %v, opened = %v; want option error before open", err, fakeDriver.opened)
 	}
-	if _, err := New(context.Background(), cfg, WithDriver(&testDriver{}), WithMeterProvider(noop.NewMeterProvider())); err != nil {
-		t.Fatalf("New() error = %v, want typed observability provider accepted", err)
+}
+
+func TestNewRejectsNilConnection(t *testing.T) {
+	client, err := New(context.Background(), testClientConfig(t), WithDriver(nilConnectionDriver{}))
+	if client != nil {
+		t.Fatal("New() returned a client for a nil connection")
+	}
+	if err == nil || err.Error() != "f1: open nil-connection driver: driver returned a nil connection" {
+		t.Fatalf("New() error = %v, want nil-connection startup error", err)
 	}
 }
 
@@ -311,6 +316,14 @@ func testClientConfig(t *testing.T) Config {
 type testDriver struct {
 	conn   *testConn
 	opened bool
+}
+
+type nilConnectionDriver struct{}
+
+func (nilConnectionDriver) Name() string                      { return "nil-connection" }
+func (nilConnectionDriver) Capabilities() driver.Capabilities { return driver.Capabilities{} }
+func (nilConnectionDriver) Open(context.Context, driver.Config) (driver.Conn, error) {
+	return nil, nil
 }
 
 func (*testDriver) Name() string                      { return "test" }

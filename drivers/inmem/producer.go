@@ -25,7 +25,7 @@ func (p *producer) Publish(ctx context.Context, messages ...driver.OutboundMessa
 	if p.closed {
 		return classify("publish", driver.KindFatal, errors.New("producer closed"))
 	}
-	if p.conn.closed {
+	if p.conn.closed || p.conn.closing {
 		return classify("publish", driver.KindFatal, errors.New("connection closed"))
 	}
 	if p.conn.failPublishFatal {
