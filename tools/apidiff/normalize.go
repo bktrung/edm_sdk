@@ -81,8 +81,11 @@ func canonicalFileSet(files *token.FileSet) *token.FileSet {
 
 func canonicalFileName(name string) string {
 	name = filepath.ToSlash(name)
-	if strings.HasPrefix(name, filepath.ToSlash(runtime.GOROOT())+"/") || strings.Contains(name, "/go/pkg/mod/") {
-		return name
+	if relative, ok := rootedPathSuffix(name, filepath.ToSlash(runtime.GOROOT())); ok {
+		return "$GOROOT/" + relative
+	}
+	if index := strings.Index(name, "/pkg/mod/"); index >= 0 {
+		return "$GOMODCACHE/" + name[index+len("/pkg/mod/"):]
 	}
 	parts := strings.Split(name, "/")
 	for i, part := range parts {
@@ -91,4 +94,15 @@ func canonicalFileName(name string) string {
 		}
 	}
 	return "$MODULE/" + filepath.Base(name)
+}
+
+func rootedPathSuffix(name, root string) (string, bool) {
+	if name == root {
+		return "", true
+	}
+	prefix := strings.TrimSuffix(root, "/") + "/"
+	if !strings.HasPrefix(name, prefix) {
+		return "", false
+	}
+	return strings.TrimPrefix(name, prefix), true
 }
