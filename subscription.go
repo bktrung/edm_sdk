@@ -106,6 +106,12 @@ type Runner struct {
 	finished              bool
 	runErr                error
 	reconnectCause        error
+	// consumerError identifies a transient failure from Consumer.Errors in this generation.
+	consumerError bool
+	// successfulDelivery means this generation completed at least one handled delivery.
+	successfulDelivery bool
+	// failedRepairCycles counts consecutive generations that fail before any handled delivery; a handled delivery resets it.
+	failedRepairCycles    int
 	inflight              *inflightRegistry
 	retryDestinationTiers map[string]int
 	lifecycle             *lifecycle.Machine

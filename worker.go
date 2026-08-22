@@ -73,18 +73,22 @@ func (r *Runner) Run(ctx context.Context) error {
 	var runErr error
 	var runCtx context.Context
 	generation := 0
+	var repairCause error
 	for {
 		runCtx, cancel := context.WithCancel(ctx)
 		r.mu.Lock()
 		r.runCtx = runCtx
 		r.cancel = cancel
 		r.reconnectCause = nil
+		r.consumerError = false
+		r.successfulDelivery = false
 		group := new(errgroup.Group)
 		r.group = group
 		r.mu.Unlock()
 
 		consumer, err := openRunnerConsumer(r, runCtx)
 		if err != nil {
+			repairCause = nil
 			if generation == 0 {
 				return err
 			}
@@ -109,12 +113,19 @@ func (r *Runner) Run(ctx context.Context) error {
 			continue
 		}
 		generation++
+		if repairCause != nil {
+			lastResortRunnerLogger(r).Info("f1 consumer repaired", "subscription", r.subscription.Name, "cause", repairCause)
+			repairCause = nil
+		}
 		r.mu.Lock()
 		r.consumer = consumer
 		r.mu.Unlock()
 
 		switch r.lifecycle.State() {
 		case lifecycle.Starting, lifecycle.Reconnecting:
+			r.mu.Lock()
+			r.failedRepairCycles = 0
+			r.mu.Unlock()
 			if err := r.lifecycle.Transition(lifecycle.Ready); err != nil {
 				runErr = err
 			}
@@ -136,11 +147,32 @@ func (r *Runner) Run(ctx context.Context) error {
 		}
 		r.mu.Lock()
 		reconnectCause := r.reconnectCause
+		consumerError := r.consumerError
+		successfulDelivery := r.successfulDelivery
+		failedRepairCycles := r.failedRepairCycles
 		draining := r.draining
 		r.mu.Unlock()
-		if ctx.Err() != nil || draining || (!r.client.isReconnecting() && reconnectCause == nil) {
+		clientReconnecting := r.client.isReconnecting()
+		if ctx.Err() != nil || draining || (!clientReconnecting && reconnectCause == nil) {
 			runErr = generationErr
 			break
+		}
+		if consumerError && !clientReconnecting {
+			if successfulDelivery {
+				failedRepairCycles = 0
+			}
+			failedRepairCycles++
+			r.mu.Lock()
+			r.failedRepairCycles = failedRepairCycles
+			r.mu.Unlock()
+			if failedRepairCycles < 2 {
+				if releaseErr := releaseRunnerConsumer(r, context.WithoutCancel(runCtx)); releaseErr == nil {
+					repairCause = reconnectCause
+					continue
+				} else {
+					reconnectCause = errors.Join(reconnectCause, releaseErr)
+				}
+			}
 		}
 		if reconnectCause == nil {
 			reconnectCause = generationErr
@@ -692,6 +724,9 @@ func consumeRunnerErrors(r *Runner, ctx context.Context) error {
 			var cancel context.CancelFunc
 			if !classified || kind == driver.KindTransient {
 				r.mu.Lock()
+				if kind == driver.KindTransient {
+					r.consumerError = true
+				}
 				if r.reconnectCause == nil {
 					r.reconnectCause = err
 				}
@@ -1020,6 +1055,11 @@ func ackDeliveryAs(r *Runner, ctx context.Context, message driver.InboundMessage
 	err := message.Settle.Ack(ctx)
 	state.attempted = true
 	state.settled = err == nil
+	if r != nil && state.settled && disposition == lifecycle.Handled {
+		r.mu.Lock()
+		r.successfulDelivery = true
+		r.mu.Unlock()
+	}
 	return state.settled
 }
 

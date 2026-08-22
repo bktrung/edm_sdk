@@ -17,11 +17,12 @@ import (
 )
 
 type reconnectTestDriver struct {
-	mu          sync.Mutex
-	opens       int
-	failOpens   int
-	connections []*reconnectTestConn
-	created     chan *reconnectTestConsumer
+	mu            sync.Mutex
+	opens         int
+	failOpens     int
+	failConsumers int
+	connections   []*reconnectTestConn
+	created       chan *reconnectTestConsumer
 }
 
 func (d *reconnectTestDriver) Name() string { return "reconnect-test" }
@@ -55,6 +56,12 @@ func (d *reconnectTestDriver) setFailOpens(n int) {
 	d.mu.Unlock()
 }
 
+func (d *reconnectTestDriver) setFailConsumers(n int) {
+	d.mu.Lock()
+	d.failConsumers = n
+	d.mu.Unlock()
+}
+
 type reconnectTestConn struct {
 	driver   *reconnectTestDriver
 	admin    *reconnectTestAdmin
@@ -76,6 +83,13 @@ func (c *reconnectTestConn) Producer(context.Context, driver.ProducerConfig) (dr
 }
 
 func (c *reconnectTestConn) Consumer(context.Context, driver.ConsumerConfig) (driver.Consumer, error) {
+	c.driver.mu.Lock()
+	if c.driver.failConsumers > 0 {
+		c.driver.failConsumers--
+		c.driver.mu.Unlock()
+		return nil, &driver.Error{Driver: c.driver.Name(), Op: "consumer", K: driver.KindTransient, Err: errors.New("consumer failed")}
+	}
+	c.driver.mu.Unlock()
 	if c.closed.Load() {
 		return nil, &driver.Error{Driver: c.driver.Name(), Op: "consumer", K: driver.KindTransient, Err: errors.New("connection closed")}
 	}
@@ -269,7 +283,7 @@ func validReconnectMessage(t *testing.T, id string) driver.InboundMessage {
 	return reconnectMessage(t, id, &reconnectTestSettler{})
 }
 
-func TestRunnerReconnectsAndResumesDelivery(t *testing.T) {
+func TestRunnerRepairsConsumerAndResumesDelivery(t *testing.T) {
 	d := &reconnectTestDriver{created: make(chan *reconnectTestConsumer, 8)}
 	client := newReconnectTestClient(t, d, nil, 0)
 	var handled atomic.Int32
@@ -293,34 +307,26 @@ func TestRunnerReconnectsAndResumesDelivery(t *testing.T) {
 	first := <-d.created
 	waitReconnectCondition(t, func() bool { return runner.lifecycle.Ready() })
 	first.sendError(&driver.Error{Driver: d.Name(), Op: "consumer", K: driver.KindTransient, Err: errors.New("transient")})
-	waitReconnectCondition(t, func() bool { return client.isReconnecting() })
-	if err := client.Health(context.Background()); err == nil || err.Error() != "f1: client is reconnecting" {
-		t.Fatalf("Health during reconnect = %v, want reconnecting error", err)
-	}
-	publishErr := publishMessages(client, context.Background(), false, driver.OutboundMessage{Destination: "test"})
-	if kind, classified := driver.Classify(publishErr); !classified || kind != driver.KindTransient {
-		t.Fatalf("publish during reconnect = %v, want classified transient", publishErr)
-	}
-	waitReconnectCondition(t, func() bool { return runner.lifecycle.State() == lifecycle.Reconnecting })
-	if runner.lifecycle.Ready() || !runner.lifecycle.Live() {
-		t.Fatalf("runner probes during reconnect = ready %t live %t", runner.lifecycle.Ready(), runner.lifecycle.Live())
-	}
 	second := <-d.created
 	if first == second {
-		t.Fatal("reconnect reused the old consumer")
-	}
-	if d.OpenCount() != 2 {
-		t.Fatalf("driver Open count = %d, want 2", d.OpenCount())
+		t.Fatal("repair reused the old consumer")
 	}
 	waitReconnectCondition(t, func() bool { return runner.lifecycle.Ready() })
-	d.mu.Lock()
-	if got := d.connections[1].admin.ensures.Load(); got != 1 {
-		d.mu.Unlock()
-		t.Fatalf("replacement topology ensures = %d, want 1", got)
+	if client.isReconnecting() {
+		t.Fatal("lane repair entered client reconnecting state")
 	}
-	d.mu.Unlock()
+	if err := client.Health(context.Background()); err != nil {
+		t.Fatalf("Health during lane repair = %v, want nil", err)
+	}
+	publishErr := publishMessages(client, context.Background(), false, driver.OutboundMessage{Destination: "test"})
+	if publishErr != nil {
+		t.Fatalf("publish during lane repair = %v", publishErr)
+	}
 	if !runner.lifecycle.Ready() || !runner.lifecycle.Live() {
-		t.Fatalf("runner probes after reconnect = ready %t live %t", runner.lifecycle.Ready(), runner.lifecycle.Live())
+		t.Fatalf("runner probes during lane repair = ready %t live %t", runner.lifecycle.Ready(), runner.lifecycle.Live())
+	}
+	if d.OpenCount() != 1 {
+		t.Fatalf("driver Open count = %d, want 1", d.OpenCount())
 	}
 	second.send(validReconnectMessage(t, "after-reconnect"))
 	waitReconnectCondition(t, func() bool { return handled.Load() == 1 })
@@ -542,6 +548,7 @@ func TestFiniteReconnectBudgetDrainsRunnerAndReturnsFatal(t *testing.T) {
 	go func() { runDone <- runner.Run(context.Background()) }()
 	first := <-d.created
 	waitReconnectCondition(t, func() bool { return runner.lifecycle.Ready() })
+	d.setFailConsumers(1)
 	d.setFailOpens(1)
 	first.sendError(&driver.Error{Driver: d.Name(), Op: "consumer", K: driver.KindTransient, Err: errors.New("transient")})
 	advanceReconnect(t, recorded, 500*time.Millisecond, 1)
