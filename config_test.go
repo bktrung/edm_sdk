@@ -128,6 +128,13 @@ func TestLoadConfigTrimsAndFiltersBrokerEndpointEnvironmentOverride(t *testing.T
 	}
 }
 
+func TestLoadConfigRejectsUnsupportedSubscriptionMode(t *testing.T) {
+	path := writeConfig(t, "f1:\n  env: test\n  service: orders\n  broker:\n    driver: inmem\n  subscriptions:\n    orders:\n      topics: [orders.created]\n      mode: invalid\n")
+	if _, err := LoadConfig(path); err == nil || !strings.Contains(err.Error(), "unsupported mode") {
+		t.Fatalf("LoadConfig() error = %v, want unsupported mode", err)
+	}
+}
+
 func TestLoadConfigSubscriptionConfigByName(t *testing.T) {
 	t.Parallel()
 	path := writeConfig(t, `
@@ -340,6 +347,25 @@ func TestValidateConfigRejectsInvalidRetryValues(t *testing.T) {
 				t.Fatalf("validateConfig() error = %v, want %s validation", err, test.field)
 			}
 		})
+	}
+}
+
+func TestValidateConfigRejectsInvalidSubscriptionModeAndPolicy(t *testing.T) {
+	cfg := validValidationConfig()
+	sub := cfg.Subscriptions["orders"]
+	sub.Mode = Mode(99)
+	if err := validateConfig(func() Config {
+		copy := cfg
+		copy.Subscriptions = map[string]SubscriptionConfig{"orders": sub}
+		return copy
+	}()); err == nil || !strings.Contains(err.Error(), "subscriptions.orders.mode") {
+		t.Fatalf("validateConfig() mode error = %v, want unsupported mode", err)
+	}
+	sub = cfg.Subscriptions["orders"]
+	sub.UnmatchedPolicy = UnmatchedPolicy(99)
+	cfg.Subscriptions["orders"] = sub
+	if err := validateConfig(cfg); err == nil || !strings.Contains(err.Error(), "subscriptions.orders.unmatchedPolicy") {
+		t.Fatalf("validateConfig() unmatched policy error = %v, want unsupported policy", err)
 	}
 }
 

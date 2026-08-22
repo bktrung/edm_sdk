@@ -321,6 +321,9 @@ func validateConfig(cfg Config) error {
 		if subscription.Concurrency < 1 || subscription.Concurrency > 1024 {
 			return fmt.Errorf("f1: subscriptions.%s.concurrency must be between 1 and 1024", name)
 		}
+		if err := validateSubscriptionModeAndPolicy(name, subscription.Mode, subscription.UnmatchedPolicy); err != nil {
+			return err
+		}
 		if err := validateRetryConfig("subscriptions."+name+".retry", subscription.Retry); err != nil {
 			return err
 		}

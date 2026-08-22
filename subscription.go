@@ -387,11 +387,8 @@ func validateSubscription(cfg Config, name string, sub SubscriptionConfig) error
 	if sub.Concurrency < 1 || sub.Concurrency > 1024 {
 		return fmt.Errorf("f1: subscriptions.%s.concurrency must be between 1 and 1024", name)
 	}
-	if sub.Mode != Unordered && sub.Mode != OrderedByKey {
-		return fmt.Errorf("f1: subscriptions.%s.mode is unsupported", name)
-	}
-	if sub.UnmatchedPolicy != Ignore && sub.UnmatchedPolicy != DeadLetter {
-		return fmt.Errorf("f1: subscriptions.%s.unmatchedPolicy is unsupported", name)
+	if err := validateSubscriptionModeAndPolicy(name, sub.Mode, sub.UnmatchedPolicy); err != nil {
+		return err
 	}
 	if len(sub.Priorities) == 0 {
 		return fmt.Errorf("f1: subscriptions.%s.priorities must not be empty", name)
@@ -438,6 +435,16 @@ func validateSubscription(cfg Config, name string, sub SubscriptionConfig) error
 		if consumerTimeout < sub.HandlerTimeout*3 {
 			return fmt.Errorf("f1: broker.rabbitmq.consumerTimeout must be at least subscriptions.%s.handlerTimeout x 3", name)
 		}
+	}
+	return nil
+}
+
+func validateSubscriptionModeAndPolicy(name string, mode Mode, policy UnmatchedPolicy) error {
+	if mode != Unordered && mode != OrderedByKey {
+		return fmt.Errorf("f1: subscriptions.%s.mode is unsupported", name)
+	}
+	if policy != Ignore && policy != DeadLetter {
+		return fmt.Errorf("f1: subscriptions.%s.unmatchedPolicy is unsupported", name)
 	}
 	return nil
 }
