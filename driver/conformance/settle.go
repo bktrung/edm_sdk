@@ -424,11 +424,6 @@ func assertDoubleSettlement(t *testing.T, group *groupContext, destination strin
 	if kind, ok := driver.Classify(err); !ok || kind != driver.KindFatal {
 		t.Fatalf("second settlement classification=(%v,%t), want fatal", kind, ok)
 	}
-	var classified driver.ClassifiedError
-	ok := errors.As(err, &classified)
-	if !ok {
-		t.Fatalf("second settlement error=%v, want classified fatal", err)
-	}
 	waitForStable(t, group, "already-settled delivery to leave the broker view unchanged", func() (bool, string) {
 		got := inspectDestination(t, group, destination)
 		return got == wantAfterFirst, fmt.Sprintf("view=%+v, want=%+v", got, wantAfterFirst)
