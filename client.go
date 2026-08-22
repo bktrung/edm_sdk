@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"math/rand/v2"
 	"sync"
 	"time"
@@ -226,6 +227,20 @@ func (c *Client) codecForContentType(contentType string) (codec.Codec, error) {
 		return nil, fmt.Errorf("f1: no codec registered for datacontenttype %q", contentType)
 	}
 	return selected, nil
+}
+
+func configuredClientLogger(c *Client) *slog.Logger {
+	if c == nil {
+		return nil
+	}
+	return c.options.logger
+}
+
+func lastResortClientLogger(c *Client) *slog.Logger {
+	if logger := configuredClientLogger(c); logger != nil {
+		return logger
+	}
+	return slog.Default()
 }
 
 func logCapabilities(c *Client) {

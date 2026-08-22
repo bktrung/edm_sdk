@@ -199,13 +199,13 @@ func (c *Client) waitPublishIdle(ctx context.Context) error {
 func (c *Client) retireConnection(ctx context.Context, producer driver.Producer, oldConn, newConn driver.Conn) {
 	closeCtx := context.WithoutCancel(ctx)
 	if producer != nil {
-		if err := producer.Close(closeCtx); err != nil && c.options.logger != nil {
-			c.options.logger.Warn("f1 retired producer close failed", "error", err)
+		if err := producer.Close(closeCtx); err != nil {
+			lastResortClientLogger(c).Warn("f1 retired producer close failed", "error", err)
 		}
 	}
 	if oldConn != nil && !sameConnection(oldConn, newConn) {
-		if err := oldConn.Close(closeCtx); err != nil && c.options.logger != nil {
-			c.options.logger.Warn("f1 retired connection close failed", "error", err)
+		if err := oldConn.Close(closeCtx); err != nil {
+			lastResortClientLogger(c).Warn("f1 retired connection close failed", "error", err)
 		}
 	}
 }

@@ -8,6 +8,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/driver"
 )
 
 func captureProcessDefault(t *testing.T) *bytes.Buffer {
@@ -166,5 +168,56 @@ func TestSuccessorHandoffWithErrorHandlerUsesHandlerNotProcessDefault(t *testing
 	recorder.waitForCall(t, time.Second)
 	if got := defaultOutput.String(); got != "" {
 		t.Fatalf("process default output = %q, want empty with an error handler", got)
+	}
+}
+
+type retiredCloseProducer struct {
+	err error
+}
+
+func (*retiredCloseProducer) Publish(context.Context, ...driver.OutboundMessage) error { return nil }
+func (*retiredCloseProducer) Flush(context.Context) error                              { return nil }
+func (p *retiredCloseProducer) Close(context.Context) error                            { return p.err }
+
+func TestRetiredCloseFailuresUseLastResortLogger(t *testing.T) {
+	cases := []struct {
+		name             string
+		configuredLogger bool
+	}{
+		{name: "without logger"},
+		{name: "with logger", configuredLogger: true},
+	}
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			defaultOutput := captureProcessDefault(t)
+			var configuredOutput bytes.Buffer
+			options := []Option{WithDriver(&testDriver{conn: &testConn{}})}
+			if testCase.configuredLogger {
+				options = append(options, WithLogger(slog.New(slog.NewTextHandler(&configuredOutput, nil))))
+			}
+			client, err := New(context.Background(), testClientConfig(t), options...)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = client.Close(context.Background()) })
+			client.retireConnection(
+				context.Background(),
+				&retiredCloseProducer{err: errors.New("retired producer close failed")},
+				&testConn{closeErr: errors.New("retired connection close failed")},
+				&testConn{},
+			)
+			if testCase.configuredLogger {
+				if got := configuredOutput.String(); !strings.Contains(got, "retired producer close failed") || !strings.Contains(got, "retired connection close failed") {
+					t.Fatalf("configured output = %q, want both retired close failures", got)
+				}
+				if got := defaultOutput.String(); got != "" {
+					t.Fatalf("process default output = %q, want empty", got)
+				}
+				return
+			}
+			if got := defaultOutput.String(); !strings.Contains(got, "retired producer close failed") || !strings.Contains(got, "retired connection close failed") {
+				t.Fatalf("process default output = %q, want both retired close failures", got)
+			}
+		})
 	}
 }
