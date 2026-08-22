@@ -138,9 +138,11 @@ type conn struct {
 	management   *managementClient
 	closed       bool
 	closing      bool
+	closeAttempt bool
 	active       map[*consumer]struct{}
 	producers    map[*producer]struct{}
 	publishFault atomic.Int32 // 0 = unset; otherwise driver.Kind + 1
+	closeFault   atomic.Bool
 	deferred     map[string]time.Duration
 	ephemeral    map[string]*amqp.Channel
 }
@@ -274,16 +276,33 @@ func (c *conn) Close(ctx context.Context) error {
 		c.mu.Unlock()
 		return nil
 	}
-	if c.closing {
+	if c.closeAttempt {
 		c.mu.Unlock()
 		return classify("close", driver.KindTransient, errors.New("close already in progress"))
 	}
-	if len(c.active) != 0 || len(c.producers) != 0 {
+	// Reject the precondition before marking teardown started so admission
+	// remains open when resources are still outstanding.
+	if !c.closing && (len(c.active) != 0 || len(c.producers) != 0) {
 		c.mu.Unlock()
 		return classify("close", driver.KindFatal, driver.ErrResourcesOutstanding)
 	}
-	c.closing = true
+	if !c.closing {
+		c.closing = true
+	}
+	c.closeAttempt = true
 	deadline, hasDeadline := ctx.Deadline()
+	var injectedErr error
+	if c.closeFault.Swap(false) {
+		if hasDeadline {
+			c.mu.Unlock()
+			<-ctx.Done()
+			c.mu.Lock()
+			c.closeAttempt = false
+			c.mu.Unlock()
+			return classify("close", driver.KindTransient, ctx.Err())
+		}
+		injectedErr = errors.New("injected close failure")
+	}
 	amqpConn := c.amqp
 	ephemeral := make([]*amqp.Channel, 0, len(c.ephemeral))
 	for _, channel := range c.ephemeral {
@@ -296,7 +315,9 @@ func (c *conn) Close(ctx context.Context) error {
 	}
 
 	var err error
-	if hasDeadline {
+	if injectedErr != nil {
+		err = injectedErr
+	} else if hasDeadline {
 		err = amqpConn.CloseDeadline(deadline)
 	} else {
 		done := make(chan error, 1)
@@ -305,26 +326,26 @@ func (c *conn) Close(ctx context.Context) error {
 		case err = <-done:
 		case <-ctx.Done():
 			c.mu.Lock()
-			c.closing = false
+			c.closeAttempt = false
 			c.mu.Unlock()
 			return classify("close", driver.KindTransient, ctx.Err())
 		}
 	}
 	if errors.Is(err, amqp.ErrClosed) {
 		c.mu.Lock()
-		c.closing = false
+		c.closeAttempt = false
 		c.closed = true
 		c.mu.Unlock()
 		return nil
 	}
 	if err != nil {
 		c.mu.Lock()
-		c.closing = false
+		c.closeAttempt = false
 		c.mu.Unlock()
 		return classifyAMQP("close", driver.KindTransient, err)
 	}
 	c.mu.Lock()
-	c.closing = false
+	c.closeAttempt = false
 	c.closed = true
 	c.mu.Unlock()
 	return nil

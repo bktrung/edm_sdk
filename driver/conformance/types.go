@@ -55,6 +55,9 @@ const (
 	FaultDeliveryFailure FaultKind = "delivery-failure"
 	// FaultFatalPublish makes the next Publish fail with a non-retryable error.
 	FaultFatalPublish FaultKind = "fatal-publish"
+	// FaultCloseFailure makes the next Conn.Close fail after teardown begins.
+	// The driver must keep admission closed and accept a retry of Close.
+	FaultCloseFailure FaultKind = "close-failure"
 )
 
 // FaultInjector applies one deterministic port-level fault to the suite connection.

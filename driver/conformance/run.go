@@ -73,7 +73,7 @@ func Run(t *testing.T, suite Suite) Report {
 		profileRan := false
 		ok := t.Run(profile.String(), func(profileTest *testing.T) {
 			profileRan = true
-			result = runProfile(profileTest, ctx, conn, inspect, profile, factoryCapabilities, inject, deadline, &report)
+			result = runProfile(profileTest, ctx, conn, inspect, profile, factoryCapabilities, inject, deadline, &report, suite.Driver, suite.Config, suite.NewFaultInjector)
 		})
 		if !ok {
 			t.Fatalf("conformance: %s profile failed", profile)
@@ -118,6 +118,9 @@ func runProfile(
 	inject FaultInjector,
 	deadline DeadlineFixture,
 	report *Report,
+	drv driver.Driver,
+	cfg driver.Config,
+	injectFactory func(driver.Conn) (FaultInjector, error),
 ) ProfileReport {
 	effective := effectiveCapabilities(conn.Capabilities(), profile)
 	destination := "conformance.inspect." + profile.String() + ".probe"
@@ -218,6 +221,7 @@ func runProfile(
 			groupResult = &groupContext{
 				t: groupTest, ctx: ctx, conn: tracked, inspect: inspect,
 				profile: profile, effective: effective, factoryCapabilities: factoryCapabilities, inject: inject, report: report,
+				drv: drv, cfg: cfg, injectFactory: injectFactory,
 				checkNames: make(map[string]struct{}),
 				skips:      make(map[string]string), deadline: deadline,
 			}

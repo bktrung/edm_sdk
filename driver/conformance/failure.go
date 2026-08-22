@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"testing"
+	"time"
 
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/driver"
 )
@@ -12,6 +13,40 @@ import (
 func init() { registerGroup("failure", runFailure) }
 
 func runFailure(group *groupContext) {
+	group.Check("failed Close keeps admission closed and remains retryable", func(t *testing.T) {
+		conn, inject := newPrivateFailureConnection(t, group)
+		closeCtx, cancel := context.WithTimeout(group.ctx, 100*time.Millisecond)
+		assertPrivateCloseFailure(t, group, conn, inject, closeCtx, group.ctx)
+		cancel()
+
+		conn, inject = newPrivateFailureConnection(t, group)
+		assertPrivateCloseFailure(t, group, conn, inject, group.ctx, group.ctx)
+		group.vector.Add(BehaviorEvent{ID: "failure-close-admission", Outcome: "closed-and-retryable", FinalDestination: "failure.close"})
+	})
+
+	group.Check("rejected Close leaves admission open", func(t *testing.T) {
+		conn, _ := newPrivateFailureConnection(t, group)
+		producer, err := conn.Producer(group.ctx, driver.ProducerConfig{})
+		if err != nil {
+			t.Fatalf("Producer() before precondition Close: %v", err)
+		}
+		if err := conn.Close(group.ctx); !errors.Is(err, driver.ErrResourcesOutstanding) {
+			t.Fatalf("Close() with an open producer = %v, want ErrResourcesOutstanding", err)
+		}
+		if next, err := conn.Producer(group.ctx, driver.ProducerConfig{}); err != nil {
+			t.Fatalf("Producer() after rejected Close: %v", err)
+		} else {
+			_ = next.Close(group.ctx)
+		}
+		if err := producer.Close(group.ctx); err != nil {
+			t.Fatalf("close precondition producer: %v", err)
+		}
+		if err := conn.Close(group.ctx); err != nil {
+			t.Fatalf("Close() after resources closed: %v", err)
+		}
+		group.vector.Add(BehaviorEvent{ID: "failure-close-precondition", Outcome: "admission-open", FinalDestination: "failure.close"})
+	})
+
 	group.Check("transient publish failure is classified", func(t *testing.T) {
 		name := "failure.publish.transient"
 		producer := newProducer(t, group, name, driver.ProducerConfig{Effective: group.effective})
@@ -279,6 +314,51 @@ func runFailure(group *groupContext) {
 		}
 		group.vector.Add(BehaviorEvent{ID: "failure-lane-close-stop", Outcome: "stopped", FinalDestination: first})
 	})
+}
+
+func assertPrivateCloseFailure(t *testing.T, group *groupContext, conn driver.Conn, inject FaultInjector, closeCtx, activeCtx context.Context) {
+	t.Helper()
+	if err := inject(activeCtx, FaultCloseFailure); err != nil {
+		t.Fatalf("inject %s: %v", FaultCloseFailure, err)
+	}
+	if err := conn.Close(closeCtx); err == nil {
+		t.Fatal("Close() after injected failure returned nil")
+	}
+	if producer, err := conn.Producer(activeCtx, driver.ProducerConfig{}); err == nil {
+		_ = producer.Close(activeCtx)
+		t.Fatal("Producer() succeeded after Close teardown began")
+	}
+	if consumer, err := conn.Consumer(activeCtx, driver.ConsumerConfig{
+		Destinations: []string{"failure.close.private.consumer"},
+	}); err == nil {
+		_ = consumer.Stop(activeCtx)
+		t.Fatal("Consumer() succeeded after Close teardown began")
+	}
+	if err := conn.Close(activeCtx); err != nil {
+		t.Fatalf("retry Close() = %v", err)
+	}
+}
+
+func newPrivateFailureConnection(t *testing.T, group *groupContext) (driver.Conn, FaultInjector) {
+	t.Helper()
+	if group.drv == nil || group.injectFactory == nil {
+		t.Fatal("private failure connection requires driver and fault injector factory")
+	}
+	conn, err := group.drv.Open(group.ctx, group.cfg)
+	if err != nil {
+		t.Fatalf("open private failure connection: %v", err)
+	}
+	inject, err := group.injectFactory(conn)
+	if err != nil {
+		_ = conn.Close(context.Background())
+		t.Fatalf("create private fault injector: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := conn.Close(context.Background()); err != nil && !errors.Is(err, driver.ErrResourcesOutstanding) {
+			t.Errorf("close private failure connection: %v", err)
+		}
+	})
+	return conn, inject
 }
 
 func assertLaneClosed(t *testing.T, group *groupContext, producer driver.Producer, consumer driver.Consumer, destination string) {

@@ -79,6 +79,11 @@ func newFaultInjector(raw driver.Conn) (conformance.FaultInjector, error) {
 				conn.failPublishFatal = true
 				conn.mu.Unlock()
 				return nil
+			case conformance.FaultCloseFailure:
+				conn.mu.Lock()
+				conn.closeFault = true
+				conn.mu.Unlock()
+				return nil
 			default:
 				return errors.New("unsupported conformance fault")
 			}

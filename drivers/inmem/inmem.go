@@ -172,8 +172,10 @@ type conn struct {
 	groups           map[string]*groupState
 	producers        int
 	closed           bool
+	closing          bool
 	failPublish      bool
 	failPublishFatal bool
+	closeFault       bool
 	failNextAck      bool
 	failNextNack     bool
 	ackFailures      uint64
@@ -219,7 +221,7 @@ func (c *conn) Producer(ctx context.Context, cfg driver.ProducerConfig) (driver.
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.closed {
+	if c.closed || c.closing {
 		return nil, classify("producer", driver.KindFatal, driver.ErrResourcesOutstanding)
 	}
 	c.producers++
@@ -239,7 +241,7 @@ func (c *conn) newConsumer(ctx context.Context, cfg driver.ConsumerConfig, ackDe
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.closed {
+	if c.closed || c.closing {
 		return nil, classify("consumer", driver.KindFatal, driver.ErrResourcesOutstanding)
 	}
 	for _, name := range cfg.Destinations {
@@ -356,7 +358,7 @@ func (c *conn) Ping(ctx context.Context) error {
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.closed {
+	if c.closed || c.closing {
 		return classify("ping", driver.KindTransient, errors.New("connection closed"))
 	}
 	return nil
@@ -371,9 +373,22 @@ func (c *conn) Close(ctx context.Context) error {
 		c.mu.Unlock()
 		return nil
 	}
-	if c.producers != 0 || len(c.consumers) != 0 {
+	// Reject the precondition before marking teardown started so admission
+	// remains open when resources are still outstanding.
+	if !c.closing && (c.producers != 0 || len(c.consumers) != 0) {
 		c.mu.Unlock()
 		return classify("close", driver.KindFatal, driver.ErrResourcesOutstanding)
+	}
+	c.closing = true
+	if c.closeFault {
+		c.closeFault = false
+		if _, hasDeadline := ctx.Deadline(); !hasDeadline {
+			c.mu.Unlock()
+			return classify("close", driver.KindTransient, errors.New("injected close failure"))
+		}
+		c.mu.Unlock()
+		<-ctx.Done()
+		return classify("close", driver.KindTransient, ctx.Err())
 	}
 	c.closed = true
 	c.closeOnce.Do(func() { close(c.done) })

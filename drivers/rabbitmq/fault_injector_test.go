@@ -29,6 +29,9 @@ func rabbitFaultInjector(raw driver.Conn) (conformance.FaultInjector, error) {
 		case conformance.FaultFatalPublish:
 			conn.publishFault.Store(int32(driver.KindFatal) + 1)
 			return nil
+		case conformance.FaultCloseFailure:
+			conn.closeFault.Store(true)
+			return nil
 		case conformance.FaultLaneChannelClose:
 			return rabbitCloseLane(ctx, conn)
 		case conformance.FaultConnectionDrop:

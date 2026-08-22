@@ -21,7 +21,7 @@ var groupManifest = []manifestEntry{
 	{name: "deferred", declared: 9},
 	{name: "drain", declared: 16},
 	{name: "rebalance", declared: 11},
-	{name: "failure", declared: 18},
+	{name: "failure", declared: 20},
 	{name: "topology", declared: 19},
 	{name: "capability", declared: 27},
 	{name: "lag", declared: 5},
@@ -43,6 +43,9 @@ type groupContext struct {
 	checkNames          map[string]struct{}
 	skips               map[string]string
 	inject              FaultInjector
+	drv                 driver.Driver
+	cfg                 driver.Config
+	injectFactory       func(driver.Conn) (FaultInjector, error)
 	deadline            DeadlineFixture
 	report              *Report
 }
