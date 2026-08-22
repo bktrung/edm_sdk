@@ -265,6 +265,45 @@ func TestPublisherTopologyArgumentDriftWarns(t *testing.T) {
 	require.Contains(t, output, "got=3")
 }
 
+func TestSubscriberTopologyArgumentDriftWarns(t *testing.T) {
+	var logs bytes.Buffer
+	admin := &topologyRecordingAdmin{
+		diff: driver.TopologyDiff{Drifted: []driver.ArgumentDrift{{
+			Name:     "f1.test.orders.created.normal",
+			Argument: "x-delivery-limit",
+			Want:     "5",
+			Got:      "3",
+		}}},
+	}
+	conn := &topologyTestConn{
+		testConn: &testConn{caps: driver.Capabilities{MaxHeaderBytes: CoreMaxHeaderBytes}},
+		admin:    admin,
+		consumer: newDispatchConsumer(),
+	}
+	client, err := New(context.Background(), testClientConfig(t),
+		WithDriver(&topologyTestDriver{conn: conn}),
+		WithLogger(slog.New(slog.NewTextHandler(&logs, nil))),
+	)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, client.Close(context.Background())) })
+
+	runner := &Runner{
+		client:       client,
+		subscription: topologyTestSubscription(),
+		config:       SubscriptionConfig{Prefetch: 1},
+	}
+	consumer, err := openRunnerConsumer(runner, context.Background())
+	require.NoError(t, err)
+	require.NoError(t, consumer.Stop(context.Background()))
+
+	output := logs.String()
+	require.Contains(t, output, "f1 topology argument drift")
+	require.Contains(t, output, "destination=f1.test.orders.created.normal")
+	require.Contains(t, output, "argument=x-delivery-limit")
+	require.Contains(t, output, "want=5")
+	require.Contains(t, output, "got=3")
+}
+
 func (*topologyRecordingAdmin) DescribeTopology(context.Context, []string) (driver.TopologyState, error) {
 	return driver.TopologyState{}, driver.ErrUnsupported
 }
