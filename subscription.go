@@ -87,7 +87,11 @@ type Runner struct {
 	// asyncGroup owns handler and terminal-callback goroutines. finishRunner
 	// cancels their contexts but does not wait: a non-cooperative handler or
 	// callback cannot be force-stopped, and waiting would violate drain's bound.
-	asyncGroup            *errgroup.Group
+	asyncGroup *errgroup.Group
+	// errorGroup owns only error-handler notifications. It is bounded and is
+	// never waited by the runner, because a non-cooperative callback cannot be
+	// force-stopped without extending shutdown.
+	errorGroup            *errgroup.Group
 	runCtx                context.Context
 	handlerCtx            context.Context
 	handlerCancel         context.CancelFunc
@@ -111,6 +115,15 @@ type Runner struct {
 
 const terminalNotificationTimeout = time.Second
 
+func newErrorHandlerGroup(concurrency int) *errgroup.Group {
+	if concurrency < 1 {
+		concurrency = 1
+	}
+	group := new(errgroup.Group)
+	group.SetLimit(concurrency)
+	return group
+}
+
 func runnerNotifyDeadLetter(r *Runner, parent context.Context, payload DeadLettered) {
 	if r == nil || r.subscription.OnDeadLetter == nil {
 		return
@@ -132,7 +145,7 @@ func runnerNotifyDiscarded(r *Runner, parent context.Context, payload Discarded)
 // Unlike runnerNotify above, this call never waits on the handler: one of
 // its two call sites is failSuccessorHandoff, on the synchronous
 // delivery/settlement path, so waiting even briefly here would let a slow
-// handler stall a delivery. The handler runs on r.asyncGroup, on its own
+// handler stall a delivery. The handler runs on r.errorGroup, on its own
 // goroutine, with panic recovery and a terminalNotificationTimeout deadline
 // passed through its context; the deadline is advisory (Go cannot force-stop
 // a goroutine that ignores ctx), but the caller itself never blocks on it.
@@ -142,13 +155,14 @@ func runnerNotifyError(r *Runner, parent context.Context, event *Event, cause er
 	}
 	handler := r.client.options.errorHandler
 	r.mu.Lock()
-	group := r.asyncGroup
-	r.mu.Unlock()
+	group := r.errorGroup
 	if group == nil {
-		group = new(errgroup.Group)
+		group = newErrorHandlerGroup(r.subscription.Concurrency)
+		r.errorGroup = group
 	}
+	r.mu.Unlock()
 	logger := lastResortRunnerLogger(r)
-	group.Go(func() (err error) {
+	if !group.TryGo(func() (err error) {
 		defer func() {
 			if recovered := recover(); recovered != nil {
 				logger.Warn("f1 error handler panicked", "panic", recovered)
@@ -158,7 +172,9 @@ func runnerNotifyError(r *Runner, parent context.Context, event *Event, cause er
 		defer cancel()
 		handler(ctx, event, cause)
 		return nil
-	})
+	}) {
+		logger.Error("f1 error handler notification dropped", "subscription", r.subscription.Name, "cause", cause)
+	}
 }
 
 func runnerNotify(r *Runner, parent context.Context, callback func(context.Context), kind string) {

@@ -65,6 +65,7 @@ func (r *Runner) Run(ctx context.Context) error {
 	handlerShutdownCtx, handlerShutdownCancel := context.WithCancel(context.Background())
 	r.handlerShutdownCtx, r.handlerShutdownCancel = handlerShutdownCtx, handlerShutdownCancel
 	r.asyncGroup = new(errgroup.Group)
+	r.errorGroup = newErrorHandlerGroup(r.subscription.Concurrency)
 	r.mu.Unlock()
 	r.client.mu.Unlock()
 
