@@ -6,6 +6,7 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -64,6 +65,44 @@ func waitRabbit(t *testing.T, condition func() bool) {
 	}
 }
 
+func cleanupRabbitTestQueues(t *testing.T, capture *captureRabbitDriver, prefixes ...string) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	seen := make(map[string]struct{})
+	for _, opened := range capture.connections() {
+		connection, ok := opened.(*conn)
+		if !ok || connection.management == nil {
+			continue
+		}
+		queues, err := connection.management.listQueues(ctx)
+		if err != nil {
+			t.Errorf("list live-test queues: %v", err)
+			continue
+		}
+		for _, queue := range queues {
+			matchesPrefix := false
+			for _, prefix := range prefixes {
+				if strings.HasPrefix(queue.Name, prefix) {
+					matchesPrefix = true
+					break
+				}
+			}
+			if !matchesPrefix {
+				continue
+			}
+			if _, alreadySeen := seen[queue.Name]; alreadySeen {
+				continue
+			}
+			seen[queue.Name] = struct{}{}
+			if _, err := connection.management.deleteQueue(ctx, queue.Name); err != nil {
+				t.Errorf("delete live-test queue %q: %v", queue.Name, err)
+			}
+		}
+	}
+}
+
 func TestRabbitMQCoreReconnectsWithSyntheticTransientFault(t *testing.T) {
 	requireBroker(t)
 	sequence := rabbitReconnectSequence.Add(1)
@@ -95,7 +134,10 @@ func TestRabbitMQCoreReconnectsWithSyntheticTransientFault(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer func() { _ = client.Close(context.Background()) }()
+	t.Cleanup(func() {
+		_ = client.Close(context.Background())
+		cleanupRabbitTestQueues(t, driverCapture, "f1.test."+topic, "f1.test.unknown.dlq.reconnect-live")
+	})
 
 	var handled atomic.Int32
 	runner, err := client.Subscribe(context.Background(), f1.Subscription{
@@ -187,7 +229,11 @@ func TestRabbitMQCoreRebuildsAfterLaneChannelClosure(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer func() { _ = client.Close(context.Background()) }()
+	cleanupPrefix := fmt.Sprintf("f1.test.lane-close.live.%d.%d.", os.Getpid(), sequence)
+	t.Cleanup(func() {
+		_ = client.Close(context.Background())
+		cleanupRabbitTestQueues(t, driverCapture, cleanupPrefix, "f1.test.unknown.dlq.lane-close-live")
+	})
 
 	var handledB atomic.Int32
 	runner, err := client.Subscribe(context.Background(), f1.Subscription{
