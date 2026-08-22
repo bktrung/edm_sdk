@@ -217,20 +217,6 @@ func (c *Client) ensurePublisherTopologyOn(ctx context.Context, conn driver.Conn
 	return nil
 }
 
-func configuredClientLogger(c *Client) *slog.Logger {
-	if c == nil {
-		return nil
-	}
-	return c.options.logger
-}
-
-func lastResortClientLogger(c *Client) *slog.Logger {
-	if logger := configuredClientLogger(c); logger != nil {
-		return logger
-	}
-	return slog.Default()
-}
-
 func logTopologyDrift(logger *slog.Logger, diff driver.TopologyDiff) {
 	for _, drift := range diff.Drifted {
 		logger.Warn("f1 topology argument drift",
