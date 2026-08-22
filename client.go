@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log/slog"
 	"math/rand/v2"
 	"sync"
 	"time"
@@ -113,7 +112,6 @@ func New(ctx context.Context, cfg Config, opts ...Option) (*Client, error) {
 		codecsByContentType: map[string]codec.Codec{jsonCodec.ContentType(): jsonCodec},
 		codecsByName:        map[string]codec.Codec{jsonCodec.Name(): jsonCodec},
 		clock:               clock.NewReal(),
-		logger:              slog.Default(),
 	}
 	for _, option := range opts {
 		if option == nil {

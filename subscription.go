@@ -147,7 +147,7 @@ func runnerNotifyError(r *Runner, parent context.Context, event *Event, cause er
 	if group == nil {
 		group = new(errgroup.Group)
 	}
-	logger := runnerLogger(r)
+	logger := lastResortRunnerLogger(r)
 	group.Go(func() (err error) {
 		defer func() {
 			if recovered := recover(); recovered != nil {
@@ -171,7 +171,7 @@ func runnerNotify(r *Runner, parent context.Context, callback func(context.Conte
 	if parent == nil {
 		return
 	}
-	notifyOwned(parent, callback, group, runnerLogger(r), kind)
+	notifyOwned(parent, callback, group, lastResortRunnerLogger(r), kind)
 }
 
 func notifyOwned(parent context.Context, callback func(context.Context), group *errgroup.Group, logger *slog.Logger, kind string) {
@@ -180,9 +180,6 @@ func notifyOwned(parent context.Context, callback func(context.Context), group *
 	}
 	if group == nil {
 		group = new(errgroup.Group)
-	}
-	if logger == nil {
-		logger = slog.Default()
 	}
 	ctx, cancel := context.WithTimeout(parent, terminalNotificationTimeout)
 	defer cancel()

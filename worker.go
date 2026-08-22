@@ -593,11 +593,18 @@ func runnerSettlementContext(r *Runner, fallback context.Context) context.Contex
 	return fallback
 }
 
-func runnerLogger(r *Runner) *slog.Logger {
-	if r == nil || r.client == nil || r.client.options.logger == nil {
-		return slog.Default()
+func configuredRunnerLogger(r *Runner) *slog.Logger {
+	if r == nil || r.client == nil {
+		return nil
 	}
 	return r.client.options.logger
+}
+
+func lastResortRunnerLogger(r *Runner) *slog.Logger {
+	if logger := configuredRunnerLogger(r); logger != nil {
+		return logger
+	}
+	return slog.Default()
 }
 
 func openRunnerConsumer(r *Runner, ctx context.Context) (driver.Consumer, error) {
@@ -675,7 +682,9 @@ func consumeRunnerErrors(r *Runner, ctx context.Context) error {
 			if err == nil {
 				continue
 			}
-			runnerLogger(r).Error("f1 consumer error", "subscription", r.subscription.Name, "error", err)
+			if r.client.options.errorHandler == nil {
+				lastResortRunnerLogger(r).Error("f1 consumer error", "subscription", r.subscription.Name, "error", err)
+			}
 			kind, classified := driver.Classify(err)
 			var cancel context.CancelFunc
 			if !classified || kind == driver.KindTransient {
@@ -975,7 +984,7 @@ func invokeHandler(r *Runner, parent context.Context, handler Handler, event *Ev
 	case <-shutdownDone:
 		return handlerResult{stuck: true}
 	case <-stuck.C:
-		runnerLogger(r).Warn("f1 stuck worker", "subscription", r.subscription.Name, "threshold", 2*timeout)
+		lastResortRunnerLogger(r).Warn("f1 stuck worker", "subscription", r.subscription.Name, "threshold", 2*timeout)
 	}
 	stackTimer := r.client.options.clock.Timer(timeout * 2)
 	defer stackTimer.Stop()
@@ -987,7 +996,7 @@ func invokeHandler(r *Runner, parent context.Context, handler Handler, event *Ev
 	case <-shutdownDone:
 		return handlerResult{stuck: true}
 	case <-stackTimer.C:
-		runnerLogger(r).Error("f1 worker exceeded stuck threshold", "subscription", r.subscription.Name, "threshold", 4*timeout)
+		lastResortRunnerLogger(r).Error("f1 worker exceeded stuck threshold", "subscription", r.subscription.Name, "threshold", 4*timeout)
 		return handlerResult{stuck: true}
 	}
 }
@@ -1147,10 +1156,14 @@ func failSuccessorHandoff(r *Runner, ctx context.Context, op string, event *Even
 	setRunnerError(r, classified)
 	runnerNotifyError(r, ctx, event, classified)
 	if err := releaseRunnerConsumer(r, ctx); err != nil {
-		runnerLogger(r).Error("f1 failed to release consumer after a successor publish exhausted its republish budget", "op", op, "cause", classified, "release_error", err)
+		if r.client.options.errorHandler == nil {
+			lastResortRunnerLogger(r).Error("f1 failed to release consumer after a successor publish exhausted its republish budget", "op", op, "cause", classified, "release_error", err)
+		}
 		return
 	}
-	runnerLogger(r).Error("f1 successor publish exhausted its republish budget; consumer released", "op", op, "cause", classified)
+	if r.client.options.errorHandler == nil {
+		lastResortRunnerLogger(r).Error("f1 successor publish exhausted its republish budget; consumer released", "op", op, "cause", classified)
+	}
 }
 
 // retryAndSettle republishes message to its retry destination, carrying the
