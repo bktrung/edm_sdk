@@ -72,10 +72,11 @@ func (r *Runner) Run(ctx context.Context) error {
 	defer finishRunner(r)
 	var runErr error
 	var runCtx context.Context
+	var cancel context.CancelFunc
 	generation := 0
 	var repairCause error
 	for {
-		runCtx, cancel := context.WithCancel(ctx)
+		runCtx, cancel = context.WithCancel(ctx)
 		r.mu.Lock()
 		r.runCtx = runCtx
 		r.cancel = cancel
@@ -199,7 +200,7 @@ func (r *Runner) Run(ctx context.Context) error {
 		}
 	}
 
-	shutdownErr := r.drainAfterRun(runCtx) //nolint:contextcheck // drain preserves settlement context across generation cancellation.
+	shutdownErr := r.drainAfterRun(runCtx)
 	if runErr == nil {
 		runErr = shutdownErr
 	} else if shutdownErr != nil {

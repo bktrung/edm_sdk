@@ -270,11 +270,7 @@ func (r *Runner) transitionToReconnecting() {
 	}
 }
 
-//nolint:contextcheck // the helper preserves the runner's settlement context while draining.
 func (r *Runner) drainAfterRun(runCtx context.Context) error {
-	if runCtx == nil {
-		runCtx = context.Background()
-	}
 	shutdownCtx := runnerSettlementContext(r, runCtx)
 	return r.lifecycle.Drain(shutdownCtx, lifecycle.Config{
 		Clock:        r.client.options.clock,
