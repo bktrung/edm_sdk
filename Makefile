@@ -11,6 +11,7 @@ export GOPRIVATE := fgit.zapps.vn
 
 APISURFACE := $(CURDIR)/.tools/bin/apisurface
 APIDIFF := $(CURDIR)/.tools/bin/apidiff
+APIDIFF_NORMALIZE := $(CURDIR)/.tools/bin/apidiff-normalize
 API_DIFF_BASELINE_DIR := $(CURDIR)/testdata/api-diff
 API_DIFF_BREAKING_CHANGE ?= 0
 API_DIFF_ENFORCE ?= 0
@@ -78,16 +79,19 @@ check-api-surface-f1test: $(APISURFACE)
 ## Enforcement is off while the first real broker driver is being built. The port has not yet met a
 ## non-memory client, so an incompatible change is expected work rather than an accident. Set
 ## API_DIFF_ENFORCE=1 once the RabbitMQ driver passes acceptance and the port is genuinely frozen.
-check-api-diff: $(APIDIFF)
+check-api-diff: $(APIDIFF) $(APIDIFF_NORMALIZE)
 	@set -e; \
 	for spec in \
 		"f1:$(MODULE):f1.export" \
 		"driver:$(MODULE)/driver:driver.export" \
 		"codec:$(MODULE)/codec:codec.export"; do \
 		package=$${spec%%:*}; rest=$${spec#*:}; import_path=$${rest%%:*}; baseline=$${rest#*:}; \
-		report=$$(mktemp); \
-		trap 'rm -f "$$report"' EXIT; \
-		$(APIDIFF) "$(API_DIFF_BASELINE_DIR)/$$baseline" "$$import_path" >"$$report"; \
+		report=$$(mktemp); current=$$(mktemp); normalized_old=$$(mktemp); normalized_new=$$(mktemp); \
+		trap 'rm -f "$$report" "$$current" "$$normalized_old" "$$normalized_new"' EXIT; \
+		$(APIDIFF) -w "$$current" "$$import_path"; \
+		$(APIDIFF_NORMALIZE) "$(API_DIFF_BASELINE_DIR)/$$baseline" "$$normalized_old"; \
+		$(APIDIFF_NORMALIZE) "$$current" "$$normalized_new"; \
+		$(APIDIFF) "$$normalized_old" "$$normalized_new" >"$$report"; \
 		cat "$$report"; \
 		if grep -q '^Incompatible changes:' "$$report"; then \
 			if [ "$(API_DIFF_ENFORCE)" = "1" ]; then \
@@ -98,11 +102,11 @@ check-api-diff: $(APIDIFF)
 		elif [ ! -s "$$report" ]; then \
 			echo "api-diff: $$package unchanged"; \
 		fi; \
-		rm -f "$$report"; \
+		rm -f "$$report" "$$current" "$$normalized_old" "$$normalized_new"; \
 	done
 
 ## record-api-diff-baseline: refresh committed snapshots; breaking changes require explicit approval.
-record-api-diff-baseline: $(APIDIFF)
+record-api-diff-baseline: $(APIDIFF) $(APIDIFF_NORMALIZE)
 	@if [ -f "$(API_DIFF_BASELINE_DIR)/f1.export" ] && \
 		[ -f "$(API_DIFF_BASELINE_DIR)/driver.export" ] && \
 		[ -f "$(API_DIFF_BASELINE_DIR)/codec.export" ] && \
@@ -114,15 +118,28 @@ record-api-diff-baseline: $(APIDIFF)
 		echo "api-diff: creating initial baseline"; \
 	fi
 	@mkdir -p "$(API_DIFF_BASELINE_DIR)"
-	$(APIDIFF) -w "$(API_DIFF_BASELINE_DIR)/f1.export" $(MODULE)
-	$(APIDIFF) -w "$(API_DIFF_BASELINE_DIR)/driver.export" $(MODULE)/driver
-	$(APIDIFF) -w "$(API_DIFF_BASELINE_DIR)/codec.export" $(MODULE)/codec
+	@set -e; \
+	raw=; \
+	trap 'rm -f "$$raw"' EXIT; \
+	for spec in \
+		"$(MODULE):f1.export" \
+		"$(MODULE)/driver:driver.export" \
+		"$(MODULE)/codec:codec.export"; do \
+		import_path=$${spec%%:*}; baseline=$${spec#*:}; \
+		raw=$$(mktemp); \
+		$(APIDIFF) -w "$$raw" "$$import_path"; \
+		$(APIDIFF_NORMALIZE) "$$raw" "$(API_DIFF_BASELINE_DIR)/$$baseline"; \
+		rm -f "$$raw"; \
+	done
 
 $(APISURFACE): tools/apisurface/main.go tools/apisurface/go.mod
 	cd tools/apisurface && go build -o ../../.tools/bin/apisurface .
 
 $(APIDIFF): tools/apidiff/go.mod tools/apidiff/go.sum
 	cd tools/apidiff && go build -o ../../.tools/bin/apidiff golang.org/x/exp/cmd/apidiff
+
+$(APIDIFF_NORMALIZE): tools/apidiff/normalize.go tools/apidiff/go.mod tools/apidiff/go.sum
+	cd tools/apidiff && go build -o ../../.tools/bin/apidiff-normalize .
 
 .PHONY: broker-up broker-down broker-reset broker-smoke test-rabbitmq
 
