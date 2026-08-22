@@ -463,6 +463,42 @@ func TestReconnectBackoffBudgetAndJitter(t *testing.T) {
 	}
 }
 
+func TestPublishOnlyClientSurfacesReconnectExhaustion(t *testing.T) {
+	fake := clock.NewFake(time.Unix(225, 0))
+	recorded := &recordingClock{Fake: fake}
+	d := &reconnectTestDriver{created: make(chan *reconnectTestConsumer, 8)}
+	client := newReconnectTestClient(t, d, recorded, 1)
+	client.reconnectRandom = func() float64 { return 1 }
+	d.setFailOpens(1)
+	attempt, err := client.requestReconnect(errors.New("transient"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	advanceReconnect(t, recorded, 500*time.Millisecond, 1)
+	reconnectErr := client.waitReconnect(context.Background(), attempt)
+	if kind, classified := driver.Classify(reconnectErr); !classified || kind != driver.KindFatal {
+		t.Fatalf("reconnect error = %v, want classified fatal", reconnectErr)
+	}
+
+	for i := 0; i < 2; i++ {
+		if healthErr := client.Health(context.Background()); !errors.Is(healthErr, reconnectErr) {
+			t.Fatalf("Health attempt %d = %v, want stored exhaustion %v", i+1, healthErr, reconnectErr)
+		}
+	}
+	if _, publishErr := client.Publisher().Publish(context.Background(), "orders.created", map[string]string{"value": "after-exhaustion"}); !errors.Is(publishErr, reconnectErr) {
+		t.Fatalf("Publish() = %v, want stored exhaustion %v", publishErr, reconnectErr)
+	}
+	client.mu.Lock()
+	shutdownStarted := client.shutdownStarted
+	client.mu.Unlock()
+	if shutdownStarted {
+		t.Fatal("reconnect exhaustion set shutdownStarted")
+	}
+	if err := client.Close(context.Background()); err != nil {
+		t.Fatalf("Close() after reconnect exhaustion = %v", err)
+	}
+}
+
 func TestReconnectUnlimitedBudget(t *testing.T) {
 	fake := clock.NewFake(time.Unix(200, 0))
 	recorded := &recordingClock{Fake: fake}

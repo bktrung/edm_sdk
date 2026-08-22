@@ -46,6 +46,11 @@ func (c *Client) requestReconnect(cause error) (*reconnectAttempt, error) {
 		c.mu.Unlock()
 		return nil, errors.New("f1: client is closing")
 	}
+	if c.reconnectErr != nil {
+		err := c.reconnectErr
+		c.mu.Unlock()
+		return nil, err
+	}
 	if c.reconnecting && c.reconnect != nil {
 		attempt := c.reconnect
 		c.mu.Unlock()
@@ -131,6 +136,7 @@ func (c *Client) reconnectOnce(ctx context.Context, cause error) error {
 					c.conn = connection
 					c.effective = effective
 					c.limits = limitsFor(c.options.driver.Name(), connection.BrokerInfo(), effective)
+					c.reconnectErr = nil
 					c.producerHandle = nil
 					c.mu.Unlock()
 					c.retireConnection(ctx, oldProducer, oldConn, connection)
@@ -149,12 +155,19 @@ func (c *Client) reconnectOnce(ctx context.Context, cause error) error {
 			return err
 		}
 		if c.config.Broker.MaxReconnectAttempts > 0 && attempt >= c.config.Broker.MaxReconnectAttempts {
-			return &driver.Error{
+			reconnectErr := &driver.Error{
 				Driver: c.options.driver.Name(),
 				Op:     "reconnect",
 				K:      driver.KindFatal,
 				Err:    fmt.Errorf("reconnect attempts exhausted after %d attempt(s): %w", attempt, err),
 			}
+			c.mu.Lock()
+			c.reconnectErr = reconnectErr
+			c.mu.Unlock()
+			if logger := configuredClientLogger(c); logger != nil {
+				logger.Error("f1 reconnect attempts exhausted", "error", reconnectErr)
+			}
+			return reconnectErr
 		}
 	}
 }

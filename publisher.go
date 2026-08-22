@@ -218,6 +218,11 @@ func (p *Publisher) PublishBatch(ctx context.Context, messages []Message) (Batch
 		p.client.mu.Unlock()
 		return result, errors.New("f1: client is closed")
 	}
+	if p.client.reconnectErr != nil {
+		err := p.client.reconnectErr
+		p.client.mu.Unlock()
+		return result, err
+	}
 	if p.client.reconnecting || !sameConnection(p.client.conn, conn) {
 		p.client.mu.Unlock()
 		return result, p.client.reconnectingError("publish")

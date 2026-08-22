@@ -54,7 +54,11 @@ type Client struct {
 	runners         map[*Runner]struct{}
 
 	// reconnecting reports connection usability, independently of shutdownStarted.
-	reconnecting      bool
+	reconnecting bool
+	// reconnectErr records a terminal reconnect decision for the current client
+	// state. It is guarded by mu and remains separate from shutdownStarted:
+	// reconnect exhaustion does not mean Close has been entered.
+	reconnectErr      error
 	reconnect         *reconnectAttempt
 	reconnectRequests chan reconnectRequest
 	reconnectRandom   func() float64
@@ -295,13 +299,18 @@ func (c *Client) Health(ctx context.Context) error {
 		return fmt.Errorf("f1: client is not connected")
 	}
 	c.mu.Lock()
-	if c.conn == nil {
-		c.mu.Unlock()
-		return fmt.Errorf("f1: client is not connected")
-	}
 	if c.closed {
 		c.mu.Unlock()
 		return fmt.Errorf("f1: client is closed")
+	}
+	if c.reconnectErr != nil {
+		err := c.reconnectErr
+		c.mu.Unlock()
+		return err
+	}
+	if c.conn == nil {
+		c.mu.Unlock()
+		return fmt.Errorf("f1: client is not connected")
 	}
 	if c.reconnecting {
 		c.mu.Unlock()
@@ -529,6 +538,11 @@ func publishMessages(c *Client, ctx context.Context, allowClosing bool, messages
 	if c.closed || c.conn == nil || (!allowClosing && c.shutdownStarted) {
 		c.mu.Unlock()
 		return errors.New("f1: client is closed")
+	}
+	if c.reconnectErr != nil {
+		err := c.reconnectErr
+		c.mu.Unlock()
+		return err
 	}
 	if c.reconnecting {
 		c.mu.Unlock()
