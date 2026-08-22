@@ -264,7 +264,13 @@ func applyEnvironment(cfg *Config) {
 		cfg.Broker.Driver = v
 	}
 	if v, ok := os.LookupEnv("F1_BROKER_ENDPOINTS"); ok {
-		cfg.Broker.Endpoints = strings.Split(v, ",")
+		parts := strings.Split(v, ",")
+		cfg.Broker.Endpoints = make([]string, 0, len(parts))
+		for _, part := range parts {
+			if endpoint := strings.TrimSpace(part); endpoint != "" {
+				cfg.Broker.Endpoints = append(cfg.Broker.Endpoints, endpoint)
+			}
+		}
 	}
 }
 

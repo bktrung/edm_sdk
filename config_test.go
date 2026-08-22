@@ -115,6 +115,19 @@ f1:
 	}
 }
 
+func TestLoadConfigTrimsAndFiltersBrokerEndpointEnvironmentOverride(t *testing.T) {
+	t.Setenv("F1_BROKER_ENDPOINTS", "amqp://a, amqp://b,, ")
+	path := writeConfig(t, "f1:\n  env: test\n  service: orders\n  broker:\n    driver: inmem\n")
+	cfg, err := LoadConfig(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"amqp://a", "amqp://b"}
+	if !reflect.DeepEqual(cfg.Broker.Endpoints, want) {
+		t.Fatalf("Broker.Endpoints = %#v, want %#v", cfg.Broker.Endpoints, want)
+	}
+}
+
 func TestLoadConfigSubscriptionConfigByName(t *testing.T) {
 	t.Parallel()
 	path := writeConfig(t, `
