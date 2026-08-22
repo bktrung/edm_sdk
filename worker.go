@@ -124,6 +124,7 @@ func (r *Runner) Run(ctx context.Context) error {
 		switch r.lifecycle.State() {
 		case lifecycle.Starting, lifecycle.Reconnecting:
 			r.mu.Lock()
+			r.repairCycleActive = false
 			r.failedRepairCycles = 0
 			r.mu.Unlock()
 			if err := r.lifecycle.Transition(lifecycle.Ready); err != nil {
@@ -149,6 +150,7 @@ func (r *Runner) Run(ctx context.Context) error {
 		reconnectCause := r.reconnectCause
 		consumerError := r.consumerError
 		successfulDelivery := r.successfulDelivery
+		repairCycleActive := r.repairCycleActive
 		failedRepairCycles := r.failedRepairCycles
 		draining := r.draining
 		r.mu.Unlock()
@@ -160,9 +162,14 @@ func (r *Runner) Run(ctx context.Context) error {
 		if consumerError && !clientReconnecting {
 			if successfulDelivery {
 				failedRepairCycles = 0
+				repairCycleActive = false
 			}
-			failedRepairCycles++
+			if repairCycleActive {
+				failedRepairCycles++
+			}
+			repairCycleActive = true
 			r.mu.Lock()
+			r.repairCycleActive = repairCycleActive
 			r.failedRepairCycles = failedRepairCycles
 			r.mu.Unlock()
 			if failedRepairCycles < 2 {

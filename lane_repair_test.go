@@ -19,6 +19,9 @@ type laneRepairDriver struct {
 	connections   []*laneRepairConn
 	created       chan *laneRepairConsumer
 	failNext      bool
+	blockNext     bool
+	blockStarted  chan struct{}
+	blockRelease  chan struct{}
 	publishedConn *laneRepairConn
 	pending       map[string][]*laneRepairConsumer
 }
@@ -50,6 +53,17 @@ func (d *laneRepairDriver) failNextConsumer() {
 	d.mu.Unlock()
 }
 
+func (d *laneRepairDriver) blockNextConsumer() (<-chan struct{}, func()) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.blockNext = true
+	d.blockStarted = make(chan struct{})
+	d.blockRelease = make(chan struct{})
+	release := d.blockRelease
+	var once sync.Once
+	return d.blockStarted, func() { once.Do(func() { close(release) }) }
+}
+
 func (d *laneRepairDriver) setPublishedConn(conn *laneRepairConn) {
 	d.mu.Lock()
 	d.publishedConn = conn
@@ -79,7 +93,16 @@ func (c *laneRepairConn) Consumer(_ context.Context, cfg driver.ConsumerConfig) 
 		c.driver.mu.Unlock()
 		return nil, &driver.Error{Driver: c.driver.Name(), Op: "consumer", K: driver.KindTransient, Err: errors.New("replacement consumer failed")}
 	}
-	c.driver.mu.Unlock()
+	if c.driver.blockNext {
+		c.driver.blockNext = false
+		started := c.driver.blockStarted
+		release := c.driver.blockRelease
+		c.driver.mu.Unlock()
+		close(started)
+		<-release
+	} else {
+		c.driver.mu.Unlock()
+	}
 	consumer := &laneRepairConsumer{
 		group:    cfg.Group,
 		conn:     c,
@@ -314,6 +337,40 @@ func TestRunnerRepairsConsumerWithoutReplacingConnection(t *testing.T) {
 	}
 }
 
+func TestRunnerKeepsAdmissionDuringConsumerRepair(t *testing.T) {
+	d := &laneRepairDriver{created: make(chan *laneRepairConsumer, 16)}
+	client := newLaneRepairClient(t, d)
+	var handled atomic.Int32
+	runner, _ := startLaneRunner(t, client, laneRepairSubscription("orders", &handled))
+	first := waitLaneConsumer(t, d, "orders")
+	waitReconnectCondition(t, runner.lifecycle.Ready)
+	started, release := d.blockNextConsumer()
+	defer release()
+	first.sendError(transientLaneError(d))
+	timer := clock.NewReal().Timer(2 * time.Second)
+	defer timer.Stop()
+	select {
+	case <-started:
+	case <-timer.C:
+		t.Fatal("replacement consumer did not block")
+	}
+	if !runner.lifecycle.Ready() {
+		t.Fatalf("runner lifecycle = %s during consumer repair, want Ready", runner.lifecycle.State())
+	}
+	if client.isReconnecting() {
+		t.Fatal("client entered reconnecting state during consumer repair")
+	}
+	if _, err := client.Publisher().Publish(context.Background(), "orders.created", map[string]string{"id": "published-during-blocked-repair"}); err != nil {
+		t.Fatalf("Publish during blocked consumer repair = %v", err)
+	}
+	release()
+	repaired := waitLaneConsumer(t, d, "orders")
+	if repaired == first {
+		t.Fatal("repair reused the failed consumer")
+	}
+	waitReconnectCondition(t, runner.lifecycle.Ready)
+}
+
 func TestRunnerEscalatesWhenConsumerRepairCannotOpen(t *testing.T) {
 	d := &laneRepairDriver{created: make(chan *laneRepairConsumer, 16)}
 	client := newLaneRepairClient(t, d)
@@ -333,7 +390,7 @@ func TestRunnerEscalatesWhenConsumerRepairCannotOpen(t *testing.T) {
 	}
 }
 
-func TestRunnerEscalatesAfterTwoFailedRepairCycles(t *testing.T) {
+func TestRunnerRebuildsTwiceBeforeEscalating(t *testing.T) {
 	d := &laneRepairDriver{created: make(chan *laneRepairConsumer, 16)}
 	client := newLaneRepairClient(t, d)
 	var handled atomic.Int32
@@ -342,30 +399,55 @@ func TestRunnerEscalatesAfterTwoFailedRepairCycles(t *testing.T) {
 	waitReconnectCondition(t, runner.lifecycle.Ready)
 	first.sendError(transientLaneError(d))
 	second := waitLaneConsumer(t, d, "orders")
-	second.sendError(transientLaneError(d))
-	waitReconnectCondition(t, func() bool { return d.openCount() >= 2 })
-	if d.openCount() < 2 {
-		t.Fatalf("driver Open count = %d, want at least 2 after repeated repair failure", d.openCount())
-	}
-}
-
-func TestRunnerUsefulDeliveryResetsRepairFailureCount(t *testing.T) {
-	d := &laneRepairDriver{created: make(chan *laneRepairConsumer, 16)}
-	client := newLaneRepairClient(t, d)
-	var handled atomic.Int32
-	runner, _ := startLaneRunner(t, client, laneRepairSubscription("orders", &handled))
-	first := waitLaneConsumer(t, d, "orders")
-	waitReconnectCondition(t, runner.lifecycle.Ready)
-	first.sendError(transientLaneError(d))
-	second := waitLaneConsumer(t, d, "orders")
-	second.send(laneRepairMessage(t, "useful", "orders.created"))
-	waitAtomicCount(t, &handled, 1)
 	second.sendError(transientLaneError(d))
 	third := waitLaneConsumer(t, d, "orders")
 	if third == second {
-		t.Fatal("repair after useful delivery reused the consumer")
+		t.Fatal("second repair reused the consumer")
 	}
 	if d.openCount() != 1 {
-		t.Fatalf("driver Open count = %d, want 1 after useful repair cycle", d.openCount())
+		t.Fatalf("driver Open count = %d, want 1 after two consumer rebuilds", d.openCount())
 	}
+	waitReconnectCondition(t, runner.lifecycle.Ready)
+}
+
+func TestRunnerEscalatesAfterThreeConsumerErrors(t *testing.T) {
+	d := &laneRepairDriver{created: make(chan *laneRepairConsumer, 16)}
+	client := newLaneRepairClient(t, d)
+	var handled atomic.Int32
+	runner, _ := startLaneRunner(t, client, laneRepairSubscription("orders", &handled))
+	first := waitLaneConsumer(t, d, "orders")
+	waitReconnectCondition(t, runner.lifecycle.Ready)
+	first.sendError(transientLaneError(d))
+	second := waitLaneConsumer(t, d, "orders")
+	second.sendError(transientLaneError(d))
+	third := waitLaneConsumer(t, d, "orders")
+	third.sendError(transientLaneError(d))
+	waitReconnectCondition(t, func() bool { return d.openCount() >= 2 })
+	if d.openCount() < 2 {
+		t.Fatalf("driver Open count = %d, want at least 2 after three consumer errors", d.openCount())
+	}
+}
+
+func TestRunnerUsefulDeliveryRestoresTwoCycleRepairBudget(t *testing.T) {
+	d := &laneRepairDriver{created: make(chan *laneRepairConsumer, 16)}
+	client := newLaneRepairClient(t, d)
+	var handled atomic.Int32
+	runner, _ := startLaneRunner(t, client, laneRepairSubscription("orders", &handled))
+	first := waitLaneConsumer(t, d, "orders")
+	waitReconnectCondition(t, runner.lifecycle.Ready)
+	first.sendError(transientLaneError(d))
+	second := waitLaneConsumer(t, d, "orders")
+	second.sendError(transientLaneError(d))
+	third := waitLaneConsumer(t, d, "orders")
+	third.send(laneRepairMessage(t, "useful", "orders.created"))
+	waitAtomicCount(t, &handled, 1)
+	third.sendError(transientLaneError(d))
+	fourth := waitLaneConsumer(t, d, "orders")
+	fourth.sendError(transientLaneError(d))
+	fifth := waitLaneConsumer(t, d, "orders")
+	if d.openCount() != 1 {
+		t.Fatalf("driver Open count = %d, want 1 after useful delivery restored the repair budget", d.openCount())
+	}
+	fifth.sendError(transientLaneError(d))
+	waitReconnectCondition(t, func() bool { return d.openCount() >= 2 })
 }

@@ -110,7 +110,11 @@ type Runner struct {
 	consumerError bool
 	// successfulDelivery means this generation completed at least one handled delivery.
 	successfulDelivery bool
-	// failedRepairCycles counts consecutive generations that fail before any handled delivery; a handled delivery resets it.
+	// repairCycleActive means a replacement consumer has been built and the next
+	// transient consumer failure can complete a failed repair cycle.
+	repairCycleActive bool
+	// failedRepairCycles counts consecutive replacement consumers that fail before
+	// any handled delivery; a handled delivery resets it.
 	failedRepairCycles    int
 	inflight              *inflightRegistry
 	retryDestinationTiers map[string]int
