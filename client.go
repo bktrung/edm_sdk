@@ -140,6 +140,9 @@ func New(ctx context.Context, cfg Config, opts ...Option) (*Client, error) {
 	if err != nil {
 		return nil, fmt.Errorf("f1: open %s driver: %w", options.driver.Name(), err)
 	}
+	if connection == nil {
+		return nil, fmt.Errorf("f1: open %s driver: driver returned a nil connection", options.driver.Name())
+	}
 	capabilities := connection.Capabilities()
 	effective := capabilities
 	if options.strictPortability {

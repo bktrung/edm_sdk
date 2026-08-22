@@ -30,6 +30,16 @@ func TestNewValidatesOptionsEagerly(t *testing.T) {
 	}
 }
 
+func TestNewRejectsNilConnection(t *testing.T) {
+	client, err := New(context.Background(), testClientConfig(t), WithDriver(nilConnectionDriver{}))
+	if client != nil {
+		t.Fatal("New() returned a client for a nil connection")
+	}
+	if err == nil || err.Error() != "f1: open nil-connection driver: driver returned a nil connection" {
+		t.Fatalf("New() error = %v, want nil-connection startup error", err)
+	}
+}
+
 func TestLogCapabilitiesWarnsForConfiguredUnavailableFeature(t *testing.T) {
 	var logs bytes.Buffer
 	cfg, err := LoadConfig(writeConfig(t, `
@@ -306,6 +316,16 @@ func testClientConfig(t *testing.T) Config {
 type testDriver struct {
 	conn   *testConn
 	opened bool
+}
+
+type nilConnectionDriver struct{}
+
+func (nilConnectionDriver) Name() string { return "nil-connection" }
+func (nilConnectionDriver) Capabilities() driver.Capabilities {
+	return driver.Capabilities{}
+}
+func (nilConnectionDriver) Open(context.Context, driver.Config) (driver.Conn, error) {
+	return nil, nil
 }
 
 func (*testDriver) Name() string                      { return "test" }
