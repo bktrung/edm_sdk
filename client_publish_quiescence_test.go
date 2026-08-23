@@ -2,6 +2,8 @@ package f1
 
 import (
 	"context"
+	"errors"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -247,5 +249,50 @@ func TestWaitPublishIdleSpansLateGenerations(t *testing.T) {
 	endPublish(client)
 	if err := <-waitDone; err != nil {
 		t.Fatalf("waitPublishIdle() = %v, want nil", err)
+	}
+}
+
+// TestFailedCloseKeepsProducerTeardownBarrierSet pins the ruling that the
+// producer-teardown barrier survives a failed Close. Once the publish-idle
+// wait has observed zero and armed the barrier, producer teardown is
+// inevitable; a Close whose later phase fails leaves the client retryable,
+// but the producer's fitness is unknown at that point, so settlement
+// publishes stay refused and stragglers take the bounded redelivery path
+// instead of being risked against a half-torn-down producer. A retried Close
+// must still be accepted: refusing it would make the state unrecoverable.
+func TestFailedCloseKeepsProducerTeardownBarrierSet(t *testing.T) {
+	connErr := errors.New("conn close failed")
+	conn := &failingCloseConn{
+		publishConn: publishConn{info: driver.BrokerInfo{Kind: "test", Version: "1"}},
+		closeErr:    connErr,
+	}
+	client, err := New(context.Background(), testClientConfig(t), WithDriver(&failingCloseDriver{conn: conn}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = client.Close(context.Background()) })
+
+	if err := client.Close(context.Background()); !errors.Is(err, connErr) {
+		t.Fatalf("Close() error = %v, want the connection close error: the failure must happen after the publish-idle wait", err)
+	}
+
+	client.mu.Lock()
+	barrier := client.producerTeardown
+	closing := client.closing
+	closed := client.closed
+	client.mu.Unlock()
+	if !barrier {
+		t.Fatal("producer teardown barrier not set although Close reached the publish-idle wait")
+	}
+	if closing || closed {
+		t.Fatalf("closing = %v, closed = %v, want a failed Close to leave the client retryable", closing, closed)
+	}
+
+	if err := publishMessages(client, context.Background(), true, driver.OutboundMessage{Destination: "orders.created"}); err == nil || !strings.Contains(err.Error(), "client is closed") {
+		t.Fatalf("successor publish after a failed Close = %v, want refused with client is closed: the barrier must survive the failure", err)
+	}
+
+	if err := client.Close(context.Background()); !errors.Is(err, connErr) {
+		t.Fatalf("retried Close() error = %v, want accepted (the same connection error), not refused as already closing", err)
 	}
 }
