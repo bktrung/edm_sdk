@@ -446,6 +446,18 @@ func TestValidateConfigRejectsZeroDrainTimeout(t *testing.T) {
 	}
 }
 
+func TestValidateRetryRejectsUnboundedGrowingLadder(t *testing.T) {
+	cfg := validValidationConfig()
+	cfg.Subscriptions["orders"] = withRetry(cfg.Subscriptions["orders"], RetryConfig{
+		MaxAttempts:     20,
+		InitialInterval: time.Second,
+		Multiplier:      5,
+	})
+	if err := validateConfig(cfg); err == nil || !strings.Contains(err.Error(), "maxInterval") {
+		t.Fatalf("validateConfig() error = %v, want maxInterval validation", err)
+	}
+}
+
 func TestValidateSubscriptionRejectsZeroDrainTimeout(t *testing.T) {
 	cfg := validValidationConfig()
 	cfg.Lifecycle.DrainTimeout = 0

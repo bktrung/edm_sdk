@@ -395,6 +395,9 @@ func validateRetryConfig(path string, retry RetryConfig) error {
 	if retry.MaxInterval < 0 {
 		return fmt.Errorf("f1: %s.maxInterval must not be negative", path)
 	}
+	if len(retry.Tiers) == 0 && retry.MaxInterval == 0 && retry.Multiplier > 1 {
+		return fmt.Errorf("f1: %s.maxInterval must be positive when multiplier is greater than 1", path)
+	}
 	if retry.Jitter < 0 || retry.Jitter > .5 || math.IsNaN(retry.Jitter) || math.IsInf(retry.Jitter, 0) {
 		return fmt.Errorf("f1: %s.jitter must be finite and between 0 and 0.5", path)
 	}
