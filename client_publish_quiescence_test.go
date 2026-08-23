@@ -93,7 +93,7 @@ func waitClientClosing(t *testing.T, client *Client) {
 		case <-timer.C:
 			t.Fatal("Close did not reach beginClose")
 		default:
-			time.Sleep(time.Millisecond)
+			_ = clock.NewReal().Sleep(context.Background(), time.Millisecond)
 		}
 	}
 }
@@ -186,7 +186,7 @@ func TestWaitForPublishesSpansLateGenerationsAndBarsTeardownAdmission(t *testing
 	// swap below. The delay only strengthens mutation detection; the
 	// assertions stay correct whichever order the scheduler picks, because
 	// a re-reading wait stays pending on generation B in every interleaving.
-	time.Sleep(5 * time.Millisecond)
+	_ = clock.NewReal().Sleep(context.Background(), 5*time.Millisecond)
 
 	// End generation A and begin generation B inside one critical section,
 	// exactly as back-to-back end and begin do under contention. A waiter
@@ -235,7 +235,7 @@ func TestWaitPublishIdleSpansLateGenerations(t *testing.T) {
 
 	// Same settle delay as the Close-path generation test: it only
 	// strengthens mutation detection, never the correctness of the assertion.
-	time.Sleep(5 * time.Millisecond)
+	_ = clock.NewReal().Sleep(context.Background(), 5*time.Millisecond)
 
 	client.mu.Lock()
 	close(idleA)

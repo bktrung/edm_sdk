@@ -902,9 +902,9 @@ func retryDeliverySettlement(r *Runner, ctx context.Context, message driver.Inbo
 			if state.settled {
 				return
 			}
-			nackDelivery(r, sctx, message, driver.NackOptions{Requeue: true}, state)
+			_ = nackDelivery(r, sctx, message, driver.NackOptions{Requeue: true}, state)
 		case settlementOperationNack:
-			nackDelivery(r, sctx, message, state.nackOptions, state)
+			_ = nackDelivery(r, sctx, message, state.nackOptions, state)
 		default:
 			return
 		}

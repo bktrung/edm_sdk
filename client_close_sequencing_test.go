@@ -116,7 +116,7 @@ func TestClientCloseReturnsBareConnCloseErrorWhenProducerCloseSucceeds(t *testin
 	if !errors.Is(err, connErr) {
 		t.Fatalf("Close() error = %v, want the connection close error", err)
 	}
-	if err != connErr {
+	if err != connErr { //nolint:errorlint // identity is the assertion: a joined wrapper must fail here
 		t.Fatalf("Close() error = %T(%v), want the bare connection error %T(%v): a nil producer close error must not be joined", err, err, connErr, connErr)
 	}
 	var joined interface{ Unwrap() []error }
