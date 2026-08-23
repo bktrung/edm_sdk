@@ -72,19 +72,12 @@ func (r *Runner) Run(ctx context.Context) error {
 	defer finishRunner(r)
 	var runErr error
 	var runCtx context.Context
+	var cancel context.CancelFunc
 	generation := 0
 	var repairCause error
 	for {
-		runCtx, cancel := context.WithCancel(ctx)
-		r.mu.Lock()
-		r.runCtx = runCtx
-		r.cancel = cancel
-		r.reconnectCause = nil
-		r.consumerError = false
-		r.successfulDelivery = false
-		group := new(errgroup.Group)
-		r.group = group
-		r.mu.Unlock()
+		runCtx, cancel = context.WithCancel(ctx)
+		group := beginRunnerGeneration(r, runCtx, cancel)
 
 		consumer, err := openRunnerConsumer(r, runCtx)
 		if err != nil {
@@ -199,13 +192,45 @@ func (r *Runner) Run(ctx context.Context) error {
 		}
 	}
 
-	shutdownErr := r.drainAfterRun(runCtx) //nolint:contextcheck // drain preserves settlement context across generation cancellation.
+	shutdownErr := r.drainAfterRun(runCtx)
 	if runErr == nil {
 		runErr = shutdownErr
 	} else if shutdownErr != nil {
 		runErr = errors.Join(runErr, shutdownErr)
 	}
 	return runErr
+}
+
+// beginRunnerGeneration resets the per-generation runner state at the top of
+// Run's loop, where the generation's run context is created. The settlement
+// context belongs to this reset: first-wins installation is correct within
+// one drain, but a context installed during a previous generation's
+// abandonment carries a drain budget that started back then, so every later
+// generation would inherit an already-expired budget and fail every drain
+// settlement at once. The field is cleared without calling the old cancel: a
+// cleanup from the previous generation captured the context value, not the
+// field, and cancelling it under such a caller is the defect first-wins
+// exists to prevent. The dropped cancel function is safe to lose because the
+// context was built over an uncancelable base: with a nil Done channel there
+// is nothing for cancellation to propagate through, no goroutine watching
+// the parent, and the context becomes unreachable once no caller references
+// it. When DrainTimeout is positive the context also carries its own
+// deadline, so its timer fires within one budget period and releases
+// whatever the deadline still holds; that timer is an additional guarantee,
+// not the protection, and it does not exist when the budget is zero.
+func beginRunnerGeneration(r *Runner, runCtx context.Context, cancel context.CancelFunc) *errgroup.Group {
+	r.mu.Lock()
+	r.runCtx = runCtx
+	r.cancel = cancel
+	r.settleCtx = nil
+	r.settleCancel = nil
+	r.reconnectCause = nil
+	r.consumerError = false
+	r.successfulDelivery = false
+	group := new(errgroup.Group)
+	r.group = group
+	r.mu.Unlock()
+	return group
 }
 
 func runDispatchPipeline(r *Runner, ctx context.Context, deliveries <-chan delivery) error {
@@ -789,10 +814,14 @@ func fetchRunnerAfterCancel(r *Runner, parent context.Context, messages <-chan d
 	drainCtx, cancel := contextWithOptionalTimeout(drainBase, drainTimeout)
 	defer cancel()
 	r.mu.Lock()
-	if r.settleCancel != nil {
-		r.settleCancel()
+	// First installation wins. A settlement context installed earlier was
+	// built from an uncancelable base with its own drain budget, so it is
+	// already fit for use; cancelling and replacing it would pull the ground
+	// out from under a settlement call that captured the old context and is
+	// about to reach the driver on it.
+	if r.settleCtx == nil {
+		r.settleCtx, r.settleCancel = contextWithOptionalTimeout(drainBase, drainTimeout)
 	}
-	r.settleCtx, r.settleCancel = contextWithOptionalTimeout(drainBase, drainTimeout)
 	r.mu.Unlock()
 	r.mu.Lock()
 	consumer := r.consumer
@@ -850,31 +879,66 @@ func processDelivery(r *Runner, ctx context.Context, item delivery) {
 		if !state.settled && !state.attempted && abandoned {
 			_ = nackDelivery(r, runnerSettlementContext(r, ctx), item.message, driver.NackOptions{Requeue: true}, state)
 		}
+		retryDeliverySettlement(r, ctx, item.message, state)
+		// The outcome names the delivery's terminal result: a delivery whose
+		// delayed cleanup eventually settled reports that settlement, and
+		// abandoned is reserved for one that never settled at all.
 		operation := state.operation
-		if !state.settled {
-			switch operation {
-			case settlementOperationAck:
-				_ = ackDelivery(r, runnerSettlementContext(r, ctx), item.message, state)
-			case settlementOperationNack:
-				_ = nackDelivery(r, runnerSettlementContext(r, ctx), item.message, state.nackOptions, state)
-			}
-		}
-		if !state.settled && operation == settlementOperationAck {
-			_ = nackDelivery(r, runnerSettlementContext(r, ctx), item.message, driver.NackOptions{Requeue: true}, state)
-		}
-		operation = state.operation
 		outcome := settlementOutcomeUnknown
-		if abandoned {
-			outcome = settlementOutcomeAbandoned
-		} else if state.settled {
+		switch {
+		case state.settled && operation == settlementOperationNack:
+			outcome = settlementOutcomeRequeued
+		case state.settled:
 			outcome = settlementOutcomeSettled
-			if operation == settlementOperationNack {
-				outcome = settlementOutcomeRequeued
-			}
+		case abandoned:
+			outcome = settlementOutcomeAbandoned
 		}
 		r.inflight.RemoveAs(item.id, outcome)
 	}()
 	dispatchMessage(r, ctx, item.message, &envelope, &abandoned, state)
+}
+
+// settlementRetryAttempts bounds how many rounds of retry the deferred
+// cleanup of a delivery gets on top of its inline attempts. It stays small
+// on purpose: a drain must stay bounded even against settlement calls that
+// keep failing transiently.
+const settlementRetryAttempts = 3
+
+// settlementRetryBackoff bounds the wait between deferred settlement retry
+// rounds. Like every wait in this path it is short and fixed: a delivery
+// held unsettled may only ever be delayed by something bounded and small.
+const settlementRetryBackoff = 20 * time.Millisecond
+
+// retryDeliverySettlement finishes the settlement of a delivery whose
+// cleanup attempts failed. The driver retains an unsettled delivery on a
+// failed settlement call, so the runner owes more attempts while any of its
+// bounded settlement budget remains: giving up after one retry would let the
+// registry report zero for work the driver still owns. Each round retries
+// the last operation in kind; a failed ack falls back to a requeue nack once
+// per round. The loop ends when the delivery settles, when the attempt bound
+// is reached, or when the settlement context ends, whichever comes first.
+func retryDeliverySettlement(r *Runner, ctx context.Context, message driver.InboundMessage, state *deliveryState) {
+	for round := 0; !state.settled && round < settlementRetryAttempts; round++ {
+		sctx := runnerSettlementContext(r, ctx)
+		switch state.operation {
+		case settlementOperationAck:
+			ackDelivery(r, sctx, message, state)
+			if state.settled {
+				return
+			}
+			_ = nackDelivery(r, sctx, message, driver.NackOptions{Requeue: true}, state)
+		case settlementOperationNack:
+			_ = nackDelivery(r, sctx, message, state.nackOptions, state)
+		default:
+			return
+		}
+		if state.settled {
+			return
+		}
+		if err := r.client.options.clock.Sleep(sctx, settlementRetryBackoff); err != nil {
+			return
+		}
+	}
 }
 
 func dispatchMessage(r *Runner, ctx context.Context, message driver.InboundMessage, envelopeOut *Envelope, abandoned *bool, states ...*deliveryState) bool {

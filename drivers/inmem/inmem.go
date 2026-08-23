@@ -213,7 +213,7 @@ type queuedMessage struct {
 
 func (c *conn) Capabilities() driver.Capabilities { return c.caps }
 func (c *conn) BrokerInfo() driver.BrokerInfo     { return c.info }
-func (c *conn) Admin() driver.Admin               { return &admin{conn: c} }
+func (c *conn) Admin() driver.Admin               { return &admin{operations: &adminOperations{conn: c}} }
 
 func (c *conn) Producer(ctx context.Context, cfg driver.ProducerConfig) (driver.Producer, error) {
 	if err := ctx.Err(); err != nil {

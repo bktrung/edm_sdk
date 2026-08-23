@@ -10,22 +10,71 @@ import (
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/driver"
 )
 
+const privateCloseDestination = "failure.close.private"
+
 func init() { registerGroup("failure", runFailure) }
 
 func runFailure(group *groupContext) {
+	group.Check("cancelled Driver Open returns transient without a connection", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(group.ctx)
+		cancel()
+		conn, err := group.drv.Open(ctx, group.cfg)
+		assertCancelled(t, "Driver.Open", err)
+		if conn != nil {
+			_ = conn.Close(group.ctx)
+			t.Fatal("Driver.Open() returned a connection after cancellation")
+		}
+		group.vector.Add(BehaviorEvent{ID: "cancel-open", Outcome: "cancelled", FinalDestination: "driver"})
+	})
+
+	group.Check("cancelled Ping returns transient", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(group.ctx)
+		cancel()
+		assertCancelled(t, "Ping", group.conn.Ping(ctx))
+		group.vector.Add(BehaviorEvent{ID: "cancel-ping", Outcome: "cancelled", FinalDestination: "connection"})
+	})
+
+	group.Check("cancelled Conn Close returns transient and leaves admission open", func(t *testing.T) {
+		conn, err := group.drv.Open(group.ctx, group.cfg)
+		if err != nil {
+			t.Fatalf("Driver.Open(): %v", err)
+		}
+		defer func() { _ = conn.Close(group.ctx) }()
+		ctx, cancel := context.WithCancel(group.ctx)
+		cancel()
+		assertCancelled(t, "Conn.Close", conn.Close(ctx))
+		producer, err := conn.Producer(group.ctx, driver.ProducerConfig{})
+		if err != nil {
+			t.Fatalf("Producer() after cancelled Conn.Close() = %v", err)
+		}
+		if err := producer.Close(group.ctx); err != nil {
+			t.Fatalf("Producer.Close() after cancelled Conn.Close() = %v", err)
+		}
+		if err := conn.Close(group.ctx); err != nil {
+			t.Fatalf("Conn.Close() cleanup = %v", err)
+		}
+		group.vector.Add(BehaviorEvent{ID: "cancel-conn-close", Outcome: "cancelled", FinalDestination: "connection"})
+	})
+
 	group.Check("failed Close keeps admission closed and remains retryable", func(t *testing.T) {
 		conn, inject := newPrivateFailureConnection(t, group)
-		closeCtx, cancel := context.WithTimeout(group.ctx, 100*time.Millisecond)
-		assertPrivateCloseFailure(t, group, conn, inject, closeCtx, group.ctx)
-		cancel()
+		assertPrivateCloseFailure(t, group, conn, inject, 100*time.Millisecond, group.ctx)
 
 		conn, inject = newPrivateFailureConnection(t, group)
-		assertPrivateCloseFailure(t, group, conn, inject, group.ctx, group.ctx)
+		assertPrivateCloseFailure(t, group, conn, inject, 0, group.ctx)
 		group.vector.Add(BehaviorEvent{ID: "failure-close-admission", Outcome: "closed-and-retryable", FinalDestination: "failure.close"})
 	})
 
 	group.Check("rejected Close leaves admission open", func(t *testing.T) {
 		conn, _ := newPrivateFailureConnection(t, group)
+		admin := conn.Admin()
+		if _, err := admin.EnsureTopology(group.ctx, driver.TopologySpec{
+			Destinations: []driver.DestinationSpec{{Name: privateCloseDestination}},
+			Scope:        []string{"failure.close."},
+			Effective:    group.effective,
+		}); err != nil {
+			t.Fatalf("declare precondition destination: %v", err)
+		}
 		producer, err := conn.Producer(group.ctx, driver.ProducerConfig{})
 		if err != nil {
 			t.Fatalf("Producer() before precondition Close: %v", err)
@@ -37,6 +86,9 @@ func runFailure(group *groupContext) {
 			t.Fatalf("Producer() after rejected Close: %v", err)
 		} else {
 			_ = next.Close(group.ctx)
+		}
+		if _, err := admin.DescribeTopology(group.ctx, []string{privateCloseDestination}); err != nil {
+			t.Fatalf("Admin.DescribeTopology() after rejected Close: %v", err)
 		}
 		if err := producer.Close(group.ctx); err != nil {
 			t.Fatalf("close precondition producer: %v", err)
@@ -316,10 +368,24 @@ func runFailure(group *groupContext) {
 	})
 }
 
-func assertPrivateCloseFailure(t *testing.T, group *groupContext, conn driver.Conn, inject FaultInjector, closeCtx, activeCtx context.Context) {
+func assertPrivateCloseFailure(t *testing.T, group *groupContext, conn driver.Conn, inject FaultInjector, closeTimeout time.Duration, activeCtx context.Context) {
 	t.Helper()
+	admin := conn.Admin()
+	if _, err := admin.EnsureTopology(activeCtx, driver.TopologySpec{
+		Destinations: []driver.DestinationSpec{{Name: privateCloseDestination}},
+		Scope:        []string{"failure.close."},
+		Effective:    group.effective,
+	}); err != nil {
+		t.Fatalf("declare close destination: %v", err)
+	}
 	if err := inject(activeCtx, FaultCloseFailure); err != nil {
 		t.Fatalf("inject %s: %v", FaultCloseFailure, err)
+	}
+	closeCtx := activeCtx
+	if closeTimeout > 0 {
+		var cancel context.CancelFunc
+		closeCtx, cancel = context.WithTimeout(activeCtx, closeTimeout)
+		defer cancel()
 	}
 	if err := conn.Close(closeCtx); err == nil {
 		t.Fatal("Close() after injected failure returned nil")
@@ -328,8 +394,11 @@ func assertPrivateCloseFailure(t *testing.T, group *groupContext, conn driver.Co
 		_ = producer.Close(activeCtx)
 		t.Fatal("Producer() succeeded after Close teardown began")
 	}
+	if _, err := admin.DescribeTopology(activeCtx, []string{privateCloseDestination}); err == nil {
+		t.Error("Admin.DescribeTopology() succeeded after Close teardown began")
+	}
 	if consumer, err := conn.Consumer(activeCtx, driver.ConsumerConfig{
-		Destinations: []string{"failure.close.private.consumer"},
+		Destinations: []string{privateCloseDestination},
 	}); err == nil {
 		_ = consumer.Stop(activeCtx)
 		t.Fatal("Consumer() succeeded after Close teardown began")

@@ -195,18 +195,7 @@ func (c *Client) abandonRunners(ctx context.Context) error {
 }
 
 func (c *Client) waitPublishIdle(ctx context.Context) error {
-	c.mu.Lock()
-	idle := c.publishIdle
-	c.mu.Unlock()
-	if idle == nil {
-		return nil
-	}
-	select {
-	case <-idle:
-		return nil
-	case <-ctx.Done():
-		return ctx.Err()
-	}
+	return c.publishQuiescence(ctx, nil)
 }
 
 func (c *Client) retireConnection(ctx context.Context, producer driver.Producer, oldConn, newConn driver.Conn) {
@@ -270,11 +259,7 @@ func (r *Runner) transitionToReconnecting() {
 	}
 }
 
-//nolint:contextcheck // the helper preserves the runner's settlement context while draining.
 func (r *Runner) drainAfterRun(runCtx context.Context) error {
-	if runCtx == nil {
-		runCtx = context.Background()
-	}
 	shutdownCtx := runnerSettlementContext(r, runCtx)
 	return r.lifecycle.Drain(shutdownCtx, lifecycle.Config{
 		Clock:        r.client.options.clock,

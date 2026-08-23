@@ -61,6 +61,45 @@ func TestClientCloseRejoinsTimedOutFlush(t *testing.T) {
 	}
 }
 
+func TestConcurrentCloseReportsInProgress(t *testing.T) {
+	producer := &recordingProducer{
+		closeStarted: make(chan struct{}),
+		closeRelease: make(chan struct{}),
+	}
+	conn := &publishConn{producer: producer, info: driver.BrokerInfo{Kind: "test", Version: "1"}}
+	client, err := New(context.Background(), testClientConfig(t), WithDriver(&publishDriver{conn: conn}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var release sync.Once
+	releaseProducer := func() { release.Do(func() { close(producer.closeRelease) }) }
+	defer func() {
+		releaseProducer()
+		_ = client.Close(context.Background())
+	}()
+	client.producerHandle = producer
+
+	firstDone := make(chan error, 1)
+	go func() { firstDone <- client.Close(context.Background()) }()
+	<-producer.closeStarted
+
+	secondErr := client.Close(context.Background())
+	if secondErr == nil {
+		t.Fatal("concurrent Close returned nil while the first Close was still running")
+	}
+	client.mu.Lock()
+	closed := client.closed
+	client.mu.Unlock()
+	if closed {
+		t.Fatal("concurrent Close observed a closed client while the first Close was still running")
+	}
+
+	releaseProducer()
+	if err := <-firstDone; err != nil {
+		t.Fatalf("first Close() = %v", err)
+	}
+}
+
 func TestClientCloseRejoinsTimedOutConnectionClose(t *testing.T) {
 	fake := clock.NewFake(time.Unix(0, 0))
 	conn := &firstCloseBlockingConn{

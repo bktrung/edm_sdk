@@ -14,7 +14,7 @@ APIDIFF := $(CURDIR)/.tools/bin/apidiff
 APIDIFF_NORMALIZE := $(CURDIR)/.tools/bin/apidiff-normalize
 API_DIFF_BASELINE_DIR := $(CURDIR)/testdata/api-diff
 API_DIFF_BREAKING_CHANGE ?= 0
-API_DIFF_ENFORCE ?= 0
+API_DIFF_ENFORCE ?= 1
 
 .PHONY: build test-fast test lint verify-agnostic verify-self-contained check-fixture check-api-surface check-api-surface-codec check-api-surface-driver check-api-surface-f1test check-api-diff record-api-diff-baseline
 
@@ -76,9 +76,9 @@ check-api-surface-f1test: $(APISURFACE)
 
 ## check-api-diff: report API changes; fails on incompatible ones only when API_DIFF_ENFORCE=1.
 ##
-## Enforcement is off while the first real broker driver is being built. The port has not yet met a
-## non-memory client, so an incompatible change is expected work rather than an accident. Set
-## API_DIFF_ENFORCE=1 once the RabbitMQ driver passes acceptance and the port is genuinely frozen.
+## Enforcement is on. Intentional breaking changes require an explicit maintainer
+## approval when recording a new baseline: API_DIFF_BREAKING_CHANGE=1 make
+## record-api-diff-baseline
 check-api-diff: $(APIDIFF) $(APIDIFF_NORMALIZE)
 	@set -e; \
 	for spec in \

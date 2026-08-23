@@ -5,23 +5,57 @@ import (
 	"errors"
 	"fmt"
 
+	amqp "github.com/rabbitmq/amqp091-go"
+
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/driver"
 )
 
-type admin struct{ conn *conn }
+type adminOperations struct{ conn *conn }
+
+type admin struct{ operations *adminOperations }
 
 var _ driver.Admin = (*admin)(nil)
 
 func (a *admin) EnsureTopology(ctx context.Context, spec driver.TopologySpec) (driver.TopologyDiff, error) {
+	return a.operations.EnsureTopology(ctx, spec)
+}
+
+func (a *admin) DescribeTopology(ctx context.Context, names []string) (driver.TopologyState, error) {
+	return a.operations.DescribeTopology(ctx, names)
+}
+
+func (a *admin) Purge(ctx context.Context, destination string) (int64, error) {
+	return a.operations.Purge(ctx, destination)
+}
+
+func (a *admin) Prune(ctx context.Context, names []string) ([]driver.PruneResult, error) {
+	return a.operations.Prune(ctx, names)
+}
+
+// admission is the shared Admin facade gate. Channel-creating internals retain openChannel as a second boundary.
+func (a *adminOperations) admission(ctx context.Context, operation string) error {
 	if err := ctx.Err(); err != nil {
-		return driver.TopologyDiff{}, classify("ensure_topology", driver.KindTransient, err)
+		return classify(operation, driver.KindTransient, err)
+	}
+	a.conn.mu.RLock()
+	closed := a.conn.closed || a.conn.closing || a.conn.amqp.IsClosed()
+	a.conn.mu.RUnlock()
+	if closed {
+		return classify(operation, driver.KindTransient, amqp.ErrClosed)
+	}
+	return nil
+}
+
+func (a *adminOperations) EnsureTopology(ctx context.Context, spec driver.TopologySpec) (driver.TopologyDiff, error) {
+	if err := a.admission(ctx, "ensure_topology"); err != nil {
+		return driver.TopologyDiff{}, err
 	}
 	return a.ensureTopology(ctx, spec)
 }
 
-func (a *admin) DescribeTopology(ctx context.Context, names []string) (driver.TopologyState, error) {
-	if err := ctx.Err(); err != nil {
-		return driver.TopologyState{}, classify("describe_topology", driver.KindTransient, err)
+func (a *adminOperations) DescribeTopology(ctx context.Context, names []string) (driver.TopologyState, error) {
+	if err := a.admission(ctx, "describe_topology"); err != nil {
+		return driver.TopologyState{}, err
 	}
 	a.conn.mu.RLock()
 	deferred := make(map[string]struct{}, len(a.conn.deferred))
@@ -52,9 +86,9 @@ func (a *admin) DescribeTopology(ctx context.Context, names []string) (driver.To
 	return driver.TopologyState{Depth: depth}, nil
 }
 
-func (a *admin) Purge(ctx context.Context, destination string) (int64, error) {
-	if err := ctx.Err(); err != nil {
-		return 0, classify("purge", driver.KindTransient, err)
+func (a *adminOperations) Purge(ctx context.Context, destination string) (int64, error) {
+	if err := a.admission(ctx, "purge"); err != nil {
+		return 0, err
 	}
 	channel, err := a.openChannel(ctx)
 	if err != nil {
@@ -81,9 +115,9 @@ func (a *admin) Purge(ctx context.Context, destination string) (int64, error) {
 	return int64(count + parked), nil
 }
 
-func (a *admin) Prune(ctx context.Context, names []string) ([]driver.PruneResult, error) {
-	if err := ctx.Err(); err != nil {
-		return nil, classify("prune", driver.KindTransient, err)
+func (a *adminOperations) Prune(ctx context.Context, names []string) ([]driver.PruneResult, error) {
+	if err := a.admission(ctx, "prune"); err != nil {
+		return nil, err
 	}
 	queues, err := a.conn.management.listQueues(ctx)
 	if err != nil {
@@ -204,7 +238,7 @@ func findQueue(queues []managementQueue, name string) (managementQueue, bool) {
 	return managementQueue{}, false
 }
 
-func (a *admin) pruneReason(name string, main managementQueue, mainReady int64, park managementQueue, hasPark bool, parkReady int64) string {
+func (a *adminOperations) pruneReason(name string, main managementQueue, mainReady int64, park managementQueue, hasPark bool, parkReady int64) string {
 	if main.Consumers > 0 || a.consumerCount(name) > 0 {
 		return fmt.Sprintf("destination %q has consumers attached", name)
 	}
@@ -217,7 +251,7 @@ func (a *admin) pruneReason(name string, main managementQueue, mainReady int64, 
 	return ""
 }
 
-func (a *admin) consumerCount(destination string) int64 {
+func (a *adminOperations) consumerCount(destination string) int64 {
 	a.conn.mu.RLock()
 	defer a.conn.mu.RUnlock()
 	var count int64
@@ -229,7 +263,7 @@ func (a *admin) consumerCount(destination string) int64 {
 	return count
 }
 
-func (a *admin) deleteQueue(ctx context.Context, name string) (bool, error) {
+func (a *adminOperations) deleteQueue(ctx context.Context, name string) (bool, error) {
 	if err := ctx.Err(); err != nil {
 		return false, err
 	}
@@ -261,7 +295,7 @@ func (a *admin) deleteQueue(ctx context.Context, name string) (bool, error) {
 	return true, nil
 }
 
-func (a *admin) inspectQueue(ctx context.Context, name string) (int64, error) {
+func (a *adminOperations) inspectQueue(ctx context.Context, name string) (int64, error) {
 	if err := ctx.Err(); err != nil {
 		return 0, err
 	}

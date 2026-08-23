@@ -259,6 +259,57 @@ func waitReconnectCondition(t *testing.T, condition func() bool) {
 	}
 }
 
+func TestRunnerPostRunDrainUsesGenerationContext(t *testing.T) {
+	d := &reconnectTestDriver{created: make(chan *reconnectTestConsumer, 1)}
+	client := newReconnectTestClient(t, d, nil, 0)
+	runner, err := client.Subscribe(context.Background(), Subscription{
+		Name:           "orders",
+		Topics:         []string{"orders.created"},
+		Prefetch:       12,
+		HandlerTimeout: 10 * time.Millisecond,
+		Handlers: map[string]Handler{
+			"orders.created": HandlerFunc(func(context.Context, *Event) error { return nil }),
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	type runContextKey struct{}
+	key := runContextKey{}
+	runCtx := context.WithValue(context.Background(), key, "run-value")
+	runDone := make(chan error, 1)
+	go func() { runDone <- runner.Run(runCtx) }()
+	consumer := <-d.created
+	consumer.once.Do(func() {
+		close(consumer.messages)
+		close(consumer.errors)
+	})
+	timeout := clock.NewReal().Timer(2 * time.Second)
+	defer timeout.Stop()
+	select {
+	case err := <-runDone:
+		if err != nil {
+			t.Fatalf("runner Run() = %v", err)
+		}
+	case <-timeout.C:
+		t.Fatal("runner Run() did not return")
+	}
+
+	runner.mu.Lock()
+	settleCtx := runner.settleCtx
+	runner.mu.Unlock()
+	if settleCtx == nil {
+		t.Fatal("post-run drain did not create a settlement context")
+	}
+	if got := settleCtx.Value(key); got != "run-value" {
+		t.Fatalf("settlement context value = %v, want run-value", got)
+	}
+	if _, ok := settleCtx.Deadline(); !ok {
+		t.Fatal("post-run drain settlement context has no deadline")
+	}
+}
+
 func reconnectMessage(t *testing.T, id string, settler driver.Settler) driver.InboundMessage {
 	t.Helper()
 	envelope := Envelope{

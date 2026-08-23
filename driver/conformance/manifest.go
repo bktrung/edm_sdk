@@ -14,14 +14,14 @@ type manifestEntry struct {
 }
 
 var groupManifest = []manifestEntry{
-	{name: "publish", declared: 14},
-	{name: "consume", declared: 18},
+	{name: "publish", declared: 17},
+	{name: "consume", declared: 19},
 	{name: "settle", declared: 16},
 	{name: "ordering", declared: 8},
 	{name: "deferred", declared: 9},
 	{name: "drain", declared: 16},
 	{name: "rebalance", declared: 11},
-	{name: "failure", declared: 20},
+	{name: "failure", declared: 23},
 	{name: "topology", declared: 19},
 	{name: "capability", declared: 27},
 	{name: "lag", declared: 5},

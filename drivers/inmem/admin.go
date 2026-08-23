@@ -2,25 +2,56 @@ package inmem
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sort"
 
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/driver"
 )
 
-type admin struct{ conn *conn }
+type adminOperations struct{ conn *conn }
+
+type admin struct{ operations *adminOperations }
 
 var _ driver.Admin = (*admin)(nil)
 
 func (a *admin) EnsureTopology(ctx context.Context, spec driver.TopologySpec) (driver.TopologyDiff, error) {
+	return a.operations.EnsureTopology(ctx, spec)
+}
+
+func (a *admin) DescribeTopology(ctx context.Context, names []string) (driver.TopologyState, error) {
+	return a.operations.DescribeTopology(ctx, names)
+}
+
+func (a *admin) Purge(ctx context.Context, name string) (int64, error) {
+	return a.operations.Purge(ctx, name)
+}
+
+func (a *admin) Prune(ctx context.Context, names []string) ([]driver.PruneResult, error) {
+	return a.operations.Prune(ctx, names)
+}
+
+// begin is the Admin facade gate. It holds the connection lock so lifecycle admission and the operation cannot be separated.
+func (a *adminOperations) begin(ctx context.Context, operation string) error {
 	if err := ctx.Err(); err != nil {
-		return driver.TopologyDiff{}, classify("ensure_topology", driver.KindTransient, err)
+		return classify(operation, driver.KindTransient, err)
 	}
+	a.conn.mu.Lock()
+	if a.conn.closed || a.conn.closing {
+		a.conn.mu.Unlock()
+		return classify(operation, driver.KindTransient, errors.New("connection closed"))
+	}
+	return nil
+}
+
+func (a *adminOperations) EnsureTopology(ctx context.Context, spec driver.TopologySpec) (driver.TopologyDiff, error) {
+	if err := a.begin(ctx, "ensure_topology"); err != nil {
+		return driver.TopologyDiff{}, err
+	}
+	defer a.conn.mu.Unlock()
 	if spec.Policy == driver.TopologyNone {
 		return driver.TopologyDiff{}, nil
 	}
-	a.conn.mu.Lock()
-	defer a.conn.mu.Unlock()
 	var diff driver.TopologyDiff
 	if spec.Policy == driver.TopologyVerify {
 		for _, item := range spec.Destinations {
@@ -101,11 +132,10 @@ func destinationArgumentDrift(want, got driver.DestinationSpec) []driver.Argumen
 	return drifted
 }
 
-func (a *admin) DescribeTopology(ctx context.Context, names []string) (driver.TopologyState, error) {
-	if err := ctx.Err(); err != nil {
-		return driver.TopologyState{}, classify("describe_topology", driver.KindTransient, err)
+func (a *adminOperations) DescribeTopology(ctx context.Context, names []string) (driver.TopologyState, error) {
+	if err := a.begin(ctx, "describe_topology"); err != nil {
+		return driver.TopologyState{}, err
 	}
-	a.conn.mu.Lock()
 	defer a.conn.mu.Unlock()
 	a.conn.dispatchLocked()
 	state := driver.TopologyState{Depth: make(map[string]int64, len(names))}
@@ -119,11 +149,10 @@ func (a *admin) DescribeTopology(ctx context.Context, names []string) (driver.To
 	return state, nil
 }
 
-func (a *admin) Purge(ctx context.Context, name string) (int64, error) {
-	if err := ctx.Err(); err != nil {
-		return 0, classify("purge", driver.KindTransient, err)
+func (a *adminOperations) Purge(ctx context.Context, name string) (int64, error) {
+	if err := a.begin(ctx, "purge"); err != nil {
+		return 0, err
 	}
-	a.conn.mu.Lock()
 	defer a.conn.mu.Unlock()
 	item, ok := a.conn.destinations[name]
 	if !ok {
@@ -134,11 +163,10 @@ func (a *admin) Purge(ctx context.Context, name string) (int64, error) {
 	return n, nil
 }
 
-func (a *admin) Prune(ctx context.Context, names []string) ([]driver.PruneResult, error) {
-	if err := ctx.Err(); err != nil {
-		return nil, classify("prune", driver.KindTransient, err)
+func (a *adminOperations) Prune(ctx context.Context, names []string) ([]driver.PruneResult, error) {
+	if err := a.begin(ctx, "prune"); err != nil {
+		return nil, err
 	}
-	a.conn.mu.Lock()
 	defer a.conn.mu.Unlock()
 	results := make([]driver.PruneResult, 0, len(names))
 	for _, name := range names {
