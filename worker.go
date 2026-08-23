@@ -211,9 +211,13 @@ func (r *Runner) Run(ctx context.Context) error {
 // cleanup from the previous generation captured the context value, not the
 // field, and cancelling it under such a caller is the defect first-wins
 // exists to prevent. The dropped cancel function is safe to lose because the
-// context it belongs to was built over an uncancelable base with its own
-// deadline, so its timer fires and releases on its own within DrainTimeout,
-// and the context object becomes unreachable once no caller references it.
+// context was built over an uncancelable base: with a nil Done channel there
+// is nothing for cancellation to propagate through, no goroutine watching
+// the parent, and the context becomes unreachable once no caller references
+// it. When DrainTimeout is positive the context also carries its own
+// deadline, so its timer fires within one budget period and releases
+// whatever the deadline still holds; that timer is an additional guarantee,
+// not the protection, and it does not exist when the budget is zero.
 func beginRunnerGeneration(r *Runner, runCtx context.Context, cancel context.CancelFunc) *errgroup.Group {
 	r.mu.Lock()
 	r.runCtx = runCtx
