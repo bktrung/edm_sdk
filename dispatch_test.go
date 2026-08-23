@@ -311,6 +311,7 @@ type dispatchConn struct {
 	consumer     *dispatchConsumer
 	admin        driver.Admin
 	closed       bool
+	closeCalls   int
 	closeStarted chan struct{}
 	closeRelease chan struct{}
 }
@@ -332,6 +333,7 @@ func (*dispatchConn) Ping(context.Context) error { return nil }
 func (c *dispatchConn) Close(context.Context) error {
 	c.mu.Lock()
 	c.closed = true
+	c.closeCalls++
 	started := c.closeStarted
 	release := c.closeRelease
 	c.mu.Unlock()
@@ -342,6 +344,12 @@ func (c *dispatchConn) Close(context.Context) error {
 		<-release
 	}
 	return nil
+}
+
+func (c *dispatchConn) closeCount() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.closeCalls
 }
 
 // dispatchAdmin is a no-op driver.Admin: EnsureTopology succeeds trivially,
@@ -365,9 +373,10 @@ func (*dispatchAdmin) Prune(context.Context, []string) ([]driver.PruneResult, er
 }
 
 type dispatchProducer struct {
-	mu       sync.Mutex
-	messages []driver.OutboundMessage
-	closed   bool
+	mu         sync.Mutex
+	messages   []driver.OutboundMessage
+	closed     bool
+	closeCalls int
 }
 
 func (p *dispatchProducer) Publish(_ context.Context, messages ...driver.OutboundMessage) error {
@@ -379,8 +388,20 @@ func (p *dispatchProducer) Publish(_ context.Context, messages ...driver.Outboun
 	}
 	return nil
 }
-func (*dispatchProducer) Flush(context.Context) error   { return nil }
-func (p *dispatchProducer) Close(context.Context) error { p.closed = true; return nil }
+func (*dispatchProducer) Flush(context.Context) error { return nil }
+func (p *dispatchProducer) Close(context.Context) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.closed = true
+	p.closeCalls++
+	return nil
+}
+
+func (p *dispatchProducer) closeCount() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.closeCalls
+}
 
 type dispatchSettler struct {
 	mu       sync.Mutex

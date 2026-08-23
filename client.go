@@ -418,25 +418,34 @@ func (c *Client) failClose(err error) error {
 	return err
 }
 
+// drainRunners waits for every subscription runner to finish draining. It is
+// the one Close phase whose budget is optional: ConsumerDrainTimeout bounds
+// the wait the same way runWithClockTimeout bounds its sibling phases, and a
+// zero value keeps the historical shape in which only the caller's context
+// can end it. The bound exists because a driver-side wedge between cancel
+// and finishRunner would otherwise hold Close open no matter what the rest
+// of the shutdown discipline promised.
 func (c *Client) drainRunners(ctx context.Context, runners []*Runner) error {
-	runnerErrors := make(chan error, len(runners))
-	var drain sync.WaitGroup
-	drain.Add(len(runners))
-	for _, runner := range runners {
-		go func(runner *Runner) {
-			defer drain.Done()
-			if err := runner.Drain(ctx); err != nil {
-				runnerErrors <- err
-			}
-		}(runner)
-	}
-	drain.Wait()
-	close(runnerErrors)
-	var drainErrors []error
-	for err := range runnerErrors {
-		drainErrors = append(drainErrors, err)
-	}
-	return errors.Join(drainErrors...)
+	return runWithClockTimeout(ctx, c.options.clock, c.config.Lifecycle.ConsumerDrainTimeout, "consumer drain", func(drainCtx context.Context) error {
+		runnerErrors := make(chan error, len(runners))
+		var drain sync.WaitGroup
+		drain.Add(len(runners))
+		for _, runner := range runners {
+			go func(runner *Runner) {
+				defer drain.Done()
+				if err := runner.Drain(drainCtx); err != nil {
+					runnerErrors <- err
+				}
+			}(runner)
+		}
+		drain.Wait()
+		close(runnerErrors)
+		var drainErrors []error
+		for err := range runnerErrors {
+			drainErrors = append(drainErrors, err)
+		}
+		return errors.Join(drainErrors...)
+	})
 }
 
 // publishQuiescence waits until the client has no publish in flight. A

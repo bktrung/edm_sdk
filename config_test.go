@@ -95,6 +95,29 @@ f1:
 	}
 }
 
+// TestLoadConfigLeavesConsumerDrainTimeoutDisabled pins the compatibility
+// posture of ConsumerDrainTimeout: the default fill must not set it, because
+// a nonzero default would silently start bounding the runner-drain wait of
+// Close for every caller who never asked for a bound. Zero is the documented
+// disabled value and the only behavior callers saw before the field existed.
+func TestLoadConfigLeavesConsumerDrainTimeoutDisabled(t *testing.T) {
+	t.Parallel()
+	path := writeConfig(t, `
+f1:
+  env: test
+  service: orders
+  broker:
+    driver: kafka
+`)
+	cfg, err := LoadConfig(path)
+	if err != nil {
+		t.Fatalf("LoadConfig() error = %v", err)
+	}
+	if got := cfg.Lifecycle.ConsumerDrainTimeout; got != 0 {
+		t.Fatalf("default consumerDrainTimeout = %s, want zero (disabled): a default here would bound Close for callers who never set it", got)
+	}
+}
+
 func TestLoadConfigEnvironmentOverridesYAML(t *testing.T) {
 	path := writeConfig(t, `
 f1:
@@ -390,6 +413,7 @@ func TestValidateConfigRejectsNegativeLifecycleDurations(t *testing.T) {
 		{name: "pre stop delay", set: func(cfg *LifecycleConfig) { cfg.PreStopDelay = -time.Second }},
 		{name: "drain timeout", set: func(cfg *LifecycleConfig) { cfg.DrainTimeout = -time.Second }},
 		{name: "handler grace", set: func(cfg *LifecycleConfig) { cfg.HandlerGrace = -time.Second }},
+		{name: "consumer drain timeout", set: func(cfg *LifecycleConfig) { cfg.ConsumerDrainTimeout = -time.Second }},
 		{name: "flush timeout", set: func(cfg *LifecycleConfig) { cfg.FlushTimeout = -time.Second }},
 		{name: "close timeout", set: func(cfg *LifecycleConfig) { cfg.CloseTimeout = -time.Second }},
 		{name: "rebalance drain timeout", set: func(cfg *LifecycleConfig) { cfg.RebalanceDrainTimeout = -time.Second }},

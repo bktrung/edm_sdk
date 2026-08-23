@@ -47,9 +47,15 @@ type CodecConfig struct {
 // DrainTimeout is the exception: it must be positive, since a disabled drain
 // deadline means shutdown never completes.
 type LifecycleConfig struct {
-	PreStopDelay          time.Duration `yaml:"preStopDelay"`
-	DrainTimeout          time.Duration `yaml:"drainTimeout"`
-	HandlerGrace          time.Duration `yaml:"handlerGrace"`
+	PreStopDelay time.Duration `yaml:"preStopDelay"`
+	DrainTimeout time.Duration `yaml:"drainTimeout"`
+	HandlerGrace time.Duration `yaml:"handlerGrace"`
+	// ConsumerDrainTimeout bounds how long Close waits for subscription
+	// runners to finish draining. It is its own budget, not another spend of
+	// DrainTimeout: zero disables the bound and leaves the caller's context
+	// as the only limit, which is the behavior every caller saw before this
+	// field existed.
+	ConsumerDrainTimeout  time.Duration `yaml:"consumerDrainTimeout"`
 	FlushTimeout          time.Duration `yaml:"flushTimeout"`
 	CloseTimeout          time.Duration `yaml:"closeTimeout"`
 	RebalanceDrainTimeout time.Duration `yaml:"rebalanceDrainTimeout"`
@@ -427,6 +433,7 @@ func validateLifecycleConfig(lifecycle LifecycleConfig) error {
 	}{
 		{name: "preStopDelay", value: lifecycle.PreStopDelay},
 		{name: "handlerGrace", value: lifecycle.HandlerGrace},
+		{name: "consumerDrainTimeout", value: lifecycle.ConsumerDrainTimeout},
 		{name: "flushTimeout", value: lifecycle.FlushTimeout},
 		{name: "closeTimeout", value: lifecycle.CloseTimeout},
 		{name: "rebalanceDrainTimeout", value: lifecycle.RebalanceDrainTimeout},
