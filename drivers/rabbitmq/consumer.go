@@ -32,6 +32,8 @@ type consumer struct {
 	messages chan driver.InboundMessage
 	errors   chan error
 	stoppedC chan struct{}
+	// Drain releases local forwarders; stoppedC remains the completed-teardown signal.
+	forwarderStopC chan struct{}
 
 	mu          sync.Mutex
 	draining    bool
@@ -39,9 +41,10 @@ type consumer struct {
 	outstanding int
 	settlers    map[*settler]struct{}
 
-	readers sync.WaitGroup
-	forward sync.WaitGroup
-	events  sync.WaitGroup
+	readers           sync.WaitGroup
+	forward           sync.WaitGroup
+	events            sync.WaitGroup
+	forwarderStopOnce sync.Once
 }
 
 type lane struct {
@@ -63,13 +66,14 @@ var _ driver.Consumer = (*consumer)(nil)
 
 func newConsumer(conn *conn, cfg driver.ConsumerConfig) (*consumer, error) {
 	c := &consumer{
-		conn:     conn,
-		cfg:      cfg,
-		byName:   make(map[string]*lane, len(cfg.Destinations)),
-		messages: make(chan driver.InboundMessage, totalPrefetch(cfg)),
-		errors:   make(chan error, 8),
-		stoppedC: make(chan struct{}),
-		settlers: make(map[*settler]struct{}),
+		conn:           conn,
+		cfg:            cfg,
+		byName:         make(map[string]*lane, len(cfg.Destinations)),
+		messages:       make(chan driver.InboundMessage, totalPrefetch(cfg)),
+		errors:         make(chan error, 8),
+		stoppedC:       make(chan struct{}),
+		forwarderStopC: make(chan struct{}),
+		settlers:       make(map[*settler]struct{}),
 	}
 	for index, destination := range cfg.Destinations {
 		if _, exists := c.byName[destination]; exists {
@@ -205,7 +209,15 @@ func (c *consumer) emitMessages(lane *lane) {
 			}
 			select {
 			case <-resume:
+			case <-c.forwarderStopC:
+				lane.mu.Lock()
+				lane.emitting--
+				lane.mu.Unlock()
+				return
 			case <-c.stoppedC:
+				lane.mu.Lock()
+				lane.emitting--
+				lane.mu.Unlock()
 				return
 			}
 		}
@@ -227,7 +239,11 @@ func (c *consumer) emitMessages(lane *lane) {
 		message := inboundMessage(lane.destination, delivery, settler, c.nativeDeliveryCount())
 		select {
 		case c.messages <- message:
+		case <-c.forwarderStopC:
+			c.release(settler)
+			return
 		case <-c.stoppedC:
+			c.release(settler)
 			return
 		}
 	}
@@ -437,6 +453,7 @@ func (c *consumer) Drain(ctx context.Context) error {
 		return nil
 	}
 	c.draining = true
+	c.stopForwarders()
 	lanes := append([]*lane(nil), c.lanes...)
 	c.mu.Unlock()
 
@@ -446,6 +463,10 @@ func (c *consumer) Drain(ctx context.Context) error {
 		}
 	}
 	return nil
+}
+
+func (c *consumer) stopForwarders() {
+	c.forwarderStopOnce.Do(func() { close(c.forwarderStopC) })
 }
 
 func (c *consumer) waitReaders(ctx context.Context, op string) error {
@@ -540,13 +561,14 @@ func (c *consumer) Release(ctx context.Context) error {
 		return classify("release", driver.KindTransient, err)
 	}
 	c.stopped = true
+	c.stopForwarders()
 	close(c.stoppedC)
 	c.mu.Unlock()
 
 	// Closing the AMQP channels requeues their unacked deliveries. Do this
 	// before waiting for local goroutines so a blocked forwarder can observe
-	// stoppedC rather than waiting for the application to consume an abandoned
-	// message.
+	// forwarderStopC and stoppedC rather than waiting for the application to
+	// consume an abandoned message.
 	c.closeLanes()
 	c.readers.Wait()
 	c.forward.Wait()
