@@ -141,7 +141,9 @@ func TestGenerationStartReplacesExpiredSettlementContext(t *testing.T) {
 		t.Fatalf("fetchRunnerAfterCancel() = %v", err)
 	}
 
+	runner.mu.Lock()
 	handedOut := runner.settleCtx
+	runner.mu.Unlock()
 	if handedOut == nil {
 		t.Fatal("drain setup installed no settlement context")
 	}
@@ -158,7 +160,10 @@ func TestGenerationStartReplacesExpiredSettlementContext(t *testing.T) {
 // never calls the old cancel. A cleanup goroutine from the previous
 // generation captured the context value, not the field, and may still be
 // about to reach the driver on it; cancelling it there would reintroduce the
-// exact defect first-wins exists to prevent, one level up.
+// exact defect first-wins exists to prevent, one level up. The reset must
+// retire both fields together: a stale cancel left behind would be invoked
+// by finishRunner at teardown, cancelling a straggler's context there
+// instead.
 func TestGenerationStartDoesNotCancelCapturedSettlementContext(t *testing.T) {
 	_, runner, _ := newSettlementOrderingRunner(t)
 
@@ -172,6 +177,12 @@ func TestGenerationStartDoesNotCancelCapturedSettlementContext(t *testing.T) {
 
 	if err := installed.Err(); err != nil {
 		t.Fatalf("captured settlement context from the previous generation ended with %v when the next generation started; starting a generation must drop the old context, not cancel it", err)
+	}
+
+	finishRunner(runner)
+
+	if err := installed.Err(); err != nil {
+		t.Fatalf("captured settlement context ended with %v at teardown; a generation start that retires the context must retire its cancel with it", err)
 	}
 }
 
