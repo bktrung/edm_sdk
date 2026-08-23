@@ -70,6 +70,61 @@ func TestClientCloseDefersConnCloseUntilProducerCloseReturns(t *testing.T) {
 	}
 }
 
+// failingCloseConn is a publishConn whose Close returns a fixed error, for
+// pinning the shape of the error a producer-present Close reports.
+type failingCloseConn struct {
+	publishConn
+	closeErr error
+}
+
+func (c *failingCloseConn) Close(context.Context) error { return c.closeErr }
+
+type failingCloseDriver struct {
+	conn driver.Conn
+}
+
+func (*failingCloseDriver) Name() string                      { return "test" }
+func (*failingCloseDriver) Capabilities() driver.Capabilities { return driver.Capabilities{} }
+
+func (d *failingCloseDriver) Open(context.Context, driver.Config) (driver.Conn, error) {
+	return d.conn, nil
+}
+
+// TestClientCloseReturnsBareConnCloseErrorWhenProducerCloseSucceeds pins the
+// error value Close returns when a producer is attached, the producer's
+// Close succeeds, and the connection's Close fails: the caller must receive
+// the connection's own error value, not a wrapper around it. The message and
+// errors.Is behaviour are identical either way; the concrete type and ==
+// identity are not, so this test asserts identity precisely enough that
+// reintroducing a join of a nil producer error reddens it.
+func TestClientCloseReturnsBareConnCloseErrorWhenProducerCloseSucceeds(t *testing.T) {
+	producer := &recordingProducer{}
+	connErr := errors.New("conn close failed")
+	conn := &failingCloseConn{
+		publishConn: publishConn{producer: producer, info: driver.BrokerInfo{Kind: "test", Version: "1"}},
+		closeErr:    connErr,
+	}
+	client, err := New(context.Background(), testClientConfig(t), WithDriver(&failingCloseDriver{conn: conn}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.Publisher().Publish(context.Background(), "orders.created", "payload"); err != nil {
+		t.Fatalf("Publish() = %v, want nil", err)
+	}
+
+	err = client.Close(context.Background())
+	if !errors.Is(err, connErr) {
+		t.Fatalf("Close() error = %v, want the connection close error", err)
+	}
+	if err != connErr {
+		t.Fatalf("Close() error = %T(%v), want the bare connection error %T(%v): a nil producer close error must not be joined", err, err, connErr, connErr)
+	}
+	var joined interface{ Unwrap() []error }
+	if errors.As(err, &joined) {
+		t.Fatalf("Close() error = %T, want a bare error, not a multi-error join of a nil producer error", err)
+	}
+}
+
 func TestPublishRejectedAfterProducerCloseTimeout(t *testing.T) {
 	client, producer, _, release, firstErr := beginTimedOutProducerClose(t)
 	if !errors.Is(firstErr, context.DeadlineExceeded) || !strings.Contains(firstErr.Error(), "close phase") {
