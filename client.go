@@ -51,7 +51,13 @@ type Client struct {
 	shutdownStarted bool
 	activePublishes int
 	publishIdle     chan struct{}
-	runners         map[*Runner]struct{}
+	// producerTeardown is guarded by mu, set once when the publish-idle wait
+	// observes zero in-flight publishes, and never cleared. Setting it in the
+	// same critical section as that observation closes admission for
+	// core-generated successor publishes, so flush and producer close can
+	// never run against a publish admitted after the wait gave its answer.
+	producerTeardown bool
+	runners          map[*Runner]struct{}
 
 	// reconnecting reports connection usability, independently of shutdownStarted.
 	reconnecting bool
@@ -367,7 +373,7 @@ func (c *Client) Close(ctx context.Context) error {
 	if c == nil {
 		return nil
 	}
-	idle, runners, alreadyClosed, err := c.beginClose()
+	runners, alreadyClosed, err := c.beginClose()
 	if err != nil {
 		return err
 	}
@@ -377,24 +383,23 @@ func (c *Client) Close(ctx context.Context) error {
 	if err := c.drainRunners(ctx, runners); err != nil {
 		return c.failClose(err)
 	}
-	if err := c.waitForPublishes(ctx, idle); err != nil {
+	if err := c.waitForPublishes(ctx); err != nil {
 		return c.failClose(err)
 	}
 	return c.closeResources(ctx)
 }
 
-func (c *Client) beginClose() (chan struct{}, []*Runner, bool, error) {
+func (c *Client) beginClose() ([]*Runner, bool, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.closed {
-		return nil, nil, true, nil
+		return nil, true, nil
 	}
 	if c.closing {
-		return nil, nil, false, fmt.Errorf("f1: client is closing")
+		return nil, false, fmt.Errorf("f1: client is closing")
 	}
 	c.closing = true
 	c.shutdownStarted = true
-	idle := c.publishIdle
 	runners := make([]*Runner, 0, len(c.runners))
 	supervisorCancel := c.supervisorCancel
 	for runner := range c.runners {
@@ -403,7 +408,7 @@ func (c *Client) beginClose() (chan struct{}, []*Runner, bool, error) {
 	if supervisorCancel != nil {
 		supervisorCancel()
 	}
-	return idle, runners, false, nil
+	return runners, false, nil
 }
 
 func (c *Client) failClose(err error) error {
@@ -434,18 +439,40 @@ func (c *Client) drainRunners(ctx context.Context, runners []*Runner) error {
 	return errors.Join(drainErrors...)
 }
 
-func (c *Client) waitForPublishes(ctx context.Context, idle <-chan struct{}) error {
-	if idle == nil {
-		return nil
-	}
-	idleTimeout := c.config.Lifecycle.DrainTimeout
-	return runWithClockTimeout(ctx, c.options.clock, idleTimeout, "drain", func(waitCtx context.Context) error {
+// publishQuiescence waits until the client has no publish in flight. A
+// single observation of the idle channel goes stale twice over: it reads nil
+// when nothing is publishing yet, and a generation it holds is closed while
+// a successor publish immediately starts the next one. The wait therefore
+// re-reads the live publish state under c.mu after every generation closes,
+// so each answer names the state at that moment. onQuiescent, when set, runs
+// under c.mu at the instant zero is observed, letting the caller bar further
+// admissions atomically with the observation.
+func (c *Client) publishQuiescence(waitCtx context.Context, onQuiescent func()) error {
+	for {
+		c.mu.Lock()
+		if c.activePublishes == 0 {
+			if onQuiescent != nil {
+				onQuiescent()
+			}
+			c.mu.Unlock()
+			return nil
+		}
+		idle := c.publishIdle
+		c.mu.Unlock()
 		select {
 		case <-idle:
-			return nil
 		case <-waitCtx.Done():
 			return waitCtx.Err()
 		}
+	}
+}
+
+func (c *Client) waitForPublishes(ctx context.Context) error {
+	idleTimeout := c.config.Lifecycle.DrainTimeout
+	return runWithClockTimeout(ctx, c.options.clock, idleTimeout, "drain", func(waitCtx context.Context) error {
+		return c.publishQuiescence(waitCtx, func() {
+			c.producerTeardown = true
+		})
 	})
 }
 
@@ -584,7 +611,7 @@ func publishMessages(c *Client, ctx context.Context, allowClosing bool, messages
 		return nil
 	}
 	c.mu.Lock()
-	if c.closed || c.conn == nil || (!allowClosing && c.shutdownStarted) {
+	if c.closed || c.conn == nil || (!allowClosing && c.shutdownStarted) || (allowClosing && c.producerTeardown) {
 		c.mu.Unlock()
 		return errors.New("f1: client is closed")
 	}
