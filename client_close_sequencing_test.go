@@ -24,7 +24,7 @@ func TestClientCloseDefersConnCloseUntilProducerCloseReturns(t *testing.T) {
 		closeStarted: make(chan struct{}),
 		closeRelease: make(chan struct{}),
 	}
-	conn := &publishConn{producer: producer, info: driver.BrokerInfo{Kind: "test", Version: "1"}}
+	conn := &publishConn{producer: producer, info: driver.BrokerInfo{Kind: "test", Version: "1"}, closeStarted: make(chan struct{})}
 	client, err := New(context.Background(), testClientConfig(t), WithDriver(&publishDriver{conn: conn}), WithClock(fake))
 	if err != nil {
 		t.Fatal(err)
@@ -43,11 +43,12 @@ func TestClientCloseDefersConnCloseUntilProducerCloseReturns(t *testing.T) {
 		t.Fatalf("first Close() error = %v, want close phase deadline", firstErr)
 	}
 
-	conn.mu.Lock()
-	closeCalls := conn.closeCalls
-	conn.mu.Unlock()
-	if closeCalls != 0 {
-		t.Fatalf("conn.Close was called %d time(s) while producer.Close had not returned, want 0", closeCalls)
+	waitTimer := clock.NewReal().Timer(100 * time.Millisecond)
+	defer waitTimer.Stop()
+	select {
+	case <-conn.closeStarted:
+		t.Fatal("Conn.Close started while Producer.Close had not returned")
+	case <-waitTimer.C:
 	}
 
 	close(producer.closeRelease)
@@ -56,7 +57,7 @@ func TestClientCloseDefersConnCloseUntilProducerCloseReturns(t *testing.T) {
 		t.Fatalf("retried Close() error = %v", err)
 	}
 	conn.mu.Lock()
-	closeCalls = conn.closeCalls
+	closeCalls := conn.closeCalls
 	conn.mu.Unlock()
 	if closeCalls != 1 {
 		t.Fatalf("conn.Close call count = %d, want 1 once producer.Close had genuinely returned", closeCalls)

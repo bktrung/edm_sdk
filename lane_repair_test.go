@@ -14,16 +14,20 @@ import (
 )
 
 type laneRepairDriver struct {
-	mu            sync.Mutex
-	opens         int
-	connections   []*laneRepairConn
-	created       chan *laneRepairConsumer
-	failNext      bool
-	blockNext     bool
-	blockStarted  chan struct{}
-	blockRelease  chan struct{}
-	publishedConn *laneRepairConn
-	pending       map[string][]*laneRepairConsumer
+	mu                                               sync.Mutex
+	opens                                            int
+	connections                                      []*laneRepairConn
+	created                                          chan *laneRepairConsumer
+	failNext                                         bool
+	blockNext                                        bool
+	blockStarted                                     chan struct{}
+	blockRelease                                     chan struct{}
+	publishedConn                                    *laneRepairConn
+	pending                                          map[string][]*laneRepairConsumer
+	publishCalls                                     int
+	firstPublishStarted, firstPublishRelease         chan struct{}
+	successorPublishStarted, successorPublishRelease chan struct{}
+	drainStarted, drainRelease                       chan struct{}
 }
 
 func (d *laneRepairDriver) Name() string { return "lane-repair-test" }
@@ -104,10 +108,12 @@ func (c *laneRepairConn) Consumer(_ context.Context, cfg driver.ConsumerConfig) 
 		c.driver.mu.Unlock()
 	}
 	consumer := &laneRepairConsumer{
-		group:    cfg.Group,
-		conn:     c,
-		messages: make(chan driver.InboundMessage, 8),
-		errors:   make(chan error, 8),
+		group:        cfg.Group,
+		conn:         c,
+		messages:     make(chan driver.InboundMessage, 8),
+		errors:       make(chan error, 8),
+		drainStarted: c.driver.drainStarted,
+		drainRelease: c.driver.drainRelease,
 	}
 	c.driver.created <- consumer
 	return consumer, nil
@@ -123,6 +129,23 @@ type laneRepairProducer struct {
 
 func (p *laneRepairProducer) Publish(context.Context, ...driver.OutboundMessage) error {
 	p.conn.driver.setPublishedConn(p.conn)
+	d := p.conn.driver
+	d.mu.Lock()
+	d.publishCalls++
+	call := d.publishCalls
+	firstStarted := d.firstPublishStarted
+	firstRelease := d.firstPublishRelease
+	successorStarted := d.successorPublishStarted
+	successorRelease := d.successorPublishRelease
+	d.mu.Unlock()
+	if call == 1 && firstStarted != nil {
+		close(firstStarted)
+		<-firstRelease
+	}
+	if call == 2 && successorStarted != nil {
+		close(successorStarted)
+		<-successorRelease
+	}
 	return nil
 }
 
@@ -134,19 +157,33 @@ func (p *laneRepairProducer) Close(context.Context) error {
 }
 
 type laneRepairConsumer struct {
-	group    string
-	conn     *laneRepairConn
-	messages chan driver.InboundMessage
-	errors   chan error
-	released atomic.Bool
-	once     sync.Once
+	group        string
+	conn         *laneRepairConn
+	messages     chan driver.InboundMessage
+	errors       chan error
+	drainStarted chan struct{}
+	drainRelease chan struct{}
+	released     atomic.Bool
+	once         sync.Once
 }
 
 func (c *laneRepairConsumer) Messages() <-chan driver.InboundMessage { return c.messages }
 func (c *laneRepairConsumer) Errors() <-chan error                   { return c.errors }
 func (*laneRepairConsumer) Pause(...string) error                    { return nil }
 func (*laneRepairConsumer) Resume(...string) error                   { return nil }
-func (*laneRepairConsumer) Drain(context.Context) error              { return nil }
+func (c *laneRepairConsumer) Drain(ctx context.Context) error {
+	if c.drainStarted == nil {
+		return nil
+	}
+	close(c.drainStarted)
+	select {
+	case <-c.drainRelease:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
 func (c *laneRepairConsumer) Stop(context.Context) error {
 	c.close()
 	return nil
@@ -293,6 +330,124 @@ func waitAtomicCount(t *testing.T, count *atomic.Int32, want int32) {
 
 func transientLaneError(d *laneRepairDriver) error {
 	return &driver.Error{Driver: d.Name(), Op: "consumer", K: driver.KindTransient, Err: errors.New("lane closed")}
+}
+
+func TestCloseDrainsRunnerBeforeWaitingForPublishIdle(t *testing.T) {
+	d := &laneRepairDriver{
+		created:                 make(chan *laneRepairConsumer, 8),
+		firstPublishStarted:     make(chan struct{}),
+		firstPublishRelease:     make(chan struct{}),
+		successorPublishStarted: make(chan struct{}),
+		successorPublishRelease: make(chan struct{}),
+		drainStarted:            make(chan struct{}),
+		drainRelease:            make(chan struct{}),
+	}
+	client := newLaneRepairClient(t, d)
+	client.config.Lifecycle.DrainTimeout = 2 * time.Second
+
+	subscription := laneRepairSubscription("orders", new(atomic.Int32))
+	subscription.Retry = RetryConfig{
+		MaxAttempts:     3,
+		InitialInterval: time.Second,
+		Tiers:           []time.Duration{time.Second},
+	}
+	subscription.Handlers["orders.created"] = HandlerFunc(func(context.Context, *Event) error {
+		return RetryAfter(errors.New("retry during drain"), 0)
+	})
+	runner, err := client.Subscribe(context.Background(), subscription)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runCtx, cancel := context.WithCancel(context.Background())
+	runDone := make(chan error, 1)
+	go func() { runDone <- runner.Run(runCtx) }()
+	var runFinished atomic.Bool
+
+	var releaseFirst, releaseSuccessor, releaseDrain sync.Once
+	release := func() {
+		releaseDrain.Do(func() { close(d.drainRelease) })
+		releaseSuccessor.Do(func() { close(d.successorPublishRelease) })
+		releaseFirst.Do(func() { close(d.firstPublishRelease) })
+	}
+	t.Cleanup(func() {
+		release()
+		cancel()
+		timer := clock.NewReal().Timer(2 * time.Second)
+		defer timer.Stop()
+		if runFinished.Load() {
+			return
+		}
+		select {
+		case <-runDone:
+			runFinished.Store(true)
+		case <-timer.C:
+			t.Errorf("runner did not stop during cleanup")
+		}
+	})
+	consumer := waitLaneConsumer(t, d, "orders")
+	waitReconnectCondition(t, runner.lifecycle.Ready)
+
+	publishDone := make(chan error, 1)
+	go func() {
+		_, publishErr := client.Publisher().Publish(context.Background(), "orders.created", "in-flight")
+		publishDone <- publishErr
+	}()
+	waitTimer := clock.NewReal().Timer(2 * time.Second)
+	select {
+	case <-d.firstPublishStarted:
+	case <-waitTimer.C:
+		waitTimer.Stop()
+		t.Fatal("initial publish did not start")
+	}
+	waitTimer.Stop()
+
+	client.mu.Lock()
+	idle := client.publishIdle
+	client.mu.Unlock()
+	if idle == nil {
+		t.Fatal("publish idle channel was not created for the in-flight publish")
+	}
+
+	closeDone := make(chan error, 1)
+	go func() { closeDone <- client.Close(context.Background()) }()
+	waitTimer = clock.NewReal().Timer(2 * time.Second)
+	select {
+	case <-d.drainStarted:
+	case <-waitTimer.C:
+		waitTimer.Stop()
+		t.Fatal("Close did not drain the runner before waiting for publish idle")
+	}
+	waitTimer.Stop()
+
+	consumer.send(laneRepairMessage(t, "drain-retry", "orders.created"))
+	releaseDrain.Do(func() { close(d.drainRelease) })
+	waitTimer = clock.NewReal().Timer(2 * time.Second)
+	select {
+	case <-d.successorPublishStarted:
+	case <-waitTimer.C:
+		waitTimer.Stop()
+		t.Fatal("runner did not publish its successor during drain")
+	}
+	waitTimer.Stop()
+	select {
+	case <-idle:
+		t.Fatal("publish idle closed before the runner successor publish was accounted for")
+	default:
+	}
+
+	releaseSuccessor.Do(func() { close(d.successorPublishRelease) })
+	releaseFirst.Do(func() { close(d.firstPublishRelease) })
+	if err := <-publishDone; err != nil {
+		t.Fatalf("in-flight Publish() = %v", err)
+	}
+	if err := <-closeDone; err != nil {
+		t.Fatalf("Close() = %v", err)
+	}
+	cancel()
+	if err := <-runDone; err != nil {
+		t.Fatalf("runner.Run() = %v", err)
+	}
+	runFinished.Store(true)
 }
 
 func TestRunnerRepairsConsumerWithoutReplacingConnection(t *testing.T) {
