@@ -446,15 +446,90 @@ func TestValidateConfigRejectsZeroDrainTimeout(t *testing.T) {
 	}
 }
 
-func TestValidateRetryRejectsUnboundedGrowingLadder(t *testing.T) {
-	cfg := validValidationConfig()
-	cfg.Subscriptions["orders"] = withRetry(cfg.Subscriptions["orders"], RetryConfig{
-		MaxAttempts:     20,
-		InitialInterval: time.Second,
-		Multiplier:      5,
-	})
-	if err := validateConfig(cfg); err == nil || !strings.Contains(err.Error(), "maxInterval") {
-		t.Fatalf("validateConfig() error = %v, want maxInterval validation", err)
+func TestValidateRetryMatchesDelayForSafety(t *testing.T) {
+	cases := []struct {
+		name     string
+		retry    RetryConfig
+		attempt  int
+		wantZero bool
+		wantErr  bool
+	}{
+		{
+			name:     "explicit growing multiplier",
+			retry:    RetryConfig{MaxAttempts: 20, InitialInterval: time.Second, Multiplier: 5},
+			attempt:  16,
+			wantZero: true,
+			wantErr:  true,
+		},
+		{
+			name:     "default multiplier",
+			retry:    RetryConfig{MaxAttempts: 20, InitialInterval: time.Second},
+			attempt:  16,
+			wantZero: true,
+			wantErr:  true,
+		},
+		{
+			name:     "default initial interval",
+			retry:    RetryConfig{MaxAttempts: 20, Multiplier: 5},
+			attempt:  16,
+			wantZero: true,
+			wantErr:  true,
+		},
+		{
+			name:     "large initial interval",
+			retry:    RetryConfig{MaxAttempts: 20, InitialInterval: 1 << 62, Multiplier: 2},
+			attempt:  2,
+			wantZero: true,
+			wantErr:  true,
+		},
+		{
+			name:     "default retry config",
+			retry:    defaultSubscription().Retry,
+			attempt:  20,
+			wantZero: false,
+			wantErr:  false,
+		},
+		{
+			name:     "implicit defaults before overflow",
+			retry:    RetryConfig{MaxAttempts: 4},
+			attempt:  3,
+			wantZero: false,
+			wantErr:  false,
+		},
+		{
+			name:     "explicit tiers without max interval",
+			retry:    RetryConfig{MaxAttempts: 20, Multiplier: 5, Tiers: []time.Duration{time.Second, 2 * time.Second}},
+			attempt:  16,
+			wantZero: false,
+			wantErr:  false,
+		},
+		{
+			name:     "no retries",
+			retry:    RetryConfig{MaxAttempts: 1, Multiplier: 5},
+			attempt:  1,
+			wantZero: false,
+			wantErr:  false,
+		},
+		{
+			name:     "decaying multiplier",
+			retry:    RetryConfig{MaxAttempts: 20, InitialInterval: time.Second, Multiplier: .5},
+			attempt:  20,
+			wantZero: false,
+			wantErr:  false,
+		},
+	}
+	for _, test := range cases {
+		t.Run(test.name, func(t *testing.T) {
+			if got := test.retry.DelayFor(test.attempt); (got == 0) != test.wantZero {
+				t.Fatalf("DelayFor(%d) = %s, want zero=%v", test.attempt, got, test.wantZero)
+			}
+			cfg := validValidationConfig()
+			cfg.Subscriptions["orders"] = withRetry(cfg.Subscriptions["orders"], test.retry)
+			err := validateConfig(cfg)
+			if (err != nil) != test.wantErr {
+				t.Fatalf("validateConfig() error = %v, want error=%v", err, test.wantErr)
+			}
+		})
 	}
 }
 
