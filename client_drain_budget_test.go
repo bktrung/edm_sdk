@@ -14,7 +14,8 @@ import (
 
 // newBudgetTestClient builds a client on a fake clock with a runner whose
 // Run goroutine has wedged before finishRunner: started is true and done
-// never closes, which is the driver-side wedge shape F1-060 names. The
+// never closes, which is the driver-side wedge shape the consumer drain
+// budget exists to bound. The
 // caller releases the runner through the returned function once the wait no
 // longer needs to stay blocked.
 func newBudgetTestClient(t *testing.T) (*Client, *Runner, *clock.Fake, func()) {
@@ -202,6 +203,9 @@ func TestCloseConsumerDrainBudgetIsThePublicContract(t *testing.T) {
 	}
 	if _, err := client.Publisher().Publish(context.Background(), "orders.created", "payload"); err == nil || !strings.Contains(err.Error(), "client is closed") {
 		t.Fatalf("Publish() after a failed close error = %v, want refusal", err)
+	}
+	if err := client.Health(context.Background()); err == nil || !strings.Contains(err.Error(), "client is closing") {
+		t.Fatalf("Health() after a failed close error = %v, want refusal", err)
 	}
 	if producer.closeCount() != 0 || conn.closeCount() != 0 {
 		t.Fatal("the failed close started tearing down driver resources during the runner drain")
