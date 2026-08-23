@@ -58,12 +58,10 @@ func runFailure(group *groupContext) {
 
 	group.Check("failed Close keeps admission closed and remains retryable", func(t *testing.T) {
 		conn, inject := newPrivateFailureConnection(t, group)
-		closeCtx, cancel := context.WithTimeout(group.ctx, 100*time.Millisecond)
-		assertPrivateCloseFailure(t, group, conn, inject, closeCtx, group.ctx)
-		cancel()
+		assertPrivateCloseFailure(t, group, conn, inject, 100*time.Millisecond, group.ctx)
 
 		conn, inject = newPrivateFailureConnection(t, group)
-		assertPrivateCloseFailure(t, group, conn, inject, group.ctx, group.ctx)
+		assertPrivateCloseFailure(t, group, conn, inject, 0, group.ctx)
 		group.vector.Add(BehaviorEvent{ID: "failure-close-admission", Outcome: "closed-and-retryable", FinalDestination: "failure.close"})
 	})
 
@@ -370,7 +368,7 @@ func runFailure(group *groupContext) {
 	})
 }
 
-func assertPrivateCloseFailure(t *testing.T, group *groupContext, conn driver.Conn, inject FaultInjector, closeCtx, activeCtx context.Context) {
+func assertPrivateCloseFailure(t *testing.T, group *groupContext, conn driver.Conn, inject FaultInjector, closeTimeout time.Duration, activeCtx context.Context) {
 	t.Helper()
 	admin := conn.Admin()
 	if _, err := admin.EnsureTopology(activeCtx, driver.TopologySpec{
@@ -382,6 +380,12 @@ func assertPrivateCloseFailure(t *testing.T, group *groupContext, conn driver.Co
 	}
 	if err := inject(activeCtx, FaultCloseFailure); err != nil {
 		t.Fatalf("inject %s: %v", FaultCloseFailure, err)
+	}
+	closeCtx := activeCtx
+	if closeTimeout > 0 {
+		var cancel context.CancelFunc
+		closeCtx, cancel = context.WithTimeout(activeCtx, closeTimeout)
+		defer cancel()
 	}
 	if err := conn.Close(closeCtx); err == nil {
 		t.Fatal("Close() after injected failure returned nil")
