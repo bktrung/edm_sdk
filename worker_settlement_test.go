@@ -145,3 +145,50 @@ func TestCleanupKeepsUnsettledDeliveryAccountedUntilSettled(t *testing.T) {
 		t.Fatalf("requeued settlement outcome = %d, want 1: the successful retry was a nack", counts.requeued)
 	}
 }
+
+// TestCleanupRemovesDeliveryOnlyWhenSettlementBudgetExhausts pins the other
+// side of the cleanup bound: when every settlement attempt within the
+// bounded budget fails transiently, the delivery is removed and recorded as
+// abandoned rather than retried forever, because a drain must terminate. The
+// registry entry stays for the whole retry budget and goes only when the
+// budget does.
+func TestCleanupRemovesDeliveryOnlyWhenSettlementBudgetExhausts(t *testing.T) {
+	_, runner, _ := newSettlementOrderingRunner(t)
+
+	settler := &scriptedNackSettler{failFirst: 99}
+	envelope := Envelope{
+		SpecVersion: "1.0",
+		ID:          "budget-exhausted",
+		Source:      "/test/orders",
+		Type:        "orders.created.v1",
+		Priority:    PriorityHigh,
+		Attempt:     1,
+	}
+	message := retryBridgeMessage(t, envelope, settler)
+	runner.subscription.Handlers = map[string]Handler{
+		"orders.created.v1": HandlerFunc(func(ctx context.Context, _ *Event) error {
+			<-ctx.Done()
+			return ctx.Err()
+		}),
+	}
+
+	ctx, cancelRun := context.WithCancel(context.Background())
+	cancelRun()
+
+	id := runner.inflight.Add(message)
+	processDelivery(runner, ctx, delivery{id: id, message: message})
+
+	nacks, _, outstanding := settler.state()
+	if nacks != 1+settlementRetryAttempts {
+		t.Fatalf("Nack calls = %d, want %d: the initial attempt plus the bounded retry rounds", nacks, 1+settlementRetryAttempts)
+	}
+	if !outstanding {
+		t.Fatal("settler reported the delivery settled, want retained")
+	}
+	if got := runner.inflight.Len(); got != 0 {
+		t.Fatalf("inflight length = %d, want 0 once the settlement budget is exhausted", got)
+	}
+	if counts := runner.inflight.Counts(); counts.abandoned != 1 {
+		t.Fatalf("abandoned settlement outcome = %d, want 1", counts.abandoned)
+	}
+}
