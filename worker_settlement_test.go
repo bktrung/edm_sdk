@@ -5,8 +5,10 @@ import (
 	"errors"
 	"sync"
 	"testing"
+	"time"
 
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/driver"
+	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/clock"
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/lifecycle"
 )
 
@@ -92,6 +94,84 @@ func TestDrainSetupKeepsInstalledSettlementContextLive(t *testing.T) {
 
 	if err := installed.Err(); err != nil {
 		t.Fatalf("settlement context the cleanup captured has error %v after drain setup; the drain must keep an already-installed settlement context live instead of cancelling and replacing it", err)
+	}
+}
+
+// TestGenerationStartReplacesExpiredSettlementContext spans two generations
+// and crosses the settlement budget. Generation 1 is abandoned for a
+// reconnect, which cancels its run context; the first settlement that runs
+// after that installs the runner's settlement context with a full drain
+// budget starting then. The runner lives longer than that budget, so by the
+// time a later generation drains at Close the inherited context is already
+// dead - and first-wins kept it, so every drain settlement failed on an
+// expired context without reaching the driver. Starting a generation must
+// retire the previous generation's settlement context so the next install
+// carries a fresh, live budget.
+func TestGenerationStartReplacesExpiredSettlementContext(t *testing.T) {
+	_, runner, consumer := newSettlementOrderingRunner(t)
+
+	runner.client.config.Lifecycle.DrainTimeout = 30 * time.Millisecond
+
+	fallback, cancelFallback := context.WithCancel(context.Background())
+	cancelFallback()
+
+	generationOne := runnerSettlementContext(runner, fallback)
+	if err := generationOne.Err(); err != nil {
+		t.Fatalf("installed err right after install: %v", err)
+	}
+
+	deadline := clock.NewReal().Timer(5 * time.Second)
+	defer deadline.Stop()
+	for generationOne.Err() == nil {
+		select {
+		case <-deadline.C:
+			t.Fatal("settlement context did not expire within 5s of a 30ms budget")
+		default:
+			_ = clock.NewReal().Sleep(context.Background(), 5*time.Millisecond)
+		}
+	}
+	if !errors.Is(generationOne.Err(), context.DeadlineExceeded) {
+		t.Fatalf("generation one settlement context ended with %v, want context deadline exceeded", generationOne.Err())
+	}
+
+	cancelGenerationTwo := func() {}
+	beginRunnerGeneration(runner, fallback, cancelGenerationTwo)
+
+	if err := fetchRunnerAfterCancel(runner, fallback, consumer.Messages(), make(chan delivery, 1)); err != nil {
+		t.Fatalf("fetchRunnerAfterCancel() = %v", err)
+	}
+
+	handedOut := runner.settleCtx
+	if handedOut == nil {
+		t.Fatal("drain setup installed no settlement context")
+	}
+	if handedOut == generationOne {
+		t.Fatal("drain setup kept the previous generation's expired settlement context")
+	}
+	if err := handedOut.Err(); err != nil {
+		t.Fatalf("STALE: drain settlement context already expired: %v", err)
+	}
+}
+
+// TestGenerationStartDoesNotCancelCapturedSettlementContext pins the way the
+// per-generation reset retires the settlement context: it drops the field,
+// never calls the old cancel. A cleanup goroutine from the previous
+// generation captured the context value, not the field, and may still be
+// about to reach the driver on it; cancelling it there would reintroduce the
+// exact defect first-wins exists to prevent, one level up.
+func TestGenerationStartDoesNotCancelCapturedSettlementContext(t *testing.T) {
+	_, runner, _ := newSettlementOrderingRunner(t)
+
+	fallback, cancelFallback := context.WithCancel(context.Background())
+	cancelFallback()
+
+	installed := runnerSettlementContext(runner, fallback)
+
+	cancelNextGeneration := func() {}
+	beginRunnerGeneration(runner, fallback, cancelNextGeneration)
+
+	if err := installed.Err(); err != nil {
+		t.Fatalf("captured settlement context from the previous generation ended with %v when the next generation started; starting a generation must drop the old context, not cancel it", err)
 	}
 }
 

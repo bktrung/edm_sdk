@@ -77,15 +77,7 @@ func (r *Runner) Run(ctx context.Context) error {
 	var repairCause error
 	for {
 		runCtx, cancel = context.WithCancel(ctx)
-		r.mu.Lock()
-		r.runCtx = runCtx
-		r.cancel = cancel
-		r.reconnectCause = nil
-		r.consumerError = false
-		r.successfulDelivery = false
-		group := new(errgroup.Group)
-		r.group = group
-		r.mu.Unlock()
+		group := beginRunnerGeneration(r, runCtx, cancel)
 
 		consumer, err := openRunnerConsumer(r, runCtx)
 		if err != nil {
@@ -207,6 +199,34 @@ func (r *Runner) Run(ctx context.Context) error {
 		runErr = errors.Join(runErr, shutdownErr)
 	}
 	return runErr
+}
+
+// beginRunnerGeneration resets the per-generation runner state at the top of
+// Run's loop, where the generation's run context is created. The settlement
+// context belongs to this reset: first-wins installation is correct within
+// one drain, but a context installed during a previous generation's
+// abandonment carries a drain budget that started back then, so every later
+// generation would inherit an already-expired budget and fail every drain
+// settlement at once. The field is cleared without calling the old cancel: a
+// cleanup from the previous generation captured the context value, not the
+// field, and cancelling it under such a caller is the defect first-wins
+// exists to prevent. The dropped cancel function is safe to lose because the
+// context it belongs to was built over an uncancelable base with its own
+// deadline, so its timer fires and releases on its own within DrainTimeout,
+// and the context object becomes unreachable once no caller references it.
+func beginRunnerGeneration(r *Runner, runCtx context.Context, cancel context.CancelFunc) *errgroup.Group {
+	r.mu.Lock()
+	r.runCtx = runCtx
+	r.cancel = cancel
+	r.settleCtx = nil
+	r.settleCancel = nil
+	r.reconnectCause = nil
+	r.consumerError = false
+	r.successfulDelivery = false
+	group := new(errgroup.Group)
+	r.group = group
+	r.mu.Unlock()
+	return group
 }
 
 func runDispatchPipeline(r *Runner, ctx context.Context, deliveries <-chan delivery) error {
