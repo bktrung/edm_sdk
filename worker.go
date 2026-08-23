@@ -790,10 +790,14 @@ func fetchRunnerAfterCancel(r *Runner, parent context.Context, messages <-chan d
 	drainCtx, cancel := contextWithOptionalTimeout(drainBase, drainTimeout)
 	defer cancel()
 	r.mu.Lock()
-	if r.settleCancel != nil {
-		r.settleCancel()
+	// First installation wins. A settlement context installed earlier was
+	// built from an uncancelable base with its own drain budget, so it is
+	// already fit for use; cancelling and replacing it would pull the ground
+	// out from under a settlement call that captured the old context and is
+	// about to reach the driver on it.
+	if r.settleCtx == nil {
+		r.settleCtx, r.settleCancel = contextWithOptionalTimeout(drainBase, drainTimeout)
 	}
-	r.settleCtx, r.settleCancel = contextWithOptionalTimeout(drainBase, drainTimeout)
 	r.mu.Unlock()
 	r.mu.Lock()
 	consumer := r.consumer
