@@ -367,14 +367,30 @@ func (c *Client) Close(ctx context.Context) error {
 	if c == nil {
 		return nil
 	}
-	c.mu.Lock()
-	if c.closed {
-		c.mu.Unlock()
+	idle, runners, alreadyClosed, err := c.beginClose()
+	if err != nil {
+		return err
+	}
+	if alreadyClosed {
 		return nil
 	}
+	if err := c.drainRunners(ctx, runners); err != nil {
+		return c.failClose(err)
+	}
+	if err := c.waitForPublishes(ctx, idle); err != nil {
+		return c.failClose(err)
+	}
+	return c.closeResources(ctx)
+}
+
+func (c *Client) beginClose() (chan struct{}, []*Runner, bool, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.closed {
+		return nil, nil, true, nil
+	}
 	if c.closing {
-		c.mu.Unlock()
-		return fmt.Errorf("f1: client is closing")
+		return nil, nil, false, fmt.Errorf("f1: client is closing")
 	}
 	c.closing = true
 	c.shutdownStarted = true
@@ -387,14 +403,17 @@ func (c *Client) Close(ctx context.Context) error {
 	if supervisorCancel != nil {
 		supervisorCancel()
 	}
-	c.mu.Unlock()
+	return idle, runners, false, nil
+}
 
-	fail := func(err error) error {
-		c.mu.Lock()
-		c.closing = false
-		c.mu.Unlock()
-		return err
-	}
+func (c *Client) failClose(err error) error {
+	c.mu.Lock()
+	c.closing = false
+	c.mu.Unlock()
+	return err
+}
+
+func (c *Client) drainRunners(ctx context.Context, runners []*Runner) error {
 	runnerErrors := make(chan error, len(runners))
 	var drain sync.WaitGroup
 	drain.Add(len(runners))
@@ -412,103 +431,109 @@ func (c *Client) Close(ctx context.Context) error {
 	for err := range runnerErrors {
 		drainErrors = append(drainErrors, err)
 	}
-	if err := errors.Join(drainErrors...); err != nil {
-		return fail(err)
-	}
-	if idle != nil {
-		idleTimeout := c.config.Lifecycle.DrainTimeout
-		err := runWithClockTimeout(ctx, c.options.clock, idleTimeout, "drain", func(waitCtx context.Context) error {
-			select {
-			case <-idle:
-				return nil
-			case <-waitCtx.Done():
-				return waitCtx.Err()
-			}
-		})
-		if err != nil {
-			return fail(err)
-		}
-	}
+	return errors.Join(drainErrors...)
+}
 
+func (c *Client) waitForPublishes(ctx context.Context, idle <-chan struct{}) error {
+	if idle == nil {
+		return nil
+	}
+	idleTimeout := c.config.Lifecycle.DrainTimeout
+	return runWithClockTimeout(ctx, c.options.clock, idleTimeout, "drain", func(waitCtx context.Context) error {
+		select {
+		case <-idle:
+			return nil
+		case <-waitCtx.Done():
+			return waitCtx.Err()
+		}
+	})
+}
+
+func (c *Client) closeResources(ctx context.Context) error {
 	c.mu.Lock()
 	producer := c.producerHandle
 	conn := c.conn
-	flushWait := c.flushWait
+	c.mu.Unlock()
+	if producer == nil {
+		return c.closeConnection(ctx, conn, nil)
+	}
+	if err := c.flushProducer(ctx, producer); err != nil {
+		return c.failClose(err)
+	}
+	producerCloseErr, resolved := c.closeProducer(ctx, producer)
+	if !resolved {
+		return c.failClose(producerCloseErr)
+	}
+	return c.closeConnection(ctx, conn, producerCloseErr)
+}
+
+func (c *Client) flushProducer(ctx context.Context, producer driver.Producer) error {
+	c.mu.Lock()
 	producerCloseWait := c.producerCloseWait
+	flushWait := c.flushWait
+	c.mu.Unlock()
+	if producerCloseWait != nil {
+		return nil
+	}
+	if flushWait == nil {
+		//nolint:contextcheck // this shutdown call must outlive the attempt and is rejoined on retry.
+		flushWait = startShutdownPhase(context.Background(), producer.Flush)
+		c.mu.Lock()
+		c.flushWait = flushWait
+		c.mu.Unlock()
+	}
+	flushErr, resolved := c.joinShutdownPhase(ctx, c.config.Lifecycle.FlushTimeout, "flush", flushWait)
+	if !resolved {
+		return flushErr
+	}
+	c.mu.Lock()
+	c.flushWait = nil
+	c.mu.Unlock()
+	if flushErr != nil {
+		return flushErr
+	}
+	return nil
+}
+
+func (c *Client) closeProducer(ctx context.Context, producer driver.Producer) (error, bool) {
+	c.mu.Lock()
+	producerCloseWait := c.producerCloseWait
+	c.mu.Unlock()
+	if producerCloseWait == nil {
+		//nolint:contextcheck // this shutdown call must outlive the attempt and is rejoined on retry.
+		producerCloseWait = startShutdownPhase(context.Background(), producer.Close)
+		c.mu.Lock()
+		c.producerCloseWait = producerCloseWait
+		c.mu.Unlock()
+	}
+	producerCloseErr, resolved := c.joinShutdownPhase(ctx, c.config.Lifecycle.CloseTimeout, "close", producerCloseWait)
+	if !resolved {
+		// producer.Close has not returned. The driver's Close contract
+		// requires every Producer created from a connection to be closed
+		// first, so Conn.Close must not run while producer.Close may
+		// still be in flight against the same connection. Keep the
+		// pending call so a retried Close rejoins it instead of starting
+		// a second one, and report the failure without ever touching
+		// the connection.
+		if c.options.logger != nil {
+			c.options.logger.Warn("f1 producer close did not return in time", "error", producerCloseErr)
+		}
+		return producerCloseErr, false
+	}
+	c.mu.Lock()
+	c.producerCloseWait = nil
+	c.producerHandle = nil
+	c.mu.Unlock()
+	if producerCloseErr != nil && c.options.logger != nil {
+		c.options.logger.Warn("f1 producer close failed", "error", producerCloseErr)
+	}
+	return producerCloseErr, true
+}
+
+func (c *Client) closeConnection(ctx context.Context, conn driver.Conn, producerCloseErr error) error {
+	c.mu.Lock()
 	connCloseWait := c.connCloseWait
 	c.mu.Unlock()
-	if producer != nil {
-		if producerCloseWait == nil {
-			if flushWait == nil {
-				//nolint:contextcheck // this shutdown call must outlive the attempt and is rejoined on retry.
-				flushWait = startShutdownPhase(context.Background(), producer.Flush)
-				c.mu.Lock()
-				c.flushWait = flushWait
-				c.mu.Unlock()
-			}
-			flushErr, resolved := c.joinShutdownPhase(ctx, c.config.Lifecycle.FlushTimeout, "flush", flushWait)
-			if !resolved {
-				return fail(flushErr)
-			}
-			c.mu.Lock()
-			c.flushWait = nil
-			c.mu.Unlock()
-			if flushErr != nil {
-				return fail(flushErr)
-			}
-		}
-
-		if producerCloseWait == nil {
-			//nolint:contextcheck // this shutdown call must outlive the attempt and is rejoined on retry.
-			producerCloseWait = startShutdownPhase(context.Background(), producer.Close)
-			c.mu.Lock()
-			c.producerCloseWait = producerCloseWait
-			c.mu.Unlock()
-		}
-		producerCloseErr, resolved := c.joinShutdownPhase(ctx, c.config.Lifecycle.CloseTimeout, "close", producerCloseWait)
-		if !resolved {
-			// producer.Close has not returned. The driver's Close contract
-			// requires every Producer created from a connection to be closed
-			// first, so Conn.Close must not run while producer.Close may
-			// still be in flight against the same connection. Keep the
-			// pending call so a retried Close rejoins it instead of starting
-			// a second one, and report the failure without ever touching
-			// the connection.
-			if c.options.logger != nil {
-				c.options.logger.Warn("f1 producer close did not return in time", "error", producerCloseErr)
-			}
-			return fail(producerCloseErr)
-		}
-		c.mu.Lock()
-		c.producerCloseWait = nil
-		c.producerHandle = nil
-		c.mu.Unlock()
-		if producerCloseErr != nil && c.options.logger != nil {
-			c.options.logger.Warn("f1 producer close failed", "error", producerCloseErr)
-		}
-		if connCloseWait == nil {
-			//nolint:contextcheck // this shutdown call must outlive the attempt and is rejoined on retry.
-			connCloseWait = startShutdownPhase(context.Background(), conn.Close)
-			c.mu.Lock()
-			c.connCloseWait = connCloseWait
-			c.mu.Unlock()
-		}
-		connErr, resolved := c.joinShutdownPhase(ctx, c.config.Lifecycle.CloseTimeout, "close", connCloseWait)
-		if !resolved {
-			return fail(errors.Join(producerCloseErr, connErr))
-		}
-		c.mu.Lock()
-		c.connCloseWait = nil
-		c.mu.Unlock()
-		if connErr != nil {
-			return fail(errors.Join(producerCloseErr, connErr))
-		}
-		c.mu.Lock()
-		c.closed = true
-		c.closing = false
-		c.mu.Unlock()
-		return producerCloseErr
-	}
 	if connCloseWait == nil {
 		//nolint:contextcheck // this shutdown call must outlive the attempt and is rejoined on retry.
 		connCloseWait = startShutdownPhase(context.Background(), conn.Close)
@@ -517,20 +542,28 @@ func (c *Client) Close(ctx context.Context) error {
 		c.mu.Unlock()
 	}
 	connErr, resolved := c.joinShutdownPhase(ctx, c.config.Lifecycle.CloseTimeout, "close", connCloseWait)
+	closeErr := connErr
+	if producerCloseErr != nil {
+		closeErr = errors.Join(producerCloseErr, connErr)
+	}
 	if !resolved {
-		return fail(connErr)
+		return c.failClose(closeErr)
 	}
 	c.mu.Lock()
 	c.connCloseWait = nil
 	c.mu.Unlock()
 	if connErr != nil {
-		return fail(connErr)
+		return c.failClose(closeErr)
 	}
+	return c.finishClose(producerCloseErr)
+}
+
+func (c *Client) finishClose(producerCloseErr error) error {
 	c.mu.Lock()
 	c.closed = true
 	c.closing = false
 	c.mu.Unlock()
-	return nil
+	return producerCloseErr
 }
 
 // startShutdownPhase starts a shutdown call with the context supplied by
