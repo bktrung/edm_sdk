@@ -483,6 +483,27 @@ func TestValidateRetryMatchesDelayForSafety(t *testing.T) {
 			wantErr:  true,
 		},
 		{
+			name:     "shrinking nanosecond interval",
+			retry:    RetryConfig{MaxAttempts: 20, InitialInterval: 100 * time.Nanosecond, Multiplier: .5},
+			attempt:  19,
+			wantZero: true,
+			wantErr:  true,
+		},
+		{
+			name:     "shrinking microsecond interval",
+			retry:    RetryConfig{MaxAttempts: 20, InitialInterval: time.Microsecond, Multiplier: .1},
+			attempt:  19,
+			wantZero: true,
+			wantErr:  true,
+		},
+		{
+			name:     "shrinking interval with positive cap",
+			retry:    RetryConfig{MaxAttempts: 20, InitialInterval: 100 * time.Nanosecond, Multiplier: .5, MaxInterval: time.Second},
+			attempt:  8,
+			wantZero: true,
+			wantErr:  true,
+		},
+		{
 			name:     "default retry config",
 			retry:    defaultSubscription().Retry,
 			attempt:  20,
