@@ -16,8 +16,12 @@ type Hooks struct {
 	Close       func(context.Context) error
 }
 
-// Config defines independent wall-clock shutdown budgets. A zero budget
-// disables its deadline; negative budgets are invalid.
+// Config defines the wall-clock budgets of the shutdown phases. The budgets
+// are not all independent: DrainTimeout bounds both the drain hook and the
+// settlement wait, one after the other, so those two phases can consume up
+// to twice DrainTimeout together, while FlushTimeout and CloseTimeout each
+// bound a single phase. A zero budget disables its deadline; negative
+// budgets are invalid.
 type Config struct {
 	// Clock provides deterministic timing for shutdown phases.
 	Clock        clock.Clock
