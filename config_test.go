@@ -118,6 +118,26 @@ f1:
 	}
 }
 
+func TestLoadConfigAcceptsRabbitMQManagementPort(t *testing.T) {
+	t.Parallel()
+	path := writeConfig(t, `
+f1:
+  env: test
+  service: orders
+  broker:
+    driver: rabbitmq
+    rabbitmq:
+      managementPort: 18080
+`)
+	cfg, err := LoadConfig(path)
+	if err != nil {
+		t.Fatalf("LoadConfig() error = %v", err)
+	}
+	if got, want := cfg.Broker.DriverOptions["rabbitmq.managementPort"], "18080"; got != want {
+		t.Fatalf("management port = %q, want %q", got, want)
+	}
+}
+
 func TestLoadConfigEnvironmentOverridesYAML(t *testing.T) {
 	path := writeConfig(t, `
 f1:
