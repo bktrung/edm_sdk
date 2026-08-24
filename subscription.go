@@ -188,15 +188,16 @@ func runnerNotifyError(r *Runner, parent context.Context, event *Event, cause er
 }
 
 func runnerNotify(r *Runner, parent context.Context, callback func(context.Context), kind string) {
-	r.mu.Lock()
-	group := r.asyncGroup
-	r.mu.Unlock()
-	if group == nil {
-		group = new(errgroup.Group)
-	}
 	if parent == nil {
 		return
 	}
+	r.mu.Lock()
+	group := r.asyncGroup
+	if group == nil {
+		group = new(errgroup.Group)
+		r.asyncGroup = group
+	}
+	r.mu.Unlock()
 	notifyOwned(parent, callback, group, lastResortRunnerLogger(r), kind)
 }
 
@@ -205,10 +206,9 @@ func notifyOwned(parent context.Context, callback func(context.Context), group *
 		return
 	}
 	if group == nil {
-		group = new(errgroup.Group)
+		return
 	}
 	ctx, cancel := context.WithTimeout(parent, terminalNotificationTimeout)
-	defer cancel()
 	done := make(chan struct{})
 	group.Go(func() (err error) {
 		defer close(done)
@@ -220,11 +220,15 @@ func notifyOwned(parent context.Context, callback func(context.Context), group *
 		callback(ctx)
 		return nil
 	})
-	select {
-	case <-done:
-	case <-ctx.Done():
-		logger.Warn("f1 terminal notification timed out", "kind", kind, "timeout", terminalNotificationTimeout)
-	}
+	group.Go(func() error {
+		select {
+		case <-done:
+		case <-ctx.Done():
+			logger.Warn("f1 terminal notification timed out", "kind", kind, "timeout", terminalNotificationTimeout)
+		}
+		cancel()
+		return nil
+	})
 }
 
 // Subscribe validates sub after applying the subscription-specific config

@@ -11,6 +11,8 @@ import (
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/driver"
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/clock"
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/lifecycle"
+
+	"golang.org/x/sync/errgroup"
 )
 
 func TestOversizeBodyDeadLettersBeforeHandlerRuns(t *testing.T) {
@@ -103,80 +105,102 @@ func TestDispatchSettlesMessagesWithoutDeliveryCount(t *testing.T) {
 	}
 }
 
-func TestSettleLastNotificationRunsBeforeAck(t *testing.T) {
-	producer := &dispatchProducer{}
-	conn := &dispatchConn{producer: producer}
-	client, err := New(context.Background(), testClientConfig(t), WithDriver(&dispatchDriver{conn: conn}))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() { _ = client.Close(context.Background()) }()
-	settler := &dispatchSettler{}
-	observed := make(chan bool, 1)
-	runner := &Runner{client: client, subscription: Subscription{
-		Name:           "orders",
-		HandlerTimeout: time.Second,
-		OnDeadLetter: func(ctx context.Context, _ DeadLettered) {
-			_, hasDeadline := ctx.Deadline()
-			observed <- !settler.acked && ctx.Err() == nil && hasDeadline
+func TestTerminalNotificationsCannotBlockSettlement(t *testing.T) {
+	tests := []struct {
+		name   string
+		settle func(*testing.T, func(context.Context), chan<- bool)
+	}{
+		{
+			name: "dead-letter",
+			settle: func(t *testing.T, callback func(context.Context), result chan<- bool) {
+				producer := &dispatchProducer{}
+				client, err := New(context.Background(), testClientConfig(t), WithDriver(&dispatchDriver{conn: &dispatchConn{producer: producer}}))
+				if err != nil {
+					t.Fatal(err)
+				}
+				t.Cleanup(func() { _ = client.Close(context.Background()) })
+				runner := &Runner{client: client, asyncGroup: new(errgroup.Group), subscription: Subscription{
+					Name:         "orders",
+					OnDeadLetter: func(ctx context.Context, _ DeadLettered) { callback(ctx) },
+				}}
+				envelope := Envelope{SpecVersion: "1.0", ID: "evt-blocking", Source: "/test/orders", Type: "orders.created", Attempt: 1}
+				go func() {
+					result <- deadLetterAndSettle(runner, context.Background(), driver.InboundMessage{Destination: "orders", Settle: &dispatchSettler{}}, envelope, ReasonTerminal, errors.New("bad request"))
+				}()
+			},
 		},
-	}}
-	envelope := Envelope{SpecVersion: "1.0", ID: "evt-2", Source: "/test/orders", Type: "orders.created", Attempt: 1}
-	headers, err := envelope.EncodeHeaders(CoreMaxHeaderBytes)
-	if err != nil {
-		t.Fatal(err)
+		{
+			name: "discarded",
+			settle: func(t *testing.T, callback func(context.Context), result chan<- bool) {
+				client, err := New(context.Background(), testClientConfig(t), WithDriver(&dispatchDriver{conn: &dispatchConn{producer: &dispatchProducer{}}}))
+				if err != nil {
+					t.Fatal(err)
+				}
+				t.Cleanup(func() { _ = client.Close(context.Background()) })
+				runner := &Runner{client: client, asyncGroup: new(errgroup.Group), subscription: Subscription{
+					Name:        "orders",
+					OnDiscarded: func(ctx context.Context, _ Discarded) { callback(ctx) },
+				}}
+				envelope := Envelope{SpecVersion: "1.0", ID: "evt-discarded", Source: "/test/orders", Type: "orders.unmatched", Attempt: 1}
+				headers, err := envelope.EncodeHeaders(CoreMaxHeaderBytes)
+				if err != nil {
+					t.Fatal(err)
+				}
+				message := driver.InboundMessage{Destination: "orders", Headers: headerSlice(headers), Body: []byte(`{}`), Settle: &dispatchSettler{}}
+				go func() { result <- dispatchMessage(runner, context.Background(), message, &Envelope{}, new(bool)) }()
+			},
+		},
 	}
-	message := driver.InboundMessage{Destination: "f1.test.orders.created.normal", Headers: headerSlice(headers), Body: []byte(`{}`), Settle: settler}
-	parent, cancel := context.WithCancel(context.Background())
-	cancel()
-	if !deadLetterAndSettle(runner, parent, message, envelope, ReasonTerminal, errors.New("bad request")) {
-		t.Fatal("terminal message was not settled")
-	}
-	if got := <-observed; !got {
-		t.Fatal("notification ran after settlement")
-	}
-	if !settler.acked {
-		t.Fatal("terminal message was not acked")
-	}
-}
 
-func TestBlockingTerminalNotificationStillSettles(t *testing.T) {
-	producer := &dispatchProducer{}
-	conn := &dispatchConn{producer: producer}
-	client, err := New(context.Background(), testClientConfig(t), WithDriver(&dispatchDriver{conn: conn}))
-	if err != nil {
-		t.Fatal(err)
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			entered := make(chan struct{})
+			release := make(chan struct{})
+			finished := make(chan struct{})
+			var releaseOnce sync.Once
+			releaseCallback := func() { releaseOnce.Do(func() { close(release) }) }
+			t.Cleanup(releaseCallback)
+			callback := func(context.Context) {
+				close(entered)
+				<-release
+				close(finished)
+			}
+			result := make(chan bool, 1)
+			test.settle(t, callback, result)
+
+			startedGuard := clock.NewReal().Timer(time.Second)
+			select {
+			case <-entered:
+				startedGuard.Stop()
+			case <-startedGuard.C:
+				t.Fatal("terminal notification did not start")
+			}
+			settledGuard := clock.NewReal().Timer(time.Second)
+			select {
+			case settled := <-result:
+				settledGuard.Stop()
+				if !settled {
+					t.Fatal("terminal settlement failed")
+				}
+			case <-settledGuard.C:
+				t.Fatal("blocking terminal notification prevented settlement")
+			}
+			select {
+			case <-finished:
+				t.Fatal("terminal notification returned before its release")
+			default:
+			}
+
+			releaseCallback()
+			finishedGuard := clock.NewReal().Timer(time.Second)
+			defer finishedGuard.Stop()
+			select {
+			case <-finished:
+			case <-finishedGuard.C:
+				t.Fatal("terminal notification did not finish after release")
+			}
+		})
 	}
-	defer func() { _ = client.Close(context.Background()) }()
-	settler := &dispatchSettler{}
-	entered := make(chan struct{})
-	release := make(chan struct{})
-	runner := &Runner{client: client, subscription: Subscription{
-		Name: "orders",
-		OnDeadLetter: func(context.Context, DeadLettered) {
-			close(entered)
-			<-release
-		},
-	}}
-	envelope := Envelope{SpecVersion: "1.0", ID: "evt-blocking", Source: "/test/orders", Type: "orders.created", Attempt: 1}
-	result := make(chan bool, 1)
-	go func() {
-		result <- deadLetterAndSettle(runner, context.Background(), driver.InboundMessage{Destination: "orders", Settle: settler}, envelope, ReasonTerminal, errors.New("bad request"))
-	}()
-	select {
-	case <-entered:
-	case <-clock.NewReal().Timer(time.Second).C:
-		t.Fatal("terminal notification did not start")
-	}
-	select {
-	case settled := <-result:
-		if !settled || !settler.acked {
-			t.Fatalf("deadLetterAndSettle() = %v, acked = %v; want settlement despite callback", settled, settler.acked)
-		}
-	case <-clock.NewReal().Timer(1500 * time.Millisecond).C:
-		t.Fatal("blocking terminal notification prevented settlement")
-	}
-	close(release)
 }
 
 func TestNonCooperativeHandlerIsReportedAsStuck(t *testing.T) {

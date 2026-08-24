@@ -4,9 +4,25 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/driver"
+	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/clock"
 )
+
+func waitForTerminalBody(t *testing.T, done <-chan struct{}, got *[]byte, want []byte, kind string) {
+	t.Helper()
+	timer := clock.NewReal().Timer(time.Second)
+	defer timer.Stop()
+	select {
+	case <-done:
+	case <-timer.C:
+		t.Fatalf("%s callback did not finish", kind)
+	}
+	if string(*got) != string(want) {
+		t.Fatalf("%s.Body = %q, want %q", kind, *got, want)
+	}
+}
 
 // terminalBodyMessage builds an InboundMessage carrying body, encoding
 // envelope into headers unless envelope is nil, in which case headers is used
@@ -37,16 +53,18 @@ func TestTerminalCallbackBodiesCarryExactPayload(t *testing.T) {
 		client, runner := newRetryBridgeRunner(t, producer, "orders.unmatched")
 		defer func() { _ = client.Close(context.Background()) }()
 		var got []byte
-		runner.subscription.OnDiscarded = func(_ context.Context, d Discarded) { got = d.Body }
+		done := make(chan struct{})
+		runner.subscription.OnDiscarded = func(_ context.Context, d Discarded) {
+			got = d.Body
+			close(done)
+		}
 		body := []byte("unmatched-payload")
 		envelope := Envelope{SpecVersion: "1.0", ID: "unmatched", Source: "/test/orders", Type: "orders.unmatched.v1", Priority: PriorityHigh, Attempt: 1}
 		message := terminalBodyMessage(t, &envelope, nil, body, &dispatchSettler{})
 		if !dispatchMessage(runner, context.Background(), message, &Envelope{}, new(bool)) {
 			t.Fatal("unmatched message was not settled")
 		}
-		if string(got) != string(body) {
-			t.Fatalf("Discarded.Body = %q, want %q", got, body)
-		}
+		waitForTerminalBody(t, done, &got, body, "Discarded")
 	})
 
 	t.Run("dropped", func(t *testing.T) {
@@ -59,16 +77,18 @@ func TestTerminalCallbackBodiesCarryExactPayload(t *testing.T) {
 			}),
 		}
 		var got []byte
-		runner.subscription.OnDiscarded = func(_ context.Context, d Discarded) { got = d.Body }
+		done := make(chan struct{})
+		runner.subscription.OnDiscarded = func(_ context.Context, d Discarded) {
+			got = d.Body
+			close(done)
+		}
 		body := []byte("dropped-payload")
 		envelope := Envelope{SpecVersion: "1.0", ID: "dropped", Source: "/test/orders", Type: "orders.dropped.v1", Priority: PriorityHigh, Attempt: 1}
 		message := terminalBodyMessage(t, &envelope, nil, body, &dispatchSettler{})
 		if !dispatchMessage(runner, context.Background(), message, &Envelope{}, new(bool)) {
 			t.Fatal("dropped message was not settled")
 		}
-		if string(got) != string(body) {
-			t.Fatalf("Discarded.Body = %q, want %q", got, body)
-		}
+		waitForTerminalBody(t, done, &got, body, "Discarded")
 	})
 
 	t.Run("decode failure", func(t *testing.T) {
@@ -76,15 +96,17 @@ func TestTerminalCallbackBodiesCarryExactPayload(t *testing.T) {
 		client, runner := newRetryBridgeRunner(t, producer, "orders.decode")
 		defer func() { _ = client.Close(context.Background()) }()
 		var got []byte
-		runner.subscription.OnDeadLetter = func(_ context.Context, d DeadLettered) { got = d.Body }
+		done := make(chan struct{})
+		runner.subscription.OnDeadLetter = func(_ context.Context, d DeadLettered) {
+			got = d.Body
+			close(done)
+		}
 		body := []byte("decode-failure-payload")
 		message := terminalBodyMessage(t, nil, map[string]string{"time": "not-a-valid-time"}, body, &dispatchSettler{})
 		if !dispatchMessage(runner, context.Background(), message, &Envelope{}, new(bool)) {
 			t.Fatal("decode-failure message was not settled")
 		}
-		if string(got) != string(body) {
-			t.Fatalf("DeadLettered.Body = %q, want %q", got, body)
-		}
+		waitForTerminalBody(t, done, &got, body, "DeadLettered")
 	})
 
 	t.Run("ordinary dead letter", func(t *testing.T) {
@@ -92,16 +114,18 @@ func TestTerminalCallbackBodiesCarryExactPayload(t *testing.T) {
 		client, runner := newRetryBridgeRunner(t, producer, "orders.runaway")
 		defer func() { _ = client.Close(context.Background()) }()
 		var got []byte
-		runner.subscription.OnDeadLetter = func(_ context.Context, d DeadLettered) { got = d.Body }
+		done := make(chan struct{})
+		runner.subscription.OnDeadLetter = func(_ context.Context, d DeadLettered) {
+			got = d.Body
+			close(done)
+		}
 		body := []byte("runaway-payload")
 		envelope := Envelope{SpecVersion: "1.0", ID: "runaway", Source: "/test/orders", Type: "orders.runaway.v1", Priority: PriorityHigh, Attempt: 15}
 		message := terminalBodyMessage(t, &envelope, nil, body, &dispatchSettler{})
 		if !dispatchMessage(runner, context.Background(), message, &Envelope{}, new(bool)) {
 			t.Fatal("runaway message was not settled")
 		}
-		if string(got) != string(body) {
-			t.Fatalf("DeadLettered.Body = %q, want %q", got, body)
-		}
+		waitForTerminalBody(t, done, &got, body, "DeadLettered")
 	})
 }
 
@@ -115,7 +139,11 @@ func TestTerminalCallbackBodyIsCopiedNotAliased(t *testing.T) {
 	defer func() { _ = client.Close(context.Background()) }()
 
 	var got []byte
-	runner.subscription.OnDeadLetter = func(_ context.Context, d DeadLettered) { got = d.Body }
+	done := make(chan struct{})
+	runner.subscription.OnDeadLetter = func(_ context.Context, d DeadLettered) {
+		got = d.Body
+		close(done)
+	}
 
 	body := []byte("original-payload")
 	envelope := Envelope{SpecVersion: "1.0", ID: "runaway", Source: "/test/orders", Type: "orders.runaway.v1", Priority: PriorityHigh, Attempt: 15}
@@ -126,6 +154,7 @@ func TestTerminalCallbackBodyIsCopiedNotAliased(t *testing.T) {
 	if !dispatchMessage(runner, context.Background(), message, &Envelope{}, new(bool)) {
 		t.Fatal("runaway message was not settled")
 	}
+	waitForTerminalBody(t, done, &got, []byte("original-payload"), "DeadLettered")
 	if !settler.acked {
 		t.Fatal("settlement never completed")
 	}

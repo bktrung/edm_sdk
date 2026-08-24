@@ -548,9 +548,9 @@ func finishRunner(r *Runner) {
 	}
 	// asyncGroup is intentionally not waited here. Handler and callback code may
 	// ignore cancellation; waiting for a non-cooperative handler would make the
-	// runner outlive its shutdown bound. Terminal callbacks are bounded before
-	// settlement, while any callback that exceeds that bound is allowed to finish
-	// independently after ownership of the runner has ended.
+	// runner outlive its shutdown bound. Terminal callbacks receive a bounded
+	// context and are allowed to finish independently after settlement and after
+	// ownership of the runner has ended.
 	if r.done != nil {
 		close(r.done)
 	}
