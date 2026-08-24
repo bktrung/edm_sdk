@@ -110,7 +110,7 @@ func validKafkaOption(key string) bool {
 
 func validRabbitMQOption(key string) bool {
 	switch key {
-	case "vhost", "queueType", "quorumInitialGroupSize", "publisherConfirmTimeout", "useNativeDelay", "consumerTimeout", "deliveryLimitMargin", "deadLetterStrategy", "maxLength":
+	case "vhost", "queueType", "quorumInitialGroupSize", "publisherConfirmTimeout", "useNativeDelay", "consumerTimeout", "deliveryLimitMargin", "deadLetterStrategy", "maxLength", "managementPort":
 		return true
 	}
 	return false

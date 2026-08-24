@@ -2,7 +2,6 @@ package sched
 
 import (
 	"errors"
-	"sort"
 	"time"
 
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/clock"
@@ -103,8 +102,8 @@ func (s *Scheduler) Next() (Item, bool) {
 		return Item{}, false
 	}
 	if s.aging {
-		if promoted := s.promoted(); len(promoted) > 0 {
-			return promoted[0].popPromoted(s.clock.Now()), true
+		if promoted := s.promoted(); promoted != nil {
+			return promoted.pop(), true
 		}
 	}
 	for checked := 0; checked < len(s.slots); checked++ {
@@ -128,49 +127,32 @@ func (s *Scheduler) Next() (Item, bool) {
 	return Item{}, false
 }
 
-func (s *Scheduler) promoted() []*slot {
+func (s *Scheduler) promoted() *lane {
 	now := s.clock.Now()
-	urgent := make([]*slot, 0)
-	for _, group := range s.slots {
-		if group.empty() {
-			group.deficit = 0
-			continue
-		}
-		if group.promotedLane(now) != nil {
-			urgent = append(urgent, group)
-		}
-	}
-	sort.SliceStable(urgent, func(i, j int) bool {
-		left := urgent[i].overrun(now)
-		right := urgent[j].overrun(now)
-		return left > right
-	})
-	return urgent
-}
-
-func (s *slot) promotedLane(now time.Time) *lane {
 	var selected *lane
 	var selectedOverrun time.Duration
-	for _, lane := range s.lanes {
-		if len(lane.items) == 0 || lane.spec.Budget <= 0 {
-			continue
+	for _, group := range s.slots {
+		groupEmpty := true
+		for _, lane := range group.lanes {
+			if len(lane.items) == 0 {
+				continue
+			}
+			groupEmpty = false
+			if lane.spec.Budget <= 0 {
+				continue
+			}
+			overrun := now.Sub(lane.items[0].EnqueuedAt) - lane.spec.Budget
+			if overrun < 0 || selected != nil && overrun <= selectedOverrun {
+				continue
+			}
+			selected = lane
+			selectedOverrun = overrun
 		}
-		overrun := now.Sub(lane.items[0].EnqueuedAt) - lane.spec.Budget
-		if overrun < 0 || selected != nil && overrun <= selectedOverrun {
-			continue
+		if groupEmpty {
+			group.deficit = 0
 		}
-		selected = lane
-		selectedOverrun = overrun
 	}
 	return selected
-}
-
-func (s *slot) overrun(now time.Time) time.Duration {
-	lane := s.promotedLane(now)
-	if lane == nil {
-		return 0
-	}
-	return now.Sub(lane.items[0].EnqueuedAt) - lane.spec.Budget
 }
 
 func (s *slot) empty() bool {
@@ -205,13 +187,6 @@ func (s *slot) pop() Item {
 			continue
 		}
 		s.cursor = (index + 1) % len(s.lanes)
-		return lane.pop()
-	}
-	return Item{}
-}
-
-func (s *slot) popPromoted(now time.Time) Item {
-	if lane := s.promotedLane(now); lane != nil {
 		return lane.pop()
 	}
 	return Item{}

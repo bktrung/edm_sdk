@@ -18,6 +18,8 @@ import (
 
 const defaultManagementTimeout = 30 * time.Second
 
+const managementPortOption = "rabbitmq.managementPort"
+
 // errQueueNotFound marks a management API 404 for one queue, distinct from a
 // transport or authorisation failure so callers can decide separately
 // whether "the queue is gone" is expected.
@@ -65,6 +67,13 @@ func newManagementClient(endpoint string, cfg driver.Config) (*managementClient,
 	}
 	if parsed.Port() == "15672" {
 		managementPort = 15672
+	}
+	if configured := strings.TrimSpace(cfg.DriverOptions[managementPortOption]); configured != "" {
+		port, parseErr := strconv.Atoi(configured)
+		if parseErr != nil || port < 1 || port > 65535 {
+			return nil, fmt.Errorf("rabbitmq: invalid %s %q: want a port from 1 to 65535", managementPortOption, configured)
+		}
+		managementPort = port
 	}
 	host := net.JoinHostPort(parsed.Hostname(), strconv.Itoa(managementPort))
 	username, password := "", ""

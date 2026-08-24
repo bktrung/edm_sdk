@@ -55,3 +55,26 @@ func TestManagementClientUsesResolvedVhostCredentialsAndTLS(t *testing.T) {
 		t.Fatalf("management TLS transport = %#v, want configured TLS client", client.client.Transport)
 	}
 }
+
+func TestManagementClientUsesConfiguredPort(t *testing.T) {
+	cfg := driver.Config{DriverOptions: map[string]string{managementPortOption: "18080"}}
+	client, err := newManagementClient("amqp://broker.example:5673/", cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if client.baseURL != "http://broker.example:18080" {
+		t.Fatalf("management base URL = %q, want configured port", client.baseURL)
+	}
+}
+
+func TestManagementClientRejectsInvalidConfiguredPort(t *testing.T) {
+	for _, configured := range []string{"not-a-port", "0", "65536"} {
+		t.Run(configured, func(t *testing.T) {
+			cfg := driver.Config{DriverOptions: map[string]string{managementPortOption: configured}}
+			client, err := newManagementClient(defaultEndpoint, cfg)
+			if err == nil || client != nil {
+				t.Fatalf("newManagementClient() = client %v, error %v; want invalid port error", client, err)
+			}
+		})
+	}
+}

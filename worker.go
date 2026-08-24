@@ -411,6 +411,34 @@ func deliveryLane(r *Runner, message driver.InboundMessage) string {
 	return ""
 }
 
+// consumingTopicFamily resolves the logical topic whose declared destination
+// family the delivery came from. Subscription topology is declared from
+// Subscription.Topics, so a successor must stay inside the family the
+// message was consumed from: WithTopic and fan-out make the envelope's event
+// type an unreliable guide to that family. Matching reuses the exact naming
+// helpers that declare topology, so destination strings are never parsed and
+// nothing is derived from the event type here. The bool is false when no
+// configured family owns the destination, letting callers keep their
+// historical derivation for deliveries outside every declared family.
+func consumingTopicFamily(r *Runner, priority Priority, destination string) (string, bool) {
+	r.client.mu.Lock()
+	effective := r.client.effective
+	source := r.client.source
+	r.client.mu.Unlock()
+	for _, configured := range r.subscription.Topics {
+		logical := topicFor(configured)
+		if consumeDestination(effective, source, logical, priority, r.subscription.Name) == destination {
+			return logical, true
+		}
+		for tier := 1; tier <= retryTiers(r.subscription.Retry); tier++ {
+			if retryDestinationFor(source, logical, priority, tier, r.subscription.Name) == destination {
+				return logical, true
+			}
+		}
+	}
+	return "", false
+}
+
 // Drain stops fetching and waits for all worker deliveries to settle. A
 // runner that has not started is already drained.
 func (r *Runner) Drain(ctx context.Context) error {
@@ -520,9 +548,9 @@ func finishRunner(r *Runner) {
 	}
 	// asyncGroup is intentionally not waited here. Handler and callback code may
 	// ignore cancellation; waiting for a non-cooperative handler would make the
-	// runner outlive its shutdown bound. Terminal callbacks are bounded before
-	// settlement, while any callback that exceeds that bound is allowed to finish
-	// independently after ownership of the runner has ended.
+	// runner outlive its shutdown bound. Terminal callbacks receive a bounded
+	// context and are allowed to finish independently after settlement and after
+	// ownership of the runner has ended.
 	if r.done != nil {
 		close(r.done)
 	}
@@ -1323,7 +1351,7 @@ func retryAndSettle(r *Runner, ctx context.Context, message driver.InboundMessag
 		_ = nackDelivery(r, runnerSettlementContext(r, ctx), message, driver.NackOptions{CountAsFailure: true}, state)
 		return false
 	}
-	destination := retryDestination(r, copyEnvelope, tier)
+	destination := retryDestination(r, copyEnvelope, message, tier)
 	out := driver.OutboundMessage{Destination: destination, Key: append([]byte(nil), message.Key...), Body: append([]byte(nil), message.Body...), DelayUntil: due}
 	for key, value := range encoded {
 		out.Headers = append(out.Headers, driver.Header{Key: key, Value: []byte(value)})
@@ -1539,16 +1567,22 @@ func subscriptionTopologySpecs(effective driver.Capabilities, source string, sub
 }
 
 func deadLetterDestination(r *Runner, envelope Envelope, message driver.InboundMessage) string {
-	_ = message
-	topic := topicFor(envelope.Type)
+	topic, ok := consumingTopicFamily(r, envelope.Priority, message.Destination)
+	if !ok {
+		topic = topicFor(envelope.Type)
+	}
 	if topic == "" {
 		topic = "unknown"
 	}
 	return deadLetterDestinationFor(r.client.source, topic, r.subscription.Name)
 }
 
-func retryDestination(r *Runner, envelope Envelope, tier int) string {
-	return retryDestinationFor(r.client.source, topicFor(envelope.Type), envelope.Priority, tier, r.subscription.Name)
+func retryDestination(r *Runner, envelope Envelope, message driver.InboundMessage, tier int) string {
+	topic, ok := consumingTopicFamily(r, envelope.Priority, message.Destination)
+	if !ok {
+		topic = topicFor(envelope.Type)
+	}
+	return retryDestinationFor(r.client.source, topic, envelope.Priority, tier, r.subscription.Name)
 }
 
 func deadLetterDestinationFor(source, topic, subscription string) string {

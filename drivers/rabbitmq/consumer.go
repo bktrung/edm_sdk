@@ -64,6 +64,17 @@ type lane struct {
 
 var _ driver.Consumer = (*consumer)(nil)
 
+type consumerConstructionPhase uint8
+
+const (
+	consumerConstructionStarted consumerConstructionPhase = iota
+	consumerConstructionReady
+)
+
+// consumerConstructionHook is a test-only synchronization seam. It remains
+// nil in production and does not change the driver behavior.
+var consumerConstructionHook func(*consumer, consumerConstructionPhase)
+
 func newConsumer(conn *conn, cfg driver.ConsumerConfig) (*consumer, error) {
 	c := &consumer{
 		conn:           conn,
@@ -74,6 +85,9 @@ func newConsumer(conn *conn, cfg driver.ConsumerConfig) (*consumer, error) {
 		stoppedC:       make(chan struct{}),
 		forwarderStopC: make(chan struct{}),
 		settlers:       make(map[*settler]struct{}),
+	}
+	if hook := consumerConstructionHook; hook != nil {
+		hook(c, consumerConstructionStarted)
 	}
 	for index, destination := range cfg.Destinations {
 		if _, exists := c.byName[destination]; exists {

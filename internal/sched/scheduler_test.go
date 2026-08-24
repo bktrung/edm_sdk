@@ -98,6 +98,76 @@ func TestAgingOverrunOrdering(t *testing.T) {
 	}
 }
 
+func TestAgingTieUsesConfiguredSlotOrder(t *testing.T) {
+	start := time.Unix(0, 0)
+	fake := clock.NewFake(start)
+	scheduler, err := New([]LaneSpec{
+		{ID: "first", Weight: 1, Budget: time.Second, Capacity: 1},
+		{ID: "second", Weight: 1, Budget: time.Second, Capacity: 1},
+	}, fake, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range []string{"first", "second"} {
+		if err := scheduler.Enqueue(id, Item{Value: id, EnqueuedAt: start}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	fake.Advance(2 * time.Second)
+	item, ok := scheduler.Next()
+	if !ok || item.Value != "first" {
+		t.Fatalf("equal slot overrun selected %#v, %v; want first", item.Value, ok)
+	}
+}
+
+func TestAgingTieUsesConfiguredLaneOrder(t *testing.T) {
+	start := time.Unix(0, 0)
+	fake := clock.NewFake(start)
+	scheduler, err := New([]LaneSpec{
+		{ID: "first", Group: "retry", Weight: 1, Budget: time.Second, Capacity: 1},
+		{ID: "second", Group: "retry", Weight: 1, Budget: time.Second, Capacity: 1},
+	}, fake, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range []string{"first", "second"} {
+		if err := scheduler.Enqueue(id, Item{Value: id, EnqueuedAt: start}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	fake.Advance(2 * time.Second)
+	item, ok := scheduler.Next()
+	if !ok || item.Value != "first" {
+		t.Fatalf("equal lane overrun selected %#v, %v; want first", item.Value, ok)
+	}
+}
+
+func TestAgingFallsBackToWeightedSelectionWhenNothingIsOverdue(t *testing.T) {
+	start := time.Unix(0, 0)
+	fake := clock.NewFake(start)
+	scheduler, err := New([]LaneSpec{
+		{ID: "high", Weight: 2, Budget: time.Hour, Capacity: 3},
+		{ID: "low", Weight: 1, Budget: time.Hour, Capacity: 3},
+	}, fake, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 3; i++ {
+		if err := scheduler.Enqueue("high", Item{Value: "high", EnqueuedAt: start}); err != nil {
+			t.Fatal(err)
+		}
+		if err := scheduler.Enqueue("low", Item{Value: "low", EnqueuedAt: start}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for i, want := range []string{"high", "high", "low"} {
+		item, ok := scheduler.Next()
+		if !ok || item.Value != want {
+			t.Fatalf("fallback item %d = %#v, %v; want %s", i, item.Value, ok, want)
+		}
+	}
+}
+
 func TestAgingUsesLaneBudgetAndEnqueueTime(t *testing.T) {
 	start := time.Unix(0, 0)
 	fake := clock.NewFake(start)

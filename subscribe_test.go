@@ -190,41 +190,38 @@ func TestUnmatchedDiscardReasonIsNotDeathReason(t *testing.T) {
 	}
 }
 
-func TestTerminalNotificationsCannotBlockSettlement(t *testing.T) {
+func TestTerminalNotificationsPreserveBoundedContextAndPanicRecovery(t *testing.T) {
 	t.Parallel()
-	started := make(chan struct{})
-	release := make(chan struct{})
-	settled := make(chan struct{})
+	observed := make(chan bool, 1)
 	runner := &Runner{subscription: Subscription{
-		OnDiscarded: func(context.Context, Discarded) {
-			close(started)
-			<-release
+		OnDeadLetter: func(ctx context.Context, _ DeadLettered) {
+			deadline, hasDeadline := ctx.Deadline()
+			observed <- hasDeadline && time.Until(deadline) > 0 && time.Until(deadline) <= terminalNotificationTimeout
 		},
 	}}
-	go func() {
-		runnerNotifyDiscarded(runner, context.Background(), Discarded{Reason: DiscardUnmatched})
-		close(settled)
-	}()
-	timer := clock.NewReal().Timer(100 * time.Millisecond)
+	runnerNotifyDeadLetter(runner, context.Background(), DeadLettered{Reason: ReasonTerminal})
+	timer := clock.NewReal().Timer(time.Second)
 	defer timer.Stop()
 	select {
-	case <-started:
+	case got := <-observed:
+		if !got {
+			t.Fatal("terminal notification context was not bounded")
+		}
 	case <-timer.C:
-		t.Fatal("notification did not start")
+		t.Fatal("terminal notification did not start")
 	}
-	select {
-	case <-settled:
-		t.Fatal("settlement ran before the notification returned")
-	case <-timer.C:
+
+	panicStarted := make(chan struct{})
+	runner.subscription.OnDeadLetter = func(context.Context, DeadLettered) {
+		close(panicStarted)
+		panic("notification panic")
 	}
-	close(release)
-	select {
-	case <-settled:
-	case <-clock.NewReal().Timer(time.Second).C:
-		t.Fatal("notification did not release settlement")
-	}
-	runner.subscription.OnDeadLetter = func(context.Context, DeadLettered) { panic("notification panic") }
 	runnerNotifyDeadLetter(runner, context.Background(), DeadLettered{Reason: ReasonTerminal})
+	select {
+	case <-panicStarted:
+	case <-clock.NewReal().Timer(time.Second).C:
+		t.Fatal("panic notification did not start")
+	}
 }
 
 func testBrokerInfo() driver.BrokerInfo {
