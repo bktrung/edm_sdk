@@ -620,42 +620,78 @@ func publishMessages(c *Client, ctx context.Context, allowClosing bool, messages
 		return nil
 	}
 	c.mu.Lock()
-	if c.closed || c.conn == nil || (!allowClosing && c.shutdownStarted) || (allowClosing && c.producerTeardown) {
+	if err := publishAdmissionLocked(c, allowClosing); err != nil {
 		c.mu.Unlock()
+		return err
+	}
+	producer := c.producerHandle
+	conn := c.conn
+	effective := c.effective
+	if producer != nil {
+		beginPublish(c)
+		c.mu.Unlock()
+	} else {
+		c.mu.Unlock()
+		builtProducer, err := conn.Producer(ctx, driver.ProducerConfig{RequireDurableAck: true, Effective: effective})
+		if err != nil {
+			requestReconnectOnTransient(c, err)
+			return err
+		}
+		if builtProducer == nil {
+			return errors.New("driver returned a nil producer")
+		}
+
+		var loser driver.Producer
+		c.mu.Lock()
+		err = publishAdmissionLocked(c, allowClosing)
+		if err == nil && !sameConnection(c.conn, conn) {
+			err = c.reconnectingError("publish")
+		}
+		if err == nil {
+			if c.producerHandle != nil {
+				producer = c.producerHandle
+				loser = builtProducer
+			} else {
+				producer = builtProducer
+				c.producerHandle = builtProducer
+			}
+			beginPublish(c)
+		}
+		c.mu.Unlock()
+		if loser != nil {
+			closeDiscardedProducer(c, loser, ctx)
+		}
+		if err != nil {
+			closeDiscardedProducer(c, builtProducer, ctx)
+			return err
+		}
+	}
+	defer endPublish(c)
+	err := producer.Publish(ctx, messages...)
+	requestReconnectOnTransient(c, err)
+	return err
+}
+
+func publishAdmissionLocked(c *Client, allowClosing bool) error {
+	if c.closed || c.conn == nil || (!allowClosing && c.shutdownStarted) || (allowClosing && c.producerTeardown) {
 		return errors.New("f1: client is closed")
 	}
 	if c.reconnectErr != nil {
-		err := c.reconnectErr
-		c.mu.Unlock()
-		return err
+		return c.reconnectErr
 	}
 	if c.reconnecting {
-		c.mu.Unlock()
 		return c.reconnectingError("publish")
 	}
-	producer := c.producerHandle
-	var err error
+	return nil
+}
+
+func closeDiscardedProducer(c *Client, producer driver.Producer, ctx context.Context) {
 	if producer == nil {
-		producer, err = c.conn.Producer(ctx, driver.ProducerConfig{RequireDurableAck: true, Effective: c.effective})
-		if err == nil && producer == nil {
-			err = errors.New("driver returned a nil producer")
-		}
-		if err == nil {
-			c.producerHandle = producer
-		}
+		return
 	}
-	if err == nil {
-		beginPublish(c)
+	if err := producer.Close(context.WithoutCancel(ctx)); err != nil {
+		lastResortClientLogger(c).Warn("f1 discarded producer close failed", "error", err)
 	}
-	c.mu.Unlock()
-	if err != nil {
-		requestReconnectOnTransient(c, err)
-		return err
-	}
-	defer endPublish(c)
-	err = producer.Publish(ctx, messages...)
-	requestReconnectOnTransient(c, err)
-	return err
 }
 
 func requestReconnectOnTransient(c *Client, err error) {

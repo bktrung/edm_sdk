@@ -205,18 +205,45 @@ func (c *conn) Consumer(ctx context.Context, cfg driver.ConsumerConfig) (driver.
 		return nil, classify("consumer", driver.KindTransient, err)
 	}
 	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.closed || c.closing || c.amqp.IsClosed() {
-		return nil, classify("consumer", driver.KindTransient, amqp.ErrClosed)
+	err := c.consumerAdmissionLocked(cfg)
+	c.mu.Unlock()
+	if err != nil {
+		return nil, err
 	}
 	if len(cfg.Destinations) == 0 {
 		return nil, classify("consumer", driver.KindFatal, errors.New("no destinations"))
+	}
+
+	consumer, err := newConsumer(c, cfg)
+	if err != nil {
+		return nil, err
+	}
+	if hook := consumerConstructionHook; hook != nil {
+		hook(consumer, consumerConstructionReady)
+	}
+	c.mu.Lock()
+	err = c.consumerAdmissionLocked(cfg)
+	if err == nil {
+		c.active[consumer] = struct{}{}
+		c.mu.Unlock()
+		return consumer, nil
+	}
+	c.mu.Unlock()
+	if releaseErr := consumer.Release(context.WithoutCancel(ctx)); releaseErr != nil {
+		return nil, errors.Join(err, releaseErr)
+	}
+	return nil, err
+}
+
+func (c *conn) consumerAdmissionLocked(cfg driver.ConsumerConfig) error {
+	if c.closed || c.closing || c.amqp.IsClosed() {
+		return classify("consumer", driver.KindTransient, amqp.ErrClosed)
 	}
 	if cfg.Exclusive {
 		for _, destination := range cfg.Destinations {
 			for active := range c.active {
 				if active.hasDestination(destination) {
-					return nil, classify("consumer", driver.KindFatal, fmt.Errorf("exclusive consumer refused: destination %q already has a consumer", destination))
+					return classify("consumer", driver.KindFatal, fmt.Errorf("exclusive consumer refused: destination %q already has a consumer", destination))
 				}
 			}
 		}
@@ -227,16 +254,11 @@ func (c *conn) Consumer(ctx context.Context, cfg driver.ConsumerConfig) (driver.
 		}
 		for _, destination := range cfg.Destinations {
 			if active.hasDestination(destination) {
-				return nil, classify("consumer", driver.KindFatal, fmt.Errorf("exclusive consumer refused: destination %q already has an exclusive consumer", destination))
+				return classify("consumer", driver.KindFatal, fmt.Errorf("exclusive consumer refused: destination %q already has an exclusive consumer", destination))
 			}
 		}
 	}
-	consumer, err := newConsumer(c, cfg)
-	if err != nil {
-		return nil, err
-	}
-	c.active[consumer] = struct{}{}
-	return consumer, nil
+	return nil
 }
 
 func (c *conn) Admin() driver.Admin { return &admin{operations: &adminOperations{conn: c}} }
