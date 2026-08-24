@@ -88,6 +88,154 @@ func TestProducerConfirmAndReturn(t *testing.T) {
 	}
 }
 
+func TestProducerAbandonedConfirmationRelay(t *testing.T) {
+	requireBroker(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	const queue = "rabbitmq-driver-producer-confirm-relay"
+	conn, _ := openProducerFixture(t, ctx, queue)
+	if _, err := conn.Admin().EnsureTopology(ctx, driver.TopologySpec{
+		Destinations: []driver.DestinationSpec{{Name: queue, Durable: true}},
+	}); err != nil {
+		t.Fatalf("EnsureTopology: %v", err)
+	}
+	rawProducer, err := conn.Producer(ctx, driver.ProducerConfig{RequireDurableAck: true})
+	if err != nil {
+		t.Fatalf("Producer: %v", err)
+	}
+	p := rawProducer.(*producer)
+	brokerConfirms := p.confirms
+	controlledConfirms := make(chan amqp.Confirmation, 2)
+	p.confirms = controlledConfirms
+	t.Cleanup(func() { _ = rawProducer.Close(context.Background()) })
+
+	aCtx, cancelA := context.WithCancel(ctx)
+	aDone := make(chan error, 1)
+	go func() {
+		aDone <- rawProducer.Publish(aCtx, driver.OutboundMessage{Destination: queue, Body: []byte("message-a")})
+	}()
+	var aConfirmation amqp.Confirmation
+	select {
+	case aConfirmation = <-brokerConfirms:
+	case <-ctx.Done():
+		t.Fatalf("message A confirmation: %v", ctx.Err())
+	}
+	cancelA()
+	select {
+	case err := <-aDone:
+		if err == nil {
+			t.Fatal("message A Publish succeeded after its context was canceled")
+		}
+		kind, classified := driver.Classify(err)
+		if !classified || kind != driver.KindTransient {
+			t.Fatalf("message A error = %v, kind=%v classified=%t; want transient", err, kind, classified)
+		}
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("message A error = %v; want context.Canceled", err)
+		}
+	case <-ctx.Done():
+		t.Fatalf("message A result: %v", ctx.Err())
+	}
+
+	bCtx, cancelB := context.WithTimeout(ctx, 5*time.Second)
+	defer cancelB()
+	bDone := make(chan error, 1)
+	go func() {
+		bDone <- rawProducer.Publish(bCtx, driver.OutboundMessage{Destination: queue, Body: []byte("message-b")})
+	}()
+	timer := time.NewTimer(2 * time.Second) //nolint:forbidigo // bounded live-broker relay guard
+	select {
+	case err := <-bDone:
+		if err == nil {
+			t.Fatal("message B Publish succeeded through a producer with an abandoned confirmation")
+		}
+		kind, classified := driver.Classify(err)
+		if !classified || kind != driver.KindTransient {
+			t.Fatalf("message B error = %v, kind=%v classified=%t; want transient", err, kind, classified)
+		}
+		if !errors.Is(err, amqp.ErrClosed) {
+			t.Fatalf("message B error = %v; want amqp.ErrClosed", err)
+		}
+	case bConfirmation, ok := <-brokerConfirms:
+		if !ok {
+			select {
+			case err := <-bDone:
+				if err == nil {
+					t.Fatal("message B succeeded after the confirmation stream closed")
+				}
+				if !errors.Is(err, amqp.ErrClosed) {
+					t.Fatalf("message B error after confirmation stream closed = %v; want amqp.ErrClosed", err)
+				}
+			case <-ctx.Done():
+				t.Fatalf("message B result after confirmation stream closed: %v", ctx.Err())
+			}
+			break
+		}
+		if aConfirmation.DeliveryTag == bConfirmation.DeliveryTag {
+			t.Fatalf("confirmation tags are equal: A=%d B=%d", aConfirmation.DeliveryTag, bConfirmation.DeliveryTag)
+		}
+		controlledConfirms <- aConfirmation
+		select {
+		case err := <-bDone:
+			if err == nil {
+				t.Fatalf("message B succeeded from message A confirmation: A tag=%d B tag=%d", aConfirmation.DeliveryTag, bConfirmation.DeliveryTag)
+			}
+			t.Fatalf("message B reached the broker after producer invalidation: %v", err)
+		case <-ctx.Done():
+			t.Fatalf("message B result after confirmation relay: %v", ctx.Err())
+		}
+	case <-timer.C:
+		t.Fatal("message B did not fail after producer invalidation")
+	}
+	if !timer.Stop() {
+		select {
+		case <-timer.C:
+		default:
+		}
+	}
+	select {
+	case confirmation, ok := <-brokerConfirms:
+		if ok {
+			t.Fatalf("stale confirmation remained available after message B was rejected: tag=%d", confirmation.DeliveryTag)
+		}
+	case <-time.After(500 * time.Millisecond): //nolint:forbidigo // bounded live-broker confirmation guard
+	}
+	if err := rawProducer.Close(ctx); err != nil {
+		t.Fatalf("first poisoned Producer.Close: %v", err)
+	}
+	if err := rawProducer.Close(ctx); err != nil {
+		t.Fatalf("second poisoned Producer.Close: %v", err)
+	}
+}
+
+func TestProducerConfirmedSequence(t *testing.T) {
+	requireBroker(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	const queue = "rabbitmq-driver-producer-confirmed-sequence"
+	conn, _ := openProducerFixture(t, ctx, queue)
+	if _, err := conn.Admin().EnsureTopology(ctx, driver.TopologySpec{
+		Destinations: []driver.DestinationSpec{{Name: queue, Durable: true}},
+	}); err != nil {
+		t.Fatalf("EnsureTopology: %v", err)
+	}
+	producer, err := conn.Producer(ctx, driver.ProducerConfig{RequireDurableAck: true})
+	if err != nil {
+		t.Fatalf("Producer: %v", err)
+	}
+	if err := producer.Publish(ctx,
+		driver.OutboundMessage{Destination: queue, Body: []byte("first")},
+		driver.OutboundMessage{Destination: queue, Body: []byte("second")},
+	); err != nil {
+		t.Fatalf("confirmed sequence Publish: %v", err)
+	}
+	if err := producer.Close(ctx); err != nil {
+		t.Fatalf("Producer.Close: %v", err)
+	}
+}
+
 func TestProducerPublishesToDeclaredFanoutExchange(t *testing.T) {
 	requireBroker(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)

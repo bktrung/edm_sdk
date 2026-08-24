@@ -100,7 +100,11 @@ func (p *producer) publishOne(ctx context.Context, message driver.OutboundMessag
 	if err := p.channel.PublishWithContext(ctx, exchange, routingKey, true, false, publishing); err != nil {
 		return classifyAMQP("publish", driver.KindTransient, err)
 	}
-	return p.waitConfirm(ctx)
+	err, abandoned := p.waitConfirm(ctx)
+	if abandoned {
+		p.invalidateLocked()
+	}
+	return err
 }
 
 // target decides AMQP routing for one outbound message. Whether Destination
@@ -156,21 +160,21 @@ func expirationMillis(remaining time.Duration) string {
 	return strconv.FormatInt(int64(millis), 10)
 }
 
-func (p *producer) waitConfirm(ctx context.Context) error {
+func (p *producer) waitConfirm(ctx context.Context) (error, bool) {
 	var returned *amqp.Return
 	for {
 		select {
 		case item, ok := <-p.returns:
 			if !ok {
-				return classify("publish", driver.KindTransient, amqp.ErrClosed)
+				return classify("publish", driver.KindTransient, amqp.ErrClosed), false
 			}
 			returned = &item
 		case confirmation, ok := <-p.confirms:
 			if !ok {
-				return classify("publish", driver.KindTransient, amqp.ErrClosed)
+				return classify("publish", driver.KindTransient, amqp.ErrClosed), false
 			}
 			if !confirmation.Ack {
-				return classify("publish", driver.KindTransient, errors.New("rabbitmq: publisher confirm was negative"))
+				return classify("publish", driver.KindTransient, errors.New("rabbitmq: publisher confirm was negative")), false
 			}
 			if returned == nil {
 				select {
@@ -182,11 +186,11 @@ func (p *producer) waitConfirm(ctx context.Context) error {
 				}
 			}
 			if returned != nil {
-				return returnedPublishError(*returned)
+				return returnedPublishError(*returned), false
 			}
-			return nil
+			return nil, false
 		case <-ctx.Done():
-			return classify("publish", driver.KindTransient, ctx.Err())
+			return classify("publish", driver.KindTransient, ctx.Err()), true
 		}
 	}
 }
@@ -257,14 +261,8 @@ func (p *producer) Close(ctx context.Context) error {
 		return classify("producer.close", driver.KindTransient, err)
 	}
 	p.mu.Lock()
-	if p.closed {
-		p.mu.Unlock()
-		return nil
-	}
-	p.closed = true
-	err := p.channel.Close()
+	err := p.closeLocked()
 	p.mu.Unlock()
-	p.conn.removeProducer(p)
 	if errors.Is(err, amqp.ErrClosed) {
 		return nil
 	}
@@ -272,4 +270,18 @@ func (p *producer) Close(ctx context.Context) error {
 		return classifyAMQP("producer.close", driver.KindTransient, err)
 	}
 	return nil
+}
+
+func (p *producer) invalidateLocked() {
+	_ = p.closeLocked()
+}
+
+func (p *producer) closeLocked() error {
+	if p.closed {
+		return nil
+	}
+	p.closed = true
+	err := p.channel.Close()
+	p.conn.removeProducer(p)
+	return err
 }
