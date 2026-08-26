@@ -2,6 +2,8 @@ package f1
 
 import (
 	"context"
+	"os"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -116,6 +118,101 @@ f1:
 	}
 	if got, want := runner.config.Prefetch, 12; got != want {
 		t.Fatalf("resolved prefetch = %d, want %d", got, want)
+	}
+}
+
+func TestApplySubscriptionEnvironmentStopsInCurrentOrderWithPartialMutation(t *testing.T) {
+	name := t.Name()
+	clearSubscriptionEnvironment(t, name)
+	prefix := subscriptionEnvPrefix(name)
+	t.Setenv(envKey(prefix, "topics"), "orders.created")
+	t.Setenv(envKey(prefix, "mode"), "invalid-mode")
+	t.Setenv(envKey(prefix, "concurrency"), "invalid-concurrency")
+
+	cfg := SubscriptionConfig{Mode: OrderedByKey, Concurrency: 9}
+	err := applySubscriptionEnvironment(name, &cfg)
+	if err == nil || !strings.Contains(err.Error(), envKey(prefix, "mode")) {
+		t.Fatalf("applySubscriptionEnvironment() error = %v, want mode error first", err)
+	}
+	if got, want := cfg.Topics, []string{"orders.created"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("topics after partial mutation = %v, want %v", got, want)
+	}
+	if cfg.Mode != OrderedByKey || cfg.Concurrency != 9 {
+		t.Fatalf("config after partial mutation = %#v, want mode ordered and concurrency 9", cfg)
+	}
+}
+
+func TestApplySubscriptionEnvironmentAllocatesFairnessMapsLazily(t *testing.T) {
+	name := t.Name()
+	clearSubscriptionEnvironment(t, name)
+	prefix := subscriptionEnvPrefix(name)
+	t.Setenv(envKey(prefix, "fairness.weights.high"), "7")
+
+	cfg := SubscriptionConfig{}
+	if err := applySubscriptionEnvironment(name, &cfg); err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Fairness.Weights == nil || cfg.Fairness.Weights[PriorityHigh] != 7 {
+		t.Fatalf("weights = %#v, want only high weight 7", cfg.Fairness.Weights)
+	}
+	if cfg.Fairness.Budgets != nil {
+		t.Fatalf("budgets = %#v, want nil when no budget env is present", cfg.Fairness.Budgets)
+	}
+
+	name = name + "_existing"
+	clearSubscriptionEnvironment(t, name)
+	prefix = subscriptionEnvPrefix(name)
+	t.Setenv(envKey(prefix, "fairness.weights.high"), "11")
+	cfg = SubscriptionConfig{Fairness: FairnessConfig{Weights: map[Priority]int{PriorityLow: 3}}}
+	if err := applySubscriptionEnvironment(name, &cfg); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(cfg.Fairness.Weights, map[Priority]int{PriorityLow: 3, PriorityHigh: 11}) {
+		t.Fatalf("existing weights = %#v, want preserved low and updated high", cfg.Fairness.Weights)
+	}
+	if cfg.Fairness.Budgets != nil {
+		t.Fatalf("existing-case budgets = %#v, want nil", cfg.Fairness.Budgets)
+	}
+
+	name = name + "_budget"
+	clearSubscriptionEnvironment(t, name)
+	prefix = subscriptionEnvPrefix(name)
+	t.Setenv(envKey(prefix, "fairness.budgets.normal"), "2s")
+	cfg = SubscriptionConfig{}
+	if err := applySubscriptionEnvironment(name, &cfg); err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Fairness.Weights != nil {
+		t.Fatalf("budget-only weights = %#v, want nil", cfg.Fairness.Weights)
+	}
+	if cfg.Fairness.Budgets == nil || cfg.Fairness.Budgets[PriorityNormal] != 2*time.Second {
+		t.Fatalf("budget-only budgets = %#v, want normal 2s", cfg.Fairness.Budgets)
+	}
+}
+
+func clearSubscriptionEnvironment(t *testing.T, name string) {
+	t.Helper()
+	keys := []string{
+		"topics", "mode", "concurrency", "prefetch", "priorities",
+		"handlerTimeout", "unmatchedPolicy", "fairness.retryWeightDivisor",
+		"fairness.costModel", "fairness.prefetchFactor", "fairness.agingEnabled",
+		"fairness.weights.high", "fairness.weights.normal", "fairness.weights.low",
+		"fairness.budgets.high", "fairness.budgets.normal", "fairness.budgets.low",
+		"retry.maxAttempts", "retry.initialInterval", "retry.multiplier",
+		"retry.maxInterval", "retry.jitter", "retry.tiers",
+	}
+	prefix := subscriptionEnvPrefix(name)
+	for _, key := range keys {
+		name := envKey(prefix, key)
+		previous, existed := os.LookupEnv(name)
+		_ = os.Unsetenv(name)
+		t.Cleanup(func() {
+			if existed {
+				_ = os.Setenv(name, previous)
+			} else {
+				_ = os.Unsetenv(name)
+			}
+		})
 	}
 }
 

@@ -33,12 +33,13 @@ Goal: understand event identity, headers, errors, settlement, capabilities, and 
 
 Read:
 
-1. `config.go` and `broker.go`
+1. `config.go` and `broker_config.go`
 2. `options.go`
-3. `client.go`
-4. `publisher.go`
-5. `examples/config.yaml`
-6. `examples/publisher/main.go`
+3. `client.go` and `limits.go`
+4. `subscription_env.go`
+5. `publisher.go`
+6. `examples/config.yaml`
+7. `examples/publisher/main.go`
 
 Goal: understand how a client connects, resolves options, builds an envelope, names a destination,
 and waits for durable publish acknowledgement.

@@ -10,19 +10,23 @@ import (
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/driver"
 )
 
-func TestChain_BuiltInOrderIsFixed(t *testing.T) {
+func TestBuildHandlerChainRecoversPanicDirectly(t *testing.T) {
 	t.Parallel()
-	got := make([]string, 0, len(builtInMiddlewareSpecs()))
-	for _, spec := range builtInMiddlewareSpecs() {
-		got = append(got, spec.name)
+	chain := buildHandlerChain(nil, HandlerFunc(func(context.Context, *Event) error {
+		panic("direct chain panic")
+	}))
+
+	err := chain.Handle(context.Background(), &Event{})
+	var panicErr *handlerPanicError
+	if !errors.As(err, &panicErr) {
+		t.Fatalf("buildHandlerChain() error = %T %v, want *handlerPanicError", err, err)
 	}
-	want := []string{"recover", "tracing", "metrics", "logging", "timeout", "retry-classify"}
-	if !reflect.DeepEqual(got, want) {
-		t.Fatalf("built-in middleware = %v, want %v", got, want)
+	if !strings.Contains(panicErr.Error(), "direct chain panic") {
+		t.Fatalf("panic error = %q, want panic value", panicErr)
 	}
 }
 
-func TestChain_UserMiddlewareRunsInsideTheBuiltIns(t *testing.T) {
+func TestChain_UserMiddlewareOrderIsPreserved(t *testing.T) {
 	producer := &dispatchProducer{}
 	order := make([]string, 0, 4)
 	sawRaw := false
@@ -81,11 +85,12 @@ func TestChain_UserMiddlewareRunsInsideTheBuiltIns(t *testing.T) {
 
 func TestChain_UserMiddlewarePanicIsRecovered(t *testing.T) {
 	producer := &dispatchProducer{}
+	const marker = "middleware panic marker"
 	client, err := New(context.Background(), testClientConfig(t),
 		WithDriver(&dispatchDriver{conn: &dispatchConn{producer: producer}}),
 		WithMiddleware(func(next Handler) Handler {
 			return HandlerFunc(func(context.Context, *Event) error {
-				panic("middleware boom")
+				panic(marker + strings.Repeat("x", 16<<10))
 			})
 		}),
 	)
@@ -124,8 +129,9 @@ func TestChain_UserMiddlewarePanicIsRecovered(t *testing.T) {
 	if len(producer.messages) != 1 || headerValue(producer.messages[0].Headers, "f1deathreason") != ReasonPanic.String() {
 		t.Fatalf("DLQ messages = %#v, want one panic message", producer.messages)
 	}
-	if !strings.Contains(headerValue(producer.messages[0].Headers, "f1deatherror"), "middleware boom") {
-		t.Fatalf("panic error header = %q, want middleware panic", headerValue(producer.messages[0].Headers, "f1deatherror"))
+	deathError := headerValue(producer.messages[0].Headers, "f1deatherror")
+	if !strings.HasPrefix(deathError, "handler panic: "+marker) || len(deathError) > 4<<10 {
+		t.Fatalf("panic error header = %q, want marker prefix and <= 4 KiB", deathError)
 	}
 }
 
