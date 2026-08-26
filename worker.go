@@ -20,11 +20,27 @@ import (
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/sched"
 )
 
+const (
+	defaultHandlerTimeout         = 30 * time.Second
+	defaultRetryWeightDivisor     = 2
+	defaultPrefetchFactor         = 2
+	retryBudgetMultiplier         = 2
+	minimumLaneCapacity           = 2
+	stuckPhaseMultiplier          = 2
+	stuckAbortMultiplier          = 4
+	deathErrorCap                 = 4 << 10
+	topologyDeliveryLimitHeadroom = 5
+)
+
+// --- Types and settlement contracts ---
+
 type delivery struct {
 	id      uint64
 	message driver.InboundMessage
 }
 
+// deliveryState records attempted versus settled ownership. operation and
+// nackOptions preserve the exact settlement operation for deferred retries.
 type deliveryState struct {
 	id        uint64
 	attempted bool
@@ -34,6 +50,8 @@ type deliveryState struct {
 	operation   settlementOperation
 	nackOptions driver.NackOptions
 }
+
+// --- Public runner API and generation lifecycle ---
 
 // Run starts the consumer, owns its fetcher and workers, and returns when the
 // consumer stops, the caller cancels ctx, or a driver error requests shutdown.
@@ -94,13 +112,8 @@ func (r *Runner) Run(ctx context.Context) error {
 			r.reconnectCause = err
 			r.mu.Unlock()
 			r.transitionToReconnecting()
-			attempt, requestErr := r.client.requestReconnect(err)
-			if requestErr != nil {
-				runErr = requestErr
-				break
-			}
-			if waitErr := r.client.waitReconnect(ctx, attempt); waitErr != nil {
-				runErr = waitErr
+			if reconnectErr := r.requestAndWaitReconnect(ctx, err); reconnectErr != nil {
+				runErr = reconnectErr
 				break
 			}
 			continue
@@ -139,6 +152,8 @@ func (r *Runner) Run(ctx context.Context) error {
 		if generationErr == nil {
 			generationErr = runnerError(r)
 		}
+		// After group.Wait, this snapshot is the only reader window for the
+		// generation result. The later repair write-back remains a separate lock.
 		r.mu.Lock()
 		reconnectCause := r.reconnectCause
 		consumerError := r.consumerError
@@ -181,13 +196,8 @@ func (r *Runner) Run(ctx context.Context) error {
 			reconnectCause = errClientReconnecting
 		}
 		r.transitionToReconnecting()
-		attempt, requestErr := r.client.requestReconnect(reconnectCause)
-		if requestErr != nil {
-			runErr = requestErr
-			break
-		}
-		if waitErr := r.client.waitReconnect(ctx, attempt); waitErr != nil {
-			runErr = waitErr
+		if reconnectErr := r.requestAndWaitReconnect(ctx, reconnectCause); reconnectErr != nil {
+			runErr = reconnectErr
 			break
 		}
 	}
@@ -199,6 +209,14 @@ func (r *Runner) Run(ctx context.Context) error {
 		runErr = errors.Join(runErr, shutdownErr)
 	}
 	return runErr
+}
+
+func (r *Runner) requestAndWaitReconnect(ctx context.Context, cause error) error {
+	attempt, err := r.client.requestReconnect(cause)
+	if err != nil {
+		return err
+	}
+	return r.client.waitReconnect(ctx, attempt)
 }
 
 // beginRunnerGeneration resets the per-generation runner state at the top of
@@ -232,6 +250,8 @@ func beginRunnerGeneration(r *Runner, runCtx context.Context, cancel context.Can
 	r.mu.Unlock()
 	return group
 }
+
+// --- Dispatch and scheduling ---
 
 func runDispatchPipeline(r *Runner, ctx context.Context, deliveries <-chan delivery) error {
 	scheduler, err := newRunnerScheduler(r)
@@ -298,16 +318,18 @@ func schedulerHasItems(scheduler *sched.Scheduler) bool {
 	return scheduler != nil && scheduler.Pending() > 0
 }
 
+// newRunnerScheduler converts fairness weights into lane capacity and applies
+// the retry divisor and prefetch factor without changing the scheduling graph.
 func newRunnerScheduler(r *Runner) (*sched.Scheduler, error) {
 	weights := r.subscription.Fairness.Weights
 	budgets := r.subscription.Fairness.Budgets
 	divisor := r.subscription.Fairness.RetryWeightDivisor
 	if divisor < 1 {
-		divisor = 2
+		divisor = defaultRetryWeightDivisor
 	}
 	factor := r.subscription.Fairness.PrefetchFactor
 	if factor < 1 {
-		factor = 2
+		factor = defaultPrefetchFactor
 	}
 	type laneMeta struct {
 		group  string
@@ -336,7 +358,7 @@ func newRunnerScheduler(r *Runner) (*sched.Scheduler, error) {
 					if laneWeight < 1 {
 						laneWeight = 1
 					}
-					laneBudget *= 2
+					laneBudget *= retryBudgetMultiplier
 				}
 				meta[laneID] = laneMeta{group: group, weight: laneWeight, budget: laneBudget}
 				if _, exists := groups[group]; !exists {
@@ -358,8 +380,8 @@ func newRunnerScheduler(r *Runner) (*sched.Scheduler, error) {
 	for _, id := range ids {
 		lane := meta[id]
 		capacity := (r.subscription.Concurrency*lane.weight + totalWeight - 1) / totalWeight
-		if capacity < 2 {
-			capacity = 2
+		if capacity < minimumLaneCapacity {
+			capacity = minimumLaneCapacity
 		}
 		capacity *= factor
 		specs = append(specs, sched.LaneSpec{ID: id, Group: lane.group, Weight: lane.weight, Budget: lane.budget, Capacity: capacity})
@@ -808,6 +830,8 @@ func consumeRunnerErrors(r *Runner, ctx context.Context) error {
 	}
 }
 
+// --- Intake and cancellation ---
+
 func fetchRunner(r *Runner, ctx context.Context, dispatch chan<- delivery) error {
 	r.mu.Lock()
 	consumer := r.consumer
@@ -819,6 +843,8 @@ func fetchRunner(r *Runner, ctx context.Context, dispatch chan<- delivery) error
 			return fetchRunnerAfterCancel(r, ctx, messages, dispatch)
 		case message, ok := <-messages:
 			if !ok {
+				// The generation barrier owns cancellation; fetchRunner reads the
+				// generation's r.cancel instead of closing it from the consumer path.
 				if r.cancel != nil {
 					r.cancel()
 				}
@@ -895,6 +921,8 @@ func enqueueDelivery(r *Runner, ctx context.Context, dispatch chan<- delivery, m
 	}
 }
 
+// --- Handler invocation and delivery processing ---
+
 func processDelivery(r *Runner, ctx context.Context, item delivery) {
 	abandoned := false
 	state := &deliveryState{id: item.id}
@@ -969,6 +997,8 @@ func retryDeliverySettlement(r *Runner, ctx context.Context, message driver.Inbo
 	}
 }
 
+// dispatchMessage returns true only after the delivery's settlement path has
+// completed; classification and settlement stay outside middleware.
 func dispatchMessage(r *Runner, ctx context.Context, message driver.InboundMessage, envelopeOut *Envelope, abandoned *bool, states ...*deliveryState) bool {
 	state := stateFor(states)
 	headers := inboundHeaders(message.Headers)
@@ -1063,7 +1093,7 @@ type handlerResult struct {
 func invokeHandler(r *Runner, parent context.Context, handler Handler, event *Event) handlerResult {
 	timeout := r.subscription.HandlerTimeout
 	if timeout <= 0 {
-		timeout = 30 * time.Second
+		timeout = defaultHandlerTimeout
 	}
 	r.mu.Lock()
 	base := r.handlerCtx //nolint:contextcheck // handlerCtx is derived from the Run context and survives the drain grace window.
@@ -1076,6 +1106,8 @@ func invokeHandler(r *Runner, parent context.Context, handler Handler, event *Ev
 	handlerCtx, cancel := context.WithTimeout(base, timeout)
 	defer cancel()
 	done := make(chan handlerResult, 1)
+	// Normal runs attach handlers to asyncGroup; direct tests and pre-Run
+	// dispatch use the generation group, then a local fallback if neither exists.
 	r.mu.Lock()
 	group := r.asyncGroup
 	if group == nil {
@@ -1103,7 +1135,7 @@ func invokeHandler(r *Runner, parent context.Context, handler Handler, event *Ev
 		done <- result
 		return nil
 	})
-	stuck := r.client.options.clock.Timer(timeout * 2)
+	stuck := r.client.options.clock.Timer(timeout * stuckPhaseMultiplier)
 	defer stuck.Stop()
 	parentDone := parent.Done()
 	if draining {
@@ -1113,6 +1145,8 @@ func invokeHandler(r *Runner, parent context.Context, handler Handler, event *Ev
 	if shutdownCtx != nil {
 		shutdownDone = shutdownCtx.Done()
 	}
+	// The first explicit 2x phase warns; only after it completes does the
+	// second explicit 2x phase begin, making the terminal threshold cumulative 4x.
 	select {
 	case result := <-done:
 		return result
@@ -1121,10 +1155,12 @@ func invokeHandler(r *Runner, parent context.Context, handler Handler, event *Ev
 	case <-shutdownDone:
 		return handlerResult{stuck: true}
 	case <-stuck.C:
-		lastResortRunnerLogger(r).Warn("f1 stuck worker", "subscription", r.subscription.Name, "threshold", 2*timeout)
+		lastResortRunnerLogger(r).Warn("f1 stuck worker", "subscription", r.subscription.Name, "threshold", stuckPhaseMultiplier*timeout)
 	}
-	stackTimer := r.client.options.clock.Timer(timeout * 2)
+	stackTimer := r.client.options.clock.Timer(timeout * stuckPhaseMultiplier)
 	defer stackTimer.Stop()
+	// Keep result, parent cancellation, shutdown cancellation, and timer order
+	// explicit: this is the second sequential stuck phase.
 	select {
 	case result := <-done:
 		return result
@@ -1133,10 +1169,12 @@ func invokeHandler(r *Runner, parent context.Context, handler Handler, event *Ev
 	case <-shutdownDone:
 		return handlerResult{stuck: true}
 	case <-stackTimer.C:
-		lastResortRunnerLogger(r).Error("f1 worker exceeded stuck threshold", "subscription", r.subscription.Name, "threshold", 4*timeout)
+		lastResortRunnerLogger(r).Error("f1 worker exceeded stuck threshold", "subscription", r.subscription.Name, "threshold", stuckAbortMultiplier*timeout)
 		return handlerResult{stuck: true}
 	}
 }
+
+// --- Settlement primitives ---
 
 func ackDelivery(r *Runner, ctx context.Context, message driver.InboundMessage, states ...*deliveryState) bool {
 	return ackDeliveryAs(r, ctx, message, lifecycle.Handled, states...)
@@ -1234,6 +1272,8 @@ func deadLetter(r *Runner, ctx context.Context, message driver.InboundMessage, e
 	runnerNotifyDeadLetter(r, runnerSettlementContext(r, ctx), DeadLettered{Envelope: death, Body: append([]byte(nil), message.Body...), Reason: reason, Attempt: death.Attempt, LastErr: lastErr, Destination: destination})
 	return nil
 }
+
+// --- Successor publishing ---
 
 // maxSuccessorPublishAttempts bounds how many times the SDK retries
 // publishing a retry or dead-letter successor before treating the
@@ -1371,10 +1411,7 @@ func stopRunnerConsumer(r *Runner, ctx context.Context) error {
 	if consumer == nil {
 		return nil
 	}
-	if err := consumer.Stop(ctx); err != nil {
-		return err
-	}
-	return nil
+	return consumer.Stop(ctx)
 }
 
 func releaseRunnerConsumer(r *Runner, ctx context.Context) error {
@@ -1384,16 +1421,16 @@ func releaseRunnerConsumer(r *Runner, ctx context.Context) error {
 	if consumer == nil {
 		return nil
 	}
-	if err := consumer.Release(ctx); err == nil {
-		return nil
-	} else if !errors.Is(err, driver.ErrUnsupported) {
-		return err
-	} else {
-		// There is no safe fallback: this path has an unsettled delivery, so
-		// Stop is forbidden. A driver without Release support cannot recover it.
+	err := consumer.Release(ctx)
+	if err != nil && !errors.Is(err, driver.ErrUnsupported) {
 		return err
 	}
+	// There is no safe fallback: this path has an unsettled delivery, so
+	// Stop is forbidden. A driver without Release support cannot recover it.
+	return err
 }
+
+// --- Shared utilities ---
 
 func matchHandler(handlers map[string]Handler, eventType string) Handler {
 	if handler := handlers[eventType]; handler != nil {
@@ -1446,8 +1483,8 @@ func truncateError(err error) string {
 		return ""
 	}
 	value := err.Error()
-	if len(value) > 4<<10 {
-		return value[:4<<10]
+	if len(value) > deathErrorCap {
+		return value[:deathErrorCap]
 	}
 	return value
 }
@@ -1500,6 +1537,8 @@ func destinationScope(source string, sub Subscription) []string {
 	return result
 }
 
+// --- Topology and destination naming ---
+
 func subscriptionTopologySpecs(effective driver.Capabilities, source string, sub Subscription) driver.TopologySpec {
 	result := driver.TopologySpec{Effective: effective, Scope: destinationScope(source, sub)}
 	seen := make(map[string]struct{})
@@ -1536,7 +1575,7 @@ func subscriptionTopologySpecs(effective driver.Capabilities, source string, sub
 				route = &driver.Route{Key: backstop}
 				// Headroom over the core's own ladder: the core dead-letters
 				// first, so this firing at all means the two disagree.
-				limit = sub.Retry.MaxAttempts + 5
+				limit = sub.Retry.MaxAttempts + topologyDeliveryLimitHeadroom
 			}
 			add(driver.DestinationSpec{Name: main, Kind: driver.DestMain, Durable: true, DeadLetter: route, DeliveryLimit: limit})
 			if isFanoutEntryPoint(effective) {

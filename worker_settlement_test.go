@@ -21,12 +21,16 @@ type scriptedNackSettler struct {
 	nackCalls   int
 	ackCalls    int
 	outstanding bool
+	onAck       func()
 }
 
 func (s *scriptedNackSettler) Ack(context.Context) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.ackCalls++
+	if s.onAck != nil {
+		s.onAck()
+	}
 	return nil
 }
 
@@ -47,6 +51,12 @@ func (s *scriptedNackSettler) state() (nacks, acks int, outstanding bool) {
 	defer s.mu.Unlock()
 	return s.nackCalls, s.ackCalls, s.outstanding
 }
+
+type classificationPanicError struct{}
+
+func (classificationPanicError) Error() string { return "classification panic" }
+
+func (classificationPanicError) Is(error) bool { panic("classification panic") }
 
 func newSettlementOrderingRunner(t *testing.T) (*Client, *Runner, *dispatchConsumer) {
 	t.Helper()
@@ -69,6 +79,67 @@ func newSettlementOrderingRunner(t *testing.T) (*Client, *Runner, *dispatchConsu
 	runner.consumer = consumer
 	runner.accounting = lifecycle.NewAccounting(runner.inflight.registry)
 	return client, runner, consumer
+}
+
+func TestProcessDeliveryRecoversClassificationPanic(t *testing.T) {
+	producer := &dispatchProducer{}
+	client, err := New(context.Background(), testClientConfig(t),
+		WithDriver(&dispatchDriver{conn: &dispatchConn{producer: producer}}),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = client.Close(context.Background()) })
+
+	runner := &Runner{
+		client: client,
+		subscription: Subscription{
+			Name:           "orders",
+			Retry:          RetryConfig{MaxAttempts: 2},
+			HandlerTimeout: time.Second,
+			Handlers: map[string]Handler{
+				"orders.created": HandlerFunc(func(context.Context, *Event) error {
+					return classificationPanicError{}
+				}),
+			},
+		},
+		inflight: newInflightRegistry(),
+	}
+	runner.accounting = lifecycle.NewAccounting(runner.inflight.registry)
+	envelope := Envelope{SpecVersion: "1.0", ID: "classification-panic", Source: "/test/orders", Type: "orders.created", Attempt: 1}
+	headers, err := envelope.EncodeHeaders(CoreMaxHeaderBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	seenPublishBeforeAck := false
+	settler := &scriptedNackSettler{onAck: func() {
+		producer.mu.Lock()
+		seenPublishBeforeAck = len(producer.messages) == 1
+		producer.mu.Unlock()
+	}}
+	message := driver.InboundMessage{
+		Destination: "f1.test.orders.created.normal",
+		Headers:     headerSlice(headers),
+		Body:        []byte(`{}`),
+		Settle:      settler,
+	}
+	id := runner.inflight.Add(message)
+	processDelivery(runner, context.Background(), delivery{id: id, message: message})
+
+	nacks, acks, outstanding := settler.state()
+	if nacks != 0 || acks != 1 || outstanding {
+		t.Fatalf("settlement calls = nacks %d, acks %d, outstanding %v; want one ack and no nack", nacks, acks, outstanding)
+	}
+	if !seenPublishBeforeAck {
+		t.Fatal("panic DLQ copy was not published before the original was acked")
+	}
+	if len(producer.messages) != 1 || headerValue(producer.messages[0].Headers, "f1deathreason") != ReasonPanic.String() {
+		t.Fatalf("DLQ messages = %#v, want one panic message", producer.messages)
+	}
+	counts := runner.inflight.Counts()
+	if runner.inflight.Len() != 0 || counts.settled != 1 {
+		t.Fatalf("inflight after classification panic = len %d counts %#v, want one settled delivery", runner.inflight.Len(), counts)
+	}
 }
 
 // TestDrainSetupKeepsInstalledSettlementContextLive pins the context

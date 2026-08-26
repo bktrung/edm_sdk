@@ -240,6 +240,55 @@ func newReconnectTestClient(t *testing.T, d *reconnectTestDriver, c clock.Clock,
 	return client
 }
 
+func TestRequestAndWaitReconnectPrefersRequestError(t *testing.T) {
+	driver := &reconnectTestDriver{created: make(chan *reconnectTestConsumer, 1)}
+	client := newReconnectTestClient(t, driver, nil, 0)
+	requestErr := errors.New("request reconnect failed")
+	client.mu.Lock()
+	client.reconnectErr = requestErr
+	client.mu.Unlock()
+
+	runner := &Runner{client: client}
+	if err := runner.requestAndWaitReconnect(context.Background(), errors.New("cause")); !errors.Is(err, requestErr) {
+		t.Fatalf("requestAndWaitReconnect() = %v, want request error %v", err, requestErr)
+	}
+	client.mu.Lock()
+	defer client.mu.Unlock()
+	if client.reconnect != nil {
+		t.Fatal("request error unexpectedly created a reconnect attempt")
+	}
+}
+
+func TestRequestAndWaitReconnectWaitsAfterSuccessfulRequest(t *testing.T) {
+	driver := &reconnectTestDriver{created: make(chan *reconnectTestConsumer, 1)}
+	client := newReconnectTestClient(t, driver, nil, 0)
+	attempt := &reconnectAttempt{done: make(chan struct{})}
+	client.mu.Lock()
+	client.reconnecting = true
+	client.reconnect = attempt
+	client.mu.Unlock()
+
+	wantErr := errors.New("reconnect wait failed")
+	result := make(chan error, 1)
+	go func() {
+		result <- (&Runner{client: client}).requestAndWaitReconnect(context.Background(), errors.New("cause"))
+	}()
+	select {
+	case err := <-result:
+		t.Fatalf("requestAndWaitReconnect() returned before reconnect completion: %v", err)
+	case <-clock.NewReal().Timer(20 * time.Millisecond).C:
+	}
+	client.finishReconnect(attempt, wantErr)
+	select {
+	case err := <-result:
+		if !errors.Is(err, wantErr) {
+			t.Fatalf("requestAndWaitReconnect() = %v, want wait error %v", err, wantErr)
+		}
+	case <-clock.NewReal().Timer(time.Second).C:
+		t.Fatal("requestAndWaitReconnect() did not return after reconnect completion")
+	}
+}
+
 func waitReconnectCondition(t *testing.T, condition func() bool) {
 	t.Helper()
 	realClock := clock.NewReal()

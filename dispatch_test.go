@@ -1,8 +1,10 @@
 package f1
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"log/slog"
 	"strings"
 	"sync"
 	"testing"
@@ -219,6 +221,83 @@ func TestNonCooperativeHandlerIsReportedAsStuck(t *testing.T) {
 	if !result.stuck {
 		t.Fatalf("invokeHandler() = %#v, want stuck result", result)
 	}
+}
+
+func TestInvokeHandlerReportsSequentialStuckThresholds(t *testing.T) {
+	fake := clock.NewFake(time.Unix(0, 0))
+	var output bytes.Buffer
+	client, err := New(context.Background(), testClientConfig(t),
+		WithDriver(&dispatchDriver{conn: &dispatchConn{producer: &dispatchProducer{}}}),
+		WithClock(fake),
+		WithLogger(slog.New(slog.NewTextHandler(&output, nil))),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = client.Close(context.Background()) })
+
+	const timeout = 10 * time.Millisecond
+	release := make(chan struct{})
+	exited := make(chan struct{})
+	var releaseOnce sync.Once
+	releaseHandler := func() { releaseOnce.Do(func() { close(release) }) }
+	t.Cleanup(func() {
+		releaseHandler()
+		select {
+		case <-exited:
+		case <-clock.NewReal().Timer(time.Second).C:
+			t.Error("stuck handler did not exit after release")
+		}
+	})
+
+	runner := &Runner{
+		client: client,
+		subscription: Subscription{
+			Name:           "orders",
+			HandlerTimeout: timeout,
+		},
+	}
+	result := make(chan handlerResult, 1)
+	go func() {
+		result <- invokeHandler(runner, context.Background(), HandlerFunc(func(context.Context, *Event) error {
+			defer close(exited)
+			<-release
+			return nil
+		}), &Event{})
+	}()
+
+	fake.BlockUntil(1)
+	select {
+	case got := <-result:
+		t.Fatalf("invokeHandler() returned before first stuck phase: %#v", got)
+	default:
+	}
+
+	fake.Advance(2 * timeout)
+	fake.BlockUntil(1)
+	if got := strings.Count(output.String(), "f1 stuck worker"); got != 1 {
+		t.Fatalf("stuck warning count after first phase = %d, want 1; output=%q", got, output.String())
+	}
+	select {
+	case got := <-result:
+		t.Fatalf("invokeHandler() returned after first stuck phase: %#v", got)
+	default:
+	}
+
+	fake.Advance(2 * timeout)
+	select {
+	case got := <-result:
+		if !got.stuck {
+			t.Fatalf("invokeHandler() result = %#v, want stuck", got)
+		}
+	case <-clock.NewReal().Timer(time.Second).C:
+		t.Fatal("invokeHandler() did not return after cumulative 4x threshold")
+	}
+	if got := strings.Count(output.String(), "f1 worker exceeded stuck threshold"); got != 1 {
+		t.Fatalf("stuck error count after second phase = %d, want 1; output=%q", got, output.String())
+	}
+	releaseHandler()
+	<-exited
 }
 
 func TestProducerAttemptCapDoesNotCreateZeroRetryTier(t *testing.T) {
