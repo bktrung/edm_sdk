@@ -20,6 +20,15 @@ func assertCancelled(t *testing.T, operation string, err error) {
 	}
 }
 
+func (g *groupContext) maintenance(t *testing.T) driver.Maintenance {
+	t.Helper()
+	maintenance, ok := g.conn.Admin().(driver.Maintenance)
+	if !ok {
+		g.Skip(t, g.currentCheck, "driver.Maintenance is not implemented")
+	}
+	return maintenance
+}
+
 const (
 	waitTimeout  = 5 * time.Second
 	waitInterval = 5 * time.Millisecond
@@ -47,7 +56,7 @@ func newProducer(t *testing.T, group *groupContext, destination string, config d
 		}
 	})
 	t.Cleanup(func() {
-		if _, err := group.conn.Admin().Purge(group.ctx, destination); err != nil {
+		if err := purgeIfSupported(group.ctx, group.conn, destination); err != nil {
 			t.Errorf("purge destination %q: %v", destination, err)
 		}
 	})

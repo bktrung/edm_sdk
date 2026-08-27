@@ -23,6 +23,7 @@ var farFuture = time.Date(2100, time.January, 1, 0, 0, 0, 0, time.UTC)
 func runTopology(group *groupContext) {
 	runTopologyPolicyChecks(group)
 	group.Check("EnsureTopology creates missing destinations", func(t *testing.T) {
+		maintenance := group.maintenance(t)
 		admin := group.conn.Admin()
 		// Suffixed by profile: Run shares one Conn across both profile passes,
 		// so a fixed name would already exist as Existing on the second pass.
@@ -40,7 +41,7 @@ func runTopology(group *groupContext) {
 		if containsName(diff.ExistingDestinations, name) {
 			t.Fatalf("ExistingDestinations=%v, want %q absent on first creation", diff.ExistingDestinations, name)
 		}
-		cleanupTopologyDestinations(t, admin, group.ctx, name)
+		cleanupTopologyDestinations(t, admin, maintenance, group.ctx, name)
 		// FinalDestination is the profile-independent label: the two profile
 		// passes must record identical vectors, but the actual destination name
 		// is suffixed per profile to stay unique across the shared Conn.
@@ -48,6 +49,7 @@ func runTopology(group *groupContext) {
 	})
 
 	group.Check("EnsureTopology is idempotent on a repeat call", func(t *testing.T) {
+		maintenance := group.maintenance(t)
 		admin := group.conn.Admin()
 		name := "topology.idempotent"
 		spec := driver.TopologySpec{
@@ -58,7 +60,7 @@ func runTopology(group *groupContext) {
 			t.Fatalf("first EnsureTopology(%q): %v", name, err)
 		}
 		t.Cleanup(func() {
-			if _, err := admin.Purge(group.ctx, name); err != nil {
+			if _, err := maintenance.Purge(group.ctx, name); err != nil {
 				t.Errorf("purge destination %q: %v", name, err)
 			}
 		})
@@ -86,6 +88,7 @@ func runTopology(group *groupContext) {
 	})
 
 	group.Check("EnsureTopology reports created and existing destinations together in one call", func(t *testing.T) {
+		maintenance := group.maintenance(t)
 		admin := group.conn.Admin()
 		existing := "topology.mixed.existing"
 		// Suffixed by profile: Run shares one Conn across both profile passes,
@@ -97,7 +100,7 @@ func runTopology(group *groupContext) {
 		}); err != nil {
 			t.Fatalf("EnsureTopology(seed): %v", err)
 		}
-		cleanupTopologyDestinations(t, admin, group.ctx, existing, created)
+		cleanupTopologyDestinations(t, admin, maintenance, group.ctx, existing, created)
 		diff, err := admin.EnsureTopology(group.ctx, driver.TopologySpec{
 			Destinations: []driver.DestinationSpec{{Name: existing}, {Name: created}},
 			Effective:    group.effective,
@@ -115,6 +118,7 @@ func runTopology(group *groupContext) {
 	})
 
 	group.Check("EnsureTopology reports a destination dropped from the spec but still in scope", func(t *testing.T) {
+		maintenance := group.maintenance(t)
 		admin := group.conn.Admin()
 		kept := "topology.orphan.under.high"
 		dropped := "topology.orphan.under.low"
@@ -128,7 +132,7 @@ func runTopology(group *groupContext) {
 		}
 		t.Cleanup(func() {
 			for _, name := range []string{kept, dropped} {
-				if _, err := admin.Purge(group.ctx, name); err != nil {
+				if _, err := maintenance.Purge(group.ctx, name); err != nil {
 					t.Errorf("purge destination %q: %v", name, err)
 				}
 			}
@@ -151,6 +155,7 @@ func runTopology(group *groupContext) {
 	})
 
 	group.Check("EnsureTopology does not report a destination outside the requested scope", func(t *testing.T) {
+		maintenance := group.maintenance(t)
 		admin := group.conn.Admin()
 		inSpec := "topology.orphan.over.sub1.main"
 		droppedInScope := "topology.orphan.over.sub1.retry"
@@ -163,7 +168,7 @@ func runTopology(group *groupContext) {
 		}
 		t.Cleanup(func() {
 			for _, name := range []string{inSpec, droppedInScope, siblingOutsideScope} {
-				if _, err := admin.Purge(group.ctx, name); err != nil {
+				if _, err := maintenance.Purge(group.ctx, name); err != nil {
 					t.Errorf("purge destination %q: %v", name, err)
 				}
 			}
@@ -192,6 +197,7 @@ func runTopology(group *groupContext) {
 	})
 
 	group.Check("EnsureTopology scope prefix matches only at a component boundary", func(t *testing.T) {
+		maintenance := group.maintenance(t)
 		admin := group.conn.Admin()
 		inSpec := "topology.orphan.boundary.worker.main"
 		continuation := "topology.orphan.boundary.worker-v2.main"
@@ -204,7 +210,7 @@ func runTopology(group *groupContext) {
 		}
 		t.Cleanup(func() {
 			for _, name := range []string{inSpec, continuation, droppedInScope} {
-				if _, err := admin.Purge(group.ctx, name); err != nil {
+				if _, err := maintenance.Purge(group.ctx, name); err != nil {
 					t.Errorf("purge destination %q: %v", name, err)
 				}
 			}
@@ -248,6 +254,7 @@ func runTopology(group *groupContext) {
 	})
 
 	group.Check("EnsureTopology with an empty scope disables orphan scanning", func(t *testing.T) {
+		maintenance := group.maintenance(t)
 		admin := group.conn.Admin()
 		kept := "topology.orphan.noscan.kept"
 		dropped := "topology.orphan.noscan.dropped"
@@ -261,7 +268,7 @@ func runTopology(group *groupContext) {
 		}
 		t.Cleanup(func() {
 			for _, name := range []string{kept, dropped} {
-				if _, err := admin.Purge(group.ctx, name); err != nil {
+				if _, err := maintenance.Purge(group.ctx, name); err != nil {
 					t.Errorf("purge destination %q: %v", name, err)
 				}
 			}
@@ -298,6 +305,7 @@ func runTopology(group *groupContext) {
 	})
 
 	group.Check("EnsureTopology folds deferred messages into an orphaned destination's message count", func(t *testing.T) {
+		maintenance := group.maintenance(t)
 		admin := group.conn.Admin()
 		kept := "topology.orphan.aux.kept"
 		dropped := "topology.orphan.aux.dropped"
@@ -311,7 +319,7 @@ func runTopology(group *groupContext) {
 		}
 		t.Cleanup(func() {
 			for _, name := range []string{kept, dropped} {
-				if _, err := admin.Purge(group.ctx, name); err != nil {
+				if _, err := maintenance.Purge(group.ctx, name); err != nil {
 					t.Errorf("purge destination %q: %v", name, err)
 				}
 			}
@@ -351,7 +359,7 @@ func runTopology(group *groupContext) {
 
 	group.Check("DescribeTopology reports depth including deferred messages", func(t *testing.T) {
 		admin := group.conn.Admin()
-		name := "topology.describe.depth"
+		name := "topology.describe.depth." + group.profile.String()
 		producer := newProducer(t, group, name, driver.ProducerConfig{Effective: group.effective})
 		if err := producer.Publish(group.ctx, driver.OutboundMessage{Destination: name}); err != nil {
 			t.Fatalf("Publish(%q): %v", name, err)
@@ -375,10 +383,11 @@ func runTopology(group *groupContext) {
 		if !ok || depth != 3 {
 			t.Fatalf("Depth[%q]=(%d,%t), want (3,true) (ready + deferred)", name, depth, ok)
 		}
-		group.vector.Add(BehaviorEvent{ID: "topology-describe-depth", Outcome: "counted", FinalDestination: name})
+		group.vector.Add(BehaviorEvent{ID: "topology-describe-depth", Outcome: "counted", FinalDestination: "topology.describe.depth"})
 	})
 
 	group.Check("Prune refuses a destination that still holds ready messages", func(t *testing.T) {
+		maintenance := group.maintenance(t)
 		admin := group.conn.Admin()
 		nonEmpty := "topology.prune.ready"
 		eligible := "topology.prune.ready.eligible"
@@ -396,7 +405,7 @@ func runTopology(group *groupContext) {
 			view := inspectDestination(t, group, nonEmpty)
 			return view.Ready == 1, fmt.Sprintf("view=%+v", view)
 		})
-		results, err := admin.Prune(group.ctx, []string{nonEmpty, eligible})
+		results, err := maintenance.Prune(group.ctx, []string{nonEmpty, eligible})
 		if err != nil {
 			t.Fatalf("Prune(): %v", err)
 		}
@@ -415,6 +424,7 @@ func runTopology(group *groupContext) {
 	})
 
 	group.Check("Prune refuses an empty destination whose park still holds messages", func(t *testing.T) {
+		maintenance := group.maintenance(t)
 		admin := group.conn.Admin()
 		parked := "topology.prune.park"
 		eligible := "topology.prune.park.eligible"
@@ -434,7 +444,7 @@ func runTopology(group *groupContext) {
 			view := inspectDestination(t, group, parked)
 			return view.Ready == 0 && view.Auxiliary == 1, fmt.Sprintf("view=%+v", view)
 		})
-		results, err := admin.Prune(group.ctx, []string{parked, eligible})
+		results, err := maintenance.Prune(group.ctx, []string{parked, eligible})
 		if err != nil {
 			t.Fatalf("Prune(): %v", err)
 		}
@@ -450,6 +460,7 @@ func runTopology(group *groupContext) {
 	})
 
 	group.Check("Prune refuses a destination with an attached consumer", func(t *testing.T) {
+		maintenance := group.maintenance(t)
 		admin := group.conn.Admin()
 		attached := "topology.prune.consumer"
 		eligible := "topology.prune.consumer.eligible"
@@ -460,7 +471,7 @@ func runTopology(group *groupContext) {
 			t.Fatalf("EnsureTopology(seed): %v", err)
 		}
 		_ = newConsumer(t, group, attached, 1)
-		results, err := admin.Prune(group.ctx, []string{attached, eligible})
+		results, err := maintenance.Prune(group.ctx, []string{attached, eligible})
 		if err != nil {
 			t.Fatalf("Prune(): %v", err)
 		}
@@ -475,9 +486,9 @@ func runTopology(group *groupContext) {
 	})
 
 	group.Check("Prune on an unknown destination reports not-deleted without erroring", func(t *testing.T) {
-		admin := group.conn.Admin()
+		maintenance := group.maintenance(t)
 		name := "topology.prune.missing"
-		results, err := admin.Prune(group.ctx, []string{name})
+		results, err := maintenance.Prune(group.ctx, []string{name})
 		if err != nil {
 			t.Fatalf("Prune(%q): %v", name, err)
 		}
@@ -489,6 +500,7 @@ func runTopology(group *groupContext) {
 	})
 
 	group.Check("Purge empties a destination and keeps it", func(t *testing.T) {
+		maintenance := group.maintenance(t)
 		admin := group.conn.Admin()
 		name := "topology.purge"
 		producer := newProducer(t, group, name, driver.ProducerConfig{Effective: group.effective})
@@ -502,7 +514,7 @@ func runTopology(group *groupContext) {
 			view := inspectDestination(t, group, name)
 			return view.Ready == 2, fmt.Sprintf("view=%+v", view)
 		})
-		purged, err := admin.Purge(group.ctx, name)
+		purged, err := maintenance.Purge(group.ctx, name)
 		if err != nil {
 			t.Fatalf("Purge(%q): %v", name, err)
 		}
@@ -534,6 +546,7 @@ func runTopology(group *groupContext) {
 	})
 
 	group.Check("cancelled context prevents topology admin calls without a partial effect", func(t *testing.T) {
+		maintenance := group.maintenance(t)
 		admin := group.conn.Admin()
 		name := "topology.cancel"
 		newName := "topology.cancel.new"
@@ -544,14 +557,14 @@ func runTopology(group *groupContext) {
 			t.Fatalf("EnsureTopology(seed): %v", err)
 		}
 		t.Cleanup(func() {
-			if _, err := admin.Purge(group.ctx, name); err != nil {
+			if _, err := maintenance.Purge(group.ctx, name); err != nil {
 				t.Errorf("purge destination %q: %v", name, err)
 			}
 		})
 		t.Cleanup(func() {
 			// Best effort: newName should never exist if the driver is correct,
 			// so a missing-destination error here is expected, not a failure.
-			_, _ = admin.Purge(group.ctx, newName)
+			_, _ = maintenance.Purge(group.ctx, newName)
 		})
 		// Seed a message so the cancelled Purge below has real state to leave
 		// behind: an already-empty destination cannot distinguish "refused"
@@ -577,9 +590,9 @@ func runTopology(group *groupContext) {
 		assertCancelled(t, "EnsureTopology", err)
 		_, err = admin.DescribeTopology(ctx, []string{name})
 		assertCancelled(t, "DescribeTopology", err)
-		_, err = admin.Purge(ctx, name)
+		_, err = maintenance.Purge(ctx, name)
 		assertCancelled(t, "Purge", err)
-		_, err = admin.Prune(ctx, []string{name})
+		_, err = maintenance.Prune(ctx, []string{name})
 		assertCancelled(t, "Prune", err)
 
 		// Positive control: newName must never have been created. This is also
@@ -615,10 +628,10 @@ func containsName(names []string, want string) bool {
 	return false
 }
 
-func cleanupTopologyDestinations(t *testing.T, admin driver.Admin, ctx context.Context, names ...string) {
+func cleanupTopologyDestinations(t *testing.T, admin driver.Admin, maintenance driver.Maintenance, ctx context.Context, names ...string) {
 	t.Helper()
 	t.Cleanup(func() {
-		results, err := admin.Prune(ctx, names)
+		results, err := maintenance.Prune(ctx, names)
 		if err != nil {
 			t.Errorf("prune destinations %v: %v", names, err)
 			return
@@ -661,6 +674,7 @@ func findPruneResult(results []driver.PruneResult, name string) driver.PruneResu
 
 func runTopologyPolicyChecks(group *groupContext) {
 	group.Check("TopologyVerify reports the first missing destination without creating", func(t *testing.T) {
+		maintenance := group.maintenance(t)
 		admin := group.conn.Admin()
 		existing := "topology.verify.existing." + group.profile.String()
 		missing := "topology.verify.missing." + group.profile.String()
@@ -672,7 +686,7 @@ func runTopologyPolicyChecks(group *groupContext) {
 			t.Fatalf("seed topology: %v", err)
 		}
 		t.Cleanup(func() {
-			if _, err := admin.Purge(group.ctx, existing); err != nil {
+			if _, err := maintenance.Purge(group.ctx, existing); err != nil {
 				t.Errorf("purge %q: %v", existing, err)
 			}
 		})
@@ -738,6 +752,7 @@ func runTopologyPolicyChecks(group *groupContext) {
 			group.Skip(t, "FanoutAtConsume ignores bindings", fmt.Sprintf("effective fanout mode %d is not FanoutAtConsume", group.effective.Fanout))
 			return
 		}
+		maintenance := group.maintenance(t)
 		effective := group.effective
 		prefix := "topology.consume-fanout." + group.profile.String()
 		first := prefix + ".first"
@@ -752,7 +767,7 @@ func runTopologyPolicyChecks(group *groupContext) {
 		}
 		t.Cleanup(func() {
 			for _, name := range []string{first, second} {
-				if _, err := group.conn.Admin().Purge(group.ctx, name); err != nil {
+				if _, err := maintenance.Purge(group.ctx, name); err != nil {
 					t.Errorf("purge FanoutAtConsume destination %q: %v", name, err)
 				}
 			}

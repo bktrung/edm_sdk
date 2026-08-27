@@ -45,6 +45,7 @@
     "KindPermission",
     "KindTooLarge",
     "KindTransient",
+    "Maintenance",
     "NackOptions",
     "OrphanedDestination",
     "OutboundMessage",

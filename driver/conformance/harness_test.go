@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"strings"
@@ -85,6 +86,116 @@ func TestRunUsesOneConnectionAndInspector(t *testing.T) {
 	}
 	if len(report.Profiles) != 2 {
 		t.Fatalf("Run returned %d profile reports; want 2", len(report.Profiles))
+	}
+}
+
+func TestTrackedAdminRecordsMaintenanceDestinations(t *testing.T) {
+	raw := &runTestConn{
+		queues:    make(map[string][]driver.OutboundMessage),
+		unsettled: make(map[string]int),
+	}
+	tracked := newTrackedConn(raw)
+	admin, ok := tracked.Admin().(driver.Maintenance)
+	if !ok {
+		t.Fatal("tracked admin does not expose driver.Maintenance")
+	}
+	if _, err := admin.Purge(context.Background(), "tracked.purge"); err != nil {
+		t.Fatalf("Purge: %v", err)
+	}
+	if _, err := admin.Prune(context.Background(), []string{"tracked.prune.a", "tracked.prune.b"}); err != nil {
+		t.Fatalf("Prune: %v", err)
+	}
+	tracked.mu.Lock()
+	defer tracked.mu.Unlock()
+	for _, name := range []string{"tracked.purge", "tracked.prune.a", "tracked.prune.b"} {
+		if _, ok := tracked.touched[name]; !ok {
+			t.Fatalf("tracked destinations = %v, missing %q", tracked.touched, name)
+		}
+	}
+}
+
+func TestMaintenanceLessDriverSkipsMaintenanceChecksLoudly(t *testing.T) {
+	manifest := groupManifest
+	pending := pendingGroups
+	runners := groupRunners
+	groupManifest = []manifestEntry{{name: "topology", declared: 19}}
+	pendingGroups = nil
+	groupRunners = map[string]groupRunner{"topology": runTopology}
+	defer func() {
+		groupManifest = manifest
+		pendingGroups = pending
+		groupRunners = runners
+	}()
+
+	report := Run(t, Suite{
+		Driver: maintenanceLessDriver{},
+		NewInspector: func(raw driver.Conn) (Inspect, error) {
+			wrapped, ok := raw.(*maintenanceLessConn)
+			if !ok {
+				return nil, errors.New("unexpected maintenance-less connection")
+			}
+			return runTestInspector(wrapped.Conn)
+		},
+	})
+	expected := map[string]struct{}{
+		"EnsureTopology creates missing destinations":                                         {},
+		"EnsureTopology is idempotent on a repeat call":                                       {},
+		"EnsureTopology reports created and existing destinations together in one call":       {},
+		"EnsureTopology reports a destination dropped from the spec but still in scope":       {},
+		"EnsureTopology does not report a destination outside the requested scope":            {},
+		"EnsureTopology scope prefix matches only at a component boundary":                    {},
+		"EnsureTopology with an empty scope disables orphan scanning":                         {},
+		"EnsureTopology folds deferred messages into an orphaned destination's message count": {},
+		"Prune refuses a destination that still holds ready messages":                         {},
+		"Prune refuses an empty destination whose park still holds messages":                  {},
+		"Prune refuses a destination with an attached consumer":                               {},
+		"Prune on an unknown destination reports not-deleted without erroring":                {},
+		"Purge empties a destination and keeps it":                                            {},
+		"cancelled context prevents topology admin calls without a partial effect":            {},
+		"TopologyVerify reports the first missing destination without creating":               {},
+		"FanoutAtConsume ignores bindings":                                                    {},
+	}
+	if len(report.Profiles) != 2 {
+		t.Fatalf("maintenance-less report has %d profiles, want 2", len(report.Profiles))
+	}
+	for _, profile := range report.Profiles {
+		if len(profile.Groups) != 1 {
+			t.Fatalf("%s profile has %d groups, want 1", profile.Profile, len(profile.Groups))
+		}
+		group := profile.Groups[0]
+		if group.Name != "topology" || group.Declared != 19 || group.Observed != 19 {
+			t.Fatalf("%s topology result = %+v, want declared and observed 19", profile.Profile, group)
+		}
+		if group.Status != "passed-with-skips" {
+			t.Fatalf("%s topology status = %q, want passed-with-skips", profile.Profile, group.Status)
+		}
+		if len(group.Skipped) != len(expected) {
+			t.Fatalf("%s skipped %d checks, want %d", profile.Profile, len(group.Skipped), len(expected))
+		}
+		seen := make(map[string]struct{}, len(group.Skipped))
+		for _, skipped := range group.Skipped {
+			if _, duplicate := seen[skipped.Name]; duplicate {
+				t.Fatalf("%s recorded duplicate skip %q", profile.Profile, skipped.Name)
+			}
+			seen[skipped.Name] = struct{}{}
+			if _, expected := expected[skipped.Name]; !expected {
+				t.Fatalf("%s recorded unexpected maintenance skip %q", profile.Profile, skipped.Name)
+			}
+			if !strings.Contains(skipped.Reason, "driver.Maintenance") {
+				t.Fatalf("%s skip %q reason = %q, want missing interface", profile.Profile, skipped.Name, skipped.Reason)
+			}
+		}
+		if len(seen) != len(expected) {
+			t.Fatalf("%s recorded %d unique skips, want %d", profile.Profile, len(seen), len(expected))
+		}
+		if len(profile.Vector) != 3 {
+			t.Fatalf("%s vector = %+v, want non-maintenance checks only", profile.Profile, profile.Vector)
+		}
+		for _, event := range profile.Vector {
+			if event.ID != "topology-argument-drift" && event.ID != "topology-none" && event.ID != "topology-describe-depth" {
+				t.Fatalf("%s vector recorded skipped check event %+v", profile.Profile, event)
+			}
+		}
 	}
 }
 
@@ -207,13 +318,39 @@ func (d runTestDriver) Open(context.Context, driver.Config) (driver.Conn, error)
 	return &runTestConn{
 		queues:    make(map[string][]driver.OutboundMessage),
 		unsettled: make(map[string]int),
+		specs:     make(map[string]driver.DestinationSpec),
 	}, nil
+}
+
+type maintenanceLessDriver struct{}
+
+func (maintenanceLessDriver) Name() string                      { return "run-test-without-maintenance" }
+func (maintenanceLessDriver) Capabilities() driver.Capabilities { return driver.Capabilities{} }
+func (maintenanceLessDriver) Open(ctx context.Context, cfg driver.Config) (driver.Conn, error) {
+	conn, err := (runTestDriver{}).Open(ctx, cfg)
+	if err != nil {
+		return nil, err
+	}
+	return &maintenanceLessConn{Conn: conn}, nil
+}
+
+type maintenanceLessConn struct {
+	driver.Conn
+}
+
+func (c *maintenanceLessConn) Admin() driver.Admin {
+	return maintenanceLessAdmin{Admin: c.Conn.Admin()}
+}
+
+type maintenanceLessAdmin struct {
+	driver.Admin
 }
 
 type runTestConn struct {
 	caps      driver.Capabilities
 	queues    map[string][]driver.OutboundMessage
 	unsettled map[string]int
+	specs     map[string]driver.DestinationSpec
 }
 
 func (c *runTestConn) Capabilities() driver.Capabilities { return c.caps }
@@ -262,16 +399,30 @@ func runTestInspector(raw driver.Conn) (Inspect, error) {
 		return nil, errors.New("unexpected fake connection")
 	}
 	return func(_ context.Context, destination string) (BrokerView, error) {
-		return BrokerView{
-			Ready:     int64(len(conn.queues[destination])),
-			Unsettled: int64(conn.unsettled[destination]),
-		}, nil
+		messages, ok := conn.queues[destination]
+		if !ok {
+			return BrokerView{}, &driver.Error{Driver: "run-test", Op: "inspect", K: driver.KindNotFound, Err: driver.ErrDestinationMissing}
+		}
+		var ready, auxiliary int64
+		for _, message := range messages {
+			if !message.DelayUntil.IsZero() {
+				auxiliary++
+				continue
+			}
+			ready++
+		}
+		return BrokerView{Ready: ready, Auxiliary: auxiliary, Unsettled: int64(conn.unsettled[destination])}, nil
 	}, nil
 }
 
 type runTestProducer struct{ conn *runTestConn }
 
 func (p *runTestProducer) Publish(_ context.Context, messages ...driver.OutboundMessage) error {
+	for _, message := range messages {
+		if _, exists := p.conn.queues[message.Destination]; !exists {
+			return &driver.Error{Driver: "run-test", Op: "publish", K: driver.KindNotFound, Err: driver.ErrDestinationMissing}
+		}
+	}
 	for _, message := range messages {
 		p.conn.queues[message.Destination] = append(p.conn.queues[message.Destination], message)
 	}
@@ -353,12 +504,32 @@ type runTestAdmin struct{ conn *runTestConn }
 
 func (a runTestAdmin) EnsureTopology(_ context.Context, spec driver.TopologySpec) (driver.TopologyDiff, error) {
 	var diff driver.TopologyDiff
+	if spec.Policy == driver.TopologyNone {
+		return diff, nil
+	}
+	if spec.Policy == driver.TopologyVerify {
+		for _, destination := range spec.Destinations {
+			declared, exists := a.conn.specs[destination.Name]
+			if !exists {
+				return diff, fmt.Errorf("%s: %w", destination.Name, driver.ErrDestinationMissing)
+			}
+			diff.ExistingDestinations = append(diff.ExistingDestinations, destination.Name)
+			if declared.DeliveryLimit != destination.DeliveryLimit {
+				diff.Drifted = append(diff.Drifted, driver.ArgumentDrift{
+					Name: destination.Name, Argument: "x-delivery-limit",
+					Want: fmt.Sprint(destination.DeliveryLimit), Got: fmt.Sprint(declared.DeliveryLimit),
+				})
+			}
+		}
+		return diff, nil
+	}
 	for _, destination := range spec.Destinations {
 		if _, exists := a.conn.queues[destination.Name]; exists {
 			diff.ExistingDestinations = append(diff.ExistingDestinations, destination.Name)
 			continue
 		}
 		a.conn.queues[destination.Name] = nil
+		a.conn.specs[destination.Name] = destination
 		diff.CreatedDestinations = append(diff.CreatedDestinations, destination.Name)
 	}
 	return diff, nil

@@ -299,7 +299,7 @@ func newDeferredProducer(t *testing.T, group *groupContext, destination string, 
 		}
 	})
 	t.Cleanup(func() {
-		if _, err := group.conn.Admin().Purge(group.ctx, destination); err != nil {
+		if err := purgeIfSupported(group.ctx, group.conn, destination); err != nil {
 			t.Errorf("purge destination %q: %v", destination, err)
 		}
 	})

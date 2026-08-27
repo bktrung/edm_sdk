@@ -210,20 +210,22 @@ func TestStopRejectsOutstandingUntilSettled(t *testing.T) {
 func TestPruneGuards(t *testing.T) {
 	ctx, conn, producer := openTest(t, clock.NewFake(time.Unix(0, 0)),
 		driver.DestinationSpec{Name: "holds"}, driver.DestinationSpec{Name: "attached"}, driver.DestinationSpec{Name: "empty"})
+	maintenance, ok := conn.Admin().(driver.Maintenance)
+	require.True(t, ok)
 	require.NoError(t, producer.Publish(ctx, driver.OutboundMessage{Destination: "holds", Body: []byte("retained")}))
-	results, err := conn.Admin().Prune(ctx, []string{"holds"})
+	results, err := maintenance.Prune(ctx, []string{"holds"})
 	require.NoError(t, err)
 	require.Equal(t, "holds 1 message", results[0].Reason)
 
 	consumer, err := conn.Consumer(ctx, driver.ConsumerConfig{Destinations: []string{"attached"}, Effective: testCaps()})
 	require.NoError(t, err)
-	results, err = conn.Admin().Prune(ctx, []string{"attached"})
+	results, err = maintenance.Prune(ctx, []string{"attached"})
 	require.NoError(t, err)
 	require.Equal(t, "consumer attached", results[0].Reason)
 	require.NoError(t, consumer.Stop(ctx))
 
 	// Inmem has no auxiliary destinations to delete.
-	results, err = conn.Admin().Prune(ctx, []string{"empty"})
+	results, err = maintenance.Prune(ctx, []string{"empty"})
 	require.NoError(t, err)
 	require.True(t, results[0].Deleted)
 	_, err = conn.Consumer(ctx, driver.ConsumerConfig{Destinations: []string{"empty"}, Effective: testCaps()})

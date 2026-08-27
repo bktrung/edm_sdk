@@ -306,7 +306,13 @@ func (c *trackedConn) rememberDestination(name string) {
 }
 
 func (c *trackedConn) Admin() driver.Admin {
-	return &trackedAdmin{Admin: c.Conn.Admin(), owner: c}
+	raw := c.Conn.Admin()
+	base := &trackedAdminBase{Admin: raw, owner: c}
+	maintenance, ok := raw.(driver.Maintenance)
+	if !ok {
+		return &trackedAdminWithoutMaintenance{trackedAdminBase: base}
+	}
+	return &trackedAdmin{trackedAdminBase: base, maintenance: maintenance}
 }
 
 func (c *trackedConn) Producer(ctx context.Context, cfg driver.ProducerConfig) (driver.Producer, error) {
@@ -362,10 +368,12 @@ func (c *trackedConn) cleanup(ctx context.Context) []error {
 			errs = append(errs, err)
 		}
 	}
-	admin := c.Conn.Admin()
-	for _, destination := range destinations {
-		if _, err := admin.Purge(ctx, destination); err != nil && !errors.Is(err, driver.ErrDestinationMissing) {
-			errs = append(errs, err)
+	maintenance, ok := c.Conn.Admin().(driver.Maintenance)
+	if ok {
+		for _, destination := range destinations {
+			if _, err := maintenance.Purge(ctx, destination); err != nil && !errors.Is(err, driver.ErrDestinationMissing) {
+				errs = append(errs, err)
+			}
 		}
 	}
 	for _, producer := range producers {
@@ -429,12 +437,12 @@ func (c *trackedConsumer) Release(ctx context.Context) error {
 	return err
 }
 
-type trackedAdmin struct {
+type trackedAdminBase struct {
 	driver.Admin
 	owner *trackedConn
 }
 
-func (a *trackedAdmin) EnsureTopology(ctx context.Context, spec driver.TopologySpec) (driver.TopologyDiff, error) {
+func (a *trackedAdminBase) EnsureTopology(ctx context.Context, spec driver.TopologySpec) (driver.TopologyDiff, error) {
 	for _, destination := range spec.Destinations {
 		a.owner.rememberDestination(destination.Name)
 	}
@@ -444,23 +452,41 @@ func (a *trackedAdmin) EnsureTopology(ctx context.Context, spec driver.TopologyS
 	return a.Admin.EnsureTopology(ctx, spec)
 }
 
-func (a *trackedAdmin) DescribeTopology(ctx context.Context, names []string) (driver.TopologyState, error) {
+func (a *trackedAdminBase) DescribeTopology(ctx context.Context, names []string) (driver.TopologyState, error) {
 	for _, name := range names {
 		a.owner.rememberDestination(name)
 	}
 	return a.Admin.DescribeTopology(ctx, names)
 }
 
+type trackedAdmin struct {
+	*trackedAdminBase
+	maintenance driver.Maintenance
+}
+
 func (a *trackedAdmin) Purge(ctx context.Context, name string) (int64, error) {
 	a.owner.rememberDestination(name)
-	return a.Admin.Purge(ctx, name)
+	return a.maintenance.Purge(ctx, name)
 }
 
 func (a *trackedAdmin) Prune(ctx context.Context, names []string) ([]driver.PruneResult, error) {
 	for _, name := range names {
 		a.owner.rememberDestination(name)
 	}
-	return a.Admin.Prune(ctx, names)
+	return a.maintenance.Prune(ctx, names)
+}
+
+type trackedAdminWithoutMaintenance struct {
+	*trackedAdminBase
+}
+
+func purgeIfSupported(ctx context.Context, conn driver.Conn, destination string) error {
+	maintenance, ok := conn.Admin().(driver.Maintenance)
+	if !ok {
+		return nil
+	}
+	_, err := maintenance.Purge(ctx, destination)
+	return err
 }
 
 func validateFaultInjector(t *testing.T, ctx context.Context, conn driver.Conn, inject FaultInjector) {
@@ -501,7 +527,7 @@ func validateFaultInjector(t *testing.T, ctx context.Context, conn driver.Conn, 
 		if err := fatalProducer.Close(ctx); err != nil {
 			t.Errorf("conformance: fatal fault producer close: %v", err)
 		}
-		if _, err := conn.Admin().Purge(ctx, fatalDestination); err != nil {
+		if err := purgeIfSupported(ctx, conn, fatalDestination); err != nil {
 			t.Errorf("conformance: fatal fault purge: %v", err)
 		}
 	}()
@@ -549,7 +575,7 @@ func validateFaultLaneClose(t *testing.T, ctx context.Context, conn driver.Conn,
 			t.Errorf("conformance: lane close producer close: %v", err)
 		}
 		for _, destination := range []string{firstDestination, secondDestination} {
-			if _, err := conn.Admin().Purge(ctx, destination); err != nil {
+			if err := purgeIfSupported(ctx, conn, destination); err != nil {
 				t.Errorf("conformance: lane close purge %q: %v", destination, err)
 			}
 		}
@@ -631,7 +657,7 @@ func validateFaultRedelivery(t *testing.T, ctx context.Context, conn driver.Conn
 		if err := producer.Close(ctx); err != nil {
 			t.Errorf("conformance: %s producer close: %v", fault, err)
 		}
-		if _, err := conn.Admin().Purge(ctx, destination); err != nil {
+		if err := purgeIfSupported(ctx, conn, destination); err != nil {
 			t.Errorf("conformance: %s purge: %v", fault, err)
 		}
 	}()
@@ -725,7 +751,7 @@ func validateDeadlineFixture(t *testing.T, ctx context.Context, conn driver.Conn
 		if err := producer.Close(ctx); err != nil {
 			t.Errorf("conformance: deadline fixture close producer: %v", err)
 		}
-		if _, err := conn.Admin().Purge(ctx, destination); err != nil {
+		if err := purgeIfSupported(ctx, conn, destination); err != nil {
 			t.Errorf("conformance: deadline fixture purge: %v", err)
 		}
 	}

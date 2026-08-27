@@ -352,12 +352,30 @@ func (c *captureConn) Admin() driver.Admin {
 	if admin == nil {
 		return nil
 	}
-	return &captureAdmin{Admin: admin, state: c.state}
+	captured := &captureAdmin{Admin: admin, state: c.state}
+	maintenance, ok := admin.(driver.Maintenance)
+	if !ok {
+		return captured
+	}
+	return &captureMaintenanceAdmin{captureAdmin: captured, maintenance: maintenance}
 }
 
 type captureAdmin struct {
 	driver.Admin
 	state *captureState
+}
+
+type captureMaintenanceAdmin struct {
+	*captureAdmin
+	maintenance driver.Maintenance
+}
+
+func (a *captureMaintenanceAdmin) Purge(ctx context.Context, destination string) (int64, error) {
+	return a.maintenance.Purge(ctx, destination)
+}
+
+func (a *captureMaintenanceAdmin) Prune(ctx context.Context, names []string) ([]driver.PruneResult, error) {
+	return a.maintenance.Prune(ctx, names)
 }
 
 func (a *captureAdmin) EnsureTopology(ctx context.Context, spec driver.TopologySpec) (driver.TopologyDiff, error) {

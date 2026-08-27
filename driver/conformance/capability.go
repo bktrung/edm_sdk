@@ -322,7 +322,7 @@ func runCapability(group *groupContext) {
 			if err := first.Stop(group.ctx); err != nil {
 				t.Errorf("stop first exclusive consumer: %v", err)
 			}
-			if _, err := group.conn.Admin().Purge(group.ctx, name); err != nil {
+			if err := purgeIfSupported(group.ctx, group.conn, name); err != nil {
 				t.Errorf("purge exclusive destination: %v", err)
 			}
 		})
@@ -407,6 +407,7 @@ func checkFanoutDeclaration(group *groupContext) {
 		exchange := "capability.fanout." + group.profile.String() + ".exchange"
 		firstDestination := "capability.fanout." + group.profile.String() + ".first"
 		secondDestination := "capability.fanout." + group.profile.String() + ".second"
+		maintenance := group.maintenance(t)
 		if _, err := group.conn.Admin().EnsureTopology(group.ctx, driver.TopologySpec{
 			Exchanges: []driver.ExchangeSpec{{Name: exchange, Kind: "fanout", Durable: true}},
 			Destinations: []driver.DestinationSpec{
@@ -434,7 +435,7 @@ func checkFanoutDeclaration(group *groupContext) {
 		})
 		t.Cleanup(func() {
 			for _, destination := range []string{firstDestination, secondDestination} {
-				if _, err := group.conn.Admin().Purge(group.ctx, destination); err != nil {
+				if _, err := maintenance.Purge(group.ctx, destination); err != nil {
 					t.Errorf("purge fanout probe destination %q: %v", destination, err)
 				}
 			}

@@ -48,6 +48,7 @@ type groupContext struct {
 	injectFactory       func(driver.Conn) (FaultInjector, error)
 	deadline            DeadlineFixture
 	report              *Report
+	currentCheck        string
 }
 
 func (g *groupContext) capability(capability, declared, status, evidence string) {
@@ -67,7 +68,10 @@ func (g *groupContext) Check(name string, fn func(*testing.T)) {
 		return
 	}
 	g.checkNames[name] = struct{}{}
-	if runCheck(g.t, name, fn) {
+	g.currentCheck = name
+	skipped := runCheck(g.t, name, fn)
+	g.currentCheck = ""
+	if skipped {
 		if _, recorded := g.skips[name]; recorded {
 			g.checks++
 			return

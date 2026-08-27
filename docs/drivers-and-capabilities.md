@@ -16,6 +16,14 @@ classDiagram
       +Ping()
       +Close()
     }
+    class Admin {
+      +EnsureTopology()
+      +DescribeTopology()
+    }
+    class Maintenance {
+      +Purge()
+      +Prune()
+    }
     class Producer {
       +Publish()
       +Flush()
@@ -32,13 +40,17 @@ classDiagram
       +Nack()
     }
     Driver --> Conn
+    Conn --> Admin
+    Conn ..> Maintenance : optional type assertion
     Conn --> Producer
     Conn --> Consumer
     Consumer --> Settler
 ```
 
-The interfaces live under [`driver/`](../driver). They are the stable boundary between the core and
-broker adapters.
+The interfaces live under [`driver/`](../driver). `Conn.Admin()` returns the required
+[`driver.Admin`](../driver/driver.go) topology surface. When that value also implements
+[`driver.Maintenance`](../driver/driver.go), callers can type-assert it before using the optional
+destructive operations; `EnsureTopology` and `DescribeTopology` remain available through `Admin`.
 
 ## Capability selection
 

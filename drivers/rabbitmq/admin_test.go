@@ -18,6 +18,11 @@ func TestRabbitMQAdminPruneRefusesNonEmptyParking(t *testing.T) {
 		t.Fatalf("Open: %v", err)
 	}
 	admin := conn.Admin()
+	maintenance, ok := admin.(driver.Maintenance)
+	if !ok {
+		_ = conn.Close(ctx)
+		t.Fatal("Admin does not implement driver.Maintenance")
+	}
 	const destination = "rabbitmq-driver-admin-prune-parking"
 	if _, err := admin.EnsureTopology(ctx, driver.TopologySpec{
 		Destinations: []driver.DestinationSpec{{Name: destination, Durable: true, Delay: time.Hour}},
@@ -42,29 +47,29 @@ func TestRabbitMQAdminPruneRefusesNonEmptyParking(t *testing.T) {
 		_ = conn.Close(ctx)
 		t.Fatalf("Close producer: %v", err)
 	}
-	results, err := admin.Prune(ctx, []string{destination})
+	results, err := maintenance.Prune(ctx, []string{destination})
 	if err != nil {
-		_, _ = admin.Purge(ctx, destination)
+		_, _ = maintenance.Purge(ctx, destination)
 		_ = conn.Close(ctx)
 		t.Fatalf("Prune: %v", err)
 	}
 	if len(results) != 1 || results[0].Deleted || !strings.Contains(results[0].Reason, ".park") {
-		_, _ = admin.Purge(ctx, destination)
+		_, _ = maintenance.Purge(ctx, destination)
 		_ = conn.Close(ctx)
 		t.Fatalf("Prune result = %+v, want a named non-empty parking auxiliary refusal", results)
 	}
 	state, err := admin.DescribeTopology(ctx, []string{destination})
 	if err != nil {
-		_, _ = admin.Purge(ctx, destination)
+		_, _ = maintenance.Purge(ctx, destination)
 		_ = conn.Close(ctx)
 		t.Fatalf("DescribeTopology: %v", err)
 	}
 	if state.Depth[destination] != 1 {
-		_, _ = admin.Purge(ctx, destination)
+		_, _ = maintenance.Purge(ctx, destination)
 		_ = conn.Close(ctx)
 		t.Fatalf("Depth[%q] = %d, want 1 while the park holds the message", destination, state.Depth[destination])
 	}
-	purged, err := admin.Purge(ctx, destination)
+	purged, err := maintenance.Purge(ctx, destination)
 	if err != nil {
 		_ = conn.Close(ctx)
 		t.Fatalf("Purge: %v", err)

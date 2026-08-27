@@ -13,7 +13,11 @@ type adminOperations struct{ conn *conn }
 
 type admin struct{ operations *adminOperations }
 
-var _ driver.Admin = (*admin)(nil)
+var (
+	_ driver.Admin       = (*admin)(nil)
+	_ driver.Maintenance = (*admin)(nil)
+	_ driver.Maintenance = (*adminOperations)(nil)
+)
 
 func (a *admin) EnsureTopology(ctx context.Context, spec driver.TopologySpec) (driver.TopologyDiff, error) {
 	return a.operations.EnsureTopology(ctx, spec)
