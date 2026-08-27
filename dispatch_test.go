@@ -409,19 +409,23 @@ func (d *dispatchDriver) Open(context.Context, driver.Config) (driver.Conn, erro
 }
 
 type dispatchConn struct {
-	mu           sync.Mutex
-	producer     *dispatchProducer
-	consumer     *dispatchConsumer
-	admin        driver.Admin
-	closed       bool
-	closeCalls   int
-	closeStarted chan struct{}
-	closeRelease chan struct{}
+	mu               sync.Mutex
+	producer         *dispatchProducer
+	producerOverride driver.Producer
+	consumer         *dispatchConsumer
+	admin            driver.Admin
+	closed           bool
+	closeCalls       int
+	closeStarted     chan struct{}
+	closeRelease     chan struct{}
 }
 
 func (*dispatchConn) Capabilities() driver.Capabilities { return driver.Capabilities{} }
 func (*dispatchConn) BrokerInfo() driver.BrokerInfo     { return driver.BrokerInfo{Kind: "test"} }
 func (c *dispatchConn) Producer(context.Context, driver.ProducerConfig) (driver.Producer, error) {
+	if c.producerOverride != nil {
+		return c.producerOverride, nil
+	}
 	return c.producer, nil
 }
 

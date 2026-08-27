@@ -49,6 +49,12 @@ type deliveryState struct {
 	// one can be retried in kind rather than guessed at.
 	operation   settlementOperation
 	nackOptions driver.NackOptions
+	poisonDrop  *poisonDropReport
+}
+
+type poisonDropReport struct {
+	envelope Envelope
+	cause    error
 }
 
 // --- Public runner API and generation lifecycle ---
@@ -75,6 +81,7 @@ func (r *Runner) Run(ctx context.Context) error {
 	}
 	r.started = true
 	r.done = make(chan struct{})
+	r.drainStarted = make(chan struct{})
 	r.inflight = newInflightRegistry()
 	r.lifecycle = lifecycle.New()
 	r.accounting = lifecycle.NewAccounting(r.inflight.registry)
@@ -94,6 +101,12 @@ func (r *Runner) Run(ctx context.Context) error {
 	generation := 0
 	var repairCause error
 	for {
+		r.mu.Lock()
+		failed := r.lifecycle != nil && r.lifecycle.State() == lifecycle.Failed
+		r.mu.Unlock()
+		if failed {
+			break
+		}
 		runCtx, cancel = context.WithCancel(ctx)
 		group := beginRunnerGeneration(r, runCtx, cancel)
 
@@ -161,7 +174,12 @@ func (r *Runner) Run(ctx context.Context) error {
 		repairCycleActive := r.repairCycleActive
 		failedRepairCycles := r.failedRepairCycles
 		draining := r.draining
+		failedLifecycle := r.lifecycle != nil && r.lifecycle.State() == lifecycle.Failed
 		r.mu.Unlock()
+		if failedLifecycle {
+			runErr = generationErr
+			break
+		}
 		clientReconnecting := r.client.isReconnecting()
 		if ctx.Err() != nil || draining || (!clientReconnecting && reconnectCause == nil) {
 			runErr = generationErr
@@ -483,6 +501,14 @@ func (r *Runner) Drain(ctx context.Context) error {
 				return err
 			}
 		case lifecycle.Starting:
+		case lifecycle.Failed:
+			r.mu.Unlock()
+			select {
+			case <-done:
+				return runnerError(r)
+			case <-ctx.Done():
+				return ctx.Err()
+			}
 		case lifecycle.Draining, lifecycle.Settling, lifecycle.Flushing:
 		case lifecycle.Closed:
 			r.mu.Unlock()
@@ -492,7 +518,12 @@ func (r *Runner) Drain(ctx context.Context) error {
 			return fmt.Errorf("f1: runner cannot drain from lifecycle state %s", r.lifecycle.State())
 		}
 	}
-	r.draining = true
+	if !r.draining {
+		r.draining = true
+		if r.drainStarted != nil {
+			close(r.drainStarted)
+		}
+	}
 	r.mu.Unlock()
 	if cancel != nil {
 		cancel()
@@ -529,7 +560,13 @@ func (r *Runner) Drain(ctx context.Context) error {
 					case <-timer.C:
 						handlerCancel()
 						if handlerShutdownCancel != nil {
-							handlerShutdownCancel()
+							graceTimer := r.client.options.clock.Timer(grace)
+							defer graceTimer.Stop()
+							select {
+							case <-graceTimer.C:
+								handlerShutdownCancel()
+							case <-done:
+							}
 						}
 					case <-done:
 					}
@@ -785,6 +822,17 @@ func consumeRunnerErrors(r *Runner, ctx context.Context) error {
 	for {
 		select {
 		case <-ctx.Done():
+			select {
+			case err, ok := <-consumer.Errors():
+				if ok && err != nil {
+					kind, classified := driver.Classify(err)
+					if classified && kind == driver.KindFatal {
+						recordFatalConsumerError(r, err)
+						runnerNotifyError(r, context.WithoutCancel(ctx), nil, err)
+					}
+				}
+			default:
+			}
 			return nil
 		case err, ok := <-consumer.Errors():
 			if !ok {
@@ -810,6 +858,12 @@ func consumeRunnerErrors(r *Runner, ctx context.Context) error {
 				r.mu.Unlock()
 			} else {
 				setRunnerError(r, err)
+				if kind == driver.KindFatal {
+					recordFatalConsumerError(r, err)
+					r.mu.Lock()
+					cancel = r.cancel
+					r.mu.Unlock()
+				}
 			}
 			// r.cancel below is about to cancel ctx, so the notification gets its
 			// own detached context: the handler's terminalNotificationTimeout
@@ -822,6 +876,16 @@ func consumeRunnerErrors(r *Runner, ctx context.Context) error {
 			return nil
 		}
 	}
+}
+
+func recordFatalConsumerError(r *Runner, err error) {
+	setRunnerError(r, err)
+	if r.lifecycle != nil {
+		if transitionErr := r.lifecycle.Transition(lifecycle.Failed); transitionErr != nil {
+			setRunnerError(r, errors.Join(err, transitionErr))
+		}
+	}
+	r.client.recordFailedRunner(r, err)
 }
 
 // --- Intake and cancellation ---
@@ -974,11 +1038,18 @@ func retryDeliverySettlement(r *Runner, ctx context.Context, message driver.Inbo
 		case settlementOperationAck:
 			ackDelivery(r, sctx, message, state)
 			if state.settled {
+				reportPendingPoisonDrop(r, sctx, message, state)
 				return
 			}
 			_ = nackDelivery(r, sctx, message, driver.NackOptions{Requeue: true}, state)
+			if state.settled {
+				state.poisonDrop = nil
+			}
 		case settlementOperationNack:
 			_ = nackDelivery(r, sctx, message, state.nackOptions, state)
+			if state.settled {
+				state.poisonDrop = nil
+			}
 		default:
 			return
 		}
@@ -1093,6 +1164,7 @@ func invokeHandler(r *Runner, parent context.Context, handler Handler, event *Ev
 	base := r.handlerCtx //nolint:contextcheck // handlerCtx is derived from the Run context and survives the drain grace window.
 	shutdownCtx := r.handlerShutdownCtx
 	draining := r.draining
+	drainStarted := r.drainStarted
 	if base == nil {
 		base = parent
 	}
@@ -1133,6 +1205,7 @@ func invokeHandler(r *Runner, parent context.Context, handler Handler, event *Ev
 	parentDone := parent.Done()
 	if draining {
 		parentDone = nil
+		drainStarted = nil
 	}
 	var shutdownDone <-chan struct{}
 	if shutdownCtx != nil {
@@ -1140,31 +1213,57 @@ func invokeHandler(r *Runner, parent context.Context, handler Handler, event *Ev
 	}
 	// The first explicit 2x phase warns; only after it completes does the
 	// second explicit 2x phase begin, making the terminal threshold cumulative 4x.
-	select {
-	case result := <-done:
-		return result
-	case <-parentDone:
-		return handlerResult{stuck: true}
-	case <-shutdownDone:
-		return handlerResult{stuck: true}
-	case <-stuck.C:
-		lastResortRunnerLogger(r).Warn("f1 stuck worker", "subscription", r.subscription.Name, "threshold", stuckPhaseMultiplier*timeout)
+firstPhase:
+	for {
+		select {
+		case result := <-done:
+			return result
+		case <-drainStarted:
+			parentDone = nil
+			drainStarted = nil
+		case <-parentDone:
+			if runnerIsDraining(r) {
+				parentDone = nil
+				continue
+			}
+			return handlerResult{stuck: true}
+		case <-shutdownDone:
+			return handlerResult{stuck: true}
+		case <-stuck.C:
+			lastResortRunnerLogger(r).Warn("f1 stuck worker", "subscription", r.subscription.Name, "threshold", stuckPhaseMultiplier*timeout)
+			break firstPhase
+		}
 	}
 	stackTimer := r.client.options.clock.Timer(timeout * stuckPhaseMultiplier)
 	defer stackTimer.Stop()
 	// Keep result, parent cancellation, shutdown cancellation, and timer order
 	// explicit: this is the second sequential stuck phase.
-	select {
-	case result := <-done:
-		return result
-	case <-parentDone:
-		return handlerResult{stuck: true}
-	case <-shutdownDone:
-		return handlerResult{stuck: true}
-	case <-stackTimer.C:
-		lastResortRunnerLogger(r).Error("f1 worker exceeded stuck threshold", "subscription", r.subscription.Name, "threshold", stuckAbortMultiplier*timeout)
-		return handlerResult{stuck: true}
+	for {
+		select {
+		case result := <-done:
+			return result
+		case <-drainStarted:
+			parentDone = nil
+			drainStarted = nil
+		case <-parentDone:
+			if runnerIsDraining(r) {
+				parentDone = nil
+				continue
+			}
+			return handlerResult{stuck: true}
+		case <-shutdownDone:
+			return handlerResult{stuck: true}
+		case <-stackTimer.C:
+			lastResortRunnerLogger(r).Error("f1 worker exceeded stuck threshold", "subscription", r.subscription.Name, "threshold", stuckAbortMultiplier*timeout)
+			return handlerResult{stuck: true}
+		}
 	}
+}
+
+func runnerIsDraining(r *Runner) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.draining
 }
 
 // --- Settlement primitives ---
@@ -1212,10 +1311,51 @@ func nackDelivery(r *Runner, ctx context.Context, message driver.InboundMessage,
 func deadLetterAndSettle(r *Runner, ctx context.Context, message driver.InboundMessage, envelope Envelope, reason DeathReason, lastErr error, states ...*deliveryState) bool {
 	state := stateFor(states)
 	if err := deadLetter(r, ctx, message, envelope, reason, lastErr); err != nil {
+		if reason == ReasonPoison && isMissingDeadLetterRoute(err) {
+			state.poisonDrop = &poisonDropReport{envelope: envelope, cause: err}
+			sctx := runnerSettlementContext(r, ctx)
+			settled := ackDeliveryAs(r, sctx, message, lifecycle.Handled, state)
+			if settled {
+				reportPendingPoisonDrop(r, sctx, message, state)
+			}
+			return settled
+		}
 		failSuccessorHandoff(r, runnerSettlementContext(r, ctx), "dead_letter", eventFromDelivery(r, message, envelope), err)
 		return false
 	}
 	return ackDeliveryAs(r, runnerSettlementContext(r, ctx), message, lifecycle.DeadLettered, state)
+}
+
+func isMissingDeadLetterRoute(err error) bool {
+	if errors.Is(err, driver.ErrDestinationMissing) {
+		return true
+	}
+	kind, classified := driver.Classify(err)
+	return classified && kind == driver.KindNotFound
+}
+
+func reportPoisonDrop(r *Runner, ctx context.Context, message driver.InboundMessage, envelope Envelope, cause error) {
+	dropErr := fmt.Errorf("f1: poison message dropped: event_id=%q destination=%q attempt=%d: no dead-letter route available: %w", envelope.ID, message.Destination, envelope.Attempt, cause)
+	if r.client.options.errorHandler == nil {
+		lastResortRunnerLogger(r).Error("f1 poison message dropped; no dead-letter route",
+			"event_id", envelope.ID,
+			"destination", message.Destination,
+			"attempt", envelope.Attempt,
+			"reason", ReasonPoison,
+			"error", cause,
+		)
+		return
+	}
+	runnerNotifyError(r, ctx, eventFromDelivery(r, message, envelope), dropErr)
+}
+
+func reportPendingPoisonDrop(r *Runner, ctx context.Context, message driver.InboundMessage, state *deliveryState) {
+	if state == nil || state.poisonDrop == nil {
+		return
+	}
+	report := state.poisonDrop
+	state.poisonDrop = nil
+	reportPoisonDrop(r, ctx, message, report.envelope, report.cause)
 }
 
 // deadLetter republishes message to its dead-letter destination, carrying

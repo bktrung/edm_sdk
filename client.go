@@ -29,6 +29,11 @@ type reconnectRequest struct {
 	cause error
 }
 
+type failedSubscription struct {
+	name string
+	err  error
+}
+
 // Client is an eagerly connected messaging client.
 type Client struct {
 	conn           driver.Conn
@@ -56,8 +61,9 @@ type Client struct {
 	// same critical section as that observation closes admission for
 	// core-generated successor publishes, so flush and producer close can
 	// never run against a publish admitted after the wait gave its answer.
-	producerTeardown bool
-	runners          map[*Runner]struct{}
+	producerTeardown    bool
+	runners             map[*Runner]struct{}
+	failedSubscriptions []failedSubscription
 
 	// reconnecting reports connection usability, independently of shutdownStarted.
 	reconnecting bool
@@ -266,7 +272,7 @@ func logCapabilities(c *Client) {
 	}
 }
 
-// Health reports whether the connected broker is reachable.
+// Health reports whether the connected broker and active subscriptions are healthy.
 func (c *Client) Health(ctx context.Context) error {
 	if c == nil {
 		return fmt.Errorf("f1: client is not connected")
@@ -295,7 +301,32 @@ func (c *Client) Health(ctx context.Context) error {
 	}
 	conn := c.conn
 	c.mu.Unlock()
-	return conn.Ping(ctx)
+	if err := conn.Ping(ctx); err != nil {
+		return err
+	}
+	c.mu.Lock()
+	failedErr := failedRunnerHealthLocked(c)
+	c.mu.Unlock()
+	return failedErr
+}
+
+func failedRunnerHealthLocked(c *Client) error {
+	var errs []error
+	for _, failed := range c.failedSubscriptions {
+		if failed.err != nil {
+			errs = append(errs, fmt.Errorf("f1: subscription %s failed: %w", failed.name, failed.err))
+		}
+	}
+	return errors.Join(errs...)
+}
+
+func (c *Client) recordFailedRunner(runner *Runner, err error) {
+	if c == nil || runner == nil || err == nil {
+		return
+	}
+	c.mu.Lock()
+	c.failedSubscriptions = append(c.failedSubscriptions, failedSubscription{name: runner.subscription.Name, err: err})
+	c.mu.Unlock()
 }
 
 // Close drains active work and releases the driver resources. It keeps the

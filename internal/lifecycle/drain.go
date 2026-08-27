@@ -46,28 +46,33 @@ func (m *Machine) Drain(ctx context.Context, cfg Config, hooks Hooks) error {
 		phaseClock = clock.NewReal()
 	}
 	state := m.State()
+	failed := state == Failed
 	if state == Ready || state == Reconnecting {
 		if err := m.Transition(Draining); err != nil {
 			return err
 		}
-	} else if state != Draining {
+	} else if state != Draining && !failed {
 		return errors.New("lifecycle: drain requires ready or draining state")
 	}
-	if hooks.Drain != nil {
+	if !failed && hooks.Drain != nil {
 		if err := runWithTimeout(ctx, cfg.DrainTimeout, hooks.Drain, phaseClock); err != nil {
 			return m.abort(err)
 		}
 	}
-	if err := m.Transition(Settling); err != nil {
-		return err
+	if !failed {
+		if err := m.Transition(Settling); err != nil {
+			return err
+		}
 	}
 	if hooks.WaitSettled != nil {
 		if err := runWithTimeout(ctx, cfg.DrainTimeout, hooks.WaitSettled, phaseClock); err != nil {
 			return m.abort(err)
 		}
 	}
-	if err := m.Transition(Flushing); err != nil {
-		return err
+	if !failed {
+		if err := m.Transition(Flushing); err != nil {
+			return err
+		}
 	}
 	if hooks.Flush != nil {
 		if err := runWithTimeout(ctx, cfg.FlushTimeout, hooks.Flush, phaseClock); err != nil {
@@ -78,6 +83,9 @@ func (m *Machine) Drain(ctx context.Context, cfg Config, hooks Hooks) error {
 		if err := runWithTimeout(ctx, cfg.CloseTimeout, hooks.Close, phaseClock); err != nil {
 			return m.abort(err)
 		}
+	}
+	if failed {
+		return nil
 	}
 	return m.Transition(Closed)
 }

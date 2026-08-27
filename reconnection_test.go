@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -419,6 +420,326 @@ func reconnectMessage(t *testing.T, id string, settler driver.Settler) driver.In
 
 func validReconnectMessage(t *testing.T, id string) driver.InboundMessage {
 	return reconnectMessage(t, id, &reconnectTestSettler{})
+}
+
+func TestFatalConsumerErrorStopsOnlyItsRunner(t *testing.T) {
+	d := &reconnectTestDriver{created: make(chan *reconnectTestConsumer, 8)}
+	recorder := newErrorHandlerRecorder()
+	client := newReconnectTestClient(t, d, nil, 0, WithErrorHandler(recorder.handle))
+
+	fatalRunner, err := client.Subscribe(context.Background(), Subscription{
+		Name:           "fatal",
+		Topics:         []string{"orders.created"},
+		Prefetch:       12,
+		HandlerTimeout: 10 * time.Millisecond,
+		Handlers: map[string]Handler{
+			"orders.created": HandlerFunc(func(context.Context, *Event) error {
+				t.Fatal("fatal subscription handler received a message")
+				return nil
+			}),
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var healthyHandled atomic.Int32
+	healthyRunner, err := client.Subscribe(context.Background(), Subscription{
+		Name:           "healthy",
+		Topics:         []string{"orders.created"},
+		Prefetch:       12,
+		HandlerTimeout: 10 * time.Millisecond,
+		Handlers: map[string]Handler{
+			"orders.created": HandlerFunc(func(context.Context, *Event) error {
+				healthyHandled.Add(1)
+				return nil
+			}),
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	fatalCtx, cancelFatal := context.WithCancel(context.Background())
+	healthyCtx, cancelHealthy := context.WithCancel(context.Background())
+	t.Cleanup(cancelFatal)
+	t.Cleanup(cancelHealthy)
+	fatalDone := make(chan error, 1)
+	healthyDone := make(chan error, 1)
+	go func() { fatalDone <- fatalRunner.Run(fatalCtx) }()
+	go func() { healthyDone <- healthyRunner.Run(healthyCtx) }()
+
+	consumers := make(map[string]*reconnectTestConsumer, 2)
+	timeout := clock.NewReal().Timer(2 * time.Second)
+	defer timeout.Stop()
+	for len(consumers) < 2 {
+		select {
+		case consumer := <-d.created:
+			consumers[consumer.group] = consumer
+		case <-timeout.C:
+			t.Fatal("timed out waiting for both subscription consumers")
+		}
+	}
+	waitReconnectCondition(t, func() bool {
+		return fatalRunner.lifecycle.Ready() && healthyRunner.lifecycle.Ready()
+	})
+
+	cause := &driver.Error{Driver: d.Name(), Op: "consumer", K: driver.KindFatal, Err: errors.New("permission denied")}
+	consumers["fatal"].sendError(cause)
+	waitReconnectCondition(t, func() bool { return fatalRunner.lifecycle.State() == lifecycle.Failed })
+
+	select {
+	case runErr := <-fatalDone:
+		if !errors.Is(runErr, cause) {
+			t.Fatalf("fatal runner Run() = %v, want %v", runErr, cause)
+		}
+	case <-clock.NewReal().Timer(2 * time.Second).C:
+		t.Fatal("fatal runner did not stop")
+	}
+	if consumers["fatal"].send(validReconnectMessage(t, "must-not-consume")) {
+		t.Fatal("fatal consumer accepted a message after failure")
+	}
+	if d.OpenCount() != 1 || client.isReconnecting() {
+		t.Fatalf("fatal runner triggered reconnect: opens=%d reconnecting=%t", d.OpenCount(), client.isReconnecting())
+	}
+	if !healthyRunner.lifecycle.Ready() || !healthyRunner.lifecycle.Live() {
+		t.Fatalf("healthy runner state = %s, ready=%t live=%t", healthyRunner.lifecycle.State(), healthyRunner.lifecycle.Ready(), healthyRunner.lifecycle.Live())
+	}
+	if !consumers["healthy"].send(validReconnectMessage(t, "healthy-after-fatal")) {
+		t.Fatal("healthy consumer rejected a message after sibling failure")
+	}
+	waitReconnectCondition(t, func() bool { return healthyHandled.Load() == 1 })
+	recorder.waitForCall(t, time.Second)
+	if got := recorder.count(); got != 1 {
+		t.Fatalf("fatal error handler calls = %d, want 1", got)
+	}
+	if err := client.Health(context.Background()); err == nil || !strings.Contains(err.Error(), "subscription fatal failed") {
+		t.Fatalf("Health() = %v, want failed fatal subscription", err)
+	}
+	select {
+	case err := <-healthyDone:
+		t.Fatalf("healthy runner stopped after sibling fatal error: %v", err)
+	default:
+	}
+}
+
+func TestFatalConsumerErrorSkipsConcurrentReconnect(t *testing.T) {
+	d := &reconnectTestDriver{created: make(chan *reconnectTestConsumer, 1)}
+	client := newReconnectTestClient(t, d, nil, 0)
+	runner, err := client.Subscribe(context.Background(), Subscription{
+		Name:           "fatal",
+		Topics:         []string{"orders.created"},
+		Prefetch:       12,
+		HandlerTimeout: 10 * time.Millisecond,
+		Handlers: map[string]Handler{
+			"orders.created": HandlerFunc(func(context.Context, *Event) error { return nil }),
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	runDone := make(chan error, 1)
+	go func() { runDone <- runner.Run(context.Background()) }()
+	consumer := <-d.created
+	waitReconnectCondition(t, func() bool {
+		runner.mu.Lock()
+		machine := runner.lifecycle
+		runner.mu.Unlock()
+		return machine != nil && machine.Ready()
+	})
+	attempt := &reconnectAttempt{done: make(chan struct{})}
+	client.mu.Lock()
+	client.reconnecting = true
+	client.reconnect = attempt
+	client.mu.Unlock()
+	cause := &driver.Error{Driver: d.Name(), Op: "consumer", K: driver.KindFatal, Err: errors.New("permission denied")}
+	consumer.sendError(cause)
+	select {
+	case runErr := <-runDone:
+		if !errors.Is(runErr, cause) {
+			t.Fatalf("fatal runner Run() = %v, want %v", runErr, cause)
+		}
+	case <-clock.NewReal().Timer(2 * time.Second).C:
+		t.Fatal("fatal runner joined a concurrent reconnect")
+	}
+	client.mu.Lock()
+	client.reconnecting = false
+	client.reconnect = nil
+	client.mu.Unlock()
+	if d.OpenCount() != 1 {
+		t.Fatalf("fatal runner opened a replacement consumer: open count = %d", d.OpenCount())
+	}
+	if err := runner.abandonForReconnect(context.Background()); err != nil {
+		t.Fatalf("abandonForReconnect(Failed) = %v, want nil", err)
+	}
+	runner.mu.Lock()
+	reconnectCause := runner.reconnectCause
+	runner.mu.Unlock()
+	if reconnectCause != nil {
+		t.Fatalf("failed runner acquired reconnect cause %v", reconnectCause)
+	}
+}
+
+func TestDrainGivesInFlightHandlerItsGraceBudget(t *testing.T) {
+	d := &reconnectTestDriver{created: make(chan *reconnectTestConsumer, 1)}
+	client := newReconnectTestClient(t, d, nil, 0)
+	handlerStarted := make(chan struct{})
+	handlerCanceled := make(chan struct{})
+	releaseHandler := make(chan struct{})
+	var startedOnce sync.Once
+	var canceledOnce sync.Once
+	runner, err := client.Subscribe(context.Background(), Subscription{
+		Name:           "orders",
+		Topics:         []string{"orders.created"},
+		Prefetch:       12,
+		HandlerTimeout: 100 * time.Millisecond,
+		Handlers: map[string]Handler{
+			"orders.created": HandlerFunc(func(ctx context.Context, _ *Event) error {
+				startedOnce.Do(func() { close(handlerStarted) })
+				select {
+				case <-releaseHandler:
+					return nil
+				case <-ctx.Done():
+					canceledOnce.Do(func() { close(handlerCanceled) })
+					return ctx.Err()
+				}
+			}),
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	runDone := make(chan error, 1)
+	go func() { runDone <- runner.Run(context.Background()) }()
+	consumer := <-d.created
+	waitReconnectCondition(t, func() bool { return runner.lifecycle.Ready() })
+	if !consumer.send(validReconnectMessage(t, "drain-grace-in-flight")) {
+		t.Fatal("consumer rejected the in-flight message")
+	}
+	select {
+	case <-handlerStarted:
+	case <-clock.NewReal().Timer(time.Second).C:
+		t.Fatal("handler did not start")
+	}
+
+	drainDone := make(chan error, 1)
+	go func() { drainDone <- runner.Drain(context.Background()) }()
+	select {
+	case err := <-drainDone:
+		t.Fatalf("Drain() returned before handler grace was used: %v", err)
+	case <-handlerCanceled:
+		t.Fatal("handler was canceled immediately at drain start")
+	case <-clock.NewReal().Timer(50 * time.Millisecond).C:
+	}
+	close(releaseHandler)
+	if err := <-drainDone; err != nil {
+		t.Fatalf("Drain() = %v, want nil after in-flight handler completed", err)
+	}
+	if err := <-runDone; err != nil {
+		t.Fatalf("runner Run() = %v, want nil after graceful drain", err)
+	}
+}
+
+type graceContextSettler struct {
+	acked  bool
+	nacked bool
+}
+
+func (s *graceContextSettler) Ack(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	s.acked = true
+	return nil
+}
+
+func (s *graceContextSettler) Nack(ctx context.Context, _ driver.NackOptions) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	s.nacked = true
+	return nil
+}
+
+func TestDrainCancelsInFlightHandlerIntoRetryLane(t *testing.T) {
+	producer := &dispatchProducer{}
+	consumer := newDispatchConsumer()
+	client, err := New(context.Background(), testClientConfig(t),
+		WithDriver(&dispatchDriver{conn: &dispatchConn{producer: producer, consumer: consumer, admin: &dispatchAdmin{}}}),
+		WithLogger(slog.New(slog.NewTextHandler(io.Discard, nil))),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client.config.Lifecycle.DrainTimeout = 50 * time.Millisecond
+	client.config.Lifecycle.HandlerGrace = 10 * time.Millisecond
+	handlerStarted := make(chan struct{})
+	handlerCanceled := make(chan struct{})
+	var startedOnce sync.Once
+	var canceledOnce sync.Once
+	runner, err := client.Subscribe(context.Background(), Subscription{
+		Name:           "orders",
+		Topics:         []string{"orders.created"},
+		Prefetch:       12,
+		Priorities:     []Priority{PriorityHigh},
+		Retry:          RetryConfig{MaxAttempts: 2, Tiers: []time.Duration{time.Second}},
+		HandlerTimeout: 45 * time.Millisecond,
+		Handlers: map[string]Handler{
+			"orders.created.v1": HandlerFunc(func(ctx context.Context, _ *Event) error {
+				startedOnce.Do(func() { close(handlerStarted) })
+				<-ctx.Done()
+				canceledOnce.Do(func() { close(handlerCanceled) })
+				return ctx.Err()
+			}),
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	runDone := make(chan error, 1)
+	go func() { runDone <- runner.Run(context.Background()) }()
+	waitReconnectCondition(t, func() bool {
+		runner.mu.Lock()
+		machine := runner.lifecycle
+		runner.mu.Unlock()
+		return machine != nil && machine.Ready()
+	})
+	settler := &graceContextSettler{}
+	consumer.messages <- retryBridgeMessage(t, Envelope{
+		SpecVersion: "1.0",
+		ID:          "drain-grace-retry",
+		Source:      "/test/orders",
+		Type:        "orders.created.v1",
+		Priority:    PriorityHigh,
+		Attempt:     1,
+	}, settler)
+	select {
+	case <-handlerStarted:
+	case <-clock.NewReal().Timer(time.Second).C:
+		t.Fatal("handler did not start")
+	}
+	if err := runner.Drain(context.Background()); err != nil {
+		t.Fatalf("Drain() = %v, want nil", err)
+	}
+	if err := <-runDone; err != nil {
+		t.Fatalf("runner Run() = %v, want nil", err)
+	}
+	select {
+	case <-handlerCanceled:
+	default:
+		t.Fatal("handler did not receive cancellation at the grace deadline")
+	}
+	if !settler.acked || settler.nacked {
+		t.Fatalf("drain-grace settlement = acked %t nacked %t, want ack only", settler.acked, settler.nacked)
+	}
+	if len(producer.messages) != 1 {
+		t.Fatalf("retry successors = %d, want 1", len(producer.messages))
+	}
+	wantDestination := retryDestinationFor(client.source, "orders.created", PriorityHigh, 1, runner.subscription.Name)
+	if got := producer.messages[0].Destination; got != wantDestination {
+		t.Fatalf("retry destination = %q, want %q", got, wantDestination)
+	}
+	if err := client.Close(context.Background()); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func TestRunnerRepairsConsumerAndResumesDelivery(t *testing.T) {
