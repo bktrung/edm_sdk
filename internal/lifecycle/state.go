@@ -26,6 +26,8 @@ const (
 	Closed
 	// Aborted means shutdown exceeded a deadline or a fatal shutdown error occurred.
 	Aborted
+	// Failed means this runner encountered a terminal consumer error.
+	Failed
 )
 
 // String returns the stable state name.
@@ -47,6 +49,8 @@ func (s State) String() string {
 		return "closed"
 	case Aborted:
 		return "aborted"
+	case Failed:
+		return "failed"
 	default:
 		return "unknown"
 	}
@@ -88,12 +92,15 @@ func (m *Machine) Transition(next State) error {
 // Ready reports whether the machine is ready for traffic.
 func (m *Machine) Ready() bool { return m != nil && m.State() == Ready }
 
-// Live reports whether the process should remain alive. Draining is live;
-// only Aborted is unhealthy for liveness.
+// Live reports whether the process should remain alive. Draining and Failed are
+// live; only Aborted is unhealthy for liveness.
 func (m *Machine) Live() bool { return m != nil && m.State() != Aborted }
 
 func allowed(from, to State) bool {
 	if from == to {
+		return true
+	}
+	if to == Failed && from != Closed && from != Failed && from != Aborted {
 		return true
 	}
 	if to == Aborted && from != Closed && from != Aborted {

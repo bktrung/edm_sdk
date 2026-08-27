@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -82,7 +83,7 @@ func (c *reconnectTestConn) Producer(context.Context, driver.ProducerConfig) (dr
 	return &reconnectTestProducer{conn: c}, nil
 }
 
-func (c *reconnectTestConn) Consumer(context.Context, driver.ConsumerConfig) (driver.Consumer, error) {
+func (c *reconnectTestConn) Consumer(_ context.Context, cfg driver.ConsumerConfig) (driver.Consumer, error) {
 	c.driver.mu.Lock()
 	if c.driver.failConsumers > 0 {
 		c.driver.failConsumers--
@@ -94,6 +95,7 @@ func (c *reconnectTestConn) Consumer(context.Context, driver.ConsumerConfig) (dr
 		return nil, &driver.Error{Driver: c.driver.Name(), Op: "consumer", K: driver.KindTransient, Err: errors.New("connection closed")}
 	}
 	consumer := &reconnectTestConsumer{
+		group:    cfg.Group,
 		messages: make(chan driver.InboundMessage, 8),
 		errors:   make(chan error, 8),
 	}
@@ -143,30 +145,52 @@ func (p *reconnectTestProducer) Close(context.Context) error {
 }
 
 type reconnectTestConsumer struct {
-	messages chan driver.InboundMessage
-	errors   chan error
-	once     sync.Once
+	group        string
+	messages     chan driver.InboundMessage
+	errors       chan error
+	drainStarted chan struct{}
+	drainRelease <-chan struct{}
+	drainOnce    sync.Once
+	once         sync.Once
+	mu           sync.RWMutex
+	closed       atomic.Bool
 }
 
 func (c *reconnectTestConsumer) Messages() <-chan driver.InboundMessage { return c.messages }
 func (c *reconnectTestConsumer) Errors() <-chan error                   { return c.errors }
 func (*reconnectTestConsumer) Pause(...string) error                    { return nil }
 func (*reconnectTestConsumer) Resume(...string) error                   { return nil }
-func (*reconnectTestConsumer) Drain(context.Context) error              { return nil }
+func (c *reconnectTestConsumer) Drain(context.Context) error {
+	if c.drainStarted == nil {
+		return nil
+	}
+	c.drainOnce.Do(func() { close(c.drainStarted) })
+	<-c.drainRelease
+	c.close()
+	return nil
+}
+
 func (c *reconnectTestConsumer) Stop(context.Context) error {
-	c.once.Do(func() {
-		close(c.messages)
-		close(c.errors)
-	})
+	c.close()
 	return nil
 }
 
 func (c *reconnectTestConsumer) Release(context.Context) error {
+	if c.drainRelease != nil {
+		return nil
+	}
+	c.close()
+	return nil
+}
+
+func (c *reconnectTestConsumer) close() {
 	c.once.Do(func() {
+		c.mu.Lock()
+		c.closed.Store(true)
 		close(c.messages)
 		close(c.errors)
+		c.mu.Unlock()
 	})
-	return nil
 }
 
 func (*reconnectTestConsumer) Lag(context.Context) (map[string]int64, error) {
@@ -177,8 +201,14 @@ func (c *reconnectTestConsumer) sendError(err error) {
 	c.errors <- err
 }
 
-func (c *reconnectTestConsumer) send(message driver.InboundMessage) {
+func (c *reconnectTestConsumer) send(message driver.InboundMessage) bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if c.closed.Load() {
+		return false
+	}
 	c.messages <- message
+	return true
 }
 
 type reconnectTestSettler struct{}
@@ -193,14 +223,23 @@ func (*reconnectTestSettler) Nack(ctx context.Context, _ driver.NackOptions) err
 
 type recordingClock struct {
 	*clock.Fake
-	mu     sync.Mutex
-	sleeps []time.Duration
+	mu           sync.Mutex
+	sleeps       []time.Duration
+	sleepStarted chan int
 }
 
 func (c *recordingClock) Sleep(ctx context.Context, duration time.Duration) error {
+	before := c.NumWaiters()
 	c.mu.Lock()
 	c.sleeps = append(c.sleeps, duration)
+	started := c.sleepStarted
 	c.mu.Unlock()
+	if started != nil {
+		select {
+		case started <- before:
+		default:
+		}
+	}
 	return c.Fake.Sleep(ctx, duration)
 }
 
@@ -383,6 +422,326 @@ func validReconnectMessage(t *testing.T, id string) driver.InboundMessage {
 	return reconnectMessage(t, id, &reconnectTestSettler{})
 }
 
+func TestFatalConsumerErrorStopsOnlyItsRunner(t *testing.T) {
+	d := &reconnectTestDriver{created: make(chan *reconnectTestConsumer, 8)}
+	recorder := newErrorHandlerRecorder()
+	client := newReconnectTestClient(t, d, nil, 0, WithErrorHandler(recorder.handle))
+
+	fatalRunner, err := client.Subscribe(context.Background(), Subscription{
+		Name:           "fatal",
+		Topics:         []string{"orders.created"},
+		Prefetch:       12,
+		HandlerTimeout: 10 * time.Millisecond,
+		Handlers: map[string]Handler{
+			"orders.created": HandlerFunc(func(context.Context, *Event) error {
+				t.Fatal("fatal subscription handler received a message")
+				return nil
+			}),
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var healthyHandled atomic.Int32
+	healthyRunner, err := client.Subscribe(context.Background(), Subscription{
+		Name:           "healthy",
+		Topics:         []string{"orders.created"},
+		Prefetch:       12,
+		HandlerTimeout: 10 * time.Millisecond,
+		Handlers: map[string]Handler{
+			"orders.created": HandlerFunc(func(context.Context, *Event) error {
+				healthyHandled.Add(1)
+				return nil
+			}),
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	fatalCtx, cancelFatal := context.WithCancel(context.Background())
+	healthyCtx, cancelHealthy := context.WithCancel(context.Background())
+	t.Cleanup(cancelFatal)
+	t.Cleanup(cancelHealthy)
+	fatalDone := make(chan error, 1)
+	healthyDone := make(chan error, 1)
+	go func() { fatalDone <- fatalRunner.Run(fatalCtx) }()
+	go func() { healthyDone <- healthyRunner.Run(healthyCtx) }()
+
+	consumers := make(map[string]*reconnectTestConsumer, 2)
+	timeout := clock.NewReal().Timer(2 * time.Second)
+	defer timeout.Stop()
+	for len(consumers) < 2 {
+		select {
+		case consumer := <-d.created:
+			consumers[consumer.group] = consumer
+		case <-timeout.C:
+			t.Fatal("timed out waiting for both subscription consumers")
+		}
+	}
+	waitReconnectCondition(t, func() bool {
+		return fatalRunner.lifecycle.Ready() && healthyRunner.lifecycle.Ready()
+	})
+
+	cause := &driver.Error{Driver: d.Name(), Op: "consumer", K: driver.KindFatal, Err: errors.New("permission denied")}
+	consumers["fatal"].sendError(cause)
+	waitReconnectCondition(t, func() bool { return fatalRunner.lifecycle.State() == lifecycle.Failed })
+
+	select {
+	case runErr := <-fatalDone:
+		if !errors.Is(runErr, cause) {
+			t.Fatalf("fatal runner Run() = %v, want %v", runErr, cause)
+		}
+	case <-clock.NewReal().Timer(2 * time.Second).C:
+		t.Fatal("fatal runner did not stop")
+	}
+	if consumers["fatal"].send(validReconnectMessage(t, "must-not-consume")) {
+		t.Fatal("fatal consumer accepted a message after failure")
+	}
+	if d.OpenCount() != 1 || client.isReconnecting() {
+		t.Fatalf("fatal runner triggered reconnect: opens=%d reconnecting=%t", d.OpenCount(), client.isReconnecting())
+	}
+	if !healthyRunner.lifecycle.Ready() || !healthyRunner.lifecycle.Live() {
+		t.Fatalf("healthy runner state = %s, ready=%t live=%t", healthyRunner.lifecycle.State(), healthyRunner.lifecycle.Ready(), healthyRunner.lifecycle.Live())
+	}
+	if !consumers["healthy"].send(validReconnectMessage(t, "healthy-after-fatal")) {
+		t.Fatal("healthy consumer rejected a message after sibling failure")
+	}
+	waitReconnectCondition(t, func() bool { return healthyHandled.Load() == 1 })
+	recorder.waitForCall(t, time.Second)
+	if got := recorder.count(); got != 1 {
+		t.Fatalf("fatal error handler calls = %d, want 1", got)
+	}
+	if err := client.Health(context.Background()); err == nil || !strings.Contains(err.Error(), "subscription fatal failed") {
+		t.Fatalf("Health() = %v, want failed fatal subscription", err)
+	}
+	select {
+	case err := <-healthyDone:
+		t.Fatalf("healthy runner stopped after sibling fatal error: %v", err)
+	default:
+	}
+}
+
+func TestFatalConsumerErrorSkipsConcurrentReconnect(t *testing.T) {
+	d := &reconnectTestDriver{created: make(chan *reconnectTestConsumer, 1)}
+	client := newReconnectTestClient(t, d, nil, 0)
+	runner, err := client.Subscribe(context.Background(), Subscription{
+		Name:           "fatal",
+		Topics:         []string{"orders.created"},
+		Prefetch:       12,
+		HandlerTimeout: 10 * time.Millisecond,
+		Handlers: map[string]Handler{
+			"orders.created": HandlerFunc(func(context.Context, *Event) error { return nil }),
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	runDone := make(chan error, 1)
+	go func() { runDone <- runner.Run(context.Background()) }()
+	consumer := <-d.created
+	waitReconnectCondition(t, func() bool {
+		runner.mu.Lock()
+		machine := runner.lifecycle
+		runner.mu.Unlock()
+		return machine != nil && machine.Ready()
+	})
+	attempt := &reconnectAttempt{done: make(chan struct{})}
+	client.mu.Lock()
+	client.reconnecting = true
+	client.reconnect = attempt
+	client.mu.Unlock()
+	cause := &driver.Error{Driver: d.Name(), Op: "consumer", K: driver.KindFatal, Err: errors.New("permission denied")}
+	consumer.sendError(cause)
+	select {
+	case runErr := <-runDone:
+		if !errors.Is(runErr, cause) {
+			t.Fatalf("fatal runner Run() = %v, want %v", runErr, cause)
+		}
+	case <-clock.NewReal().Timer(2 * time.Second).C:
+		t.Fatal("fatal runner joined a concurrent reconnect")
+	}
+	client.mu.Lock()
+	client.reconnecting = false
+	client.reconnect = nil
+	client.mu.Unlock()
+	if d.OpenCount() != 1 {
+		t.Fatalf("fatal runner opened a replacement consumer: open count = %d", d.OpenCount())
+	}
+	if err := runner.abandonForReconnect(context.Background()); err != nil {
+		t.Fatalf("abandonForReconnect(Failed) = %v, want nil", err)
+	}
+	runner.mu.Lock()
+	reconnectCause := runner.reconnectCause
+	runner.mu.Unlock()
+	if reconnectCause != nil {
+		t.Fatalf("failed runner acquired reconnect cause %v", reconnectCause)
+	}
+}
+
+func TestDrainGivesInFlightHandlerItsGraceBudget(t *testing.T) {
+	d := &reconnectTestDriver{created: make(chan *reconnectTestConsumer, 1)}
+	client := newReconnectTestClient(t, d, nil, 0)
+	handlerStarted := make(chan struct{})
+	handlerCanceled := make(chan struct{})
+	releaseHandler := make(chan struct{})
+	var startedOnce sync.Once
+	var canceledOnce sync.Once
+	runner, err := client.Subscribe(context.Background(), Subscription{
+		Name:           "orders",
+		Topics:         []string{"orders.created"},
+		Prefetch:       12,
+		HandlerTimeout: 100 * time.Millisecond,
+		Handlers: map[string]Handler{
+			"orders.created": HandlerFunc(func(ctx context.Context, _ *Event) error {
+				startedOnce.Do(func() { close(handlerStarted) })
+				select {
+				case <-releaseHandler:
+					return nil
+				case <-ctx.Done():
+					canceledOnce.Do(func() { close(handlerCanceled) })
+					return ctx.Err()
+				}
+			}),
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	runDone := make(chan error, 1)
+	go func() { runDone <- runner.Run(context.Background()) }()
+	consumer := <-d.created
+	waitReconnectCondition(t, func() bool { return runner.lifecycle.Ready() })
+	if !consumer.send(validReconnectMessage(t, "drain-grace-in-flight")) {
+		t.Fatal("consumer rejected the in-flight message")
+	}
+	select {
+	case <-handlerStarted:
+	case <-clock.NewReal().Timer(time.Second).C:
+		t.Fatal("handler did not start")
+	}
+
+	drainDone := make(chan error, 1)
+	go func() { drainDone <- runner.Drain(context.Background()) }()
+	select {
+	case err := <-drainDone:
+		t.Fatalf("Drain() returned before handler grace was used: %v", err)
+	case <-handlerCanceled:
+		t.Fatal("handler was canceled immediately at drain start")
+	case <-clock.NewReal().Timer(50 * time.Millisecond).C:
+	}
+	close(releaseHandler)
+	if err := <-drainDone; err != nil {
+		t.Fatalf("Drain() = %v, want nil after in-flight handler completed", err)
+	}
+	if err := <-runDone; err != nil {
+		t.Fatalf("runner Run() = %v, want nil after graceful drain", err)
+	}
+}
+
+type graceContextSettler struct {
+	acked  bool
+	nacked bool
+}
+
+func (s *graceContextSettler) Ack(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	s.acked = true
+	return nil
+}
+
+func (s *graceContextSettler) Nack(ctx context.Context, _ driver.NackOptions) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	s.nacked = true
+	return nil
+}
+
+func TestDrainCancelsInFlightHandlerIntoRetryLane(t *testing.T) {
+	producer := &dispatchProducer{}
+	consumer := newDispatchConsumer()
+	client, err := New(context.Background(), testClientConfig(t),
+		WithDriver(&dispatchDriver{conn: &dispatchConn{producer: producer, consumer: consumer, admin: &dispatchAdmin{}}}),
+		WithLogger(slog.New(slog.NewTextHandler(io.Discard, nil))),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client.config.Lifecycle.DrainTimeout = 50 * time.Millisecond
+	client.config.Lifecycle.HandlerGrace = 10 * time.Millisecond
+	handlerStarted := make(chan struct{})
+	handlerCanceled := make(chan struct{})
+	var startedOnce sync.Once
+	var canceledOnce sync.Once
+	runner, err := client.Subscribe(context.Background(), Subscription{
+		Name:           "orders",
+		Topics:         []string{"orders.created"},
+		Prefetch:       12,
+		Priorities:     []Priority{PriorityHigh},
+		Retry:          RetryConfig{MaxAttempts: 2, Tiers: []time.Duration{time.Second}},
+		HandlerTimeout: 45 * time.Millisecond,
+		Handlers: map[string]Handler{
+			"orders.created.v1": HandlerFunc(func(ctx context.Context, _ *Event) error {
+				startedOnce.Do(func() { close(handlerStarted) })
+				<-ctx.Done()
+				canceledOnce.Do(func() { close(handlerCanceled) })
+				return ctx.Err()
+			}),
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	runDone := make(chan error, 1)
+	go func() { runDone <- runner.Run(context.Background()) }()
+	waitReconnectCondition(t, func() bool {
+		runner.mu.Lock()
+		machine := runner.lifecycle
+		runner.mu.Unlock()
+		return machine != nil && machine.Ready()
+	})
+	settler := &graceContextSettler{}
+	consumer.messages <- retryBridgeMessage(t, Envelope{
+		SpecVersion: "1.0",
+		ID:          "drain-grace-retry",
+		Source:      "/test/orders",
+		Type:        "orders.created.v1",
+		Priority:    PriorityHigh,
+		Attempt:     1,
+	}, settler)
+	select {
+	case <-handlerStarted:
+	case <-clock.NewReal().Timer(time.Second).C:
+		t.Fatal("handler did not start")
+	}
+	if err := runner.Drain(context.Background()); err != nil {
+		t.Fatalf("Drain() = %v, want nil", err)
+	}
+	if err := <-runDone; err != nil {
+		t.Fatalf("runner Run() = %v, want nil", err)
+	}
+	select {
+	case <-handlerCanceled:
+	default:
+		t.Fatal("handler did not receive cancellation at the grace deadline")
+	}
+	if !settler.acked || settler.nacked {
+		t.Fatalf("drain-grace settlement = acked %t nacked %t, want ack only", settler.acked, settler.nacked)
+	}
+	if len(producer.messages) != 1 {
+		t.Fatalf("retry successors = %d, want 1", len(producer.messages))
+	}
+	wantDestination := retryDestinationFor(client.source, "orders.created", PriorityHigh, 1, runner.subscription.Name)
+	if got := producer.messages[0].Destination; got != wantDestination {
+		t.Fatalf("retry destination = %q, want %q", got, wantDestination)
+	}
+	if err := client.Close(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestRunnerRepairsConsumerAndResumesDelivery(t *testing.T) {
 	d := &reconnectTestDriver{created: make(chan *reconnectTestConsumer, 8)}
 	client := newReconnectTestClient(t, d, nil, 0)
@@ -441,6 +800,341 @@ func TestRunnerRepairsConsumerAndResumesDelivery(t *testing.T) {
 	client.mu.Unlock()
 	if !shutdownStarted {
 		t.Fatal("Close did not set shutdownStarted")
+	}
+}
+
+func TestSupervisorReconnectKeepsAbandonedSiblingRunning(t *testing.T) {
+	fake := clock.NewFake(time.Unix(350, 0))
+	recorded := &recordingClock{Fake: fake, sleepStarted: make(chan int, 8)}
+	d := &reconnectTestDriver{created: make(chan *reconnectTestConsumer, 8)}
+	var handlerCalls atomic.Int32
+	client := newReconnectTestClient(t, d, recorded, 0, WithErrorHandler(func(context.Context, *Event, error) {
+		handlerCalls.Add(1)
+	}))
+	client.config.Lifecycle.DrainTimeout = 20 * time.Millisecond
+	client.reconnectRandom = func() float64 { return 0 }
+
+	var causingHandled, victimHandled atomic.Int32
+	causingRunner, err := client.Subscribe(context.Background(), Subscription{
+		Name:           "causing",
+		Topics:         []string{"orders.created"},
+		Prefetch:       12,
+		HandlerTimeout: 10 * time.Millisecond,
+		Handlers: map[string]Handler{
+			"orders.created": HandlerFunc(func(context.Context, *Event) error {
+				causingHandled.Add(1)
+				return nil
+			}),
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	victimRunner, err := client.Subscribe(context.Background(), Subscription{
+		Name:           "victim",
+		Topics:         []string{"orders.created"},
+		Prefetch:       12,
+		HandlerTimeout: 10 * time.Millisecond,
+		Handlers: map[string]Handler{
+			"orders.created": HandlerFunc(func(context.Context, *Event) error {
+				victimHandled.Add(1)
+				return nil
+			}),
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	causingCtx, cancelCausing := context.WithCancel(context.Background())
+	victimCtx, cancelVictim := context.WithCancel(context.Background())
+	t.Cleanup(func() {
+		cancelCausing()
+		cancelVictim()
+	})
+	causingDone := make(chan error, 1)
+	victimDone := make(chan error, 1)
+	go func() { causingDone <- causingRunner.Run(causingCtx) }()
+	go func() { victimDone <- victimRunner.Run(victimCtx) }()
+
+	initial := make(map[string]*reconnectTestConsumer, 2)
+	initialTimer := clock.NewReal().Timer(2 * time.Second)
+	defer initialTimer.Stop()
+	for len(initial) < 2 {
+		select {
+		case consumer := <-d.created:
+			initial[consumer.group] = consumer
+		case <-initialTimer.C:
+			t.Fatal("timed out waiting for both initial consumers")
+		}
+	}
+	waitReconnectCondition(t, func() bool {
+		return causingRunner.lifecycle.Ready() && victimRunner.lifecycle.Ready()
+	})
+	if err := client.Health(context.Background()); err != nil {
+		t.Fatalf("Health before supervisor reconnect = %v, want nil", err)
+	}
+
+	causing := initial["causing"]
+	causing.drainStarted = make(chan struct{})
+	causingRelease := make(chan struct{})
+	causing.drainRelease = causingRelease
+	victim := initial["victim"]
+	victim.drainStarted = make(chan struct{})
+	victimRelease := make(chan struct{})
+	victim.drainRelease = victimRelease
+	var releaseCausing, releaseVictim sync.Once
+	release := func() {
+		releaseCausing.Do(func() { close(causingRelease) })
+		releaseVictim.Do(func() { close(victimRelease) })
+	}
+	t.Cleanup(release)
+	cause := errors.New("causing runner requested reconnect")
+	causeDone := make(chan error, 1)
+	go func() { causeDone <- causingRunner.requestAndWaitReconnect(context.Background(), cause) }()
+
+	waitReconnectCondition(t, func() bool {
+		causingStarted := false
+		victimStarted := false
+		select {
+		case <-causing.drainStarted:
+			causingStarted = true
+		default:
+		}
+		select {
+		case <-victim.drainStarted:
+			victimStarted = true
+		default:
+		}
+		return causingStarted && victimStarted
+	})
+	waitReconnectCondition(t, func() bool { return recorded.sleepCount() == 1 })
+	releaseCausing.Do(func() { close(causingRelease) })
+	select {
+	case before := <-recorded.sleepStarted:
+		fake.BlockUntil(before + 1)
+		fake.Advance(0)
+	case <-clock.NewReal().Timer(2 * time.Second).C:
+		t.Fatal("reconnect sleep did not start")
+	}
+	select {
+	case err := <-causeDone:
+		if err != nil {
+			t.Fatalf("causing runner reconnect = %v, want nil", err)
+		}
+	case <-clock.NewReal().Timer(2 * time.Second).C:
+		t.Fatal("supervisor reconnect did not finish")
+	}
+	releaseVictim.Do(func() { close(victimRelease) })
+
+	sent := make(map[*reconnectTestConsumer]bool)
+	replacementTimer := clock.NewReal().Timer(2 * time.Second)
+	defer replacementTimer.Stop()
+	for causingHandled.Load() < 1 || victimHandled.Load() < 1 || client.isReconnecting() {
+		select {
+		case err := <-victimDone:
+			t.Fatalf("victim Run returned after supervisor reconnect: %v", err)
+		case consumer := <-d.created:
+			if sent[consumer] {
+				continue
+			}
+			sent[consumer] = true
+			switch consumer.group {
+			case "causing":
+				consumer.send(validReconnectMessage(t, "causing-after-reconnect"))
+			case "victim":
+				consumer.send(validReconnectMessage(t, "victim-after-reconnect"))
+			}
+		case before := <-recorded.sleepStarted:
+			fake.BlockUntil(before + 1)
+			fake.Advance(0)
+		case <-replacementTimer.C:
+			if causingHandled.Load() >= 1 && victimHandled.Load() >= 1 && !client.isReconnecting() {
+				break
+			}
+			t.Fatalf("timed out waiting for deliveries: causing=%d victim=%d reconnecting=%t", causingHandled.Load(), victimHandled.Load(), client.isReconnecting())
+		}
+	}
+	if err := client.Health(context.Background()); err != nil {
+		t.Fatalf("Health after supervisor reconnect = %v, want nil", err)
+	}
+	select {
+	case err := <-victimDone:
+		t.Fatalf("victim Run returned after delivering its rebuilt generation: %v", err)
+	default:
+	}
+	select {
+	case err := <-causingDone:
+		t.Fatalf("causing Run returned after delivering its rebuilt generation: %v", err)
+	default:
+	}
+	if got := handlerCalls.Load(); got != 0 {
+		t.Fatalf("error handler calls = %d, want 0", got)
+	}
+}
+
+// TestAbandonForReconnectPreservesRunnerOwnCause proves that a runner which
+// already recorded its own driver error before a client-wide reconnect began
+// keeps that error through supervisor abandonment, instead of having it
+// replaced by the generic reconnect placeholder every abandoned runner would
+// otherwise receive.
+func TestAbandonForReconnectPreservesRunnerOwnCause(t *testing.T) {
+	fake := clock.NewFake(time.Unix(350, 0))
+	recorded := &recordingClock{Fake: fake, sleepStarted: make(chan int, 8)}
+	d := &reconnectTestDriver{created: make(chan *reconnectTestConsumer, 8)}
+	client := newReconnectTestClient(t, d, recorded, 0)
+	client.config.Lifecycle.DrainTimeout = 20 * time.Millisecond
+	client.reconnectRandom = func() float64 { return 0 }
+
+	causingRunner, err := client.Subscribe(context.Background(), Subscription{
+		Name:           "causing",
+		Topics:         []string{"orders.created"},
+		Prefetch:       12,
+		HandlerTimeout: 10 * time.Millisecond,
+		Handlers: map[string]Handler{
+			"orders.created": HandlerFunc(func(context.Context, *Event) error { return nil }),
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	victimRunner, err := client.Subscribe(context.Background(), Subscription{
+		Name:           "victim",
+		Topics:         []string{"orders.created"},
+		Prefetch:       12,
+		HandlerTimeout: 10 * time.Millisecond,
+		Handlers: map[string]Handler{
+			"orders.created": HandlerFunc(func(context.Context, *Event) error { return nil }),
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	causingCtx, cancelCausing := context.WithCancel(context.Background())
+	victimCtx, cancelVictim := context.WithCancel(context.Background())
+	t.Cleanup(func() {
+		cancelCausing()
+		cancelVictim()
+	})
+	causingDone := make(chan error, 1)
+	victimDone := make(chan error, 1)
+	go func() { causingDone <- causingRunner.Run(causingCtx) }()
+	go func() { victimDone <- victimRunner.Run(victimCtx) }()
+
+	initial := make(map[string]*reconnectTestConsumer, 2)
+	initialTimer := clock.NewReal().Timer(2 * time.Second)
+	defer initialTimer.Stop()
+	for len(initial) < 2 {
+		select {
+		case consumer := <-d.created:
+			initial[consumer.group] = consumer
+		case <-initialTimer.C:
+			t.Fatal("timed out waiting for both initial consumers")
+		}
+	}
+	waitReconnectCondition(t, func() bool {
+		return causingRunner.lifecycle.Ready() && victimRunner.lifecycle.Ready()
+	})
+
+	// The victim runner records its own driver error, the same way
+	// consumeRunnerErrors does for a transient consumer error, before any
+	// client-wide reconnect has been requested.
+	ownCause := errors.New("victim runner's own transient consumer error")
+	victimRunner.mu.Lock()
+	victimRunner.reconnectCause = ownCause
+	victimRunner.mu.Unlock()
+
+	causing := initial["causing"]
+	causing.drainStarted = make(chan struct{})
+	causingRelease := make(chan struct{})
+	causing.drainRelease = causingRelease
+	victim := initial["victim"]
+	victim.drainStarted = make(chan struct{})
+	victimRelease := make(chan struct{})
+	victim.drainRelease = victimRelease
+	var releaseCausing, releaseVictim sync.Once
+	release := func() {
+		releaseCausing.Do(func() { close(causingRelease) })
+		releaseVictim.Do(func() { close(victimRelease) })
+	}
+	t.Cleanup(release)
+	cause := errors.New("causing runner requested reconnect")
+	causeDone := make(chan error, 1)
+	go func() { causeDone <- causingRunner.requestAndWaitReconnect(context.Background(), cause) }()
+
+	waitReconnectCondition(t, func() bool {
+		causingStarted := false
+		victimStarted := false
+		select {
+		case <-causing.drainStarted:
+			causingStarted = true
+		default:
+		}
+		select {
+		case <-victim.drainStarted:
+			victimStarted = true
+		default:
+		}
+		return causingStarted && victimStarted
+	})
+
+	// Both runners' contexts are cancelled by abandonForReconnect before
+	// their post-cancel drain (which is what just closed drainStarted)
+	// begins, so abandonForReconnect has already run to completion for the
+	// victim runner by this point. Its own cause must still be on record.
+	victimRunner.mu.Lock()
+	gotCause := victimRunner.reconnectCause
+	victimRunner.mu.Unlock()
+	if !errors.Is(gotCause, ownCause) {
+		t.Fatalf("victim reconnectCause after abandonment = %v, want %v", gotCause, ownCause)
+	}
+
+	releaseCausing.Do(func() { close(causingRelease) })
+	select {
+	case before := <-recorded.sleepStarted:
+		fake.BlockUntil(before + 1)
+		fake.Advance(0)
+	case <-clock.NewReal().Timer(2 * time.Second).C:
+		t.Fatal("reconnect sleep did not start")
+	}
+	select {
+	case err := <-causeDone:
+		if err != nil {
+			t.Fatalf("causing runner reconnect = %v, want nil", err)
+		}
+	case <-clock.NewReal().Timer(2 * time.Second).C:
+		t.Fatal("supervisor reconnect did not finish")
+	}
+	releaseVictim.Do(func() { close(victimRelease) })
+
+	// Releasing the victim's drain hands it a fresh generation whose own
+	// bottom-of-loop reconnect request (client.reconnecting has already gone
+	// false by now) starts a second reconnect cycle on the same fake clock,
+	// exactly as in TestSupervisorReconnectKeepsAbandonedSiblingRunning.
+	settleTimer := clock.NewReal().Timer(2 * time.Second)
+	defer settleTimer.Stop()
+	for !causingRunner.lifecycle.Ready() || !victimRunner.lifecycle.Ready() || client.isReconnecting() {
+		select {
+		case err := <-victimDone:
+			t.Fatalf("victim Run returned after supervisor reconnect: %v", err)
+		case err := <-causingDone:
+			t.Fatalf("causing Run returned after supervisor reconnect: %v", err)
+		case <-d.created:
+		case before := <-recorded.sleepStarted:
+			fake.BlockUntil(before + 1)
+			fake.Advance(0)
+		case <-settleTimer.C:
+			t.Fatalf("timed out settling after abandonment: reconnecting=%t", client.isReconnecting())
+		}
+	}
+	select {
+	case err := <-victimDone:
+		t.Fatalf("victim Run returned after rebuilding its generation: %v", err)
+	default:
+	}
+	select {
+	case err := <-causingDone:
+		t.Fatalf("causing Run returned after rebuilding its generation: %v", err)
+	default:
 	}
 }
 

@@ -68,6 +68,35 @@ func TestMachineAbortIsTerminal(t *testing.T) {
 	}
 }
 
+func TestMachineFailedIsTerminalAndLive(t *testing.T) {
+	machine := New()
+	if err := machine.Transition(Ready); err != nil {
+		t.Fatal(err)
+	}
+	if err := machine.Transition(Failed); err != nil {
+		t.Fatal(err)
+	}
+	if machine.Ready() || !machine.Live() || machine.State().String() != "failed" {
+		t.Fatalf("failed probes = ready %t live %t state %s", machine.Ready(), machine.Live(), machine.State())
+	}
+	if err := machine.Transition(Ready); err == nil {
+		t.Fatal("Failed -> Ready must be rejected")
+	}
+	if err := machine.Transition(Reconnecting); err == nil {
+		t.Fatal("Failed -> Reconnecting must be rejected")
+	}
+}
+
+func TestMachineAbortCannotBecomeFailed(t *testing.T) {
+	machine := New()
+	if err := machine.Transition(Aborted); err != nil {
+		t.Fatal(err)
+	}
+	if err := machine.Transition(Failed); err == nil {
+		t.Fatal("Aborted -> Failed must be rejected")
+	}
+}
+
 func TestStateStringsAndNilMachine(t *testing.T) {
 	if got := State(99).String(); got != "unknown" {
 		t.Fatalf("unknown state string = %q", got)
@@ -84,7 +113,7 @@ func TestStateStringsAndNilMachine(t *testing.T) {
 func TestAllStateStrings(t *testing.T) {
 	for state, want := range map[State]string{
 		Starting: "starting", Ready: "ready", Reconnecting: "reconnecting", Draining: "draining", Settling: "settling",
-		Flushing: "flushing", Closed: "closed", Aborted: "aborted",
+		Flushing: "flushing", Closed: "closed", Aborted: "aborted", Failed: "failed",
 	} {
 		if got := state.String(); got != want {
 			t.Errorf("State(%d).String() = %q, want %q", state, got, want)

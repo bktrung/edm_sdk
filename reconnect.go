@@ -226,8 +226,19 @@ func sameConnection(left, right driver.Conn) bool {
 
 func (r *Runner) abandonForReconnect(ctx context.Context) error {
 	r.mu.Lock()
+	if r.lifecycle != nil && r.lifecycle.State() == lifecycle.Failed {
+		consumer := r.consumer
+		r.mu.Unlock()
+		if consumer == nil {
+			return nil
+		}
+		return consumer.Release(ctx)
+	}
 	if r.lifecycle != nil && r.lifecycle.State() == lifecycle.Ready {
 		_ = r.lifecycle.Transition(lifecycle.Reconnecting)
+	}
+	if r.reconnectCause == nil {
+		r.reconnectCause = errClientReconnecting
 	}
 	cancel := r.cancel
 	consumer := r.consumer

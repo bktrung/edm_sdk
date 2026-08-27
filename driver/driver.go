@@ -99,7 +99,7 @@ type Consumer interface {
 
 	// Errors yields asynchronous driver errors: connection loss, rebalance
 	// notifications, and transport decode failures. The core logs and counts
-	// these; fatal ones trigger client shutdown.
+	// these; fatal ones stop only the subscription that received the error.
 	Errors() <-chan error
 
 	// Pause stops delivery without leaving the consumer group. Accumulation must

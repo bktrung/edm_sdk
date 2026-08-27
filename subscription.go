@@ -101,6 +101,7 @@ type Runner struct {
 	done                  chan struct{}
 	started               bool
 	draining              bool
+	drainStarted          chan struct{}
 	finished              bool
 	runErr                error
 	reconnectCause        error

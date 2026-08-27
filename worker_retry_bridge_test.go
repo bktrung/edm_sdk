@@ -1,8 +1,11 @@
 package f1
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"log/slog"
+	"strings"
 	"testing"
 	"time"
 
@@ -40,6 +43,162 @@ func retryBridgeMessage(t *testing.T, envelope Envelope, settler driver.Settler)
 		Headers:     headerSlice(headers),
 		Body:        []byte("{}"),
 		Settle:      settler,
+	}
+}
+
+type missingRouteProducer struct {
+	attempts int
+	kindOnly bool
+}
+
+func (p *missingRouteProducer) Publish(_ context.Context, messages ...driver.OutboundMessage) error {
+	p.attempts += len(messages)
+	failed := make(map[int]error, len(messages))
+	for i := range messages {
+		cause := error(driver.ErrDestinationMissing)
+		if p.kindOnly {
+			cause = errors.New("dead-letter route missing")
+		}
+		failed[i] = &driver.Error{Driver: "test", Op: "publish", K: driver.KindNotFound, Err: cause}
+	}
+	return &driver.PublishError{Failed: failed}
+}
+
+func (*missingRouteProducer) Flush(context.Context) error { return nil }
+func (*missingRouteProducer) Close(context.Context) error { return nil }
+
+func noRoutePoisonRunner(t *testing.T, producer driver.Producer, options ...Option) (*Client, *Runner) {
+	t.Helper()
+	options = append([]Option{WithDriver(&dispatchDriver{conn: &dispatchConn{producerOverride: producer}})}, options...)
+	client, err := New(context.Background(), testClientConfig(t), options...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runner := &Runner{
+		client: client,
+		subscription: Subscription{
+			Name:           "orders",
+			Topics:         []string{"orders.created"},
+			Priorities:     []Priority{PriorityHigh},
+			Retry:          RetryConfig{MaxAttempts: 3, Tiers: []time.Duration{time.Second}},
+			HandlerTimeout: time.Second,
+		},
+	}
+	return client, runner
+}
+
+func poisonEnvelope() Envelope {
+	return Envelope{
+		SpecVersion: "1.0",
+		ID:          "poison-no-route",
+		Source:      "/test/orders",
+		Type:        "orders.created.v1",
+		Priority:    PriorityHigh,
+		Attempt:     15,
+	}
+}
+
+func TestDispatchDropsPoisonWithoutDLQRoute(t *testing.T) {
+	producer := &missingRouteProducer{}
+	recorder := newErrorHandlerRecorder()
+	client, runner := noRoutePoisonRunner(t, producer, WithErrorHandler(recorder.handle))
+	defer func() { _ = client.Close(context.Background()) }()
+
+	settler := &dispatchSettler{}
+	message := retryBridgeMessage(t, poisonEnvelope(), settler)
+	if !dispatchMessage(runner, context.Background(), message, &Envelope{}, new(bool)) {
+		t.Fatal("poison message was not settled as handled")
+	}
+	if !settler.acked || settler.nacked {
+		t.Fatalf("poison settlement = acked %t nacked %t, want ack only", settler.acked, settler.nacked)
+	}
+	if producer.attempts != maxSuccessorPublishAttempts {
+		t.Fatalf("missing-route publish attempts = %d, want %d", producer.attempts, maxSuccessorPublishAttempts)
+	}
+	recorder.waitForCall(t, time.Second)
+	if got := recorder.count(); got != 1 {
+		t.Fatalf("poison error handler calls = %d, want 1", got)
+	}
+	recorder.mu.Lock()
+	call := recorder.calls[0]
+	recorder.mu.Unlock()
+	if call.event == nil || call.event.ID() != poisonEnvelope().ID || call.event.Attempt() != poisonEnvelope().Attempt {
+		t.Fatalf("poison error event = %#v, want id %q attempt %d", call.event, poisonEnvelope().ID, poisonEnvelope().Attempt)
+	}
+	for _, want := range []string{poisonEnvelope().ID, message.Destination, "attempt=15", "no dead-letter route available"} {
+		if !strings.Contains(call.err.Error(), want) {
+			t.Fatalf("poison error = %q, missing %q", call.err, want)
+		}
+	}
+}
+
+func TestDispatchDropsPoisonForClassifiedMissingRoute(t *testing.T) {
+	producer := &missingRouteProducer{kindOnly: true}
+	client, runner := noRoutePoisonRunner(t, producer)
+	defer func() { _ = client.Close(context.Background()) }()
+
+	settler := &dispatchSettler{}
+	if !dispatchMessage(runner, context.Background(), retryBridgeMessage(t, poisonEnvelope(), settler), &Envelope{}, new(bool)) {
+		t.Fatal("classified missing-route poison was not settled as handled")
+	}
+	if !settler.acked || settler.nacked {
+		t.Fatalf("classified missing-route settlement = acked %t nacked %t, want ack only", settler.acked, settler.nacked)
+	}
+}
+
+func TestDispatchPoisonNoRouteDoesNotRedeliver(t *testing.T) {
+	producer := &missingRouteProducer{}
+	client, runner := noRoutePoisonRunner(t, producer)
+	defer func() { _ = client.Close(context.Background()) }()
+
+	settler := &dispatchSettler{}
+	message := retryBridgeMessage(t, poisonEnvelope(), settler)
+	deliveries := 0
+	for deliveries < maxSuccessorPublishAttempts+1 {
+		deliveries++
+		if dispatchMessage(runner, context.Background(), message, &Envelope{}, new(bool)) {
+			break
+		}
+	}
+	if deliveries != 1 || !settler.acked {
+		t.Fatalf("poison deliveries = %d acked=%t, want one handled delivery", deliveries, settler.acked)
+	}
+}
+
+func TestDispatchPoisonNoRouteUsesLastResortLogger(t *testing.T) {
+	var logs bytes.Buffer
+	producer := &missingRouteProducer{}
+	client, runner := noRoutePoisonRunner(t, producer, WithLogger(slog.New(slog.NewTextHandler(&logs, nil))))
+	defer func() { _ = client.Close(context.Background()) }()
+
+	if !dispatchMessage(runner, context.Background(), retryBridgeMessage(t, poisonEnvelope(), &dispatchSettler{}), &Envelope{}, new(bool)) {
+		t.Fatal("poison message was not settled as handled")
+	}
+	output := logs.String()
+	for _, want := range []string{"poison message dropped", poisonEnvelope().ID, "destination", "attempt", "no dead-letter route"} {
+		if !strings.Contains(output, want) {
+			t.Fatalf("last-resort poison log = %q, missing %q", output, want)
+		}
+	}
+}
+
+func TestDispatchLadderExhaustionKeepsMaxAttemptsReason(t *testing.T) {
+	producer := &dispatchProducer{}
+	client, runner := newRetryBridgeRunner(t, producer, "orders.created")
+	defer func() { _ = client.Close(context.Background()) }()
+
+	envelope := poisonEnvelope()
+	envelope.ID = "ladder-exhausted"
+	envelope.Attempt = 3
+	envelope.MaxAttempts = 3
+	runner.subscription.Handlers = map[string]Handler{
+		"orders.created.v1": HandlerFunc(func(context.Context, *Event) error { return errors.New("temporary") }),
+	}
+	if !dispatchMessage(runner, context.Background(), retryBridgeMessage(t, envelope, &dispatchSettler{}), &Envelope{}, new(bool)) {
+		t.Fatal("ladder-exhausted message was not settled")
+	}
+	if got := headerValue(producer.messages[0].Headers, "f1deathreason"); got != ReasonMaxAttempts.String() {
+		t.Fatalf("ladder exhaustion reason = %q, want %q", got, ReasonMaxAttempts)
 	}
 }
 
