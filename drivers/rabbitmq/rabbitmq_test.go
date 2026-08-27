@@ -20,8 +20,8 @@ func TestDriverCapabilities(t *testing.T) {
 	if caps.NativePriority != driver.PriorityStrict || caps.NativePriorityLevels != 32 {
 		t.Fatalf("priority capabilities = %#v, want strict 32 levels", caps)
 	}
-	if caps.Fanout != driver.FanoutAtPublish || caps.OrderedByKey {
-		t.Fatalf("routing capabilities = %#v, want publish fanout and unordered keys", caps)
+	if caps.Fanout != driver.FanoutAtPublish || !caps.OrderedByKey {
+		t.Fatalf("routing capabilities = %#v, want publish fanout and ordered keys", caps)
 	}
 }
 

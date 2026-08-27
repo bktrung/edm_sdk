@@ -61,7 +61,7 @@ func capabilitiesForQueueKind(kind queueKind) driver.Capabilities {
 func (Driver) Capabilities() driver.Capabilities {
 	return driver.Capabilities{
 		PerMessageAck:        true,
-		OrderedByKey:         false,
+		OrderedByKey:         true,
 		NativePriority:       driver.PriorityStrict,
 		NativePriorityLevels: 32,
 		NativeDelay:          false,

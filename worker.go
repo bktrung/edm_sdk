@@ -799,6 +799,7 @@ func openRunnerConsumer(r *Runner, ctx context.Context) (driver.Consumer, error)
 		Destinations:   destinations,
 		Prefetch:       r.config.Prefetch,
 		PerDestination: perDestination,
+		Exclusive:      r.subscription.Mode == OrderedByKey,
 		Effective:      effective,
 		StartAt:        driver.StartEarliest,
 	})
