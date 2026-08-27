@@ -46,8 +46,8 @@ func newBenchmarkScheduler(aging, overdue bool) (*Scheduler, int) {
 	start := time.Unix(0, 0)
 	fake := clock.NewFake(start)
 	specs := make([]LaneSpec, 0, slotCount*lanesPerSlot)
-	for slot := 0; slot < slotCount; slot++ {
-		for lane := 0; lane < lanesPerSlot; lane++ {
+	for slot := range slotCount {
+		for lane := range lanesPerSlot {
 			specs = append(specs, LaneSpec{
 				ID:       fmt.Sprintf("slot-%d-lane-%d", slot, lane),
 				Group:    fmt.Sprintf("slot-%d", slot),
@@ -61,10 +61,10 @@ func newBenchmarkScheduler(aging, overdue bool) (*Scheduler, int) {
 	if err != nil {
 		panic(err)
 	}
-	for slot := 0; slot < slotCount; slot++ {
-		for lane := 0; lane < lanesPerSlot; lane++ {
+	for slot := range slotCount {
+		for lane := range lanesPerSlot {
 			id := fmt.Sprintf("slot-%d-lane-%d", slot, lane)
-			for item := 0; item < itemsPerLane; item++ {
+			for range itemsPerLane {
 				if err := scheduler.Enqueue(id, Item{EnqueuedAt: start}); err != nil {
 					panic(err)
 				}

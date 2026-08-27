@@ -56,7 +56,7 @@ func NewPool(parent context.Context, concurrency int, ordered bool, queueSize in
 	} else {
 		queue := make(chan Work, queueSize)
 		p.queues = []chan Work{queue}
-		for i := 0; i < concurrency; i++ {
+		for i := range concurrency {
 			p.start(i, queue)
 		}
 	}

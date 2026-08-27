@@ -229,6 +229,9 @@ func (r *Runner) abandonForReconnect(ctx context.Context) error {
 	if r.lifecycle != nil && r.lifecycle.State() == lifecycle.Ready {
 		_ = r.lifecycle.Transition(lifecycle.Reconnecting)
 	}
+	if r.reconnectCause == nil {
+		r.reconnectCause = errClientReconnecting
+	}
 	cancel := r.cancel
 	consumer := r.consumer
 	r.mu.Unlock()

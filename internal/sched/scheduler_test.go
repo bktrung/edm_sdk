@@ -12,7 +12,7 @@ func TestDWRRShareMatchesWeights(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for i := 0; i < 10000; i++ {
+	for range 10000 {
 		for _, id := range []string{"high", "normal", "low"} {
 			if err := scheduler.Enqueue(id, Item{Value: id}); err != nil {
 				t.Fatal(err)
@@ -20,7 +20,7 @@ func TestDWRRShareMatchesWeights(t *testing.T) {
 		}
 	}
 	counts := map[string]int{}
-	for i := 0; i < 130; i++ {
+	for range 130 {
 		item, ok := scheduler.Next()
 		if !ok {
 			t.Fatal("scheduler unexpectedly empty")
@@ -37,7 +37,7 @@ func TestDWRRNoStarvationUnderSaturation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for i := 0; i < 100; i++ {
+	for i := range 100 {
 		_ = scheduler.Enqueue("high", Item{Value: "high"})
 		_ = scheduler.Enqueue("low", Item{Value: i})
 	}
@@ -61,7 +61,7 @@ func TestDWRRDeficitResetOnEmpty(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for i := 0; i < 8; i++ {
+	for range 8 {
 		if err := scheduler.Enqueue("high", Item{Value: "high"}); err != nil {
 			t.Fatal(err)
 		}

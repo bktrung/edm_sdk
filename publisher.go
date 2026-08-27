@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -213,36 +214,58 @@ func (p *Publisher) PublishBatch(ctx context.Context, messages []Message) (Batch
 	// This publish was already admitted above and is counted in Close's
 	// idle wait, so closing may legitimately be true here; only a fully
 	// closed client or a torn-down connection stop it from proceeding.
+	// publishAdmissionLocked's producerTeardown branch cannot fire on this
+	// path: beginPublish above already counted this call as in flight, and
+	// producerTeardown is only set once the publish-idle wait observes zero
+	// in-flight publishes, which cannot happen while this call is one of
+	// them. Moving beginPublish to run after this check would break that.
 	p.client.mu.Lock()
-	if p.client.closed || p.client.conn == nil {
-		p.client.mu.Unlock()
-		return result, errors.New("f1: client is closed")
-	}
-	if p.client.reconnectErr != nil {
-		err := p.client.reconnectErr
+	if err := publishAdmissionLocked(p.client, true); err != nil {
 		p.client.mu.Unlock()
 		return result, err
 	}
-	if p.client.reconnecting || !sameConnection(p.client.conn, conn) {
+	if !sameConnection(p.client.conn, conn) {
 		p.client.mu.Unlock()
 		return result, p.client.reconnectingError("publish")
 	}
 	producer := p.client.producerHandle
-	var err error
-	if producer == nil {
-		producer, err = conn.Producer(ctx, driver.ProducerConfig{RequireDurableAck: true, Effective: effective})
-		if err == nil && producer == nil {
+	if producer != nil {
+		p.client.mu.Unlock()
+	} else {
+		p.client.mu.Unlock()
+		builtProducer, err := conn.Producer(ctx, driver.ProducerConfig{RequireDurableAck: true, Effective: effective})
+		if err == nil && builtProducer == nil {
 			err = errors.New("driver returned a nil producer")
 		}
-		if err == nil {
-			p.client.producerHandle = producer
+		if err != nil {
+			warnUnclassified(p.client.options.logger, err)
+			requestReconnectOnTransient(p.client, err)
+			return result, fmt.Errorf("f1: create publisher: %w", err)
 		}
-	}
-	p.client.mu.Unlock()
-	if err != nil {
-		warnUnclassified(p.client.options.logger, err)
-		requestReconnectOnTransient(p.client, err)
-		return result, fmt.Errorf("f1: create publisher: %w", err)
+
+		var loser driver.Producer
+		p.client.mu.Lock()
+		err = publishAdmissionLocked(p.client, true)
+		if err == nil && !sameConnection(p.client.conn, conn) {
+			err = p.client.reconnectingError("publish")
+		}
+		if err == nil {
+			if p.client.producerHandle != nil {
+				producer = p.client.producerHandle
+				loser = builtProducer
+			} else {
+				producer = builtProducer
+				p.client.producerHandle = builtProducer
+			}
+		}
+		p.client.mu.Unlock()
+		if loser != nil {
+			closeDiscardedProducer(p.client, loser, ctx)
+		}
+		if err != nil {
+			closeDiscardedProducer(p.client, builtProducer, ctx)
+			return result, err
+		}
 	}
 	publishErr := producer.Publish(ctx, outbound...)
 	if publishErr == nil {
@@ -282,8 +305,7 @@ func warnPublishError(logger *slog.Logger, err error) {
 	if logger == nil {
 		return
 	}
-	var partial *driver.PublishError
-	if errors.As(err, &partial) {
+	if partial, ok := errors.AsType[*driver.PublishError](err); ok {
 		indexes := make([]int, 0, len(partial.Failed))
 		for index := range partial.Failed {
 			indexes = append(indexes, index)
@@ -423,10 +445,8 @@ func validatePublishTopic(options clientOptions, topic, topicInput string) error
 	if !options.publishTopicsSet {
 		return nil
 	}
-	for _, listed := range options.publishTopics {
-		if listed == topic {
-			return nil
-		}
+	if slices.Contains(options.publishTopics, topic) {
+		return nil
 	}
 	return fmt.Errorf("topic %q derived from input %q was not listed in WithPublishTopics; listed topics: %v", topic, topicInput, options.publishTopics)
 }

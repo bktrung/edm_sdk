@@ -341,10 +341,7 @@ func newRunnerScheduler(r *Runner) (*sched.Scheduler, error) {
 	totalWeight := 0
 	for _, topic := range r.subscription.Topics {
 		for _, priority := range r.subscription.Priorities {
-			weight := weights[priority]
-			if weight < 1 {
-				weight = 1
-			}
+			weight := max(weights[priority], 1)
 			budget := budgets[priority]
 			for tier := 0; tier <= retryTiers(r.subscription.Retry); tier++ {
 				laneID := schedulerLaneID(topicFor(topic), priority, tier)
@@ -379,10 +376,7 @@ func newRunnerScheduler(r *Runner) (*sched.Scheduler, error) {
 	sort.Strings(ids)
 	for _, id := range ids {
 		lane := meta[id]
-		capacity := (r.subscription.Concurrency*lane.weight + totalWeight - 1) / totalWeight
-		if capacity < minimumLaneCapacity {
-			capacity = minimumLaneCapacity
-		}
+		capacity := max((r.subscription.Concurrency*lane.weight+totalWeight-1)/totalWeight, minimumLaneCapacity)
 		capacity *= factor
 		specs = append(specs, sched.LaneSpec{ID: id, Group: lane.group, Weight: lane.weight, Budget: lane.budget, Capacity: capacity})
 	}
@@ -1127,8 +1121,7 @@ func invokeHandler(r *Runner, parent context.Context, handler Handler, event *Ev
 			}()
 			result.err = handler.Handle(handlerCtx, event)
 		}()
-		var panicErr *handlerPanicError
-		if errors.As(result.err, &panicErr) {
+		if panicErr, ok := errors.AsType[*handlerPanicError](result.err); ok {
 			result.panic = panicErr
 			result.err = nil
 		}
