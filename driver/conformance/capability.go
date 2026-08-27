@@ -407,7 +407,6 @@ func checkFanoutDeclaration(group *groupContext) {
 		exchange := "capability.fanout." + group.profile.String() + ".exchange"
 		firstDestination := "capability.fanout." + group.profile.String() + ".first"
 		secondDestination := "capability.fanout." + group.profile.String() + ".second"
-		maintenance := group.maintenance(t)
 		if _, err := group.conn.Admin().EnsureTopology(group.ctx, driver.TopologySpec{
 			Exchanges: []driver.ExchangeSpec{{Name: exchange, Kind: "fanout", Durable: true}},
 			Destinations: []driver.DestinationSpec{
@@ -435,7 +434,7 @@ func checkFanoutDeclaration(group *groupContext) {
 		})
 		t.Cleanup(func() {
 			for _, destination := range []string{firstDestination, secondDestination} {
-				if _, err := maintenance.Purge(group.ctx, destination); err != nil {
+				if err := purgeIfSupported(group.ctx, group.conn, destination); err != nil {
 					t.Errorf("purge fanout probe destination %q: %v", destination, err)
 				}
 			}
