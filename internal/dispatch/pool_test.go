@@ -3,6 +3,7 @@ package dispatch
 import (
 	"context"
 	"errors"
+	"hash/fnv"
 	"runtime"
 	"sync"
 	"sync/atomic"
@@ -44,6 +45,61 @@ func TestOrderedPoolKeepsEqualKeysOnOneWorker(t *testing.T) {
 	for i, value := range sequence {
 		if value != i {
 			t.Fatalf("ordered sequence = %v", sequence)
+		}
+	}
+}
+
+func TestQueueIndexKeepsHighBitHashInRange(t *testing.T) {
+	const (
+		queueCount    uint32 = 4
+		key                  = "key-10"
+		expectedHash         = uint32(3421672898) // FNV-1a sum for key-10; high bit set.
+		expectedIndex uint32 = 2
+	)
+
+	hash := fnv.New32a()
+	_, _ = hash.Write([]byte(key))
+	if got := hash.Sum32(); got != expectedHash {
+		t.Fatalf("FNV-1a sum for %q = %d, want %d", key, got, expectedHash)
+	}
+	if expectedHash&0x80000000 == 0 {
+		t.Fatalf("FNV-1a sum for %q = %#x, want high bit set", key, expectedHash)
+	}
+
+	got := queueIndex(hash.Sum32(), queueCount)
+	if got >= queueCount {
+		t.Fatalf("queue index = %d, want range [0, %d)", got, queueCount)
+	}
+	if got != expectedIndex {
+		t.Fatalf("queue index for %q = %d, want %d", key, got, expectedIndex)
+	}
+}
+
+func TestQueueIndexPreservesFNVDistribution(t *testing.T) {
+	const queueCount uint32 = 4
+	tests := []struct {
+		key      string
+		hash     uint32
+		expected uint32
+	}{
+		{key: "", hash: 2166136261, expected: 1},
+		{key: "same", hash: 3440134715, expected: 3},
+		{key: "alpha", hash: 1569418667, expected: 3},
+		{key: "beta", hash: 2944525511, expected: 3},
+		{key: "key-0", hash: 1491088857, expected: 1},
+		{key: "key-1", hash: 1474311238, expected: 2},
+		{key: "key-10", hash: 3421672898, expected: 2},
+		{key: "key-11", hash: 3438450517, expected: 1},
+	}
+
+	for _, test := range tests {
+		hash := fnv.New32a()
+		_, _ = hash.Write([]byte(test.key))
+		if got := hash.Sum32(); got != test.hash {
+			t.Fatalf("FNV-1a sum for %q = %d, want %d", test.key, got, test.hash)
+		}
+		if got := queueIndex(hash.Sum32(), queueCount); got != test.expected {
+			t.Fatalf("queue index for %q = %d, want %d", test.key, got, test.expected)
 		}
 	}
 }

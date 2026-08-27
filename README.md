@@ -11,8 +11,8 @@ deliberately does not do. For the code tour, start with [`docs/`](docs/README.md
 
 ## Guarantees
 
-Each of these is testable. Most are enforced today by CI - `make test`, `make lint`,
-`make verify-agnostic`, and `make check-cardinality` all run in the pipeline. A few are designed
+Each of these is testable. Most are enforced today by CI - `make test`, `make lint`, and
+`make verify-agnostic` all run in the pipeline. A few are designed
 for but not yet proven by a suite: `make swap-report`, `make test-chaos`, and `make kpi` exist as
 placeholders today, each printing "not available yet" until its harness is built.
 

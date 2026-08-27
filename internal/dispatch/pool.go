@@ -31,6 +31,15 @@ type Pool struct {
 	free    chan struct{}
 }
 
+// queueIndex reduces hash to a worker slot while both operands are still
+// unsigned. Narrowing a uint32 with the high bit set to int first produces a
+// negative dividend, and Go's % keeps the dividend's sign, so reducing after
+// that narrowing can send the index negative and panic the queue lookup.
+// Reducing before narrowing keeps the result in [0, queueCount).
+func queueIndex(hash, queueCount uint32) uint32 {
+	return hash % queueCount
+}
+
 // NewPool creates a worker pool. Ordered mode hashes each key to one worker;
 // unordered mode uses the same shared queue for every worker.
 //
@@ -77,7 +86,7 @@ func (p *Pool) Submit(ctx context.Context, work Work) error {
 	if p.ordered {
 		hash := fnv.New32a()
 		_, _ = hash.Write(work.Key)
-		queue = p.queues[int(hash.Sum32())%len(p.queues)]
+		queue = p.queues[queueIndex(hash.Sum32(), uint32(len(p.queues)))] //nolint:gosec // queue count is the configured worker count, far below MaxUint32.
 	}
 	p.mu.Lock()
 	if p.closed {

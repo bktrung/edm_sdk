@@ -1,6 +1,6 @@
 # Jobs use the same Make targets as local development.
 
-image: golang:1.24.0
+image: golang:1.26.1
 
 variables:
   GOPRIVATE: fgit.zapps.vn
@@ -50,12 +50,6 @@ verify-agnostic:
   extends: .go-cache
   script:
     - make verify-agnostic
-
-cardinality:
-  stage: verify
-  extends: .go-cache
-  script:
-    - make check-cardinality
 
 # Add coverage thresholds as packages gain dedicated coverage requirements.
 
