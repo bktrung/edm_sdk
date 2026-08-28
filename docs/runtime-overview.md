@@ -10,11 +10,14 @@ flowchart TB
     PORT[driver port\ninterfaces · errors · capabilities · topology]
     INMEM[drivers/inmem]
     RMQ[drivers/rabbitmq]
-    BROKER[(Broker)]
+    KAFKA[drivers/kafka\nscaffold]
+    BROKER[(RabbitMQ or Kafka)]
 
     APP --> API --> CORE --> PORT
     PORT --> INMEM
     PORT --> RMQ --> BROKER
+    PORT --> KAFKA
+    KAFKA -. Open unsupported .-> BROKER
     INMEM --> MEM[(In-memory broker state)]
 ```
 

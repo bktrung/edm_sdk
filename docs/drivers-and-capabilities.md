@@ -97,6 +97,14 @@ The RabbitMQ adapter translates the port into AMQP operations:
 It may use broker-specific mechanisms internally. Those mechanisms must not leak through the root
 handler API.
 
+## Kafka driver scaffold
+
+The [`drivers/kafka`](../drivers/kafka) package reserves the Kafka adapter boundary and declares its
+planned capability ceiling. [`Driver.Open`](../drivers/kafka/kafka.go) currently returns
+`driver.ErrUnsupported`, so the package is not a usable runtime adapter yet. The Kafka service in
+the [local compose fixture](../docker/docker-compose.yml) supports driver development; it is not a
+supported F1 integration target yet.
+
 ## Topology
 
 The core generates physical names for:
@@ -112,10 +120,14 @@ owns broker syntax; the core owns the logical topology contract.
 
 ## Conformance
 
-[`driver/conformance`](../driver/conformance) runs the same behavior checks against each driver in:
+[`driver/conformance`](../driver/conformance) runs the same behavior checks against the in-memory and
+RabbitMQ adapters in:
 
 - full capability mode
 - strict portability mode
 
 The two modes must produce equivalent observable behavior. This protects the port from adapters that
 silently change semantics when a native optimization is unavailable.
+
+The Kafka scaffold is not wired into conformance until its connection, producer, consumer, and
+topology surfaces are implemented.

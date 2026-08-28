@@ -41,7 +41,7 @@ flowchart LR
 - [Consume flow](consume-flow.md) — broker delivery to handler result and settlement.
 - [Dispatch and scheduling](dispatch-and-scheduling.md) — lanes, fairness, backpressure, and ordering.
 - [Settlement and shutdown](settlement-and-shutdown.md) — retry/DLQ safety and drain phases.
-- [Drivers and capabilities](drivers-and-capabilities.md) — the broker port, in-memory driver, RabbitMQ adapter, and conformance.
+- [Drivers and capabilities](drivers-and-capabilities.md) — the broker port, supported adapters, Kafka scaffold, and conformance.
 - [Reading guide](reading-guide.md) — file-by-file order and which tests to read later.
 
 ## Source authority
@@ -52,8 +52,9 @@ current behavior. Start from the symbol links in each guide when behavior matter
 ## Current implementation
 
 The repository contains the core SDK, the public codec and driver ports, the deterministic in-memory
-driver, and the RabbitMQ driver. Kafka appears in shared configuration and port types, but no
-`drivers/kafka` package is committed.
+driver, the RabbitMQ driver, and a Kafka driver scaffold. Kafka configuration and port compatibility
+surfaces exist, but [`drivers/kafka.Driver.Open`](../drivers/kafka/kafka.go) currently returns
+`driver.ErrUnsupported`, so RabbitMQ is the supported external runtime adapter.
 
 Useful commands are owned by the [Makefile](../Makefile):
 
@@ -66,5 +67,6 @@ make lint
 make verify-agnostic
 ```
 
-`test-rabbitmq` requires Docker. `test-chaos`, `kpi`, and `swap-report` currently report that their
-matrices are unavailable.
+`test-rabbitmq` requires Docker. The broker lifecycle targets use the
+[local compose fixture](../docker/docker-compose.yml); its Kafka service is a development fixture
+until the Kafka driver is implemented.

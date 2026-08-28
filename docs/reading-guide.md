@@ -1,6 +1,6 @@
 # Reading guide
 
-Read in this order. Do not begin with tests or the 1,365-line worker file.
+Read in this order. Do not begin with tests or the main worker implementation.
 
 ```mermaid
 flowchart TD
@@ -13,6 +13,7 @@ flowchart TD
     G --> H[In-memory driver]
     H --> I[Tests and conformance]
     I --> J[RabbitMQ adapter]
+    J --> K[Kafka scaffold]
 ```
 
 ## Pass 1: vocabulary and contracts
@@ -68,9 +69,12 @@ Read:
 2. `f1test/`
 3. `driver/conformance/`
 4. `drivers/rabbitmq/`
+5. `drivers/kafka/`
 
 The in-memory adapter is easier to reason about. RabbitMQ should be read as a translation of the
-same port contract into AMQP and management API operations.
+same port contract into AMQP and management API operations. The Kafka package currently contains
+the driver scaffold only; `Driver.Open` returns `driver.ErrUnsupported` until the adapter is
+implemented.
 
 ## Tests to read early
 

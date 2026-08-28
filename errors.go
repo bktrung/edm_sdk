@@ -2,6 +2,7 @@ package f1
 
 import (
 	"errors"
+	"slices"
 	"time"
 )
 
@@ -174,12 +175,7 @@ func IsTerminal(err error) bool {
 		return true
 	}
 	if joined, ok := err.(interface{ Unwrap() []error }); ok {
-		for _, child := range joined.Unwrap() {
-			if IsTerminal(child) {
-				return true
-			}
-		}
-		return false
+		return slices.ContainsFunc(joined.Unwrap(), IsTerminal)
 	}
 	if wrapped, ok := err.(interface{ Unwrap() error }); ok {
 		return IsTerminal(wrapped.Unwrap())

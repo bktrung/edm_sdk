@@ -13,11 +13,14 @@ flowchart TB
     PORT[driver/\nstdlib-only broker port]
     IM[drivers/inmem]
     RMQ[drivers/rabbitmq]
-    BROKER[(RabbitMQ or in-memory state)]
+    KAFKA[drivers/kafka\nscaffold]
+    BROKER[(RabbitMQ or Kafka)]
 
     APP --> F1 --> INT --> PORT
     PORT --> IM
     PORT --> RMQ --> BROKER
+    PORT --> KAFKA
+    KAFKA -. Open unsupported .-> BROKER
 ```
 
 The core does not import `drivers/**` or a broker client. Drivers implement the port and own broker
@@ -84,14 +87,14 @@ duplicates; application effects must use `Event.IdempotencyKey()` when they need
 | `internal/sched/` | Bounded weighted lanes and aging |
 | `internal/dispatch/` | Worker pool, ordered-key routing, settlement registry |
 | `internal/lifecycle/` | Runner drain state machine and disposition accounting; `Client.Close` coordinates runner drains |
-| `internal/obs/` | OpenTelemetry metric registration and sampled collection |
 | `drivers/inmem/` | Deterministic reference broker and test driver |
 | `drivers/rabbitmq/` | AMQP and RabbitMQ management adapter |
+| `drivers/kafka/` | Kafka driver scaffold; `Driver.Open` currently returns `driver.ErrUnsupported` |
 | `f1test/` | Deterministic black-box test client built on in-memory transport |
 | `tools/` | `tools/apisurface` and `tools/apidiff` checks |
 
-Kafka is recognized by shared configuration and port types, but `drivers/kafka/` is not present.
-There is no SDK database, deduplication store, or outbox.
+Kafka is recognized by shared configuration and port types, and its scaffold reserves the concrete
+driver boundary.
 
 ## Core ownership
 

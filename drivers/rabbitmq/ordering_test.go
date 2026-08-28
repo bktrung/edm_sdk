@@ -136,7 +136,7 @@ func liveOrderingSequence() []driver.OutboundMessage {
 		messages = append(messages, driver.OutboundMessage{
 			Destination: liveOrderingQueue,
 			Key:         []byte(key),
-			Body:        []byte(fmt.Sprintf("%s:%d", key, counts[key])),
+			Body:        fmt.Appendf(nil, "%s:%d", key, counts[key]),
 		})
 	}
 	return messages
