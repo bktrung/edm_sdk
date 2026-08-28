@@ -787,10 +787,7 @@ func openRunnerConsumer(r *Runner, ctx context.Context) (driver.Consumer, error)
 	for i, destination := range destinations {
 		share := 1
 		if remaining > len(destinations)-i {
-			share = remaining / (len(destinations) - i)
-			if share < 1 {
-				share = 1
-			}
+			share = max(remaining/(len(destinations)-i), 1)
 		}
 		perDestination[destination] = share
 		remaining -= share

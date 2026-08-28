@@ -6,6 +6,7 @@ import (
 	"crypto/x509"
 	"errors"
 	"fmt"
+	"maps"
 	"net"
 	"net/url"
 	"os"
@@ -545,12 +546,7 @@ func brokerInfo(connection *amqp.Connection) driver.BrokerInfo {
 
 func copyBrokerInfo(info driver.BrokerInfo) driver.BrokerInfo {
 	info.Nodes = append([]string(nil), info.Nodes...)
-	if info.Extra != nil {
-		info.Extra = make(map[string]string, len(info.Extra))
-		for key, value := range info.Extra {
-			info.Extra[key] = value
-		}
-	}
+	info.Extra = maps.Clone(info.Extra)
 	return info
 }
 
@@ -566,8 +562,7 @@ func classifyAMQP(op string, fallback driver.Kind, err error) error {
 		return nil
 	}
 	kind := fallback
-	var amqpErr *amqp.Error
-	if errors.As(err, &amqpErr) {
+	if amqpErr, ok := errors.AsType[*amqp.Error](err); ok {
 		switch amqpErr.Code {
 		case 403:
 			kind = driver.KindPermission

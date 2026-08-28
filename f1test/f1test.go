@@ -241,8 +241,7 @@ func (s *captureStore) add(messages []driver.OutboundMessage, err error) {
 		return
 	}
 	failed := map[int]struct{}{}
-	var partial *driver.PublishError
-	if errors.As(err, &partial) {
+	if partial, ok := errors.AsType[*driver.PublishError](err); ok {
 		for index := range partial.Failed {
 			failed[index] = struct{}{}
 		}

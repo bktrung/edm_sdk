@@ -68,7 +68,6 @@ func Run(t *testing.T, suite Suite) Report {
 	profilesRan := 0
 	groupsRan := 0
 	for _, profile := range []Profile{ProfileFull, ProfileStrictPortability} {
-		profile := profile
 		var result ProfileReport
 		profileRan := false
 		ok := t.Run(profile.String(), func(profileTest *testing.T) {
@@ -149,7 +148,7 @@ func runProfile(
 		t.Fatalf("inspect baseline: %v", err)
 	}
 	const n = 2
-	for i := 0; i < n; i++ {
+	for i := range n {
 		if err := producer.Publish(ctx, driver.OutboundMessage{
 			Destination: destination,
 			Body:        []byte{byte(i)},
@@ -170,7 +169,7 @@ func runProfile(
 	if err != nil {
 		t.Fatalf("create consumer: %v", err)
 	}
-	for i := 0; i < n; i++ {
+	for i := range n {
 		receiveCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 		select {
 		case message := <-consumer.Messages():

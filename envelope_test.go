@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"log/slog"
+	"maps"
 	"os"
 	"strings"
 	"testing"
@@ -459,9 +460,7 @@ func TestEnvelope_DecodeHeadersRejectsMalformedValues(t *testing.T) {
 	}
 	for key, bad := range cases {
 		h := map[string]string{}
-		for k, v := range base {
-			h[k] = v
-		}
+		maps.Copy(h, base)
 		h[key] = bad
 		_, err := f1.DecodeHeaders(h)
 		require.Errorf(t, err, "expected DecodeHeaders to reject %s=%q", key, bad)
@@ -615,9 +614,7 @@ func TestEnvelope_DecodeHeadersRejectsMissingRequiredAttributes(t *testing.T) {
 
 func cloneHeaders(input map[string]string) map[string]string {
 	clone := make(map[string]string, len(input))
-	for key, value := range input {
-		clone[key] = value
-	}
+	maps.Copy(clone, input)
 	return clone
 }
 

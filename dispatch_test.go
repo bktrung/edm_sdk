@@ -619,17 +619,6 @@ func (*dispatchConsumer) Lag(context.Context) (map[string]int64, error) {
 	return nil, driver.ErrUnsupported
 }
 
-func waitDispatchSignal(t *testing.T, signal <-chan struct{}, message string) {
-	t.Helper()
-	timer := clock.NewReal().Timer(time.Second)
-	defer timer.Stop()
-	select {
-	case <-signal:
-	case <-timer.C:
-		t.Fatal(message)
-	}
-}
-
 func TestRunnerAccountingAxesSumAfterMixedOutcomes(t *testing.T) {
 	producer := &dispatchProducer{}
 	conn := &dispatchConn{producer: producer}

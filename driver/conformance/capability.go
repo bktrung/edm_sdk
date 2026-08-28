@@ -78,7 +78,7 @@ func runCapability(group *groupContext) {
 				t.Fatal(err)
 			}
 		}
-		for i := 0; i < 3; i++ {
+		for i := range 3 {
 			message := receiveMessage(t, group, consumer)
 			if string(message.Body) != fmt.Sprintf("order-%d", i) {
 				t.Fatalf("body=%q at position %d, want order-%d", message.Body, i, i)

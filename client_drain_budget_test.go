@@ -96,7 +96,7 @@ func TestZeroConsumerDrainTimeoutLeavesTheCallerContextAsTheOnlyBound(t *testing
 	}
 
 	fake.Advance(24 * time.Hour)
-	for i := 0; i < 50; i++ {
+	for range 50 {
 		fake.Advance(time.Hour)
 		select {
 		case err := <-drained:

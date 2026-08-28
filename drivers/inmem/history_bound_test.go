@@ -34,7 +34,7 @@ func TestHistoryEvictsOldestOnceCapped(t *testing.T) {
 
 	const overflow = 5
 	total := maxDestinationHistory + overflow
-	for i := 0; i < total; i++ {
+	for range total {
 		require.NoError(t, producer.Publish(ctx, driver.OutboundMessage{Destination: "orders", Body: []byte("x")}))
 	}
 

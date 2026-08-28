@@ -34,7 +34,7 @@ func TestStrict_ZeroesEveryNegotiableCapability(t *testing.T) {
 		"MaxHeaderBytes":  true,
 	}
 	typeOfCapabilities := value.Type()
-	for i := 0; i < value.NumField(); i++ {
+	for i := range value.NumField() {
 		fieldName := typeOfCapabilities.Field(i).Name
 		if !kept[fieldName] && !value.Field(i).IsZero() {
 			t.Errorf("Strict() field %s = %#v, want zero", fieldName, value.Field(i).Interface())

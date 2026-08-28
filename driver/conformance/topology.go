@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -620,12 +621,7 @@ func runTopology(group *groupContext) {
 }
 
 func containsName(names []string, want string) bool {
-	for _, name := range names {
-		if name == want {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(names, want)
 }
 
 func cleanupTopologyDestinations(t *testing.T, admin driver.Admin, maintenance driver.Maintenance, ctx context.Context, names ...string) {

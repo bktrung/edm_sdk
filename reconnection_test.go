@@ -1280,7 +1280,7 @@ func TestPublishOnlyClientSurfacesReconnectExhaustion(t *testing.T) {
 		t.Fatalf("reconnect error = %v, want classified fatal", reconnectErr)
 	}
 
-	for i := 0; i < 2; i++ {
+	for i := range 2 {
 		if healthErr := client.Health(context.Background()); !errors.Is(healthErr, reconnectErr) {
 			t.Fatalf("Health attempt %d = %v, want stored exhaustion %v", i+1, healthErr, reconnectErr)
 		}

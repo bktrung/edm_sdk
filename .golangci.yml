@@ -29,6 +29,10 @@ linters:
     - rowserrcheck
     # Require a specific linter and an explanation for every suppression.
     - nolintlint
+    # Standard-library constants and adjacent hygiene.
+    - usestdlibvars
+    - intrange
+    - copyloopvar
 
   settings:
     revive:

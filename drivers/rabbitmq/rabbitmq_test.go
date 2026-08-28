@@ -25,6 +25,22 @@ func TestDriverCapabilities(t *testing.T) {
 	}
 }
 
+func TestCopyBrokerInfoClonesExtra(t *testing.T) {
+	source := driver.BrokerInfo{
+		Extra: map[string]string{"region": "saigon"},
+	}
+
+	got := copyBrokerInfo(source)
+	if got.Extra["region"] != "saigon" {
+		t.Errorf("copyBrokerInfo().Extra[region] = %q, want saigon", got.Extra["region"])
+	}
+
+	got.Extra["region"] = "singapore"
+	if source.Extra["region"] != "saigon" {
+		t.Errorf("mutating copied Extra changed source: got %q, want saigon", source.Extra["region"])
+	}
+}
+
 func TestConfiguredQueueKind(t *testing.T) {
 	cases := []struct {
 		name    string

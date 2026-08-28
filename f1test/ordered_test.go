@@ -89,7 +89,7 @@ func TestOrderedByKeyKeepsEqualKeysSerialAndDifferentKeysConcurrent(t *testing.T
 
 	messages := make([]f1.Message, 0, totalMessages)
 	for _, key := range keys {
-		for i := 0; i < messagesPerKey; i++ {
+		for range messagesPerKey {
 			messages = append(messages, f1.Message{
 				EventType: "orders.created.v1",
 				Payload:   struct{ Key string }{Key: key},
@@ -121,7 +121,7 @@ func TestOrderedByKeyKeepsEqualKeysSerialAndDifferentKeysConcurrent(t *testing.T
 	require.Equal(t, len(keys), activeAtSaturation)
 
 	releaseOnce.Do(func() { close(release) })
-	for i := 0; i < totalMessages; i++ {
+	for i := range totalMessages {
 		select {
 		case <-handled:
 		case <-waitCtx.Done():

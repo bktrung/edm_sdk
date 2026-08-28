@@ -183,8 +183,7 @@ func TestErrorHandlerReceivesSuccessorHandoffFailure(t *testing.T) {
 	if err := call.event.Decode(&map[string]any{}); err == nil || err.Error() != "f1: event codec is unavailable" {
 		t.Fatalf("event.Decode() error = %v, want unavailable-codec error", err)
 	}
-	var classified *driver.Error
-	if !errors.As(call.err, &classified) {
+	if _, ok := errors.AsType[*driver.Error](call.err); !ok {
 		t.Fatalf("error = %v, want a classified *driver.Error", call.err)
 	}
 }
@@ -297,7 +296,7 @@ func TestErrorHandlerNotificationsAreBoundedAndDroppable(t *testing.T) {
 
 	runnerNotifyError(runner, context.Background(), nil, errors.New("first"))
 	runnerNotifyError(runner, context.Background(), nil, errors.New("second"))
-	for i := 0; i < 2; i++ {
+	for range 2 {
 		timer := clock.NewReal().Timer(time.Second)
 		select {
 		case <-started:
@@ -322,7 +321,7 @@ func TestErrorHandlerNotificationsAreBoundedAndDroppable(t *testing.T) {
 	}
 
 	releaseOnce.Do(func() { close(release) })
-	for i := 0; i < 2; i++ {
+	for range 2 {
 		timer := clock.NewReal().Timer(time.Second)
 		select {
 		case <-finished:

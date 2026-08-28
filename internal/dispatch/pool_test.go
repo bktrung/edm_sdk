@@ -17,7 +17,7 @@ func TestPoolRunsAllWork(t *testing.T) {
 	}
 	var mu sync.Mutex
 	count := 0
-	for i := 0; i < 20; i++ {
+	for range 20 {
 		if err := pool.Submit(context.Background(), Work{Run: func(context.Context) { mu.Lock(); count++; mu.Unlock() }}); err != nil {
 			t.Fatal(err)
 		}
@@ -35,7 +35,7 @@ func TestOrderedPoolKeepsEqualKeysOnOneWorker(t *testing.T) {
 	}
 	var mu sync.Mutex
 	sequence := make([]int, 0, 10)
-	for i := 0; i < 10; i++ {
+	for i := range 10 {
 		value := i
 		if err := pool.Submit(context.Background(), Work{Key: []byte("same"), Run: func(context.Context) { mu.Lock(); sequence = append(sequence, value); mu.Unlock() }}); err != nil {
 			t.Fatal(err)
@@ -190,7 +190,7 @@ func TestPoolCloseUnblocksBlockedSubmit(t *testing.T) {
 	go func() {
 		submitDone <- p.Submit(context.Background(), Work{Run: func(context.Context) {}})
 	}()
-	for i := 0; i < 100000; i++ {
+	for i := range 100000 {
 		p.mu.Lock()
 		active := p.active
 		p.mu.Unlock()
@@ -209,7 +209,7 @@ func TestPoolCloseUnblocksBlockedSubmit(t *testing.T) {
 		close(closeDone)
 	}()
 	<-p.closing
-	for i := 0; i < 100000; i++ {
+	for range 100000 {
 		select {
 		case err := <-submitDone:
 			if err == nil {
@@ -268,7 +268,7 @@ func TestPoolSubmitAndWaitCancellationPaths(t *testing.T) {
 		t.Fatal(err)
 	}
 	var resizedRuns atomic.Int32
-	for i := 0; i < 2; i++ {
+	for range 2 {
 		if err := resized.Submit(context.Background(), Work{Run: func(context.Context) { resizedRuns.Add(1) }}); err != nil {
 			t.Fatal(err)
 		}
@@ -300,7 +300,7 @@ func TestPoolSubmitReturnsClosedDuringClose(t *testing.T) {
 	go func() {
 		submitDone <- pool.Submit(context.Background(), Work{Run: func(context.Context) {}})
 	}()
-	for i := 0; i < 100000; i++ {
+	for i := range 100000 {
 		pool.mu.Lock()
 		active := pool.active
 		pool.mu.Unlock()

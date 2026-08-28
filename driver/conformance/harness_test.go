@@ -363,10 +363,7 @@ func (c *runTestConn) Producer(context.Context, driver.ProducerConfig) (driver.P
 }
 
 func (c *runTestConn) Consumer(_ context.Context, cfg driver.ConsumerConfig) (driver.Consumer, error) {
-	capacity := cfg.Prefetch
-	if capacity < 1 {
-		capacity = 1
-	}
+	capacity := max(cfg.Prefetch, 1)
 	consumer := &runTestConsumer{
 		conn:     c,
 		messages: make(chan driver.InboundMessage, capacity),

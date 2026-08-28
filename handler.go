@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"runtime/debug"
+	"slices"
 )
 
 // Handler processes one delivered Event.
@@ -30,9 +31,9 @@ func buildHandlerChain(user []Middleware, handler Handler) Handler {
 		return nil
 	}
 	chain := handler
-	for i := len(user) - 1; i >= 0; i-- {
-		if user[i] != nil {
-			chain = user[i](chain)
+	for _, u := range slices.Backward(user) {
+		if u != nil {
+			chain = u(chain)
 		}
 	}
 	return recoverMiddleware(chain)

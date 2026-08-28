@@ -40,7 +40,7 @@ func TestFake_SleepIsDeterministicUnderParallel(t *testing.T) {
 
 	const n = 50
 	results := make(chan error, n)
-	for i := 0; i < n; i++ {
+	for range n {
 		go func() {
 			results <- fc.Sleep(context.Background(), time.Second)
 		}()
@@ -50,7 +50,7 @@ func TestFake_SleepIsDeterministicUnderParallel(t *testing.T) {
 	fc.BlockUntil(n)
 	fc.Advance(time.Second)
 
-	for i := 0; i < n; i++ {
+	for range n {
 		require.NoError(t, <-results)
 	}
 }
@@ -101,7 +101,7 @@ func TestFake_TickerFiresOnEveryInterval(t *testing.T) {
 	tk := fc.Ticker(time.Second)
 
 	// Each advance should reschedule the ticker.
-	for i := 0; i < 3; i++ {
+	for range 3 {
 		fc.Advance(time.Second)
 		requireFired(t, tk.C)
 	}
@@ -204,7 +204,7 @@ func TestReal_TickerFiresRepeatedly(t *testing.T) {
 	tk := r.Ticker(5 * time.Millisecond)
 	defer tk.Stop()
 
-	for i := 0; i < 2; i++ {
+	for range 2 {
 		select {
 		case <-tk.C:
 		case <-time.After(time.Second):

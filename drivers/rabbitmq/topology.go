@@ -369,8 +369,8 @@ func (a *adminOperations) scanOrphans(ctx context.Context, spec driver.TopologyS
 		if _, exists := known[queue.Name]; exists {
 			continue
 		}
-		if strings.HasSuffix(queue.Name, ".park") {
-			parent := strings.TrimSuffix(queue.Name, ".park")
+		if before, ok := strings.CutSuffix(queue.Name, ".park"); ok {
+			parent := before
 			if _, parentExists := byName[parent]; parentExists {
 				if _, parentKnown := known[parent]; !parentKnown {
 					add(parent, queue.totalMessages())

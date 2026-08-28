@@ -458,7 +458,6 @@ func newLaneCloseFixture(t *testing.T, group *groupContext, suffix string) (driv
 		}
 	})
 	for _, destination := range []string{first, second} {
-		destination := destination
 		t.Cleanup(func() {
 			if err := purgeIfSupported(group.ctx, group.conn, destination); err != nil {
 				t.Errorf("purge lane close destination %q: %v", destination, err)

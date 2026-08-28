@@ -22,7 +22,7 @@ func BenchmarkSchedulerNext(b *testing.B) {
 			scheduler, remaining := newBenchmarkScheduler(test.aging, test.overdue)
 			b.ReportAllocs()
 			b.ResetTimer()
-			for i := 0; i < b.N; i++ {
+			for range b.N {
 				if remaining == 0 {
 					b.StopTimer()
 					scheduler, remaining = newBenchmarkScheduler(test.aging, test.overdue)
