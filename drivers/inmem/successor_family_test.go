@@ -36,8 +36,7 @@ func (d *successorFamilyDriver) Open(ctx context.Context, cfg driver.Config) (dr
 // undeclared payments.charged family and the broker would refuse every
 // republish attempt, releasing the consumer instead of settling the delivery.
 func TestDeadLetterSuccessorReachesTheDeclaredConsumerFamily(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := t.Context()
 	broker := &successorFamilyDriver{}
 	client, err := f1.New(ctx, successorFamilyConfig(), f1.WithDriver(broker),
 		f1.WithPublishTopics("orders.created"))

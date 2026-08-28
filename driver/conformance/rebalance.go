@@ -125,7 +125,7 @@ func runRebalance(group *groupContext) {
 
 		initial := make([]driver.InboundMessage, 0, firstPrefetch+secondPrefetch)
 		firstOutstanding, secondOutstanding := 0, 0
-		for i := 0; i < firstPrefetch+secondPrefetch; i++ {
+		for range firstPrefetch + secondPrefetch {
 			message, owner, _ := receiveFromEither(t, group, "prefetch delivery", first, second)
 			initial = append(initial, message)
 			switch owner {

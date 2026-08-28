@@ -23,8 +23,7 @@ func TestAcceptanceFlowReconcilesHandledRetryAndDeadLetteredMessages(t *testing.
 		published = 10
 	)
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := t.Context()
 	client, err := f1.New(ctx, acceptanceFlowConfig(),
 		f1.WithDriver(inmem.Driver{}),
 		f1.WithCodec(codec.JSON{}),

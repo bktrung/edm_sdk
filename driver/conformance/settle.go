@@ -323,12 +323,9 @@ func runSettle(group *groupContext) {
 		errorsCh := make(chan error, len(messages))
 		var waitGroup sync.WaitGroup
 		for _, message := range messages {
-			message := message
-			waitGroup.Add(1)
-			go func() {
-				defer waitGroup.Done()
+			waitGroup.Go(func() {
 				errorsCh <- message.Settle.Ack(group.ctx)
-			}()
+			})
 		}
 		waitGroup.Wait()
 		close(errorsCh)

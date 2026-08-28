@@ -145,7 +145,7 @@ type Consumer interface {
 	Lag(ctx context.Context) (map[string]int64, error)
 }
 
-// Admin provisions, inspects, and safely prunes broker destinations.
+// Admin provisions and inspects broker destinations.
 // Implementations must be safe for concurrent use.
 type Admin interface {
 	// EnsureTopology creates missing destinations and reports the diff. It must
@@ -156,7 +156,11 @@ type Admin interface {
 
 	// DescribeTopology reads current topology state for topology diff output.
 	DescribeTopology(ctx context.Context, names []string) (TopologyState, error)
+}
 
+// Maintenance provides optional destructive destination operations.
+// Implementations must be safe for concurrent use.
+type Maintenance interface {
 	// Purge empties a destination and keeps it.
 	Purge(ctx context.Context, destination string) (int64, error)
 

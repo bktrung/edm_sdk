@@ -229,3 +229,108 @@ func TestDrainReturnsHookAndParentErrors(t *testing.T) {
 		t.Fatalf("cancelled drain state = %s, want aborted", machine.State())
 	}
 }
+
+func TestDrainFinishesWhenFailureOccursDuringSettlement(t *testing.T) {
+	machine := New()
+	if err := machine.Transition(Ready); err != nil {
+		t.Fatal(err)
+	}
+	var flushRan, closeRan bool
+	err := machine.Drain(context.Background(), Config{}, Hooks{
+		WaitSettled: func(context.Context) error {
+			return machine.Transition(Failed)
+		},
+		Flush: func(context.Context) error {
+			flushRan = true
+			return nil
+		},
+		Close: func(context.Context) error {
+			closeRan = true
+			return nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("Drain() error = %v, want nil", err)
+	}
+	if got := machine.State(); got != Failed {
+		t.Fatalf("state after failed settlement = %s, want failed", got)
+	}
+	if !flushRan || !closeRan {
+		t.Fatalf("hooks ran: flush=%t close=%t, want both true", flushRan, closeRan)
+	}
+}
+
+func TestDrainPreservesAlreadyFailedBehavior(t *testing.T) {
+	machine := New()
+	if err := machine.Transition(Ready); err != nil {
+		t.Fatal(err)
+	}
+	if err := machine.Transition(Failed); err != nil {
+		t.Fatal(err)
+	}
+	var drainRan, waitRan, flushRan, closeRan bool
+	err := machine.Drain(context.Background(), Config{}, Hooks{
+		Drain: func(context.Context) error {
+			drainRan = true
+			return nil
+		},
+		WaitSettled: func(context.Context) error {
+			waitRan = true
+			return nil
+		},
+		Flush: func(context.Context) error {
+			flushRan = true
+			return nil
+		},
+		Close: func(context.Context) error {
+			closeRan = true
+			return nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("Drain() error = %v, want nil", err)
+	}
+	if got := machine.State(); got != Failed {
+		t.Fatalf("state after already-failed drain = %s, want failed", got)
+	}
+	if drainRan || !waitRan || !flushRan || !closeRan {
+		t.Fatalf("hooks ran: drain=%t wait=%t flush=%t close=%t", drainRan, waitRan, flushRan, closeRan)
+	}
+}
+
+func TestDrainTransitionsOrdinaryPathToClosed(t *testing.T) {
+	machine := New()
+	if err := machine.Transition(Ready); err != nil {
+		t.Fatal(err)
+	}
+	states := make([]State, 0, 4)
+	record := func(want State) func(context.Context) error {
+		return func(context.Context) error {
+			states = append(states, machine.State())
+			if got := machine.State(); got != want {
+				return errors.New("unexpected lifecycle state: " + got.String())
+			}
+			return nil
+		}
+	}
+	if err := machine.Drain(context.Background(), Config{}, Hooks{
+		Drain:       record(Draining),
+		WaitSettled: record(Settling),
+		Flush:       record(Flushing),
+		Close:       record(Flushing),
+	}); err != nil {
+		t.Fatalf("Drain() error = %v, want nil", err)
+	}
+	want := []State{Draining, Settling, Flushing, Flushing}
+	if len(states) != len(want) {
+		t.Fatalf("hook states = %v, want %v", states, want)
+	}
+	for i := range want {
+		if states[i] != want[i] {
+			t.Fatalf("hook states = %v, want %v", states, want)
+		}
+	}
+	if got := machine.State(); got != Closed {
+		t.Fatalf("ordinary drain state = %s, want closed", got)
+	}
+}

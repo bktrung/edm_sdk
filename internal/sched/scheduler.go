@@ -106,7 +106,7 @@ func (s *Scheduler) Next() (Item, bool) {
 			return promoted.pop(), true
 		}
 	}
-	for checked := 0; checked < len(s.slots); checked++ {
+	for checked := range len(s.slots) {
 		index := (s.cursor + checked) % len(s.slots)
 		group := s.slots[index]
 		if group.empty() {
@@ -180,7 +180,7 @@ func (s *slot) head() Item {
 }
 
 func (s *slot) pop() Item {
-	for checked := 0; checked < len(s.lanes); checked++ {
+	for checked := range len(s.lanes) {
 		index := (s.cursor + checked) % len(s.lanes)
 		lane := s.lanes[index]
 		if len(lane.items) == 0 {

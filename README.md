@@ -11,10 +11,9 @@ deliberately does not do. For the code tour, start with [`docs/`](docs/README.md
 
 ## Guarantees
 
-Each of these is testable. Most are enforced today by CI - `make test`, `make lint`, and
-`make verify-agnostic` all run in the pipeline. A few are designed
-for but not yet proven by a suite: `make swap-report`, `make test-chaos`, and `make kpi` exist as
-placeholders today, each printing "not available yet" until its harness is built.
+Each of these is testable. The current CI pipeline runs `make build`, `make test-fast`, `make test`,
+`make lint`, and `make verify-agnostic`; the [Makefile](Makefile) owns the complete local command
+set.
 
 - **At-least-once delivery, with a stable message identity.** Transport redelivers during failures
   and rolling restarts - that is the guarantee, not a bug. F1 generates an event id, uses it as the
@@ -57,8 +56,9 @@ placeholders today, each printing "not available yet" until its harness is built
 - Schema registry integration. v1 uses JSON plus a versioned envelope; the codec port has hooks for
   Avro/Protobuf, but no registry client ships in v1.
 - NATS JetStream / Pulsar drivers. The port is designed to accommodate them; neither is present.
-- Kafka has shared configuration and port compatibility surfaces, but no `drivers/kafka` package is
-  committed in this repository.
+- Kafka runtime support is not available yet. The repository includes a Kafka driver scaffold and
+  shared configuration and port surfaces; [`drivers/kafka.Driver.Open`](drivers/kafka/kafka.go)
+  currently returns `driver.ErrUnsupported`.
 - Multiple broker versions per broker. The RabbitMQ adapter targets one stable broker family.
 
 ## Install
@@ -78,9 +78,11 @@ cannot see it.
 ## Quickstart with RabbitMQ
 
 This repository includes two separate services that use the public SDK API against the local
-RabbitMQ fixture. They share `examples/config.yaml`; change the broker endpoint there when using a
-real broker. The development config sets `topology.autoCreate: true` so the publisher can declare
-its entry point. Production should provision topology separately and leave auto-creation disabled.
+RabbitMQ fixture. The [compose fixture](docker/docker-compose.yml) also defines Kafka for driver
+development, but the Kafka driver is not operational yet. The services share `examples/config.yaml`;
+change the broker endpoint there when using a real broker. The development config sets
+`topology.autoCreate: true` so the publisher can declare its entry point. Production should
+provision topology separately and leave auto-creation disabled.
 
 From a clean checkout:
 

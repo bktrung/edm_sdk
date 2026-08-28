@@ -83,7 +83,7 @@ func TestLogCapabilitiesAnnouncesUnusedUnavailableFeatureAtInfo(t *testing.T) {
 func assertOrderedCapabilityLog(t *testing.T, output, wantLevel string) {
 	t.Helper()
 	var matches []string
-	for _, line := range strings.Split(output, "\n") {
+	for line := range strings.SplitSeq(output, "\n") {
 		if strings.Contains(line, "feature=ordered_by_key") {
 			matches = append(matches, line)
 		}

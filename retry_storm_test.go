@@ -33,7 +33,7 @@ func TestRunnerSchedulerPreservesRetryStormFairness(t *testing.T) {
 		t.Fatalf("scheduler lanes = %d, want %d", got, want)
 	}
 	for _, id := range laneIDs {
-		for i := 0; i < retryStormBacklog; i++ {
+		for range retryStormBacklog {
 			if err := scheduler.Enqueue(id, sched.Item{Value: id}); err != nil {
 				t.Fatalf("enqueue %s: %v", id, err)
 			}
@@ -51,7 +51,7 @@ func TestRunnerSchedulerPreservesRetryStormFairness(t *testing.T) {
 
 	retrySeen := make(map[string]int)
 	freshCount := 0
-	for i := 0; i < retryStormWindow; i++ {
+	for i := range retryStormWindow {
 		item, ok := scheduler.Next()
 		if !ok {
 			t.Fatalf("scheduler emptied during saturation window at %d", i)
@@ -119,10 +119,7 @@ func retryStormExpectedWeights(defaults SubscriptionConfig) (freshWeight, totalW
 		weight := defaults.Fairness.Weights[priority]
 		freshWeight += weight
 		totalWeight += weight
-		retryWeight := weight / retryStormDefaultDivide
-		if retryWeight < 1 {
-			retryWeight = 1
-		}
+		retryWeight := max(weight/retryStormDefaultDivide, 1)
 		totalWeight += retryWeight
 	}
 	return freshWeight, totalWeight

@@ -182,7 +182,7 @@ func TestConcurrentFirstPublishesInstallOneProducerAndCloseLoser(t *testing.T) {
 	releaseBuild := func() { releaseOnce.Do(func() { close(release) }) }
 	t.Cleanup(func() {
 		releaseBuild()
-		for i := 0; i < 2; i++ {
+		for range 2 {
 			select {
 			case <-results:
 			case <-clock.NewReal().Timer(time.Second).C:
@@ -191,7 +191,7 @@ func TestConcurrentFirstPublishesInstallOneProducerAndCloseLoser(t *testing.T) {
 		}
 		_ = client.Close(context.Background())
 	})
-	for i := 0; i < 2; i++ {
+	for range 2 {
 		go func() {
 			results <- publishMessages(client, context.Background(), true, driver.OutboundMessage{Destination: "orders.created"})
 		}()
@@ -199,7 +199,7 @@ func TestConcurrentFirstPublishesInstallOneProducerAndCloseLoser(t *testing.T) {
 	waitForSignal(t, built, "first producer build")
 	waitForSignal(t, built, "second producer build")
 	releaseBuild()
-	for i := 0; i < 2; i++ {
+	for i := range 2 {
 		if err := <-results; err != nil {
 			t.Fatalf("concurrent publish %d = %v, want nil", i, err)
 		}

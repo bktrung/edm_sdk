@@ -152,7 +152,7 @@ func TestAgingFallsBackToWeightedSelectionWhenNothingIsOverdue(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for i := 0; i < 3; i++ {
+	for range 3 {
 		if err := scheduler.Enqueue("high", Item{Value: "high", EnqueuedAt: start}); err != nil {
 			t.Fatal(err)
 		}
@@ -252,7 +252,7 @@ func TestGroupedLanesShareOneWeightedSlot(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for i := 0; i < 3; i++ {
+	for range 3 {
 		if err := scheduler.Enqueue("retry-1", Item{Value: "one"}); err != nil {
 			t.Fatal(err)
 		}
@@ -310,7 +310,7 @@ func TestAgingKeepsLowPriorityMovingUnderSustainedHighLoad(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for i := 0; i < 16; i++ {
+	for range 16 {
 		if err := scheduler.Enqueue("high", Item{Value: "high", EnqueuedAt: start}); err != nil {
 			t.Fatal(err)
 		}

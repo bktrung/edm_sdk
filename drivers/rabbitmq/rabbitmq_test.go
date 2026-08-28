@@ -20,8 +20,24 @@ func TestDriverCapabilities(t *testing.T) {
 	if caps.NativePriority != driver.PriorityStrict || caps.NativePriorityLevels != 32 {
 		t.Fatalf("priority capabilities = %#v, want strict 32 levels", caps)
 	}
-	if caps.Fanout != driver.FanoutAtPublish || caps.OrderedByKey {
-		t.Fatalf("routing capabilities = %#v, want publish fanout and unordered keys", caps)
+	if caps.Fanout != driver.FanoutAtPublish || !caps.OrderedByKey {
+		t.Fatalf("routing capabilities = %#v, want publish fanout and ordered keys", caps)
+	}
+}
+
+func TestCopyBrokerInfoClonesExtra(t *testing.T) {
+	source := driver.BrokerInfo{
+		Extra: map[string]string{"region": "saigon"},
+	}
+
+	got := copyBrokerInfo(source)
+	if got.Extra["region"] != "saigon" {
+		t.Errorf("copyBrokerInfo().Extra[region] = %q, want saigon", got.Extra["region"])
+	}
+
+	got.Extra["region"] = "singapore"
+	if source.Extra["region"] != "saigon" {
+		t.Errorf("mutating copied Extra changed source: got %q, want saigon", source.Extra["region"])
 	}
 }
 
@@ -112,12 +128,24 @@ func TestExpirationMillisClampsLargeDelay(t *testing.T) {
 func TestOpenRejectsSCRAM(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
-	_, err := (Driver{}).Open(ctx, driver.Config{SASL: &driver.SASLConfig{Mechanism: "scram-sha-256"}})
+	_, err := (Driver{}).Open(ctx, driver.Config{Endpoints: []string{defaultEndpoint}, SASL: &driver.SASLConfig{Mechanism: "scram-sha-256"}})
 	if err == nil {
 		t.Fatal("Open() error = nil, want unsupported SASL error")
 	}
 	if !strings.Contains(err.Error(), "PLAIN, AMQPLAIN, EXTERNAL") {
 		t.Fatalf("Open() error = %v, want supported mechanism list", err)
+	}
+	if kind, ok := driver.Classify(err); !ok || kind != driver.KindFatal {
+		t.Fatalf("Classify(Open error) = %v, %t, want fatal, true", kind, ok)
+	}
+}
+
+func TestOpenRejectsEmptyEndpoints(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	_, err := (Driver{}).Open(ctx, driver.Config{})
+	if err == nil || !errors.Is(err, errMissingEndpoints) {
+		t.Fatalf("Open() error = %v, want named empty-endpoint error", err)
 	}
 	if kind, ok := driver.Classify(err); !ok || kind != driver.KindFatal {
 		t.Fatalf("Classify(Open error) = %v, %t, want fatal, true", kind, ok)

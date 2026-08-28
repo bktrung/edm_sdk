@@ -282,10 +282,7 @@ func (c *conn) newConsumer(ctx context.Context, cfg driver.ConsumerConfig, ackDe
 			startAfter[name] = c.nextMessage.Load()
 		}
 	}
-	capacity := cfg.Prefetch
-	if capacity < 1 {
-		capacity = 1
-	}
+	capacity := max(cfg.Prefetch, 1)
 	cs := &consumer{
 		conn:         c,
 		cfg:          cfg,
@@ -440,10 +437,7 @@ func (c *conn) pump() {
 			}
 			continue
 		}
-		d := next.Sub(c.clock.Now())
-		if d < 0 {
-			d = 0
-		}
+		d := max(next.Sub(c.clock.Now()), 0)
 		t := c.clock.Timer(d)
 		select {
 		case <-t.C:

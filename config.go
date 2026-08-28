@@ -280,6 +280,12 @@ func applyEnvironment(cfg *Config) {
 	}
 }
 
+var productionEnvironmentAliases = map[string]struct{}{
+	"prod":       {},
+	"production": {},
+	"prd":        {},
+}
+
 func validateConfig(cfg Config) error {
 	if cfg.Env == "" {
 		return fmt.Errorf("f1: env must not be empty")
@@ -287,8 +293,14 @@ func validateConfig(cfg Config) error {
 	if cfg.Service == "" {
 		return fmt.Errorf("f1: service must not be empty")
 	}
+	if _, ok := productionEnvironmentAliases[strings.ToLower(cfg.Env)]; ok && cfg.Env != "prod" {
+		return fmt.Errorf("f1: env %q must be exactly %q for production", cfg.Env, "prod")
+	}
 	if cfg.Broker.Driver != "kafka" && cfg.Broker.Driver != "rabbitmq" && cfg.Broker.Driver != "inmem" {
 		return fmt.Errorf("f1: broker.driver %q is unsupported", cfg.Broker.Driver)
+	}
+	if (cfg.Broker.Driver == "kafka" || cfg.Broker.Driver == "rabbitmq") && len(cfg.Broker.Endpoints) == 0 {
+		return fmt.Errorf("f1: broker.endpoints must not be empty")
 	}
 	if cfg.Broker.Driver == "inmem" && cfg.Env == "prod" {
 		return fmt.Errorf("f1: broker.driver inmem is not allowed in prod")
@@ -296,6 +308,10 @@ func validateConfig(cfg Config) error {
 	if cfg.Broker.MaxReconnectAttempts < 0 {
 		return fmt.Errorf("f1: broker.maxReconnectAttempts must not be negative")
 	}
+	if cfg.Env == "prod" && cfg.Broker.SASL.Mechanism != "" && !cfg.Broker.TLS.Enabled {
+		return fmt.Errorf("f1: broker.sasl.mechanism requires broker.tls.enabled in prod")
+	}
+
 	if cfg.Env == "prod" && cfg.Broker.TLS.InsecureSkipVerify {
 		return fmt.Errorf("f1: broker.tls.insecureSkipVerify must be false in prod")
 	}

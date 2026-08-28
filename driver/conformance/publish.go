@@ -300,20 +300,17 @@ func runPublish(group *groupContext) {
 		start := make(chan struct{})
 		ready := make(chan struct{}, count)
 		errs := make(chan error, count)
-		for i := 0; i < count; i++ {
-			i := i
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
+		for i := range count {
+			wg.Go(func() {
 				ready <- struct{}{}
 				<-start
 				errs <- producer.Publish(group.ctx, driver.OutboundMessage{
 					Destination: "publish.concurrent",
 					Body:        fmt.Appendf(nil, "message-%d", i),
 				})
-			}()
+			})
 		}
-		for i := 0; i < count; i++ {
+		for range count {
 			<-ready
 		}
 		close(start)

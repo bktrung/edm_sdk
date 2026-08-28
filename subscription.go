@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"maps"
 	"strings"
 	"sync"
 	"time"
@@ -530,9 +531,7 @@ func clonePriorityWeights(value map[Priority]int) map[Priority]int {
 		return nil
 	}
 	result := make(map[Priority]int, len(value))
-	for key, item := range value {
-		result[key] = item
-	}
+	maps.Copy(result, value)
 	return result
 }
 
@@ -541,8 +540,6 @@ func clonePriorityBudgets(value map[Priority]time.Duration) map[Priority]time.Du
 		return nil
 	}
 	result := make(map[Priority]time.Duration, len(value))
-	for key, item := range value {
-		result[key] = item
-	}
+	maps.Copy(result, value)
 	return result
 }

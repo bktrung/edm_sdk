@@ -11,7 +11,7 @@ func TestPoolCloseRunsEveryAcceptedSubmission(t *testing.T) {
 	const iterations = 1000
 	const submitters = 4
 
-	for iteration := 0; iteration < iterations; iteration++ {
+	for iteration := range iterations {
 		pool, err := NewPool(context.Background(), 1, false, 1)
 		if err != nil {
 			t.Fatal(err)
@@ -40,7 +40,7 @@ func TestPoolCloseRunsEveryAcceptedSubmission(t *testing.T) {
 
 		startSubmitters := make(chan struct{})
 		submitDone := make(chan error, submitters)
-		for i := 0; i < submitters; i++ {
+		for range submitters {
 			go func() {
 				<-startSubmitters
 				err := pool.Submit(context.Background(), Work{Run: func(context.Context) {
@@ -53,7 +53,7 @@ func TestPoolCloseRunsEveryAcceptedSubmission(t *testing.T) {
 			}()
 		}
 		close(startSubmitters)
-		for spin := 0; spin < 100000; spin++ {
+		for spin := range 100000 {
 			pool.mu.Lock()
 			active := pool.active
 			pool.mu.Unlock()
@@ -74,7 +74,7 @@ func TestPoolCloseRunsEveryAcceptedSubmission(t *testing.T) {
 		<-pool.closing
 		close(release)
 		<-closeDone
-		for i := 0; i < submitters; i++ {
+		for range submitters {
 			<-submitDone
 		}
 

@@ -27,9 +27,12 @@ The repository currently includes:
 
 - `drivers/rabbitmq` for RabbitMQ.
 - `drivers/inmem` for deterministic tests and local in-process use.
+- `drivers/kafka` as a scaffold for the Kafka adapter; its `Open` method currently returns
+  `driver.ErrUnsupported`.
 
-Kafka is represented in shared configuration and port types, but no Kafka
-driver package is included in this repository.
+Kafka is also represented in shared configuration and port types, and a local Kafka fixture is
+defined in [`docker/docker-compose.yml`](../../docker/docker-compose.yml). It is not a usable runtime
+driver yet.
 
 ## Load configuration and connect
 

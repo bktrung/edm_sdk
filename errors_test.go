@@ -1,8 +1,11 @@
 package f1_test
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
+	"log/slog"
+	"strings"
 	"testing"
 	"time"
 
@@ -97,6 +100,75 @@ func TestClassify_NilErrorStaysNil(t *testing.T) {
 	require.Nil(t, f1.Terminal(nil))
 	require.Nil(t, f1.RetryAfter(nil, time.Second))
 	require.Nil(t, f1.Drop(nil))
+}
+
+func TestWithDetails_PreservesErrorBehaviorAndBounds(t *testing.T) {
+	base := errors.New("failure")
+	var logs bytes.Buffer
+	previous := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&logs, nil)))
+	t.Cleanup(func() { slog.SetDefault(previous) })
+
+	tooMany := make(map[string]string, 17)
+	for i := range 17 {
+		tooMany[fmt.Sprintf("key%d", i)] = "value"
+	}
+	got := f1.WithDetails(base, tooMany)
+	require.ErrorIs(t, got, base)
+	var detailer interface {
+		DeathDetails() map[string]string
+	}
+	require.True(t, errors.As(got, &detailer))
+	require.Nil(t, detailer.DeathDetails())
+
+	withinCount := make(map[string]string, 16)
+	for i := range 16 {
+		withinCount[fmt.Sprintf("key%d", i)] = "value"
+	}
+	got = f1.WithDetails(base, withinCount)
+	require.True(t, errors.As(got, &detailer))
+	require.Len(t, detailer.DeathDetails(), 16)
+
+	got = f1.WithDetails(base, map[string]string{"tenant": strings.Repeat("x", 1024)})
+	require.True(t, errors.As(got, &detailer))
+	require.Nil(t, detailer.DeathDetails())
+
+	got = f1.WithDetails(base, map[string]string{"tenant": "acme", "BAD_KEY": "discard"})
+	require.True(t, errors.As(got, &detailer))
+	require.Equal(t, map[string]string{"tenant": "acme"}, detailer.DeathDetails())
+	require.Empty(t, logs.String(), "WithDetails must defer discard reporting to deadLetter")
+}
+
+func TestWithDetails_ComposesWithClassification(t *testing.T) {
+	t.Parallel()
+
+	base := errors.New("failure")
+	for _, err := range []error{
+		f1.Terminal(f1.WithDetails(base, map[string]string{"tenant": "acme"})),
+		f1.WithDetails(f1.Terminal(base), map[string]string{"tenant": "acme"}),
+	} {
+		require.True(t, f1.IsTerminal(err))
+		require.ErrorIs(t, err, base)
+	}
+}
+
+func TestWithDetails_NilErrorStaysNil(t *testing.T) {
+	t.Parallel()
+
+	require.Nil(t, f1.WithDetails(nil, map[string]string{"tenant": "acme"}))
+}
+
+type withDetailsTypedError struct{}
+
+func (*withDetailsTypedError) Error() string { return "typed failure" }
+
+func TestWithDetails_PreservesErrorsAs(t *testing.T) {
+	t.Parallel()
+
+	base := &withDetailsTypedError{}
+	wrapped := f1.WithDetails(base, map[string]string{"tenant": "acme"})
+	var got *withDetailsTypedError
+	require.ErrorAs(t, wrapped, &got)
 }
 
 func TestClassify_ErrorTrees(t *testing.T) {

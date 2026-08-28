@@ -59,12 +59,17 @@ func cleanupConsumerAdmissionConn(connection *conn, queue string) {
 		public, err := (Driver{}).Open(ctx, driver.Config{Endpoints: []string{defaultEndpoint}})
 		if err == nil {
 			fresh := public.(*conn)
-			_, _ = fresh.Admin().Prune(ctx, []string{queue})
+			freshAdmin, ok := fresh.Admin().(driver.Maintenance)
+			if ok {
+				_, _ = freshAdmin.Prune(ctx, []string{queue})
+			}
 			_ = fresh.Close(context.Background())
 		}
 		cancel()
 	}
-	_, _ = connection.Admin().Prune(context.Background(), []string{queue})
+	if maintenance, ok := connection.Admin().(driver.Maintenance); ok {
+		_, _ = maintenance.Prune(context.Background(), []string{queue})
+	}
 	_ = connection.Close(context.Background())
 }
 

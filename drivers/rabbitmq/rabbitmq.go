@@ -6,6 +6,7 @@ import (
 	"crypto/x509"
 	"errors"
 	"fmt"
+	"maps"
 	"net"
 	"net/url"
 	"os"
@@ -21,6 +22,8 @@ import (
 
 // Local fixture credentials are intentional and never used for production endpoints.
 const defaultEndpoint = "amqp://guest:guest@localhost:5672/" //nolint:gosec // test fixture endpoint
+
+var errMissingEndpoints = errors.New("rabbitmq: broker endpoints must not be empty")
 
 var _ driver.Driver = Driver{}
 
@@ -61,7 +64,7 @@ func capabilitiesForQueueKind(kind queueKind) driver.Capabilities {
 func (Driver) Capabilities() driver.Capabilities {
 	return driver.Capabilities{
 		PerMessageAck:        true,
-		OrderedByKey:         false,
+		OrderedByKey:         true,
 		NativePriority:       driver.PriorityStrict,
 		NativePriorityLevels: 32,
 		NativeDelay:          false,
@@ -94,10 +97,10 @@ func (Driver) Open(ctx context.Context, cfg driver.Config) (driver.Conn, error) 
 		defer cancel()
 	}
 
-	endpoints := cfg.Endpoints
-	if len(endpoints) == 0 {
-		endpoints = []string{defaultEndpoint}
+	if len(cfg.Endpoints) == 0 {
+		return nil, classify("open", driver.KindFatal, errMissingEndpoints)
 	}
+	endpoints := cfg.Endpoints
 	var lastErr error
 	for {
 		for _, endpoint := range endpoints {
@@ -543,12 +546,7 @@ func brokerInfo(connection *amqp.Connection) driver.BrokerInfo {
 
 func copyBrokerInfo(info driver.BrokerInfo) driver.BrokerInfo {
 	info.Nodes = append([]string(nil), info.Nodes...)
-	if info.Extra != nil {
-		info.Extra = make(map[string]string, len(info.Extra))
-		for key, value := range info.Extra {
-			info.Extra[key] = value
-		}
-	}
+	info.Extra = maps.Clone(info.Extra)
 	return info
 }
 
@@ -564,8 +562,7 @@ func classifyAMQP(op string, fallback driver.Kind, err error) error {
 		return nil
 	}
 	kind := fallback
-	var amqpErr *amqp.Error
-	if errors.As(err, &amqpErr) {
+	if amqpErr, ok := errors.AsType[*amqp.Error](err); ok {
 		switch amqpErr.Code {
 		case 403:
 			kind = driver.KindPermission

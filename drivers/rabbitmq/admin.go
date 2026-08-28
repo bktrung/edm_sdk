@@ -14,7 +14,11 @@ type adminOperations struct{ conn *conn }
 
 type admin struct{ operations *adminOperations }
 
-var _ driver.Admin = (*admin)(nil)
+var (
+	_ driver.Admin       = (*admin)(nil)
+	_ driver.Maintenance = (*admin)(nil)
+	_ driver.Maintenance = (*adminOperations)(nil)
+)
 
 func (a *admin) EnsureTopology(ctx context.Context, spec driver.TopologySpec) (driver.TopologyDiff, error) {
 	return a.operations.EnsureTopology(ctx, spec)
@@ -133,7 +137,7 @@ func (a *adminOperations) Prune(ctx context.Context, names []string) ([]driver.P
 			continue
 		}
 		parkName := name + ".park"
-		park, hasPark := findQueue(queues, parkName)
+		_, hasPark := findQueue(queues, parkName)
 		mainReady, inspectErr := a.inspectQueue(ctx, name)
 		if inspectErr != nil {
 			result.Reason = "destination disappeared before deletion"
@@ -149,7 +153,7 @@ func (a *adminOperations) Prune(ctx context.Context, names []string) ([]driver.P
 				continue
 			}
 		}
-		if reason := a.pruneReason(name, main, mainReady, park, hasPark, parkReady); reason != "" {
+		if reason := a.pruneReason(name, main, mainReady, hasPark, parkReady); reason != "" {
 			result.Reason = reason
 			results = append(results, result)
 			continue
@@ -160,7 +164,7 @@ func (a *adminOperations) Prune(ctx context.Context, names []string) ([]driver.P
 				return nil, classify("prune", driver.KindTransient, err)
 			}
 			main, exists = findQueue(queues, name)
-			park, hasPark = findQueue(queues, parkName)
+			_, hasPark = findQueue(queues, parkName)
 			if !exists {
 				result.Reason = "destination disappeared before deletion"
 				results = append(results, result)
@@ -178,7 +182,7 @@ func (a *adminOperations) Prune(ctx context.Context, names []string) ([]driver.P
 				results = append(results, result)
 				continue
 			}
-			if reason := a.pruneReason(name, main, mainReady, park, hasPark, parkReady); reason != "" {
+			if reason := a.pruneReason(name, main, mainReady, hasPark, parkReady); reason != "" {
 				result.Reason = reason
 				results = append(results, result)
 				continue
@@ -209,7 +213,7 @@ func (a *adminOperations) Prune(ctx context.Context, names []string) ([]driver.P
 			results = append(results, result)
 			continue
 		}
-		if reason := a.pruneReason(name, main, mainReady, managementQueue{}, false, 0); reason != "" {
+		if reason := a.pruneReason(name, main, mainReady, false, 0); reason != "" {
 			result.Reason = reason
 			results = append(results, result)
 			continue
@@ -238,7 +242,7 @@ func findQueue(queues []managementQueue, name string) (managementQueue, bool) {
 	return managementQueue{}, false
 }
 
-func (a *adminOperations) pruneReason(name string, main managementQueue, mainReady int64, park managementQueue, hasPark bool, parkReady int64) string {
+func (a *adminOperations) pruneReason(name string, main managementQueue, mainReady int64, hasPark bool, parkReady int64) string {
 	if main.Consumers > 0 || a.consumerCount(name) > 0 {
 		return fmt.Sprintf("destination %q has consumers attached", name)
 	}

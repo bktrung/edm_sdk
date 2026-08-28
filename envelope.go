@@ -38,6 +38,13 @@ type Envelope struct {
 	DeathError  string
 	DeathReason DeathReason // empty when live or no SDK-recorded reason
 	DeathTime   *time.Time
+	// DeathDetails holds handler-supplied diagnostic keys, written as one
+	// f1detail<key> header each and read back from them. A map rather than a
+	// nested object because the whole point is that each key is addressable on
+	// the wire. Populated only on a dead-letter copy whose reason is terminal or
+	// max_attempts, and cleared on a retry copy: details that rode the retry
+	// ladder would accumulate the same way forwarded death records do.
+	DeathDetails map[string]string `json:"-"`
 
 	// Trace context is preserved separately from free-form extensions.
 	TraceParent string
@@ -59,8 +66,9 @@ const CoreMaxHeaderBytes = 8 * 1024
 
 // EncodeHeaders serializes e to canonical wire headers. driverMaxBytes is the
 // connected driver's limit; zero or a larger value uses CoreMaxHeaderBytes.
-// Oversized headers drop Extensions and then truncate DeathError. Invalid
-// priorities and reserved extension keys return errors.
+// Oversized headers drop Extensions, preserve DeathError down to a floor, shed
+// DeathDetails, and then truncate DeathError further. Invalid priorities and
+// reserved extension keys return errors.
 func (e Envelope) EncodeHeaders(driverMaxBytes int) (map[string]string, error) {
 	if !e.Priority.Valid() {
 		return nil, ErrInvalidPriority
@@ -108,6 +116,13 @@ func (e Envelope) EncodeHeaders(driverMaxBytes int) (map[string]string, error) {
 		h["f1deathreason"] = e.DeathReason.String()
 	}
 	setOptTime(h, "f1deathtime", e.DeathTime)
+	for key, value := range e.DeathDetails {
+		if !validDeathDetailKey(key) {
+			// This final wire guard has no logger; discarded keys are reported when the dead-letter copy is built.
+			continue
+		}
+		h["f1detail"+key] = value
+	}
 	setOpt(h, "traceparent", e.TraceParent)
 	setOpt(h, "tracestate", e.TraceState)
 
@@ -118,6 +133,18 @@ func (e Envelope) EncodeHeaders(driverMaxBytes int) (map[string]string, error) {
 	}
 	for k := range e.Extensions {
 		delete(h, k)
+	}
+	if headerBytes(h) <= limit {
+		return h, nil
+	}
+	shrinkDeathErrorTo(h, limit, deathErrorFloor)
+	if headerBytes(h) <= limit {
+		return h, nil
+	}
+	for k := range h {
+		if strings.HasPrefix(k, "f1detail") {
+			delete(h, k)
+		}
 	}
 	if headerBytes(h) <= limit {
 		return h, nil
@@ -146,20 +173,54 @@ func headerBytes(h map[string]string) int {
 	return n
 }
 
+const deathErrorFloor = 512
+
 // shrinkDeathError trims f1deatherror until h fits limit.
 func shrinkDeathError(h map[string]string, limit int) {
+	shrinkDeathErrorTo(h, limit, 0)
+}
+
+// shrinkDeathErrorTo trims f1deatherror until h fits limit or its value
+// cannot be trimmed below floor; a floor of zero means no lower bound.
+func shrinkDeathErrorTo(h map[string]string, limit, floor int) {
 	for headerBytes(h) > limit {
 		v, ok := h["f1deatherror"]
 		if !ok || v == "" {
 			return // There is no remaining field to shrink.
 		}
+		previousLen := len(v)
 		over := headerBytes(h) - limit
-		cut := max(len(v)-over, 0)
-		for cut > 0 && cut < len(v) && !utf8.RuneStart(v[cut]) {
+		cut := max(previousLen-over, floor)
+		if cut >= previousLen {
+			return // The floor prevents further shrinking.
+		}
+		for cut > 0 && cut < previousLen && !utf8.RuneStart(v[cut]) {
 			cut--
+		}
+		if cut < floor {
+			cut = floor
+			for cut < previousLen && !utf8.RuneStart(v[cut]) {
+				cut++
+			}
+		}
+		if cut >= previousLen {
+			return // The floor falls inside the final rune.
 		}
 		h["f1deatherror"] = v[:cut]
 	}
+}
+
+func validDeathDetailKey(key string) bool {
+	if key == "" {
+		return false
+	}
+	for i := range len(key) {
+		c := key[i]
+		if (c < 'a' || c > 'z') && (c < '0' || c > '9') {
+			return false
+		}
+	}
+	return true
 }
 
 // DecodeHeaders parses canonical wire headers into an Envelope. Unknown
@@ -242,6 +303,13 @@ func DecodeHeaders(h map[string]string) (Envelope, error) {
 
 	for k, v := range h {
 		if knownHeaders[k] {
+			continue
+		}
+		if strings.HasPrefix(k, "f1detail") {
+			if e.DeathDetails == nil {
+				e.DeathDetails = map[string]string{}
+			}
+			e.DeathDetails[strings.TrimPrefix(k, "f1detail")] = v
 			continue
 		}
 		if isBrokerReserved(k) {

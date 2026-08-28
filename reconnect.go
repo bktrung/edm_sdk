@@ -29,6 +29,7 @@ func (c *Client) reconnectSupervisor() {
 			if attempt == nil {
 				continue
 			}
+			lastResortClientLogger(c).Warn("f1 reconnect started", "error", request.cause)
 			err := c.reconnectOnce(c.supervisorCtx, request.cause)
 			c.finishReconnect(attempt, err)
 		case <-c.supervisorCtx.Done():

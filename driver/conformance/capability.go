@@ -78,7 +78,7 @@ func runCapability(group *groupContext) {
 				t.Fatal(err)
 			}
 		}
-		for i := 0; i < 3; i++ {
+		for i := range 3 {
 			message := receiveMessage(t, group, consumer)
 			if string(message.Body) != fmt.Sprintf("order-%d", i) {
 				t.Fatalf("body=%q at position %d, want order-%d", message.Body, i, i)
@@ -322,7 +322,7 @@ func runCapability(group *groupContext) {
 			if err := first.Stop(group.ctx); err != nil {
 				t.Errorf("stop first exclusive consumer: %v", err)
 			}
-			if _, err := group.conn.Admin().Purge(group.ctx, name); err != nil {
+			if err := purgeIfSupported(group.ctx, group.conn, name); err != nil {
 				t.Errorf("purge exclusive destination: %v", err)
 			}
 		})
@@ -434,7 +434,7 @@ func checkFanoutDeclaration(group *groupContext) {
 		})
 		t.Cleanup(func() {
 			for _, destination := range []string{firstDestination, secondDestination} {
-				if _, err := group.conn.Admin().Purge(group.ctx, destination); err != nil {
+				if err := purgeIfSupported(group.ctx, group.conn, destination); err != nil {
 					t.Errorf("purge fanout probe destination %q: %v", destination, err)
 				}
 			}
