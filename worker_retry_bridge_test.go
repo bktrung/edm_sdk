@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"strings"
 	"testing"
@@ -13,9 +14,10 @@ import (
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/clock"
 )
 
-func newRetryBridgeRunner(t *testing.T, producer *dispatchProducer, topic string) (*Client, *Runner) {
+func newRetryBridgeRunner(t *testing.T, producer *dispatchProducer, topic string, options ...Option) (*Client, *Runner) {
 	t.Helper()
-	client, err := New(context.Background(), testClientConfig(t), WithDriver(&dispatchDriver{conn: &dispatchConn{producer: producer}}))
+	options = append([]Option{WithDriver(&dispatchDriver{conn: &dispatchConn{producer: producer}})}, options...)
+	client, err := New(context.Background(), testClientConfig(t), options...)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -182,6 +184,184 @@ func TestDispatchPoisonNoRouteUsesLastResortLogger(t *testing.T) {
 	}
 }
 
+func TestDispatchDiscardedDeathDetailsUsesConfiguredLogger(t *testing.T) {
+	defaultOutput := captureProcessDefault(t)
+	var configuredOutput bytes.Buffer
+	producer := &dispatchProducer{}
+	client, runner := newRetryBridgeRunner(t, producer, "orders.created",
+		WithLogger(slog.New(slog.NewTextHandler(&configuredOutput, nil))),
+	)
+	defer func() { _ = client.Close(context.Background()) }()
+
+	innerDetails := map[string]string{"tenant": "acme"}
+	outerDetails := make(map[string]string, 5)
+	for i := range 5 {
+		innerDetails[fmt.Sprintf("BAD%02d", i)] = fmt.Sprintf("secret-%02d", i)
+		outerDetails[fmt.Sprintf("BAD%02d", i+5)] = fmt.Sprintf("secret-%02d", i+5)
+	}
+	runner.subscription.Handlers = map[string]Handler{
+		"orders.created.v1": HandlerFunc(func(context.Context, *Event) error {
+			err := WithDetails(errors.New("terminal failure"), innerDetails)
+			return Terminal(WithDetails(err, outerDetails))
+		}),
+	}
+	envelope := Envelope{
+		SpecVersion: "1.0",
+		ID:          "discarded-details-configured",
+		Source:      "/test/orders",
+		Type:        "orders.created.v1",
+		Priority:    PriorityHigh,
+		Attempt:     1,
+	}
+	if !dispatchMessage(runner, context.Background(), retryBridgeMessage(t, envelope, &dispatchSettler{}), &Envelope{}, new(bool)) {
+		t.Fatal("terminal message was not settled")
+	}
+
+	output := configuredOutput.String()
+	if !strings.Contains(output, "f1 death details discarded") {
+		t.Fatalf("configured logger output = %q, want discard warning", output)
+	}
+	if strings.Count(output, "f1 death details discarded") != 1 {
+		t.Fatalf("configured logger output = %q, want one discard warning", output)
+	}
+	for i := range maxLoggedDeathDetailKeys {
+		if !strings.Contains(output, fmt.Sprintf("BAD%02d", i)) {
+			t.Fatalf("configured logger output = %q, missing logged key BAD%02d", output, i)
+		}
+	}
+	for i := maxLoggedDeathDetailKeys; i < 10; i++ {
+		if strings.Contains(output, fmt.Sprintf("BAD%02d", i)) {
+			t.Fatalf("configured logger output = %q, includes uncapped key BAD%02d", output, i)
+		}
+	}
+	for i := range 10 {
+		if strings.Contains(output, fmt.Sprintf("secret-%02d", i)) {
+			t.Fatalf("configured logger output = %q, logged detail value", output)
+		}
+	}
+	for _, want := range []string{"subscription=orders", "event_id=discarded-details-configured", "count=10"} {
+		if !strings.Contains(output, want) {
+			t.Fatalf("configured logger output = %q, missing %q", output, want)
+		}
+	}
+	if got := defaultOutput.String(); got != "" {
+		t.Fatalf("process default output = %q, want empty", got)
+	}
+}
+
+func TestDispatchDiscardedDeathDetailsUsesProcessDefaultWithoutLogger(t *testing.T) {
+	defaultOutput := captureProcessDefault(t)
+	producer := &dispatchProducer{}
+	client, runner := newRetryBridgeRunner(t, producer, "orders.created")
+	defer func() { _ = client.Close(context.Background()) }()
+
+	runner.subscription.Handlers = map[string]Handler{
+		"orders.created.v1": HandlerFunc(func(context.Context, *Event) error {
+			return Terminal(WithDetails(errors.New("terminal failure"), map[string]string{"BAD_KEY": "secret"}))
+		}),
+	}
+	envelope := Envelope{
+		SpecVersion: "1.0",
+		ID:          "discarded-details-default",
+		Source:      "/test/orders",
+		Type:        "orders.created.v1",
+		Priority:    PriorityHigh,
+		Attempt:     1,
+	}
+	if !dispatchMessage(runner, context.Background(), retryBridgeMessage(t, envelope, &dispatchSettler{}), &Envelope{}, new(bool)) {
+		t.Fatal("terminal message was not settled")
+	}
+
+	output := defaultOutput.String()
+	for _, want := range []string{
+		"f1 death details discarded",
+		"subscription=orders",
+		"event_id=discarded-details-default",
+		"keys=[BAD_KEY]",
+		"count=1",
+	} {
+		if !strings.Contains(output, want) {
+			t.Fatalf("process default output = %q, missing %q", output, want)
+		}
+	}
+	if strings.Contains(output, "secret") {
+		t.Fatalf("process default output = %q, logged detail value", output)
+	}
+}
+
+func TestDispatchCustomDeathDetailsValidatesKeys(t *testing.T) {
+	var configuredOutput bytes.Buffer
+	producer := &dispatchProducer{}
+	client, runner := newRetryBridgeRunner(t, producer, "orders.created",
+		WithLogger(slog.New(slog.NewTextHandler(&configuredOutput, nil))),
+	)
+	defer func() { _ = client.Close(context.Background()) }()
+
+	runner.subscription.Handlers = map[string]Handler{
+		"orders.created.v1": HandlerFunc(func(context.Context, *Event) error {
+			return Terminal(customDeathDetailError{details: map[string]string{
+				"tenant":  "acme",
+				"BAD_KEY": "secret",
+			}})
+		}),
+	}
+	envelope := Envelope{
+		SpecVersion: "1.0",
+		ID:          "custom-discarded-details",
+		Source:      "/test/orders",
+		Type:        "orders.created.v1",
+		Priority:    PriorityHigh,
+		Attempt:     1,
+	}
+	if !dispatchMessage(runner, context.Background(), retryBridgeMessage(t, envelope, &dispatchSettler{}), &Envelope{}, new(bool)) {
+		t.Fatal("custom carrier message was not settled")
+	}
+	if got := headerValue(producer.messages[0].Headers, "f1detailtenant"); got != "acme" {
+		t.Fatalf("custom detail tenant = %q, want acme", got)
+	}
+	if got := headerValue(producer.messages[0].Headers, "f1detailBAD_KEY"); got != "" {
+		t.Fatalf("custom invalid detail = %q, want omitted", got)
+	}
+	output := configuredOutput.String()
+	for _, want := range []string{"f1 death details discarded", "keys=[BAD_KEY]", "count=1"} {
+		if !strings.Contains(output, want) {
+			t.Fatalf("configured logger output = %q, missing %q", output, want)
+		}
+	}
+	if strings.Contains(output, "secret") {
+		t.Fatalf("configured logger output = %q, logged detail value", output)
+	}
+}
+
+func TestDispatchValidDeathDetailsDoNotWarn(t *testing.T) {
+	var configuredOutput bytes.Buffer
+	producer := &dispatchProducer{}
+	client, runner := newRetryBridgeRunner(t, producer, "orders.created",
+		WithLogger(slog.New(slog.NewTextHandler(&configuredOutput, nil))),
+	)
+	defer func() { _ = client.Close(context.Background()) }()
+
+	runner.subscription.Handlers = map[string]Handler{
+		"orders.created.v1": HandlerFunc(func(context.Context, *Event) error {
+			return Terminal(WithDetails(errors.New("terminal failure"), map[string]string{"tenant": "acme"}))
+		}),
+	}
+	envelope := Envelope{
+		SpecVersion: "1.0",
+		ID:          "valid-details-no-warning",
+		Source:      "/test/orders",
+		Type:        "orders.created.v1",
+		Priority:    PriorityHigh,
+		Attempt:     1,
+	}
+	if !dispatchMessage(runner, context.Background(), retryBridgeMessage(t, envelope, &dispatchSettler{}), &Envelope{}, new(bool)) {
+		t.Fatal("terminal message was not settled")
+	}
+	if output := configuredOutput.String(); strings.Contains(output, "f1 death details discarded") {
+		t.Fatalf("configured logger output = %q, want no discard warning", output)
+	}
+}
+
 func TestDispatchLadderExhaustionKeepsMaxAttemptsReason(t *testing.T) {
 	producer := &dispatchProducer{}
 	client, runner := newRetryBridgeRunner(t, producer, "orders.created")
@@ -199,6 +379,255 @@ func TestDispatchLadderExhaustionKeepsMaxAttemptsReason(t *testing.T) {
 	}
 	if got := headerValue(producer.messages[0].Headers, "f1deathreason"); got != ReasonMaxAttempts.String() {
 		t.Fatalf("ladder exhaustion reason = %q, want %q", got, ReasonMaxAttempts)
+	}
+}
+
+type deadLetterTypedError struct{}
+
+func (*deadLetterTypedError) Error() string { return "typed terminal failure" }
+
+func TestDispatchTerminalCarriesDetailsAndUntouchedCallbackError(t *testing.T) {
+	producer := &dispatchProducer{}
+	client, runner := newRetryBridgeRunner(t, producer, "orders.created")
+	defer func() { _ = client.Close(context.Background()) }()
+
+	handlerErr := &deadLetterTypedError{}
+	deadLetters := make(chan DeadLettered, 1)
+	runner.subscription.OnDeadLetter = func(_ context.Context, dead DeadLettered) {
+		deadLetters <- dead
+	}
+	runner.subscription.Handlers = map[string]Handler{
+		"orders.created.v1": HandlerFunc(func(context.Context, *Event) error {
+			return Terminal(WithDetails(handlerErr, map[string]string{"tenant": "acme"}))
+		}),
+	}
+	envelope := Envelope{
+		SpecVersion: "1.0",
+		ID:          "terminal-details",
+		Source:      "/test/orders",
+		Type:        "orders.created.v1",
+		Priority:    PriorityHigh,
+		Attempt:     1,
+	}
+	if !dispatchMessage(runner, context.Background(), retryBridgeMessage(t, envelope, &dispatchSettler{}), &Envelope{}, new(bool)) {
+		t.Fatal("terminal message was not settled")
+	}
+	if got := headerValue(producer.messages[0].Headers, "f1deathreason"); got != ReasonTerminal.String() {
+		t.Fatalf("terminal death reason = %q, want %q", got, ReasonTerminal)
+	}
+	if got := headerValue(producer.messages[0].Headers, "f1detailtenant"); got != "acme" {
+		t.Fatalf("terminal detail tenant = %q, want acme", got)
+	}
+
+	timer := clock.NewReal().Timer(time.Second)
+	defer timer.Stop()
+	select {
+	case dead := <-deadLetters:
+		var got *deadLetterTypedError
+		if !errors.As(dead.LastErr, &got) || got != handlerErr {
+			t.Fatalf("DeadLettered.LastErr = %T %v, want original typed error", dead.LastErr, dead.LastErr)
+		}
+	case <-timer.C:
+		t.Fatal("DeadLettered callback did not run")
+	}
+}
+
+func TestDispatchMaxAttemptsCarriesHandlerDetails(t *testing.T) {
+	producer := &dispatchProducer{}
+	client, runner := newRetryBridgeRunner(t, producer, "orders.created")
+	defer func() { _ = client.Close(context.Background()) }()
+
+	runner.subscription.Handlers = map[string]Handler{
+		"orders.created.v1": HandlerFunc(func(context.Context, *Event) error {
+			return WithDetails(errors.New("temporary"), map[string]string{"tenant": "acme"})
+		}),
+	}
+	envelope := Envelope{
+		SpecVersion: "1.0",
+		ID:          "max-attempts-details",
+		Source:      "/test/orders",
+		Type:        "orders.created.v1",
+		Priority:    PriorityHigh,
+		Attempt:     1,
+		MaxAttempts: 1,
+	}
+	if !dispatchMessage(runner, context.Background(), retryBridgeMessage(t, envelope, &dispatchSettler{}), &Envelope{}, new(bool)) {
+		t.Fatal("max-attempts message was not settled")
+	}
+	if got := headerValue(producer.messages[0].Headers, "f1deathreason"); got != ReasonMaxAttempts.String() {
+		t.Fatalf("max-attempts death reason = %q, want %q", got, ReasonMaxAttempts)
+	}
+	if got := headerValue(producer.messages[0].Headers, "f1detailtenant"); got != "acme" {
+		t.Fatalf("max-attempts detail tenant = %q, want acme", got)
+	}
+}
+
+func TestRetryExhaustionCarriesHandlerDetails(t *testing.T) {
+	producer := &dispatchProducer{}
+	client, runner := newRetryBridgeRunner(t, producer, "orders.created")
+	defer func() { _ = client.Close(context.Background()) }()
+	runner.subscription.Retry.MaxAttempts = 1
+	runner.subscription.Retry.Tiers = nil
+
+	envelope := Envelope{
+		SpecVersion: "1.0",
+		ID:          "retry-exhaustion-details",
+		Source:      "/test/orders",
+		Type:        "orders.created.v1",
+		Priority:    PriorityHigh,
+		Attempt:     1,
+	}
+	err := WithDetails(errors.New("temporary"), map[string]string{"tenant": "acme"})
+	if !retryAndSettle(runner, context.Background(), retryBridgeMessage(t, envelope, &dispatchSettler{}), envelope, err) {
+		t.Fatal("retry-exhaustion message was not settled")
+	}
+	if got := headerValue(producer.messages[0].Headers, "f1deathreason"); got != ReasonMaxAttempts.String() {
+		t.Fatalf("retry-exhaustion death reason = %q, want %q", got, ReasonMaxAttempts)
+	}
+	if got := headerValue(producer.messages[0].Headers, "f1detailtenant"); got != "acme" {
+		t.Fatalf("retry-exhaustion detail tenant = %q, want acme", got)
+	}
+}
+
+func TestDispatchPanicDoesNotCarryHandlerDetails(t *testing.T) {
+	producer := &dispatchProducer{}
+	client, runner := newRetryBridgeRunner(t, producer, "orders.created")
+	defer func() { _ = client.Close(context.Background()) }()
+
+	runner.subscription.Handlers = map[string]Handler{
+		"orders.created.v1": HandlerFunc(func(context.Context, *Event) error {
+			panic(WithDetails(errors.New("panic value"), map[string]string{"tenant": "acme"}))
+		}),
+	}
+	envelope := Envelope{
+		SpecVersion: "1.0",
+		ID:          "panic-details",
+		Source:      "/test/orders",
+		Type:        "orders.created.v1",
+		Priority:    PriorityHigh,
+		Attempt:     1,
+	}
+	if !dispatchMessage(runner, context.Background(), retryBridgeMessage(t, envelope, &dispatchSettler{}), &Envelope{}, new(bool)) {
+		t.Fatal("panic message was not settled")
+	}
+	if got := headerValue(producer.messages[0].Headers, "f1deathreason"); got != ReasonPanic.String() {
+		t.Fatalf("panic death reason = %q, want %q", got, ReasonPanic)
+	}
+	assertNoDeathDetailHeaders(t, producer.messages[0].Headers)
+}
+
+func TestDispatchNonHandlerDeathsDoNotCarryDetails(t *testing.T) {
+	tests := []struct {
+		name string
+		run  func(*testing.T, *Runner, *dispatchProducer)
+	}{
+		{
+			name: "decode",
+			run: func(t *testing.T, runner *Runner, producer *dispatchProducer) {
+				envelope := Envelope{
+					SpecVersion:  "1.0",
+					ID:           "decode-details",
+					Source:       "/test/orders",
+					Type:         "orders.created.v1",
+					Priority:     PriorityHigh,
+					Attempt:      1,
+					DeathDetails: map[string]string{"tenant": "acme"},
+				}
+				message := retryBridgeMessage(t, envelope, &dispatchSettler{})
+				for i := range message.Headers {
+					if message.Headers[i].Key == "time" {
+						message.Headers[i].Value = []byte("not-a-time")
+					}
+				}
+				if !dispatchMessage(runner, context.Background(), message, &Envelope{}, new(bool)) {
+					t.Fatal("decode message was not settled")
+				}
+				assertNoDeathDetailHeaders(t, producer.messages[0].Headers)
+			},
+		},
+		{
+			name: "expired",
+			run: func(t *testing.T, runner *Runner, producer *dispatchProducer) {
+				expiry := time.Unix(1, 0).UTC()
+				envelope := Envelope{
+					SpecVersion:  "1.0",
+					ID:           "expired-details",
+					Source:       "/test/orders",
+					Type:         "orders.created.v1",
+					Priority:     PriorityHigh,
+					Attempt:      1,
+					Expiry:       &expiry,
+					DeathDetails: map[string]string{"tenant": "acme"},
+				}
+				if !dispatchMessage(runner, context.Background(), retryBridgeMessage(t, envelope, &dispatchSettler{}), &Envelope{}, new(bool)) {
+					t.Fatal("expired message was not settled")
+				}
+				assertNoDeathDetailHeaders(t, producer.messages[0].Headers)
+			},
+		},
+		{
+			name: "unmatched",
+			run: func(t *testing.T, runner *Runner, producer *dispatchProducer) {
+				runner.subscription.UnmatchedPolicy = DeadLetter
+				envelope := Envelope{
+					SpecVersion:  "1.0",
+					ID:           "unmatched-details",
+					Source:       "/test/orders",
+					Type:         "orders.unknown.v1",
+					Priority:     PriorityHigh,
+					Attempt:      1,
+					DeathDetails: map[string]string{"tenant": "acme"},
+				}
+				if !dispatchMessage(runner, context.Background(), retryBridgeMessage(t, envelope, &dispatchSettler{}), &Envelope{}, new(bool)) {
+					t.Fatal("unmatched message was not settled")
+				}
+				assertNoDeathDetailHeaders(t, producer.messages[0].Headers)
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			producer := &dispatchProducer{}
+			client, runner := newRetryBridgeRunner(t, producer, "orders.created")
+			defer func() { _ = client.Close(context.Background()) }()
+			test.run(t, runner, producer)
+		})
+	}
+}
+
+func TestDispatchPlainErrorPreservesDeathError(t *testing.T) {
+	producer := &dispatchProducer{}
+	client, runner := newRetryBridgeRunner(t, producer, "orders.created")
+	defer func() { _ = client.Close(context.Background()) }()
+
+	runner.subscription.Handlers = map[string]Handler{
+		"orders.created.v1": HandlerFunc(func(context.Context, *Event) error {
+			return errors.New("plain temporary failure")
+		}),
+	}
+	envelope := Envelope{
+		SpecVersion: "1.0",
+		ID:          "plain-error",
+		Source:      "/test/orders",
+		Type:        "orders.created.v1",
+		Priority:    PriorityHigh,
+		Attempt:     1,
+		MaxAttempts: 1,
+	}
+	if !dispatchMessage(runner, context.Background(), retryBridgeMessage(t, envelope, &dispatchSettler{}), &Envelope{}, new(bool)) {
+		t.Fatal("plain-error message was not settled")
+	}
+	if got := headerValue(producer.messages[0].Headers, "f1deatherror"); got != "plain temporary failure" {
+		t.Fatalf("plain death error = %q, want unchanged error", got)
+	}
+}
+
+func assertNoDeathDetailHeaders(t *testing.T, headers []driver.Header) {
+	t.Helper()
+	for _, header := range headers {
+		if strings.HasPrefix(header.Key, "f1detail") {
+			t.Fatalf("unexpected death detail header %q", header.Key)
+		}
 	}
 }
 
@@ -291,6 +720,39 @@ func TestRetryAndSettleIncrementsAttempt(t *testing.T) {
 	}
 	if got.Attempt != 2 {
 		t.Fatalf("retry attempt = %d, want 2", got.Attempt)
+	}
+}
+
+func TestRetryCopyDropsDeathDetails(t *testing.T) {
+	producer := &dispatchProducer{}
+	client, runner := newRetryBridgeRunner(t, producer, "orders.retry.created")
+	defer func() { _ = client.Close(context.Background()) }()
+
+	envelope := Envelope{
+		SpecVersion:  "1.0",
+		ID:           "details-retry",
+		Source:       "/test/orders",
+		Type:         "orders.retry.created.v1",
+		Priority:     PriorityHigh,
+		Attempt:      1,
+		DeathDetails: map[string]string{"tenant": "acme"},
+	}
+	if !retryAndSettle(runner, context.Background(), retryBridgeMessage(t, envelope, &dispatchSettler{}), envelope, errors.New("temporary")) {
+		t.Fatal("ordinary retry was not published and settled")
+	}
+	if len(producer.messages) != 1 {
+		t.Fatalf("retry copies = %d, want 1", len(producer.messages))
+	}
+	headers := inboundHeaders(producer.messages[0].Headers)
+	if _, ok := headers["f1detailtenant"]; ok {
+		t.Fatal("retry copy retained death details")
+	}
+	got, err := DecodeHeaders(headers)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.DeathDetails) != 0 {
+		t.Fatalf("retry copy death details = %#v, want empty", got.DeathDetails)
 	}
 }
 

@@ -1,7 +1,9 @@
 package f1_test
 
 import (
+	"bytes"
 	"encoding/json"
+	"log/slog"
 	"os"
 	"strings"
 	"testing"
@@ -139,6 +141,54 @@ func TestEnvelope_HeaderRoundTripIsLossless(t *testing.T) {
 	got, err := f1.DecodeHeaders(headers)
 	require.NoError(t, err)
 	require.Equal(t, e, got)
+}
+
+func TestEnvelope_DeathDetailsRoundTripAndRejectInvalidKeys(t *testing.T) {
+	t.Parallel()
+
+	e := fullEnvelope()
+	e.DeathDetails = map[string]string{
+		"tenant":          "acme",
+		"step":            "charge",
+		"with_underscore": "discard",
+		"Capital":         "discard",
+		"bad-key":         "discard",
+	}
+	headers, err := e.EncodeHeaders(0)
+	require.NoError(t, err)
+	require.Equal(t, "acme", headers["f1detailtenant"])
+	require.Equal(t, "charge", headers["f1detailstep"])
+	require.NotContains(t, headers, "f1detailwith_underscore")
+	require.NotContains(t, headers, "f1detailCapital")
+	require.NotContains(t, headers, "f1detailbad-key")
+
+	got, err := f1.DecodeHeaders(headers)
+	require.NoError(t, err)
+	require.Equal(t, map[string]string{"tenant": "acme", "step": "charge"}, got.DeathDetails)
+	require.NotContains(t, got.Forwarded, "f1detailtenant")
+	require.NotContains(t, got.Extensions, "f1detailtenant")
+
+	e.Extensions = map[string]string{"f1detailtenant": "must reject"}
+	_, err = e.EncodeHeaders(0)
+	require.ErrorIs(t, err, f1.ErrReservedExtension)
+}
+
+func TestEnvelope_InvalidDeathDetailKeyIsSilent(t *testing.T) {
+	var logs bytes.Buffer
+	previous := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&logs, nil)))
+	t.Cleanup(func() { slog.SetDefault(previous) })
+
+	envelope := fullEnvelope()
+	envelope.DeathDetails = map[string]string{
+		"tenant":  "acme",
+		"BAD_KEY": "secret",
+	}
+	headers, err := envelope.EncodeHeaders(0)
+	require.NoError(t, err)
+	require.Equal(t, "acme", headers["f1detailtenant"])
+	require.NotContains(t, headers, "f1detailBAD_KEY")
+	require.Empty(t, logs.String())
 }
 
 func timePtr(t time.Time) *time.Time { return &t }
@@ -284,6 +334,73 @@ func TestEnvelope_HeaderSizeGuardExtensionsAloneIsEnough(t *testing.T) {
 	_, hasExt := h["ext-a"]
 	require.False(t, hasExt)
 	require.Equal(t, "boom", h["f1deatherror"], "DeathError must be untouched once dropping Extensions alone fits")
+}
+
+func TestEnvelope_SizeGuardRetainsDetailsAfterErrorFloor(t *testing.T) {
+	t.Parallel()
+
+	e := fullEnvelope()
+	e.DeathError = strings.Repeat("💥", 400)
+	e.DeathDetails = map[string]string{"tenant": "acme", "step": "charge"}
+
+	atFloor := e
+	atFloor.DeathError = strings.Repeat("💥", 128)
+	floorHeaders, err := atFloor.EncodeHeaders(0)
+	require.NoError(t, err)
+
+	headers, err := e.EncodeHeaders(headerBytesOf(floorHeaders))
+	require.NoError(t, err)
+	require.GreaterOrEqual(t, len(headers["f1deatherror"]), 512)
+	require.True(t, utf8.ValidString(headers["f1deatherror"]))
+	require.Equal(t, "acme", headers["f1detailtenant"])
+	require.Equal(t, "charge", headers["f1detailstep"])
+}
+
+func TestEnvelope_SizeGuardFloorRuneBoundaryTerminates(t *testing.T) {
+	t.Parallel()
+
+	e := fullEnvelope()
+	e.DeathError = "é" + strings.Repeat("💥", 250)
+	headers, err := e.EncodeHeaders(1000)
+	require.NoError(t, err)
+	require.Greater(t, len(headers["f1deatherror"]), 0)
+	require.True(t, utf8.ValidString(headers["f1deatherror"]))
+	require.LessOrEqual(t, headerBytesOf(headers), 1000)
+}
+
+func TestEnvelope_SizeGuardShedsAllDetailsAtErrorFloor(t *testing.T) {
+	t.Parallel()
+
+	atFloor := fullEnvelope()
+	atFloor.DeathError = strings.Repeat("e", 512)
+	floorHeaders, err := atFloor.EncodeHeaders(0)
+	require.NoError(t, err)
+	limit := headerBytesOf(floorHeaders)
+
+	e := atFloor
+	e.DeathError = strings.Repeat("e", 2048)
+	e.DeathDetails = map[string]string{"tenant": "acme", "step": "charge"}
+	headers, err := e.EncodeHeaders(limit)
+	require.NoError(t, err)
+	require.Equal(t, 512, len(headers["f1deatherror"]))
+	require.NotContains(t, headers, "f1detailtenant")
+	require.NotContains(t, headers, "f1detailstep")
+	require.LessOrEqual(t, headerBytesOf(headers), limit)
+}
+
+func TestEnvelope_SizeGuardTruncatesErrorBelowFloorWhenDetailsAbsent(t *testing.T) {
+	t.Parallel()
+
+	withoutError := fullEnvelope()
+	withoutError.DeathError = ""
+	baseHeaders, err := withoutError.EncodeHeaders(0)
+	require.NoError(t, err)
+
+	e := withoutError
+	e.DeathError = strings.Repeat("e", 2048)
+	headers, err := e.EncodeHeaders(headerBytesOf(baseHeaders))
+	require.NoError(t, err)
+	require.Empty(t, headers["f1deatherror"])
 }
 
 func headerBytesOf(h map[string]string) int {

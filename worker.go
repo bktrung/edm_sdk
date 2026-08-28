@@ -30,6 +30,7 @@ const (
 	stuckAbortMultiplier          = 4
 	deathErrorCap                 = 4 << 10
 	topologyDeliveryLimitHeadroom = 5
+	maxLoggedDeathDetailKeys      = 8
 )
 
 // --- Types and settlement contracts ---
@@ -1371,6 +1372,11 @@ func deadLetter(r *Runner, ctx context.Context, message driver.InboundMessage, e
 	if reason == ReasonDecode && envelope.ID == "" {
 		// Preserve the raw headers when the envelope itself could not be decoded.
 		headers := inboundHeaders(message.Headers)
+		for key := range headers {
+			if strings.HasPrefix(key, "f1detail") {
+				delete(headers, key)
+			}
+		}
 		destination := deadLetterDestination(r, envelope, message)
 		setDeathHeaders(headers, reason, lastErr, r.client.options.clock.Now().UTC(), message.Destination)
 		if err := publishSuccessor(r, runnerSettlementContext(r, ctx), driver.OutboundMessage{Destination: destination, Key: append([]byte(nil), message.Key...), Headers: headerSlice(headers), Body: append([]byte(nil), message.Body...)}); err != nil {
@@ -1388,6 +1394,25 @@ func deadLetter(r *Runner, ctx context.Context, message driver.InboundMessage, e
 	}
 	death.DeathReason = reason
 	death.DeathError = truncateError(lastErr)
+	if reason == ReasonTerminal || reason == ReasonMaxAttempts {
+		details, discarded := collectDeathDetails(lastErr)
+		death.DeathDetails = details
+		if len(discarded) > 0 {
+			sort.Strings(discarded)
+			logged := discarded
+			if len(logged) > maxLoggedDeathDetailKeys {
+				logged = logged[:maxLoggedDeathDetailKeys]
+			}
+			lastResortRunnerLogger(r).Warn("f1 death details discarded",
+				"subscription", r.subscription.Name,
+				"event_id", envelope.ID,
+				"keys", logged,
+				"count", len(discarded),
+			)
+		}
+	} else {
+		death.DeathDetails = nil
+	}
 	now := r.client.options.clock.Now().UTC()
 	death.DeathTime = &now
 	destination := deadLetterDestination(r, death, message)
@@ -1495,6 +1520,7 @@ func retryAndSettle(r *Runner, ctx context.Context, message driver.InboundMessag
 	copyEnvelope.DeathError = ""
 	copyEnvelope.DeathReason = ReasonUnspecified
 	copyEnvelope.DeathTime = nil
+	copyEnvelope.DeathDetails = nil
 	copyEnvelope.Attempt++
 	if copyEnvelope.MaxAttempts == 0 {
 		copyEnvelope.MaxAttempts = r.subscription.Retry.MaxAttempts
