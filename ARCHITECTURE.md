@@ -88,7 +88,7 @@ duplicates; application effects must use `Event.IdempotencyKey()` when they need
 | `drivers/inmem/` | Deterministic reference broker and test driver |
 | `drivers/rabbitmq/` | AMQP and RabbitMQ management adapter |
 | `f1test/` | Deterministic black-box test client built on in-memory transport |
-| `tools/` | API surface, API diff, and metric-cardinality checks |
+| `tools/` | `tools/apisurface` and `tools/apidiff` checks |
 
 Kafka is recognized by shared configuration and port types, but `drivers/kafka/` is not present.
 There is no SDK database, deduplication store, or outbox.

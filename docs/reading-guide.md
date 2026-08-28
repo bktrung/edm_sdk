@@ -87,7 +87,7 @@ same port contract into AMQP and management API operations.
 - `envelope_test.go` — wire compatibility and header-size behavior.
 - `internal/*/*_test.go` — isolated algorithm contracts.
 - `drivers/rabbitmq/*_test.go` — broker-specific behavior; some require Docker.
-- `tools/apisurface` and `tools/cardinality` — repository safeguards, not message runtime.
+- `tools/apisurface` and `tools/apidiff` — repository safeguards, not message runtime.
 
 ## How to follow one message
 

@@ -76,6 +76,7 @@ f1:
   service: orders
   broker:
     driver: kafka
+    endpoints: [kafka://broker:9092]
     connectTimeout: 4s
     kafka:
       compression: lz4
@@ -108,6 +109,7 @@ f1:
   service: orders
   broker:
     driver: kafka
+    endpoints: [kafka://broker:9092]
 `)
 	cfg, err := LoadConfig(path)
 	if err != nil {
@@ -126,6 +128,7 @@ f1:
   service: orders
   broker:
     driver: rabbitmq
+    endpoints: [amqp://broker:5672/]
     rabbitmq:
       managementPort: 18080
 `)
@@ -228,7 +231,7 @@ func TestLoadConfigAppliesNestedDefaults(t *testing.T) {
 
 func TestLoadConfigBareKafkaUsesCompatibleDefaults(t *testing.T) {
 	t.Parallel()
-	path := writeConfig(t, "f1:\n  env: test\n  service: orders\n  broker:\n    driver: kafka\n")
+	path := writeConfig(t, "f1:\n  env: test\n  service: orders\n  broker:\n    driver: kafka\n    endpoints: [kafka://broker:9092]\n")
 	cfg, err := LoadConfig(path)
 	if err != nil {
 		t.Fatal(err)
@@ -336,18 +339,118 @@ func TestLoadConfigFairnessMapsReplaceDefaults(t *testing.T) {
 func TestLoadConfigRequiresQuorumRabbitMQInProd(t *testing.T) {
 	t.Parallel()
 	for _, queueType := range []string{"", "garbage"} {
-		path := writeConfig(t, "f1:\n  env: prod\n  service: orders\n  broker:\n    driver: rabbitmq\n    rabbitmq:\n      queueType: "+queueType+"\n")
+		path := writeConfig(t, "f1:\n  env: prod\n  service: orders\n  broker:\n    driver: rabbitmq\n    endpoints: [amqp://broker:5672/]\n    rabbitmq:\n      queueType: "+queueType+"\n")
 		if _, err := LoadConfig(path); err == nil || !strings.Contains(err.Error(), "queueType") {
 			t.Fatalf("queueType %q: error = %v, want quorum error", queueType, err)
 		}
 	}
-	path := writeConfig(t, "f1:\n  env: prod\n  service: orders\n  broker:\n    driver: rabbitmq\n")
+	path := writeConfig(t, "f1:\n  env: prod\n  service: orders\n  broker:\n    driver: rabbitmq\n    endpoints: [amqp://broker:5672/]\n")
 	if _, err := LoadConfig(path); err == nil || !strings.Contains(err.Error(), "queueType") {
 		t.Fatalf("omitted queueType: error = %v, want quorum error", err)
 	}
-	path = writeConfig(t, "f1:\n  env: prod\n  service: orders\n  broker:\n    driver: rabbitmq\n    rabbitmq:\n      queueType: quorum\n")
+	path = writeConfig(t, "f1:\n  env: prod\n  service: orders\n  broker:\n    driver: rabbitmq\n    endpoints: [amqp://broker:5672/]\n    rabbitmq:\n      queueType: quorum\n")
 	if _, err := LoadConfig(path); err != nil {
 		t.Fatalf("quorum queueType error = %v", err)
+	}
+}
+
+func TestValidateConfigRequiresEndpointsForNetworkDrivers(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		driver  string
+		wantErr bool
+	}{
+		{driver: "kafka", wantErr: true},
+		{driver: "rabbitmq", wantErr: true},
+		{driver: "inmem", wantErr: false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.driver, func(t *testing.T) {
+			cfg := validValidationConfig()
+			cfg.Broker.Driver = tc.driver
+			err := validateConfig(cfg)
+			if tc.wantErr {
+				if err == nil || !strings.Contains(err.Error(), "broker.endpoints") {
+					t.Fatalf("validateConfig() error = %v, want broker.endpoints error", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("validateConfig() error = %v, want no endpoint requirement", err)
+			}
+		})
+	}
+}
+
+func TestValidateConfigRejectsProductionAliasEnvironments(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name    string
+		env     string
+		wantErr bool
+	}{
+		{name: "exact production trigger", env: "prod", wantErr: false},
+		{name: "production", env: "production", wantErr: true},
+		{name: "Production", env: "Production", wantErr: true},
+		{name: "PROD", env: "PROD", wantErr: true},
+		{name: "Prod", env: "Prod", wantErr: true},
+		{name: "prd", env: "prd", wantErr: true},
+		{name: "staging", env: "staging", wantErr: false},
+		{name: "dev", env: "dev", wantErr: false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := validValidationConfig()
+			cfg.Env = tc.env
+			cfg.Broker.Driver = "kafka"
+			cfg.Broker.Endpoints = []string{"kafka://broker:9092"}
+			err := validateConfig(cfg)
+			if tc.wantErr {
+				if err == nil || !strings.Contains(err.Error(), tc.env) || !strings.Contains(err.Error(), "prod") {
+					t.Fatalf("validateConfig() error = %v, want offending env and prod", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("validateConfig() error = %v, want no alias error", err)
+			}
+		})
+	}
+}
+
+func TestValidateConfigRequiresTLSForProductionSASL(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name      string
+		env       string
+		sasl      string
+		tls       bool
+		wantError bool
+	}{
+		{name: "production SASL without TLS", env: "prod", sasl: "plain", wantError: true},
+		{name: "production SASL with TLS", env: "prod", sasl: "plain", tls: true, wantError: false},
+		{name: "production without SASL", env: "prod", wantError: false},
+		{name: "staging SASL without TLS", env: "staging", sasl: "plain", wantError: false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := validValidationConfig()
+			cfg.Env = tc.env
+			cfg.Broker.Driver = "kafka"
+			cfg.Broker.Endpoints = []string{"kafka://broker:9092"}
+			cfg.Broker.SASL.Mechanism = tc.sasl
+			cfg.Broker.TLS.Enabled = tc.tls
+			err := validateConfig(cfg)
+			if tc.wantError {
+				if err == nil || !strings.Contains(err.Error(), "broker.sasl.mechanism") || !strings.Contains(err.Error(), "broker.tls.enabled") {
+					t.Fatalf("validateConfig() error = %v, want SASL and TLS keys", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("validateConfig() error = %v, want no TLS requirement", err)
+			}
+		})
 	}
 }
 
@@ -363,10 +466,10 @@ func TestSubscriptionZeroValuesAreDocumentedDefaults(t *testing.T) {
 func TestLoadConfigValidatesBrokerTimeoutRelationships(t *testing.T) {
 	t.Parallel()
 	cases := []struct{ name, yaml, want string }{
-		{"kafka too long", "f1:\n  env: test\n  service: orders\n  broker:\n    driver: kafka\n  lifecycle:\n    rebalanceDrainTimeout: 30s\n", "rebalanceDrainTimeout"},
-		{"kafka malformed", "f1:\n  env: test\n  service: orders\n  broker:\n    driver: kafka\n    kafka:\n      sessionTimeout: garbage\n", "sessionTimeout"},
-		{"rabbit malformed", "f1:\n  env: test\n  service: orders\n  broker:\n    driver: rabbitmq\n    rabbitmq:\n      consumerTimeout: garbage\n", "consumerTimeout"},
-		{"rabbit too short", "f1:\n  env: test\n  service: orders\n  broker:\n    driver: rabbitmq\n    rabbitmq:\n      consumerTimeout: 10s\n  subscriptions:\n    orders:\n      topics: [orders]\n", "consumerTimeout"},
+		{"kafka too long", "f1:\n  env: test\n  service: orders\n  broker:\n    driver: kafka\n    endpoints: [kafka://broker:9092]\n  lifecycle:\n    rebalanceDrainTimeout: 30s\n", "rebalanceDrainTimeout"},
+		{"kafka malformed", "f1:\n  env: test\n  service: orders\n  broker:\n    driver: kafka\n    endpoints: [kafka://broker:9092]\n    kafka:\n      sessionTimeout: garbage\n", "sessionTimeout"},
+		{"rabbit malformed", "f1:\n  env: test\n  service: orders\n  broker:\n    driver: rabbitmq\n    endpoints: [amqp://broker:5672/]\n    rabbitmq:\n      consumerTimeout: garbage\n", "consumerTimeout"},
+		{"rabbit too short", "f1:\n  env: test\n  service: orders\n  broker:\n    driver: rabbitmq\n    endpoints: [amqp://broker:5672/]\n    rabbitmq:\n      consumerTimeout: 10s\n  subscriptions:\n    orders:\n      topics: [orders]\n", "consumerTimeout"},
 	}
 	for _, test := range cases {
 		t.Run(test.name, func(t *testing.T) {

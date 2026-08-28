@@ -22,6 +22,8 @@ import (
 // Local fixture credentials are intentional and never used for production endpoints.
 const defaultEndpoint = "amqp://guest:guest@localhost:5672/" //nolint:gosec // test fixture endpoint
 
+var errMissingEndpoints = errors.New("rabbitmq: broker endpoints must not be empty")
+
 var _ driver.Driver = Driver{}
 
 // Driver is a stateless RabbitMQ driver factory.
@@ -94,10 +96,10 @@ func (Driver) Open(ctx context.Context, cfg driver.Config) (driver.Conn, error) 
 		defer cancel()
 	}
 
-	endpoints := cfg.Endpoints
-	if len(endpoints) == 0 {
-		endpoints = []string{defaultEndpoint}
+	if len(cfg.Endpoints) == 0 {
+		return nil, classify("open", driver.KindFatal, errMissingEndpoints)
 	}
+	endpoints := cfg.Endpoints
 	var lastErr error
 	for {
 		for _, endpoint := range endpoints {

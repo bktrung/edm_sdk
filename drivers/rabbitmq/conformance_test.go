@@ -13,7 +13,7 @@ func TestConformance(t *testing.T) {
 	requireBroker(t)
 	conformance.Run(t, conformance.Suite{
 		Driver:           Driver{},
-		Config:           driver.Config{},
+		Config:           driver.Config{Endpoints: []string{defaultEndpoint}},
 		NewInspector:     rabbitInspector,
 		NewFaultInjector: rabbitFaultInjector,
 	})
