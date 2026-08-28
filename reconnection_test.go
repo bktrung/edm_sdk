@@ -1,6 +1,7 @@
 package f1
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"io"
@@ -22,6 +23,7 @@ type reconnectTestDriver struct {
 	opens         int
 	failOpens     int
 	failConsumers int
+	consumerErr   error
 	connections   []*reconnectTestConn
 	created       chan *reconnectTestConsumer
 }
@@ -58,8 +60,13 @@ func (d *reconnectTestDriver) setFailOpens(n int) {
 }
 
 func (d *reconnectTestDriver) setFailConsumers(n int) {
+	d.setFailConsumersWithError(n, nil)
+}
+
+func (d *reconnectTestDriver) setFailConsumersWithError(n int, err error) {
 	d.mu.Lock()
 	d.failConsumers = n
+	d.consumerErr = err
 	d.mu.Unlock()
 }
 
@@ -87,8 +94,12 @@ func (c *reconnectTestConn) Consumer(_ context.Context, cfg driver.ConsumerConfi
 	c.driver.mu.Lock()
 	if c.driver.failConsumers > 0 {
 		c.driver.failConsumers--
+		err := c.driver.consumerErr
 		c.driver.mu.Unlock()
-		return nil, &driver.Error{Driver: c.driver.Name(), Op: "consumer", K: driver.KindTransient, Err: errors.New("consumer failed")}
+		if err == nil {
+			err = errors.New("consumer failed")
+		}
+		return nil, &driver.Error{Driver: c.driver.Name(), Op: "consumer", K: driver.KindTransient, Err: err}
 	}
 	c.driver.mu.Unlock()
 	if c.closed.Load() {
@@ -256,6 +267,10 @@ func (c *recordingClock) sleepAt(index int) time.Duration {
 }
 
 func newReconnectTestClient(t *testing.T, d *reconnectTestDriver, c clock.Clock, maxAttempts int, extra ...Option) *Client {
+	return newReconnectTestClientWithLogger(t, d, c, maxAttempts, slog.New(slog.NewTextHandler(io.Discard, nil)), extra...)
+}
+
+func newReconnectTestClientWithLogger(t *testing.T, d *reconnectTestDriver, c clock.Clock, maxAttempts int, logger *slog.Logger, extra ...Option) *Client {
 	t.Helper()
 	cfg := testClientConfig(t)
 	cfg.Broker.MaxReconnectAttempts = maxAttempts
@@ -263,9 +278,9 @@ func newReconnectTestClient(t *testing.T, d *reconnectTestDriver, c clock.Clock,
 	cfg.Lifecycle.HandlerGrace = 100 * time.Millisecond
 	cfg.Lifecycle.FlushTimeout = 100 * time.Millisecond
 	cfg.Lifecycle.CloseTimeout = 100 * time.Millisecond
-	options := []Option{
-		WithDriver(d),
-		WithLogger(slog.New(slog.NewTextHandler(io.Discard, nil))),
+	options := []Option{WithDriver(d)}
+	if logger != nil {
+		options = append(options, WithLogger(logger))
 	}
 	options = append(options, extra...)
 	if c != nil {
@@ -277,6 +292,167 @@ func newReconnectTestClient(t *testing.T, d *reconnectTestDriver, c clock.Clock,
 	}
 	t.Cleanup(func() { _ = client.Close(context.Background()) })
 	return client
+}
+
+func TestReconnectStartUsesConfiguredLogger(t *testing.T) {
+	defaultOutput := captureProcessDefault(t)
+	var configuredOutput bytes.Buffer
+	fake := clock.NewFake(time.Unix(450, 0))
+	recorded := &recordingClock{Fake: fake}
+	d := &reconnectTestDriver{created: make(chan *reconnectTestConsumer, 1)}
+	client := newReconnectTestClientWithLogger(
+		t,
+		d,
+		recorded,
+		0,
+		slog.New(slog.NewTextHandler(&configuredOutput, nil)),
+	)
+	cause := errors.New("configured reconnect cause")
+	attempt, err := client.requestReconnect(cause)
+	if err != nil {
+		t.Fatal(err)
+	}
+	advanceReconnect(t, recorded, 500*time.Millisecond, 1)
+	if err := client.waitReconnect(context.Background(), attempt); err != nil {
+		t.Fatalf("reconnect = %v, want nil", err)
+	}
+	assertReconnectStartedLog(t, configuredOutput.String(), cause)
+	if got := defaultOutput.String(); got != "" {
+		t.Fatalf("process default output = %q, want empty", got)
+	}
+}
+
+func TestReconnectStartUsesProcessDefaultWithoutConfiguredLogger(t *testing.T) {
+	defaultOutput := captureProcessDefault(t)
+	fake := clock.NewFake(time.Unix(450, 0))
+	recorded := &recordingClock{Fake: fake}
+	d := &reconnectTestDriver{created: make(chan *reconnectTestConsumer, 1)}
+	client := newReconnectTestClientWithLogger(t, d, recorded, 0, nil)
+	cause := errors.New("default reconnect cause")
+	attempt, err := client.requestReconnect(cause)
+	if err != nil {
+		t.Fatal(err)
+	}
+	advanceReconnect(t, recorded, 500*time.Millisecond, 1)
+	if err := client.waitReconnect(context.Background(), attempt); err != nil {
+		t.Fatalf("reconnect = %v, want nil", err)
+	}
+	assertReconnectStartedLog(t, defaultOutput.String(), cause)
+}
+
+func TestRunnerReconnectReportsGenerationCause(t *testing.T) {
+	defaultOutput := captureProcessDefault(t)
+	var configuredOutput bytes.Buffer
+	fake := clock.NewFake(time.Unix(450, 0))
+	recorded := &recordingClock{Fake: fake}
+	d := &reconnectTestDriver{created: make(chan *reconnectTestConsumer, 8)}
+	cause := errors.New("runner generation cause")
+	client := newReconnectTestClientWithLogger(
+		t,
+		d,
+		recorded,
+		0,
+		slog.New(slog.NewTextHandler(&configuredOutput, nil)),
+	)
+	runner, err := client.Subscribe(context.Background(), Subscription{
+		Name:           "orders",
+		Topics:         []string{"orders.created"},
+		Prefetch:       12,
+		HandlerTimeout: 10 * time.Millisecond,
+		Handlers: map[string]Handler{
+			"orders.created": HandlerFunc(func(context.Context, *Event) error { return nil }),
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	runCtx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	runDone := make(chan error, 1)
+	go func() { runDone <- runner.Run(runCtx) }()
+	first := <-d.created
+	waitReconnectCondition(t, func() bool { return runner.lifecycle.Ready() })
+	d.setFailConsumersWithError(1, cause)
+	first.sendError(&driver.Error{
+		Driver: d.Name(),
+		Op:     "consumer",
+		K:      driver.KindTransient,
+		Err:    errors.New("runner failure signal"),
+	})
+	advanceReconnect(t, recorded, 500*time.Millisecond, 1)
+	waitReconnectCondition(t, func() bool {
+		return d.OpenCount() >= 2 && runner.lifecycle.Ready() && !client.isReconnecting()
+	})
+	assertReconnectStartedLog(t, configuredOutput.String(), cause)
+	if got := defaultOutput.String(); got != "" {
+		t.Fatalf("process default output = %q, want empty", got)
+	}
+	cancel()
+	select {
+	case <-runDone:
+	case <-clock.NewReal().Timer(time.Second).C:
+		t.Fatal("runner did not stop after context cancellation")
+	}
+}
+
+func TestReconnectStartLoggedOnceForSharedAttempt(t *testing.T) {
+	var configuredOutput bytes.Buffer
+	fake := clock.NewFake(time.Unix(450, 0))
+	recorded := &recordingClock{Fake: fake}
+	d := &reconnectTestDriver{created: make(chan *reconnectTestConsumer, 1)}
+	client := newReconnectTestClientWithLogger(
+		t,
+		d,
+		recorded,
+		0,
+		slog.New(slog.NewTextHandler(&configuredOutput, nil)),
+	)
+	cause := errors.New("shared reconnect cause")
+	firstResult := make(chan error, 1)
+	go func() {
+		firstResult <- (&Runner{client: client}).requestAndWaitReconnect(context.Background(), cause)
+	}()
+	waitReconnectCondition(t, func() bool { return recorded.sleepCount() == 1 })
+	results := make(chan error, 8)
+	for range 8 {
+		attempt, err := client.requestReconnect(cause)
+		if err != nil {
+			t.Fatal(err)
+		}
+		go func(attempt *reconnectAttempt) {
+			results <- client.waitReconnect(context.Background(), attempt)
+		}(attempt)
+	}
+	advanceReconnect(t, recorded, 500*time.Millisecond, 1)
+	select {
+	case err := <-firstResult:
+		if err != nil {
+			t.Fatalf("first requestAndWaitReconnect() = %v, want nil", err)
+		}
+	case <-clock.NewReal().Timer(time.Second).C:
+		t.Fatal("first reconnect waiter did not return")
+	}
+	for range 8 {
+		select {
+		case err := <-results:
+			if err != nil {
+				t.Fatalf("shared reconnect waiter = %v, want nil", err)
+			}
+		case <-clock.NewReal().Timer(time.Second).C:
+			t.Fatal("shared reconnect waiter did not return")
+		}
+	}
+	assertReconnectStartedLog(t, configuredOutput.String(), cause)
+}
+
+func assertReconnectStartedLog(t *testing.T, output string, cause error) {
+	t.Helper()
+	if got := strings.Count(output, "f1 reconnect started"); got != 1 {
+		t.Fatalf("reconnect start log lines = %d, want 1; output = %q", got, output)
+	}
+	if !strings.Contains(output, cause.Error()) {
+		t.Fatalf("reconnect start output = %q, want cause %q", output, cause)
+	}
 }
 
 func TestRequestAndWaitReconnectPrefersRequestError(t *testing.T) {
