@@ -50,11 +50,17 @@ type managementBinding struct {
 
 func newManagementClient(endpoint string, cfg driver.Config) (*managementClient, error) {
 	parsed, err := url.Parse(endpoint)
-	if err != nil || parsed.Hostname() == "" {
-		if err == nil {
-			err = fmt.Errorf("missing host")
+	if err != nil {
+		var urlErr *url.Error
+		if errors.As(err, &urlErr) {
+			err = urlErr.Err
 		}
-		return nil, fmt.Errorf("rabbitmq: invalid management endpoint %q: %w", endpoint, err)
+		return nil, fmt.Errorf("rabbitmq: invalid management endpoint: %w", err)
+	}
+	if parsed.Hostname() == "" {
+		// Opaque and path fields can retain raw credential-looking input; keep only the scheme.
+		redacted := url.URL{Scheme: parsed.Scheme}
+		return nil, fmt.Errorf("rabbitmq: invalid management endpoint %q: %w", redacted.String(), errors.New("missing host"))
 	}
 	scheme := "http"
 	managementPort := 15672
@@ -74,6 +80,9 @@ func newManagementClient(endpoint string, cfg driver.Config) (*managementClient,
 			return nil, fmt.Errorf("rabbitmq: invalid %s %q: want a port from 1 to 65535", managementPortOption, configured)
 		}
 		managementPort = port
+	}
+	if parsed.Scheme != "amqps" && !isLoopbackEndpoint(endpoint) {
+		return nil, errors.New("rabbitmq: plaintext connection to non-loopback host requires an amqps:// endpoint")
 	}
 	host := net.JoinHostPort(parsed.Hostname(), strconv.Itoa(managementPort))
 	username, password := "", ""

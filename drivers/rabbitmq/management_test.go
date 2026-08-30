@@ -30,6 +30,119 @@ func TestManagementClientRejectsInvalidEndpoint(t *testing.T) {
 	}
 }
 
+func TestManagementEndpointErrorRedactsCredentials(t *testing.T) {
+	const username = "fake-management-user"
+	const password = "fake-management-pass"
+
+	for _, test := range []struct {
+		name     string
+		endpoint string
+	}{
+		{
+			name:     "missing host",
+			endpoint: "amqp://" + username + ":" + password + "@",
+		},
+		{
+			name:     "opaque endpoint",
+			endpoint: "amqp:" + username + ":" + password + "@",
+		},
+		{
+			name:     "parse failure",
+			endpoint: "amqp://" + username + ":" + password + "@%zz",
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			client, err := newManagementClient(test.endpoint, driver.Config{})
+			if err == nil || client != nil {
+				t.Fatalf("newManagementClient() = client %v, error %v; want validation error", client, err)
+			}
+			if !strings.Contains(err.Error(), "invalid management endpoint") {
+				t.Fatalf("newManagementClient() error = %v, want invalid endpoint detail", err)
+			}
+			if strings.Contains(err.Error(), username) || strings.Contains(err.Error(), password) {
+				t.Fatalf("newManagementClient() error = %v, contains endpoint credentials", err)
+			}
+		})
+	}
+}
+
+func TestManagementClientRefusesPlaintextForRemoteHost(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		cfg  driver.Config
+	}{
+		{
+			name: "without TLS",
+			cfg:  driver.Config{},
+		},
+		{
+			name: "with TLS enabled",
+			cfg:  driver.Config{TLS: &driver.TLSConfig{Enabled: true}},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			client, err := newManagementClient("amqp://broker.example:5672/", test.cfg)
+			if err == nil || client != nil {
+				t.Fatalf("newManagementClient() = client %v, error %v; want remote plaintext refusal", client, err)
+			}
+			if !strings.Contains(err.Error(), "plaintext") || !strings.Contains(err.Error(), "amqps://") {
+				t.Fatalf("newManagementClient() error = %v, want plaintext and amqps requirement", err)
+			}
+		})
+	}
+}
+
+func TestManagementClientRefusesForgedLoopbackHost(t *testing.T) {
+	const username = "fake-loopback-user"
+	const value = "fake-loopback-value"
+
+	for _, endpoint := range []string{
+		"amqp://" + username + ":" + value + "@evil-localhost.example.com:5672/",
+		"amqp://" + username + ":" + value + "@127.0.0.1.example.com:5672/",
+	} {
+		t.Run(endpoint, func(t *testing.T) {
+			client, err := newManagementClient(endpoint, driver.Config{})
+			if err == nil || client != nil {
+				t.Fatalf("newManagementClient() = client %v, error %v; want forged loopback refusal", client, err)
+			}
+			if !strings.Contains(err.Error(), "plaintext") || !strings.Contains(err.Error(), "amqps://") {
+				t.Fatalf("newManagementClient() error = %v, want plaintext and amqps requirement", err)
+			}
+			if strings.Contains(err.Error(), username) || strings.Contains(err.Error(), value) {
+				t.Fatalf("newManagementClient() error = %v, contains endpoint credentials", err)
+			}
+		})
+	}
+}
+
+func TestManagementClientAllowsPlaintextOnLoopback(t *testing.T) {
+	for _, endpoint := range []string{
+		"amqp://localhost:5672/",
+		"amqp://127.0.0.1:5672/",
+	} {
+		t.Run(endpoint, func(t *testing.T) {
+			client, err := newManagementClient(endpoint, driver.Config{})
+			if err != nil {
+				t.Fatalf("newManagementClient() error = %v, want loopback plaintext to work", err)
+			}
+			if client == nil {
+				t.Fatal("newManagementClient() returned nil client")
+			}
+		})
+	}
+}
+
+func TestManagementClientUsesHTTPSWhenTLSEnabled(t *testing.T) {
+	cfg := driver.Config{TLS: &driver.TLSConfig{Enabled: true}}
+	client, err := newManagementClient("amqps://broker.example:5671/", cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if client.baseURL != "https://broker.example:15671" {
+		t.Fatalf("management base URL = %q, want HTTPS management endpoint", client.baseURL)
+	}
+}
+
 func TestManagementClientUsesResolvedVhostCredentialsAndTLS(t *testing.T) {
 	cfg := driver.Config{
 		ConnectTimeout: 7 * time.Second,
@@ -58,12 +171,23 @@ func TestManagementClientUsesResolvedVhostCredentialsAndTLS(t *testing.T) {
 
 func TestManagementClientUsesConfiguredPort(t *testing.T) {
 	cfg := driver.Config{DriverOptions: map[string]string{managementPortOption: "18080"}}
-	client, err := newManagementClient("amqp://broker.example:5673/", cfg)
+	client, err := newManagementClient("amqp://localhost:5673/", cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if client.baseURL != "http://broker.example:18080" {
+	if client.baseURL != "http://localhost:18080" {
 		t.Fatalf("management base URL = %q, want configured port", client.baseURL)
+	}
+}
+
+func TestManagementClientUsesConfiguredPortForAMQPSTransport(t *testing.T) {
+	cfg := driver.Config{DriverOptions: map[string]string{managementPortOption: "18080"}}
+	client, err := newManagementClient("amqps://broker.example:5671/", cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if client.baseURL != "https://broker.example:18080" {
+		t.Fatalf("management base URL = %q, want configured HTTPS port", client.baseURL)
 	}
 }
 
