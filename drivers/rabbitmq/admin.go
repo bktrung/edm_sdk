@@ -10,7 +10,12 @@ import (
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/driver"
 )
 
-type adminOperations struct{ conn *conn }
+type adminOperations struct {
+	conn *conn
+	// pruneBeforeDeleteHook is a test-only synchronization seam. It remains nil
+	// in production and does not change driver behavior.
+	pruneBeforeDeleteHook func(string)
+}
 
 type admin struct{ operations *adminOperations }
 
@@ -19,6 +24,16 @@ var (
 	_ driver.Maintenance = (*admin)(nil)
 	_ driver.Maintenance = (*adminOperations)(nil)
 )
+
+var errQueueNotPrunable = errors.New("rabbitmq: queue is no longer prunable")
+
+type queuePruneGuardError struct {
+	reason string
+}
+
+func (e *queuePruneGuardError) Error() string { return e.reason }
+
+func (e *queuePruneGuardError) Unwrap() error { return errQueueNotPrunable }
 
 func (a *admin) EnsureTopology(ctx context.Context, spec driver.TopologySpec) (driver.TopologyDiff, error) {
 	return a.operations.EnsureTopology(ctx, spec)
@@ -187,7 +202,15 @@ func (a *adminOperations) Prune(ctx context.Context, names []string) ([]driver.P
 				results = append(results, result)
 				continue
 			}
-			deleted, deleteErr := a.deleteQueue(ctx, parkName)
+			if a.pruneBeforeDeleteHook != nil {
+				a.pruneBeforeDeleteHook(parkName)
+			}
+			deleted, deleteErr := a.deleteQueue(ctx, parkName, true)
+			if errors.Is(deleteErr, errQueueNotPrunable) {
+				result.Reason = pruneDeleteReason(deleteErr, "parking destination is no longer prunable")
+				results = append(results, result)
+				continue
+			}
 			if deleteErr != nil {
 				return nil, classify("prune", driver.KindTransient, deleteErr)
 			}
@@ -218,7 +241,15 @@ func (a *adminOperations) Prune(ctx context.Context, names []string) ([]driver.P
 			results = append(results, result)
 			continue
 		}
-		deleted, deleteErr := a.deleteQueue(ctx, name)
+		if a.pruneBeforeDeleteHook != nil {
+			a.pruneBeforeDeleteHook(name)
+		}
+		deleted, deleteErr := a.deleteQueue(ctx, name, false)
+		if errors.Is(deleteErr, errQueueNotPrunable) {
+			result.Reason = pruneDeleteReason(deleteErr, "destination is no longer prunable")
+			results = append(results, result)
+			continue
+		}
 		if deleteErr != nil {
 			return nil, classify("prune", driver.KindTransient, deleteErr)
 		}
@@ -267,7 +298,36 @@ func (a *adminOperations) consumerCount(destination string) int64 {
 	return count
 }
 
-func (a *adminOperations) deleteQueue(ctx context.Context, name string) (bool, error) {
+func pruneDeleteReason(err error, fallback string) string {
+	var guardErr *queuePruneGuardError
+	if errors.As(err, &guardErr) {
+		return guardErr.reason
+	}
+	return fallback
+}
+
+func queuePruneReason(name string, ready, consumers int64, auxiliary bool) string {
+	if consumers > 0 {
+		if auxiliary {
+			return fmt.Sprintf("auxiliary %q has consumers attached", name)
+		}
+		return fmt.Sprintf("destination %q has consumers attached", name)
+	}
+	if ready > 0 {
+		if auxiliary {
+			return fmt.Sprintf("auxiliary %q holds %d ready message(s)", name, ready)
+		}
+		return fmt.Sprintf("destination %q holds %d ready message(s)", name, ready)
+	}
+	return ""
+}
+
+// deleteQueue uses broker preconditions for classic queues. Quorum queues
+// support no conditional delete, so their final passive-declare recheck leaves
+// a window where a newly arrived message can still be destroyed. The recheck
+// runs on the channel that performs the delete, so no other channel's traffic
+// can be interleaved between them.
+func (a *adminOperations) deleteQueue(ctx context.Context, name string, auxiliary bool) (bool, error) {
 	if err := ctx.Err(); err != nil {
 		return false, err
 	}
@@ -285,13 +345,43 @@ func (a *adminOperations) deleteQueue(ctx context.Context, name string) (bool, e
 	if !owned {
 		defer channel.Close()
 	}
-	_, err := channel.QueueDelete(name, false, false, false)
+
+	if a.conn.queueKind == queueKindQuorum {
+		ready, consumers, err := inspectQueueOnChannel(channel, name, owned)
+		if err != nil {
+			if isNotFound(err) {
+				return false, nil
+			}
+			return false, err
+		}
+		if reason := queuePruneReason(name, ready, consumers, auxiliary); reason != "" {
+			return false, &queuePruneGuardError{reason: reason}
+		}
+	}
+	var err error
+	if a.conn.queueKind == queueKindQuorum {
+		_, err = channel.QueueDelete(name, false, false, false)
+	} else {
+		_, err = channel.QueueDelete(name, true, true, false)
+	}
 	if err != nil {
 		if isNotFound(err) {
 			return false, nil
 		}
+		if isPreconditionFailed(err) {
+			if owned {
+				a.conn.mu.Lock()
+				if a.conn.ephemeral[name] == channel {
+					delete(a.conn.ephemeral, name)
+				}
+				a.conn.mu.Unlock()
+				_ = channel.Close()
+			}
+			return false, errQueueNotPrunable
+		}
 		return false, err
 	}
+
 	a.conn.mu.Lock()
 	delete(a.conn.ephemeral, name)
 	delete(a.conn.deferred, name)
@@ -299,9 +389,19 @@ func (a *adminOperations) deleteQueue(ctx context.Context, name string) (bool, e
 	return true, nil
 }
 
+func isPreconditionFailed(err error) bool {
+	var amqpErr *amqp.Error
+	return errors.As(err, &amqpErr) && amqpErr.Code == 406
+}
+
 func (a *adminOperations) inspectQueue(ctx context.Context, name string) (int64, error) {
+	ready, _, err := a.inspectQueueWithConsumers(ctx, name)
+	return ready, err
+}
+
+func (a *adminOperations) inspectQueueWithConsumers(ctx context.Context, name string) (int64, int64, error) {
 	if err := ctx.Err(); err != nil {
-		return 0, err
+		return 0, 0, err
 	}
 	a.conn.mu.RLock()
 	channel := a.conn.ephemeral[name]
@@ -311,16 +411,20 @@ func (a *adminOperations) inspectQueue(ctx context.Context, name string) (int64,
 		var err error
 		channel, err = a.conn.amqp.Channel()
 		if err != nil {
-			return 0, err
+			return 0, 0, err
 		}
 	}
 	if !owned {
 		defer channel.Close()
 	}
+	return inspectQueueOnChannel(channel, name, owned)
+}
+
+func inspectQueueOnChannel(channel *amqp.Channel, name string, owned bool) (int64, int64, error) {
 	durable, exclusive := !owned, owned
 	queue, err := channel.QueueDeclarePassive(name, durable, false, exclusive, false, nil)
 	if err != nil {
-		return 0, err
+		return 0, 0, err
 	}
-	return int64(queue.Messages), nil
+	return int64(queue.Messages), int64(queue.Consumers), nil
 }

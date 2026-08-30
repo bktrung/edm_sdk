@@ -34,6 +34,15 @@ type consumer struct {
 	stoppedC chan struct{}
 	// Drain releases local forwarders; stoppedC remains the completed-teardown signal.
 	forwarderStopC chan struct{}
+	// forwarderExitHook is a test-only synchronization seam. It remains nil in
+	// production and does not change the driver behavior.
+	forwarderExitHook func()
+	// readerSendHook is a test-only synchronization seam. It remains nil in
+	// production and does not change the driver behavior.
+	readerSendHook func(*lane)
+	// cancelHook is a test-only synchronization seam. It remains nil in
+	// production and does not change the driver behavior.
+	cancelHook func()
 
 	mu          sync.Mutex
 	draining    bool
@@ -45,18 +54,23 @@ type consumer struct {
 	forward           sync.WaitGroup
 	events            sync.WaitGroup
 	forwarderStopOnce sync.Once
+	stoppedOnce       sync.Once
 }
 
 type lane struct {
 	owner       *consumer
 	destination string
 	channel     *amqp.Channel
-	tag         string
-	prefetch    int
-	deliveries  <-chan amqp.Delivery
-	pending     chan amqp.Delivery
-	resume      chan struct{}
-	emitting    int
+	// channelMu serializes channel RPCs because AMQP does not correlate
+	// requests with their replies. Channel.Close deliberately does not take it
+	// because closing releases a stuck RPC.
+	channelMu  sync.Mutex
+	tag        string
+	prefetch   int
+	deliveries <-chan amqp.Delivery
+	pending    chan amqp.Delivery
+	resume     chan struct{}
+	emitting   int
 
 	mu     sync.Mutex
 	paused bool
@@ -68,6 +82,7 @@ type consumerConstructionPhase uint8
 
 const (
 	consumerConstructionStarted consumerConstructionPhase = iota
+	consumerConstructionLaneReady
 	consumerConstructionReady
 )
 
@@ -76,6 +91,14 @@ const (
 var consumerConstructionHook func(*consumer, consumerConstructionPhase)
 
 func newConsumer(conn *conn, cfg driver.ConsumerConfig) (*consumer, error) {
+	seen := make(map[string]struct{}, len(cfg.Destinations))
+	for _, destination := range cfg.Destinations {
+		if _, exists := seen[destination]; exists {
+			return nil, classify("consumer", driver.KindFatal, fmt.Errorf("duplicate destination %q", destination))
+		}
+		seen[destination] = struct{}{}
+	}
+
 	c := &consumer{
 		conn:           conn,
 		cfg:            cfg,
@@ -86,33 +109,31 @@ func newConsumer(conn *conn, cfg driver.ConsumerConfig) (*consumer, error) {
 		forwarderStopC: make(chan struct{}),
 		settlers:       make(map[*settler]struct{}),
 	}
+	rollback := func(err error) (*consumer, error) {
+		_ = c.rollbackConstruction()
+		return nil, err
+	}
 	if hook := consumerConstructionHook; hook != nil {
 		hook(c, consumerConstructionStarted)
 	}
 	for index, destination := range cfg.Destinations {
-		if _, exists := c.byName[destination]; exists {
-			return nil, classify("consumer", driver.KindFatal, fmt.Errorf("duplicate destination %q", destination))
-		}
 		prefetch := destinationPrefetch(cfg, destination, index)
 		channel, err := conn.amqp.Channel()
 		if err != nil {
-			c.closeLanes()
-			return nil, classifyAMQP("consumer", driver.KindTransient, err)
+			return rollback(classifyAMQP("consumer", driver.KindTransient, err))
 		}
 		if err := channel.Qos(prefetch, 0, false); err != nil {
 			_ = channel.Close()
-			c.closeLanes()
-			return nil, classifyAMQP("consumer", driver.KindFatal, err)
+			return rollback(classifyAMQP("consumer", driver.KindFatal, err))
 		}
 		tag := "f1-consumer-" + strconv.FormatUint(consumerSequence.Add(1), 10)
 		deliveries, err := channel.Consume(destination, tag, false, cfg.Exclusive, false, false, nil)
 		if err != nil {
 			_ = channel.Close()
-			c.closeLanes()
 			if cfg.Exclusive && isPermission(err) {
-				return nil, classify("consumer", driver.KindFatal, fmt.Errorf("exclusive consumer refused: %w", err))
+				return rollback(classify("consumer", driver.KindFatal, fmt.Errorf("exclusive consumer refused: %w", err)))
 			}
-			return nil, classifyAMQP("consumer", driver.KindNotFound, err)
+			return rollback(classifyAMQP("consumer", driver.KindNotFound, err))
 		}
 		lane := &lane{
 			owner:       c,
@@ -132,6 +153,9 @@ func newConsumer(conn *conn, cfg driver.ConsumerConfig) (*consumer, error) {
 		go c.readDeliveries(lane)
 		go c.emitMessages(lane)
 		go c.watchClose(lane)
+		if hook := consumerConstructionHook; hook != nil {
+			hook(c, consumerConstructionLaneReady)
+		}
 	}
 	return c, nil
 }
@@ -169,6 +193,13 @@ func (c *consumer) closeLanes() {
 	}
 }
 
+func (c *consumer) rollbackConstruction() error {
+	c.mu.Lock()
+	c.stopped = true
+	c.mu.Unlock()
+	return c.stopAndWait(true, nil)
+}
+
 func (c *consumer) Messages() <-chan driver.InboundMessage { return c.messages }
 func (c *consumer) Errors() <-chan error                   { return c.errors }
 
@@ -182,6 +213,9 @@ func (c *consumer) readDeliveries(lane *lane) {
 		if stopped || draining {
 			continue
 		}
+		if c.readerSendHook != nil {
+			c.readerSendHook(lane)
+		}
 		select {
 		case lane.pending <- delivery:
 		case <-c.stoppedC:
@@ -191,8 +225,25 @@ func (c *consumer) readDeliveries(lane *lane) {
 }
 
 func (c *consumer) emitMessages(lane *lane) {
-	defer c.forward.Done()
-	for delivery := range lane.pending {
+	defer func() {
+		if c.forwarderExitHook != nil {
+			c.forwarderExitHook()
+		}
+		c.forward.Done()
+	}()
+	for {
+		var (
+			delivery amqp.Delivery
+			ok       bool
+		)
+		select {
+		case delivery, ok = <-lane.pending:
+			if !ok {
+				return
+			}
+		case <-c.forwarderStopC:
+			return
+		}
 		lane.mu.Lock()
 		lane.emitting++
 		lane.mu.Unlock()
@@ -471,16 +522,43 @@ func (c *consumer) Drain(ctx context.Context) error {
 	lanes := append([]*lane(nil), c.lanes...)
 	c.mu.Unlock()
 
+	var drainErr error
 	for _, lane := range lanes {
-		if err := cancelConsumer(ctx, lane.channel, lane.tag); err != nil && !errors.Is(err, amqp.ErrClosed) {
-			return classifyAMQP("drain", driver.KindTransient, err)
+		if err := cancelConsumer(ctx, lane); err != nil && !errors.Is(err, amqp.ErrClosed) {
+			drainErr = classifyAMQP("drain", driver.KindTransient, err)
+			break
 		}
 	}
-	return nil
+	// forwarderStopC is closed before this join, and every blocking point in
+	// emitMessages observes it. Removing an escape can make Drain hang forever.
+	c.forward.Wait()
+	return drainErr
 }
 
 func (c *consumer) stopForwarders() {
 	c.forwarderStopOnce.Do(func() { close(c.forwarderStopC) })
+}
+
+func (c *consumer) stopSignals() {
+	c.stopForwarders()
+	c.stoppedOnce.Do(func() { close(c.stoppedC) })
+}
+
+func (c *consumer) stopAndWait(closeLanes bool, wait func() error) error {
+	c.stopSignals()
+	if closeLanes {
+		c.closeLanes()
+	}
+	if wait != nil {
+		if err := wait(); err != nil {
+			return err
+		}
+	} else {
+		c.readers.Wait()
+		c.forward.Wait()
+	}
+	c.events.Wait()
+	return nil
 }
 
 func (c *consumer) waitReaders(ctx context.Context, op string) error {
@@ -493,6 +571,9 @@ func (c *consumer) waitReaders(ctx context.Context, op string) error {
 	case <-done:
 		return nil
 	case <-ctx.Done():
+		if op == "stop" && errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			return classify("stop", driver.KindTransient, fmt.Errorf("%w: %w", driver.ErrDrainTimeout, ctx.Err()))
+		}
 		return classify(op, driver.KindTransient, ctx.Err())
 	}
 }
@@ -514,9 +595,16 @@ func (c *consumer) waitForwarders(ctx context.Context, op string) error {
 	}
 }
 
-func cancelConsumer(ctx context.Context, channel *amqp.Channel, tag string) error {
+func cancelConsumer(ctx context.Context, lane *lane) error {
 	result := make(chan error, 1)
-	go func() { result <- channel.Cancel(tag, false) }()
+	go func() {
+		lane.channelMu.Lock()
+		defer lane.channelMu.Unlock()
+		if hook := lane.owner.cancelHook; hook != nil {
+			hook()
+		}
+		result <- lane.channel.Cancel(lane.tag, false)
+	}()
 	select {
 	case err := <-result:
 		return err
@@ -532,13 +620,20 @@ func (c *consumer) Stop(ctx context.Context) error {
 		}
 		return classify("stop", driver.KindTransient, err)
 	}
-	if err := c.Drain(ctx); err != nil {
-		return err
+	drainErr := c.Drain(ctx)
+	if drainErr != nil {
+		if errors.Is(drainErr, context.DeadlineExceeded) && !errors.Is(drainErr, driver.ErrDrainTimeout) {
+			return classify("stop", driver.KindTransient, fmt.Errorf("%w: %w", driver.ErrDrainTimeout, drainErr))
+		}
+		return drainErr
 	}
-	if err := c.waitReaders(ctx, "stop"); err != nil {
-		return err
+	wait := func() error {
+		if err := c.waitReaders(ctx, "stop"); err != nil {
+			return err
+		}
+		return c.waitForwarders(ctx, "stop")
 	}
-	if err := c.waitForwarders(ctx, "stop"); err != nil {
+	if err := c.stopAndWait(false, wait); err != nil {
 		return err
 	}
 	c.mu.Lock()
@@ -552,12 +647,8 @@ func (c *consumer) Stop(ctx context.Context) error {
 		return classify("stop", driver.KindFatal, fmt.Errorf("%w: %d outstanding messages", driver.ErrResourcesOutstanding, count))
 	}
 	c.stopped = true
-	close(c.stoppedC)
 	c.mu.Unlock()
-	for _, lane := range c.lanes {
-		_ = lane.channel.Close()
-	}
-	c.events.Wait()
+	c.closeLanes()
 	c.conn.removeConsumer(c)
 	close(c.messages)
 	close(c.errors)
@@ -575,18 +666,15 @@ func (c *consumer) Release(ctx context.Context) error {
 		return classify("release", driver.KindTransient, err)
 	}
 	c.stopped = true
-	c.stopForwarders()
-	close(c.stoppedC)
 	c.mu.Unlock()
 
 	// Closing the AMQP channels requeues their unacked deliveries. Do this
 	// before waiting for local goroutines so a blocked forwarder can observe
 	// forwarderStopC and stoppedC rather than waiting for the application to
 	// consume an abandoned message.
-	c.closeLanes()
-	c.readers.Wait()
-	c.forward.Wait()
-	c.events.Wait()
+	if err := c.stopAndWait(true, nil); err != nil {
+		return err
+	}
 	c.conn.removeConsumer(c)
 	close(c.messages)
 	close(c.errors)
