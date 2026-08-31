@@ -159,9 +159,23 @@ func (r *Runner) Run(ctx context.Context) error {
 		}
 
 		deliveries := make(chan delivery, r.subscription.Concurrency)
-		group.Go(func() error { return fetchRunner(r, runCtx, deliveries) })
-		group.Go(func() error { return runDispatchPipeline(r, runCtx, deliveries) })
-		group.Go(func() error { return consumeRunnerErrors(r, runCtx) })
+		runPipeline := func(run func() error) error {
+			if err := run(); err != nil {
+				cancel()
+				return err
+			}
+			return nil
+		}
+		group.Go(func() error {
+			return runPipeline(func() error { return fetchRunner(r, runCtx, deliveries) })
+		})
+		group.Go(func() error {
+			return runPipeline(func() error { return runDispatchPipeline(r, runCtx, deliveries) })
+		})
+		group.Go(func() error {
+			return runPipeline(func() error { return consumeRunnerErrors(r, runCtx) })
+		})
+
 		generationErr := group.Wait()
 		if generationErr == nil {
 			generationErr = runnerError(r)
@@ -293,15 +307,19 @@ func runDispatchPipeline(r *Runner, ctx context.Context, deliveries <-chan deliv
 	}()
 
 	var pending *delivery
+	pendingLane := ""
 	open := true
 	for open || pending != nil || schedulerHasItems(scheduler) {
 		if pending != nil {
-			laneID := deliveryLane(r, pending.message)
-			err := scheduler.Enqueue(laneID, sched.Item{Value: *pending, EnqueuedAt: r.client.options.clock.Now()})
-			if err == nil {
-				pending = nil
-			} else if !errors.Is(err, sched.ErrLaneFull) {
+			laneID, queued, err := enqueuePendingDelivery(r, scheduler, pending, pendingLane)
+			if err != nil {
 				return err
+			}
+			if queued {
+				pending = nil
+				pendingLane = ""
+			} else {
+				pendingLane = laneID
 			}
 		}
 		if item, ok := scheduler.Next(); ok {
@@ -329,8 +347,38 @@ func runDispatchPipeline(r *Runner, ctx context.Context, deliveries <-chan deliv
 			continue
 		}
 		pending = &item
+		pendingLane = ""
 	}
 	return nil
+}
+
+func enqueuePendingDelivery(r *Runner, scheduler *sched.Scheduler, pending *delivery, pendingLane string) (string, bool, error) {
+	laneID := pendingLane
+	if laneID == "" {
+		laneID = deliveryLane(r, pending.message)
+	}
+	item := sched.Item{Value: *pending, EnqueuedAt: r.client.options.clock.Now()}
+	err := scheduler.Enqueue(laneID, item)
+	if err == nil {
+		return "", true, nil
+	}
+	if errors.Is(err, sched.ErrLaneFull) {
+		return laneID, false, nil
+	}
+
+	fallbackLane := fallbackDeliveryLane(r)
+	lastResortRunnerLogger(r).Warn("f1 unknown delivery lane; routing to fallback lane",
+		"subscription", r.subscription.Name,
+		"lane", laneID,
+	)
+	err = scheduler.Enqueue(fallbackLane, item)
+	if err == nil {
+		return "", true, nil
+	}
+	if errors.Is(err, sched.ErrLaneFull) {
+		return fallbackLane, false, nil
+	}
+	return fallbackLane, false, err
 }
 
 func schedulerHasItems(scheduler *sched.Scheduler) bool {
@@ -440,6 +488,13 @@ func deliveryLane(r *Runner, message driver.InboundMessage) string {
 		}
 		return schedulerLaneID(topic, envelope.Priority, tier)
 	}
+	if len(r.subscription.Topics) > 0 && len(r.subscription.Priorities) > 0 {
+		return fallbackDeliveryLane(r)
+	}
+	return ""
+}
+
+func fallbackDeliveryLane(r *Runner) string {
 	if len(r.subscription.Topics) > 0 && len(r.subscription.Priorities) > 0 {
 		return schedulerLaneID(topicFor(r.subscription.Topics[0]), r.subscription.Priorities[0], 0)
 	}

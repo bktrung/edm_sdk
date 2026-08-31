@@ -55,7 +55,7 @@ func (m *Machine) Drain(ctx context.Context, cfg Config, hooks Hooks) error {
 	}
 	if m.State() != Failed && hooks.Drain != nil {
 		if err := runWithTimeout(ctx, cfg.DrainTimeout, hooks.Drain, phaseClock); err != nil {
-			return m.abort(err)
+			return m.abortWithClose(ctx, cfg.CloseTimeout, hooks.Close, phaseClock, err)
 		}
 	}
 	if m.State() != Failed {
@@ -65,7 +65,7 @@ func (m *Machine) Drain(ctx context.Context, cfg Config, hooks Hooks) error {
 	}
 	if hooks.WaitSettled != nil {
 		if err := runWithTimeout(ctx, cfg.DrainTimeout, hooks.WaitSettled, phaseClock); err != nil {
-			return m.abort(err)
+			return m.abortWithClose(ctx, cfg.CloseTimeout, hooks.Close, phaseClock, err)
 		}
 	}
 	if m.State() != Failed {
@@ -75,7 +75,7 @@ func (m *Machine) Drain(ctx context.Context, cfg Config, hooks Hooks) error {
 	}
 	if hooks.Flush != nil {
 		if err := runWithTimeout(ctx, cfg.FlushTimeout, hooks.Flush, phaseClock); err != nil {
-			return m.abort(err)
+			return m.abortWithClose(ctx, cfg.CloseTimeout, hooks.Close, phaseClock, err)
 		}
 	}
 	if hooks.Close != nil {
@@ -92,6 +92,13 @@ func (m *Machine) Drain(ctx context.Context, cfg Config, hooks Hooks) error {
 func (m *Machine) abort(err error) error {
 	transitionErr := m.Transition(Aborted)
 	return errors.Join(err, transitionErr)
+}
+
+func (m *Machine) abortWithClose(parent context.Context, closeTimeout time.Duration, closeHook func(context.Context) error, phaseClock clock.Clock, err error) error {
+	// Abort often follows parent cancellation, so teardown must outlive that cancellation.
+	// A zero CloseTimeout intentionally remains unbounded per Config's documented semantics.
+	closeErr := runWithTimeout(context.WithoutCancel(parent), closeTimeout, closeHook, phaseClock)
+	return m.abort(errors.Join(err, closeErr))
 }
 
 func runWithTimeout(parent context.Context, timeout time.Duration, fn func(context.Context) error, clk clock.Clock) error {
