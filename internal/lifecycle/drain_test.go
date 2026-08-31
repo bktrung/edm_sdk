@@ -80,6 +80,309 @@ func TestDrainBoundsCloseWithFakeClock(t *testing.T) {
 	}
 }
 
+func TestSettlementTimeoutStillRunsClose(t *testing.T) {
+	fake := clock.NewFake(time.Unix(0, 0))
+	machine := New()
+	if err := machine.Transition(Ready); err != nil {
+		t.Fatal(err)
+	}
+	settleStarted := make(chan struct{})
+	closeRan := make(chan struct{})
+	done := make(chan error, 1)
+	go func() {
+		done <- machine.Drain(context.Background(), Config{
+			Clock:        fake,
+			DrainTimeout: 7 * time.Second,
+		}, Hooks{
+			WaitSettled: func(ctx context.Context) error {
+				close(settleStarted)
+				<-ctx.Done()
+				return ctx.Err()
+			},
+			Close: func(context.Context) error {
+				close(closeRan)
+				return nil
+			},
+		})
+	}()
+	<-settleStarted
+	fake.BlockUntil(1)
+	fake.Advance(7 * time.Second)
+	if err := <-done; !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Drain() error = %v, want deadline exceeded", err)
+	}
+	if got := machine.State(); got != Aborted {
+		t.Fatalf("state after settlement deadline = %s, want aborted", got)
+	}
+	select {
+	case <-closeRan:
+	default:
+		t.Fatal("close hook did not run after settlement timeout")
+	}
+}
+
+func TestFlushTimeoutStillRunsClose(t *testing.T) {
+	fake := clock.NewFake(time.Unix(0, 0))
+	machine := New()
+	if err := machine.Transition(Ready); err != nil {
+		t.Fatal(err)
+	}
+	flushStarted := make(chan struct{})
+	closeRan := make(chan struct{})
+	done := make(chan error, 1)
+	go func() {
+		done <- machine.Drain(context.Background(), Config{
+			Clock:        fake,
+			FlushTimeout: 7 * time.Second,
+		}, Hooks{
+			Flush: func(ctx context.Context) error {
+				close(flushStarted)
+				<-ctx.Done()
+				return ctx.Err()
+			},
+			Close: func(context.Context) error {
+				close(closeRan)
+				return nil
+			},
+		})
+	}()
+	<-flushStarted
+	fake.BlockUntil(1)
+	fake.Advance(7 * time.Second)
+	if err := <-done; !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Drain() error = %v, want deadline exceeded", err)
+	}
+	if got := machine.State(); got != Aborted {
+		t.Fatalf("state after flush deadline = %s, want aborted", got)
+	}
+	select {
+	case <-closeRan:
+	default:
+		t.Fatal("close hook did not run after flush timeout")
+	}
+}
+
+func TestDrainHookAbortStillRunsClose(t *testing.T) {
+	fake := clock.NewFake(time.Unix(0, 0))
+	machine := New()
+	if err := machine.Transition(Ready); err != nil {
+		t.Fatal(err)
+	}
+	drainStarted := make(chan struct{})
+	closeRan := make(chan struct{})
+	done := make(chan error, 1)
+	go func() {
+		done <- machine.Drain(context.Background(), Config{
+			Clock:        fake,
+			DrainTimeout: 7 * time.Second,
+		}, Hooks{
+			Drain: func(ctx context.Context) error {
+				close(drainStarted)
+				<-ctx.Done()
+				return ctx.Err()
+			},
+			Close: func(context.Context) error {
+				close(closeRan)
+				return nil
+			},
+		})
+	}()
+	<-drainStarted
+	fake.BlockUntil(1)
+	fake.Advance(7 * time.Second)
+	if err := <-done; !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Drain() error = %v, want deadline exceeded", err)
+	}
+	if got := machine.State(); got != Aborted {
+		t.Fatalf("state after drain deadline = %s, want aborted", got)
+	}
+	select {
+	case <-closeRan:
+	default:
+		t.Fatal("close hook did not run after drain timeout")
+	}
+}
+
+func TestAbortPathCloseGetsALiveContext(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	machine := New()
+	if err := machine.Transition(Ready); err != nil {
+		t.Fatal(err)
+	}
+	var closeContextErr error
+	err := machine.Drain(ctx, Config{}, Hooks{
+		Drain: func(ctx context.Context) error {
+			return ctx.Err()
+		},
+		Close: func(ctx context.Context) error {
+			closeContextErr = ctx.Err()
+			return nil
+		},
+	})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("Drain() error = %v, want context canceled", err)
+	}
+	if closeContextErr != nil {
+		t.Fatalf("close hook context error = %v, want nil", closeContextErr)
+	}
+	if got := machine.State(); got != Aborted {
+		t.Fatalf("state after cancelled drain = %s, want aborted", got)
+	}
+}
+
+func TestAbortPathCloseIsBoundedByCloseTimeout(t *testing.T) {
+	fake := clock.NewFake(time.Unix(0, 0))
+	parent, cancel := context.WithCancel(context.Background())
+	cancel()
+	machine := New()
+	if err := machine.Transition(Ready); err != nil {
+		t.Fatal(err)
+	}
+	realClock := clock.NewReal()
+	closeStarted := make(chan struct{})
+	releaseClose := make(chan struct{})
+	release := func() {
+		select {
+		case <-releaseClose:
+		default:
+			close(releaseClose)
+		}
+	}
+	t.Cleanup(release)
+	done := make(chan error, 1)
+	go func() {
+		done <- machine.Drain(parent, Config{
+			Clock:        fake,
+			CloseTimeout: 7 * time.Second,
+		}, Hooks{
+			Drain: func(ctx context.Context) error {
+				return ctx.Err()
+			},
+			Close: func(ctx context.Context) error {
+				close(closeStarted)
+				select {
+				case <-ctx.Done():
+					return ctx.Err()
+				case <-releaseClose:
+					return nil
+				}
+			},
+		})
+	}()
+	waitForClose := realClock.Timer(time.Second)
+	defer waitForClose.Stop()
+	select {
+	case <-closeStarted:
+	case <-waitForClose.C:
+		release()
+		waitForDone := realClock.Timer(time.Second)
+		defer waitForDone.Stop()
+		select {
+		case <-done:
+		case <-waitForDone.C:
+		}
+		t.Fatal("close hook did not start")
+	}
+	timerReady := make(chan struct{})
+	go func() {
+		fake.BlockUntil(1)
+		close(timerReady)
+	}()
+	waitForTimer := realClock.Timer(time.Second)
+	defer waitForTimer.Stop()
+	select {
+	case <-timerReady:
+		fake.Advance(7 * time.Second)
+	case <-waitForTimer.C:
+		wake := fake.Timer(0)
+		<-timerReady
+		wake.Stop()
+		release()
+		waitForDoneAfterMissingTimer := realClock.Timer(time.Second)
+		defer waitForDoneAfterMissingTimer.Stop()
+		select {
+		case <-done:
+		case <-waitForDoneAfterMissingTimer.C:
+		}
+		t.Fatal("CloseTimeout timer was not registered")
+	}
+	waitForDrain := realClock.Timer(time.Second)
+	defer waitForDrain.Stop()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("Drain() error = %v, want context canceled", err)
+		}
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("Drain() error = %v, want close deadline exceeded", err)
+		}
+	case <-waitForDrain.C:
+		release()
+		waitForDoneAfterTimeout := realClock.Timer(time.Second)
+		defer waitForDoneAfterTimeout.Stop()
+		select {
+		case <-done:
+		case <-waitForDoneAfterTimeout.C:
+		}
+		t.Fatal("Drain() did not return after CloseTimeout")
+	}
+	if got := machine.State(); got != Aborted {
+		t.Fatalf("state after abort close timeout = %s, want aborted", got)
+	}
+}
+
+func TestSuccessPathCloseHonoursTheCallerContext(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	machine := New()
+	if err := machine.Transition(Ready); err != nil {
+		t.Fatal(err)
+	}
+	var closeContextErr error
+	err := machine.Drain(ctx, Config{}, Hooks{
+		Close: func(ctx context.Context) error {
+			closeContextErr = ctx.Err()
+			return nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("Drain() error = %v, want nil", err)
+	}
+	if closeContextErr != context.Canceled {
+		t.Fatalf("close hook context error = %v, want context canceled", closeContextErr)
+	}
+	if got := machine.State(); got != Closed {
+		t.Fatalf("state after successful drain = %s, want closed", got)
+	}
+}
+
+func TestAbortPathCloseErrorReachesTheCaller(t *testing.T) {
+	phaseErr := errors.New("drain failed")
+	closeErr := errors.New("close failed")
+	machine := New()
+	if err := machine.Transition(Ready); err != nil {
+		t.Fatal(err)
+	}
+	err := machine.Drain(context.Background(), Config{}, Hooks{
+		Drain: func(context.Context) error {
+			return phaseErr
+		},
+		Close: func(context.Context) error {
+			return closeErr
+		},
+	})
+	if !errors.Is(err, phaseErr) {
+		t.Fatalf("Drain() error = %v, want phase error %v", err, phaseErr)
+	}
+	if !errors.Is(err, closeErr) {
+		t.Fatalf("Drain() error = %v, want close error %v", err, closeErr)
+	}
+	if got := machine.State(); got != Aborted {
+		t.Fatalf("state after aborted drain = %s, want aborted", got)
+	}
+}
+
 func TestDrainAbortsOnDeadline(t *testing.T) {
 	machine := New()
 	if err := machine.Transition(Ready); err != nil {
