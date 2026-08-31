@@ -2,8 +2,10 @@ package f1
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"math"
+	"net/url"
 	"os"
 	"strings"
 	"time"
@@ -310,6 +312,17 @@ func validateConfig(cfg Config) error {
 	}
 	if cfg.Env == "prod" && cfg.Broker.SASL.Mechanism != "" && !cfg.Broker.TLS.Enabled {
 		return fmt.Errorf("f1: broker.sasl.mechanism requires broker.tls.enabled in prod")
+	}
+	if cfg.Broker.Driver == "rabbitmq" && cfg.Broker.TLS.Enabled {
+		for _, endpoint := range cfg.Broker.Endpoints {
+			parsed, err := url.Parse(endpoint)
+			if err != nil {
+				return errors.New("f1: broker.tls.enabled requires a valid amqps:// endpoint")
+			}
+			if parsed.Scheme != "amqps" {
+				return fmt.Errorf("f1: broker.tls.enabled requires an amqps:// endpoint; got %q", parsed.Scheme)
+			}
+		}
 	}
 
 	if cfg.Env == "prod" && cfg.Broker.TLS.InsecureSkipVerify {

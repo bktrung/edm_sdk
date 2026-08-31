@@ -107,6 +107,9 @@ func (Driver) Open(ctx context.Context, cfg driver.Config) (driver.Conn, error) 
 			if err := openCtx.Err(); err != nil {
 				return nil, classify("open", driver.KindTransient, err)
 			}
+			if err := validateEndpoint(endpoint); err != nil {
+				return nil, classify("open", driver.KindFatal, err)
+			}
 			conn, err := dial(openCtx, endpoint, cfg)
 			if err == nil {
 				managedConn, connErr := newConn(conn, capabilitiesForQueueKind(queueKind), endpoint, cfg, queueKind)
@@ -410,6 +413,17 @@ func dial(ctx context.Context, endpoint string, cfg driver.Config) (*amqp.Connec
 		}()
 		return nil, ctx.Err()
 	}
+}
+
+func validateEndpoint(endpoint string) error {
+	parsed, err := url.Parse(endpoint)
+	if err != nil {
+		return errors.New("rabbitmq: invalid endpoint")
+	}
+	if parsed.Scheme != "amqps" && !isLoopbackEndpoint(endpoint) {
+		return errors.New("rabbitmq: plaintext connection to non-loopback host requires an amqps:// endpoint")
+	}
+	return nil
 }
 
 func makeAMQPConfig(cfg driver.Config) (amqp.Config, error) {

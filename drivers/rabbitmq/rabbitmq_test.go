@@ -3,6 +3,8 @@ package rabbitmq
 import (
 	"context"
 	"errors"
+	"fmt"
+	"net"
 	"strings"
 	"testing"
 	"time"
@@ -149,6 +151,87 @@ func TestOpenRejectsEmptyEndpoints(t *testing.T) {
 	}
 	if kind, ok := driver.Classify(err); !ok || kind != driver.KindFatal {
 		t.Fatalf("Classify(Open error) = %v, %t, want fatal, true", kind, ok)
+	}
+}
+
+func TestOpenRefusesPlaintextRemoteBeforeDialing(t *testing.T) {
+	listener, accepted := listenerForOpenAttempt(t)
+	endpoint := fmt.Sprintf("amqp://0.0.0.0:%d/", listener.Addr().(*net.TCPAddr).Port)
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	_, err := (Driver{}).Open(ctx, driver.Config{Endpoints: []string{endpoint}, ConnectTimeout: time.Second})
+	if err == nil {
+		t.Fatal("Open() error = nil, want plaintext endpoint refusal")
+	}
+	if receivedOpenAttempt(accepted) {
+		t.Fatal("Open() attempted a connection before refusing the plaintext remote endpoint")
+	}
+	if !strings.Contains(err.Error(), "amqps://") {
+		t.Fatalf("Open() error = %v, want plaintext endpoint refusal", err)
+	}
+}
+
+func TestOpenAllowsPlaintextLoopback(t *testing.T) {
+	requireBroker(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	conn, err := (Driver{}).Open(ctx, driver.Config{Endpoints: []string{defaultEndpoint}})
+	if err != nil {
+		t.Fatalf("Open() error = %v, want loopback plaintext connection", err)
+	}
+	defer func() { _ = conn.Close(ctx) }()
+}
+
+func TestOpenAllowsAmqpsEndpoint(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		tls  *driver.TLSConfig
+	}{
+		{name: "without TLS block"},
+		{name: "with TLS block", tls: &driver.TLSConfig{Enabled: true}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			listener, accepted := listenerForOpenAttempt(t)
+			endpoint := fmt.Sprintf("amqps://0.0.0.0:%d/", listener.Addr().(*net.TCPAddr).Port)
+			ctx, cancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
+			defer cancel()
+
+			_, _ = (Driver{}).Open(ctx, driver.Config{Endpoints: []string{endpoint}, TLS: test.tls})
+			if !receivedOpenAttempt(accepted) {
+				t.Fatal("Open() refused the amqps endpoint before dialing")
+			}
+		})
+	}
+}
+
+func listenerForOpenAttempt(t *testing.T) (net.Listener, <-chan struct{}) {
+	t.Helper()
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("net.Listen() error = %v", err)
+	}
+	t.Cleanup(func() { _ = listener.Close() })
+
+	accepted := make(chan struct{}, 1)
+	go func() {
+		conn, err := listener.Accept()
+		if err != nil {
+			return
+		}
+		accepted <- struct{}{}
+		_ = conn.Close()
+	}()
+	return listener, accepted
+}
+
+func receivedOpenAttempt(accepted <-chan struct{}) bool {
+	select {
+	case <-accepted:
+		return true
+	case <-time.After(100 * time.Millisecond): //nolint:forbidigo // bounded socket acceptance observation
+		return false
 	}
 }
 
