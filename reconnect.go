@@ -33,6 +33,10 @@ func (c *Client) reconnectSupervisor() {
 			err := c.reconnectOnce(c.supervisorCtx, request.cause)
 			c.finishReconnect(attempt, err)
 		case <-c.supervisorCtx.Done():
+			err := c.supervisorCtx.Err()
+			c.mu.Lock()
+			c.finishReconnectLocked(c.reconnect, err)
+			c.mu.Unlock()
 			return
 		}
 	}
@@ -74,7 +78,11 @@ func (c *Client) requestReconnect(cause error) (*reconnectAttempt, error) {
 func (c *Client) finishReconnect(attempt *reconnectAttempt, err error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.reconnect != attempt {
+	c.finishReconnectLocked(attempt, err)
+}
+
+func (c *Client) finishReconnectLocked(attempt *reconnectAttempt, err error) {
+	if attempt == nil || c.reconnect != attempt {
 		return
 	}
 	attempt.err = err

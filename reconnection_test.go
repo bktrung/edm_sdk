@@ -294,6 +294,178 @@ func newReconnectTestClientWithLogger(t *testing.T, d *reconnectTestDriver, c cl
 	return client
 }
 
+func newReconnectSupervisorTestClient() (*Client, context.CancelFunc) {
+	supervisorCtx, supervisorCancel := context.WithCancel(context.Background())
+	return &Client{
+		reconnectRequests: make(chan reconnectRequest, 1),
+		supervisorCtx:     supervisorCtx,
+		supervisorCancel:  supervisorCancel,
+		supervisorDone:    make(chan struct{}),
+	}, supervisorCancel
+}
+
+func registerReconnectAttempt(client *Client) *reconnectAttempt {
+	attempt := &reconnectAttempt{done: make(chan struct{})}
+	client.mu.Lock()
+	client.reconnecting = true
+	client.reconnect = attempt
+	client.mu.Unlock()
+	return attempt
+}
+
+func TestSupervisorExitReleasesAnInFlightAttempt(t *testing.T) {
+	client, cancel := newReconnectSupervisorTestClient()
+	attempt := registerReconnectAttempt(client)
+	cancel()
+	go client.reconnectSupervisor()
+
+	waitCtx, waitCancel := context.WithTimeout(context.Background(), time.Second)
+	defer waitCancel()
+	if err := client.waitReconnect(waitCtx, attempt); !errors.Is(err, context.Canceled) {
+		t.Fatalf("waitReconnect() after supervisor exit = %v, want context canceled", err)
+	}
+	select {
+	case <-client.supervisorDone:
+	case <-waitCtx.Done():
+		t.Fatalf("reconnect supervisor did not exit: %v", waitCtx.Err())
+	}
+	client.mu.Lock()
+	defer client.mu.Unlock()
+	if client.reconnect != nil {
+		t.Fatal("reconnect attempt remains registered after supervisor exit")
+	}
+	if client.reconnecting {
+		t.Fatal("client remains reconnecting after supervisor exit")
+	}
+}
+
+func TestDrainCompletesWhenTheSupervisorExitsMidReconnect(t *testing.T) {
+	client, cancel := newReconnectSupervisorTestClient()
+	attempt := registerReconnectAttempt(client)
+	runner := &Runner{
+		client:    client,
+		started:   true,
+		done:      make(chan struct{}),
+		lifecycle: lifecycle.New(),
+	}
+	waitCtx, waitCancel := context.WithCancel(context.Background())
+	defer waitCancel()
+	go func() {
+		_ = client.waitReconnect(waitCtx, attempt)
+		close(runner.done)
+	}()
+
+	cancel()
+	go client.reconnectSupervisor()
+	drainCtx, drainCancel := context.WithTimeout(context.Background(), time.Second)
+	defer drainCancel()
+	if err := runner.Drain(drainCtx); err != nil {
+		t.Fatalf("Drain() after supervisor exit = %v, want nil", err)
+	}
+}
+
+func TestRequestReconnectIsRefusedWhileShuttingDown(t *testing.T) {
+	client, runner, fake, _ := newBudgetTestClient(t)
+	client.config.Lifecycle.ConsumerDrainTimeout = 5 * time.Second
+	client.mu.Lock()
+	client.runners[runner] = struct{}{}
+	client.mu.Unlock()
+
+	closed := make(chan error, 1)
+	go func() { closed <- client.Close(context.Background()) }()
+	waitForFakeTimer(t, fake)
+	fake.Advance(5 * time.Second)
+	watchdog := clock.NewReal().Timer(2 * time.Second)
+	defer watchdog.Stop()
+	select {
+	case err := <-closed:
+		if err == nil || !strings.Contains(err.Error(), "consumer drain") {
+			t.Fatalf("Close() error = %v, want the consumer drain phase deadline", err)
+		}
+	case <-watchdog.C:
+		t.Fatal("Close did not return after the consumer drain budget expired")
+	}
+	client.mu.Lock()
+	shutdownStarted, closedState := client.shutdownStarted, client.closed
+	client.mu.Unlock()
+	if !shutdownStarted || closedState {
+		t.Fatalf("shutdown state = shutdownStarted:%t closed:%t, want started and open", shutdownStarted, closedState)
+	}
+
+	attempt, err := client.requestReconnect(errors.New("during shutdown"))
+	if attempt != nil {
+		t.Fatal("request while shutting down returned a reconnect attempt")
+	}
+	if err == nil || !strings.Contains(err.Error(), "client is closing") {
+		t.Fatalf("request while shutting down = %v, want client-closing error", err)
+	}
+	client.mu.Lock()
+	defer client.mu.Unlock()
+	if client.reconnect != nil {
+		t.Fatal("request while shutting down registered a reconnect attempt")
+	}
+	if client.reconnecting {
+		t.Fatal("client remains reconnecting after rejected shutdown request")
+	}
+}
+
+func TestRequestReconnectCancellationStillFinishesItsAttempt(t *testing.T) {
+	supervisorCtx, supervisorCancel := context.WithCancel(context.Background())
+	defer supervisorCancel()
+	client := &Client{supervisorCtx: supervisorCtx}
+	requestResult := make(chan struct {
+		attempt *reconnectAttempt
+		err     error
+	}, 1)
+	go func() {
+		attempt, err := client.requestReconnect(errors.New("canceled request"))
+		requestResult <- struct {
+			attempt *reconnectAttempt
+			err     error
+		}{attempt: attempt, err: err}
+	}()
+
+	var attempt *reconnectAttempt
+	realClock := clock.NewReal()
+	poll := realClock.Ticker(time.Millisecond)
+	defer poll.Stop()
+	deadline := realClock.Timer(time.Second)
+	defer deadline.Stop()
+	for attempt == nil {
+		client.mu.Lock()
+		attempt = client.reconnect
+		client.mu.Unlock()
+		if attempt != nil {
+			break
+		}
+		select {
+		case <-deadline.C:
+			t.Fatal("requestReconnect() did not register an attempt")
+		case <-poll.C:
+		}
+	}
+
+	supervisorCancel()
+	resultTimer := realClock.Timer(time.Second)
+	defer resultTimer.Stop()
+	select {
+	case result := <-requestResult:
+		if result.attempt != nil {
+			t.Fatalf("canceled request returned attempt %p, want nil", result.attempt)
+		}
+		if !errors.Is(result.err, context.Canceled) {
+			t.Fatalf("canceled request = %v, want context canceled", result.err)
+		}
+	case <-resultTimer.C:
+		t.Fatal("canceled request did not return")
+	}
+	waitCtx, waitCancel := context.WithTimeout(context.Background(), time.Second)
+	defer waitCancel()
+	if err := client.waitReconnect(waitCtx, attempt); !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled request attempt = %v, want context canceled", err)
+	}
+}
+
 func TestReconnectStartUsesConfiguredLogger(t *testing.T) {
 	defaultOutput := captureProcessDefault(t)
 	var configuredOutput bytes.Buffer
