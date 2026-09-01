@@ -1,7 +1,6 @@
 package f1
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"log/slog"
@@ -256,7 +255,7 @@ func TestCloseFailureDoesNotShadowSuccessfulPublish(t *testing.T) {
 	closeErr := errors.New("producer close failed")
 	producer := &recordingProducer{closeErr: closeErr}
 	conn := &publishConn{producer: producer, info: driver.BrokerInfo{Kind: "test", Version: "1"}}
-	var logs bytes.Buffer
+	var logs logSink
 	client, err := New(context.Background(), testClientConfig(t),
 		WithDriver(&publishDriver{conn: conn}),
 		WithLogger(slog.New(slog.NewTextHandler(&logs, nil))),
@@ -361,7 +360,7 @@ func TestPublishDefaultKeyIsNotStampedAsPartitionKey(t *testing.T) {
 
 func TestPublishBatchReportsPartialFailuresAndWarnsPerMessage(t *testing.T) {
 	t.Parallel()
-	var logs bytes.Buffer
+	var logs logSink
 	producer := &recordingProducer{publishErr: &driver.PublishError{Failed: map[int]error{
 		0: errors.New("untranslated one"),
 		1: errors.New("untranslated two"),
@@ -384,7 +383,7 @@ func TestPublishBatchReportsPartialFailuresAndWarnsPerMessage(t *testing.T) {
 
 func TestNewLogsNonNativeCapabilities(t *testing.T) {
 	t.Parallel()
-	var logs bytes.Buffer
+	var logs logSink
 	producer := &recordingProducer{}
 	client := newPublishClient(t, producer, WithLogger(slog.New(slog.NewTextHandler(&logs, nil))))
 	if client == nil {

@@ -1,7 +1,6 @@
 package f1
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"log/slog"
@@ -235,7 +234,7 @@ func (a *topologyRecordingAdmin) EnsureTopology(_ context.Context, spec driver.T
 }
 
 func TestPublisherTopologyArgumentDriftWarns(t *testing.T) {
-	var logs bytes.Buffer
+	var logs logSink
 	admin := &topologyRecordingAdmin{
 		diff: driver.TopologyDiff{Drifted: []driver.ArgumentDrift{{
 			Name:     "f1.test.orders.created.normal",
@@ -266,7 +265,7 @@ func TestPublisherTopologyArgumentDriftWarns(t *testing.T) {
 }
 
 func TestSubscriberTopologyArgumentDriftWarns(t *testing.T) {
-	var logs bytes.Buffer
+	var logs logSink
 	admin := &topologyRecordingAdmin{
 		diff: driver.TopologyDiff{Drifted: []driver.ArgumentDrift{{
 			Name:     "f1.test.orders.created.normal",

@@ -1,7 +1,6 @@
 package f1
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"log/slog"
@@ -225,7 +224,7 @@ func TestNonCooperativeHandlerIsReportedAsStuck(t *testing.T) {
 
 func TestInvokeHandlerReportsSequentialStuckThresholds(t *testing.T) {
 	fake := clock.NewFake(time.Unix(0, 0))
-	var output bytes.Buffer
+	var output logSink
 	client, err := New(context.Background(), testClientConfig(t),
 		WithDriver(&dispatchDriver{conn: &dispatchConn{producer: &dispatchProducer{}}}),
 		WithClock(fake),

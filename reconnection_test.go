@@ -1,7 +1,6 @@
 package f1
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"io"
@@ -468,7 +467,7 @@ func TestRequestReconnectCancellationStillFinishesItsAttempt(t *testing.T) {
 
 func TestReconnectStartUsesConfiguredLogger(t *testing.T) {
 	defaultOutput := captureProcessDefault(t)
-	var configuredOutput bytes.Buffer
+	var configuredOutput logSink
 	fake := clock.NewFake(time.Unix(450, 0))
 	recorded := &recordingClock{Fake: fake}
 	d := &reconnectTestDriver{created: make(chan *reconnectTestConsumer, 1)}
@@ -514,7 +513,7 @@ func TestReconnectStartUsesProcessDefaultWithoutConfiguredLogger(t *testing.T) {
 
 func TestRunnerReconnectReportsGenerationCause(t *testing.T) {
 	defaultOutput := captureProcessDefault(t)
-	var configuredOutput bytes.Buffer
+	var configuredOutput logSink
 	fake := clock.NewFake(time.Unix(450, 0))
 	recorded := &recordingClock{Fake: fake}
 	d := &reconnectTestDriver{created: make(chan *reconnectTestConsumer, 8)}
@@ -568,7 +567,7 @@ func TestRunnerReconnectReportsGenerationCause(t *testing.T) {
 }
 
 func TestReconnectStartLoggedOnceForSharedAttempt(t *testing.T) {
-	var configuredOutput bytes.Buffer
+	var configuredOutput logSink
 	fake := clock.NewFake(time.Unix(450, 0))
 	recorded := &recordingClock{Fake: fake}
 	d := &reconnectTestDriver{created: make(chan *reconnectTestConsumer, 1)}

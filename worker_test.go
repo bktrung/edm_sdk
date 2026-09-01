@@ -1,7 +1,6 @@
 package f1
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"log/slog"
@@ -97,7 +96,7 @@ func TestPipelineErrorCancelsTheGeneration(t *testing.T) {
 }
 
 func TestUnknownLaneRoutesToTheFallbackLane(t *testing.T) {
-	var output bytes.Buffer
+	var output logSink
 	client, runner := newRetryBridgeRunner(t, &dispatchProducer{}, "orders.created",
 		WithLogger(slog.New(slog.NewTextHandler(&output, nil))))
 	defer func() { _ = client.Close(context.Background()) }()
