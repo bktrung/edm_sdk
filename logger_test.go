@@ -4,21 +4,89 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"io"
 	"log/slog"
+	"runtime"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/driver"
 )
 
-func captureProcessDefault(t *testing.T) *bytes.Buffer {
+type logSink struct {
+	mu     sync.Mutex
+	buffer bytes.Buffer
+}
+
+var _ io.Writer = (*logSink)(nil)
+
+func (s *logSink) Write(p []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.buffer.Write(p)
+}
+
+func (s *logSink) String() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.buffer.String()
+}
+
+func captureProcessDefault(t *testing.T) *logSink {
 	t.Helper()
 	previous := slog.Default()
-	var output bytes.Buffer
+	var output logSink
 	slog.SetDefault(slog.New(slog.NewTextHandler(&output, nil)))
 	t.Cleanup(func() { slog.SetDefault(previous) })
 	return &output
+}
+
+func TestLogSinkIsSafeForConcurrentUse(t *testing.T) {
+	var sink logSink
+	const (
+		writerCount     = 8
+		writesPerWriter = 2000
+	)
+
+	start := make(chan struct{})
+	writersDone := make(chan struct{})
+	readerDone := make(chan struct{})
+	var writers sync.WaitGroup
+	writers.Add(writerCount)
+	for range writerCount {
+		go func() {
+			defer writers.Done()
+			<-start
+			for range writesPerWriter {
+				_, _ = sink.Write([]byte("log\n"))
+				runtime.Gosched()
+			}
+		}()
+	}
+	go func() {
+		defer close(readerDone)
+		<-start
+		for {
+			select {
+			case <-writersDone:
+				return
+			default:
+				_ = sink.String()
+				runtime.Gosched()
+			}
+		}
+	}()
+	close(start)
+	go func() {
+		writers.Wait()
+		close(writersDone)
+	}()
+	<-readerDone
+	if got, want := strings.Count(sink.String(), "log\n"), writerCount*writesPerWriter; got != want {
+		t.Fatalf("sink line count = %d, want %d", got, want)
+	}
 }
 
 func newLoggerConsumerRunner(t *testing.T, logger *slog.Logger, handler func(context.Context, *Event, error)) (*Client, *Runner, *dispatchConsumer) {
@@ -63,7 +131,7 @@ func TestNoLoggerLeavesCapabilityInfoOffProcessDefault(t *testing.T) {
 
 func TestWithLoggerReceivesCapabilityOutputWithoutProcessDefault(t *testing.T) {
 	defaultOutput := captureProcessDefault(t)
-	var configuredOutput bytes.Buffer
+	var configuredOutput logSink
 	client, err := New(context.Background(), testClientConfig(t),
 		WithDriver(&testDriver{conn: &testConn{}}),
 		WithLogger(slog.New(slog.NewTextHandler(&configuredOutput, nil))),
@@ -92,7 +160,7 @@ func TestNoLoggerConsumerErrorUsesProcessDefault(t *testing.T) {
 
 func TestWithLoggerConsumerErrorUsesConfiguredLogger(t *testing.T) {
 	defaultOutput := captureProcessDefault(t)
-	var configuredOutput bytes.Buffer
+	var configuredOutput logSink
 	client, runner, consumer := newLoggerConsumerRunner(t, slog.New(slog.NewTextHandler(&configuredOutput, nil)), nil)
 	t.Cleanup(func() { _ = client.Close(context.Background()) })
 	triggerLoggerConsumerError(t, runner, consumer)
@@ -190,7 +258,7 @@ func TestRetiredCloseFailuresUseLastResortLogger(t *testing.T) {
 	for _, testCase := range cases {
 		t.Run(testCase.name, func(t *testing.T) {
 			defaultOutput := captureProcessDefault(t)
-			var configuredOutput bytes.Buffer
+			var configuredOutput logSink
 			options := []Option{WithDriver(&testDriver{conn: &testConn{}})}
 			if testCase.configuredLogger {
 				options = append(options, WithLogger(slog.New(slog.NewTextHandler(&configuredOutput, nil))))

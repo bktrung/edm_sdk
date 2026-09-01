@@ -1,7 +1,6 @@
 package f1
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"log/slog"
@@ -41,7 +40,7 @@ func TestNewRejectsNilConnection(t *testing.T) {
 }
 
 func TestLogCapabilitiesWarnsForConfiguredUnavailableFeature(t *testing.T) {
-	var logs bytes.Buffer
+	var logs logSink
 	cfg, err := LoadConfig(writeConfig(t, `
 f1:
   env: test
@@ -68,7 +67,7 @@ f1:
 }
 
 func TestLogCapabilitiesAnnouncesUnusedUnavailableFeatureAtInfo(t *testing.T) {
-	var logs bytes.Buffer
+	var logs logSink
 	client, err := New(context.Background(), testClientConfig(t),
 		WithDriver(&testDriver{conn: &testConn{info: driver.BrokerInfo{Kind: "test", Version: "1"}}}),
 		WithLogger(slog.New(slog.NewTextHandler(&logs, nil))),

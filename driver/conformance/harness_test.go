@@ -549,7 +549,12 @@ func (a runTestAdmin) Purge(_ context.Context, destination string) (int64, error
 func (a runTestAdmin) Prune(_ context.Context, names []string) ([]driver.PruneResult, error) {
 	results := make([]driver.PruneResult, 0, len(names))
 	for _, name := range names {
-		results = append(results, driver.PruneResult{Name: name})
+		if _, exists := a.conn.queues[name]; !exists {
+			results = append(results, driver.PruneResult{Name: name, Reason: "destination does not exist"})
+			continue
+		}
+		delete(a.conn.queues, name)
+		results = append(results, driver.PruneResult{Name: name, Deleted: true})
 	}
 	return results, nil
 }

@@ -1,7 +1,6 @@
 package f1
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -168,7 +167,7 @@ func TestDispatchPoisonNoRouteDoesNotRedeliver(t *testing.T) {
 }
 
 func TestDispatchPoisonNoRouteUsesLastResortLogger(t *testing.T) {
-	var logs bytes.Buffer
+	var logs logSink
 	producer := &missingRouteProducer{}
 	client, runner := noRoutePoisonRunner(t, producer, WithLogger(slog.New(slog.NewTextHandler(&logs, nil))))
 	defer func() { _ = client.Close(context.Background()) }()
@@ -186,7 +185,7 @@ func TestDispatchPoisonNoRouteUsesLastResortLogger(t *testing.T) {
 
 func TestDispatchDiscardedDeathDetailsUsesConfiguredLogger(t *testing.T) {
 	defaultOutput := captureProcessDefault(t)
-	var configuredOutput bytes.Buffer
+	var configuredOutput logSink
 	producer := &dispatchProducer{}
 	client, runner := newRetryBridgeRunner(t, producer, "orders.created",
 		WithLogger(slog.New(slog.NewTextHandler(&configuredOutput, nil))),
@@ -290,7 +289,7 @@ func TestDispatchDiscardedDeathDetailsUsesProcessDefaultWithoutLogger(t *testing
 }
 
 func TestDispatchCustomDeathDetailsValidatesKeys(t *testing.T) {
-	var configuredOutput bytes.Buffer
+	var configuredOutput logSink
 	producer := &dispatchProducer{}
 	client, runner := newRetryBridgeRunner(t, producer, "orders.created",
 		WithLogger(slog.New(slog.NewTextHandler(&configuredOutput, nil))),
@@ -334,7 +333,7 @@ func TestDispatchCustomDeathDetailsValidatesKeys(t *testing.T) {
 }
 
 func TestDispatchValidDeathDetailsDoNotWarn(t *testing.T) {
-	var configuredOutput bytes.Buffer
+	var configuredOutput logSink
 	producer := &dispatchProducer{}
 	client, runner := newRetryBridgeRunner(t, producer, "orders.created",
 		WithLogger(slog.New(slog.NewTextHandler(&configuredOutput, nil))),

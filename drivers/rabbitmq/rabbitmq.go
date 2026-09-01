@@ -150,7 +150,6 @@ type conn struct {
 	publishFault atomic.Int32 // 0 = unset; otherwise driver.Kind + 1
 	closeFault   atomic.Bool
 	deferred     map[string]time.Duration
-	ephemeral    map[string]*amqp.Channel
 }
 
 var _ driver.Conn = (*conn)(nil)
@@ -169,7 +168,6 @@ func newConn(amqpConn *amqp.Connection, caps driver.Capabilities, endpoint strin
 		active:     make(map[*consumer]struct{}),
 		producers:  make(map[*producer]struct{}),
 		deferred:   make(map[string]time.Duration),
-		ephemeral:  make(map[string]*amqp.Channel),
 	}, nil
 }
 
@@ -332,15 +330,7 @@ func (c *conn) Close(ctx context.Context) error {
 		injectedErr = errors.New("injected close failure")
 	}
 	amqpConn := c.amqp
-	ephemeral := make([]*amqp.Channel, 0, len(c.ephemeral))
-	for _, channel := range c.ephemeral {
-		ephemeral = append(ephemeral, channel)
-	}
-	c.ephemeral = nil
 	c.mu.Unlock()
-	for _, channel := range ephemeral {
-		_ = channel.Close()
-	}
 
 	var err error
 	if injectedErr != nil {

@@ -331,23 +331,14 @@ func (a *adminOperations) deleteQueue(ctx context.Context, name string, auxiliar
 	if err := ctx.Err(); err != nil {
 		return false, err
 	}
-	a.conn.mu.RLock()
-	channel := a.conn.ephemeral[name]
-	a.conn.mu.RUnlock()
-	owned := channel != nil
-	if !owned {
-		var err error
-		channel, err = a.conn.amqp.Channel()
-		if err != nil {
-			return false, err
-		}
+	channel, err := a.openChannel(ctx)
+	if err != nil {
+		return false, err
 	}
-	if !owned {
-		defer channel.Close()
-	}
+	defer channel.Close()
 
 	if a.conn.queueKind == queueKindQuorum {
-		ready, consumers, err := inspectQueueOnChannel(channel, name, owned)
+		ready, consumers, err := inspectQueueOnChannel(channel, name)
 		if err != nil {
 			if isNotFound(err) {
 				return false, nil
@@ -358,7 +349,6 @@ func (a *adminOperations) deleteQueue(ctx context.Context, name string, auxiliar
 			return false, &queuePruneGuardError{reason: reason}
 		}
 	}
-	var err error
 	if a.conn.queueKind == queueKindQuorum {
 		_, err = channel.QueueDelete(name, false, false, false)
 	} else {
@@ -369,21 +359,12 @@ func (a *adminOperations) deleteQueue(ctx context.Context, name string, auxiliar
 			return false, nil
 		}
 		if isPreconditionFailed(err) {
-			if owned {
-				a.conn.mu.Lock()
-				if a.conn.ephemeral[name] == channel {
-					delete(a.conn.ephemeral, name)
-				}
-				a.conn.mu.Unlock()
-				_ = channel.Close()
-			}
 			return false, errQueueNotPrunable
 		}
 		return false, err
 	}
 
 	a.conn.mu.Lock()
-	delete(a.conn.ephemeral, name)
 	delete(a.conn.deferred, name)
 	a.conn.mu.Unlock()
 	return true, nil
@@ -403,26 +384,16 @@ func (a *adminOperations) inspectQueueWithConsumers(ctx context.Context, name st
 	if err := ctx.Err(); err != nil {
 		return 0, 0, err
 	}
-	a.conn.mu.RLock()
-	channel := a.conn.ephemeral[name]
-	a.conn.mu.RUnlock()
-	owned := channel != nil
-	if !owned {
-		var err error
-		channel, err = a.conn.amqp.Channel()
-		if err != nil {
-			return 0, 0, err
-		}
+	channel, err := a.openChannel(ctx)
+	if err != nil {
+		return 0, 0, err
 	}
-	if !owned {
-		defer channel.Close()
-	}
-	return inspectQueueOnChannel(channel, name, owned)
+	defer channel.Close()
+	return inspectQueueOnChannel(channel, name)
 }
 
-func inspectQueueOnChannel(channel *amqp.Channel, name string, owned bool) (int64, int64, error) {
-	durable, exclusive := !owned, owned
-	queue, err := channel.QueueDeclarePassive(name, durable, false, exclusive, false, nil)
+func inspectQueueOnChannel(channel *amqp.Channel, name string) (int64, int64, error) {
+	queue, err := channel.QueueDeclarePassive(name, true, false, false, false, nil)
 	if err != nil {
 		return 0, 0, err
 	}
