@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -351,8 +352,8 @@ func TestPruneQuorumKeepsTheConnectionAlive(t *testing.T) {
 	}
 }
 
-func TestPruneSurvivesAPreconditionFailureOnAReusedChannel(t *testing.T) {
-	const destination = "rabbitmq-driver-prune-precondition-ephemeral"
+func TestPruneSurvivesAPreconditionFailure(t *testing.T) {
+	const destination = "rabbitmq-driver-prune-precondition-nondurable"
 	ctx, rabbitConn, facade := setupPruneTest(t, queueKindClassic, driver.DestinationSpec{Name: destination})
 	publisher, err := rabbitConn.amqp.Channel()
 	if err != nil {
@@ -382,12 +383,6 @@ func TestPruneSurvivesAPreconditionFailureOnAReusedChannel(t *testing.T) {
 	if len(firstResults) != 1 || firstResults[0].Deleted || !strings.Contains(firstResults[0].Reason, "no longer prunable") {
 		t.Fatalf("first Prune result = %+v, want a non-deleted destination with a precondition reason", firstResults)
 	}
-	rabbitConn.mu.RLock()
-	_, retained := rabbitConn.ephemeral[destination]
-	rabbitConn.mu.RUnlock()
-	if retained {
-		t.Fatal("ephemeral channel remained cached after a precondition failure")
-	}
 
 	secondResults, err := facade.Prune(ctx, []string{destination})
 	if err != nil {
@@ -395,6 +390,119 @@ func TestPruneSurvivesAPreconditionFailureOnAReusedChannel(t *testing.T) {
 	}
 	if len(secondResults) != 1 || secondResults[0].Deleted || !strings.Contains(secondResults[0].Reason, "holds 1 ready message(s)") {
 		t.Fatalf("second Prune result = %+v, want the existing message to remain observable", secondResults)
+	}
+}
+
+func TestConcurrentAdminOperationsDoNotCrossReplies(t *testing.T) {
+	const (
+		firstDestination       = "rabbitmq-driver-admin-concurrent-first"
+		secondDestination      = "rabbitmq-driver-admin-concurrent-second"
+		firstMessages          = int64(2)
+		secondMessages         = int64(5)
+		operationsPerIteration = 8
+		iterations             = 200
+	)
+	ctx, rabbitConn, facade := setupPruneTest(t, queueKindClassic,
+		driver.DestinationSpec{Name: firstDestination, Delay: time.Hour},
+		driver.DestinationSpec{Name: secondDestination, Delay: time.Hour},
+	)
+	publisher, err := rabbitConn.amqp.Channel()
+	if err != nil {
+		t.Fatalf("Channel: %v", err)
+	}
+	if err := publisher.Confirm(false); err != nil {
+		_ = publisher.Close()
+		t.Fatalf("Confirm: %v", err)
+	}
+	confirmations := publisher.NotifyPublish(make(chan amqp.Confirmation, 1))
+	t.Cleanup(func() { _ = publisher.Close() })
+	for i := range firstMessages {
+		if err := publishPruneMessage(ctx, publisher, confirmations, firstDestination); err != nil {
+			t.Fatalf("publish first message %d: %v", i, err)
+		}
+	}
+	for i := range secondMessages {
+		if err := publishPruneMessage(ctx, publisher, confirmations, secondDestination); err != nil {
+			t.Fatalf("publish second message %d: %v", i, err)
+		}
+	}
+
+	type describeResult struct {
+		state driver.TopologyState
+		err   error
+	}
+	names := []string{firstDestination, secondDestination}
+	reverseNames := []string{secondDestination, firstDestination}
+	for iteration := range iterations {
+		start := make(chan struct{})
+		ready := make(chan struct{}, operationsPerIteration)
+		results := make(chan describeResult, operationsPerIteration)
+		var operations sync.WaitGroup
+		operations.Add(operationsPerIteration)
+		for operation := range operationsPerIteration {
+			targets := names
+			if operation%2 == 1 {
+				targets = reverseNames
+			}
+			go func(targets []string) {
+				defer operations.Done()
+				ready <- struct{}{}
+				<-start
+				state, err := facade.DescribeTopology(ctx, targets)
+				results <- describeResult{state: state, err: err}
+			}(targets)
+		}
+		for range operationsPerIteration {
+			<-ready
+		}
+		close(start)
+		operations.Wait()
+		close(results)
+
+		for result := range results {
+			if result.err != nil {
+				t.Fatalf("iteration %d DescribeTopology: %v", iteration, result.err)
+			}
+			if result.state.Depth[firstDestination] != firstMessages {
+				t.Fatalf("iteration %d Depth[%q] = %d, want %d", iteration, firstDestination, result.state.Depth[firstDestination], firstMessages)
+			}
+			if result.state.Depth[secondDestination] != secondMessages {
+				t.Fatalf("iteration %d Depth[%q] = %d, want %d", iteration, secondDestination, result.state.Depth[secondDestination], secondMessages)
+			}
+		}
+	}
+}
+
+func TestNonDurableDestinationOutlivesTheCallThatDeclaredIt(t *testing.T) {
+	const destination = "rabbitmq-driver-admin-nondurable-lifetime"
+	ctx, rabbitConn, facade := setupPruneTest(t, queueKindClassic, driver.DestinationSpec{Name: destination})
+	publisher, err := rabbitConn.amqp.Channel()
+	if err != nil {
+		t.Fatalf("Channel: %v", err)
+	}
+	if err := publisher.Confirm(false); err != nil {
+		_ = publisher.Close()
+		t.Fatalf("Confirm: %v", err)
+	}
+	confirmations := publisher.NotifyPublish(make(chan amqp.Confirmation, 1))
+	t.Cleanup(func() { _ = publisher.Close() })
+
+	queue, err := publisher.QueueDeclarePassive(destination, true, false, false, false, nil)
+	if err != nil {
+		t.Fatalf("QueueDeclarePassive(%q): %v", destination, err)
+	}
+	if queue.Messages != 0 {
+		t.Fatalf("QueueDeclarePassive(%q) messages = %d, want 0", destination, queue.Messages)
+	}
+	if err := publishPruneMessage(ctx, publisher, confirmations, destination); err != nil {
+		t.Fatalf("publish message: %v", err)
+	}
+	state, err := facade.DescribeTopology(ctx, []string{destination})
+	if err != nil {
+		t.Fatalf("DescribeTopology(%q): %v", destination, err)
+	}
+	if state.Depth[destination] != 1 {
+		t.Fatalf("Depth[%q] = %d, want 1", destination, state.Depth[destination])
 	}
 }
 

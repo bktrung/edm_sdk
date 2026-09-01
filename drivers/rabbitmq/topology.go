@@ -536,21 +536,10 @@ func (a *adminOperations) declareQueue(ctx context.Context, name string, durable
 	if err != nil {
 		return err
 	}
+	defer channel.Close()
 	declaredDurable, autoDelete, exclusive := queueFlags(durable, a.conn.queueKind)
 	if _, err := channel.QueueDeclare(name, declaredDurable, autoDelete, exclusive, false, args); err != nil {
-		_ = channel.Close()
 		return classifyAMQP("ensure_topology", driver.KindFatal, err)
-	}
-	if durable {
-		_ = channel.Close()
-		return nil
-	}
-	a.conn.mu.Lock()
-	old := a.conn.ephemeral[name]
-	a.conn.ephemeral[name] = channel
-	a.conn.mu.Unlock()
-	if old != nil {
-		_ = old.Close()
 	}
 	return nil
 }
