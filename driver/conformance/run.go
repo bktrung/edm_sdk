@@ -2,17 +2,40 @@ package conformance
 
 import (
 	"context"
+	cryptorand "crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"sort"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/driver"
 )
+
+func newRunID() (string, error) {
+	var raw [16]byte
+	if _, err := cryptorand.Read(raw[:]); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(raw[:]), nil
+}
+
+const (
+	pruneRetryAttempts  = 100
+	pruneRetryDelay     = 200 * time.Millisecond
+	pruneRetryBudget    = 10 * time.Second
+	pruneAttemptTimeout = 2 * time.Second
+)
+
+func realTimer(duration time.Duration) *time.Timer {
+	//nolint:forbidigo // conformance cleanup retries require wall-clock timing.
+	return time.NewTimer(duration)
+}
 
 // Run opens one connection, executes both profiles, and compares their vectors.
 func Run(t *testing.T, suite Suite) Report {
@@ -67,12 +90,16 @@ func Run(t *testing.T, suite Suite) Report {
 	profileReports := make([]ProfileReport, 0, 2)
 	profilesRan := 0
 	groupsRan := 0
+	runID, err := newRunID()
+	if err != nil {
+		t.Fatalf("conformance: generate run id: %v", err)
+	}
 	for _, profile := range []Profile{ProfileFull, ProfileStrictPortability} {
 		var result ProfileReport
 		profileRan := false
 		ok := t.Run(profile.String(), func(profileTest *testing.T) {
 			profileRan = true
-			result = runProfile(profileTest, ctx, conn, inspect, profile, factoryCapabilities, inject, deadline, &report, suite.Driver, suite.Config, suite.NewFaultInjector)
+			result = runProfile(profileTest, ctx, conn, inspect, runID, profile, factoryCapabilities, inject, deadline, &report, suite.Driver, suite.Config, suite.NewFaultInjector)
 		})
 		if !ok {
 			t.Fatalf("conformance: %s profile failed", profile)
@@ -112,6 +139,7 @@ func runProfile(
 	ctx context.Context,
 	conn driver.Conn,
 	inspect Inspect,
+	runID string,
 	profile Profile,
 	factoryCapabilities driver.Capabilities,
 	inject FaultInjector,
@@ -122,27 +150,28 @@ func runProfile(
 	injectFactory func(driver.Conn) (FaultInjector, error),
 ) ProfileReport {
 	effective := effectiveCapabilities(conn.Capabilities(), profile)
-	destination := "conformance.inspect." + profile.String() + ".probe"
+	destination := "conformance.inspect." + runID + "." + profile.String() + ".probe"
+	var producer driver.Producer
+	var consumer driver.Consumer
+	messages := make([]driver.InboundMessage, 0, 2)
+	t.Cleanup(func() {
+		cleanupProfile(t, ctx, conn, producer, consumer, destination, messages...)
+	})
 	_, err := conn.Admin().EnsureTopology(ctx, driver.TopologySpec{
 		Destinations: []driver.DestinationSpec{{Name: destination}},
-		Scope:        []string{"conformance.inspect." + profile.String() + "."},
+		Scope:        []string{"conformance.inspect." + runID + "." + profile.String() + "."},
 		Effective:    effective,
 	})
 	if err != nil {
 		t.Fatalf("ensure topology: %v", err)
 	}
-	producer, err := conn.Producer(ctx, driver.ProducerConfig{
+	producer, err = conn.Producer(ctx, driver.ProducerConfig{
 		RequireDurableAck: true,
 		Effective:         effective,
 	})
 	if err != nil {
 		t.Fatalf("create producer: %v", err)
 	}
-	var consumer driver.Consumer
-	messages := make([]driver.InboundMessage, 0, 2)
-	t.Cleanup(func() {
-		cleanupProfile(t, ctx, producer, consumer, messages...)
-	})
 	before, err := inspect(ctx, destination)
 	if err != nil {
 		t.Fatalf("inspect baseline: %v", err)
@@ -795,21 +824,142 @@ func receiveDeadlineProbe(t *testing.T, ctx context.Context, consumer driver.Con
 	}
 }
 
-func cleanupProfile(t *testing.T, ctx context.Context, producer driver.Producer, consumer driver.Consumer, messages ...driver.InboundMessage) {
+func cleanupProfile(t *testing.T, ctx context.Context, conn driver.Conn, producer driver.Producer, consumer driver.Consumer, destination string, messages ...driver.InboundMessage) {
 	t.Helper()
+	for _, err := range cleanupProfileErrors(ctx, conn, producer, consumer, destination, messages...) {
+		t.Errorf("%v", err)
+	}
+}
+
+func cleanupProfileErrors(ctx context.Context, conn driver.Conn, producer driver.Producer, consumer driver.Consumer, destination string, messages ...driver.InboundMessage) []error {
+	var errs []error
 	for _, message := range messages {
 		if message.Settle != nil {
-			_ = message.Settle.Nack(ctx, driver.NackOptions{})
+			if err := message.Settle.Nack(ctx, driver.NackOptions{}); err != nil {
+				errs = append(errs, fmt.Errorf("nack profile message: %w", err))
+			}
 		}
 	}
 	if consumer != nil {
 		if err := consumer.Stop(ctx); err != nil {
-			t.Errorf("stop profile consumer: %v", err)
+			errs = append(errs, fmt.Errorf("stop profile consumer: %w", err))
+			if errors.Is(err, driver.ErrResourcesOutstanding) {
+				if releaseErr := consumer.Release(ctx); releaseErr != nil {
+					errs = append(errs, fmt.Errorf("release profile consumer: %w", releaseErr))
+				}
+			}
 		}
 	}
-	if err := producer.Close(ctx); err != nil {
-		t.Errorf("close profile producer: %v", err)
+	if maintenance, ok := conn.Admin().(driver.Maintenance); ok {
+		if _, err := maintenance.Purge(ctx, destination); err != nil && !errors.Is(err, driver.ErrDestinationMissing) {
+			errs = append(errs, fmt.Errorf("purge profile destination: %w", err))
+		}
+		if err := pruneProfileDestination(ctx, maintenance, destination); err != nil {
+			errs = append(errs, err)
+		}
 	}
+	if producer != nil {
+		if err := producer.Close(ctx); err != nil {
+			errs = append(errs, fmt.Errorf("close profile producer: %w", err))
+		}
+	}
+	return errs
+}
+
+func pruneProfileDestination(ctx context.Context, maintenance driver.Maintenance, destination string) error {
+	retryCtx, cancel := context.WithTimeout(ctx, pruneRetryBudget)
+	defer cancel()
+
+	var last driver.PruneResult
+	for attempt := 1; attempt <= pruneRetryAttempts; attempt++ {
+		if err := retryCtx.Err(); err != nil {
+			return pruneRetryBudgetError(destination, attempt-1, err)
+		}
+
+		attemptCtx, attemptCancel := context.WithTimeout(ctx, pruneAttemptTimeout)
+		results, err := maintenance.Prune(attemptCtx, []string{destination})
+		attemptCancel()
+		if err != nil {
+			if errors.Is(err, driver.ErrDestinationMissing) {
+				return nil
+			}
+			if !transientPruneError(err) {
+				return fmt.Errorf("prune profile destination %q: %w", destination, err)
+			}
+			if attempt == pruneRetryAttempts {
+				break
+			}
+			if err := waitForPruneRetry(retryCtx, destination, attempt); err != nil {
+				return err
+			}
+			continue
+		}
+
+		found := false
+		for _, result := range results {
+			if result.Name == destination {
+				last = result
+				found = true
+				break
+			}
+		}
+		if !found {
+			return fmt.Errorf("prune profile destination %q returned no result", destination)
+		}
+		if last.Deleted || pruneResultMissing(last) {
+			return nil
+		}
+		if last.Reason == "" {
+			return fmt.Errorf("prune profile destination %q reported not deleted without a reason", destination)
+		}
+		if !transientPruneReason(last.Reason) {
+			return fmt.Errorf("prune profile destination %q refused: %s", destination, last.Reason)
+		}
+		if attempt == pruneRetryAttempts {
+			break
+		}
+		if err := waitForPruneRetry(retryCtx, destination, attempt); err != nil {
+			return err
+		}
+	}
+	return fmt.Errorf("prune profile destination %q was not deleted after %d attempts: %s", destination, pruneRetryAttempts, last.Reason)
+}
+
+func transientPruneError(err error) bool {
+	var classified *driver.Error
+	return errors.As(err, &classified) && classified.Retryable()
+}
+
+func waitForPruneRetry(ctx context.Context, destination string, attempt int) error {
+	timer := realTimer(pruneRetryDelay)
+	select {
+	case <-timer.C:
+		return nil
+	case <-ctx.Done():
+		if !timer.Stop() {
+			select {
+			case <-timer.C:
+			default:
+			}
+		}
+		return pruneRetryBudgetError(destination, attempt, ctx.Err())
+	}
+}
+
+func pruneRetryBudgetError(destination string, attempts int, err error) error {
+	return fmt.Errorf("prune profile destination %q retry budget exhausted after %d attempts: %w", destination, attempts, err)
+}
+
+func pruneResultMissing(result driver.PruneResult) bool {
+	reason := strings.ToLower(strings.TrimSpace(result.Reason))
+	return reason == "missing" || strings.Contains(reason, "does not exist") || strings.Contains(reason, "not found")
+}
+
+func transientPruneReason(reason string) bool {
+	reason = strings.ToLower(strings.TrimSpace(reason))
+	return (strings.Contains(reason, "consumer") && strings.Contains(reason, "attached")) ||
+		strings.Contains(reason, "disappeared before deletion") ||
+		strings.Contains(reason, "no longer prunable")
 }
 
 // WriteJSON writes an indented JSON report.
