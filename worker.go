@@ -1616,6 +1616,10 @@ func retryAndSettle(r *Runner, ctx context.Context, message driver.InboundMessag
 	return ackDeliveryAs(r, runnerSettlementContext(r, ctx), message, lifecycle.Retried, state)
 }
 
+// A Stop refusal for outstanding messages is a redelivery case, not a retry
+// case: Release gives those deliveries back to the broker. Keep the refusal
+// joined with the Release result rather than replacing it, so the outstanding
+// count and any teardown failure reach the caller.
 func stopRunnerConsumer(r *Runner, ctx context.Context) error {
 	r.mu.Lock()
 	consumer := r.consumer
@@ -1623,7 +1627,13 @@ func stopRunnerConsumer(r *Runner, ctx context.Context) error {
 	if consumer == nil {
 		return nil
 	}
-	return consumer.Stop(ctx)
+	if err := consumer.Stop(ctx); err != nil {
+		if !errors.Is(err, driver.ErrResourcesOutstanding) {
+			return err
+		}
+		return errors.Join(err, consumer.Release(ctx))
+	}
+	return nil
 }
 
 func releaseRunnerConsumer(r *Runner, ctx context.Context) error {
