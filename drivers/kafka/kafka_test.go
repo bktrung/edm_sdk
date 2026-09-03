@@ -2,6 +2,7 @@ package kafka
 
 import (
 	"context"
+	"errors"
 	"net"
 	"reflect"
 	"strconv"
@@ -215,5 +216,66 @@ func TestCapabilitiesReadBrokerLimits(t *testing.T) {
 	}
 	if caps.MaxHeaderBytes != 0 {
 		t.Errorf("MaxHeaderBytes = %d, want 0", caps.MaxHeaderBytes)
+	}
+}
+
+func assertFatalOpenError(t *testing.T, err error, wantText string) {
+	t.Helper()
+	if err == nil {
+		t.Fatal("Open() error = nil, want classified fatal error")
+	}
+	if !strings.Contains(err.Error(), wantText) {
+		t.Fatalf("Open() error = %v, want text %q", err, wantText)
+	}
+	var classified *driver.Error
+	if !errors.As(err, &classified) {
+		t.Fatalf("Open() error = %T, want *driver.Error", err)
+	}
+	if classified.Op != "open" {
+		t.Errorf("Open() error Op = %q, want open", classified.Op)
+	}
+	if classified.Kind() != driver.KindFatal {
+		t.Errorf("Open() error Kind = %v, want fatal", classified.Kind())
+	}
+}
+
+func TestOpenRefusesEmptyEndpoints(t *testing.T) {
+	cases := []struct {
+		name      string
+		endpoints []string
+	}{
+		{name: "nil", endpoints: nil},
+		{name: "empty", endpoints: []string{}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := (Driver{}).Open(context.Background(), driver.Config{Endpoints: tc.endpoints})
+			assertFatalOpenError(t, err, "broker endpoints must not be empty")
+		})
+	}
+}
+
+func TestOpenRefusesEmptySASLCredentials(t *testing.T) {
+	for _, mechanism := range []string{"plain", "scram-sha-256", "scram-sha-512"} {
+		for _, missing := range []string{"username", "password"} {
+			t.Run(mechanism+"/"+missing, func(t *testing.T) {
+				settings := &driver.SASLConfig{
+					Mechanism: mechanism,
+					Username:  "user",
+					Password:  "password",
+				}
+				if missing == "username" {
+					settings.Username = ""
+				} else {
+					settings.Password = ""
+				}
+				_, err := (Driver{}).Open(context.Background(), driver.Config{
+					Endpoints:      []string{"127.0.0.1:1"},
+					ConnectTimeout: 100 * time.Millisecond,
+					SASL:           settings,
+				})
+				assertFatalOpenError(t, err, "SASL username and password must be non-empty")
+			})
+		}
 	}
 }
