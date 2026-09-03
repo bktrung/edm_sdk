@@ -51,8 +51,7 @@ type managementBinding struct {
 func newManagementClient(endpoint string, cfg driver.Config) (*managementClient, error) {
 	parsed, err := url.Parse(endpoint)
 	if err != nil {
-		var urlErr *url.Error
-		if errors.As(err, &urlErr) {
+		if urlErr, ok := errors.AsType[*url.Error](err); ok {
 			err = urlErr.Err
 		}
 		return nil, fmt.Errorf("rabbitmq: invalid management endpoint: %w", err)

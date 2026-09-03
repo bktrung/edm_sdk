@@ -1,0 +1,703 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="Offline front door for the F1 broker-agnostic Go messaging SDK.">
+  <title>F1 | Event-driven messaging for Go</title>
+  <style>
+    :root {
+      --canvas: oklch(97% 0.012 150);
+      --surface: oklch(99% 0.008 150);
+      --ink: oklch(20% 0.028 155);
+      --muted: oklch(39% 0.035 155);
+      --line: oklch(78% 0.035 155);
+      --line-strong: oklch(57% 0.06 155);
+      --teal: oklch(42% 0.105 164);
+      --teal-dark: oklch(31% 0.08 164);
+      --teal-pale: oklch(91% 0.045 164);
+      --amber: oklch(47% 0.11 72);
+      --amber-pale: oklch(92% 0.055 82);
+      --coral: oklch(45% 0.12 30);
+      --coral-pale: oklch(92% 0.05 32);
+      --slate: oklch(40% 0.028 245);
+      --slate-pale: oklch(92% 0.018 245);
+      --code: oklch(21% 0.035 155);
+      --code-ink: oklch(94% 0.02 150);
+      --radius: 8px;
+      --content: 1180px;
+      --measure: 68ch;
+      --ease-out: cubic-bezier(0.16, 1, 0.3, 1);
+    }
+    *, *::before, *::after { box-sizing: border-box; }
+    html { scroll-behavior: smooth; }
+    body {
+      margin: 0;
+      background: var(--canvas);
+      color: var(--ink);
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      font-size: 1rem;
+      line-height: 1.6;
+    }
+    a { color: var(--teal-dark); text-decoration-thickness: 0.1em; text-underline-offset: 0.16em; }
+    a:hover { color: var(--coral); }
+    a:focus-visible, summary:focus-visible {
+      outline: 3px solid var(--amber);
+      outline-offset: 4px;
+      border-radius: 4px;
+    }
+    code, pre, .eyebrow, .tag, th, .flow-node small, .metric-label {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+    }
+    h1, h2, h3 {
+      margin: 0;
+      font-family: Georgia, "Times New Roman", serif;
+      font-weight: 700;
+      line-height: 1.14;
+      text-wrap: balance;
+    }
+    h1 { font-size: clamp(2.75rem, 6vw + 1rem, 5.5rem); letter-spacing: -0.03em; }
+    h2 { font-size: clamp(2rem, 3vw + 1rem, 3.25rem); letter-spacing: -0.02em; }
+    h3 { font-size: 1.4rem; }
+    p { max-width: var(--measure); margin: 0; text-wrap: pretty; }
+    ul, ol { margin: 0; padding-left: 1.25rem; }
+    li + li { margin-top: 8px; }
+    .skip-link {
+      position: absolute;
+      top: 8px;
+      left: 8px;
+      z-index: 10;
+      min-height: 44px;
+      padding: 8px 16px;
+      background: var(--ink);
+      color: var(--surface);
+      transform: translateY(-160%);
+    }
+    .skip-link:focus { transform: translateY(0); }
+    .site-header { border-bottom: 1px solid var(--line); background: var(--surface); }
+    .header-inner, .section-inner, .footer-inner {
+      width: min(calc(100% - 48px), var(--content));
+      margin: 0 auto;
+    }
+    .header-inner {
+      min-height: 72px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 24px;
+    }
+    .wordmark {
+      display: inline-flex;
+      align-items: center;
+      min-height: 44px;
+      color: var(--ink);
+      font-size: 1.25rem;
+      font-weight: 800;
+      letter-spacing: 0.08em;
+      text-decoration: none;
+    }
+    .wordmark-mark {
+      display: inline-grid;
+      place-items: center;
+      width: 32px;
+      height: 32px;
+      margin-right: 8px;
+      border: 2px solid var(--ink);
+      border-radius: 4px;
+      background: var(--teal);
+      color: var(--surface);
+      font-family: Georgia, "Times New Roman", serif;
+      letter-spacing: 0;
+    }
+    nav ul { display: flex; flex-wrap: wrap; gap: 8px; padding: 0; list-style: none; }
+    nav a {
+      display: inline-flex;
+      align-items: center;
+      min-height: 44px;
+      padding: 8px 12px;
+      color: var(--muted);
+      font-size: 0.9rem;
+      font-weight: 700;
+      text-decoration: none;
+    }
+    nav a:hover, nav a:focus-visible { color: var(--ink); background: var(--teal-pale); }
+    main { display: block; }
+    .hero { padding: 96px 0 64px; border-bottom: 1px solid var(--line); }
+    .hero-grid {
+      display: grid;
+      grid-template-columns: minmax(0, 1.3fr) minmax(260px, 0.7fr);
+      gap: 64px;
+      align-items: end;
+    }
+    .hero-copy { display: grid; gap: 24px; }
+    .eyebrow {
+      color: var(--teal-dark);
+      font-size: 0.75rem;
+      font-weight: 800;
+      letter-spacing: 0.1em;
+      text-transform: uppercase;
+    }
+    .hero-lede { max-width: 58ch; font-size: 1.2rem; line-height: 1.55; }
+    .actions { display: flex; flex-wrap: wrap; gap: 12px; }
+    .action {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-height: 48px;
+      padding: 8px 16px;
+      border: 2px solid var(--teal-dark);
+      border-radius: var(--radius);
+      background: var(--teal-dark);
+      color: var(--surface);
+      font-weight: 800;
+      text-decoration: none;
+      transition: transform 200ms var(--ease-out), background-color 200ms var(--ease-out);
+    }
+    .action:hover { color: var(--surface); transform: translateY(-2px); background: var(--teal); }
+    .action:active { transform: translateY(2px); }
+    .action.secondary { background: transparent; color: var(--teal-dark); }
+    .action.secondary:hover { color: var(--teal-dark); background: var(--teal-pale); }
+    .hero-note {
+      display: grid;
+      gap: 16px;
+      padding: 24px;
+      border: 1px solid var(--line-strong);
+      border-radius: var(--radius);
+      background: var(--surface);
+    }
+    .hero-note strong { font-size: 1.1rem; }
+    .hero-note p { color: var(--muted); font-size: 0.95rem; }
+    .section { padding: 96px 0; border-bottom: 1px solid var(--line); }
+    .section-heading { display: grid; gap: 16px; margin-bottom: 48px; }
+    .section-heading p { color: var(--muted); font-size: 1.1rem; }
+    .section-heading h2 { max-width: 18ch; }
+    .flow-diagram {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 8px;
+      margin-top: 32px;
+      padding: 24px;
+      border: 1px solid var(--line-strong);
+      border-radius: var(--radius);
+      background: var(--surface);
+    }
+    .flow-node {
+      position: relative;
+      min-height: 112px;
+      display: grid;
+      align-content: center;
+      gap: 8px;
+      padding: 16px;
+      border: 1px solid var(--line);
+      border-radius: 4px;
+      background: var(--teal-pale);
+    }
+    .flow-node:not(:last-child)::after {
+      content: ">";
+      position: absolute;
+      right: -14px;
+      top: 50%;
+      z-index: 1;
+      width: 20px;
+      transform: translateY(-50%);
+      background: var(--surface);
+      color: var(--teal-dark);
+      font-size: 1.4rem;
+      font-weight: 800;
+      text-align: center;
+    }
+    .flow-node strong { font-size: 1.1rem; }
+    .flow-node small { color: var(--muted); font-size: 0.75rem; }
+    .diagram-note { margin-top: 12px; color: var(--muted); font-size: 0.9rem; }
+    .contract-grid {
+      display: grid;
+      grid-template-columns: minmax(0, 1.4fr) minmax(260px, 0.6fr);
+      gap: 48px;
+      align-items: start;
+    }
+    .contract-list { display: grid; gap: 24px; }
+    .contract-item { display: grid; gap: 8px; padding-bottom: 24px; border-bottom: 1px solid var(--line); }
+    .contract-item:last-child { padding-bottom: 0; border-bottom: 0; }
+    .contract-item h3 { font-size: 1.25rem; }
+    .contract-item p { color: var(--muted); }
+    .signal { display: inline-block; margin-right: 8px; padding: 2px 8px; border-radius: 4px; font-size: 0.7rem; font-weight: 800; letter-spacing: 0.05em; text-transform: uppercase; vertical-align: 0.1em; }
+    .signal.teal { background: var(--teal-pale); color: var(--teal-dark); }
+    .signal.amber { background: var(--amber-pale); color: var(--amber); }
+    .signal.coral { background: var(--coral-pale); color: var(--coral); }
+    .signal.slate { background: var(--slate-pale); color: var(--slate); }
+    .boundary {
+      display: grid;
+      gap: 16px;
+      padding: 24px;
+      border: 1px solid var(--line-strong);
+      border-radius: var(--radius);
+      background: var(--surface);
+    }
+    .boundary h3 { font-size: 1.25rem; }
+    .boundary ul { color: var(--muted); }
+    .split {
+      display: grid;
+      grid-template-columns: minmax(0, 0.8fr) minmax(0, 1.2fr);
+      gap: 48px;
+      align-items: start;
+    }
+    .stack { display: grid; gap: 24px; min-width: 0; }
+    .stack > * { min-width: 0; }
+    .stack h3 { margin-bottom: 8px; }
+    .source-note { color: var(--muted); font-size: 0.9rem; }
+    pre {
+      margin: 0;
+      padding: 24px;
+      overflow-x: auto;
+      border: 1px solid var(--line-strong);
+      border-radius: var(--radius);
+      background: var(--code);
+      color: var(--code-ink);
+      font-size: 0.84rem;
+      line-height: 1.65;
+      tab-size: 2;
+    }
+    .code-label { margin-bottom: 8px; color: var(--muted); font-size: 0.75rem; font-weight: 800; letter-spacing: 0.08em; text-transform: uppercase; }
+    .outcome-table-wrap, .driver-table-wrap { overflow-x: auto; }
+    .outcome-table {
+      width: 100%;
+      border-collapse: collapse;
+      border: 1px solid var(--line-strong);
+      background: var(--surface);
+    }
+    .outcome-table th, .outcome-table td { padding: 16px; border-bottom: 1px solid var(--line); text-align: left; vertical-align: top; }
+    .outcome-table th { color: var(--muted); font-size: 0.75rem; letter-spacing: 0.06em; text-transform: uppercase; }
+    .outcome-table tr:last-child td { border-bottom: 0; }
+    .outcome-table td:first-child { width: 22%; font-weight: 800; }
+    .settlement {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 8px;
+      margin-top: 32px;
+    }
+    .settlement-step { display: grid; gap: 8px; padding: 24px; border-top: 3px solid var(--teal); background: var(--surface); }
+    .settlement-step:nth-child(2) { border-color: var(--amber); }
+    .settlement-step:nth-child(3) { border-color: var(--coral); }
+    .settlement-step strong { font-size: 1.05rem; }
+    .settlement-step p { color: var(--muted); font-size: 0.95rem; }
+    .runtime-grid { display: grid; grid-template-columns: minmax(0, 1fr) minmax(280px, 0.8fr); gap: 48px; align-items: start; }
+    .phase-list { display: grid; gap: 8px; padding: 0; list-style: none; counter-reset: phase; }
+    .phase-list li { display: grid; grid-template-columns: 48px 1fr; gap: 16px; align-items: start; padding: 16px; border: 1px solid var(--line); background: var(--surface); counter-increment: phase; }
+    .phase-list li::before { content: counter(phase, decimal-leading-zero); color: var(--teal-dark); font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace; font-weight: 800; }
+    .phase-list strong { display: block; }
+    .phase-list span { color: var(--muted); font-size: 0.95rem; }
+    .driver-table { width: 100%; min-width: 620px; border-collapse: collapse; border: 1px solid var(--line-strong); background: var(--surface); }
+    .driver-table th, .driver-table td { padding: 16px; border-bottom: 1px solid var(--line); text-align: left; vertical-align: top; }
+    .driver-table th { color: var(--muted); font-size: 0.75rem; letter-spacing: 0.06em; text-transform: uppercase; }
+    .driver-table tr:last-child td { border-bottom: 0; }
+    .guide-layout { display: grid; grid-template-columns: minmax(0, 1fr) minmax(280px, 0.7fr); gap: 48px; align-items: start; }
+    .guide-group { display: grid; gap: 16px; }
+    .guide-group + .guide-group { margin-top: 48px; }
+    .guide-group h3 { padding-bottom: 12px; border-bottom: 2px solid var(--line-strong); }
+    .guide-list { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px 24px; padding: 0; list-style: none; }
+    .guide-list li { min-height: 74px; padding: 12px 0; border-bottom: 1px solid var(--line); }
+    .guide-list a { font-weight: 800; }
+    .guide-list span { display: block; color: var(--muted); font-size: 0.9rem; }
+    .trust-panel { display: grid; gap: 16px; padding: 24px; border: 1px solid var(--line-strong); border-radius: var(--radius); background: var(--surface); }
+    .trust-panel ul { color: var(--muted); }
+    .trust-panel details { border-top: 1px solid var(--line); padding-top: 12px; }
+    summary { min-height: 44px; padding: 8px 0; cursor: pointer; font-weight: 800; }
+    .footer { padding: 64px 0; background: var(--ink); color: var(--surface); }
+    .footer-inner { display: grid; grid-template-columns: 1fr auto; gap: 48px; align-items: start; }
+    .footer a { color: var(--teal-pale); }
+    .footer p { color: oklch(87% 0.025 150); }
+    .footer small { display: block; margin-top: 16px; color: oklch(78% 0.025 150); }
+    @media (max-width: 900px) {
+      .hero-grid, .contract-grid, .split, .runtime-grid, .guide-layout { grid-template-columns: 1fr; gap: 32px; }
+      .flow-diagram { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
+      .flow-node:not(:last-child)::after { display: none; }
+      .flow-node:nth-child(2)::after { display: block; content: "v"; right: auto; top: auto; bottom: -18px; left: 50%; transform: translateX(-50%); }
+      .settlement { grid-template-columns: 1fr; }
+      .footer-inner { grid-template-columns: 1fr; gap: 24px; }
+    }
+    @media (max-width: 600px) {
+      .header-inner, .section-inner, .footer-inner { width: min(calc(100% - 32px), var(--content)); }
+      .header-inner { align-items: flex-start; padding: 12px 0; flex-direction: column; gap: 8px; }
+      nav ul { gap: 4px; }
+      nav a { padding: 8px; }
+      .hero, .section { padding: 64px 0; }
+      .hero-grid { gap: 32px; }
+      .hero-lede { font-size: 1.05rem; }
+      .flow-diagram { grid-template-columns: 1fr; padding: 16px; }
+      .flow-node:nth-child(2)::after { display: none; }
+      .guide-list { grid-template-columns: 1fr; }
+      .outcome-table { display: block; overflow-x: auto; min-width: 620px; }
+      pre { padding: 16px; font-size: 0.78rem; }
+    }
+    @media (prefers-reduced-motion: reduce) {
+      *, *::before, *::after { scroll-behavior: auto !important; transition-duration: 0.01ms !important; animation-duration: 0.01ms !important; animation-iteration-count: 1 !important; }
+    }
+  </style>
+</head>
+<body>
+  <a class="skip-link" href="#main-content">Skip to main content</a>
+  <header class="site-header">
+    <div class="header-inner">
+      <a class="wordmark" href="#top" aria-label="F1 home"><span class="wordmark-mark" aria-hidden="true">F1</span>F1 SDK</a>
+      <nav aria-label="Primary navigation">
+        <ul>
+          <li><a href="#quickstart">Build a service</a></li>
+          <li><a href="#contract">Contract</a></li>
+          <li><a href="#runtime">Runtime</a></li>
+          <li><a href="#drivers">Drivers</a></li>
+          <li><a href="#guides">Guides</a></li>
+        </ul>
+      </nav>
+    </div>
+  </header>
+  <main id="main-content">
+    <section class="hero" id="top" aria-labelledby="hero-title">
+      <div class="section-inner hero-grid">
+        <div class="hero-copy">
+          <p class="eyebrow">Event-driven messaging for Go</p>
+          <h1 id="hero-title">A clear path from event to effect.</h1>
+          <p class="hero-lede">F1 gives services a broker-agnostic port for publishing and consuming events, with explicit delivery, failure, and shutdown boundaries.</p>
+          <div class="actions">
+            <a class="action" href="#quickstart">Start with the quickstart</a>
+            <a class="action secondary" href="#runtime">See the runtime map</a>
+          </div>
+        </div>
+        <aside class="hero-note" aria-label="First decision">
+          <strong>Before you integrate</strong>
+          <p>RabbitMQ is the supported external adapter. In-memory is the deterministic reference and test adapter. Kafka is a scaffold and its <code>Driver.Open</code> returns <code>driver.ErrUnsupported</code>.</p>
+          <a href="#drivers">Review adapter status and limits</a>
+        </aside>
+      </div>
+    </section>
+    <section class="section" id="contract" aria-labelledby="contract-title">
+      <div class="section-inner">
+        <div class="section-heading">
+          <p class="eyebrow">The operating contract</p>
+          <h2 id="contract-title">Guarantees with their boundaries attached.</h2>
+          <p>Read each promise with the condition beside it. Source and tests remain the authority for current behavior.</p>
+        </div>
+        <div class="contract-grid">
+          <div class="contract-list">
+            <article class="contract-item">
+              <h3><span class="signal teal">Delivery</span>At-least-once with stable identity</h3>
+              <p>F1 preserves an idempotency key across retries, dead-letter copies, and redelivery. Delivery can repeat, so the application owns deduplicating its effects through <code>Event.IdempotencyKey()</code>.</p>
+              <a href="../README.md">Read the guarantee owner</a>
+            </article>
+            <article class="contract-item">
+              <h3><span class="signal teal">Order</span>Per-key ordering, not global ordering</h3>
+              <p><code>OrderedByKey</code> can preserve order for a key across the subscription path. F1 does not promise one global order across partitions or queues.</p>
+              <a href="user-guide/consuming-events.md">Read the ordering guide</a>
+            </article>
+            <article class="contract-item">
+              <h3><span class="signal teal">Shutdown</span>Drain accepted work before exit</h3>
+              <p>A runner stops fetching, settles in-flight deliveries, and can be explicitly drained. <code>Client.Close</code> coordinates runner drain, waits for publishes, flushes, and releases driver resources.</p>
+              <a href="user-guide/graceful-shutdown.md">Read the shutdown guide</a>
+            </article>
+            <article class="contract-item">
+              <h3><span class="signal amber">Priority</span>Fair lanes with bounded waiting</h3>
+              <p>Priority scheduling uses weighted lanes and aging so lower-priority work gets a bounded wait under sustained higher-priority load. The bound is a runtime scheduling property, not a global broker order.</p>
+              <a href="dispatch-and-scheduling.md">Read scheduling details</a>
+            </article>
+          </div>
+          <aside class="boundary">
+            <h3>What F1 does not claim</h3>
+            <ul>
+              <li>Exactly-once transport or effects</li>
+              <li>SDK-owned effect deduplication</li>
+              <li>Global ordering</li>
+              <li>Kafka runtime support today</li>
+              <li>A database transaction or outbox</li>
+            </ul>
+            <a href="../README.md">See the v1 non-goals</a>
+          </aside>
+        </div>
+        <div class="flow-diagram" role="img" aria-label="Application sends through the F1 public API, internal runtime, driver port, and selected adapter.">
+          <div class="flow-node"><strong>Application</strong><small>handlers and event structs</small></div>
+          <div class="flow-node"><strong>F1 API</strong><small>Client and Publisher</small></div>
+          <div class="flow-node"><strong>Driver port</strong><small>stdlib-only boundary</small></div>
+          <div class="flow-node"><strong>Adapter</strong><small>RabbitMQ or in-memory</small></div>
+        </div>
+        <p class="diagram-note">Text equivalent: service logic uses root F1 types. The runtime owns encoding, scheduling, settlement, and lifecycle. A driver translates the port to a transport.</p>
+      </div>
+    </section>
+    <section class="section" id="quickstart" aria-labelledby="quickstart-title">
+      <div class="section-inner">
+        <div class="section-heading">
+          <h2 id="quickstart-title">Install, configure, then publish.</h2>
+          <p>The local fixture is for development. Provision production topology separately and disable automatic creation there.</p>
+        </div>
+        <div class="split">
+          <div class="stack">
+            <div>
+              <h3>Use the private module</h3>
+              <p>F1 is hosted at <code>fgit.zapps.vn</code>. Set <code>GOPRIVATE=fgit.zapps.vn</code> so the Go toolchain does not use the public proxy or checksum database for this module. The repository pins Go 1.26.1.</p>
+            </div>
+            <div>
+              <h3>Run the safe fixture path</h3>
+              <p><code>examples/config.yaml</code> uses a local RabbitMQ endpoint, development credentials, and <code>topology.autoCreate: true</code>. Treat those values as fixture-only.</p>
+              <p class="source-note">Start, smoke-test, compile, and stop from a clean checkout. Use <code>make broker-down</code> for cleanup. <code>make broker-reset</code> destroys volumes and is not routine cleanup.</p>
+            </div>
+          </div>
+          <div class="stack">
+            <div>
+              <p class="code-label">Shell</p>
+              <pre><code>export GOPRIVATE=fgit.zapps.vn
+go get fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk
+
+make broker-up
+make broker-smoke
+go build -o /tmp/f1-quickstart-publisher ./examples/publisher
+go build -o /tmp/f1-quickstart-consumer ./examples/consumer
+
+make broker-down</code></pre>
+            </div>
+            <p class="source-note">The complete two-terminal sequence lives in <a href="../README.md">README quickstart</a>. Configuration owner: <a href="../examples/config.yaml">examples/config.yaml</a>.</p>
+          </div>
+        </div>
+      </div>
+    </section>
+    <section class="section" id="compose" aria-labelledby="compose-title">
+      <div class="section-inner">
+        <div class="section-heading">
+          <h2 id="compose-title">Keep service logic on the port.</h2>
+          <p>Publish and handler code use F1 types. Select a concrete driver only at the application composition boundary.</p>
+        </div>
+        <div class="split">
+          <div class="stack">
+            <div>
+              <p class="code-label">Publish from service code</p>
+              <pre><code>id, err := client.Publisher().Publish(
+    ctx,
+    "orders.created.v1",
+    OrderCreated{OrderID: order.ID},
+    f1.WithKey(order.CustomerID),
+)
+if err != nil {
+    return fmt.Errorf("publish order: %w", err)
+}
+log.Info("published", "id", id)</code></pre>
+            </div>
+            <p class="source-note">The key is routing metadata. It supports per-key ordering when the subscription requests that mode. See <a href="user-guide/publishing-events.md">publishing events</a>.</p>
+          </div>
+          <div class="stack">
+            <div>
+              <p class="code-label">Consume and decode</p>
+              <pre><code>runner, err := client.Subscribe(ctx, f1.Subscription{
+    Name: "orders",
+    Handlers: map[string]f1.Handler{
+        "orders.created.v1": f1.HandlerFunc(
+            func(ctx context.Context, event *f1.Event) error {
+                var payload OrderCreated
+                if err := event.Decode(&amp;payload); err != nil {
+                    return f1.Terminal(err)
+                }
+                return handleOrder(ctx, event.IdempotencyKey(), payload)
+            },
+        ),
+    },
+})
+if err != nil { return err }
+go runner.Run(ctx)</code></pre>
+            </div>
+            <p class="source-note">A handler returns nil for success. Use <a href="user-guide/consuming-events.md">subscriptions and handlers</a> for full configuration. The <a href="../examples/consumer/main.go">consumer example</a> shows driver selection separately.</p>
+          </div>
+        </div>
+        <div class="boundary" style="margin-top: 48px">
+          <h3>Composition boundary only</h3>
+          <pre><code>client, err := f1.New(ctx, cfg,
+    f1.WithDriver(rabbitmq.Driver{}),
+)</code></pre>
+          <p>This is application wiring in <code>main</code>. The root package and business-facing handler path do not import a broker client. <a href="../ARCHITECTURE.md">Read the import boundary</a>.</p>
+        </div>
+      </div>
+    </section>
+    <section class="section" id="failures" aria-labelledby="failures-title">
+      <div class="section-inner">
+        <div class="section-heading">
+          <h2 id="failures-title">Name the outcome before you settle.</h2>
+          <p>Every handler result has a deliberate path. Retry and dead-letter successors are confirmed before the original delivery is acknowledged.</p>
+        </div>
+        <div class="outcome-table-wrap">
+          <table class="outcome-table">
+            <thead><tr><th scope="col">Handler result</th><th scope="col">F1 action</th><th scope="col">Boundary</th></tr></thead>
+            <tbody>
+              <tr><td><span class="signal teal">Success</span><code>nil</code></td><td>Acknowledge the original delivery.</td><td>The effect may still be repeated by a later redelivery; use the idempotency key for application-owned safety.</td></tr>
+              <tr><td><span class="signal amber">Retry</span>ordinary error</td><td>Publish the next retry successor using the configured ladder, then acknowledge the original.</td><td>Retries are bounded by the subscription policy.</td></tr>
+              <tr><td><span class="signal amber">Retry</span><code>RetryAfter</code></td><td>Use the explicit delay for that attempt, then follow the same successor-first settlement.</td><td>The error remains retryable; the delay is not a new delivery guarantee.</td></tr>
+              <tr><td><span class="signal coral">Terminal</span><code>Terminal(err)</code></td><td>Publish a dead-letter copy with reason and error, then acknowledge the original.</td><td><code>OnDeadLetter</code> is notified only after a confirmed copy.</td></tr>
+              <tr><td><span class="signal coral">Drop</span><code>Drop(err)</code></td><td>Acknowledge without retaining a dead-letter copy.</td><td>Use when the application intentionally treats the event as handled without another attempt.</td></tr>
+              <tr><td><span class="signal slate">Unmatched</span>no handler</td><td><code>Ignore</code> acknowledges and discards. <code>DeadLetter</code> retains a copy.</td><td>Choose <code>Subscription.UnmatchedPolicy</code> explicitly for the event types you route.</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="settlement" aria-label="Settle-last sequence">
+          <div class="settlement-step"><strong>1. Classify</strong><p>Handler outcome, decode failure, or panic becomes an explicit disposition.</p></div>
+          <div class="settlement-step"><strong>2. Confirm successor</strong><p>Retry or dead-letter publication is durably confirmed by the shared producer.</p></div>
+          <div class="settlement-step"><strong>3. Acknowledge original</strong><p>The original delivery is settled only after the successor handoff.</p></div>
+        </div>
+        <p class="diagram-note">This settle-last window prevents loss but permits duplicate delivery or effects if a process crashes after publication and before acknowledgement.</p>
+        <div class="boundary" style="margin-top: 48px">
+          <h3>Poison and no-route safety</h3>
+          <p>A poison message can fail decoding or panic in a handler. If bounded successor publication attempts find no dead-letter route, F1 acknowledges and drops the poison message to prevent infinite redelivery, then reports the condition through the configured asynchronous error handler or last-resort logger. That is a containment path, not a retained DLQ copy.</p>
+          <p><code>OnDeadLetter</code> receives a <em>confirmed</em> DLQ copy. Terminal callbacks and the client error handler run asynchronously with bounded notification contexts; a slow, panicking, or over-capacity callback can time out or be dropped.</p>
+          <a href="user-guide/handling-failures.md">Read failure handling</a>
+        </div>
+      </div>
+    </section>
+    <section class="section" id="runtime" aria-labelledby="runtime-title">
+      <div class="section-inner">
+        <div class="section-heading">
+          <h2 id="runtime-title">Drain runners, then close.</h2>
+          <p>Publish admission, consumer work, and driver resources have separate lifecycle phases.</p>
+        </div>
+        <div class="runtime-grid">
+          <ol class="phase-list">
+            <li><div><strong>Stop admission</strong><span><code>Client.Close</code> prevents new work after shutdown begins.</span></div></li>
+            <li><div><strong>Drain subscriptions</strong><span>Each <code>Runner.Drain</code> stops fetching and waits for accepted deliveries to settle.</span></div></li>
+            <li><div><strong>Wait for publishes</strong><span>In-flight application publishes finish before producer teardown.</span></div></li>
+            <li><div><strong>Flush and release</strong><span>The producer and connection close with retryable phase handling when a caller deadline expires.</span></div></li>
+          </ol>
+          <div class="stack">
+            <p class="code-label">Explicit runner drain</p>
+            <pre><code>runDone := make(chan error, 1)
+go func() { runDone &lt;- runner.Run(ctx) }()
+
+// On SIGTERM:
+drainCtx, cancel := context.WithTimeout(
+    context.Background(), 20*time.Second,
+)
+defer cancel()
+if err := runner.Drain(drainCtx); err != nil {
+    return err
+}
+return &lt;-runDone</code></pre>
+            <p class="source-note">The <a href="../examples/consumer/main.go">consumer example</a> owns this signal pattern. <a href="settlement-and-shutdown.md">Read settlement and shutdown</a> for phase detail.</p>
+          </div>
+        </div>
+      </div>
+    </section>
+    <section class="section" id="drivers" aria-labelledby="drivers-title">
+      <div class="section-inner">
+        <div class="section-heading">
+          <h2 id="drivers-title">Choose a port, then inspect its limits.</h2>
+          <p>Adapter status and capability declarations are separate facts. A declared Kafka ceiling does not make an unsupported open path usable.</p>
+        </div>
+        <div class="driver-table-wrap">
+          <table class="driver-table">
+            <thead><tr><th scope="col">Adapter</th><th scope="col">Status</th><th scope="col">Use it for</th><th scope="col">Owner</th></tr></thead>
+            <tbody>
+              <tr><td><span class="signal teal">Supported</span>RabbitMQ</td><td>Supported external runtime adapter.</td><td>Application integration against the local or provisioned broker.</td><td><a href="../drivers/rabbitmq/rabbitmq.go">RabbitMQ driver source</a></td></tr>
+              <tr><td><span class="signal teal">Reference</span>In-memory</td><td>Deterministic reference and test adapter.</td><td>Fast tests, conformance, and isolated local behavior.</td><td><a href="../drivers/inmem/inmem.go">In-memory driver source</a></td></tr>
+              <tr><td><span class="signal slate">Scaffold</span>Kafka</td><td><code>Driver.Open</code> returns <code>driver.ErrUnsupported</code>.</td><td>Configuration and port work only; no connected runtime claim.</td><td><a href="../drivers/kafka/kafka.go">Kafka scaffold source</a></td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="split" style="margin-top: 48px">
+          <div class="stack">
+            <div>
+              <h3>Client.Limits()</h3>
+              <p>After a successful connection, <code>Client.Limits()</code> reports feature modes for that connected driver: native, emulated, or unavailable. Review the report when a feature depends on transport behavior.</p>
+            </div>
+            <pre><code>limits := client.Limits()
+for _, feature := range limits.Features {
+    fmt.Println(feature.Feature, feature.Mode)
+}</code></pre>
+          </div>
+          <aside class="boundary">
+            <h3>Capability reading rule</h3>
+            <p>Kafka's <code>Capabilities()</code> describes a planned ceiling across modes. Because <code>Open</code> is unsupported, do not present those values as connected deployment features or demonstrate <code>Client.Limits()</code> against Kafka.</p>
+            <a href="drivers-and-capabilities.md">Read drivers and capabilities</a>
+          </aside>
+        </div>
+      </div>
+    </section>
+    <section class="section" id="trust" aria-labelledby="trust-title">
+      <div class="section-inner">
+        <div class="section-heading">
+          <h2 id="trust-title">Test the boundary you depend on.</h2>
+          <p>Use the deterministic adapter for behavior checks, then read the conformance and integration owners for transport-specific evidence.</p>
+        </div>
+        <div class="guide-layout">
+          <div class="stack">
+            <h3>Useful evidence paths</h3>
+            <ul>
+              <li><a href="../publish_test.go">Publish tests</a> cover durable publishing and close races.</li>
+              <li><a href="../dispatch_test.go">Dispatch tests</a> cover worker pipeline and settlement edges.</li>
+              <li><a href="../settlement_state_test.go">Settlement state tests</a> cover acknowledgement recovery.</li>
+              <li><a href="../worker_retry_bridge_test.go">Retry bridge tests</a> cover retry, DLQ, and missing-route poison containment.</li>
+              <li><a href="../f1test/">F1 black-box test client</a> uses the in-memory transport.</li>
+              <li><a href="../driver/conformance/">Driver conformance</a> keeps adapter behavior on the port contract.</li>
+              <li><a href="../Makefile">Makefile gates</a> own repository verification commands.</li>
+            </ul>
+            <p class="source-note">The <a href="reading-guide.md">reading guide</a> gives the full source order. The <a href="../testdata/public-api.json">public API fixture</a> records the exported surface; <code>Translator</code> is documented-not-built and is not used here.</p>
+          </div>
+          <aside class="trust-panel">
+            <h3>Frozen wire boundary</h3>
+            <p>The <code>f1</code>-prefixed headers are a cross-service wire contract. This front door explains stable identity without enumerating or redesigning those headers.</p>
+            <details>
+              <summary>Where source wins</summary>
+              <p>Docs provide navigation, diagrams, terminology, and durable constraints. Source and tests own current behavior. Start with the <a href="README.md">docs map</a> when a claim needs deeper evidence.</p>
+            </details>
+          </aside>
+        </div>
+      </div>
+    </section>
+    <section class="section" id="guides" aria-labelledby="guides-title">
+      <div class="section-inner">
+        <div class="section-heading">
+          <h2 id="guides-title">Pick the route that matches your work.</h2>
+          <p>Every deep procedure remains in its source guide. The links below are the complete current service-author and maintainer/runtime inventory.</p>
+        </div>
+        <div class="guide-layout">
+          <div>
+            <div class="guide-group">
+              <h3>For service authors</h3>
+              <ul class="guide-list">
+                <li><a href="user-guide/getting-started.md">Getting started</a><span>Install, load configuration, and connect a driver.</span></li>
+                <li><a href="user-guide/publishing-events.md">Publishing events</a><span>Publish versioned events and choose routing metadata.</span></li>
+                <li><a href="user-guide/consuming-events.md">Consuming events</a><span>Register handlers, decode payloads, and run a subscription.</span></li>
+                <li><a href="user-guide/handling-failures.md">Handling failures</a><span>Choose retry, terminal, drop, dead-letter, and idempotency behavior.</span></li>
+                <li><a href="user-guide/graceful-shutdown.md">Graceful shutdown</a><span>Drain runners and close clients without losing accepted work.</span></li>
+                <li><a href="user-guide/testing.md">Testing</a><span>Test handlers deterministically with the in-memory client.</span></li>
+              </ul>
+            </div>
+            <div class="guide-group">
+              <h3>For maintainers</h3>
+              <ul class="guide-list">
+                <li><a href="runtime-overview.md">Runtime overview</a><span>Boundaries, ownership, and the two main flows.</span></li>
+                <li><a href="publish-flow.md">Publish flow</a><span>Application payload to durable broker acknowledgement.</span></li>
+                <li><a href="consume-flow.md">Consume flow</a><span>Broker delivery to handler result and settlement.</span></li>
+                <li><a href="dispatch-and-scheduling.md">Dispatch and scheduling</a><span>Lanes, fairness, backpressure, and ordering.</span></li>
+                <li><a href="settlement-and-shutdown.md">Settlement and shutdown</a><span>Retry/DLQ safety and drain phases.</span></li>
+                <li><a href="drivers-and-capabilities.md">Drivers and capabilities</a><span>The broker port, adapters, scaffold, and conformance.</span></li>
+                <li><a href="reading-guide.md">Reading guide</a><span>File-by-file order and tests to read later.</span></li>
+              </ul>
+            </div>
+          </div>
+          <aside class="trust-panel">
+            <h3>Repository map</h3>
+            <ul>
+              <li><a href="../README.md">README</a> for guarantees, install, and quickstart.</li>
+              <li><a href="../ARCHITECTURE.md">Architecture</a> for package boundaries and flows.</li>
+              <li><a href="README.md">Docs map</a> for audience split and authority.</li>
+              <li><a href="../examples/">Examples</a> for the two service compositions.</li>
+              <li><a href="../go.mod">go.mod</a> for the pinned Go version.</li>
+              <li><a href="../Makefile">Makefile</a> for build, test, lint, and verification gates.</li>
+            </ul>
+          </aside>
+        </div>
+      </div>
+    </section>
+  </main>
+  <footer class="footer">
+    <div class="footer-inner">
+      <div>
+        <h2>F1 keeps the port clear.</h2>
+        <p>Start with the <a href="#quickstart">quickstart</a>, then follow the <a href="#guides">source guides</a> that match your role. Keep broker choice at composition and keep application effects idempotent.</p>
+        <small>Offline by design. This page has no required network, JavaScript, server, or sibling-file read.</small>
+      </div>
+      <p><a href="#top">Back to top</a></p>
+    </div>
+  </footer>
+</body>
+</html>

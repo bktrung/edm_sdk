@@ -1,5 +1,7 @@
 # F1 documentation
 
+Open the [offline documentation front door](index.html) for a browser-friendly route through the docs.
+
 Choose the route that matches your role:
 
 ## For service authors

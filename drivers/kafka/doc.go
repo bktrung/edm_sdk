@@ -1,6 +1,6 @@
 // Package kafka is the Kafka adapter for the F1 driver port.
 //
-// The package reserves the adapter boundary and declares the capability
-// ceiling the finished driver will report. Open returns driver.ErrUnsupported
-// until the connection, producer, consumer, and topology surfaces exist.
+// The package provides the connected Kafka boundary and declares the
+// capability ceiling the driver can report. Resource factories remain
+// unsupported until their corresponding surfaces are implemented.
 package kafka
