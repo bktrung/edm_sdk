@@ -1,7 +1,11 @@
 package kafka
 
 import (
+	"context"
 	"errors"
+	"math"
+	"strconv"
+	"strings"
 	"testing"
 
 	"github.com/twmb/franz-go/pkg/kerr"
@@ -25,6 +29,35 @@ func TestPartitionCountResolution(t *testing.T) {
 			got := translateDestination(driver.DestinationSpec{Partitions: tc.partitions}).partitions
 			if got != tc.want {
 				t.Fatalf("translateDestination(%d).partitions = %d, want %d", tc.partitions, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestPartitionCountRejectsOutOfRange(t *testing.T) {
+	const maxKafkaPartitions = int(math.MaxInt32)
+	if got := translateDestination(driver.DestinationSpec{Partitions: maxKafkaPartitions}).partitions; got != int32(maxKafkaPartitions) {
+		t.Fatalf("max Kafka partition count translated to %d, want %d", got, maxKafkaPartitions)
+	}
+
+	const destination = "out-of-range"
+	for _, partitions := range []int{maxKafkaPartitions + 1, 4294967297} {
+		t.Run(strconv.Itoa(partitions), func(t *testing.T) {
+			_, err := (&admin{}).EnsureTopology(context.Background(), driver.TopologySpec{
+				Destinations: []driver.DestinationSpec{{Name: destination, Partitions: partitions}},
+			})
+			if err == nil {
+				t.Fatalf("EnsureTopology(%d) returned nil error", partitions)
+			}
+			var classified *driver.Error
+			if !errors.As(err, &classified) {
+				t.Fatalf("EnsureTopology(%d) error = %T, want *driver.Error", partitions, err)
+			}
+			if got := classified.Kind(); got != driver.KindFatal {
+				t.Fatalf("EnsureTopology(%d).Kind() = %s, want %s", partitions, got, driver.KindFatal)
+			}
+			if !strings.Contains(err.Error(), destination) {
+				t.Fatalf("EnsureTopology(%d) error = %q, want destination %q", partitions, err, destination)
 			}
 		})
 	}

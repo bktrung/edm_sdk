@@ -84,7 +84,7 @@ func produceKafkaRecords(t *testing.T, client *kgo.Client, ctx context.Context, 
 	t.Helper()
 	records := make([]*kgo.Record, count)
 	for i := range records {
-		records[i] = &kgo.Record{Topic: topic, Value: []byte(fmt.Sprintf("record-%d", i))}
+		records[i] = &kgo.Record{Topic: topic, Value: fmt.Appendf(nil, "record-%d", i)}
 	}
 	if err := client.ProduceSync(ctx, records...).FirstErr(); err != nil {
 		t.Fatalf("ProduceSync(%q): %v", topic, err)
@@ -102,6 +102,33 @@ func namesContainAll(got []string, want ...string) bool {
 		}
 	}
 	return true
+}
+
+func TestClassifyAdminErrorKinds(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+		want driver.Kind
+	}{
+		{name: "unknown topic", err: kerr.UnknownTopicOrPartition, want: driver.KindNotFound},
+		{name: "invalid topic", err: kerr.InvalidTopicException, want: driver.KindFatal},
+		{name: "invalid partitions", err: kerr.InvalidPartitions, want: driver.KindFatal},
+		{name: "invalid replication factor", err: kerr.InvalidReplicationFactor, want: driver.KindFatal},
+		{name: "invalid config", err: kerr.InvalidConfig, want: driver.KindFatal},
+		{name: "unmapped leader unavailable", err: kerr.LeaderNotAvailable, want: driver.KindTransient},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			gotErr := classifyAdminError("test", tc.err)
+			var classified *driver.Error
+			if !errors.As(gotErr, &classified) {
+				t.Fatalf("classifyAdminError(%v) = %T, want *driver.Error", tc.err, gotErr)
+			}
+			if got := classified.Kind(); got != tc.want {
+				t.Fatalf("classifyAdminError(%v).Kind() = %s, want %s", tc.err, got, tc.want)
+			}
+		})
+	}
 }
 
 func TestEnsureTopologyCreatesAndIsIdempotent(t *testing.T) {

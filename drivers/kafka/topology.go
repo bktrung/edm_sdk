@@ -17,6 +17,7 @@ type kafkaTopicSpec struct {
 	name              string
 	partitions        int32
 	replicationFactor int16
+	err               error
 }
 
 type kafkaTopologyPlan struct {
@@ -36,15 +37,21 @@ func translateTopology(spec driver.TopologySpec) kafkaTopologyPlan {
 }
 
 func translateDestination(spec driver.DestinationSpec) kafkaTopicSpec {
-	partitions := int32(spec.Partitions) //nolint:gosec // Kafka's API represents partition counts as int32.
-	if partitions <= 0 {
-		partitions = -1
-	}
-	return kafkaTopicSpec{
+	topic := kafkaTopicSpec{
 		name:              spec.Name,
-		partitions:        partitions,
 		replicationFactor: -1,
 	}
+	if spec.Partitions <= 0 {
+		topic.partitions = -1
+		return topic
+	}
+	const maxKafkaPartitions = int(1<<31 - 1)
+	if spec.Partitions > maxKafkaPartitions {
+		topic.err = classify("ensure_topology", driver.KindFatal, fmt.Errorf("destination %q partition count %d exceeds Kafka int32 maximum", spec.Name, spec.Partitions))
+		return topic
+	}
+	topic.partitions = int32(spec.Partitions)
+	return topic
 }
 
 func (a *admin) ensureTopology(ctx context.Context, spec driver.TopologySpec) (driver.TopologyDiff, error) {
@@ -58,6 +65,9 @@ func (a *admin) ensureTopology(ctx context.Context, spec driver.TopologySpec) (d
 	var diff driver.TopologyDiff
 	plan := translateTopology(spec)
 	for _, destination := range plan.destinations {
+		if destination.err != nil {
+			return driver.TopologyDiff{}, destination.err
+		}
 		if err := ctx.Err(); err != nil {
 			return driver.TopologyDiff{}, classify("ensure_topology", driver.KindTransient, err)
 		}
@@ -130,7 +140,7 @@ func (a *admin) describeTopology(ctx context.Context, names []string) (driver.To
 	if len(names) == 0 {
 		return state, nil
 	}
-	starts, ends, err := a.listTopicOffsets(ctx, names...)
+	starts, ends, err := a.listTopicOffsets(ctx, "describe_topology", names...)
 	if err != nil {
 		return driver.TopologyState{}, err
 	}
@@ -222,7 +232,7 @@ func (a *admin) scanOrphans(ctx context.Context, spec driver.TopologySpec, diff 
 	if len(orphanNames) == 0 {
 		return
 	}
-	starts, ends, err := a.listTopicOffsets(ctx, orphanNames...)
+	starts, ends, err := a.listTopicOffsets(ctx, "ensure_topology", orphanNames...)
 	if err != nil {
 		diff.OrphanScanError = err.Error()
 		return
