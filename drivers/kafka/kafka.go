@@ -35,7 +35,7 @@ import (
 var (
 	_ driver.Driver = Driver{}
 	_ driver.Conn   = (*conn)(nil)
-	_ driver.Admin  = unsupportedAdmin{}
+	_ driver.Admin  = (*admin)(nil)
 )
 
 var (
@@ -292,7 +292,7 @@ func (c *conn) Consumer(context.Context, driver.ConsumerConfig) (driver.Consumer
 	return nil, driver.ErrUnsupported
 }
 
-func (c *conn) Admin() driver.Admin { return unsupportedAdmin{} }
+func (c *conn) Admin() driver.Admin { return &admin{client: kadm.NewClient(c.client)} }
 
 func (c *conn) Ping(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
@@ -310,16 +310,6 @@ func (c *conn) Close(ctx context.Context) error {
 	}
 	c.closeOnce.Do(c.client.Close)
 	return nil
-}
-
-type unsupportedAdmin struct{}
-
-func (unsupportedAdmin) EnsureTopology(context.Context, driver.TopologySpec) (driver.TopologyDiff, error) {
-	return driver.TopologyDiff{}, driver.ErrUnsupported
-}
-
-func (unsupportedAdmin) DescribeTopology(context.Context, []string) (driver.TopologyState, error) {
-	return driver.TopologyState{}, driver.ErrUnsupported
 }
 
 func validateSASLCredentials(settings *driver.SASLConfig) error {
