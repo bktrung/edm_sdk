@@ -141,7 +141,7 @@ $(APIDIFF): tools/apidiff/go.mod tools/apidiff/go.sum
 $(APIDIFF_NORMALIZE): tools/apidiff/normalize.go tools/apidiff/go.mod tools/apidiff/go.sum
 	cd tools/apidiff && go build -o ../../.tools/bin/apidiff-normalize .
 
-.PHONY: broker-up broker-down broker-reset broker-smoke test-rabbitmq
+.PHONY: broker-up broker-down broker-reset broker-smoke test-rabbitmq test-kafka kafka-up kafka-down
 
 ## test-rabbitmq: run the RabbitMQ driver suite against the fixture, starting it
 ## first. F1_REQUIRE_RABBITMQ makes an unreachable broker a failure rather than a
@@ -149,6 +149,19 @@ $(APIDIFF_NORMALIZE): tools/apidiff/normalize.go tools/apidiff/go.mod tools/apid
 ## broker is left running for repeat runs; stop it with broker-down.
 test-rabbitmq: broker-up broker-smoke
 	F1_REQUIRE_RABBITMQ=1 go test -race -count=1 ./drivers/rabbitmq/...
+
+## test-kafka: run the Kafka driver suite against the fixture, starting it first.
+## F1_REQUIRE_KAFKA makes an unreachable broker a failure rather than a skip.
+test-kafka: kafka-up
+	F1_REQUIRE_KAFKA=1 go test -race -count=1 ./drivers/kafka/...
+
+## kafka-up: start the pinned local Kafka fixture without starting RabbitMQ.
+kafka-up:
+	docker compose -f docker/docker-compose.yml up -d kafka
+
+## kafka-down: stop the Kafka fixture and keep its named volume.
+kafka-down:
+	docker compose -f docker/docker-compose.yml stop kafka
 
 ## broker-up: start the pinned local RabbitMQ fixture.
 broker-up:
