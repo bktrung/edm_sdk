@@ -99,9 +99,14 @@ func (Driver) Open(ctx context.Context, cfg driver.Config) (driver.Conn, error) 
 		defer cancel()
 	}
 
+	// The port's durability promise must not depend on franz-go's defaults. No
+	// repository test can observe a leader-only acknowledgement during a broker
+	// failure, so keep all-ISR acknowledgements explicit. Idempotent writes
+	// remain enabled by not opting into DisableIdempotentWrite.
 	opts := []kgo.Opt{
 		kgo.SeedBrokers(cfg.Endpoints...),
 		kgo.ClientID(cfg.ClientID),
+		kgo.RequiredAcks(kgo.AllISRAcks()),
 	}
 	if cfg.TLS != nil && cfg.TLS.Enabled {
 		if err := validateTLSConfig(cfg.Endpoints, cfg.TLS); err != nil {
@@ -284,8 +289,12 @@ func (c *conn) BrokerInfo() driver.BrokerInfo {
 	return info
 }
 
-func (c *conn) Producer(context.Context, driver.ProducerConfig) (driver.Producer, error) {
-	return nil, driver.ErrUnsupported
+func (c *conn) Producer(ctx context.Context, cfg driver.ProducerConfig) (driver.Producer, error) {
+	_ = cfg
+	if err := ctx.Err(); err != nil {
+		return nil, classify("producer", driver.KindTransient, err)
+	}
+	return &producer{client: c.client}, nil
 }
 
 func (c *conn) Consumer(context.Context, driver.ConsumerConfig) (driver.Consumer, error) {
@@ -424,6 +433,10 @@ func kafkaErrorKind(err error) driver.Kind {
 		errors.Is(err, kerr.TransactionalIDAuthorizationFailed),
 		errors.Is(err, kerr.DelegationTokenAuthorizationFailed):
 		return driver.KindPermission
+	case errors.Is(err, kerr.MessageTooLarge):
+		return driver.KindTooLarge
+	case errors.Is(err, kerr.UnknownTopicOrPartition):
+		return driver.KindNotFound
 	case errors.Is(err, kerr.SaslAuthenticationFailed),
 		errors.Is(err, kerr.UnsupportedSaslMechanism),
 		errors.Is(err, kerr.IllegalSaslState),
