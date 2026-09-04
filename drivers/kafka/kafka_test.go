@@ -3,6 +3,7 @@ package kafka
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net"
 	"reflect"
 	"strconv"
@@ -11,6 +12,7 @@ import (
 	"time"
 
 	"github.com/twmb/franz-go/pkg/kadm"
+	"github.com/twmb/franz-go/pkg/kerr"
 	"github.com/twmb/franz-go/pkg/kgo"
 
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/driver"
@@ -77,6 +79,38 @@ func TestCapabilityCeilingAndReduction(t *testing.T) {
 	}
 	if !reflect.DeepEqual(strict, wantStrict) {
 		t.Fatalf("classic Strict() = %#v, want %#v", strict, wantStrict)
+	}
+}
+
+func TestKafkaErrorKind(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+		want driver.Kind
+	}{
+		{name: "permission/topic", err: fmt.Errorf("wrapped: %w", kerr.TopicAuthorizationFailed), want: driver.KindPermission},
+		{name: "permission/group", err: fmt.Errorf("wrapped: %w", kerr.GroupAuthorizationFailed), want: driver.KindPermission},
+		{name: "permission/cluster", err: fmt.Errorf("wrapped: %w", kerr.ClusterAuthorizationFailed), want: driver.KindPermission},
+		{name: "permission/transactional-id", err: fmt.Errorf("wrapped: %w", kerr.TransactionalIDAuthorizationFailed), want: driver.KindPermission},
+		{name: "permission/delegation-token", err: fmt.Errorf("wrapped: %w", kerr.DelegationTokenAuthorizationFailed), want: driver.KindPermission},
+		{name: "too large", err: fmt.Errorf("wrapped: %w", kerr.MessageTooLarge), want: driver.KindTooLarge},
+		{name: "not found", err: fmt.Errorf("wrapped: %w", kerr.UnknownTopicOrPartition), want: driver.KindNotFound},
+		{name: "fatal/sasl-authentication", err: fmt.Errorf("wrapped: %w", kerr.SaslAuthenticationFailed), want: driver.KindFatal},
+		{name: "fatal/unsupported-sasl", err: fmt.Errorf("wrapped: %w", kerr.UnsupportedSaslMechanism), want: driver.KindFatal},
+		{name: "fatal/illegal-sasl-state", err: fmt.Errorf("wrapped: %w", kerr.IllegalSaslState), want: driver.KindFatal},
+		{name: "fatal/unsupported-version", err: fmt.Errorf("wrapped: %w", kerr.UnsupportedVersion), want: driver.KindFatal},
+		{name: "fatal/invalid-request", err: fmt.Errorf("wrapped: %w", kerr.InvalidRequest), want: driver.KindFatal},
+		{name: "fatal/security-disabled", err: fmt.Errorf("wrapped: %w", kerr.SecurityDisabled), want: driver.KindFatal},
+		{name: "fatal/broker-config", err: fmt.Errorf("wrapped: %w", errBrokerConfig), want: driver.KindFatal},
+		{name: "fatal/protocol-response", err: fmt.Errorf("wrapped: %w", errProtocolResponse), want: driver.KindFatal},
+		{name: "transient default", err: errors.New("unrecognised Kafka error"), want: driver.KindTransient},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := kafkaErrorKind(tc.err); got != tc.want {
+				t.Fatalf("kafkaErrorKind(%v) = %v, want %v", tc.err, got, tc.want)
+			}
+		})
 	}
 }
 
