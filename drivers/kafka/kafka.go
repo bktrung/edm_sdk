@@ -55,13 +55,14 @@ const classicMode consumeMode = "classic"
 // conn owns the single client used for connection, producer, and metadata
 // operations. Consumer instances use cloned options so each can own its group.
 type conn struct {
-	client     *kgo.Client
-	clientOpts []kgo.Opt
-	caps       driver.Capabilities
-	info       driver.BrokerInfo
-	consumers  map[*consumer]struct{}
-	mu         sync.RWMutex
-	closeOnce  sync.Once
+	client        *kgo.Client
+	clientOpts    []kgo.Opt
+	driverOptions map[string]string
+	caps          driver.Capabilities
+	info          driver.BrokerInfo
+	consumers     map[*consumer]struct{}
+	mu            sync.RWMutex
+	closeOnce     sync.Once
 }
 
 // Name returns the stable Kafka driver key.
@@ -182,11 +183,12 @@ func (Driver) Open(ctx context.Context, cfg driver.Config) (driver.Conn, error) 
 	caps := classicCapabilities(messageMaxBytes)
 	keepClient = true
 	return &conn{
-		client:     client,
-		clientOpts: append([]kgo.Opt(nil), opts...),
-		caps:       caps,
-		info:       info,
-		consumers:  make(map[*consumer]struct{}),
+		client:        client,
+		clientOpts:    append([]kgo.Opt(nil), opts...),
+		driverOptions: maps.Clone(cfg.DriverOptions),
+		caps:          caps,
+		info:          info,
+		consumers:     make(map[*consumer]struct{}),
 	}, nil
 }
 

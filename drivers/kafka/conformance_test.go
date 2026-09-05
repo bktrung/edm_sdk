@@ -47,6 +47,7 @@ func kafkaInspector(raw driver.Conn) (conformance.Inspect, error) {
 		var (
 			group     string
 			unsettled int64
+			discarded int64
 		)
 		matches := 0
 		for _, consumer := range active {
@@ -56,6 +57,11 @@ func kafkaInspector(raw driver.Conn) (conformance.Inspect, error) {
 				matches++
 				group = consumer.group
 				unsettled = int64(consumer.unsettled[destination])
+				for key, offsets := range consumer.discarded {
+					if key.destination == destination {
+						discarded += int64(len(offsets))
+					}
+				}
 			}
 			consumer.mu.Unlock()
 		}
@@ -110,9 +116,10 @@ func kafkaInspector(raw driver.Conn) (conformance.Inspect, error) {
 			}
 		}
 		// Kafka reports committed and retained offsets, not deliveries already
-		// handed to Messages. Keep those driver-held deliveries in Unsettled so
-		// Ready remains the broker backlog after the inspector's subtraction.
+		// handed to Messages. Keep those driver-held deliveries in Unsettled, and
+		// subtract discarded holes that wait behind a requeued offset.
 		ready -= unsettled
+		ready -= discarded
 		if ready < 0 {
 			ready = 0
 		}

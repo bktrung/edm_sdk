@@ -8,12 +8,14 @@ import (
 	"testing"
 	"time"
 
+	"github.com/twmb/franz-go/pkg/kadm"
+
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/driver"
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/driver/conformance"
 )
 
 func TestPauseReasonSet(t *testing.T) {
-	reasons := []pauseReason{pauseReasonDeferred, pauseReasonPrefetch, pauseReasonUserPaused}
+	reasons := []pauseReason{pauseReasonDeferred, pauseReasonPrefetch, pauseReasonAckGap, pauseReasonUserPaused}
 	orders := [][]pauseReason{
 		{reasons[0], reasons[1], reasons[2]},
 		{reasons[0], reasons[2], reasons[1]},
@@ -50,6 +52,195 @@ func TestPauseReasonSet(t *testing.T) {
 	}
 	if !set.remove(pauseReasonPrefetch) {
 		t.Fatal("removing the second reason did not become empty")
+	}
+}
+
+func openKafkaConsumerTest(t *testing.T, options map[string]string) (context.Context, *conn, *kadm.Client) {
+	t.Helper()
+	requireBroker(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	t.Cleanup(cancel)
+	opened, err := (Driver{}).Open(ctx, driver.Config{
+		Endpoints:     []string{kafkaEndpoint},
+		ClientID:      "f1-kafka-consumer-test",
+		DriverOptions: options,
+	})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	connection, ok := opened.(*conn)
+	if !ok {
+		t.Fatalf("Open() returned %T, want *conn", opened)
+	}
+	t.Cleanup(func() { _ = connection.Close(context.Background()) })
+	return ctx, connection, kadm.NewClient(connection.client)
+}
+
+func TestConsumerAckGapPause(t *testing.T) {
+	ctx, connection, admin := openKafkaConsumerTest(t, map[string]string{"kafka.maxAckGap": "1"})
+	topic := kafkaTestTopic(t, "consumer-ack-gap")
+	group := kafkaTestTopic(t, "consumer-ack-gap-group")
+	cleanupKafkaTopics(t, admin, topic)
+	cleanupKafkaGroups(t, admin, group)
+	createKafkaTopic(t, admin, ctx, topic, 1)
+
+	producer, err := connection.Producer(ctx, driver.ProducerConfig{RequireDurableAck: true, Effective: connection.Capabilities()})
+	if err != nil {
+		t.Fatalf("Producer: %v", err)
+	}
+	defer func() { _ = producer.Close(context.Background()) }()
+	publishKafkaCount(t, producer, ctx, topic, 3)
+
+	consumerValue, err := connection.Consumer(ctx, driver.ConsumerConfig{
+		Group: group, Destinations: []string{topic}, Prefetch: 3, Effective: connection.Capabilities(),
+	})
+	if err != nil {
+		t.Fatalf("Consumer: %v", err)
+	}
+	t.Cleanup(func() { closeKafkaConsumer(consumerValue) })
+	concrete := consumerValue.(*consumer)
+	messages := []driver.InboundMessage{
+		receiveKafkaMessage(t, consumerValue),
+		receiveKafkaMessage(t, consumerValue),
+		receiveKafkaMessage(t, consumerValue),
+	}
+	if err := messages[2].Settle.Ack(ctx); err != nil {
+		t.Fatalf("Ack(high offset): %v", err)
+	}
+	concrete.mu.Lock()
+	_, paused := concrete.pauseReasons[topic][pauseReasonAckGap]
+	concrete.mu.Unlock()
+	if !paused {
+		t.Fatalf("ack-gap pause reason missing after out-of-order Ack")
+	}
+	if err := messages[0].Settle.Nack(ctx, driver.NackOptions{Requeue: true}); err != nil {
+		t.Fatalf("Nack(first offset): %v", err)
+	}
+	redelivered := receiveKafkaMessage(t, consumerValue)
+	if redelivered.Ref.Offset != messages[0].Ref.Offset {
+		t.Fatalf("redelivery offset = %d, want %d", redelivered.Ref.Offset, messages[0].Ref.Offset)
+	}
+	if err := redelivered.Settle.Ack(ctx); err != nil {
+		t.Fatalf("Ack(redelivery): %v", err)
+	}
+	concrete.mu.Lock()
+	_, paused = concrete.pauseReasons[topic][pauseReasonAckGap]
+	concrete.mu.Unlock()
+	if paused {
+		t.Fatalf("ack-gap pause reason remained after gap returned to bound")
+	}
+	if err := messages[1].Settle.Ack(ctx); err != nil {
+		t.Fatalf("Ack(middle offset): %v", err)
+	}
+	if err := consumerValue.Stop(ctx); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+}
+
+func TestConsumerRequeueRedeliversInRun(t *testing.T) {
+	ctx, connection, admin := openKafkaAdminTest(t)
+	topic := kafkaTestTopic(t, "consumer-requeue")
+	group := kafkaTestTopic(t, "consumer-requeue-group")
+	cleanupKafkaTopics(t, admin, topic)
+	cleanupKafkaGroups(t, admin, group)
+	createKafkaTopic(t, admin, ctx, topic, 1)
+	producer, err := connection.Producer(ctx, driver.ProducerConfig{RequireDurableAck: true, Effective: connection.Capabilities()})
+	if err != nil {
+		t.Fatalf("Producer: %v", err)
+	}
+	defer func() { _ = producer.Close(context.Background()) }()
+	publishKafkaMessage(t, producer, ctx, topic, "requeue")
+
+	consumer, err := connection.Consumer(ctx, driver.ConsumerConfig{
+		Group: group, Destinations: []string{topic}, Prefetch: 1, Effective: connection.Capabilities(),
+	})
+	if err != nil {
+		t.Fatalf("Consumer: %v", err)
+	}
+	t.Cleanup(func() { closeKafkaConsumer(consumer) })
+	first := receiveKafkaMessage(t, consumer)
+	if err := consumer.Pause(topic); err != nil {
+		t.Fatalf("Pause: %v", err)
+	}
+	if err := first.Settle.Nack(ctx, driver.NackOptions{Requeue: true}); err != nil {
+		t.Fatalf("Nack(requeue): %v", err)
+	}
+	expectNoKafkaMessage(t, consumer, 200*time.Millisecond)
+	if err := consumer.Resume(topic); err != nil {
+		t.Fatalf("Resume: %v", err)
+	}
+	redelivered := receiveKafkaMessage(t, consumer)
+	if redelivered.Ref.Offset != first.Ref.Offset || !bytes.Equal(redelivered.Body, first.Body) {
+		t.Fatalf("redelivery = offset %d body %q, want offset %d body %q", redelivered.Ref.Offset, redelivered.Body, first.Ref.Offset, first.Body)
+	}
+	if err := redelivered.Settle.Ack(ctx); err != nil {
+		t.Fatalf("Ack(redelivery): %v", err)
+	}
+	if err := consumer.Stop(ctx); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+}
+
+func TestConsumerCommittedPrefixRestartsAtBase(t *testing.T) {
+	ctx, firstConnection, admin := openKafkaAdminTest(t)
+	topic := kafkaTestTopic(t, "consumer-prefix-restart")
+	group := kafkaTestTopic(t, "consumer-prefix-restart-group")
+	cleanupKafkaTopics(t, admin, topic)
+	cleanupKafkaGroups(t, admin, group)
+	createKafkaTopic(t, admin, ctx, topic, 1)
+	producer, err := firstConnection.Producer(ctx, driver.ProducerConfig{RequireDurableAck: true, Effective: firstConnection.Capabilities()})
+	if err != nil {
+		t.Fatalf("Producer: %v", err)
+	}
+	defer func() { _ = producer.Close(context.Background()) }()
+	publishKafkaCount(t, producer, ctx, topic, 3)
+
+	firstConsumer, err := firstConnection.Consumer(ctx, driver.ConsumerConfig{
+		Group: group, Destinations: []string{topic}, Prefetch: 3, Effective: firstConnection.Capabilities(),
+	})
+	if err != nil {
+		t.Fatalf("Consumer before restart: %v", err)
+	}
+	firstConcrete := firstConsumer.(*consumer)
+	firstMessages := []driver.InboundMessage{
+		receiveKafkaMessage(t, firstConsumer),
+		receiveKafkaMessage(t, firstConsumer),
+		receiveKafkaMessage(t, firstConsumer),
+	}
+	if err := firstMessages[0].Settle.Ack(ctx); err != nil {
+		t.Fatalf("Ack(prefix): %v", err)
+	}
+	firstConcrete.client.Close()
+
+	secondOpened, err := (Driver{}).Open(ctx, driver.Config{Endpoints: []string{kafkaEndpoint}, ClientID: "f1-kafka-prefix-restart"})
+	if err != nil {
+		t.Fatalf("Open after restart: %v", err)
+	}
+	secondConnection := secondOpened.(*conn)
+	t.Cleanup(func() { _ = secondConnection.Close(context.Background()) })
+	secondConsumer, err := secondConnection.Consumer(ctx, driver.ConsumerConfig{
+		Group: group, Destinations: []string{topic}, Prefetch: 3, Effective: secondConnection.Capabilities(),
+	})
+	if err != nil {
+		t.Fatalf("Consumer after restart: %v", err)
+	}
+	t.Cleanup(func() { closeKafkaConsumer(secondConsumer) })
+	redelivered := receiveKafkaMessage(t, secondConsumer)
+	if redelivered.Ref.Offset != 1 {
+		t.Fatalf("first offset after restart = %d, want committed base 1", redelivered.Ref.Offset)
+	}
+	if err := redelivered.Settle.Ack(ctx); err != nil {
+		t.Fatalf("Ack(first redelivery): %v", err)
+	}
+	remaining := receiveKafkaMessage(t, secondConsumer)
+	if remaining.Ref.Offset != 2 {
+		t.Fatalf("second offset after restart = %d, want 2", remaining.Ref.Offset)
+	}
+	if err := remaining.Settle.Ack(ctx); err != nil {
+		t.Fatalf("Ack(second redelivery): %v", err)
+	}
+	if err := secondConsumer.Stop(ctx); err != nil {
+		t.Fatalf("Stop after restart: %v", err)
 	}
 }
 
