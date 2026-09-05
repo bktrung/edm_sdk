@@ -6,6 +6,7 @@ VERSION := $(shell git describe --tags --dirty --always 2>/dev/null || echo dev)
 # Keep the linter version aligned with CI.
 GOLANGCI_LINT_VERSION := v2.12.2
 GOLANGCI_LINT := $(CURDIR)/.tools/bin/golangci-lint
+export GOLANGCI_LINT_CACHE := $(CURDIR)/.cache/golangci-lint
 
 export GOPRIVATE := fgit.zapps.vn
 
