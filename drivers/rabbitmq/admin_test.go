@@ -106,7 +106,7 @@ func publishPruneMessage(ctx context.Context, channel *amqp.Channel, confirmatio
 	}
 }
 
-func attachPruneConsumer(t *testing.T, ctx context.Context, destination string) {
+func attachPruneConsumer(t *testing.T, ctx context.Context, destination string) *amqp.Channel {
 	t.Helper()
 	raw, err := amqp.Dial(defaultEndpoint)
 	if err != nil {
@@ -143,12 +143,31 @@ func attachPruneConsumer(t *testing.T, ctx context.Context, destination string) 
 			t.Fatalf("QueueDeclarePassive(%q): %v", destination, err)
 		}
 		if queue.Consumers > 0 {
-			return
+			return channel
 		}
 		select {
 		case <-ctx.Done():
 			t.Fatalf("consumer for %q was not registered: %v", destination, ctx.Err())
 		case <-time.After(10 * time.Millisecond): //nolint:forbidigo // bounded polling interval for broker registration
+		}
+	}
+}
+
+func waitForPruneManagementConsumer(t *testing.T, ctx context.Context, facade *admin, destination string) {
+	t.Helper()
+	for {
+		queues, err := facade.operations.conn.management.listQueues(ctx)
+		if err != nil {
+			t.Fatalf("listQueues: %v", err)
+		}
+		queue, ok := findQueue(queues, destination)
+		if ok && queue.Consumers > 0 {
+			return
+		}
+		select {
+		case <-ctx.Done():
+			t.Fatalf("management snapshot for %q did not report a consumer: %v", destination, ctx.Err())
+		case <-time.After(10 * time.Millisecond): //nolint:forbidigo // bounded polling interval for broker statistics
 		}
 	}
 }
@@ -226,6 +245,58 @@ func TestPruneDoesNotDeleteQueueThatGainedAConsumer(t *testing.T) {
 				t.Fatalf("Prune result = %+v, want a non-deleted destination with reason %q", results, wantReason)
 			}
 			assertPruneQueuePresent(t, ctx, facade, destination, true)
+		})
+	}
+}
+
+func TestPruneDeletesQueueWhoseConsumerJustDetached(t *testing.T) {
+	for _, kind := range []queueKind{queueKindClassic, queueKindQuorum} {
+		t.Run(string(kind), func(t *testing.T) {
+			destination := "rabbitmq-driver-prune-detached-consumer-" + string(kind)
+			ctx, _, facade := setupPruneTest(t, kind, driver.DestinationSpec{Name: destination, Durable: true})
+			consumerChannel := attachPruneConsumer(t, ctx, destination)
+			waitForPruneManagementConsumer(t, ctx, facade, destination)
+
+			if err := consumerChannel.Close(); err != nil {
+				t.Fatalf("Close consumer channel: %v", err)
+			}
+			queues, err := facade.operations.conn.management.listQueues(ctx)
+			if err != nil {
+				t.Fatalf("listQueues after detach: %v", err)
+			}
+			queue, ok := findQueue(queues, destination)
+			if !ok || queue.Consumers == 0 {
+				t.Fatalf("management snapshot after detach for %q = %+v, want Consumers > 0", destination, queue)
+			}
+
+			results, err := facade.Prune(ctx, []string{destination})
+			if err != nil {
+				t.Fatalf("Prune: %v", err)
+			}
+			if len(results) != 1 || !results[0].Deleted || results[0].Reason != "" {
+				t.Fatalf("Prune result = %+v, want a deleted destination without a reason", results)
+			}
+			assertPruneQueuePresent(t, ctx, facade, destination, false)
+		})
+	}
+}
+
+func TestPruneRefusesDestinationWithALiveConsumer(t *testing.T) {
+	for _, kind := range []queueKind{queueKindClassic, queueKindQuorum} {
+		t.Run(string(kind), func(t *testing.T) {
+			destination := "rabbitmq-driver-prune-live-consumer-" + string(kind)
+			ctx, _, facade := setupPruneTest(t, kind, driver.DestinationSpec{Name: destination, Durable: true})
+			_ = attachPruneConsumer(t, ctx, destination)
+			waitForPruneManagementConsumer(t, ctx, facade, destination)
+
+			results, err := facade.Prune(ctx, []string{destination})
+			if err != nil {
+				t.Fatalf("Prune: %v", err)
+			}
+			wantReason := fmt.Sprintf("destination %q has consumers attached", destination)
+			if len(results) != 1 || results[0].Deleted || results[0].Reason != wantReason {
+				t.Fatalf("Prune result = %+v, want a non-deleted destination with reason %q", results, wantReason)
+			}
 		})
 	}
 }
