@@ -15,7 +15,200 @@ type admin struct {
 	client *kadm.Client
 }
 
-var _ driver.Admin = (*admin)(nil)
+var (
+	_ driver.Admin       = (*admin)(nil)
+	_ driver.Maintenance = (*admin)(nil)
+)
+
+// maintenanceGate serializes destructive metadata sequences. Conn.Admin
+// creates a fresh facade for each call, so a receiver mutex would not
+// coordinate two Purge calls sharing the same broker client: without
+// serialization, both can read the same low watermark and both report the
+// same records as removed. Channel acquisition remains context-aware.
+var maintenanceGate = make(chan struct{}, 1)
+
+func acquireMaintenance(ctx context.Context) error {
+	select {
+	case maintenanceGate <- struct{}{}:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func releaseMaintenance() {
+	<-maintenanceGate
+}
+
+func missingPurgeDestinationError(destination string, cause error) error {
+	if cause == nil {
+		cause = driver.ErrDestinationMissing
+	} else {
+		cause = errors.Join(driver.ErrDestinationMissing, cause)
+	}
+	return classify("purge", driver.KindNotFound, fmt.Errorf("destination %q is missing: %w", destination, cause))
+}
+
+// Purge advances every partition's low watermark to its current end offset
+// and returns the number of records removed. The destination remains present.
+func (a *admin) Purge(ctx context.Context, destination string) (int64, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, classify("purge", driver.KindTransient, err)
+	}
+	if err := acquireMaintenance(ctx); err != nil {
+		return 0, classify("purge", driver.KindTransient, err)
+	}
+	defer releaseMaintenance()
+	starts, ends, err := a.listTopicOffsets(ctx, "purge", destination)
+	if err != nil {
+		if errors.Is(err, kerr.UnknownTopicOrPartition) {
+			return 0, missingPurgeDestinationError(destination, err)
+		}
+		return 0, err
+	}
+	startPartitions, ok := starts[destination]
+	if !ok {
+		return 0, missingPurgeDestinationError(destination, nil)
+	}
+	endPartitions, ok := ends[destination]
+	if !ok {
+		return 0, missingPurgeDestinationError(destination, nil)
+	}
+
+	offsets := make(kadm.Offsets)
+	for partition, end := range endPartitions {
+		if end.Err != nil {
+			if errors.Is(end.Err, kerr.UnknownTopicOrPartition) {
+				return 0, missingPurgeDestinationError(destination, end.Err)
+			}
+			return 0, classifyAdminError("purge", end.Err)
+		}
+		start, ok := startPartitions[partition]
+		if !ok {
+			return 0, classify("purge", driver.KindFatal, fmt.Errorf("kafka: start offset missing for %s[%d]", destination, partition))
+		}
+		if start.Err != nil {
+			if errors.Is(start.Err, kerr.UnknownTopicOrPartition) {
+				return 0, missingPurgeDestinationError(destination, start.Err)
+			}
+			return 0, classifyAdminError("purge", start.Err)
+		}
+		offsets.AddOffset(destination, partition, end.Offset, end.LeaderEpoch)
+	}
+
+	responses, err := a.client.DeleteRecords(ctx, offsets)
+	if err != nil {
+		return 0, classifyAdminError("purge", err)
+	}
+	var removed int64
+	for partition := range endPartitions {
+		response, ok := responses.Lookup(destination, partition)
+		if !ok {
+			return 0, classify("purge", driver.KindFatal, fmt.Errorf("kafka: delete records response missing for %s[%d]", destination, partition))
+		}
+		if response.Err != nil {
+			return 0, classifyAdminError("purge", response.Err)
+		}
+		removed += response.LowWatermark - startPartitions[partition].Offset
+	}
+	return removed, nil
+}
+
+// Prune deletes empty, unattached destinations and reports a reason for each
+// destination that is missing, non-empty, or still assigned to a consumer.
+func (a *admin) Prune(ctx context.Context, names []string) ([]driver.PruneResult, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, classify("prune", driver.KindTransient, err)
+	}
+	if err := acquireMaintenance(ctx); err != nil {
+		return nil, classify("prune", driver.KindTransient, err)
+	}
+	defer releaseMaintenance()
+	results := make([]driver.PruneResult, 0, len(names))
+	for _, name := range names {
+		reason, err := a.pruneGuard(ctx, name)
+		if err != nil {
+			return nil, err
+		}
+		if reason != "" {
+			results = append(results, driver.PruneResult{Name: name, Reason: reason})
+			continue
+		}
+
+		// Kafka has no conditional delete. A consumer can attach after the
+		// guard and before DeleteTopics, so this check-then-delete window can
+		// still destroy a newly attached destination; the port has no atomic
+		// compare-and-delete operation with which to close it.
+		reason, err = a.pruneGuard(ctx, name)
+		if err != nil {
+			return nil, err
+		}
+		if reason != "" {
+			results = append(results, driver.PruneResult{Name: name, Reason: reason})
+			continue
+		}
+		responses, err := a.client.DeleteTopics(ctx, name)
+		if err != nil {
+			return nil, classifyAdminError("prune", err)
+		}
+		response, ok := responses[name]
+		if !ok {
+			return nil, classify("prune", driver.KindFatal, fmt.Errorf("kafka: delete topic response missing %q", name))
+		}
+		if response.Err != nil {
+			if errors.Is(response.Err, kerr.UnknownTopicOrPartition) {
+				results = append(results, driver.PruneResult{Name: name, Reason: "destination does not exist"})
+				continue
+			}
+			return nil, classifyAdminError("prune", response.Err)
+		}
+		results = append(results, driver.PruneResult{Name: name, Deleted: true})
+	}
+	return results, nil
+}
+
+func (a *admin) pruneGuard(ctx context.Context, name string) (string, error) {
+	starts, ends, err := a.listTopicOffsets(ctx, "prune", name)
+	if err != nil {
+		return "", err
+	}
+	depth, present, err := topicDepth(name, starts, ends)
+	if err != nil {
+		return "", classifyAdminError("prune", err)
+	}
+	if !present {
+		return "destination does not exist", nil
+	}
+	if depth != 0 {
+		return fmt.Sprintf("destination holds %d records", depth), nil
+	}
+
+	groups, err := a.client.ListGroups(ctx)
+	if err != nil {
+		return "", classifyAdminError("prune", err)
+	}
+	if len(groups) == 0 {
+		return "", nil
+	}
+	described, err := a.client.DescribeGroups(ctx, groups.Groups()...)
+	if err != nil {
+		return "", classifyAdminError("prune", err)
+	}
+	for _, group := range described {
+		if group.Err != nil && !errors.Is(group.Err, kerr.GroupIDNotFound) {
+			return "", classifyAdminError("prune", group.Err)
+		}
+	}
+	for _, topic := range described.AssignedPartitions().Topics() {
+		if topic == name {
+			// This guard reads live group metadata for every call. Unlike a
+			// cached management snapshot, it does not retain stale consumers
+			// after they have detached.
+			return "consumer attached", nil
+		}
+	}
+	return "", nil
+}
 
 // EnsureTopology accepts exchanges, bindings, DeadLetter, and DeliveryLimit
 // fields, but Kafka does not honor them: routing is FanoutAtConsume, native
@@ -77,7 +270,8 @@ func classifyAdminError(operation string, err error) error {
 	case errors.Is(err, kerr.InvalidTopicException),
 		errors.Is(err, kerr.InvalidPartitions),
 		errors.Is(err, kerr.InvalidReplicationFactor),
-		errors.Is(err, kerr.InvalidConfig):
+		errors.Is(err, kerr.InvalidConfig),
+		errors.Is(err, kerr.TopicDeletionDisabled):
 		kind = driver.KindFatal
 	}
 	return classify(operation, kind, err)

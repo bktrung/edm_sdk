@@ -52,12 +52,16 @@ type consumeMode string
 
 const classicMode consumeMode = "classic"
 
-// conn owns the single client used for liveness and metadata operations.
+// conn owns the single client used for connection, producer, and metadata
+// operations. Consumer instances use cloned options so each can own its group.
 type conn struct {
-	client    *kgo.Client
-	caps      driver.Capabilities
-	info      driver.BrokerInfo
-	closeOnce sync.Once
+	client     *kgo.Client
+	clientOpts []kgo.Opt
+	caps       driver.Capabilities
+	info       driver.BrokerInfo
+	consumers  map[*consumer]struct{}
+	mu         sync.RWMutex
+	closeOnce  sync.Once
 }
 
 // Name returns the stable Kafka driver key.
@@ -177,7 +181,13 @@ func (Driver) Open(ctx context.Context, cfg driver.Config) (driver.Conn, error) 
 	info := brokerInfo(metadata, versionResponse)
 	caps := classicCapabilities(messageMaxBytes)
 	keepClient = true
-	return &conn{client: client, caps: caps, info: info}, nil
+	return &conn{
+		client:     client,
+		clientOpts: append([]kgo.Opt(nil), opts...),
+		caps:       caps,
+		info:       info,
+		consumers:  make(map[*consumer]struct{}),
+	}, nil
 }
 
 func resolveMode(options map[string]string) (consumeMode, error) {
@@ -297,8 +307,8 @@ func (c *conn) Producer(ctx context.Context, cfg driver.ProducerConfig) (driver.
 	return &producer{client: c.client}, nil
 }
 
-func (c *conn) Consumer(context.Context, driver.ConsumerConfig) (driver.Consumer, error) {
-	return nil, driver.ErrUnsupported
+func (c *conn) Consumer(ctx context.Context, cfg driver.ConsumerConfig) (driver.Consumer, error) {
+	return newConsumer(ctx, c, cfg)
 }
 
 func (c *conn) Admin() driver.Admin { return &admin{client: kadm.NewClient(c.client)} }
