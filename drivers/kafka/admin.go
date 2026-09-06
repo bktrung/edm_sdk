@@ -191,6 +191,18 @@ func (a *admin) pruneGuard(ctx context.Context, name string) (string, error) {
 	if depth != 0 {
 		return fmt.Sprintf("destination holds %d records", depth), nil
 	}
+	if a.conn != nil {
+		a.conn.mu.RLock()
+		for csm := range a.conn.consumers {
+			for _, dest := range csm.destinations {
+				if dest == name {
+					a.conn.mu.RUnlock()
+					return "consumer attached", nil
+				}
+			}
+		}
+		a.conn.mu.RUnlock()
+	}
 
 	groups, err := a.client.ListGroups(ctx)
 	if err != nil {
@@ -207,13 +219,21 @@ func (a *admin) pruneGuard(ctx context.Context, name string) (string, error) {
 		if group.Err != nil && !errors.Is(group.Err, kerr.GroupIDNotFound) {
 			return "", classifyAdminError("prune", group.Err)
 		}
-	}
-	for _, topic := range described.AssignedPartitions().Topics() {
-		if topic == name {
-			// This guard reads live group metadata for every call. Unlike a
-			// cached management snapshot, it does not retain stale consumers
-			// after they have detached.
-			return "consumer attached", nil
+		for _, member := range group.Members {
+			if joinConsumer, ok := member.Join.AsConsumer(); ok {
+				for _, topic := range joinConsumer.Topics {
+					if topic == name {
+						return "consumer attached", nil
+					}
+				}
+			}
+			if assignConsumer, ok := member.Assigned.AsConsumer(); ok {
+				for _, t := range assignConsumer.Topics {
+					if t.Topic == name {
+						return "consumer attached", nil
+					}
+				}
+			}
 		}
 	}
 	return "", nil
@@ -301,7 +321,7 @@ func classifyAdminError(operation string, err error) error {
 	}
 	kind := kafkaErrorKind(err)
 	switch {
-	case errors.Is(err, kerr.UnknownTopicOrPartition):
+	case errors.Is(err, kerr.UnknownTopicOrPartition), errors.Is(err, kerr.UnknownTopicID):
 		kind = driver.KindNotFound
 	case errors.Is(err, kerr.InvalidTopicException),
 		errors.Is(err, kerr.InvalidPartitions),

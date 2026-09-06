@@ -111,7 +111,7 @@ func (a *admin) verifyTopology(ctx context.Context, spec driver.TopologySpec) (d
 		}
 		detail, ok := topics[destination.Name]
 		if !ok || errors.Is(detail.Err, kerr.UnknownTopicOrPartition) {
-			return driver.TopologyDiff{}, missingDestinationError(destination.Name)
+			return driver.TopologyDiff{}, missingDestinationError("ensure_topology", destination.Name)
 		}
 		if detail.Err != nil {
 			return driver.TopologyDiff{}, classifyAdminError("ensure_topology", detail.Err)
@@ -128,6 +128,15 @@ func (a *admin) verifyTopology(ctx context.Context, spec driver.TopologySpec) (d
 				})
 			}
 		}
+		if destination.DeliveryLimit > 0 {
+			return driver.TopologyDiff{}, classify("ensure_topology", driver.KindFatal, fmt.Errorf("destination %q delivery limit verification unsupported: %w", destination.Name, driver.ErrUnsupported))
+		}
+		if destination.DeadLetter != nil {
+			return driver.TopologyDiff{}, classify("ensure_topology", driver.KindFatal, fmt.Errorf("destination %q dead letter verification unsupported: %w", destination.Name, driver.ErrUnsupported))
+		}
+		if destination.Delay > 0 {
+			return driver.TopologyDiff{}, classify("ensure_topology", driver.KindFatal, fmt.Errorf("destination %q delay verification unsupported: %w", destination.Name, driver.ErrUnsupported))
+		}
 	}
 	return diff, nil
 }
@@ -136,22 +145,27 @@ func (a *admin) verifyTopology(ctx context.Context, spec driver.TopologySpec) (d
 // consumer group input, so the phase that introduces consumer groups must decide
 // whether this port should expose consumer lag instead.
 func (a *admin) describeTopology(ctx context.Context, names []string) (driver.TopologyState, error) {
-	state := driver.TopologyState{Depth: make(map[string]int64, len(names))}
 	if len(names) == 0 {
-		return state, nil
+		return driver.TopologyState{Depth: make(map[string]int64)}, nil
 	}
 	starts, ends, err := a.listTopicOffsets(ctx, "describe_topology", names...)
 	if err != nil {
 		return driver.TopologyState{}, err
 	}
+	return evaluateTopicDepths(names, starts, ends)
+}
+
+func evaluateTopicDepths(names []string, starts, ends kadm.ListedOffsets) (driver.TopologyState, error) {
+	state := driver.TopologyState{Depth: make(map[string]int64, len(names))}
 	for _, name := range names {
 		depth, present, err := topicDepth(name, starts, ends)
 		if err != nil {
 			return driver.TopologyState{}, classifyAdminError("describe_topology", err)
 		}
-		if present {
-			state.Depth[name] = depth
+		if !present {
+			return driver.TopologyState{}, missingDestinationError("describe_topology", name)
 		}
+		state.Depth[name] = depth
 	}
 	return state, nil
 }
@@ -164,8 +178,8 @@ func destinationNames(destinations []driver.DestinationSpec) []string {
 	return names
 }
 
-func missingDestinationError(name string) error {
-	return classify("ensure_topology", driver.KindNotFound, fmt.Errorf("destination %q is missing: %w", name, driver.ErrDestinationMissing))
+func missingDestinationError(operation, name string) error {
+	return classify(operation, driver.KindNotFound, fmt.Errorf("destination %q is missing: %w", name, driver.ErrDestinationMissing))
 }
 
 // topicDepth computes retained records as end.Offset - start.Offset summed over
@@ -173,17 +187,17 @@ func missingDestinationError(name string) error {
 // from an existing topic with zero retained records.
 func topicDepth(name string, starts, ends kadm.ListedOffsets) (int64, bool, error) {
 	endPartitions, ok := ends[name]
-	if !ok {
+	if !ok || len(endPartitions) == 0 {
 		return 0, false, nil
 	}
 	startPartitions, ok := starts[name]
-	if !ok {
+	if !ok || len(startPartitions) == 0 {
 		return 0, false, nil
 	}
 	var depth int64
 	for partition, end := range endPartitions {
 		if end.Err != nil {
-			if errors.Is(end.Err, kerr.UnknownTopicOrPartition) {
+			if errors.Is(end.Err, kerr.UnknownTopicOrPartition) || errors.Is(end.Err, kerr.UnknownTopicID) {
 				return 0, false, nil
 			}
 			return 0, false, end.Err
@@ -193,7 +207,7 @@ func topicDepth(name string, starts, ends kadm.ListedOffsets) (int64, bool, erro
 			return 0, false, nil
 		}
 		if start.Err != nil {
-			if errors.Is(start.Err, kerr.UnknownTopicOrPartition) {
+			if errors.Is(start.Err, kerr.UnknownTopicOrPartition) || errors.Is(start.Err, kerr.UnknownTopicID) {
 				return 0, false, nil
 			}
 			return 0, false, start.Err
