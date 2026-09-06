@@ -461,6 +461,215 @@ func TestDispatchMaxAttemptsCarriesHandlerDetails(t *testing.T) {
 	}
 }
 
+func TestDispatchRetryCapUsesSubscriptionCeiling(t *testing.T) {
+	producer := &dispatchProducer{}
+	client, runner := newRetryBridgeRunner(t, producer, "orders.created")
+	defer func() { _ = client.Close(context.Background()) }()
+
+	runner.subscription.Retry.MaxAttempts = 2
+	runner.subscription.Handlers = map[string]Handler{
+		"orders.created.v1": HandlerFunc(func(context.Context, *Event) error {
+			return errors.New("temporary")
+		}),
+	}
+	envelope := Envelope{
+		SpecVersion: "1.0",
+		ID:          "retry-cap-ceiling",
+		Source:      "/test/orders",
+		Type:        "orders.created.v1",
+		Priority:    PriorityHigh,
+		Attempt:     2,
+		MaxAttempts: 100,
+	}
+	if !dispatchMessage(runner, context.Background(), retryBridgeMessage(t, envelope, &dispatchSettler{}), &Envelope{}, new(bool)) {
+		t.Fatal("retry-cap ceiling message was not settled")
+	}
+	if got := headerValue(producer.messages[0].Headers, "f1deathreason"); got != ReasonMaxAttempts.String() {
+		t.Fatalf("retry-cap ceiling death reason = %q, want %q", got, ReasonMaxAttempts)
+	}
+}
+
+func TestDispatchRetryCapCanLowerSubscriptionPolicy(t *testing.T) {
+	producer := &dispatchProducer{}
+	client, runner := newRetryBridgeRunner(t, producer, "orders.created")
+	defer func() { _ = client.Close(context.Background()) }()
+
+	runner.subscription.Handlers = map[string]Handler{
+		"orders.created.v1": HandlerFunc(func(context.Context, *Event) error {
+			return errors.New("temporary")
+		}),
+	}
+	envelope := Envelope{
+		SpecVersion: "1.0",
+		ID:          "retry-cap-lowering",
+		Source:      "/test/orders",
+		Type:        "orders.created.v1",
+		Priority:    PriorityHigh,
+		Attempt:     1,
+		MaxAttempts: 1,
+	}
+	if !dispatchMessage(runner, context.Background(), retryBridgeMessage(t, envelope, &dispatchSettler{}), &Envelope{}, new(bool)) {
+		t.Fatal("retry-cap lowering message was not settled")
+	}
+	if got := headerValue(producer.messages[0].Headers, "f1deathreason"); got != ReasonMaxAttempts.String() {
+		t.Fatalf("retry-cap lowering death reason = %q, want %q", got, ReasonMaxAttempts)
+	}
+}
+
+func TestDispatchRetryCopyCarriesEffectiveRetryCap(t *testing.T) {
+	producer := &dispatchProducer{}
+	client, runner := newRetryBridgeRunner(t, producer, "orders.created")
+	defer func() { _ = client.Close(context.Background()) }()
+
+	runner.subscription.Retry.MaxAttempts = 2
+	runner.subscription.Handlers = map[string]Handler{
+		"orders.created.v1": HandlerFunc(func(context.Context, *Event) error {
+			return errors.New("temporary")
+		}),
+	}
+	envelope := Envelope{
+		SpecVersion: "1.0",
+		ID:          "retry-cap-propagation",
+		Source:      "/test/orders",
+		Type:        "orders.created.v1",
+		Priority:    PriorityHigh,
+		Attempt:     1,
+		MaxAttempts: 100,
+	}
+	if !dispatchMessage(runner, context.Background(), retryBridgeMessage(t, envelope, &dispatchSettler{}), &Envelope{}, new(bool)) {
+		t.Fatal("retry-cap propagation message was not settled")
+	}
+	if got := headerValue(producer.messages[0].Headers, "f1maxattempts"); got != "2" {
+		t.Fatalf("retry-copy max attempts = %q, want 2", got)
+	}
+}
+
+func TestDispatchHandlerSeesSubscriptionRetryCap(t *testing.T) {
+	producer := &dispatchProducer{}
+	client, runner := newRetryBridgeRunner(t, producer, "orders.created")
+	defer func() { _ = client.Close(context.Background()) }()
+
+	runner.subscription.Retry.MaxAttempts = 2
+	var got int
+	runner.subscription.Handlers = map[string]Handler{
+		"orders.created.v1": HandlerFunc(func(_ context.Context, event *Event) error {
+			got = event.MaxAttempts()
+			return nil
+		}),
+	}
+	envelope := Envelope{
+		SpecVersion: "1.0",
+		ID:          "handler-retry-cap",
+		Source:      "/test/orders",
+		Type:        "orders.created.v1",
+		Priority:    PriorityHigh,
+		Attempt:     1,
+		MaxAttempts: 100,
+	}
+	var dispatched Envelope
+	if !dispatchMessage(runner, context.Background(), retryBridgeMessage(t, envelope, &dispatchSettler{}), &dispatched, new(bool)) {
+		t.Fatal("handler retry-cap message was not settled")
+	}
+	if got != 2 {
+		t.Fatalf("handler max attempts = %d, want 2", got)
+	}
+	if dispatched.MaxAttempts != 100 {
+		t.Fatalf("dispatch envelope max attempts = %d, want raw value 100", dispatched.MaxAttempts)
+	}
+}
+
+func TestDispatchHandlerSeesLowerEventRetryCap(t *testing.T) {
+	producer := &dispatchProducer{}
+	client, runner := newRetryBridgeRunner(t, producer, "orders.created")
+	defer func() { _ = client.Close(context.Background()) }()
+
+	runner.subscription.Retry.MaxAttempts = 3
+	var got int
+	runner.subscription.Handlers = map[string]Handler{
+		"orders.created.v1": HandlerFunc(func(_ context.Context, event *Event) error {
+			got = event.MaxAttempts()
+			return nil
+		}),
+	}
+	envelope := Envelope{
+		SpecVersion: "1.0",
+		ID:          "handler-lower-retry-cap",
+		Source:      "/test/orders",
+		Type:        "orders.created.v1",
+		Priority:    PriorityHigh,
+		Attempt:     1,
+		MaxAttempts: 1,
+	}
+	if !dispatchMessage(runner, context.Background(), retryBridgeMessage(t, envelope, &dispatchSettler{}), &Envelope{}, new(bool)) {
+		t.Fatal("lower handler retry-cap message was not settled")
+	}
+	if got != 1 {
+		t.Fatalf("handler max attempts = %d, want 1", got)
+	}
+}
+
+func TestDispatchHandlerUsesPolicyWhenEventRetryCapAbsent(t *testing.T) {
+	producer := &dispatchProducer{}
+	client, runner := newRetryBridgeRunner(t, producer, "orders.created")
+	defer func() { _ = client.Close(context.Background()) }()
+
+	runner.subscription.Retry.MaxAttempts = 3
+	var got int
+	runner.subscription.Handlers = map[string]Handler{
+		"orders.created.v1": HandlerFunc(func(_ context.Context, event *Event) error {
+			got = event.MaxAttempts()
+			return nil
+		}),
+	}
+	envelope := Envelope{
+		SpecVersion: "1.0",
+		ID:          "handler-default-retry-cap",
+		Source:      "/test/orders",
+		Type:        "orders.created.v1",
+		Priority:    PriorityHigh,
+		Attempt:     1,
+	}
+	if !dispatchMessage(runner, context.Background(), retryBridgeMessage(t, envelope, &dispatchSettler{}), &Envelope{}, new(bool)) {
+		t.Fatal("absent handler retry-cap message was not settled")
+	}
+	if got != 3 {
+		t.Fatalf("handler max attempts = %d, want 3", got)
+	}
+}
+
+func TestEventFromDeliveryUsesEffectiveRetryCap(t *testing.T) {
+	producer := &dispatchProducer{}
+	recorder := newErrorHandlerRecorder()
+	client, runner := newRetryBridgeRunner(t, producer, "orders.created", WithErrorHandler(recorder.handle))
+	defer func() { _ = client.Close(context.Background()) }()
+	client.producerHandle = &retryBridgeFailingProducer{}
+	runner.subscription.Retry.MaxAttempts = 2
+
+	envelope := Envelope{
+		SpecVersion: "1.0",
+		ID:          "error-handler-retry-cap",
+		Source:      "/test/orders",
+		Type:        "orders.created.v1",
+		Priority:    PriorityHigh,
+		Attempt:     1,
+		MaxAttempts: 100,
+	}
+	message := retryBridgeMessage(t, envelope, &retryBridgeSettler{})
+	if retryAndSettle(runner, context.Background(), message, envelope, errors.New("temporary")) {
+		t.Fatal("failed retry successor hand-off was reported as successful")
+	}
+	recorder.waitForCall(t, time.Second)
+	recorder.mu.Lock()
+	call := recorder.calls[0]
+	recorder.mu.Unlock()
+	if call.event == nil {
+		t.Fatal("error handler event = nil, want failed delivery event")
+	}
+	if got := call.event.MaxAttempts(); got != 2 {
+		t.Fatalf("error handler max attempts = %d, want 2", got)
+	}
+}
+
 func TestRetryExhaustionCarriesHandlerDetails(t *testing.T) {
 	producer := &dispatchProducer{}
 	client, runner := newRetryBridgeRunner(t, producer, "orders.created")

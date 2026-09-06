@@ -222,6 +222,36 @@ func TestNonCooperativeHandlerIsReportedAsStuck(t *testing.T) {
 	}
 }
 
+func TestInvokeHandlerReturnsStuckForCancelledParent(t *testing.T) {
+	client, err := New(context.Background(), testClientConfig(t), WithDriver(&dispatchDriver{conn: &dispatchConn{producer: &dispatchProducer{}}}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = client.Close(context.Background()) })
+	handled := false
+	runner := &Runner{
+		client:       client,
+		group:        new(errgroup.Group),
+		subscription: Subscription{Name: "orders", HandlerTimeout: time.Second},
+	}
+	parent, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	result := invokeHandler(runner, parent, HandlerFunc(func(ctx context.Context, _ *Event) error {
+		handled = true
+		return ctx.Err()
+	}), &Event{})
+	if err := runner.group.Wait(); err != nil {
+		t.Fatalf("handler group wait = %v", err)
+	}
+	if !result.stuck {
+		t.Fatalf("invokeHandler() = %#v, want stuck result for a cancelled parent", result)
+	}
+	if handled {
+		t.Fatal("invokeHandler() launched a handler for a cancelled parent")
+	}
+}
+
 func TestInvokeHandlerReportsSequentialStuckThresholds(t *testing.T) {
 	fake := clock.NewFake(time.Unix(0, 0))
 	var output logSink

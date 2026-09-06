@@ -4,10 +4,12 @@ import (
 	"context"
 	"errors"
 	"math"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
 
+	"github.com/twmb/franz-go/pkg/kadm"
 	"github.com/twmb/franz-go/pkg/kerr"
 
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/driver"
@@ -95,6 +97,7 @@ func TestEnsureTopologyDrift(t *testing.T) {
 	destination := kafkaTestTopic(t, "drift")
 	cleanupKafkaTopics(t, admin, destination)
 	createKafkaTopic(t, admin, ctx, destination, 1)
+	produceKafkaRecords(t, connection.client, ctx, destination, 1)
 
 	diff, err := connection.Admin().EnsureTopology(ctx, driver.TopologySpec{
 		Policy:       driver.TopologyVerify,
@@ -133,15 +136,16 @@ func TestDescribeTopologyDepth(t *testing.T) {
 	createKafkaTopic(t, admin, ctx, destination, 1)
 	produceKafkaRecords(t, connection.client, ctx, destination, 5)
 
-	state, err := connection.Admin().DescribeTopology(ctx, []string{destination, missing})
+	state, err := connection.Admin().DescribeTopology(ctx, []string{destination})
 	if err != nil {
 		t.Fatalf("DescribeTopology before truncation: %v", err)
 	}
 	if got, ok := state.Depth[destination]; !ok || got != 5 {
 		t.Fatalf("Depth[%q] = %d, present=%t, want 5", destination, got, ok)
 	}
-	if _, ok := state.Depth[missing]; ok {
-		t.Fatalf("Depth contains missing destination %q, want it absent", missing)
+	_, err = connection.Admin().DescribeTopology(ctx, []string{missing})
+	if !errors.Is(err, driver.ErrDestinationMissing) {
+		t.Fatalf("DescribeTopology(%q) error = %v, want ErrDestinationMissing", missing, err)
 	}
 
 	endOffsets, err := admin.ListEndOffsets(ctx, destination)
@@ -162,5 +166,59 @@ func TestDescribeTopologyDepth(t *testing.T) {
 	}
 	if got := state.Depth[destination]; got != 0 {
 		t.Fatalf("Depth[%q] after truncation = %d, want 0", destination, got)
+	}
+}
+
+func TestDescribeTopologyReportsMissingDestinationPure(t *testing.T) {
+	_, err := evaluateTopicDepths([]string{"pure-missing"}, kadm.ListedOffsets{}, kadm.ListedOffsets{})
+	if err == nil {
+		t.Fatalf("evaluateTopicDepths missing destination returned nil error, want ErrDestinationMissing")
+	}
+	if !errors.Is(err, driver.ErrDestinationMissing) {
+		t.Fatalf("evaluateTopicDepths missing destination error = %v, want ErrDestinationMissing", err)
+	}
+	if kind, ok := driver.Classify(err); !ok || kind != driver.KindNotFound {
+		t.Fatalf("evaluateTopicDepths classification = (%v,%t), want not_found", kind, ok)
+	}
+}
+
+func TestTopologyVerifyRejectsUnsupportedDeliveryLimit(t *testing.T) {
+	ctx, connection, admin := openKafkaAdminTest(t)
+	destination := kafkaTestTopic(t, "verify-delivery-limit")
+	cleanupKafkaTopics(t, admin, destination)
+	createKafkaTopic(t, admin, ctx, destination, 1)
+
+	_, err := connection.Admin().EnsureTopology(ctx, driver.TopologySpec{
+		Policy:       driver.TopologyVerify,
+		Destinations: []driver.DestinationSpec{{Name: destination, DeliveryLimit: 5}},
+		Effective:    connection.Capabilities(),
+	})
+	if err == nil {
+		t.Fatalf("TopologyVerify with delivery limit returned clean diff, want unsupported error")
+	}
+	if !strings.Contains(err.Error(), "delivery limit") {
+		t.Fatalf("TopologyVerify error = %v, want delivery limit mentioned", err)
+	}
+	if kind, ok := driver.Classify(err); !ok || kind != driver.KindFatal {
+		t.Fatalf("TopologyVerify classification = (%v,%t), want fatal", kind, ok)
+	}
+}
+
+func TestFanoutAtConsumeCreatedDestinations(t *testing.T) {
+	ctx, connection, admin := openKafkaAdminTest(t)
+	first := kafkaTestTopic(t, "fanout-first")
+	second := kafkaTestTopic(t, "fanout-second")
+	cleanupKafkaTopics(t, admin, first, second)
+
+	diff, err := connection.Admin().EnsureTopology(ctx, driver.TopologySpec{
+		Destinations: []driver.DestinationSpec{{Name: first}, {Name: second}},
+		Bindings:     []driver.BindingSpec{{Source: "events.exchange", Destination: first}},
+		Effective:    driver.Capabilities{Fanout: driver.FanoutAtConsume},
+	})
+	if err != nil {
+		t.Fatalf("EnsureTopology: %v", err)
+	}
+	if !slices.Contains(diff.CreatedDestinations, first) || !slices.Contains(diff.CreatedDestinations, second) || len(diff.CreatedDestinations) != 2 {
+		t.Fatalf("fanout CreatedDestinations = %v, want exactly %q and %q", diff.CreatedDestinations, first, second)
 	}
 }

@@ -145,7 +145,7 @@ func (a *adminOperations) Prune(ctx context.Context, names []string) ([]driver.P
 	results := make([]driver.PruneResult, 0, len(names))
 	for _, name := range names {
 		result := driver.PruneResult{Name: name}
-		main, exists := findQueue(queues, name)
+		_, exists := findQueue(queues, name)
 		if !exists {
 			result.Reason = "destination does not exist"
 			results = append(results, result)
@@ -153,7 +153,7 @@ func (a *adminOperations) Prune(ctx context.Context, names []string) ([]driver.P
 		}
 		parkName := name + ".park"
 		_, hasPark := findQueue(queues, parkName)
-		mainReady, inspectErr := a.inspectQueue(ctx, name)
+		mainReady, mainConsumers, inspectErr := a.inspectQueueWithConsumers(ctx, name)
 		if inspectErr != nil {
 			result.Reason = "destination disappeared before deletion"
 			results = append(results, result)
@@ -168,7 +168,7 @@ func (a *adminOperations) Prune(ctx context.Context, names []string) ([]driver.P
 				continue
 			}
 		}
-		if reason := a.pruneReason(name, main, mainReady, hasPark, parkReady); reason != "" {
+		if reason := a.pruneReason(name, mainConsumers, mainReady, hasPark, parkReady); reason != "" {
 			result.Reason = reason
 			results = append(results, result)
 			continue
@@ -178,14 +178,14 @@ func (a *adminOperations) Prune(ctx context.Context, names []string) ([]driver.P
 			if err != nil {
 				return nil, classify("prune", driver.KindTransient, err)
 			}
-			main, exists = findQueue(queues, name)
+			_, exists = findQueue(queues, name)
 			_, hasPark = findQueue(queues, parkName)
 			if !exists {
 				result.Reason = "destination disappeared before deletion"
 				results = append(results, result)
 				continue
 			}
-			mainReady, inspectErr = a.inspectQueue(ctx, name)
+			mainReady, mainConsumers, inspectErr = a.inspectQueueWithConsumers(ctx, name)
 			if inspectErr != nil {
 				result.Reason = "destination disappeared before deletion"
 				results = append(results, result)
@@ -197,7 +197,7 @@ func (a *adminOperations) Prune(ctx context.Context, names []string) ([]driver.P
 				results = append(results, result)
 				continue
 			}
-			if reason := a.pruneReason(name, main, mainReady, hasPark, parkReady); reason != "" {
+			if reason := a.pruneReason(name, mainConsumers, mainReady, hasPark, parkReady); reason != "" {
 				result.Reason = reason
 				results = append(results, result)
 				continue
@@ -224,19 +224,19 @@ func (a *adminOperations) Prune(ctx context.Context, names []string) ([]driver.P
 		if err != nil {
 			return nil, classify("prune", driver.KindTransient, err)
 		}
-		main, exists = findQueue(queues, name)
+		_, exists = findQueue(queues, name)
 		if !exists {
 			result.Reason = "destination disappeared before deletion"
 			results = append(results, result)
 			continue
 		}
-		mainReady, inspectErr = a.inspectQueue(ctx, name)
+		mainReady, mainConsumers, inspectErr = a.inspectQueueWithConsumers(ctx, name)
 		if inspectErr != nil {
 			result.Reason = "destination disappeared before deletion"
 			results = append(results, result)
 			continue
 		}
-		if reason := a.pruneReason(name, main, mainReady, false, 0); reason != "" {
+		if reason := a.pruneReason(name, mainConsumers, mainReady, false, 0); reason != "" {
 			result.Reason = reason
 			results = append(results, result)
 			continue
@@ -273,8 +273,8 @@ func findQueue(queues []managementQueue, name string) (managementQueue, bool) {
 	return managementQueue{}, false
 }
 
-func (a *adminOperations) pruneReason(name string, main managementQueue, mainReady int64, hasPark bool, parkReady int64) string {
-	if main.Consumers > 0 || a.consumerCount(name) > 0 {
+func (a *adminOperations) pruneReason(name string, mainConsumers, mainReady int64, hasPark bool, parkReady int64) string {
+	if mainConsumers > 0 || a.consumerCount(name) > 0 {
 		return fmt.Sprintf("destination %q has consumers attached", name)
 	}
 	if mainReady > 0 {

@@ -6,12 +6,15 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"log/slog"
+	"strconv"
 	"sync"
 	"time"
 
 	"github.com/twmb/franz-go/pkg/kadm"
 	"github.com/twmb/franz-go/pkg/kerr"
 	"github.com/twmb/franz-go/pkg/kgo"
+	"github.com/twmb/franz-go/pkg/kmsg"
 
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/driver"
 )
@@ -21,6 +24,7 @@ type pauseReason string
 const (
 	pauseReasonDeferred   pauseReason = "deferred"
 	pauseReasonPrefetch   pauseReason = "prefetch-full"
+	pauseReasonAckGap     pauseReason = "ack-gap"
 	pauseReasonUserPaused pauseReason = "user-paused"
 )
 
@@ -50,39 +54,68 @@ func (s pauseReasonSet) remove(reason pauseReason) bool {
 
 func (s pauseReasonSet) empty() bool { return len(s) == 0 }
 
+func (s pauseReasonSet) permitsRedelivery() bool {
+	// A deferred reason remains a correctness gate for a requeued record:
+	// allowing that record through would deliver it before its due time.
+	for reason := range s {
+		if reason != pauseReasonPrefetch && reason != pauseReasonAckGap {
+			return false
+		}
+	}
+	return true
+}
+
+type partitionKey struct {
+	destination string
+	partition   int32
+}
+
 type consumer struct {
-	conn             *conn
-	client           *kgo.Client
-	cfg              driver.ConsumerConfig
-	group            string
-	synthesizedGroup bool
-	destinations     []string
-	budgets          map[string]int
-	messages         chan driver.InboundMessage
-	errors           chan error
-	errorsMu         sync.Mutex
-	pollCtx          context.Context
-	cancelPoll       context.CancelFunc
-	pollDone         chan struct{}
-	stopDone         chan struct{}
-	pauseReasons     map[string]pauseReasonSet
-	unsettled        map[string]int
-	settlers         map[*settler]struct{}
-	mu               sync.Mutex
-	draining         bool
-	stopped          bool
+	conn               *conn
+	client             *kgo.Client
+	cfg                driver.ConsumerConfig
+	group              string
+	synthesizedGroup   bool
+	destinations       []string
+	budgets            map[string]int
+	messages           chan driver.InboundMessage
+	errors             chan error
+	errorsMu           sync.Mutex
+	pollCtx            context.Context
+	cancelPoll         context.CancelFunc
+	pollDone           chan struct{}
+	stopDone           chan struct{}
+	pauseReasons       map[string]pauseReasonSet
+	unsettled          map[string]int
+	settlers           map[*settler]struct{}
+	trackers           map[partitionKey]*ackTracker
+	trackerGenerations map[partitionKey]uint64
+	requeued           map[partitionKey]int
+	discarded          map[partitionKey]map[int64]struct{}
+	reportedDeferrals  map[string]struct{}
+	maxAckGap          int64
+	now                func() time.Time
+	offsetMu           sync.Mutex
+	assignmentMu       sync.Mutex
+	mu                 sync.Mutex
+	draining           bool
+	stopped            bool
+	forwarderStopC     chan struct{}
+	forwarderStopOnce  sync.Once
 }
 
 type settler struct {
 	owner   *consumer
 	record  *kgo.Record
+	tracker *ackTracker
+	key     partitionKey
 	mu      sync.Mutex
 	settled bool
 }
 
-// Ack commits the record immediately and releases its destination prefetch slot.
-// This provisional settler does not preserve a contiguous committed prefix, so
-// out-of-order acknowledgements can over-commit.
+// Ack commits the next offset after the contiguous acknowledged prefix and
+// releases this delivery's destination prefetch slot. An out-of-order
+// acknowledgement waits for every lower offset before committing.
 func (s *settler) Ack(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
 		return classify("ack", driver.KindTransient, err)
@@ -95,34 +128,93 @@ func (s *settler) Ack(ctx context.Context) error {
 		s.owner.mu.Unlock()
 		return classify("ack", driver.KindFatal, driver.ErrAlreadySettled)
 	}
+	tracker := s.tracker
 	s.owner.mu.Unlock()
-
-	if err := s.owner.client.CommitRecords(ctx, s.record); err != nil {
-		return classify("ack", kafkaErrorKind(err), err)
+	if tracker == nil {
+		return classify("ack", driver.KindFatal, ErrRevoked)
 	}
 
-	s.owner.mu.Lock()
-	s.settled = true
-	delete(s.owner.settlers, s)
-	if s.owner.unsettled[s.record.Topic] > 0 {
-		s.owner.unsettled[s.record.Topic]--
+	if err := tracker.Ack(s.record.Offset, func(commitPoint int64) error {
+		return s.owner.commitOffset(ctx, s.key, commitPoint)
+	}); err != nil {
+		if !errors.Is(err, ErrRevoked) && !errors.Is(err, errAckTrackerAlreadySettled) {
+			s.owner.refreshAckGap(s.record.Topic)
+		}
+		return classifySettlement("ack", err)
 	}
-	budget := s.owner.budgets[s.record.Topic]
-	if budget > 0 && s.owner.unsettled[s.record.Topic] < budget {
-		s.owner.setPauseReasonLocked(s.record.Topic, pauseReasonPrefetch, false)
-	}
-	s.owner.mu.Unlock()
+	s.owner.completeSettlement(s, false)
 	return nil
 }
 
-// Nack reports that Kafka settlement through this provisional consumer is not
-// implemented. Callers receive a classified unsupported error and the delivery
-// remains outstanding. A canceled context still returns a transient error.
-func (s *settler) Nack(ctx context.Context, _ driver.NackOptions) error {
+// Nack either commits and discards a record or rewinds its active partition
+// cursor for an in-run redelivery. Requeue does not advance the tracker base.
+// CountAsFailure is a no-op because classic Kafka groups expose no delivery count.
+func (s *settler) Nack(ctx context.Context, options driver.NackOptions) error {
 	if err := ctx.Err(); err != nil {
 		return classify("nack", driver.KindTransient, err)
 	}
-	return classify("nack", driver.KindFatal, driver.ErrUnsupported)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.owner.mu.Lock()
+	if s.settled {
+		s.owner.mu.Unlock()
+		return classify("nack", driver.KindFatal, driver.ErrAlreadySettled)
+	}
+	tracker := s.tracker
+	s.owner.mu.Unlock()
+	if tracker == nil {
+		return classify("nack", driver.KindFatal, ErrRevoked)
+	}
+
+	if options.Requeue {
+		s.owner.mu.Lock()
+		if err := tracker.Release(s.record.Offset); err != nil {
+			s.owner.mu.Unlock()
+			return classifySettlement("nack", err)
+		}
+		s.owner.requeued[s.key]++
+		s.owner.mu.Unlock()
+		resetOffset := s.record.Offset
+		if lowest, ok := tracker.lowestRequeue(); ok {
+			resetOffset = lowest
+		}
+		if !s.owner.resetOffset(s.key, tracker, resetOffset) {
+			return classifySettlement("nack", ErrRevoked)
+		}
+		s.owner.resumeForRedelivery(s.record.Topic)
+		s.owner.completeSettlement(s, true)
+		return nil
+	}
+
+	if err := tracker.Ack(s.record.Offset, func(commitPoint int64) error {
+		return s.owner.commitOffset(ctx, s.key, commitPoint)
+	}); err != nil {
+		if !errors.Is(err, ErrRevoked) && !errors.Is(err, errAckTrackerAlreadySettled) {
+			s.owner.refreshAckGap(s.record.Topic)
+		}
+		return classifySettlement("nack", err)
+	}
+	s.owner.noteDiscarded(s.key, tracker, s.record.Offset)
+	slog.Default().Warn(
+		"discarding Kafka record",
+		"topic", s.record.Topic,
+		"partition", s.record.Partition,
+		"offset", s.record.Offset,
+	)
+	s.owner.completeSettlement(s, false)
+	return nil
+}
+
+func classifySettlement(operation string, err error) error {
+	switch {
+	case errors.Is(err, ErrRevoked):
+		return classify(operation, driver.KindFatal, ErrRevoked)
+	case errors.Is(err, errAckTrackerAlreadySettled):
+		return classify(operation, driver.KindFatal, driver.ErrAlreadySettled)
+	default:
+		return classify(operation, kafkaErrorKind(err), err)
+	}
 }
 
 var (
@@ -133,6 +225,10 @@ var (
 func newConsumer(ctx context.Context, connection *conn, cfg driver.ConsumerConfig) (*consumer, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, classify("consumer", driver.KindTransient, err)
+	}
+	maxAckGap, err := resolveMaxAckGap(connection.driverOptions)
+	if err != nil {
+		return nil, classify("consumer", driver.KindFatal, err)
 	}
 	seen := make(map[string]struct{}, len(cfg.Destinations))
 	for _, destination := range cfg.Destinations {
@@ -155,21 +251,29 @@ func newConsumer(ctx context.Context, connection *conn, cfg driver.ConsumerConfi
 
 	pollCtx, cancelPoll := context.WithCancel(context.Background())
 	consumer := &consumer{
-		conn:             connection,
-		cfg:              cfg,
-		group:            group,
-		synthesizedGroup: synthesized,
-		destinations:     append([]string(nil), cfg.Destinations...),
-		budgets:          make(map[string]int, len(cfg.Destinations)),
-		messages:         make(chan driver.InboundMessage, totalPrefetch(cfg)),
-		errors:           make(chan error, 8),
-		pollCtx:          pollCtx,
-		cancelPoll:       cancelPoll,
-		pollDone:         make(chan struct{}),
-		stopDone:         make(chan struct{}),
-		pauseReasons:     make(map[string]pauseReasonSet, len(cfg.Destinations)),
-		unsettled:        make(map[string]int, len(cfg.Destinations)),
-		settlers:         make(map[*settler]struct{}),
+		conn:               connection,
+		cfg:                cfg,
+		group:              group,
+		synthesizedGroup:   synthesized,
+		destinations:       append([]string(nil), cfg.Destinations...),
+		budgets:            make(map[string]int, len(cfg.Destinations)),
+		messages:           make(chan driver.InboundMessage, totalPrefetch(cfg)),
+		errors:             make(chan error, 8),
+		pollCtx:            pollCtx,
+		cancelPoll:         cancelPoll,
+		pollDone:           make(chan struct{}),
+		stopDone:           make(chan struct{}),
+		forwarderStopC:     make(chan struct{}),
+		pauseReasons:       make(map[string]pauseReasonSet, len(cfg.Destinations)),
+		unsettled:          make(map[string]int, len(cfg.Destinations)),
+		settlers:           make(map[*settler]struct{}),
+		trackers:           make(map[partitionKey]*ackTracker),
+		trackerGenerations: make(map[partitionKey]uint64),
+		requeued:           make(map[partitionKey]int),
+		discarded:          make(map[partitionKey]map[int64]struct{}),
+		reportedDeferrals:  make(map[string]struct{}),
+		maxAckGap:          maxAckGap,
+		now:                kafkaNow,
 	}
 	for index, destination := range cfg.Destinations {
 		consumer.budgets[destination] = destinationPrefetch(cfg, destination, index)
@@ -181,6 +285,15 @@ func newConsumer(ctx context.Context, connection *conn, cfg driver.ConsumerConfi
 		kgo.ConsumeTopics(cfg.Destinations...),
 		kgo.DisableAutoCommit(),
 		consumerStartOffset(cfg.StartAt),
+		// Franz-go defaults FetchMaxWait to 5000ms for non-share groups. When a
+		// multi-destination consumer settles a message on a destination whose
+		// broker partition is currently exhausted, franz-go issues a Fetch
+		// request for that destination which the broker holds for up to
+		// MaxWaitMillis. While that single-broker request is held, other unpaused
+		// destinations on the same broker cannot be fetched, stalling refill
+		// deliveries for up to 5 seconds. Bounding FetchMaxWait prevents an
+		// exhausted destination from starving ready destinations.
+		kgo.FetchMaxWait(50*time.Millisecond),
 		kgo.OnPartitionsRevoked(func(_ context.Context, _ *kgo.Client, partitions map[string][]int32) {
 			consumer.sendRebalanceError("revoked", partitions)
 		}),
@@ -195,8 +308,24 @@ func newConsumer(ctx context.Context, connection *conn, cfg driver.ConsumerConfi
 	}
 	consumer.client = client
 	connection.registerConsumer(consumer)
-	go consumer.poll()
+	// The poll context is owned by the consumer and canceled by Drain or Stop.
+	//nolint:contextcheck // this goroutine uses the consumer-owned cancellation context.
+	go consumer.poll(pollCtx)
 	return consumer, nil
+}
+
+const defaultKafkaMaxAckGap int64 = 10000
+
+func resolveMaxAckGap(options map[string]string) (int64, error) {
+	value, ok := options["kafka.maxAckGap"]
+	if !ok {
+		return defaultKafkaMaxAckGap, nil
+	}
+	gap, err := strconv.ParseInt(value, 10, 64)
+	if err != nil || gap <= 0 {
+		return 0, fmt.Errorf("kafka: invalid maxAckGap %q; must be a positive integer", value)
+	}
+	return gap, nil
 }
 
 func newConsumerGroup() (string, error) {
@@ -244,45 +373,73 @@ func destinationPrefetch(cfg driver.ConsumerConfig, destination string, index in
 func (c *consumer) Messages() <-chan driver.InboundMessage { return c.messages }
 func (c *consumer) Errors() <-chan error                   { return c.errors }
 
-func (c *consumer) poll() {
+func (c *consumer) poll(ctx context.Context) {
 	defer close(c.pollDone)
 	pending := make([]*kgo.Record, 0, 1)
 	for {
 		if !c.flushPending(&pending) {
 			return
 		}
+		c.clearDeferredReasons(pending)
 
-		fetches := c.client.PollRecords(c.pollCtx, 1)
-		if c.pollCtx.Err() != nil || fetches.IsClientClosed() {
+		fetchCtx := ctx
+		bounded := false
+		if due, ok := c.pendingDeadline(pending); ok {
+			var cancel context.CancelFunc
+			fetchCtx, cancel = context.WithDeadline(ctx, due)
+			bounded = true
+			fetches := c.client.PollRecords(fetchCtx, 0)
+			cancel()
+			if ctx.Err() != nil || fetches.IsClientClosed() {
+				return
+			}
+			if !c.handleFetches(&pending, fetches, bounded) {
+				return
+			}
+			continue
+		}
+
+		fetches := c.client.PollRecords(fetchCtx, 1)
+		if ctx.Err() != nil || fetches.IsClientClosed() {
 			return
 		}
-		for _, fetchErr := range fetches.Errors() {
-			kind := kafkaErrorKind(fetchErr.Err)
-			if kind != driver.KindTransient {
-				// A non-retryable fetch error cannot recover by polling again.
-				// Reclassify it as fatal for this subscription so the core
-				// cancels its fetch runner while retaining the Kafka cause.
-				kind = driver.KindFatal
-			}
-			c.sendError(classify("consumer", kind, fmt.Errorf("kafka fetch %s[%d]: %w", fetchErr.Topic, fetchErr.Partition, fetchErr.Err)))
-			if kind == driver.KindFatal {
-				return
-			}
-		}
-		for record := range fetches.RecordsAll() {
-			if !c.canDeliver(record.Topic) {
-				pending = append(pending, record)
-				continue
-			}
-			delivered, active := c.emit(record)
-			if !active {
-				return
-			}
-			if !delivered {
-				pending = append(pending, record)
-			}
+		if !c.handleFetches(&pending, fetches, bounded) {
+			return
 		}
 	}
+}
+
+func (c *consumer) handleFetches(pending *[]*kgo.Record, fetches kgo.Fetches, bounded bool) bool {
+	for _, fetchErr := range fetches.Errors() {
+		if bounded && (errors.Is(fetchErr.Err, context.DeadlineExceeded) || errors.Is(fetchErr.Err, context.Canceled)) {
+			continue
+		}
+		kind := kafkaErrorKind(fetchErr.Err)
+		if kind != driver.KindTransient {
+			// A non-retryable fetch error cannot recover by polling again.
+			// Reclassify it as fatal for this subscription while retaining
+			// the Kafka cause.
+			kind = driver.KindFatal
+		}
+		c.sendError(classify("consumer", kind, fmt.Errorf("kafka fetch %s[%d]: %w", fetchErr.Topic, fetchErr.Partition, fetchErr.Err)))
+		if kind == driver.KindFatal {
+			return false
+		}
+	}
+	for record := range fetches.RecordsAll() {
+		if !c.canDeliver(record) {
+			*pending = append(*pending, record)
+			continue
+		}
+		delivered, active := c.emit(record)
+		if !active {
+			return false
+		}
+		if !delivered {
+			*pending = append(*pending, record)
+		}
+	}
+	return true
 }
 
 func (c *consumer) flushPending(pending *[]*kgo.Record) bool {
@@ -290,7 +447,7 @@ func (c *consumer) flushPending(pending *[]*kgo.Record) bool {
 		records := *pending
 		index := -1
 		for i, record := range records {
-			if c.canDeliver(record.Topic) {
+			if c.canDeliver(record) {
 				index = i
 				break
 			}
@@ -313,22 +470,13 @@ func (c *consumer) flushPending(pending *[]*kgo.Record) bool {
 	return true
 }
 
-func (c *consumer) canDeliver(destination string) bool {
+func (c *consumer) canDeliver(record *kgo.Record) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.stopped || c.draining {
 		return false
 	}
-	budget := c.budgets[destination]
-	if budget <= 0 {
-		budget = 1
-	}
-	reasons := c.pauseReasons[destination]
-	if c.unsettled[destination] >= budget {
-		c.setPauseReasonLocked(destination, pauseReasonPrefetch, true)
-		reasons = c.pauseReasons[destination]
-	}
-	return reasons.empty() && c.unsettled[destination] < budget
+	return c.admissionLocked(record)
 }
 
 func (c *consumer) emit(record *kgo.Record) (delivered, active bool) {
@@ -337,16 +485,34 @@ func (c *consumer) emit(record *kgo.Record) (delivered, active bool) {
 		c.mu.Unlock()
 		return false, false
 	}
+	if !c.admissionLocked(record) {
+		c.mu.Unlock()
+		return false, true
+	}
 	budget := c.budgets[record.Topic]
 	if budget <= 0 {
 		budget = 1
 	}
-	if !c.pauseReasons[record.Topic].empty() || c.unsettled[record.Topic] >= budget {
-		if c.unsettled[record.Topic] >= budget {
-			c.setPauseReasonLocked(record.Topic, pauseReasonPrefetch, true)
-		}
+	key := partitionKey{destination: record.Topic, partition: record.Partition}
+	tracker := c.trackers[key]
+	if tracker == nil {
+		tracker = c.trackerForLocked(record)
+	}
+	reused, deliver, err := tracker.TrackRedelivery(record.Offset)
+	if err != nil {
 		c.mu.Unlock()
 		return false, true
+	}
+	if !deliver {
+		c.mu.Unlock()
+		return true, true
+	}
+	if reused {
+		c.requeued[key]--
+		if c.requeued[key] == 0 {
+			delete(c.requeued, key)
+		}
+		c.pauseAfterRedeliveryLocked(record.Topic)
 	}
 	settler := &settler{
 		owner: c,
@@ -356,17 +522,263 @@ func (c *consumer) emit(record *kgo.Record) (delivered, active bool) {
 			Offset:      record.Offset,
 			LeaderEpoch: record.LeaderEpoch,
 		},
+		tracker: tracker,
+		key:     key,
 	}
 	c.settlers[settler] = struct{}{}
-	c.unsettled[record.Topic]++
+	if !reused {
+		c.unsettled[record.Topic]++
+	}
 	if c.unsettled[record.Topic] >= budget {
 		c.setPauseReasonLocked(record.Topic, pauseReasonPrefetch, true)
 	}
 	message := inboundMessage(record, settler)
 	c.mu.Unlock()
+	select {
+	case <-c.forwarderStopC:
+		c.abortSettler(settler, reused)
+		return false, false
+	case c.messages <- message:
+		return true, true
+	}
+}
 
-	c.messages <- message
-	return true, true
+func (c *consumer) stopForwarders() {
+	c.forwarderStopOnce.Do(func() {
+		close(c.forwarderStopC)
+	})
+}
+
+func (c *consumer) abortSettler(settler *settler, reused bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	delete(c.settlers, settler)
+	if !reused && c.unsettled[settler.record.Topic] > 0 {
+		c.unsettled[settler.record.Topic]--
+	}
+}
+
+func (c *consumer) detachAllTrackersLocked() []*ackTracker {
+	trackers := make([]*ackTracker, 0, len(c.trackers))
+	for key, tracker := range c.trackers {
+		trackers = append(trackers, tracker)
+		delete(c.trackers, key)
+	}
+	for settler := range c.settlers {
+		settler.tracker = nil
+		delete(c.settlers, settler)
+	}
+	clear(c.requeued)
+	clear(c.discarded)
+	clear(c.unsettled)
+	return trackers
+}
+
+func (c *consumer) trackerForLocked(record *kgo.Record) *ackTracker {
+	key := partitionKey{destination: record.Topic, partition: record.Partition}
+	if tracker := c.trackers[key]; tracker != nil {
+		return tracker
+	}
+	if c.trackers == nil {
+		c.trackers = make(map[partitionKey]*ackTracker)
+	}
+	if c.trackerGenerations == nil {
+		c.trackerGenerations = make(map[partitionKey]uint64)
+	}
+	generation := c.trackerGenerations[key] + 1
+	c.trackerGenerations[key] = generation
+	tracker := newAckTracker(record.Offset, generation)
+	c.trackers[key] = tracker
+	return tracker
+}
+
+func (c *consumer) dropTracker(destination string, partition int32) {
+	key := partitionKey{destination: destination, partition: partition}
+	c.assignmentMu.Lock()
+	defer c.assignmentMu.Unlock()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	tracker := c.trackers[key]
+	if tracker == nil {
+		return
+	}
+	// tracker.Drop only acquires t.mu to mark revoked; it no longer acquires commitMu
+	// and never blocks on broker network I/O. Calling it while holding c.assignmentMu
+	// and c.mu is safe and necessary to close the window where an in-flight settler could
+	// read tracker before detachment and proceed to commit rather than see ErrRevoked.
+	tracker.Drop()
+	pending := tracker.Unacked()
+	delete(c.trackers, key)
+	delete(c.requeued, key)
+	delete(c.discarded, key)
+	for settler := range c.settlers {
+		if settler.tracker != tracker {
+			continue
+		}
+		settler.tracker = nil
+		if !tracker.holds(settler.record.Offset) {
+			pending++
+		}
+		delete(c.settlers, settler)
+	}
+	if pending > c.unsettled[destination] {
+		pending = c.unsettled[destination]
+	}
+	c.unsettled[destination] -= pending
+	budget := c.budgets[destination]
+	if budget > 0 && c.unsettled[destination] < budget {
+		c.setPauseReasonLocked(destination, pauseReasonPrefetch, false)
+	}
+	c.refreshAckGapLocked(destination)
+}
+
+func (c *consumer) completeSettlement(settler *settler, preserveUnsettled bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	settler.settled = true
+	if c.trackers[settler.key] == settler.tracker {
+		c.reconcileDiscardedLocked(settler.key, settler.tracker)
+	}
+	if _, exists := c.settlers[settler]; !exists {
+		c.refreshAckGapLocked(settler.record.Topic)
+		return
+	}
+	delete(c.settlers, settler)
+	if !preserveUnsettled && c.unsettled[settler.record.Topic] > 0 {
+		c.unsettled[settler.record.Topic]--
+	}
+	budget := c.budgets[settler.record.Topic]
+	if budget > 0 && (preserveUnsettled || c.unsettled[settler.record.Topic] < budget) {
+		c.setPauseReasonLocked(settler.record.Topic, pauseReasonPrefetch, false)
+	}
+	c.refreshAckGapLocked(settler.record.Topic)
+}
+
+func (c *consumer) noteDiscarded(key partitionKey, tracker *ackTracker, offset int64) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.trackers[key] != tracker || tracker.CommitPoint() > offset {
+		return
+	}
+	if c.discarded == nil {
+		c.discarded = make(map[partitionKey]map[int64]struct{})
+	}
+	if c.discarded[key] == nil {
+		c.discarded[key] = make(map[int64]struct{})
+	}
+	c.discarded[key][offset] = struct{}{}
+	c.reconcileDiscardedLocked(key, tracker)
+}
+
+func (c *consumer) hasPendingRequeueLocked(destination string) bool {
+	for key, count := range c.requeued {
+		if key.destination == destination && count > 0 {
+			return true
+		}
+	}
+	return false
+}
+
+func (c *consumer) reconcileDiscardedLocked(key partitionKey, tracker *ackTracker) {
+	if tracker == nil || len(c.discarded[key]) == 0 {
+		return
+	}
+	base := tracker.CommitPoint()
+	for offset := range c.discarded[key] {
+		if offset < base {
+			delete(c.discarded[key], offset)
+		}
+	}
+	if len(c.discarded[key]) == 0 {
+		delete(c.discarded, key)
+	}
+}
+
+func (c *consumer) refreshAckGap(destination string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.refreshAckGapLocked(destination)
+}
+
+func (c *consumer) refreshAckGapLocked(destination string) {
+	exceeded := false
+	for key, tracker := range c.trackers {
+		if key.destination == destination && tracker.Gap() > c.maxAckGap {
+			exceeded = true
+			break
+		}
+	}
+	c.setPauseReasonLocked(destination, pauseReasonAckGap, exceeded)
+}
+
+func (c *consumer) commitOffset(ctx context.Context, key partitionKey, commitPoint int64) error {
+	c.offsetMu.Lock()
+	defer c.offsetMu.Unlock()
+	var commitErr error
+	c.client.CommitOffsetsSync(ctx, map[string]map[int32]kgo.EpochOffset{
+		key.destination: {
+			key.partition: {Epoch: -1, Offset: commitPoint},
+		},
+	}, func(_ *kgo.Client, _ *kmsg.OffsetCommitRequest, response *kmsg.OffsetCommitResponse, err error) {
+		if err != nil {
+			commitErr = err
+			return
+		}
+		for _, topic := range response.Topics {
+			for _, partition := range topic.Partitions {
+				if err := kerr.ErrorForCode(partition.ErrorCode); err != nil {
+					commitErr = err
+					return
+				}
+			}
+		}
+	})
+	return commitErr
+}
+
+func (c *consumer) resetOffset(key partitionKey, tracker *ackTracker, offset int64) bool {
+	c.assignmentMu.Lock()
+	defer c.assignmentMu.Unlock()
+	c.mu.Lock()
+	current := c.trackers[key] == tracker
+	c.mu.Unlock()
+	if !current {
+		return false
+	}
+	c.offsetMu.Lock()
+	defer c.offsetMu.Unlock()
+	c.client.SetOffsets(map[string]map[int32]kgo.EpochOffset{
+		key.destination: {
+			key.partition: {Epoch: -1, Offset: offset},
+		},
+	})
+	return true
+}
+
+func (c *consumer) resumeForRedelivery(destination string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.resumeForRedeliveryLocked(destination)
+}
+
+func (c *consumer) resumeForRedeliveryLocked(destination string) {
+	if c.draining || c.stopped || !c.hasPendingRequeueLocked(destination) {
+		return
+	}
+	reasons := c.pauseReasons[destination]
+	if !reasons.empty() && reasons.permitsRedelivery() {
+		c.client.ResumeFetchTopics(destination)
+	}
+}
+
+func (c *consumer) pauseAfterRedeliveryLocked(destination string) {
+	if c.draining || c.stopped || c.hasPendingRequeueLocked(destination) {
+		return
+	}
+	reasons := c.pauseReasons[destination]
+	if !reasons.empty() && reasons.permitsRedelivery() {
+		c.client.PauseFetchTopics(destination)
+	}
 }
 
 func inboundMessage(record *kgo.Record, settler *settler) driver.InboundMessage {
@@ -377,10 +789,7 @@ func inboundMessage(record *kgo.Record, settler *settler) driver.InboundMessage 
 		}
 		headers = append(headers, driver.Header{Key: header.Key, Value: append([]byte(nil), header.Value...)})
 	}
-	receivedAt := record.Timestamp
-	if receivedAt.IsZero() {
-		receivedAt = time.Now() //nolint:forbidigo // the port requires receipt time and drivers have no clock dependency
-	}
+	receivedAt := kafkaNow()
 	return driver.InboundMessage{
 		Destination:   record.Topic,
 		Key:           append([]byte(nil), record.Key...),
@@ -421,6 +830,9 @@ func (c *consumer) setUserPaused(destinations []string, paused bool) error {
 			return classify("consumer", driver.KindNotFound, driver.ErrDestinationMissing)
 		}
 		c.setPauseReasonLocked(destination, pauseReasonUserPaused, paused)
+		if !paused {
+			c.resumeForRedeliveryLocked(destination)
+		}
 	}
 	return nil
 }
@@ -452,6 +864,7 @@ func (c *consumer) Drain(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
 		return classify("drain", driver.KindTransient, err)
 	}
+	c.stopForwarders()
 	c.mu.Lock()
 	if c.stopped {
 		c.mu.Unlock()
@@ -525,6 +938,11 @@ func (c *consumer) Stop(ctx context.Context) error {
 	c.stopped = true
 	c.mu.Unlock()
 
+	c.closeTeardown(ctx)
+	return nil
+}
+
+func (c *consumer) closeTeardown(ctx context.Context) {
 	c.client.Close()
 	c.conn.removeConsumer(c)
 	if c.synthesizedGroup {
@@ -535,7 +953,6 @@ func (c *consumer) Stop(ctx context.Context) error {
 	close(c.messages)
 	close(c.errors)
 	close(c.stopDone)
-	return nil
 }
 
 func stopContextError(err error) error {
@@ -563,13 +980,60 @@ func (c *consumer) Release(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
 		return classify("release", driver.KindTransient, err)
 	}
+	c.stopForwarders()
+
 	c.mu.Lock()
-	stopped := c.stopped
-	c.mu.Unlock()
-	if stopped {
-		return nil
+	if c.stopped {
+		stopDone := c.stopDone
+		c.mu.Unlock()
+		select {
+		case <-stopDone:
+			return nil
+		case <-ctx.Done():
+			return classify("release", driver.KindTransient, ctx.Err())
+		}
 	}
-	return classify("release", driver.KindFatal, driver.ErrUnsupported)
+	if !c.draining {
+		c.draining = true
+		c.cancelPoll()
+		c.client.PauseFetchTopics(c.destinations...)
+	}
+	pollDone := c.pollDone
+	c.mu.Unlock()
+
+	if err := c.waitPoll(ctx, "release", pollDone); err != nil {
+		return err
+	}
+	c.assignmentMu.Lock()
+	c.mu.Lock()
+	trackers := c.detachAllTrackersLocked()
+	c.mu.Unlock()
+	c.assignmentMu.Unlock()
+
+	for _, tracker := range trackers {
+		tracker.Drop()
+	}
+
+	if err := c.client.LeaveGroupContext(ctx); err != nil {
+		return classify("release", driver.KindTransient, err)
+	}
+
+	c.mu.Lock()
+	if c.stopped {
+		stopDone := c.stopDone
+		c.mu.Unlock()
+		select {
+		case <-stopDone:
+			return nil
+		case <-ctx.Done():
+			return classify("release", driver.KindTransient, ctx.Err())
+		}
+	}
+	c.stopped = true
+	c.mu.Unlock()
+
+	c.closeTeardown(ctx)
+	return nil
 }
 
 func (c *consumer) Lag(ctx context.Context) (map[string]int64, error) {

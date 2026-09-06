@@ -25,7 +25,7 @@ type Envelope struct {
 	IdempotencyKey string
 	Priority       Priority // encoded as a string on the wire
 	Attempt        int
-	MaxAttempts    int // absent unless producer-capped or stamped on a retry copy
+	MaxAttempts    int // positive producer cap; the subscription policy is the ceiling when consumed
 	DueTime        *time.Time
 	OriginalDest   string
 	CorrelationID  string
@@ -278,6 +278,9 @@ func DecodeHeaders(h map[string]string) (Envelope, error) {
 		n, err := strconv.Atoi(v)
 		if err != nil {
 			return Envelope{}, fmt.Errorf("f1: header f1maxattempts: %w", err)
+		}
+		if n < 0 {
+			return Envelope{}, fmt.Errorf("f1: header f1maxattempts: value must not be negative")
 		}
 		e.MaxAttempts = n
 	}

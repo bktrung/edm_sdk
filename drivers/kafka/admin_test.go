@@ -277,3 +277,36 @@ func TestEnsureTopologyOrphanScan(t *testing.T) {
 		t.Fatalf("empty-scope result = %#v, want empty Orphaned and non-empty OrphanScanError", emptyScope)
 	}
 }
+
+func TestPruneRefusesConnectionConsumer(t *testing.T) {
+	ctx, connection, admin := openKafkaAdminTest(t)
+	topic := kafkaTestTopic(t, "prune-consumer")
+	cleanupKafkaTopics(t, admin, topic)
+	createKafkaTopic(t, admin, ctx, topic, 1)
+
+	consumer, err := connection.Consumer(ctx, driver.ConsumerConfig{
+		Destinations: []string{topic},
+		Prefetch:     1,
+		Effective:    connection.Capabilities(),
+	})
+	if err != nil {
+		t.Fatalf("Consumer: %v", err)
+	}
+	t.Cleanup(func() { _ = consumer.Stop(ctx) })
+
+	maintenance, ok := connection.Admin().(driver.Maintenance)
+	if !ok {
+		t.Fatalf("Admin does not implement driver.Maintenance")
+	}
+	results, err := maintenance.Prune(ctx, []string{topic})
+	if err != nil {
+		t.Fatalf("Prune: %v", err)
+	}
+	if len(results) != 1 {
+		t.Fatalf("Prune results = %v, want 1", results)
+	}
+	result := results[0]
+	if result.Deleted || result.Reason == "" {
+		t.Fatalf("Prune(%q) = %+v, want refused with a reason", topic, result)
+	}
+}

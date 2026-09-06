@@ -6,6 +6,7 @@
 
 # Locally downloaded tool binaries (Makefile-managed, pinned by version)
 /.tools/
+/.cache/
 
 # Coverage
 *.out

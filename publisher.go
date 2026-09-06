@@ -125,9 +125,15 @@ func WithExpiry(expiry time.Time) PublishOption {
 	return publishOption(func(options *publishOptions) error { options.expiry = &expiry; return nil })
 }
 
-// WithMaxAttempts caps the retry ladder for this event.
+// WithMaxAttempts caps this event's retry ladder below the subscription policy.
 func WithMaxAttempts(attempts int) PublishOption {
-	return publishOption(func(options *publishOptions) error { options.maxAttempts = attempts; return nil })
+	return publishOption(func(options *publishOptions) error {
+		if attempts < 1 {
+			return fmt.Errorf("f1: WithMaxAttempts requires attempts >= 1")
+		}
+		options.maxAttempts = attempts
+		return nil
+	})
 }
 
 func publishOption(apply func(*publishOptions) error) PublishOption {
