@@ -725,6 +725,86 @@ func TestConsumerPrefetchBound(t *testing.T) {
 	}
 }
 
+func TestConsumerPerDestinationShareRefillsOnSettlement(t *testing.T) {
+	ctx, connection, admin := openKafkaAdminTest(t)
+	first := kafkaTestTopic(t, "consumer-refill-first")
+	second := kafkaTestTopic(t, "consumer-refill-second")
+	group := kafkaTestTopic(t, "consumer-refill-group")
+	cleanupKafkaTopics(t, admin, first, second)
+	cleanupKafkaGroups(t, admin, group)
+	createKafkaTopic(t, admin, ctx, first, 1)
+	createKafkaTopic(t, admin, ctx, second, 1)
+
+	producer, err := connection.Producer(ctx, driver.ProducerConfig{Effective: connection.Capabilities()})
+	if err != nil {
+		t.Fatalf("Producer: %v", err)
+	}
+	defer func() { _ = producer.Close(context.Background()) }()
+	consumer, err := connection.Consumer(ctx, driver.ConsumerConfig{
+		Group: group, Destinations: []string{first, second}, Prefetch: 4,
+		PerDestination: map[string]int{first: 1, second: 3}, Effective: connection.Capabilities(),
+	})
+	if err != nil {
+		t.Fatalf("Consumer: %v", err)
+	}
+	t.Cleanup(func() { closeKafkaConsumer(consumer) })
+	publishKafkaCount(t, producer, ctx, first, 3)
+	publishKafkaCount(t, producer, ctx, second, 5)
+	inspect, err := kafkaInspector(connection)
+	if err != nil {
+		t.Fatalf("Inspector: %v", err)
+	}
+	waitForKafkaShares(t, inspect, ctx, map[string]int{first: 1, second: 3})
+
+	// Settle messages as they are received (mirroring ackAll in conformance).
+	// After each destination's initial share settles (1 on first, 3 on second),
+	// further messages must refill and be delivered promptly on each destination.
+	delivered := make(map[string]int)
+	for i := range 8 {
+		msg := receiveKafkaMessageBefore(t, consumer, kafkaNow().Add(2*time.Second))
+		delivered[msg.Destination]++
+		if err := msg.Settle.Ack(ctx); err != nil {
+			t.Fatalf("Ack(msg %d): %v", i, err)
+		}
+	}
+
+	// Both destinations must have refilled and delivered all published messages:
+	// 3 on first (> share 1) and 5 on second (> share 3).
+	if delivered[first] != 3 || delivered[second] != 5 {
+		t.Fatalf("delivered: first=%d second=%d, want 3 and 5", delivered[first], delivered[second])
+	}
+
+	if err := consumer.Stop(ctx); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+}
+
+func waitForKafkaShares(t *testing.T, inspect func(context.Context, string) (conformance.BrokerView, error), ctx context.Context, shares map[string]int) {
+	t.Helper()
+	deadline, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	ticker := time.NewTicker(10 * time.Millisecond) //nolint:forbidigo // broker polling needs a bounded wall-clock retry
+	defer ticker.Stop()
+	for {
+		allMatch := true
+		for destination, share := range shares {
+			view, err := inspect(ctx, destination)
+			if err != nil || view.Unsettled != int64(share) {
+				allMatch = false
+				break
+			}
+		}
+		if allMatch {
+			return
+		}
+		select {
+		case <-deadline.Done():
+			t.Fatalf("prefetch shares did not saturate to %v", shares)
+		case <-ticker.C:
+		}
+	}
+}
+
 func closeKafkaConsumer(value driver.Consumer) {
 	value.(*consumer).client.Close()
 }

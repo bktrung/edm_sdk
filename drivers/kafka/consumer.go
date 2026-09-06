@@ -285,6 +285,15 @@ func newConsumer(ctx context.Context, connection *conn, cfg driver.ConsumerConfi
 		kgo.ConsumeTopics(cfg.Destinations...),
 		kgo.DisableAutoCommit(),
 		consumerStartOffset(cfg.StartAt),
+		// Franz-go defaults FetchMaxWait to 5000ms for non-share groups. When a
+		// multi-destination consumer settles a message on a destination whose
+		// broker partition is currently exhausted, franz-go issues a Fetch
+		// request for that destination which the broker holds for up to
+		// MaxWaitMillis. While that single-broker request is held, other unpaused
+		// destinations on the same broker cannot be fetched, stalling refill
+		// deliveries for up to 5 seconds. Bounding FetchMaxWait prevents an
+		// exhausted destination from starving ready destinations.
+		kgo.FetchMaxWait(50*time.Millisecond),
 		kgo.OnPartitionsRevoked(func(_ context.Context, _ *kgo.Client, partitions map[string][]int32) {
 			consumer.sendRebalanceError("revoked", partitions)
 		}),
