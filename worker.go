@@ -1116,6 +1116,13 @@ func retryDeliverySettlement(r *Runner, ctx context.Context, message driver.Inbo
 	}
 }
 
+func effectiveMaxAttempts(eventMaxAttempts, policyMaxAttempts int) int {
+	if eventMaxAttempts > 0 && eventMaxAttempts < policyMaxAttempts {
+		return eventMaxAttempts
+	}
+	return policyMaxAttempts
+}
+
 // dispatchMessage returns true only after the delivery's settlement path has
 // completed; classification and settlement stay outside middleware.
 func dispatchMessage(r *Runner, ctx context.Context, message driver.InboundMessage, envelopeOut *Envelope, abandoned *bool, states ...*deliveryState) bool {
@@ -1132,11 +1139,8 @@ func dispatchMessage(r *Runner, ctx context.Context, message driver.InboundMessa
 	if err != nil {
 		return deadLetterAndSettle(r, ctx, message, envelope, ReasonDecode, err, state)
 	}
+	maxAttempts := effectiveMaxAttempts(envelope.MaxAttempts, r.subscription.Retry.MaxAttempts)
 	*envelopeOut = envelope
-	maxAttempts := envelope.MaxAttempts
-	if maxAttempts <= 0 {
-		maxAttempts = r.subscription.Retry.MaxAttempts
-	}
 	if retry.CounterRunaway(envelope.Attempt, maxAttempts) {
 		return deadLetterAndSettle(r, ctx, message, envelope, ReasonPoison, errors.New("retry counter exceeded sanity margin"), state)
 	}
@@ -1154,7 +1158,9 @@ func dispatchMessage(r *Runner, ctx context.Context, message driver.InboundMessa
 		runnerNotifyDiscarded(r, runnerSettlementContext(r, ctx), discardUnmatched(envelope, append([]byte(nil), message.Body...)))
 		return ackDelivery(r, runnerSettlementContext(r, ctx), message, state)
 	}
-	event := &Event{envelope: envelope, raw: append([]byte(nil), message.Body...), codec: eventCodec, headers: headers}
+	eventEnvelope := envelope
+	eventEnvelope.MaxAttempts = maxAttempts
+	event := &Event{envelope: eventEnvelope, raw: append([]byte(nil), message.Body...), codec: eventCodec, headers: headers}
 	result := invokeHandler(r, ctx, handler, event)
 	if result.stuck {
 		*abandoned = true
@@ -1537,7 +1543,9 @@ func publishSuccessor(r *Runner, ctx context.Context, messages ...driver.Outboun
 // failure is about.
 func eventFromDelivery(r *Runner, message driver.InboundMessage, envelope Envelope) *Event {
 	eventCodec, _ := r.client.codecForContentType(envelope.DataContentType)
-	return &Event{envelope: envelope, raw: append([]byte(nil), message.Body...), codec: eventCodec, headers: inboundHeaders(message.Headers)}
+	eventEnvelope := envelope
+	eventEnvelope.MaxAttempts = effectiveMaxAttempts(envelope.MaxAttempts, r.subscription.Retry.MaxAttempts)
+	return &Event{envelope: eventEnvelope, raw: append([]byte(nil), message.Body...), codec: eventCodec, headers: inboundHeaders(message.Headers)}
 }
 
 // failSuccessorHandoff runs once a retry or dead-letter successor could not
@@ -1578,9 +1586,7 @@ func retryAndSettle(r *Runner, ctx context.Context, message driver.InboundMessag
 	copyEnvelope.DeathTime = nil
 	copyEnvelope.DeathDetails = nil
 	copyEnvelope.Attempt++
-	if copyEnvelope.MaxAttempts == 0 {
-		copyEnvelope.MaxAttempts = r.subscription.Retry.MaxAttempts
-	}
+	copyEnvelope.MaxAttempts = effectiveMaxAttempts(copyEnvelope.MaxAttempts, r.subscription.Retry.MaxAttempts)
 	retryConfig := retry.Config{
 		MaxAttempts:     r.subscription.Retry.MaxAttempts,
 		InitialInterval: r.subscription.Retry.InitialInterval,

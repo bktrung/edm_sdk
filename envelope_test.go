@@ -273,6 +273,30 @@ func TestMaxAttempts_AbsentUnlessProducerSets(t *testing.T) {
 	require.Equal(t, "3", v)
 }
 
+func TestEnvelope_DecodeHeadersRejectsNegativeMaxAttempts(t *testing.T) {
+	t.Parallel()
+
+	headers, err := fullEnvelope().EncodeHeaders(0)
+	require.NoError(t, err)
+	headers["f1maxattempts"] = "-1"
+
+	_, err = f1.DecodeHeaders(headers)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "f1maxattempts")
+}
+
+func TestEnvelope_DecodeHeadersPreservesOverRangeMaxAttempts(t *testing.T) {
+	t.Parallel()
+
+	headers, err := fullEnvelope().EncodeHeaders(0)
+	require.NoError(t, err)
+	headers["f1maxattempts"] = "1000000"
+
+	got, err := f1.DecodeHeaders(headers)
+	require.NoError(t, err)
+	require.Equal(t, 1000000, got.MaxAttempts)
+}
+
 func TestCorrelationID_RootDefault(t *testing.T) {
 	t.Parallel()
 

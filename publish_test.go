@@ -3,6 +3,7 @@ package f1
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"runtime"
 	"strings"
@@ -327,6 +328,34 @@ func TestPublishTopicDerivationAndEnvelope(t *testing.T) {
 	}
 	if got, want := producer.messages[0].Destination, "f1.test.explicit.topic.normal"; got != want {
 		t.Fatalf("overridden destination = %q, want %q", got, want)
+	}
+}
+
+func TestPublishMaxAttemptsOptionValidationAndEncoding(t *testing.T) {
+	t.Parallel()
+
+	for _, attempts := range []int{0, -1} {
+		t.Run(fmt.Sprintf("rejects %d", attempts), func(t *testing.T) {
+			producer := &recordingProducer{}
+			client := newPublishClient(t, producer)
+
+			_, err := client.Publisher().Publish(context.Background(), "orders.created", "payload", WithMaxAttempts(attempts))
+			if err == nil {
+				t.Fatalf("Publish() with max attempts %d returned nil error", attempts)
+			}
+			if got := len(producer.messages); got != 0 {
+				t.Fatalf("producer received %d messages for invalid max attempts %d, want 0", got, attempts)
+			}
+		})
+	}
+
+	producer := &recordingProducer{}
+	client := newPublishClient(t, producer)
+	if _, err := client.Publisher().Publish(context.Background(), "orders.created", "payload", WithMaxAttempts(4)); err != nil {
+		t.Fatal(err)
+	}
+	if got := messageHeaders(producer.messages[0])["f1maxattempts"]; got != "4" {
+		t.Fatalf("published max attempts = %q, want 4", got)
 	}
 }
 
