@@ -100,6 +100,8 @@ type consumer struct {
 	mu                 sync.Mutex
 	draining           bool
 	stopped            bool
+	forwarderStopC     chan struct{}
+	forwarderStopOnce  sync.Once
 }
 
 type settler struct {
@@ -261,6 +263,7 @@ func newConsumer(ctx context.Context, connection *conn, cfg driver.ConsumerConfi
 		cancelPoll:         cancelPoll,
 		pollDone:           make(chan struct{}),
 		stopDone:           make(chan struct{}),
+		forwarderStopC:     make(chan struct{}),
 		pauseReasons:       make(map[string]pauseReasonSet, len(cfg.Destinations)),
 		unsettled:          make(map[string]int, len(cfg.Destinations)),
 		settlers:           make(map[*settler]struct{}),
@@ -522,9 +525,44 @@ func (c *consumer) emit(record *kgo.Record) (delivered, active bool) {
 	}
 	message := inboundMessage(record, settler)
 	c.mu.Unlock()
+	select {
+	case <-c.forwarderStopC:
+		c.abortSettler(settler, reused)
+		return false, false
+	case c.messages <- message:
+		return true, true
+	}
+}
 
-	c.messages <- message
-	return true, true
+func (c *consumer) stopForwarders() {
+	c.forwarderStopOnce.Do(func() {
+		close(c.forwarderStopC)
+	})
+}
+
+func (c *consumer) abortSettler(settler *settler, reused bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	delete(c.settlers, settler)
+	if !reused && c.unsettled[settler.record.Topic] > 0 {
+		c.unsettled[settler.record.Topic]--
+	}
+}
+
+func (c *consumer) detachAllTrackersLocked() []*ackTracker {
+	trackers := make([]*ackTracker, 0, len(c.trackers))
+	for key, tracker := range c.trackers {
+		trackers = append(trackers, tracker)
+		delete(c.trackers, key)
+	}
+	for settler := range c.settlers {
+		settler.tracker = nil
+		delete(c.settlers, settler)
+	}
+	clear(c.requeued)
+	clear(c.discarded)
+	clear(c.unsettled)
+	return trackers
 }
 
 func (c *consumer) trackerForLocked(record *kgo.Record) *ackTracker {
@@ -812,6 +850,7 @@ func (c *consumer) Drain(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
 		return classify("drain", driver.KindTransient, err)
 	}
+	c.stopForwarders()
 	c.mu.Lock()
 	if c.stopped {
 		c.mu.Unlock()
@@ -885,6 +924,11 @@ func (c *consumer) Stop(ctx context.Context) error {
 	c.stopped = true
 	c.mu.Unlock()
 
+	c.closeTeardown(ctx)
+	return nil
+}
+
+func (c *consumer) closeTeardown(ctx context.Context) {
 	c.client.Close()
 	c.conn.removeConsumer(c)
 	if c.synthesizedGroup {
@@ -895,7 +939,6 @@ func (c *consumer) Stop(ctx context.Context) error {
 	close(c.messages)
 	close(c.errors)
 	close(c.stopDone)
-	return nil
 }
 
 func stopContextError(err error) error {
@@ -923,13 +966,60 @@ func (c *consumer) Release(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
 		return classify("release", driver.KindTransient, err)
 	}
+	c.stopForwarders()
+
 	c.mu.Lock()
-	stopped := c.stopped
-	c.mu.Unlock()
-	if stopped {
-		return nil
+	if c.stopped {
+		stopDone := c.stopDone
+		c.mu.Unlock()
+		select {
+		case <-stopDone:
+			return nil
+		case <-ctx.Done():
+			return classify("release", driver.KindTransient, ctx.Err())
+		}
 	}
-	return classify("release", driver.KindFatal, driver.ErrUnsupported)
+	if !c.draining {
+		c.draining = true
+		c.cancelPoll()
+		c.client.PauseFetchTopics(c.destinations...)
+	}
+	pollDone := c.pollDone
+	c.mu.Unlock()
+
+	if err := c.waitPoll(ctx, "release", pollDone); err != nil {
+		return err
+	}
+	c.assignmentMu.Lock()
+	c.mu.Lock()
+	trackers := c.detachAllTrackersLocked()
+	c.mu.Unlock()
+	c.assignmentMu.Unlock()
+
+	for _, tracker := range trackers {
+		tracker.Drop()
+	}
+
+	if err := c.client.LeaveGroupContext(ctx); err != nil {
+		return classify("release", driver.KindTransient, err)
+	}
+
+	c.mu.Lock()
+	if c.stopped {
+		stopDone := c.stopDone
+		c.mu.Unlock()
+		select {
+		case <-stopDone:
+			return nil
+		case <-ctx.Done():
+			return classify("release", driver.KindTransient, ctx.Err())
+		}
+	}
+	c.stopped = true
+	c.mu.Unlock()
+
+	c.closeTeardown(ctx)
+	return nil
 }
 
 func (c *consumer) Lag(ctx context.Context) (map[string]int64, error) {

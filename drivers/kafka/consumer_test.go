@@ -834,3 +834,252 @@ func waitForDeferredPause(t *testing.T, value driver.Consumer, destination strin
 		}
 	}
 }
+
+func TestConsumerReleaseAbandonsUnsettledAndCloses(t *testing.T) {
+	ctx, connection, admin := openKafkaAdminTest(t)
+	topic := kafkaTestTopic(t, "consumer-release-abandons")
+	group := kafkaTestTopic(t, "consumer-release-abandons-group")
+	cleanupKafkaTopics(t, admin, topic)
+	cleanupKafkaGroups(t, admin, group)
+	createKafkaTopic(t, admin, ctx, topic, 1)
+
+	producer, err := connection.Producer(ctx, driver.ProducerConfig{Effective: connection.Capabilities()})
+	if err != nil {
+		t.Fatalf("Producer: %v", err)
+	}
+	defer func() { _ = producer.Close(context.Background()) }()
+	publishKafkaMessage(t, producer, ctx, topic, "unsettled-payload")
+
+	csm, err := connection.Consumer(ctx, driver.ConsumerConfig{
+		Group: group, Destinations: []string{topic}, Prefetch: 1, Effective: connection.Capabilities(),
+	})
+	if err != nil {
+		t.Fatalf("Consumer: %v", err)
+	}
+	defer closeKafkaConsumer(csm)
+
+	message := receiveKafkaMessage(t, csm)
+	if string(message.Body) != "unsettled-payload" {
+		t.Fatalf("received body = %q, want %q", message.Body, "unsettled-payload")
+	}
+
+	// Release must not refuse on outstanding settlers, and must not commit.
+	if err := csm.Release(ctx); err != nil {
+		t.Fatalf("Release() error = %v", err)
+	}
+
+	// Messages must be closed after Release.
+	select {
+	case _, ok := <-csm.Messages():
+		if ok {
+			t.Fatal("Messages remains open after Release")
+		}
+	case <-time.After(5 * time.Second): //nolint:forbidigo // bounded wait for Messages channel close
+		t.Fatal("timed out waiting for Messages to close after Release")
+	}
+
+	// A second consumer in the same group must receive the abandoned work.
+	receiver, err := connection.Consumer(ctx, driver.ConsumerConfig{
+		Group: group, Destinations: []string{topic}, Prefetch: 1, Effective: connection.Capabilities(),
+	})
+	if err != nil {
+		t.Fatalf("Receiver Consumer: %v", err)
+	}
+	defer closeKafkaConsumer(receiver)
+
+	redelivered := receiveKafkaMessage(t, receiver)
+	if string(redelivered.Body) != "unsettled-payload" {
+		t.Fatalf("redelivered body = %q, want %q", redelivered.Body, "unsettled-payload")
+	}
+	if err := redelivered.Settle.Ack(ctx); err != nil {
+		t.Fatalf("Ack: %v", err)
+	}
+	if err := receiver.Stop(ctx); err != nil {
+		t.Fatalf("Stop after Ack: %v", err)
+	}
+}
+
+func TestConsumerReleaseIdempotencyAndMutualStopSafety(t *testing.T) {
+	ctx, connection, admin := openKafkaAdminTest(t)
+	topic := kafkaTestTopic(t, "consumer-release-idempotent")
+	group := kafkaTestTopic(t, "consumer-release-idempotent-group")
+	cleanupKafkaTopics(t, admin, topic)
+	cleanupKafkaGroups(t, admin, group)
+	createKafkaTopic(t, admin, ctx, topic, 1)
+
+	// Release twice then Stop.
+	csm1, err := connection.Consumer(ctx, driver.ConsumerConfig{
+		Group: group, Destinations: []string{topic}, Prefetch: 1, Effective: connection.Capabilities(),
+	})
+	if err != nil {
+		t.Fatalf("Consumer 1: %v", err)
+	}
+	defer closeKafkaConsumer(csm1)
+
+	if err := csm1.Release(ctx); err != nil {
+		t.Fatalf("first Release() error = %v", err)
+	}
+	if err := csm1.Release(ctx); err != nil {
+		t.Fatalf("second Release() error = %v", err)
+	}
+	if err := csm1.Stop(ctx); err != nil {
+		t.Fatalf("Stop() after Release error = %v", err)
+	}
+
+	// Stop then Release.
+	csm2, err := connection.Consumer(ctx, driver.ConsumerConfig{
+		Group: group, Destinations: []string{topic}, Prefetch: 1, Effective: connection.Capabilities(),
+	})
+	if err != nil {
+		t.Fatalf("Consumer 2: %v", err)
+	}
+	defer closeKafkaConsumer(csm2)
+
+	if err := csm2.Stop(ctx); err != nil {
+		t.Fatalf("Stop() error = %v", err)
+	}
+	if err := csm2.Release(ctx); err != nil {
+		t.Fatalf("Release() after Stop error = %v", err)
+	}
+}
+
+func TestConsumerDrainSaturatedEmitDoesNotDeliverAfterDrain(t *testing.T) {
+	ctx, connection, admin := openKafkaAdminTest(t)
+	topic := kafkaTestTopic(t, "consumer-drain-saturated")
+	group := kafkaTestTopic(t, "consumer-drain-saturated-group")
+	cleanupKafkaTopics(t, admin, topic)
+	cleanupKafkaGroups(t, admin, group)
+	createKafkaTopic(t, admin, ctx, topic, 1)
+
+	producer, err := connection.Producer(ctx, driver.ProducerConfig{Effective: connection.Capabilities()})
+	if err != nil {
+		t.Fatalf("Producer: %v", err)
+	}
+	defer func() { _ = producer.Close(context.Background()) }()
+
+	csm, err := connection.Consumer(ctx, driver.ConsumerConfig{
+		Group: group, Destinations: []string{topic}, Prefetch: 1, Effective: connection.Capabilities(),
+	})
+	if err != nil {
+		t.Fatalf("Consumer: %v", err)
+	}
+	defer closeKafkaConsumer(csm)
+
+	c := csm.(*consumer)
+
+	// Saturate the emit path by pre-filling the delivery channel buffer to capacity.
+	// The test intentionally never reads from Messages prior to or during Drain.
+	c.messages <- driver.InboundMessage{Destination: topic, Body: []byte("prefilled")}
+
+	// Publish a broker record. The consumer polls it and calls emit, where it parks
+	// on the blocking send c.messages <- message because the buffer is saturated.
+	publishKafkaMessage(t, producer, ctx, topic, "parked-record")
+
+	// Wait until the sender is parked in emit: settler is tracked, buffer is full.
+	waitForKafkaConsumerState(t, c, "sender parked mid-send", func() bool {
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		return len(c.settlers) == 1 && len(c.messages) == cap(c.messages)
+	})
+
+	drainCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	drainErr := csm.Drain(drainCtx)
+
+	// Read only the prefilled message that was placed before Drain.
+	select {
+	case msg, ok := <-c.messages:
+		if !ok || string(msg.Body) != "prefilled" {
+			t.Fatalf("expected prefilled message, got %v (ok=%t)", msg, ok)
+		}
+	default:
+		t.Fatal("expected prefilled message in delivery channel")
+	}
+
+	// Verify that Messages yields nothing new after Drain returned.
+	select {
+	case msg := <-c.messages:
+		t.Fatalf("observed delivery after Drain returned: %s", msg.Body)
+	case <-time.After(100 * time.Millisecond): //nolint:forbidigo // bounded assertion that Messages yields nothing
+	}
+
+	if drainErr != nil {
+		t.Fatalf("Drain() error = %v", drainErr)
+	}
+}
+
+func TestConsumerReleaseFencesLateSettlement(t *testing.T) {
+	ctx, connection, admin := openKafkaAdminTest(t)
+	topic := kafkaTestTopic(t, "consumer-release-fenced")
+	group := kafkaTestTopic(t, "consumer-release-fenced-group")
+	cleanupKafkaTopics(t, admin, topic)
+	cleanupKafkaGroups(t, admin, group)
+	createKafkaTopic(t, admin, ctx, topic, 1)
+
+	producer, err := connection.Producer(ctx, driver.ProducerConfig{Effective: connection.Capabilities()})
+	if err != nil {
+		t.Fatalf("Producer: %v", err)
+	}
+	defer func() { _ = producer.Close(context.Background()) }()
+	publishKafkaMessage(t, producer, ctx, topic, "fenced-payload")
+
+	csm, err := connection.Consumer(ctx, driver.ConsumerConfig{
+		Group: group, Destinations: []string{topic}, Prefetch: 1, Effective: connection.Capabilities(),
+	})
+	if err != nil {
+		t.Fatalf("Consumer: %v", err)
+	}
+	defer closeKafkaConsumer(csm)
+
+	message := receiveKafkaMessage(t, csm)
+	if string(message.Body) != "fenced-payload" {
+		t.Fatalf("received body = %q, want %q", message.Body, "fenced-payload")
+	}
+
+	if err := csm.Release(ctx); err != nil {
+		t.Fatalf("Release() error = %v", err)
+	}
+
+	// Late settlement must be fenced and rejected.
+	if err := message.Settle.Ack(ctx); !errors.Is(err, ErrRevoked) {
+		t.Fatalf("late Ack() error = %v, want ErrRevoked", err)
+	}
+
+	// A second consumer in the same group must receive the abandoned work intact.
+	receiver, err := connection.Consumer(ctx, driver.ConsumerConfig{
+		Group: group, Destinations: []string{topic}, Prefetch: 1, Effective: connection.Capabilities(),
+	})
+	if err != nil {
+		t.Fatalf("Receiver Consumer: %v", err)
+	}
+	defer closeKafkaConsumer(receiver)
+
+	redelivered := receiveKafkaMessage(t, receiver)
+	if string(redelivered.Body) != "fenced-payload" {
+		t.Fatalf("redelivered body = %q, want %q", redelivered.Body, "fenced-payload")
+	}
+	if err := redelivered.Settle.Ack(ctx); err != nil {
+		t.Fatalf("Ack: %v", err)
+	}
+	if err := receiver.Stop(ctx); err != nil {
+		t.Fatalf("Stop after Ack: %v", err)
+	}
+}
+
+func waitForKafkaConsumerState(t *testing.T, consumer *consumer, description string, check func() bool) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	ticker := time.NewTicker(10 * time.Millisecond) //nolint:forbidigo // state polling needs a bounded wall-clock retry
+	defer ticker.Stop()
+	for {
+		if check() {
+			return
+		}
+		select {
+		case <-ctx.Done():
+			t.Fatalf("timed out waiting for %s: %v", description, ctx.Err())
+		case <-ticker.C:
+		}
+	}
+}
