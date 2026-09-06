@@ -6,9 +6,11 @@ import (
 	"fmt"
 	"os"
 	"testing"
+	"time"
 
 	"github.com/twmb/franz-go/pkg/kadm"
 	"github.com/twmb/franz-go/pkg/kerr"
+	"github.com/twmb/franz-go/pkg/kgo"
 
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/driver"
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/driver/conformance"
@@ -95,6 +97,7 @@ func kafkaInspector(raw driver.Conn) (conformance.Inspect, error) {
 		}
 
 		var ready int64
+		committedOffsets := make(map[int32]int64)
 		for partition, end := range endPartitions {
 			start, ok := starts.Lookup(destination, partition)
 			if !ok {
@@ -113,16 +116,89 @@ func kafkaInspector(raw driver.Conn) (conformance.Inspect, error) {
 			}
 			if end.Offset > committedOffset {
 				ready += end.Offset - committedOffset
+				committedOffsets[partition] = committedOffset
 			}
 		}
+		auxiliary, err := countDeferredRecords(ctx, connection, destination, committedOffsets)
+		if err != nil {
+			return conformance.BrokerView{}, err
+		}
 		// Kafka reports committed and retained offsets, not deliveries already
-		// handed to Messages. Keep those driver-held deliveries in Unsettled, and
-		// subtract discarded holes that wait behind a requeued offset.
+		// handed to Messages. Keep those driver-held deliveries in Unsettled,
+		// subtract discarded holes that wait behind a requeued offset, and
+		// subtract not-yet-due records counted as Auxiliary.
 		ready -= unsettled
 		ready -= discarded
+		ready -= auxiliary
 		if ready < 0 {
 			ready = 0
 		}
-		return conformance.BrokerView{Ready: ready, Unsettled: unsettled, Auxiliary: 0}, nil
+		return conformance.BrokerView{Ready: ready, Unsettled: unsettled, Auxiliary: auxiliary}, nil
 	}, nil
+}
+
+func countDeferredRecords(ctx context.Context, connection *conn, destination string, offsets map[int32]int64) (int64, error) {
+	delay, known := connection.destinationDelay(destination)
+	if !known || delay <= 0 || len(offsets) == 0 {
+		return 0, nil
+	}
+	partitions := map[string]map[int32]kgo.Offset{destination: {}}
+	var expected int64
+	for partition, offset := range offsets {
+		partitions[destination][partition] = kgo.NewOffset().At(offset)
+	}
+	ends, err := kadm.NewClient(connection.client).ListEndOffsets(ctx, destination)
+	if err != nil {
+		return 0, classifyKafkaOffsetError("inspect", err)
+	}
+	for partition, end := range ends[destination] {
+		if offset, ok := offsets[partition]; ok && end.Offset > offset {
+			expected += end.Offset - offset
+		}
+	}
+	if expected == 0 {
+		return 0, nil
+	}
+
+	opts := append([]kgo.Opt(nil), connection.clientOpts...)
+	opts = append(opts,
+		kgo.ConsumePartitions(partitions),
+		kgo.FetchMaxWait(50*time.Millisecond),
+	)
+	probe, err := kgo.NewClient(opts...)
+	if err != nil {
+		return 0, classify("inspect", driver.KindFatal, err)
+	}
+	defer probe.Close()
+
+	var (
+		fetched   int64
+		auxiliary int64
+	)
+	for fetched < expected {
+		fetches := probe.PollRecords(ctx, int(expected-fetched))
+		for _, fetchErr := range fetches.Errors() {
+			if errors.Is(fetchErr.Err, context.Canceled) || errors.Is(fetchErr.Err, context.DeadlineExceeded) {
+				if ctx.Err() != nil {
+					return 0, ctx.Err()
+				}
+				continue
+			}
+			return 0, classifyKafkaOffsetError("inspect", fetchErr.Err)
+		}
+		records := fetches.Records()
+		if len(records) == 0 {
+			if err := ctx.Err(); err != nil {
+				return 0, err
+			}
+			continue
+		}
+		for _, record := range records {
+			if evaluateDeferral(record, delay, true, kafkaNow()).wait {
+				auxiliary++
+			}
+		}
+		fetched += int64(len(records))
+	}
+	return auxiliary, nil
 }

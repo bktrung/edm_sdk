@@ -58,6 +58,7 @@ type conn struct {
 	client        *kgo.Client
 	clientOpts    []kgo.Opt
 	driverOptions map[string]string
+	delays        map[string]time.Duration
 	caps          driver.Capabilities
 	info          driver.BrokerInfo
 	consumers     map[*consumer]struct{}
@@ -186,6 +187,7 @@ func (Driver) Open(ctx context.Context, cfg driver.Config) (driver.Conn, error) 
 		client:        client,
 		clientOpts:    append([]kgo.Opt(nil), opts...),
 		driverOptions: maps.Clone(cfg.DriverOptions),
+		delays:        make(map[string]time.Duration),
 		caps:          caps,
 		info:          info,
 		consumers:     make(map[*consumer]struct{}),
@@ -306,14 +308,21 @@ func (c *conn) Producer(ctx context.Context, cfg driver.ProducerConfig) (driver.
 	if err := ctx.Err(); err != nil {
 		return nil, classify("producer", driver.KindTransient, err)
 	}
-	return &producer{client: c.client}, nil
+	return &producer{client: c.client, conn: c, now: kafkaNow}, nil
 }
 
 func (c *conn) Consumer(ctx context.Context, cfg driver.ConsumerConfig) (driver.Consumer, error) {
 	return newConsumer(ctx, c, cfg)
 }
 
-func (c *conn) Admin() driver.Admin { return &admin{client: kadm.NewClient(c.client)} }
+func (c *conn) Admin() driver.Admin { return &admin{client: kadm.NewClient(c.client), conn: c} }
+
+func (c *conn) destinationDelay(destination string) (time.Duration, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	delay, ok := c.delays[destination]
+	return delay, ok
+}
 
 func (c *conn) Ping(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {

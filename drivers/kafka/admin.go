@@ -13,6 +13,7 @@ import (
 
 type admin struct {
 	client *kadm.Client
+	conn   *conn
 }
 
 var (
@@ -131,6 +132,9 @@ func (a *admin) Prune(ctx context.Context, names []string) ([]driver.PruneResult
 			return nil, err
 		}
 		if reason != "" {
+			if reason == "destination does not exist" {
+				a.clearDestinationDelay(name)
+			}
 			results = append(results, driver.PruneResult{Name: name, Reason: reason})
 			continue
 		}
@@ -144,6 +148,9 @@ func (a *admin) Prune(ctx context.Context, names []string) ([]driver.PruneResult
 			return nil, err
 		}
 		if reason != "" {
+			if reason == "destination does not exist" {
+				a.clearDestinationDelay(name)
+			}
 			results = append(results, driver.PruneResult{Name: name, Reason: reason})
 			continue
 		}
@@ -157,11 +164,13 @@ func (a *admin) Prune(ctx context.Context, names []string) ([]driver.PruneResult
 		}
 		if response.Err != nil {
 			if errors.Is(response.Err, kerr.UnknownTopicOrPartition) {
+				a.clearDestinationDelay(name)
 				results = append(results, driver.PruneResult{Name: name, Reason: "destination does not exist"})
 				continue
 			}
 			return nil, classifyAdminError("prune", response.Err)
 		}
+		a.clearDestinationDelay(name)
 		results = append(results, driver.PruneResult{Name: name, Deleted: true})
 	}
 	return results, nil
@@ -217,7 +226,25 @@ func (a *admin) EnsureTopology(ctx context.Context, spec driver.TopologySpec) (d
 	if err := ctx.Err(); err != nil {
 		return driver.TopologyDiff{}, classify("ensure_topology", driver.KindTransient, err)
 	}
-	return a.ensureTopology(ctx, spec)
+	diff, err := a.ensureTopology(ctx, spec)
+	if err != nil {
+		return driver.TopologyDiff{}, err
+	}
+	if spec.Policy != driver.TopologyNone {
+		a.recordDestinationDelays(spec.Destinations)
+	}
+	return diff, nil
+}
+
+func (a *admin) recordDestinationDelays(destinations []driver.DestinationSpec) {
+	if a.conn == nil {
+		return
+	}
+	a.conn.mu.Lock()
+	defer a.conn.mu.Unlock()
+	for _, destination := range destinations {
+		a.conn.delays[destination.Name] = destination.Delay
+	}
 }
 
 func (a *admin) DescribeTopology(ctx context.Context, names []string) (driver.TopologyState, error) {
@@ -225,6 +252,15 @@ func (a *admin) DescribeTopology(ctx context.Context, names []string) (driver.To
 		return driver.TopologyState{}, classify("describe_topology", driver.KindTransient, err)
 	}
 	return a.describeTopology(ctx, names)
+}
+
+func (a *admin) clearDestinationDelay(destination string) {
+	if a.conn == nil {
+		return
+	}
+	a.conn.mu.Lock()
+	defer a.conn.mu.Unlock()
+	delete(a.conn.delays, destination)
 }
 
 func (a *admin) createTopic(ctx context.Context, topic kafkaTopicSpec) (kadm.CreateTopicResponse, error) {

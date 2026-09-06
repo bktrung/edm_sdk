@@ -181,6 +181,182 @@ func TestConsumerRequeueRedeliversInRun(t *testing.T) {
 	}
 }
 
+func TestConsumerDefersFutureRecordWithPositiveControl(t *testing.T) {
+	ctx, connection, admin := openKafkaAdminTest(t)
+	deferred := kafkaTestTopic(t, "consumer-deferred-control")
+	control := kafkaTestTopic(t, "consumer-deferred-control-positive")
+	group := kafkaTestTopic(t, "consumer-deferred-control-group")
+	cleanupKafkaTopics(t, admin, deferred, control)
+	cleanupKafkaGroups(t, admin, group)
+	const delay = 2 * time.Second
+	if _, err := connection.Admin().EnsureTopology(ctx, driver.TopologySpec{
+		Destinations: []driver.DestinationSpec{
+			{Name: deferred, Delay: delay},
+			{Name: control},
+		},
+		Effective: connection.Capabilities(),
+	}); err != nil {
+		t.Fatalf("EnsureTopology: %v", err)
+	}
+	producer, err := connection.Producer(ctx, driver.ProducerConfig{Effective: connection.Capabilities()})
+	if err != nil {
+		t.Fatalf("Producer: %v", err)
+	}
+	t.Cleanup(func() { _ = producer.Close(context.Background()) })
+	consumer, err := connection.Consumer(ctx, driver.ConsumerConfig{
+		Group: group, Destinations: []string{deferred, control}, Prefetch: 2, Effective: connection.Capabilities(),
+	})
+	if err != nil {
+		t.Fatalf("Consumer: %v", err)
+	}
+	t.Cleanup(func() { closeKafkaConsumer(consumer) })
+
+	const controlBody = "control"
+	if err := producer.Publish(ctx,
+		driver.OutboundMessage{Destination: control, Body: []byte(controlBody)},
+		driver.OutboundMessage{Destination: control, Body: []byte(controlBody)},
+	); err != nil {
+		t.Fatalf("Publish(control): %v", err)
+	}
+	controlMessage := receiveKafkaMessage(t, consumer)
+	if controlMessage.Destination != control {
+		t.Fatalf("first delivery destination = %q, want control %q", controlMessage.Destination, control)
+	}
+	if err := controlMessage.Settle.Ack(ctx); err != nil {
+		t.Fatalf("Ack(control): %v", err)
+	}
+	due := kafkaNow().Add(delay)
+	if err := producer.Publish(ctx, driver.OutboundMessage{
+		Destination: deferred, Body: []byte("deferred"), DelayUntil: due,
+	}); err != nil {
+		t.Fatalf("Publish(deferred): %v", err)
+	}
+	controlMessage = receiveKafkaMessage(t, consumer)
+	if controlMessage.Destination != control || string(controlMessage.Body) != controlBody {
+		t.Fatalf("second delivery = %+v, want control %q", controlMessage, controlBody)
+	}
+	if err := controlMessage.Settle.Ack(ctx); err != nil {
+		t.Fatalf("Ack(second control): %v", err)
+	}
+	expectNoKafkaMessage(t, consumer, 150*time.Millisecond)
+	deferredMessage := receiveKafkaMessageBefore(t, consumer, due.Add(2*time.Second))
+	if deferredMessage.Destination != deferred || deferredMessage.ReceivedAt.Before(due) {
+		t.Fatalf("deferred delivery = %+v, want %q at or after %s", deferredMessage, deferred, due)
+	}
+	if err := deferredMessage.Settle.Ack(ctx); err != nil {
+		t.Fatalf("Ack(deferred): %v", err)
+	}
+}
+
+func TestConsumerLoneDeferredRecordArrivesAtDueTime(t *testing.T) {
+	ctx, connection, admin := openKafkaAdminTest(t)
+	topic := kafkaTestTopic(t, "consumer-deferred-lone")
+	group := kafkaTestTopic(t, "consumer-deferred-lone-group")
+	cleanupKafkaTopics(t, admin, topic)
+	cleanupKafkaGroups(t, admin, group)
+	const delay = 25 * time.Second
+	if _, err := connection.Admin().EnsureTopology(ctx, driver.TopologySpec{
+		Destinations: []driver.DestinationSpec{{Name: topic, Delay: delay}},
+		Effective:    connection.Capabilities(),
+	}); err != nil {
+		t.Fatalf("EnsureTopology: %v", err)
+	}
+	producer, err := connection.Producer(ctx, driver.ProducerConfig{Effective: connection.Capabilities()})
+	if err != nil {
+		t.Fatalf("Producer: %v", err)
+	}
+	t.Cleanup(func() { _ = producer.Close(context.Background()) })
+	consumer, err := connection.Consumer(ctx, driver.ConsumerConfig{
+		Group: group, Destinations: []string{topic}, Prefetch: 1, Effective: connection.Capabilities(),
+	})
+	if err != nil {
+		t.Fatalf("Consumer: %v", err)
+	}
+	t.Cleanup(func() { closeKafkaConsumer(consumer) })
+
+	due := kafkaNow().Add(delay)
+	if err := producer.Publish(ctx, driver.OutboundMessage{
+		Destination: topic, Body: []byte("lone"), DelayUntil: due,
+	}); err != nil {
+		t.Fatalf("Publish: %v", err)
+	}
+	deadlineCtx, deadlineCancel := context.WithDeadline(context.Background(), due.Add(5*time.Second))
+	defer deadlineCancel()
+	var message driver.InboundMessage
+	select {
+	case message = <-consumer.Messages():
+	case err := <-consumer.Errors():
+		t.Fatalf("consumer error: %v", err)
+	case <-deadlineCtx.Done():
+		t.Fatalf("receive message before deadline: %v", deadlineCtx.Err())
+	}
+	if message.ReceivedAt.Before(due) {
+		t.Fatalf("delivery at %s, want at or after %s", message.ReceivedAt, due)
+	}
+	if err := message.Settle.Ack(ctx); err != nil {
+		t.Fatalf("Ack: %v", err)
+	}
+}
+
+func TestConsumerRequeueWaitsBehindDeferredRecord(t *testing.T) {
+	ctx, connection, admin := openKafkaAdminTest(t)
+	topic := kafkaTestTopic(t, "consumer-deferred-requeue")
+	group := kafkaTestTopic(t, "consumer-deferred-requeue-group")
+	cleanupKafkaTopics(t, admin, topic)
+	cleanupKafkaGroups(t, admin, group)
+	const delay = 500 * time.Millisecond
+	if _, err := connection.Admin().EnsureTopology(ctx, driver.TopologySpec{
+		Destinations: []driver.DestinationSpec{{Name: topic, Delay: delay}},
+		Effective:    connection.Capabilities(),
+	}); err != nil {
+		t.Fatalf("EnsureTopology: %v", err)
+	}
+	producer, err := connection.Producer(ctx, driver.ProducerConfig{Effective: connection.Capabilities()})
+	if err != nil {
+		t.Fatalf("Producer: %v", err)
+	}
+	t.Cleanup(func() { _ = producer.Close(context.Background()) })
+	consumerValue, err := connection.Consumer(ctx, driver.ConsumerConfig{
+		Group: group, Destinations: []string{topic}, Prefetch: 2, Effective: connection.Capabilities(),
+	})
+	if err != nil {
+		t.Fatalf("Consumer: %v", err)
+	}
+	t.Cleanup(func() { closeKafkaConsumer(consumerValue) })
+	consumer := consumerValue.(*consumer)
+
+	firstDue := kafkaNow().Add(delay)
+	if err := producer.Publish(ctx, driver.OutboundMessage{
+		Destination: topic, Body: []byte("first"), DelayUntil: firstDue,
+	}); err != nil {
+		t.Fatalf("Publish(first): %v", err)
+	}
+	first := receiveKafkaMessage(t, consumerValue)
+	secondDue := kafkaNow().Add(delay)
+	if err := producer.Publish(ctx, driver.OutboundMessage{
+		Destination: topic, Body: []byte("second"), DelayUntil: secondDue,
+	}); err != nil {
+		t.Fatalf("Publish(second): %v", err)
+	}
+	waitForDeferredPause(t, consumer, topic)
+	if err := first.Settle.Nack(ctx, driver.NackOptions{Requeue: true}); err != nil {
+		t.Fatalf("Nack(first): %v", err)
+	}
+	expectNoKafkaMessage(t, consumerValue, 150*time.Millisecond)
+
+	seen := map[int64]driver.InboundMessage{}
+	for range 2 {
+		message := receiveKafkaMessageBefore(t, consumerValue, secondDue.Add(2*time.Second))
+		seen[message.Ref.Offset] = message
+		if err := message.Settle.Ack(ctx); err != nil {
+			t.Fatalf("Ack(offset %d): %v", message.Ref.Offset, err)
+		}
+	}
+	if _, ok := seen[first.Ref.Offset]; !ok {
+		t.Fatalf("redelivery offsets = %v, want first offset %d", seen, first.Ref.Offset)
+	}
+}
+
 func TestConsumerCommittedPrefixRestartsAtBase(t *testing.T) {
 	ctx, firstConnection, admin := openKafkaAdminTest(t)
 	topic := kafkaTestTopic(t, "consumer-prefix-restart")
@@ -612,6 +788,48 @@ func waitForKafkaPrefetch(t *testing.T, inspect func(context.Context, string) (c
 		select {
 		case <-deadline.Done():
 			t.Fatalf("prefetch did not saturate: first=%+v err=%v second=%+v err=%v", firstView, firstErr, secondView, secondErr)
+		case <-ticker.C:
+		}
+	}
+}
+
+func receiveKafkaMessageBefore(t *testing.T, consumer driver.Consumer, deadline time.Time) driver.InboundMessage {
+	t.Helper()
+	timeout := time.Until(deadline)
+	if timeout <= 0 {
+		timeout = time.Millisecond
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	select {
+	case message, ok := <-consumer.Messages():
+		if !ok {
+			t.Fatal("Messages closed before delivery")
+		}
+		return message
+	case <-ctx.Done():
+		t.Fatalf("receive message before deadline: %v", ctx.Err())
+		return driver.InboundMessage{}
+	}
+}
+
+func waitForDeferredPause(t *testing.T, value driver.Consumer, destination string) {
+	t.Helper()
+	consumer := value.(*consumer)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	ticker := time.NewTicker(10 * time.Millisecond) //nolint:forbidigo // broker polling needs a bounded wall-clock retry
+	defer ticker.Stop()
+	for {
+		consumer.mu.Lock()
+		_, paused := consumer.pauseReasons[destination][pauseReasonDeferred]
+		consumer.mu.Unlock()
+		if paused {
+			return
+		}
+		select {
+		case <-ctx.Done():
+			t.Fatalf("deferred pause was not set: %v", ctx.Err())
 		case <-ticker.C:
 		}
 	}

@@ -3,6 +3,8 @@ package kafka
 import (
 	"context"
 	"errors"
+	"strconv"
+	"time"
 
 	"github.com/twmb/franz-go/pkg/kgo"
 
@@ -15,6 +17,8 @@ const delayUntilHeader = "x-f1-delay-until"
 
 type producer struct {
 	client *kgo.Client
+	conn   *conn
+	now    func() time.Time
 }
 
 var _ driver.Producer = (*producer)(nil)
@@ -34,19 +38,8 @@ func (p *producer) Publish(ctx context.Context, msgs ...driver.OutboundMessage) 
 
 	records := make([]*kgo.Record, len(msgs))
 	for i, msg := range msgs {
-		record := &kgo.Record{
-			Topic:   msg.Destination,
-			Key:     append([]byte(nil), msg.Key...),
-			Value:   append([]byte(nil), msg.Body...),
-			Headers: make([]kgo.RecordHeader, len(msg.Headers)),
-		}
-		for j, header := range msg.Headers {
-			record.Headers[j] = kgo.RecordHeader{
-				Key:   header.Key,
-				Value: append([]byte(nil), header.Value...),
-			}
-		}
-		records[i] = record
+		delay, known := p.destinationDelay(msg.Destination)
+		records[i] = recordForMessage(msg, delay, known, p.currentTime())
 	}
 
 	results := p.client.ProduceSync(ctx, records...)
@@ -58,6 +51,46 @@ func (p *producer) Publish(ctx context.Context, msgs ...driver.OutboundMessage) 
 		return &driver.PublishError{Failed: failed}
 	}
 	return nil
+}
+
+func (p *producer) destinationDelay(destination string) (time.Duration, bool) {
+	if p.conn == nil {
+		return 0, false
+	}
+	return p.conn.destinationDelay(destination)
+}
+
+func (p *producer) currentTime() time.Time {
+	if p.now != nil {
+		return p.now()
+	}
+	return kafkaNow()
+}
+
+func recordForMessage(msg driver.OutboundMessage, destinationDelay time.Duration, known bool, now time.Time) *kgo.Record {
+	record := &kgo.Record{
+		Topic:     msg.Destination,
+		Key:       append([]byte(nil), msg.Key...),
+		Value:     append([]byte(nil), msg.Body...),
+		Timestamp: now,
+		Headers:   make([]kgo.RecordHeader, 0, len(msg.Headers)+1),
+	}
+	for _, header := range msg.Headers {
+		if header.Key == delayUntilHeader {
+			continue
+		}
+		record.Headers = append(record.Headers, kgo.RecordHeader{
+			Key:   header.Key,
+			Value: append([]byte(nil), header.Value...),
+		})
+	}
+	if due := outboundDue(msg.DelayUntil, destinationDelay, known, now); !due.IsZero() {
+		record.Headers = append(record.Headers, kgo.RecordHeader{
+			Key:   delayUntilHeader,
+			Value: []byte(strconv.FormatInt(due.UnixNano(), 10)),
+		})
+	}
+	return record
 }
 
 func failedPublishIndexes(records []*kgo.Record, results kgo.ProduceResults) (map[int]error, error) {
