@@ -593,6 +593,10 @@ func (c *consumer) dropTracker(destination string, partition int32) {
 	if tracker == nil {
 		return
 	}
+	// tracker.Drop only acquires t.mu to mark revoked; it no longer acquires commitMu
+	// and never blocks on broker network I/O. Calling it while holding c.assignmentMu
+	// and c.mu is safe and necessary to close the window where an in-flight settler could
+	// read tracker before detachment and proceed to commit rather than see ErrRevoked.
 	tracker.Drop()
 	pending := tracker.Unacked()
 	delete(c.trackers, key)
@@ -602,6 +606,7 @@ func (c *consumer) dropTracker(destination string, partition int32) {
 		if settler.tracker != tracker {
 			continue
 		}
+		settler.tracker = nil
 		if !tracker.holds(settler.record.Offset) {
 			pending++
 		}

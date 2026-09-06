@@ -5,6 +5,7 @@ import (
 	"errors"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/twmb/franz-go/pkg/kgo"
 
@@ -345,5 +346,158 @@ func TestSettlerRejectsTombstonedTracker(t *testing.T) {
 	}
 	if errors.Is(err, driver.ErrAlreadySettled) {
 		t.Fatalf("Ack on dropped tracker = %v, unexpectedly already-settled", err)
+	}
+}
+
+func TestAckTrackerDropDoesNotWaitOnCommit(t *testing.T) {
+	tracker := newAckTracker(0, 1)
+	if err := tracker.Track(0); err != nil {
+		t.Fatalf("Track(0): %v", err)
+	}
+
+	commitEntered := make(chan struct{})
+	commitRelease := make(chan struct{})
+	ackDone := make(chan error, 1)
+
+	go func() {
+		err := tracker.Ack(0, func(commitPoint int64) error {
+			close(commitEntered)
+			<-commitRelease
+			return nil
+		})
+		ackDone <- err
+	}()
+
+	enterCtx, enterCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer enterCancel()
+	select {
+	case <-commitEntered:
+	case <-enterCtx.Done():
+		t.Fatal("timed out waiting for commit callback to be entered")
+	}
+
+	dropDone := make(chan struct{})
+	go func() {
+		tracker.Drop()
+		close(dropDone)
+	}()
+
+	dropCtx, dropCancel := context.WithTimeout(context.Background(), time.Second)
+	defer dropCancel()
+	select {
+	case <-dropDone:
+	case <-dropCtx.Done():
+		t.Fatal("Drop waited on in-flight commit")
+	}
+
+	close(commitRelease)
+	doneCtx, doneCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer doneCancel()
+	select {
+	case err := <-ackDone:
+		if err != nil {
+			t.Fatalf("Ack: %v", err)
+		}
+	case <-doneCtx.Done():
+		t.Fatal("timed out waiting for Ack to complete")
+	}
+}
+
+func TestAckTrackerTrackDoesNotWaitOnCommit(t *testing.T) {
+	tracker := newAckTracker(0, 1)
+	if err := tracker.Track(0); err != nil {
+		t.Fatalf("Track(0): %v", err)
+	}
+
+	commitEntered := make(chan struct{})
+	commitRelease := make(chan struct{})
+	ackDone := make(chan error, 1)
+
+	go func() {
+		err := tracker.Ack(0, func(commitPoint int64) error {
+			close(commitEntered)
+			<-commitRelease
+			return nil
+		})
+		ackDone <- err
+	}()
+	enterCtx, enterCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer enterCancel()
+	select {
+	case <-commitEntered:
+	case <-enterCtx.Done():
+		t.Fatal("timed out waiting for commit callback to be entered")
+	}
+	trackDone := make(chan error, 1)
+	go func() {
+		trackDone <- tracker.Track(1)
+	}()
+	trackCtx, trackCancel := context.WithTimeout(context.Background(), time.Second)
+	defer trackCancel()
+	select {
+	case err := <-trackDone:
+		if err != nil {
+			t.Fatalf("Track(1) returned error: %v", err)
+		}
+	case <-trackCtx.Done():
+		t.Fatal("Track waited on in-flight commit")
+	}
+
+	if !tracker.holds(1) {
+		t.Fatal("offset 1 was not admitted")
+	}
+
+	close(commitRelease)
+	doneCtx, doneCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer doneCancel()
+	select {
+	case err := <-ackDone:
+		if err != nil {
+			t.Fatalf("Ack: %v", err)
+		}
+	case <-doneCtx.Done():
+		t.Fatal("timed out waiting for Ack to complete")
+	}
+}
+
+func TestAckTrackerCommitsNeverRegress(t *testing.T) {
+	const count = 200
+	tracker := newAckTracker(0, 1)
+	for offset := range count {
+		if err := tracker.Track(int64(offset)); err != nil {
+			t.Fatalf("Track(%d): %v", offset, err)
+		}
+	}
+
+	var mu sync.Mutex
+	var commitPoints []int64
+
+	commit := func(commitPoint int64) error {
+		mu.Lock()
+		commitPoints = append(commitPoints, commitPoint)
+		mu.Unlock()
+		return nil
+	}
+
+	var group sync.WaitGroup
+	for offset := range count {
+		group.Add(1)
+		go func(offset int) {
+			defer group.Done()
+			_ = tracker.Ack(int64(offset), commit)
+		}(offset)
+	}
+	group.Wait()
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(commitPoints) == 0 {
+		t.Fatal("no commits were recorded")
+	}
+	for i := 1; i < len(commitPoints); i++ {
+		if commitPoints[i] < commitPoints[i-1] {
+			t.Fatalf("commit point regressed at index %d: %d < %d (sequence: %v)",
+				i, commitPoints[i], commitPoints[i-1], commitPoints)
+		}
 	}
 }
