@@ -1222,6 +1222,10 @@ func invokeHandler(r *Runner, parent context.Context, handler Handler, event *Ev
 	if base == nil {
 		base = parent
 	}
+	if !draining && parent.Err() != nil {
+		r.mu.Unlock()
+		return handlerResult{stuck: true}
+	}
 	r.mu.Unlock()
 	handlerCtx, cancel := context.WithTimeout(base, timeout)
 	defer cancel()
