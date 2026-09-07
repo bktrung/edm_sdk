@@ -326,12 +326,16 @@ func runConsume(group *groupContext) {
 	})
 
 	group.Check("StartEarliest includes retained messages for a new group", func(t *testing.T) {
-		producer := newProducer(t, group, "consume.earliest", driver.ProducerConfig{Effective: group.effective})
-		if err := producer.Publish(group.ctx, driver.OutboundMessage{Destination: "consume.earliest", Body: []byte("retained")}); err != nil {
+		destination := "consume.earliest." + group.profile.String()
+		groupName := "consume-earliest-new-" + group.runID + "-" + group.profile.String()
+		maintenance := group.maintenance(t)
+		purgeAndCleanupTopologyDestinations(t, maintenance, group.ctx, destination)
+		producer := newProducer(t, group, destination, driver.ProducerConfig{Effective: group.effective})
+		if err := producer.Publish(group.ctx, driver.OutboundMessage{Destination: destination, Body: []byte("retained")}); err != nil {
 			t.Fatalf("Publish() error = %v", err)
 		}
 		consumer := newConsumerFor(t, group, driver.ConsumerConfig{
-			Group: "consume-earliest-new-" + group.profile.String(), Destinations: []string{"consume.earliest"}, Prefetch: 1,
+			Group: groupName, Destinations: []string{destination}, Prefetch: 1,
 			StartAt: driver.StartEarliest, Effective: group.effective,
 		})
 		message := receiveMessage(t, group, consumer)
@@ -343,12 +347,16 @@ func runConsume(group *groupContext) {
 	})
 
 	group.Check("StartAt does not reposition an existing group", func(t *testing.T) {
-		producer := newProducer(t, group, "consume.existing-group", driver.ProducerConfig{Effective: group.effective})
-		if err := producer.Publish(group.ctx, driver.OutboundMessage{Destination: "consume.existing-group", Body: []byte("first")}); err != nil {
+		destination := "consume.existing-group." + group.profile.String()
+		groupName := "consume-existing-" + group.runID + "-" + group.profile.String()
+		maintenance := group.maintenance(t)
+		purgeAndCleanupTopologyDestinations(t, maintenance, group.ctx, destination)
+		producer := newProducer(t, group, destination, driver.ProducerConfig{Effective: group.effective})
+		if err := producer.Publish(group.ctx, driver.OutboundMessage{Destination: destination, Body: []byte("first")}); err != nil {
 			t.Fatalf("Publish(first) error = %v", err)
 		}
 		firstConsumer := newConsumerFor(t, group, driver.ConsumerConfig{
-			Group: "consume-existing", Destinations: []string{"consume.existing-group"}, Prefetch: 1,
+			Group: groupName, Destinations: []string{destination}, Prefetch: 1,
 			StartAt: driver.StartEarliest, Effective: group.effective,
 		})
 		first := receiveMessage(t, group, firstConsumer)
@@ -356,11 +364,11 @@ func runConsume(group *groupContext) {
 		if err := firstConsumer.Stop(group.ctx); err != nil {
 			t.Fatalf("Stop(first consumer) error = %v", err)
 		}
-		if err := producer.Publish(group.ctx, driver.OutboundMessage{Destination: "consume.existing-group", Body: []byte("second")}); err != nil {
+		if err := producer.Publish(group.ctx, driver.OutboundMessage{Destination: destination, Body: []byte("second")}); err != nil {
 			t.Fatalf("Publish(second) error = %v", err)
 		}
 		secondConsumer := newConsumerFor(t, group, driver.ConsumerConfig{
-			Group: "consume-existing", Destinations: []string{"consume.existing-group"}, Prefetch: 1,
+			Group: groupName, Destinations: []string{destination}, Prefetch: 1,
 			StartAt: driver.StartEarliest, Effective: group.effective,
 		})
 		second := receiveMessage(t, group, secondConsumer)

@@ -252,6 +252,7 @@ func runProfile(
 				drv: drv, cfg: cfg, injectFactory: injectFactory,
 				checkNames: make(map[string]struct{}),
 				skips:      make(map[string]string), deadline: deadline,
+				runID: runID,
 			}
 			runner(groupResult)
 		})

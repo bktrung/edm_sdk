@@ -650,6 +650,28 @@ func cleanupTopologyDestinations(t *testing.T, admin driver.Admin, maintenance d
 	})
 }
 
+func purgeAndCleanupTopologyDestinations(t *testing.T, maintenance driver.Maintenance, ctx context.Context, names ...string) {
+	t.Helper()
+	t.Cleanup(func() {
+		for _, name := range names {
+			if _, err := maintenance.Purge(ctx, name); err != nil && !errors.Is(err, driver.ErrDestinationMissing) {
+				t.Errorf("purge destination %q: %v", name, err)
+			}
+		}
+		results, err := maintenance.Prune(ctx, names)
+		if err != nil {
+			t.Errorf("prune destinations %v: %v", names, err)
+			return
+		}
+		for _, name := range names {
+			result := findPruneResult(results, name)
+			if !result.Deleted {
+				t.Errorf("Prune(%q)=%+v, want deleted", name, result)
+			}
+		}
+	})
+}
+
 func findOrphan(orphans []driver.OrphanedDestination, name string) (driver.OrphanedDestination, bool) {
 	for _, orphan := range orphans {
 		if orphan.Name == name {
@@ -761,13 +783,7 @@ func runTopologyPolicyChecks(group *groupContext) {
 		if err != nil {
 			t.Fatalf("FanoutAtConsume EnsureTopology: %v", err)
 		}
-		t.Cleanup(func() {
-			for _, name := range []string{first, second} {
-				if _, err := maintenance.Purge(group.ctx, name); err != nil {
-					t.Errorf("purge FanoutAtConsume destination %q: %v", name, err)
-				}
-			}
-		})
+		purgeAndCleanupTopologyDestinations(t, maintenance, group.ctx, first, second)
 		if !containsName(diff.CreatedDestinations, first) || !containsName(diff.CreatedDestinations, second) {
 			t.Fatalf("FanoutAtConsume CreatedDestinations=%v, want %q and %q", diff.CreatedDestinations, first, second)
 		}

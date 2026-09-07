@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"strings"
+	"sync"
 	"testing"
 
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/driver"
@@ -662,5 +663,122 @@ func TestManifestRejectsUntrackedState(t *testing.T) {
 	}
 	if err := validateManifestState(manifest, []string{"missing"}, map[string]groupRunner{}); err == nil {
 		t.Fatal("manifest accepted a pending group absent from the manifest")
+	}
+}
+
+type consumerConfigRecordingConn struct {
+	driver.Conn
+	mu      sync.Mutex
+	configs []driver.ConsumerConfig
+}
+
+func (c *consumerConfigRecordingConn) Consumer(ctx context.Context, cfg driver.ConsumerConfig) (driver.Consumer, error) {
+	c.mu.Lock()
+	c.configs = append(c.configs, cfg)
+	c.mu.Unlock()
+	return c.Conn.Consumer(ctx, cfg)
+}
+
+func (c *consumerConfigRecordingConn) recordedConfigs() []driver.ConsumerConfig {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([]driver.ConsumerConfig(nil), c.configs...)
+}
+
+func TestRunScopedPersistentGroups(t *testing.T) {
+	runCheckCalls := func(t *testing.T, profile Profile, runID string) []driver.ConsumerConfig {
+		raw := &runTestConn{
+			queues:    make(map[string][]driver.OutboundMessage),
+			unsettled: make(map[string]int),
+			specs:     make(map[string]driver.DestinationSpec),
+		}
+		inspect, err := runTestInspector(raw)
+		if err != nil {
+			t.Fatalf("runTestInspector: %v", err)
+		}
+		recorder := &consumerConfigRecordingConn{Conn: raw}
+		group := &groupContext{
+			t:          t,
+			ctx:        context.Background(),
+			conn:       recorder,
+			inspect:    inspect,
+			profile:    profile,
+			checkNames: make(map[string]struct{}),
+			skips:      make(map[string]string),
+			runID:      runID,
+			checkFilter: func(name string) bool {
+				return name == "StartEarliest includes retained messages for a new group" ||
+					name == "StartAt does not reposition an existing group"
+			},
+		}
+		runConsume(group)
+		return recorder.recordedConfigs()
+	}
+
+	pass1 := runCheckCalls(t, ProfileFull, "run-alpha")
+	pass2 := runCheckCalls(t, ProfileFull, "run-beta")
+	pass3 := runCheckCalls(t, ProfileStrictPortability, "run-alpha")
+
+	if len(pass1) != 3 {
+		t.Fatalf("pass1 recorded %d consumer configs, want 3", len(pass1))
+	}
+	if len(pass2) != 3 {
+		t.Fatalf("pass2 recorded %d consumer configs, want 3", len(pass2))
+	}
+	if len(pass3) != 3 {
+		t.Fatalf("pass3 recorded %d consumer configs, want 3", len(pass3))
+	}
+
+	startEarliest1 := pass1[0].Group
+	startAt1_First := pass1[1].Group
+	startAt1_Second := pass1[2].Group
+
+	startEarliest2 := pass2[0].Group
+	startAt2_First := pass2[1].Group
+	startAt2_Second := pass2[2].Group
+
+	startEarliest3 := pass3[0].Group
+	startAt3_First := pass3[1].Group
+	startAt3_Second := pass3[2].Group
+
+	// 1. the StartEarliest group contains the supplied run ID and changes when the run ID changes:
+	if !strings.Contains(startEarliest1, "run-alpha") {
+		t.Errorf("StartEarliest group %q does not contain run ID %q", startEarliest1, "run-alpha")
+	}
+	if !strings.Contains(startEarliest2, "run-beta") {
+		t.Errorf("StartEarliest group %q does not contain run ID %q", startEarliest2, "run-beta")
+	}
+	if startEarliest1 == startEarliest2 {
+		t.Errorf("StartEarliest group did not change across run IDs: %q", startEarliest1)
+	}
+
+	// 2. both StartAt consumers within one check use the same group:
+	if startAt1_First != startAt1_Second {
+		t.Errorf("StartAt consumers within pass1 use different groups: %q vs %q", startAt1_First, startAt1_Second)
+	}
+	if startAt2_First != startAt2_Second {
+		t.Errorf("StartAt consumers within pass2 use different groups: %q vs %q", startAt2_First, startAt2_Second)
+	}
+	if startAt3_First != startAt3_Second {
+		t.Errorf("StartAt consumers within pass3 use different groups: %q vs %q", startAt3_First, startAt3_Second)
+	}
+
+	// 3. StartAt's group changes when the run ID changes (and contains the run ID):
+	if !strings.Contains(startAt1_First, "run-alpha") {
+		t.Errorf("StartAt group %q does not contain run ID %q", startAt1_First, "run-alpha")
+	}
+	if !strings.Contains(startAt2_First, "run-beta") {
+		t.Errorf("StartAt group %q does not contain run ID %q", startAt2_First, "run-beta")
+	}
+	if startAt1_First == startAt2_First {
+		t.Errorf("StartAt group did not change across run IDs: %q", startAt1_First)
+	}
+
+	// 4. full and strict profiles do not share a group:
+	if startEarliest1 == startEarliest3 {
+		t.Errorf("StartEarliest group shared across full and strict profiles: %q", startEarliest1)
+	}
+	if startAt1_First == startAt3_First {
+		t.Errorf("StartAt group shared across full and strict profiles: %q", startAt1_First)
 	}
 }
