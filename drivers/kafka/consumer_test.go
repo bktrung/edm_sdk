@@ -755,23 +755,72 @@ func TestConsumerPerDestinationShareRefillsOnSettlement(t *testing.T) {
 		t.Fatalf("Inspector: %v", err)
 	}
 	waitForKafkaShares(t, inspect, ctx, map[string]int{first: 1, second: 3})
+	// Explicit initial 1/3 categorization asserting share saturation.
+	initial := make(map[string][]driver.InboundMessage)
+	for range 4 {
+		msg := receiveKafkaMessage(t, consumer)
+		initial[msg.Destination] = append(initial[msg.Destination], msg)
+	}
+	if len(initial[first]) != 1 || len(initial[second]) != 3 {
+		t.Fatalf("initial deliveries by destination: first=%d second=%d, want 1 and 3", len(initial[first]), len(initial[second]))
+	}
 
-	// Settle messages as they are received (mirroring ackAll in conformance).
-	// After each destination's initial share settles (1 on first, 3 on second),
-	// further messages must refill and be delivered promptly on each destination.
-	delivered := make(map[string]int)
-	for i := range 8 {
-		msg := receiveKafkaMessageBefore(t, consumer, kafkaNow().Add(2*time.Second))
-		delivered[msg.Destination]++
+	// Settle exactly one message on each destination.
+	if err := initial[first][0].Settle.Ack(ctx); err != nil {
+		t.Fatalf("Ack(first initial): %v", err)
+	}
+	if err := initial[second][0].Settle.Ack(ctx); err != nil {
+		t.Fatalf("Ack(second initial): %v", err)
+	}
+
+	// Assert immediate per-destination refill: one further message delivered from each.
+	deadline := kafkaNow().Add(2 * time.Second)
+	refills := make(map[string]driver.InboundMessage)
+	for range 2 {
+		msg := receiveKafkaMessageBefore(t, consumer, deadline)
+		refills[msg.Destination] = msg
+	}
+	refilledFirst, hasFirst := refills[first]
+	if !hasFirst {
+		t.Fatalf("further message not delivered on %q after initial settlement", first)
+	}
+	refilledSecond, hasSecond := refills[second]
+	if !hasSecond {
+		t.Fatalf("further message not delivered on %q after initial settlement", second)
+	}
+
+	// Settle destination second's refilled message and its remaining initial messages.
+	if err := refilledSecond.Settle.Ack(ctx); err != nil {
+		t.Fatalf("Ack(second refilled): %v", err)
+	}
+	for i, msg := range initial[second][1:] {
 		if err := msg.Settle.Ack(ctx); err != nil {
-			t.Fatalf("Ack(msg %d): %v", i, err)
+			t.Fatalf("Ack(initial second %d): %v", i+1, err)
 		}
 	}
 
-	// Both destinations must have refilled and delivered all published messages:
-	// 3 on first (> share 1) and 5 on second (> share 3).
-	if delivered[first] != 3 || delivered[second] != 5 {
-		t.Fatalf("delivered: first=%d second=%d, want 3 and 5", delivered[first], delivered[second])
+	// Drain the remaining message on second so that second is completely exhausted on the broker.
+	secondFinal := receiveKafkaMessageBefore(t, consumer, deadline)
+	if secondFinal.Destination != second {
+		t.Fatalf("received %q, want final %q", secondFinal.Destination, second)
+	}
+	if err := secondFinal.Settle.Ack(ctx); err != nil {
+		t.Fatalf("Ack(second final): %v", err)
+	}
+
+	// Destination second is now exhausted on the broker and idle/unpaused.
+	// Only now acknowledge first's refilled message. Its final message must be delivered promptly.
+	// Without FetchMaxWait configured, franz-go issues a fetch request for the exhausted
+	// destination second which Kafka holds for 5 seconds, starving first and failing this 2s deadline.
+	if err := refilledFirst.Settle.Ack(ctx); err != nil {
+		t.Fatalf("Ack(first refilled): %v", err)
+	}
+	firstFinal := receiveKafkaMessageBefore(t, consumer, kafkaNow().Add(2*time.Second))
+	if firstFinal.Destination != first {
+		t.Fatalf("received %q, want final %q", firstFinal.Destination, first)
+	}
+	if err := firstFinal.Settle.Ack(ctx); err != nil {
+		t.Fatalf("Ack(first final): %v", err)
 	}
 
 	if err := consumer.Stop(ctx); err != nil {
