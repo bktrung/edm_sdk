@@ -95,13 +95,15 @@ type consumer struct {
 	reportedDeferrals  map[string]struct{}
 	maxAckGap          int64
 	now                func() time.Time
-	offsetMu           sync.Mutex
-	assignmentMu       sync.Mutex
-	mu                 sync.Mutex
-	draining           bool
-	stopped            bool
-	forwarderStopC     chan struct{}
-	forwarderStopOnce  sync.Once
+	// offsetMu serializes CommitOffsetsSync with SetOffsets because franz-go
+	// forbids those operations from running concurrently.
+	offsetMu          sync.Mutex
+	assignmentMu      sync.Mutex
+	mu                sync.Mutex
+	draining          bool
+	stopped           bool
+	forwarderStopC    chan struct{}
+	forwarderStopOnce sync.Once
 }
 
 type settler struct {

@@ -323,6 +323,7 @@ func classifyAdminError(operation string, err error) error {
 	switch {
 	case errors.Is(err, kerr.UnknownTopicOrPartition), errors.Is(err, kerr.UnknownTopicID):
 		kind = driver.KindNotFound
+		err = errors.Join(driver.ErrDestinationMissing, err)
 	case errors.Is(err, kerr.InvalidTopicException),
 		errors.Is(err, kerr.InvalidPartitions),
 		errors.Is(err, kerr.InvalidReplicationFactor),

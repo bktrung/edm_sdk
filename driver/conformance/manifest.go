@@ -49,6 +49,8 @@ type groupContext struct {
 	deadline            DeadlineFixture
 	report              *Report
 	currentCheck        string
+	runID               string
+	checkFilter         func(string) bool
 }
 
 func (g *groupContext) capability(capability, declared, status, evidence string) {
@@ -60,6 +62,9 @@ func (g *groupContext) capability(capability, declared, status, evidence string)
 type groupRunner func(*groupContext)
 
 func (g *groupContext) Check(name string, fn func(*testing.T)) {
+	if g.checkFilter != nil && !g.checkFilter(name) {
+		return
+	}
 	if g.checkNames == nil {
 		g.checkNames = make(map[string]struct{})
 	}

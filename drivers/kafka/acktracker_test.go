@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -461,38 +462,127 @@ func TestAckTrackerTrackDoesNotWaitOnCommit(t *testing.T) {
 }
 
 func TestAckTrackerCommitsNeverRegress(t *testing.T) {
-	const count = 200
 	tracker := newAckTracker(0, 1)
-	for offset := range count {
-		if err := tracker.Track(int64(offset)); err != nil {
-			t.Fatalf("Track(%d): %v", offset, err)
-		}
+	if err := tracker.Track(0); err != nil {
+		t.Fatalf("Track(0): %v", err)
 	}
+	if err := tracker.Track(1); err != nil {
+		t.Fatalf("Track(1): %v", err)
+	}
+
+	testCtx, testCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer testCancel()
+
+	olderEntered := make(chan struct{})
+	olderRelease := make(chan struct{})
+	newerEntered := make(chan struct{}, 1)
+	ack0Done := make(chan error, 1)
+	ack1Done := make(chan error, 1)
+
+	var releaseOnce sync.Once
+	releaseAll := func() {
+		releaseOnce.Do(func() {
+			close(olderRelease)
+		})
+	}
+	defer releaseAll()
 
 	var mu sync.Mutex
 	var commitPoints []int64
+	var newerEnteredEarly atomic.Bool
 
-	commit := func(commitPoint int64) error {
+	olderCommit := func(commitPoint int64) error {
+		close(olderEntered)
+		select {
+		case <-olderRelease:
+		case <-testCtx.Done():
+			return testCtx.Err()
+		}
 		mu.Lock()
 		commitPoints = append(commitPoints, commitPoint)
 		mu.Unlock()
 		return nil
 	}
 
-	var group sync.WaitGroup
-	for offset := range count {
-		group.Add(1)
-		go func(offset int) {
-			defer group.Done()
-			_ = tracker.Ack(int64(offset), commit)
-		}(offset)
+	newerCommit := func(commitPoint int64) error {
+		select {
+		case <-olderRelease:
+		default:
+			newerEnteredEarly.Store(true)
+		}
+		mu.Lock()
+		commitPoints = append(commitPoints, commitPoint)
+		mu.Unlock()
+		select {
+		case newerEntered <- struct{}{}:
+		default:
+		}
+		return nil
 	}
-	group.Wait()
+
+	go func() {
+		ack0Done <- tracker.Ack(0, olderCommit)
+	}()
+
+	enterCtx, enterCancel := context.WithTimeout(testCtx, 5*time.Second)
+	defer enterCancel()
+	select {
+	case <-olderEntered:
+	case <-enterCtx.Done():
+		t.Fatal("timed out waiting for older commit callback to enter")
+	}
+
+	ack1Started := make(chan struct{})
+	go func() {
+		close(ack1Started)
+		ack1Done <- tracker.Ack(1, newerCommit)
+	}()
+
+	select {
+	case <-ack1Started:
+	case <-testCtx.Done():
+		t.Fatal("timed out waiting for newer ack to start")
+	}
+
+	waitCtx, waitCancel := context.WithTimeout(testCtx, 100*time.Millisecond)
+	defer waitCancel()
+	select {
+	case <-newerEntered:
+		t.Fatal("newer commit callback entered before older callback was released")
+	case <-waitCtx.Done():
+	}
+
+	releaseAll()
+
+	doneCtx, doneCancel := context.WithTimeout(testCtx, 5*time.Second)
+	defer doneCancel()
+
+	select {
+	case err := <-ack0Done:
+		if err != nil {
+			t.Fatalf("Ack(0) failed: %v", err)
+		}
+	case <-doneCtx.Done():
+		t.Fatal("timed out waiting for Ack(0) to complete")
+	}
+
+	select {
+	case err := <-ack1Done:
+		if err != nil {
+			t.Fatalf("Ack(1) failed: %v", err)
+		}
+	case <-doneCtx.Done():
+		t.Fatal("timed out waiting for Ack(1) to complete")
+	}
+
+	if newerEnteredEarly.Load() {
+		t.Fatal("newer commit callback entered before older callback was released")
+	}
 
 	mu.Lock()
 	defer mu.Unlock()
-	if len(commitPoints) == 0 {
-		t.Fatal("no commits were recorded")
+	if len(commitPoints) != 2 {
+		t.Fatalf("expected 2 commit points, got %d: %v", len(commitPoints), commitPoints)
 	}
 	for i := 1; i < len(commitPoints); i++ {
 		if commitPoints[i] < commitPoints[i-1] {

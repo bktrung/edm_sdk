@@ -131,6 +131,39 @@ func TestClassifyAdminErrorKinds(t *testing.T) {
 	}
 }
 
+func TestClassifyAdminErrorOffsetLookupMissingDestination(t *testing.T) {
+	cases := []struct {
+		name     string
+		kafkaErr error
+	}{
+		{
+			name:     "unknown topic or partition",
+			kafkaErr: kerr.UnknownTopicOrPartition,
+		},
+		{
+			name:     "unknown topic id",
+			kafkaErr: kerr.UnknownTopicID,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			outerErr := fmt.Errorf("list offsets: %w", tc.kafkaErr)
+			err := classifyAdminError("describe_topology", outerErr)
+			if !errors.Is(err, driver.ErrDestinationMissing) {
+				t.Fatalf("classifyAdminError error = %v, want ErrDestinationMissing", err)
+			}
+			if !errors.Is(err, tc.kafkaErr) {
+				t.Fatalf("classifyAdminError error = %v, want Kafka error %v", err, tc.kafkaErr)
+			}
+			kind, ok := driver.Classify(err)
+			if !ok || kind != driver.KindNotFound {
+				t.Fatalf("classifyAdminError classification = (%v, %t), want (%v, true)", kind, ok, driver.KindNotFound)
+			}
+		})
+	}
+}
+
 func TestEnsureTopologyCreatesAndIsIdempotent(t *testing.T) {
 	ctx, connection, admin := openKafkaAdminTest(t)
 	first := kafkaTestTopic(t, "create-first")
