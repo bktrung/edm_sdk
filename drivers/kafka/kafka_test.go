@@ -151,6 +151,40 @@ func TestModeResolution(t *testing.T) {
 	}
 }
 
+func TestStaticMembershipResolution(t *testing.T) {
+	cases := []struct {
+		name    string
+		options map[string]string
+		want    bool
+		wantErr bool
+	}{
+		{name: "default when missing", options: nil, want: true},
+		{name: "empty options map", options: map[string]string{}, want: true},
+		{name: "explicit true", options: map[string]string{"kafka.staticMembership": "true"}, want: true},
+		{name: "explicit 1", options: map[string]string{"kafka.staticMembership": "1"}, want: true},
+		{name: "explicit false", options: map[string]string{"kafka.staticMembership": "false"}, want: false},
+		{name: "explicit 0", options: map[string]string{"kafka.staticMembership": "0"}, want: false},
+		{name: "invalid boolean string", options: map[string]string{"kafka.staticMembership": "invalid"}, wantErr: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := resolveStaticMembership(tc.options)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("resolveStaticMembership(%v) wanted error, got nil", tc.options)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("resolveStaticMembership(%v) unexpected error: %v", tc.options, err)
+			}
+			if got != tc.want {
+				t.Fatalf("resolveStaticMembership(%v) = %v, want %v", tc.options, got, tc.want)
+			}
+		})
+	}
+}
+
 func TestOpenPingClose(t *testing.T) {
 	requireBroker(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)

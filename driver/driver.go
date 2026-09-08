@@ -175,11 +175,13 @@ type Maintenance interface {
 
 // Config contains connection settings shared by all drivers.
 type Config struct {
-	Endpoints      []string      // broker endpoints
-	ClientID       string        // stable client identity
-	ConnectTimeout time.Duration // timeout for Open retries
-	TLS            *TLSConfig    // nil disables TLS
-	SASL           *SASLConfig   // nil disables SASL
+	Endpoints             []string      // broker endpoints
+	ClientID              string        // stable client identity
+	InstanceID            string        // stable group instance identity
+	RebalanceDrainTimeout time.Duration // bound for in-flight settlement during rebalance drain
+	ConnectTimeout        time.Duration // timeout for Open retries
+	TLS                   *TLSConfig    // nil disables TLS
+	SASL                  *SASLConfig   // nil disables SASL
 	// DriverOptions carries driver-specific knobs untouched by the core.
 	DriverOptions map[string]string
 }

@@ -71,30 +71,36 @@ type partitionKey struct {
 }
 
 type consumer struct {
-	conn               *conn
-	client             *kgo.Client
-	cfg                driver.ConsumerConfig
-	group              string
-	synthesizedGroup   bool
-	destinations       []string
-	budgets            map[string]int
-	messages           chan driver.InboundMessage
-	errors             chan error
-	errorsMu           sync.Mutex
-	pollCtx            context.Context
-	cancelPoll         context.CancelFunc
-	pollDone           chan struct{}
-	stopDone           chan struct{}
-	pauseReasons       map[string]pauseReasonSet
-	unsettled          map[string]int
-	settlers           map[*settler]struct{}
-	trackers           map[partitionKey]*ackTracker
-	trackerGenerations map[partitionKey]uint64
-	requeued           map[partitionKey]int
-	discarded          map[partitionKey]map[int64]struct{}
-	reportedDeferrals  map[string]struct{}
-	maxAckGap          int64
-	now                func() time.Time
+	conn                  *conn
+	client                *kgo.Client
+	cfg                   driver.ConsumerConfig
+	group                 string
+	synthesizedGroup      bool
+	destinations          []string
+	budgets               map[string]int
+	messages              chan driver.InboundMessage
+	errors                chan error
+	errorsMu              sync.Mutex
+	pollCtx               context.Context
+	cancelPoll            context.CancelFunc
+	pollDone              chan struct{}
+	stopDone              chan struct{}
+	pauseReasons          map[string]pauseReasonSet
+	unsettled             map[string]int
+	settlers              map[*settler]struct{}
+	trackers              map[partitionKey]*ackTracker
+	trackerGenerations    map[partitionKey]uint64
+	assignmentGenerations map[partitionKey]uint64
+	activeGenerations     map[partitionKey]uint64
+	fenced                map[partitionKey]bool
+	recordGenerations     map[*kgo.Record]uint64
+	settlerCh             chan struct{}
+	rebalanceDrainTimeout time.Duration
+	requeued              map[partitionKey]int
+	discarded             map[partitionKey]map[int64]struct{}
+	reportedDeferrals     map[string]struct{}
+	maxAckGap             int64
+	now                   func() time.Time
 	// offsetMu serializes CommitOffsetsSync with SetOffsets because franz-go
 	// forbids those operations from running concurrently.
 	offsetMu          sync.Mutex
@@ -251,34 +257,73 @@ func newConsumer(ctx context.Context, connection *conn, cfg driver.ConsumerConfi
 		synthesized = true
 	}
 
+	drainTimeout := connection.rebalanceDrainTimeout
+	if drainTimeout == 0 {
+		drainTimeout = 25 * time.Second
+	}
+
 	pollCtx, cancelPoll := context.WithCancel(context.Background())
 	consumer := &consumer{
-		conn:               connection,
-		cfg:                cfg,
-		group:              group,
-		synthesizedGroup:   synthesized,
-		destinations:       append([]string(nil), cfg.Destinations...),
-		budgets:            make(map[string]int, len(cfg.Destinations)),
-		messages:           make(chan driver.InboundMessage, totalPrefetch(cfg)),
-		errors:             make(chan error, 8),
-		pollCtx:            pollCtx,
-		cancelPoll:         cancelPoll,
-		pollDone:           make(chan struct{}),
-		stopDone:           make(chan struct{}),
-		forwarderStopC:     make(chan struct{}),
-		pauseReasons:       make(map[string]pauseReasonSet, len(cfg.Destinations)),
-		unsettled:          make(map[string]int, len(cfg.Destinations)),
-		settlers:           make(map[*settler]struct{}),
-		trackers:           make(map[partitionKey]*ackTracker),
-		trackerGenerations: make(map[partitionKey]uint64),
-		requeued:           make(map[partitionKey]int),
-		discarded:          make(map[partitionKey]map[int64]struct{}),
-		reportedDeferrals:  make(map[string]struct{}),
-		maxAckGap:          maxAckGap,
-		now:                kafkaNow,
+		conn:                  connection,
+		cfg:                   cfg,
+		group:                 group,
+		synthesizedGroup:      synthesized,
+		destinations:          append([]string(nil), cfg.Destinations...),
+		budgets:               make(map[string]int, len(cfg.Destinations)),
+		messages:              make(chan driver.InboundMessage, totalPrefetch(cfg)),
+		errors:                make(chan error, 8),
+		pollCtx:               pollCtx,
+		cancelPoll:            cancelPoll,
+		pollDone:              make(chan struct{}),
+		stopDone:              make(chan struct{}),
+		forwarderStopC:        make(chan struct{}),
+		pauseReasons:          make(map[string]pauseReasonSet, len(cfg.Destinations)),
+		unsettled:             make(map[string]int, len(cfg.Destinations)),
+		settlers:              make(map[*settler]struct{}),
+		trackers:              make(map[partitionKey]*ackTracker),
+		trackerGenerations:    make(map[partitionKey]uint64),
+		assignmentGenerations: make(map[partitionKey]uint64),
+		activeGenerations:     make(map[partitionKey]uint64),
+		fenced:                make(map[partitionKey]bool),
+		recordGenerations:     make(map[*kgo.Record]uint64),
+		settlerCh:             make(chan struct{}, 1),
+		rebalanceDrainTimeout: drainTimeout,
+		requeued:              make(map[partitionKey]int),
+		discarded:             make(map[partitionKey]map[int64]struct{}),
+		reportedDeferrals:     make(map[string]struct{}),
+		maxAckGap:             maxAckGap,
+		now:                   kafkaNow,
 	}
 	for index, destination := range cfg.Destinations {
 		consumer.budgets[destination] = destinationPrefetch(cfg, destination, index)
+	}
+
+	opts, err := consumerClientOpts(connection, cfg, group, consumer)
+	if err != nil {
+		cancelPoll()
+		return nil, classify("consumer", driver.KindFatal, err)
+	}
+	client, err := kgo.NewClient(opts...)
+	if err != nil {
+		cancelPoll()
+		return nil, classify("consumer", driver.KindFatal, err)
+	}
+	consumer.client = client
+	connection.registerConsumer(consumer)
+	// The poll context is owned by the consumer and canceled by Drain or Stop.
+	//nolint:contextcheck // this goroutine uses the consumer-owned cancellation context.
+	go consumer.poll(pollCtx)
+	return consumer, nil
+}
+
+func consumerClientOpts(connection *conn, cfg driver.ConsumerConfig, group string, consumer *consumer) ([]kgo.Opt, error) {
+	staticMembership := connection.staticMembership
+	if connection.driverOptions != nil {
+		if resolved, err := resolveStaticMembership(connection.driverOptions); err == nil {
+			staticMembership = resolved
+		} else {
+			return nil, err
+		}
 	}
 
 	opts := append([]kgo.Opt(nil), connection.clientOpts...)
@@ -296,24 +341,21 @@ func newConsumer(ctx context.Context, connection *conn, cfg driver.ConsumerConfi
 		// deliveries for up to 5 seconds. Bounding FetchMaxWait prevents an
 		// exhausted destination from starving ready destinations.
 		kgo.FetchMaxWait(50*time.Millisecond),
-		kgo.OnPartitionsRevoked(func(_ context.Context, _ *kgo.Client, partitions map[string][]int32) {
-			consumer.sendRebalanceError("revoked", partitions)
+		kgo.BlockRebalanceOnPoll(),
+		kgo.OnPartitionsAssigned(func(ctx context.Context, cl *kgo.Client, partitions map[string][]int32) {
+			consumer.onPartitionsAssigned(ctx, cl, partitions)
 		}),
-		kgo.OnPartitionsLost(func(_ context.Context, _ *kgo.Client, partitions map[string][]int32) {
-			consumer.sendRebalanceError("lost", partitions)
+		kgo.OnPartitionsRevoked(func(ctx context.Context, cl *kgo.Client, partitions map[string][]int32) {
+			consumer.onPartitionsRevoked(ctx, cl, partitions)
+		}),
+		kgo.OnPartitionsLost(func(ctx context.Context, cl *kgo.Client, partitions map[string][]int32) {
+			consumer.onPartitionsLost(ctx, cl, partitions)
 		}),
 	)
-	client, err := kgo.NewClient(opts...)
-	if err != nil {
-		cancelPoll()
-		return nil, classify("consumer", driver.KindFatal, err)
+	if staticMembership && connection.instanceID != "" {
+		opts = append(opts, kgo.InstanceID(connection.instanceID))
 	}
-	consumer.client = client
-	connection.registerConsumer(consumer)
-	// The poll context is owned by the consumer and canceled by Drain or Stop.
-	//nolint:contextcheck // this goroutine uses the consumer-owned cancellation context.
-	go consumer.poll(pollCtx)
-	return consumer, nil
+	return opts, nil
 }
 
 const defaultKafkaMaxAckGap int64 = 10000
@@ -393,6 +435,7 @@ func (c *consumer) poll(ctx context.Context) {
 			fetches := c.client.PollRecords(fetchCtx, 0)
 			cancel()
 			if ctx.Err() != nil || fetches.IsClientClosed() {
+				c.client.AllowRebalance()
 				return
 			}
 			if !c.handleFetches(&pending, fetches, bounded) {
@@ -403,6 +446,7 @@ func (c *consumer) poll(ctx context.Context) {
 
 		fetches := c.client.PollRecords(fetchCtx, 1)
 		if ctx.Err() != nil || fetches.IsClientClosed() {
+			c.client.AllowRebalance()
 			return
 		}
 		if !c.handleFetches(&pending, fetches, bounded) {
@@ -412,6 +456,14 @@ func (c *consumer) poll(ctx context.Context) {
 }
 
 func (c *consumer) handleFetches(pending *[]*kgo.Record, fetches kgo.Fetches, bounded bool) bool {
+	c.mu.Lock()
+	if c.recordGenerations == nil {
+		c.recordGenerations = make(map[*kgo.Record]uint64)
+	}
+	fetches.EachRecord(c.tagRecordLocked)
+	c.mu.Unlock()
+	c.client.AllowRebalance()
+
 	for _, fetchErr := range fetches.Errors() {
 		if bounded && (errors.Is(fetchErr.Err, context.DeadlineExceeded) || errors.Is(fetchErr.Err, context.Canceled)) {
 			continue
@@ -429,6 +481,10 @@ func (c *consumer) handleFetches(pending *[]*kgo.Record, fetches kgo.Fetches, bo
 		}
 	}
 	for record := range fetches.RecordsAll() {
+		if c.isRecordStale(record) {
+			c.discardStaleRecord(record)
+			continue
+		}
 		if !c.canDeliver(record) {
 			*pending = append(*pending, record)
 			continue
@@ -449,10 +505,21 @@ func (c *consumer) flushPending(pending *[]*kgo.Record) bool {
 		records := *pending
 		index := -1
 		for i, record := range records {
+			if c.isRecordStale(record) {
+				copy(records[i:], records[i+1:])
+				records[len(records)-1] = nil
+				*pending = records[:len(records)-1]
+				c.discardStaleRecord(record)
+				index = -2
+				break
+			}
 			if c.canDeliver(record) {
 				index = i
 				break
 			}
+		}
+		if index == -2 {
+			continue
 		}
 		if index < 0 {
 			return true
@@ -478,7 +545,52 @@ func (c *consumer) canDeliver(record *kgo.Record) bool {
 	if c.stopped || c.draining {
 		return false
 	}
+	if c.isRecordStaleLocked(record) {
+		return false
+	}
 	return c.admissionLocked(record)
+}
+
+func (c *consumer) tagRecord(record *kgo.Record) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.recordGenerations == nil {
+		c.recordGenerations = make(map[*kgo.Record]uint64)
+	}
+	c.tagRecordLocked(record)
+}
+
+func (c *consumer) tagRecordLocked(record *kgo.Record) {
+	key := partitionKey{destination: record.Topic, partition: record.Partition}
+	c.recordGenerations[record] = c.activeGenerations[key]
+}
+
+func (c *consumer) isRecordStale(record *kgo.Record) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.isRecordStaleLocked(record)
+}
+
+func (c *consumer) isRecordStaleLocked(record *kgo.Record) bool {
+	key := partitionKey{destination: record.Topic, partition: record.Partition}
+	if c.fenced != nil && c.fenced[key] {
+		return true
+	}
+	activeGen, ok := c.activeGenerations[key]
+	if !ok || activeGen == 0 {
+		return true
+	}
+	recordGen, ok := c.recordGenerations[record]
+	if !ok || recordGen == 0 || recordGen != activeGen {
+		return true
+	}
+	return false
+}
+
+func (c *consumer) discardStaleRecord(record *kgo.Record) {
+	c.mu.Lock()
+	delete(c.recordGenerations, record)
+	c.mu.Unlock()
 }
 
 func (c *consumer) emit(record *kgo.Record) (delivered, active bool) {
@@ -486,6 +598,10 @@ func (c *consumer) emit(record *kgo.Record) (delivered, active bool) {
 	if c.stopped || c.draining {
 		c.mu.Unlock()
 		return false, false
+	}
+	if c.isRecordStaleLocked(record) {
+		c.mu.Unlock()
+		return false, true
 	}
 	if !c.admissionLocked(record) {
 		c.mu.Unlock()
@@ -528,6 +644,7 @@ func (c *consumer) emit(record *kgo.Record) (delivered, active bool) {
 		key:     key,
 	}
 	c.settlers[settler] = struct{}{}
+	delete(c.recordGenerations, record)
 	if !reused {
 		c.unsettled[record.Topic]++
 	}
@@ -553,10 +670,15 @@ func (c *consumer) stopForwarders() {
 
 func (c *consumer) abortSettler(settler *settler, reused bool) {
 	c.mu.Lock()
-	defer c.mu.Unlock()
 	delete(c.settlers, settler)
 	if !reused && c.unsettled[settler.record.Topic] > 0 {
 		c.unsettled[settler.record.Topic]--
+	}
+	c.signalSettlerDoneLocked()
+	shouldLeave := c.draining && len(c.settlers) == 0
+	c.mu.Unlock()
+	if shouldLeave {
+		c.client.LeaveGroup()
 	}
 }
 
@@ -573,6 +695,9 @@ func (c *consumer) detachAllTrackersLocked() []*ackTracker {
 	clear(c.requeued)
 	clear(c.discarded)
 	clear(c.unsettled)
+	clear(c.recordGenerations)
+	clear(c.activeGenerations)
+	clear(c.fenced)
 	return trackers
 }
 
@@ -581,13 +706,16 @@ func (c *consumer) trackerForLocked(record *kgo.Record) *ackTracker {
 	if tracker := c.trackers[key]; tracker != nil {
 		return tracker
 	}
+	generation := c.activeGenerations[key]
+	if generation == 0 {
+		return nil
+	}
 	if c.trackers == nil {
 		c.trackers = make(map[partitionKey]*ackTracker)
 	}
 	if c.trackerGenerations == nil {
 		c.trackerGenerations = make(map[partitionKey]uint64)
 	}
-	generation := c.trackerGenerations[key] + 1
 	c.trackerGenerations[key] = generation
 	tracker := newAckTracker(record.Offset, generation)
 	c.trackers[key] = tracker
@@ -606,13 +734,16 @@ func (c *consumer) dropTracker(destination string, partition int32) {
 	}
 	// tracker.Drop only acquires t.mu to mark revoked; it no longer acquires commitMu
 	// and never blocks on broker network I/O. Calling it while holding c.assignmentMu
-	// and c.mu is safe and necessary to close the window where an in-flight settler could
-	// read tracker before detachment and proceed to commit rather than see ErrRevoked.
+	// and c.mu is safe and makes the tombstone and detachment atomic against any settler
+	// that has not yet taken c.mu. A settler that already read s.tracker before detachment
+	// holds a local pointer, so it sees ErrRevoked from the tombstone Drop set under t.mu
+	// rather than from mutex exclusion.
 	tracker.Drop()
 	pending := tracker.Unacked()
 	delete(c.trackers, key)
 	delete(c.requeued, key)
 	delete(c.discarded, key)
+	delete(c.activeGenerations, key)
 	for settler := range c.settlers {
 		if settler.tracker != tracker {
 			continue
@@ -636,13 +767,14 @@ func (c *consumer) dropTracker(destination string, partition int32) {
 
 func (c *consumer) completeSettlement(settler *settler, preserveUnsettled bool) {
 	c.mu.Lock()
-	defer c.mu.Unlock()
 	settler.settled = true
 	if c.trackers[settler.key] == settler.tracker {
 		c.reconcileDiscardedLocked(settler.key, settler.tracker)
 	}
 	if _, exists := c.settlers[settler]; !exists {
 		c.refreshAckGapLocked(settler.record.Topic)
+		c.signalSettlerDoneLocked()
+		c.mu.Unlock()
 		return
 	}
 	delete(c.settlers, settler)
@@ -654,6 +786,12 @@ func (c *consumer) completeSettlement(settler *settler, preserveUnsettled bool) 
 		c.setPauseReasonLocked(settler.record.Topic, pauseReasonPrefetch, false)
 	}
 	c.refreshAckGapLocked(settler.record.Topic)
+	c.signalSettlerDoneLocked()
+	shouldLeave := c.draining && len(c.settlers) == 0
+	c.mu.Unlock()
+	if shouldLeave {
+		c.client.LeaveGroup()
+	}
 }
 
 func (c *consumer) noteDiscarded(key partitionKey, tracker *ackTracker, offset int64) {
@@ -881,7 +1019,18 @@ func (c *consumer) Drain(ctx context.Context) error {
 	}
 	pollDone := c.pollDone
 	c.mu.Unlock()
-	return c.waitPoll(ctx, "drain", pollDone)
+	if err := c.waitPoll(ctx, "drain", pollDone); err != nil {
+		return err
+	}
+	c.mu.Lock()
+	leaveNow := len(c.settlers) == 0
+	c.mu.Unlock()
+	if leaveNow {
+		if err := c.client.LeaveGroupContext(ctx); err != nil {
+			return classify("drain", driver.KindTransient, err)
+		}
+	}
+	return nil
 }
 
 func (c *consumer) waitPoll(ctx context.Context, operation string, pollDone <-chan struct{}) error {
@@ -1196,4 +1345,126 @@ func (c *consumer) sendRebalanceError(event string, partitions map[string][]int3
 		return
 	}
 	c.sendError(classify("consumer", driver.KindTransient, fmt.Errorf("kafka partitions %s: %v", event, partitions)))
+}
+
+func (c *consumer) signalSettlerDoneLocked() {
+	if c.settlerCh != nil {
+		select {
+		case c.settlerCh <- struct{}{}:
+		default:
+		}
+	}
+}
+
+func (c *consumer) waitForSettlers(keys map[partitionKey]struct{}, timeout time.Duration) {
+	timer := time.NewTimer(timeout) //nolint:forbidigo // bounded revoke drain needs a wall-clock timeout
+	defer timer.Stop()
+	for {
+		c.mu.Lock()
+		has := c.hasSettlersForLocked(keys)
+		c.mu.Unlock()
+		if !has {
+			return
+		}
+		select {
+		case <-c.settlerCh:
+		case <-timer.C:
+			return
+		}
+	}
+}
+
+func (c *consumer) hasSettlersForLocked(keys map[partitionKey]struct{}) bool {
+	for s := range c.settlers {
+		if _, ok := keys[s.key]; ok {
+			return true
+		}
+	}
+	return false
+}
+
+func (c *consumer) onPartitionsAssigned(_ context.Context, _ *kgo.Client, partitions map[string][]int32) {
+	if len(partitions) == 0 {
+		return
+	}
+	c.assignmentMu.Lock()
+	c.mu.Lock()
+	if c.assignmentGenerations == nil {
+		c.assignmentGenerations = make(map[partitionKey]uint64)
+	}
+	if c.activeGenerations == nil {
+		c.activeGenerations = make(map[partitionKey]uint64)
+	}
+	if c.fenced == nil {
+		c.fenced = make(map[partitionKey]bool)
+	}
+	for topic, partitionList := range partitions {
+		for _, partition := range partitionList {
+			key := partitionKey{destination: topic, partition: partition}
+			c.assignmentGenerations[key]++
+			gen := c.assignmentGenerations[key]
+			c.activeGenerations[key] = gen
+			c.fenced[key] = false
+		}
+	}
+	c.mu.Unlock()
+	c.assignmentMu.Unlock()
+
+	c.sendRebalanceError("assigned", partitions)
+}
+
+func (c *consumer) onPartitionsRevoked(_ context.Context, _ *kgo.Client, partitions map[string][]int32) {
+	if len(partitions) == 0 {
+		return
+	}
+	revokedKeys := make(map[partitionKey]struct{})
+	c.mu.Lock()
+	if c.fenced == nil {
+		c.fenced = make(map[partitionKey]bool)
+	}
+	for topic, partitionList := range partitions {
+		for _, partition := range partitionList {
+			key := partitionKey{destination: topic, partition: partition}
+			revokedKeys[key] = struct{}{}
+			c.fenced[key] = true
+			delete(c.activeGenerations, key)
+		}
+	}
+	c.mu.Unlock()
+	c.sendRebalanceError("revoked", partitions)
+
+	timeout := c.rebalanceDrainTimeout
+	if timeout <= 0 {
+		timeout = 25 * time.Second
+	}
+	c.waitForSettlers(revokedKeys, timeout)
+
+	for key := range revokedKeys {
+		c.dropTracker(key.destination, key.partition)
+	}
+}
+
+func (c *consumer) onPartitionsLost(_ context.Context, _ *kgo.Client, partitions map[string][]int32) {
+	if len(partitions) == 0 {
+		return
+	}
+	c.mu.Lock()
+	if c.fenced == nil {
+		c.fenced = make(map[partitionKey]bool)
+	}
+	for topic, partitionList := range partitions {
+		for _, partition := range partitionList {
+			key := partitionKey{destination: topic, partition: partition}
+			c.fenced[key] = true
+			delete(c.activeGenerations, key)
+		}
+	}
+	c.mu.Unlock()
+
+	for topic, partitionList := range partitions {
+		for _, partition := range partitionList {
+			c.dropTracker(topic, partition)
+		}
+	}
+	c.sendRebalanceError("lost", partitions)
 }

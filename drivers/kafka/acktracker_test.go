@@ -287,12 +287,16 @@ func TestAckTrackerMaxGapAndOptions(t *testing.T) {
 func TestConsumerTrackerGenerationAndCounter(t *testing.T) {
 	const destination = "topic"
 	consumer := &consumer{
-		trackers:     make(map[partitionKey]*ackTracker),
-		settlers:     make(map[*settler]struct{}),
-		unsettled:    map[string]int{destination: 2},
-		budgets:      map[string]int{destination: 2},
-		pauseReasons: make(map[string]pauseReasonSet),
+		trackers:              make(map[partitionKey]*ackTracker),
+		settlers:              make(map[*settler]struct{}),
+		unsettled:             map[string]int{destination: 2},
+		budgets:               map[string]int{destination: 2},
+		pauseReasons:          make(map[string]pauseReasonSet),
+		activeGenerations:     make(map[partitionKey]uint64),
+		assignmentGenerations: make(map[partitionKey]uint64),
+		fenced:                make(map[partitionKey]bool),
 	}
+	consumer.onPartitionsAssigned(context.Background(), nil, map[string][]int32{destination: {0}})
 	firstRecord := &kgo.Record{Topic: destination, Partition: 0, Offset: 10}
 	consumer.mu.Lock()
 	first := consumer.trackerForLocked(firstRecord)
@@ -321,9 +325,9 @@ func TestConsumerTrackerGenerationAndCounter(t *testing.T) {
 	if got := consumer.unsettled[destination]; got != 0 {
 		t.Fatalf("unsettled after tracker drop = %d, want 0", got)
 	}
+	consumer.onPartitionsAssigned(context.Background(), nil, map[string][]int32{destination: {0}})
 	consumer.mu.Lock()
 	second := consumer.trackerForLocked(&kgo.Record{Topic: destination, Partition: 0, Offset: 10})
-	consumer.mu.Unlock()
 	if second.Generation() != 2 {
 		t.Fatalf("second tracker generation = %d, want 2", second.Generation())
 	}

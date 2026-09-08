@@ -365,3 +365,52 @@ func (c *testConn) Ping(context.Context) error {
 	return c.pingErr
 }
 func (c *testConn) Close(context.Context) error { c.closeCalls++; return c.closeErr }
+
+func TestDriverConfigForwardingAndFallback(t *testing.T) {
+	t.Run("explicit instance id and rebalance timeout", func(t *testing.T) {
+		cfg := Config{
+			Service:    "order-service",
+			InstanceID: "order-worker-1",
+			Lifecycle: LifecycleConfig{
+				RebalanceDrainTimeout: 12 * time.Second,
+			},
+			Broker: BrokerConfig{
+				Endpoints:      []string{"127.0.0.1:9092"},
+				ConnectTimeout: 5 * time.Second,
+			},
+		}
+		driverCfg := driverConfig(cfg)
+		if driverCfg.ClientID != "order-worker-1" {
+			t.Fatalf("ClientID = %q, want %q", driverCfg.ClientID, "order-worker-1")
+		}
+		if driverCfg.InstanceID != "order-worker-1" {
+			t.Fatalf("InstanceID = %q, want %q", driverCfg.InstanceID, "order-worker-1")
+		}
+		if driverCfg.RebalanceDrainTimeout != 12*time.Second {
+			t.Fatalf("RebalanceDrainTimeout = %v, want %v", driverCfg.RebalanceDrainTimeout, 12*time.Second)
+		}
+	})
+
+	t.Run("empty instance id falls back client id to service", func(t *testing.T) {
+		cfg := Config{
+			Service:    "order-service",
+			InstanceID: "",
+			Lifecycle: LifecycleConfig{
+				RebalanceDrainTimeout: 18 * time.Second,
+			},
+			Broker: BrokerConfig{
+				Endpoints: []string{"127.0.0.1:9092"},
+			},
+		}
+		driverCfg := driverConfig(cfg)
+		if driverCfg.ClientID != "order-service" {
+			t.Fatalf("ClientID = %q, want fallback to service %q", driverCfg.ClientID, "order-service")
+		}
+		if driverCfg.InstanceID != "" {
+			t.Fatalf("InstanceID = %q, want empty", driverCfg.InstanceID)
+		}
+		if driverCfg.RebalanceDrainTimeout != 18*time.Second {
+			t.Fatalf("RebalanceDrainTimeout = %v, want %v", driverCfg.RebalanceDrainTimeout, 18*time.Second)
+		}
+	})
+}

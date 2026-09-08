@@ -5,10 +5,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"runtime"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/twmb/franz-go/pkg/kadm"
+	"github.com/twmb/franz-go/pkg/kgo"
 
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/driver"
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/driver/conformance"
@@ -283,12 +286,19 @@ func TestConsumerLoneDeferredRecordArrivesAtDueTime(t *testing.T) {
 	deadlineCtx, deadlineCancel := context.WithDeadline(context.Background(), due.Add(5*time.Second))
 	defer deadlineCancel()
 	var message driver.InboundMessage
-	select {
-	case message = <-consumer.Messages():
-	case err := <-consumer.Errors():
-		t.Fatalf("consumer error: %v", err)
-	case <-deadlineCtx.Done():
-		t.Fatalf("receive message before deadline: %v", deadlineCtx.Err())
+receive:
+	for {
+		select {
+		case message = <-consumer.Messages():
+			break receive
+		case err := <-consumer.Errors():
+			if strings.Contains(err.Error(), "partitions assigned") {
+				continue
+			}
+			t.Fatalf("consumer error: %v", err)
+		case <-deadlineCtx.Done():
+			t.Fatalf("receive message before deadline: %v", deadlineCtx.Err())
+		}
 	}
 	if message.ReceivedAt.Before(due) {
 		t.Fatalf("delivery at %s, want at or after %s", message.ReceivedAt, due)
@@ -1210,5 +1220,719 @@ func waitForKafkaConsumerState(t *testing.T, consumer *consumer, description str
 			t.Fatalf("timed out waiting for %s: %v", description, ctx.Err())
 		case <-ticker.C:
 		}
+	}
+}
+
+func TestConsumerStaticMembershipOptionInspection(t *testing.T) {
+	conn := &conn{
+		clientOpts: []kgo.Opt{kgo.SeedBrokers("localhost:19092")},
+	}
+	cfg := driver.ConsumerConfig{Group: "group", Destinations: []string{"topic"}}
+
+	t.Run("static membership true with non-empty instance id", func(t *testing.T) {
+		conn.staticMembership = true
+		conn.instanceID = "worker-1"
+		opts, err := consumerClientOpts(conn, cfg, "group", nil)
+		if err != nil {
+			t.Fatalf("consumerClientOpts error = %v", err)
+		}
+		cl, err := kgo.NewClient(opts...)
+		if err != nil {
+			t.Fatalf("NewClient error = %v", err)
+		}
+		defer cl.Close()
+		vals := cl.OptValues(kgo.InstanceID)
+		if len(vals) != 2 || vals[0] != "worker-1" || vals[1] != true {
+			t.Fatalf("kgo.InstanceID = %v, want [worker-1 true]", vals)
+		}
+	})
+
+	t.Run("static membership false with non-empty instance id", func(t *testing.T) {
+		conn.staticMembership = false
+		conn.instanceID = "worker-1"
+		opts, err := consumerClientOpts(conn, cfg, "group", nil)
+		if err != nil {
+			t.Fatalf("consumerClientOpts error = %v", err)
+		}
+		cl, err := kgo.NewClient(opts...)
+		if err != nil {
+			t.Fatalf("NewClient error = %v", err)
+		}
+		defer cl.Close()
+		vals := cl.OptValues(kgo.InstanceID)
+		if len(vals) == 2 && vals[1] == true {
+			t.Fatalf("kgo.InstanceID unexpectedly enabled when staticMembership is false: %v", vals)
+		}
+	})
+
+	t.Run("static membership true with empty instance id", func(t *testing.T) {
+		conn.staticMembership = true
+		conn.instanceID = ""
+		opts, err := consumerClientOpts(conn, cfg, "group", nil)
+		if err != nil {
+			t.Fatalf("consumerClientOpts error = %v", err)
+		}
+		cl, err := kgo.NewClient(opts...)
+		if err != nil {
+			t.Fatalf("NewClient error = %v", err)
+		}
+		defer cl.Close()
+		vals := cl.OptValues(kgo.InstanceID)
+		if len(vals) == 2 && vals[1] == true {
+			t.Fatalf("kgo.InstanceID unexpectedly enabled when instanceID is empty: %v", vals)
+		}
+	})
+}
+
+func TestConsumerRevokeWaitsForSettlerInsideBound(t *testing.T) {
+	key := partitionKey{destination: "topic", partition: 0}
+	tracker := newAckTracker(0, 1)
+	if err := tracker.Track(0); err != nil {
+		t.Fatalf("Track: %v", err)
+	}
+
+	c := &consumer{
+		rebalanceDrainTimeout: 500 * time.Millisecond,
+		trackers:              map[partitionKey]*ackTracker{key: tracker},
+		activeGenerations:     map[partitionKey]uint64{key: 1},
+		fenced:                make(map[partitionKey]bool),
+		settlers:              make(map[*settler]struct{}),
+		settlerCh:             make(chan struct{}, 1),
+		unsettled:             map[string]int{"topic": 1},
+		budgets:               map[string]int{"topic": 1},
+		pauseReasons:          make(map[string]pauseReasonSet),
+	}
+	s := &settler{
+		owner:   c,
+		record:  &kgo.Record{Topic: "topic", Partition: 0, Offset: 0},
+		tracker: tracker,
+		key:     key,
+	}
+	c.settlers[s] = struct{}{}
+
+	revokeDone := make(chan struct{})
+	start := time.Now() //nolint:forbidigo // timing test measuring duration
+	go func() {
+		c.onPartitionsRevoked(context.Background(), nil, map[string][]int32{"topic": {0}})
+		close(revokeDone)
+	}()
+
+	// Handshake: wait until onPartitionsRevoked enters wait (fenced is set).
+	waitForKafkaConsumerState(t, c, "partition to become fenced", func() bool {
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		return c.fenced[key]
+	})
+
+	// Settle inside the bound.
+	c.completeSettlement(s, false)
+
+	select {
+	case <-revokeDone:
+	case <-time.After(1 * time.Second): //nolint:forbidigo // bounded wait for revoke completion
+		t.Fatal("onPartitionsRevoked timed out waiting for settler settlement")
+	}
+
+	elapsed := time.Since(start) //nolint:forbidigo // timing test duration assertion
+	if elapsed >= 450*time.Millisecond {
+		t.Fatalf("revoke waited too long: %v, want return immediately after settlement", elapsed)
+	}
+
+	// Verify tracker is dropped and Ack after drop returns ErrRevoked.
+	if err := tracker.Ack(0, nil); !errors.Is(err, ErrRevoked) {
+		t.Fatalf("Ack after drop = %v, want ErrRevoked", err)
+	}
+}
+
+func TestConsumerRevokeTombstonesAfterBound(t *testing.T) {
+	key := partitionKey{destination: "topic", partition: 0}
+	tracker := newAckTracker(0, 1)
+	if err := tracker.Track(0); err != nil {
+		t.Fatalf("Track: %v", err)
+	}
+
+	c := &consumer{
+		rebalanceDrainTimeout: 60 * time.Millisecond,
+		trackers:              map[partitionKey]*ackTracker{key: tracker},
+		activeGenerations:     map[partitionKey]uint64{key: 1},
+		fenced:                make(map[partitionKey]bool),
+		settlers:              make(map[*settler]struct{}),
+		settlerCh:             make(chan struct{}, 1),
+		unsettled:             map[string]int{"topic": 1},
+		budgets:               map[string]int{"topic": 1},
+		pauseReasons:          make(map[string]pauseReasonSet),
+	}
+	s := &settler{
+		owner:   c,
+		record:  &kgo.Record{Topic: "topic", Partition: 0, Offset: 0},
+		tracker: tracker,
+		key:     key,
+	}
+	c.settlers[s] = struct{}{}
+
+	start := time.Now() //nolint:forbidigo // timing test measuring duration
+	revokeDone := make(chan struct{})
+	go func() {
+		c.onPartitionsRevoked(context.Background(), nil, map[string][]int32{"topic": {0}})
+		close(revokeDone)
+	}()
+
+	// Outer bound: 400ms is well under 25s, so mutation 3 fails on its first run.
+	select {
+	case <-revokeDone:
+	case <-time.After(400 * time.Millisecond): //nolint:forbidigo // bounded wait for revoke timeout
+		t.Fatal("onPartitionsRevoked did not return after configured 60ms bound")
+	}
+
+	elapsed := time.Since(start) //nolint:forbidigo // timing test duration assertion
+	if elapsed < 50*time.Millisecond || elapsed > 350*time.Millisecond {
+		t.Fatalf("onPartitionsRevoked elapsed = %v, want ~60ms", elapsed)
+	}
+
+	// Verify tracker is tombstoned after bound expired.
+	if err := tracker.Ack(0, nil); !errors.Is(err, ErrRevoked) {
+		t.Fatalf("Ack after bound expired = %v, want ErrRevoked", err)
+	}
+}
+
+func TestConsumerLostDropsImmediatelyWithoutWaiting(t *testing.T) {
+	key := partitionKey{destination: "topic", partition: 0}
+	tracker := newAckTracker(0, 1)
+	if err := tracker.Track(0); err != nil {
+		t.Fatalf("Track: %v", err)
+	}
+
+	c := &consumer{
+		rebalanceDrainTimeout: 5 * time.Second,
+		trackers:              map[partitionKey]*ackTracker{key: tracker},
+		activeGenerations:     map[partitionKey]uint64{key: 1},
+		fenced:                make(map[partitionKey]bool),
+		settlers:              make(map[*settler]struct{}),
+		settlerCh:             make(chan struct{}, 1),
+		unsettled:             map[string]int{"topic": 1},
+		budgets:               map[string]int{"topic": 1},
+		pauseReasons:          make(map[string]pauseReasonSet),
+	}
+	s := &settler{
+		owner:   c,
+		record:  &kgo.Record{Topic: "topic", Partition: 0, Offset: 0},
+		tracker: tracker,
+		key:     key,
+	}
+	c.settlers[s] = struct{}{}
+
+	start := time.Now() //nolint:forbidigo // timing test measuring duration
+	c.onPartitionsLost(context.Background(), nil, map[string][]int32{"topic": {0}})
+	elapsed := time.Since(start) //nolint:forbidigo // timing test duration assertion
+
+	if elapsed > 100*time.Millisecond {
+		t.Fatalf("onPartitionsLost took %v, want immediate return without waiting for drain timeout", elapsed)
+	}
+
+	if err := tracker.Ack(0, nil); !errors.Is(err, ErrRevoked) {
+		t.Fatalf("Ack after lost = %v, want ErrRevoked", err)
+	}
+}
+
+func TestConsumerBufferedRecordFencedAfterReassignment(t *testing.T) {
+	key := partitionKey{destination: "topic", partition: 0}
+	c := &consumer{
+		trackers:              make(map[partitionKey]*ackTracker),
+		activeGenerations:     make(map[partitionKey]uint64),
+		assignmentGenerations: make(map[partitionKey]uint64),
+		fenced:                make(map[partitionKey]bool),
+		recordGenerations:     make(map[*kgo.Record]uint64),
+		settlers:              make(map[*settler]struct{}),
+		messages:              make(chan driver.InboundMessage, 10),
+		budgets:               map[string]int{"topic": 10},
+		unsettled:             map[string]int{"topic": 0},
+		pauseReasons:          make(map[string]pauseReasonSet),
+		now:                   kafkaNow,
+	}
+
+	// 1. Initial assignment at generation 1.
+	c.onPartitionsAssigned(context.Background(), nil, map[string][]int32{"topic": {0}})
+	if c.activeGenerations[key] != 1 {
+		t.Fatalf("active generation = %d, want 1", c.activeGenerations[key])
+	}
+
+	// 2. Poll fetches record at generation 1.
+	record := &kgo.Record{Topic: "topic", Partition: 0, Offset: 42, Value: []byte("payload")}
+	c.tagRecord(record)
+
+	// 3. Partition is revoked and reassigned at generation 2.
+	c.onPartitionsRevoked(context.Background(), nil, map[string][]int32{"topic": {0}})
+	c.onPartitionsAssigned(context.Background(), nil, map[string][]int32{"topic": {0}})
+	if c.activeGenerations[key] != 2 {
+		t.Fatalf("active generation after reassignment = %d, want 2", c.activeGenerations[key])
+	}
+
+	// 4. Pending buffer holds the old-generation record.
+	pending := []*kgo.Record{record}
+	if !c.flushPending(&pending) {
+		t.Fatal("flushPending returned false")
+	}
+
+	// 5. The old-generation record must be discarded from pending and not emitted.
+	if len(pending) != 0 {
+		t.Fatalf("pending length = %d, want 0 (stale record discarded)", len(pending))
+	}
+	if len(c.messages) != 0 {
+		t.Fatalf("delivered messages = %d, want 0 (fenced from delivery)", len(c.messages))
+	}
+}
+
+func TestConsumerUnassignedRecordIsDiscarded(t *testing.T) {
+	key := partitionKey{destination: "topic", partition: 0}
+	c := &consumer{
+		trackers:          make(map[partitionKey]*ackTracker),
+		activeGenerations: make(map[partitionKey]uint64),
+		fenced:            make(map[partitionKey]bool),
+		recordGenerations: make(map[*kgo.Record]uint64),
+		settlers:          make(map[*settler]struct{}),
+		messages:          make(chan driver.InboundMessage, 1),
+		budgets:           map[string]int{"topic": 10},
+		unsettled:         map[string]int{"topic": 0},
+		pauseReasons:      make(map[string]pauseReasonSet),
+		now:               kafkaNow,
+	}
+	pending := []*kgo.Record{{Topic: key.destination, Partition: key.partition, Offset: 7, Value: []byte("unassigned")}}
+	c.tagRecord(pending[0])
+	if got, tagged := c.recordGenerations[pending[0]]; !tagged || got != 0 {
+		t.Fatalf("unassigned record tag = (%d, %t), want (0, true)", got, tagged)
+	}
+	if !c.flushPending(&pending) {
+		t.Fatal("flushPending returned false")
+	}
+	if len(pending) != 0 {
+		t.Fatalf("pending length = %d, want 0 for unassigned record", len(pending))
+	}
+	if len(c.trackers) != 0 {
+		t.Fatalf("trackers = %d, want 0 for unassigned record", len(c.trackers))
+	}
+	if len(c.activeGenerations) != 0 {
+		t.Fatalf("active generations = %d, want 0 for unassigned record", len(c.activeGenerations))
+	}
+	if len(c.messages) != 0 {
+		t.Fatalf("delivered messages = %d, want 0 for unassigned record", len(c.messages))
+	}
+}
+
+func TestConsumerUnassignedRecordCannotReviveAfterAssignment(t *testing.T) {
+	key := partitionKey{destination: "topic", partition: 0}
+	record := &kgo.Record{Topic: key.destination, Partition: key.partition, Offset: 7, Value: []byte("unassigned")}
+	c := &consumer{
+		trackers:              make(map[partitionKey]*ackTracker),
+		activeGenerations:     make(map[partitionKey]uint64),
+		assignmentGenerations: make(map[partitionKey]uint64),
+		fenced:                make(map[partitionKey]bool),
+		recordGenerations:     make(map[*kgo.Record]uint64),
+		settlers:              make(map[*settler]struct{}),
+		messages:              make(chan driver.InboundMessage, 1),
+		budgets:               map[string]int{"topic": 1},
+		unsettled:             map[string]int{"topic": 0},
+		pauseReasons:          make(map[string]pauseReasonSet),
+		now:                   kafkaNow,
+	}
+	c.tagRecord(record)
+	if got, tagged := c.recordGenerations[record]; !tagged || got != 0 {
+		t.Fatalf("unassigned record tag = (%d, %t), want (0, true)", got, tagged)
+	}
+	c.onPartitionsAssigned(context.Background(), nil, map[string][]int32{"topic": {0}})
+	if got := c.activeGenerations[key]; got != 1 {
+		t.Fatalf("active generation = %d, want 1", got)
+	}
+
+	pending := []*kgo.Record{record}
+	if !c.flushPending(&pending) {
+		t.Fatal("flushPending returned false")
+	}
+	if len(pending) != 0 {
+		t.Fatalf("pending length = %d, want 0 after assignment", len(pending))
+	}
+	if len(c.messages) != 0 {
+		t.Fatalf("delivered messages = %d, want 0 after assignment", len(c.messages))
+	}
+	if len(c.trackers) != 0 {
+		t.Fatalf("trackers = %d, want 0 after assignment", len(c.trackers))
+	}
+	if got := c.activeGenerations[key]; got != 1 {
+		t.Fatalf("active generation after discard = %d, want 1", got)
+	}
+}
+
+func TestConsumerOnePartitionChangeDoesNotResetDestinationAccounting(t *testing.T) {
+	key0 := partitionKey{destination: "topic", partition: 0}
+	key1 := partitionKey{destination: "topic", partition: 1}
+	tracker0 := newAckTracker(0, 1)
+	tracker1 := newAckTracker(0, 1)
+
+	for i := range int64(3) {
+		_ = tracker0.Track(i)
+	}
+	for i := range int64(4) {
+		_ = tracker1.Track(i)
+	}
+
+	c := &consumer{
+		trackers:          map[partitionKey]*ackTracker{key0: tracker0, key1: tracker1},
+		activeGenerations: map[partitionKey]uint64{key0: 1, key1: 1},
+		fenced:            make(map[partitionKey]bool),
+		settlers:          make(map[*settler]struct{}),
+		unsettled:         map[string]int{"topic": 7},
+		budgets:           map[string]int{"topic": 10},
+		pauseReasons:      make(map[string]pauseReasonSet),
+	}
+
+	// Drop only partition 0.
+	c.dropTracker("topic", 0)
+
+	if got := c.unsettled["topic"]; got != 4 {
+		t.Fatalf("destination unsettled after dropping partition 0 = %d, want 4 (not reset to 0)", got)
+	}
+	if c.trackers[key1] != tracker1 {
+		t.Fatal("partition 1 tracker was unexpectedly removed")
+	}
+	if err := tracker1.Ack(0, nil); err != nil {
+		t.Fatalf("partition 1 Ack: %v, want success", err)
+	}
+}
+
+func TestConsumerNotificationsObservableAndQuietOnClose(t *testing.T) {
+	c := &consumer{
+		errors:       make(chan error, 8),
+		pauseReasons: make(map[string]pauseReasonSet),
+		trackers:     make(map[partitionKey]*ackTracker),
+		fenced:       make(map[partitionKey]bool),
+		settlers:     make(map[*settler]struct{}),
+		now:          kafkaNow,
+	}
+	c.onPartitionsAssigned(context.Background(), nil, map[string][]int32{"topic": {0}})
+	select {
+	case err := <-c.Errors():
+		if !strings.Contains(err.Error(), "assigned") {
+			t.Fatalf("expected assigned error, got %v", err)
+		}
+	default:
+		t.Fatal("expected assigned notification on Errors")
+	}
+
+	c.onPartitionsRevoked(context.Background(), nil, map[string][]int32{"topic": {0}})
+	select {
+	case err := <-c.Errors():
+		if !strings.Contains(err.Error(), "revoked") {
+			t.Fatalf("expected revoked error, got %v", err)
+		}
+	default:
+		t.Fatal("expected revoked notification on Errors")
+	}
+
+	c.onPartitionsLost(context.Background(), nil, map[string][]int32{"topic": {0}})
+	select {
+	case err := <-c.Errors():
+		if !strings.Contains(err.Error(), "lost") {
+			t.Fatalf("expected lost error, got %v", err)
+		}
+	default:
+		t.Fatal("expected lost notification on Errors")
+	}
+
+	// Quiet on close:
+	c.mu.Lock()
+	c.stopped = true
+	c.mu.Unlock()
+
+	c.sendRebalanceError("assigned", map[string][]int32{"topic": {0}})
+	c.sendRebalanceError("revoked", map[string][]int32{"topic": {0}})
+	c.sendRebalanceError("lost", map[string][]int32{"topic": {0}})
+	select {
+	case err := <-c.Errors():
+		t.Fatalf("unexpected error received after close: %v", err)
+	default:
+		// Quiet!
+	}
+}
+
+func TestConsumerRealRebalanceOwnershipTransfer(t *testing.T) {
+	requireBroker(t)
+	ctx, connection, admin := openKafkaAdminTest(t)
+	topic := kafkaTestTopic(t, "rebalance-real")
+	group := kafkaTestTopic(t, "rebalance-real-group")
+	cleanupKafkaTopics(t, admin, topic)
+	cleanupKafkaGroups(t, admin, group)
+	createKafkaTopic(t, admin, ctx, topic, 2)
+	t.Cleanup(func() {
+		cleanupKafkaTopics(t, admin, topic)
+		cleanupKafkaGroups(t, admin, group)
+	})
+
+	manualClient, err := kgo.NewClient(append([]kgo.Opt(nil), append(connection.clientOpts, kgo.RecordPartitioner(kgo.ManualPartitioner()))...)...)
+	if err != nil {
+		t.Fatalf("ManualPartitioner client: %v", err)
+	}
+	defer manualClient.Close()
+
+	produceSync := func(part int32, body string) {
+		record := &kgo.Record{Topic: topic, Partition: part, Value: []byte(body)}
+		res := manualClient.ProduceSync(ctx, record)
+		if err := res.FirstErr(); err != nil {
+			t.Fatalf("ProduceSync partition %d (%s): %v", part, body, err)
+		}
+	}
+
+	// Seed both partitions with test sequence:
+	// offset 0: settled lower
+	// offset 1: unsettled abandoned
+	// offset 2: later body
+	produceSync(0, "p0-settled-lower")
+	produceSync(0, "p0-unsettled-abandoned")
+
+	produceSync(1, "p1-settled-lower")
+	produceSync(1, "p1-unsettled-abandoned")
+
+	// Consumer 1 config with 200ms drain timeout.
+	cfg1 := driver.ConsumerConfig{
+		Group:        group,
+		Destinations: []string{topic},
+		Prefetch:     10,
+		Effective:    connection.Capabilities(),
+	}
+	conn1 := &conn{
+		client:                connection.client,
+		clientOpts:            connection.clientOpts,
+		driverOptions:         map[string]string{"kafka.staticMembership": "false"},
+		rebalanceDrainTimeout: 200 * time.Millisecond,
+		caps:                  connection.caps,
+		info:                  connection.info,
+		delays:                connection.delays,
+		consumers:             make(map[*consumer]struct{}),
+	}
+	c1Raw, err := newConsumer(ctx, conn1, cfg1)
+	if err != nil {
+		t.Fatalf("Consumer 1: %v", err)
+	}
+	defer closeKafkaConsumer(c1Raw)
+
+	var (
+		p0Lower, p1Lower     driver.InboundMessage
+		p0Abandon, p1Abandon driver.InboundMessage
+	)
+
+	initCtx, initCancel := context.WithTimeout(ctx, 15*time.Second)
+	defer initCancel()
+
+	for p0Lower.Body == nil || p1Lower.Body == nil || p0Abandon.Body == nil || p1Abandon.Body == nil {
+		select {
+		case msg := <-c1Raw.Messages():
+			body := string(msg.Body)
+			switch body {
+			case "p0-settled-lower":
+				p0Lower = msg
+				if err := msg.Settle.Ack(ctx); err != nil {
+					t.Fatalf("Ack(p0Lower): %v", err)
+				}
+			case "p1-settled-lower":
+				p1Lower = msg
+				if err := msg.Settle.Ack(ctx); err != nil {
+					t.Fatalf("Ack(p1Lower): %v", err)
+				}
+			case "p0-unsettled-abandoned":
+				p0Abandon = msg
+			case "p1-unsettled-abandoned":
+				p1Abandon = msg
+			}
+		case <-initCtx.Done():
+			t.Fatalf("timed out receiving initial records on C1: %v (p0L=%v, p1L=%v, p0A=%v, p1A=%v)",
+				initCtx.Err(), p0Lower.Body != nil, p1Lower.Body != nil, p0Abandon.Body != nil, p1Abandon.Body != nil)
+		}
+	}
+
+	// Start Consumer 2 in the same group to force cooperative rebalance.
+	cfg2 := driver.ConsumerConfig{
+		Group:        group,
+		Destinations: []string{topic},
+		Prefetch:     10,
+		Effective:    connection.Capabilities(),
+	}
+	conn2 := &conn{
+		client:                connection.client,
+		clientOpts:            connection.clientOpts,
+		driverOptions:         map[string]string{"kafka.staticMembership": "false"},
+		rebalanceDrainTimeout: 200 * time.Millisecond,
+		caps:                  connection.caps,
+		info:                  connection.info,
+		delays:                connection.delays,
+		consumers:             make(map[*consumer]struct{}),
+	}
+	c2Raw, err := newConsumer(ctx, conn2, cfg2)
+	if err != nil {
+		t.Fatalf("Consumer 2: %v", err)
+	}
+	defer closeKafkaConsumer(c2Raw)
+
+	c2Ctx, c2Cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer c2Cancel()
+
+	var c2FirstMsg driver.InboundMessage
+	for c2FirstMsg.Body == nil {
+		select {
+		case msg := <-c2Raw.Messages():
+			c2FirstMsg = msg
+		case <-c2Raw.Errors():
+		case <-c1Raw.Errors():
+		case <-c2Ctx.Done():
+			t.Fatalf("C2 timed out waiting for reassigned message: %v", c2Ctx.Err())
+		}
+	}
+	reassignedPart := c2FirstMsg.Ref.Partition
+	stayingPart := int32(1 - reassignedPart)
+
+	wantAbandonBody := fmt.Sprintf("p%d-unsettled-abandoned", reassignedPart)
+	if string(c2FirstMsg.Body) != wantAbandonBody {
+		t.Fatalf("C2 first message = %q, want abandoned body %q (proves survivor receives abandoned body, not settled lower offset)",
+			string(c2FirstMsg.Body), wantAbandonBody)
+	}
+
+	// Identify the held messages on C1.
+	var departingMsg, stayingMsg driver.InboundMessage
+	if reassignedPart == 0 {
+		departingMsg = p0Abandon
+		stayingMsg = p1Abandon
+	} else {
+		departingMsg = p1Abandon
+		stayingMsg = p0Abandon
+	}
+
+	// 1. Prove departing owner's settle after tombstoning returns error wrapping ErrRevoked.
+	departingErr := departingMsg.Settle.Ack(ctx)
+	if departingErr == nil || !errors.Is(departingErr, ErrRevoked) {
+		t.Fatalf("departing settler Ack = %v, want error wrapping ErrRevoked", departingErr)
+	}
+
+	// 2. Survivor settles the abandoned body.
+	if err := c2FirstMsg.Settle.Ack(ctx); err != nil {
+		t.Fatalf("C2 Ack abandoned body: %v", err)
+	}
+	// 3. Now publish each partition's later body after rebalance ownership is determined.
+	produceSync(reassignedPart, fmt.Sprintf("p%d-later-body", reassignedPart))
+	produceSync(stayingPart, fmt.Sprintf("p%d-later-body", stayingPart))
+
+	// Survivor receives later body on the reassigned partition (proves later body not skipped).
+	var c2SecondMsg driver.InboundMessage
+	for c2SecondMsg.Body == nil {
+		select {
+		case msg := <-c2Raw.Messages():
+			c2SecondMsg = msg
+		case <-c2Raw.Errors():
+		case <-c1Raw.Errors():
+		case <-c2Ctx.Done():
+			t.Fatalf("C2 timed out waiting for later body: %v", c2Ctx.Err())
+		}
+	}
+	wantLaterBody := fmt.Sprintf("p%d-later-body", reassignedPart)
+	if string(c2SecondMsg.Body) != wantLaterBody {
+		t.Fatalf("C2 second message = %q, want later body %q", string(c2SecondMsg.Body), wantLaterBody)
+	}
+	if err := c2SecondMsg.Settle.Ack(ctx); err != nil {
+		t.Fatalf("C2 Ack later body: %v", err)
+	}
+	// 4. Prove unaffected partition on C1 continues progressing through cooperative revoke.
+	if err := stayingMsg.Settle.Ack(ctx); err != nil {
+		t.Fatalf("C1 Ack on unaffected partition: %v", err)
+	}
+	var c1LaterMsg driver.InboundMessage
+	c1Ctx, c1Cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer c1Cancel()
+	for c1LaterMsg.Body == nil {
+		select {
+		case msg := <-c1Raw.Messages():
+			c1LaterMsg = msg
+		case <-c1Raw.Errors():
+		case <-c2Raw.Errors():
+		case <-c1Ctx.Done():
+			t.Fatalf("C1 timed out waiting for later message on unaffected partition: %v", c1Ctx.Err())
+		}
+	}
+	wantStayingLater := fmt.Sprintf("p%d-later-body", stayingPart)
+	if string(c1LaterMsg.Body) != wantStayingLater {
+		t.Fatalf("C1 unaffected partition message = %q, want %q", string(c1LaterMsg.Body), wantStayingLater)
+	}
+	if err := c1LaterMsg.Settle.Ack(ctx); err != nil {
+		t.Fatalf("C1 Ack later message on unaffected partition: %v", err)
+	}
+}
+
+func TestConsumerRealRebalanceNoGoroutineOrTimerLeak(t *testing.T) {
+	requireBroker(t)
+	ctx, connection, admin := openKafkaAdminTest(t)
+	topic := kafkaTestTopic(t, "rebalance-leak")
+	group := kafkaTestTopic(t, "rebalance-leak-group")
+	cleanupKafkaTopics(t, admin, topic)
+	cleanupKafkaGroups(t, admin, group)
+	createKafkaTopic(t, admin, ctx, topic, 2)
+	t.Cleanup(func() {
+		cleanupKafkaTopics(t, admin, topic)
+		cleanupKafkaGroups(t, admin, group)
+	})
+
+	cfg := driver.ConsumerConfig{
+		Group:        group,
+		Destinations: []string{topic},
+		Prefetch:     1,
+		Effective:    connection.Capabilities(),
+	}
+
+	c1, err := connection.Consumer(ctx, cfg)
+	if err != nil {
+		t.Fatalf("Consumer 1: %v", err)
+	}
+	defer closeKafkaConsumer(c1)
+
+	// Wait for C1 to join and stabilize
+	waitForKafkaConsumerState(t, c1.(*consumer), "C1 to join", func() bool {
+		c1.(*consumer).mu.Lock()
+		defer c1.(*consumer).mu.Unlock()
+		return len(c1.(*consumer).activeGenerations) > 0
+	})
+
+	// Measure baseline goroutines
+	time.Sleep(100 * time.Millisecond) //nolint:forbidigo // stabilization wait before baseline leak check
+	baselineGoroutines := runtime.NumGoroutine()
+
+	// Run 4 join/leave rebalance cycles
+	const cycles = 4
+	counts := make([]int, 0, cycles)
+	for range cycles {
+		c2, err := connection.Consumer(ctx, cfg)
+		if err != nil {
+			t.Fatalf("Consumer C2: %v", err)
+		}
+		waitForKafkaConsumerState(t, c2.(*consumer), "C2 to join", func() bool {
+			c2.(*consumer).mu.Lock()
+			defer c2.(*consumer).mu.Unlock()
+			return len(c2.(*consumer).activeGenerations) > 0
+		})
+		closeKafkaConsumer(c2)
+		time.Sleep(100 * time.Millisecond) //nolint:forbidigo // bounded stabilization wait per rebalance cycle
+		counts = append(counts, runtime.NumGoroutine())
+	}
+
+	finalGoroutines := runtime.NumGoroutine()
+	t.Logf("Rebalance leak proof: baseline=%d, cycles=%v, final=%d", baselineGoroutines, counts, finalGoroutines)
+
+	// Check for monotone growth across cycles
+	strictlyIncreasing := true
+	for i := 1; i < len(counts); i++ {
+		if counts[i] <= counts[i-1] {
+			strictlyIncreasing = false
+			break
+		}
+	}
+	if strictlyIncreasing && len(counts) > 2 {
+		t.Fatalf("goroutine count exhibited monotone growth across rebalance cycles: %v", counts)
+	}
+	// Ensure final is not significantly higher than baseline (allow up to 2 for background runtime noise)
+	if diff := finalGoroutines - baselineGoroutines; diff > 3 {
+		t.Fatalf("goroutine count grew from %d to %d (delta %d)", baselineGoroutines, finalGoroutines, diff)
 	}
 }

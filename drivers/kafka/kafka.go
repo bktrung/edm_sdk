@@ -55,15 +55,18 @@ const classicMode consumeMode = "classic"
 // conn owns the single client used for connection, producer, and metadata
 // operations. Consumer instances use cloned options so each can own its group.
 type conn struct {
-	client        *kgo.Client
-	clientOpts    []kgo.Opt
-	driverOptions map[string]string
-	delays        map[string]time.Duration
-	caps          driver.Capabilities
-	info          driver.BrokerInfo
-	consumers     map[*consumer]struct{}
-	mu            sync.RWMutex
-	closeOnce     sync.Once
+	client                *kgo.Client
+	clientOpts            []kgo.Opt
+	driverOptions         map[string]string
+	instanceID            string
+	rebalanceDrainTimeout time.Duration
+	staticMembership      bool
+	delays                map[string]time.Duration
+	caps                  driver.Capabilities
+	info                  driver.BrokerInfo
+	consumers             map[*consumer]struct{}
+	mu                    sync.RWMutex
+	closeOnce             sync.Once
 }
 
 // Name returns the stable Kafka driver key.
@@ -92,6 +95,10 @@ func (Driver) Open(ctx context.Context, cfg driver.Config) (driver.Conn, error) 
 	}
 
 	if _, err := resolveMode(cfg.DriverOptions); err != nil {
+		return nil, classify("open", driver.KindFatal, err)
+	}
+	staticMembership, err := resolveStaticMembership(cfg.DriverOptions)
+	if err != nil {
 		return nil, classify("open", driver.KindFatal, err)
 	}
 	if len(cfg.Endpoints) == 0 {
@@ -183,14 +190,21 @@ func (Driver) Open(ctx context.Context, cfg driver.Config) (driver.Conn, error) 
 	info := brokerInfo(metadata, versionResponse)
 	caps := classicCapabilities(messageMaxBytes)
 	keepClient = true
+	rebalanceDrainTimeout := cfg.RebalanceDrainTimeout
+	if rebalanceDrainTimeout == 0 {
+		rebalanceDrainTimeout = 25 * time.Second
+	}
 	return &conn{
-		client:        client,
-		clientOpts:    append([]kgo.Opt(nil), opts...),
-		driverOptions: maps.Clone(cfg.DriverOptions),
-		delays:        make(map[string]time.Duration),
-		caps:          caps,
-		info:          info,
-		consumers:     make(map[*consumer]struct{}),
+		client:                client,
+		clientOpts:            append([]kgo.Opt(nil), opts...),
+		driverOptions:         maps.Clone(cfg.DriverOptions),
+		instanceID:            cfg.InstanceID,
+		rebalanceDrainTimeout: rebalanceDrainTimeout,
+		staticMembership:      staticMembership,
+		delays:                make(map[string]time.Duration),
+		caps:                  caps,
+		info:                  info,
+		consumers:             make(map[*consumer]struct{}),
 	}, nil
 }
 
@@ -207,6 +221,18 @@ func resolveMode(options map[string]string) (consumeMode, error) {
 	default:
 		return "", fmt.Errorf("kafka: invalid useShareGroups mode %q; supported values: auto, always, never", value)
 	}
+}
+
+func resolveStaticMembership(options map[string]string) (bool, error) {
+	value, ok := options["kafka.staticMembership"]
+	if !ok {
+		return true, nil
+	}
+	enabled, err := strconv.ParseBool(value)
+	if err != nil {
+		return false, fmt.Errorf("kafka: invalid staticMembership %q; must be a boolean", value)
+	}
+	return enabled, nil
 }
 
 func classicCapabilities(maxMessageBytes int) driver.Capabilities {
