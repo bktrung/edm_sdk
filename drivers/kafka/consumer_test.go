@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"runtime"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -612,6 +613,234 @@ func TestConsumerGroupIdentityIsPerConsumer(t *testing.T) {
 	if err := second.Stop(ctx); err != nil {
 		t.Fatalf("Stop(B): %v", err)
 	}
+}
+
+func assertExclusiveConsumerRefused(t *testing.T, err error) {
+	t.Helper()
+	kind, classified := driver.Classify(err)
+	if err == nil || !classified || kind != driver.KindFatal || !strings.Contains(strings.ToLower(err.Error()), "exclusive") {
+		t.Fatalf("exclusive consumer error=%v kind=%v classified=%t", err, kind, classified)
+	}
+}
+
+func cleanupLifecycleConsumer(t *testing.T, ctx context.Context, value driver.Consumer) {
+	t.Helper()
+	t.Cleanup(func() {
+		if err := value.Stop(ctx); err != nil {
+			t.Errorf("cleanup Stop: %v", err)
+		}
+	})
+}
+
+func TestConsumerExclusiveAdmission(t *testing.T) {
+	ctx, connection, admin := openKafkaAdminTest(t)
+	topic := kafkaTestTopic(t, "consumer-exclusive-admission")
+	otherTopic := kafkaTestTopic(t, "consumer-exclusive-disjoint")
+	cleanupKafkaTopics(t, admin, topic, otherTopic)
+	createKafkaTopic(t, admin, ctx, topic, 1)
+	createKafkaTopic(t, admin, ctx, otherTopic, 1)
+
+	newConsumer := func(t *testing.T, destination string, exclusive bool) driver.Consumer {
+		t.Helper()
+		value, err := connection.Consumer(ctx, driver.ConsumerConfig{
+			Destinations: []string{destination},
+			Prefetch:     1,
+			Exclusive:    exclusive,
+			Effective:    connection.Capabilities(),
+		})
+		if err != nil {
+			t.Fatalf("Consumer(exclusive=%t): %v", exclusive, err)
+		}
+		cleanupLifecycleConsumer(t, ctx, value)
+		return value
+	}
+
+	newMultiConsumer := func(t *testing.T, destinations []string, exclusive bool) driver.Consumer {
+		t.Helper()
+		value, err := connection.Consumer(ctx, driver.ConsumerConfig{
+			Destinations: destinations,
+			Prefetch:     len(destinations),
+			Exclusive:    exclusive,
+			Effective:    connection.Capabilities(),
+		})
+		if err != nil {
+			t.Fatalf("Consumer(destinations=%v, exclusive=%t): %v", destinations, exclusive, err)
+		}
+		cleanupLifecycleConsumer(t, ctx, value)
+		return value
+	}
+	t.Run("exclusive refuses competing exclusive", func(t *testing.T) {
+		first := newConsumer(t, topic, true)
+		_, err := connection.Consumer(ctx, driver.ConsumerConfig{
+			Destinations: []string{topic},
+			Prefetch:     1,
+			Exclusive:    true,
+			Effective:    connection.Capabilities(),
+		})
+		assertExclusiveConsumerRefused(t, err)
+
+		if err := first.Stop(ctx); err != nil {
+			t.Fatalf("Stop(first): %v", err)
+		}
+		replacement := newConsumer(t, topic, true)
+		if err := replacement.Stop(ctx); err != nil {
+			t.Fatalf("Stop(replacement): %v", err)
+		}
+	})
+
+	t.Run("active exclusive refuses incoming nonexclusive", func(t *testing.T) {
+		newConsumer(t, topic, true)
+		_, err := connection.Consumer(ctx, driver.ConsumerConfig{
+			Destinations: []string{topic},
+			Prefetch:     1,
+			Effective:    connection.Capabilities(),
+		})
+		assertExclusiveConsumerRefused(t, err)
+	})
+
+	t.Run("active nonexclusive refuses incoming exclusive", func(t *testing.T) {
+		newConsumer(t, topic, false)
+		_, err := connection.Consumer(ctx, driver.ConsumerConfig{
+			Destinations: []string{topic},
+			Prefetch:     1,
+			Exclusive:    true,
+			Effective:    connection.Capabilities(),
+		})
+		assertExclusiveConsumerRefused(t, err)
+	})
+
+	t.Run("multi-destination overlap is refused", func(t *testing.T) {
+		newMultiConsumer(t, []string{topic, otherTopic}, true)
+		_, err := connection.Consumer(ctx, driver.ConsumerConfig{
+			Destinations: []string{otherTopic},
+			Prefetch:     1,
+			Effective:    connection.Capabilities(),
+		})
+		assertExclusiveConsumerRefused(t, err)
+	})
+
+	t.Run("nonexclusive consumers may share a destination", func(t *testing.T) {
+		newConsumer(t, topic, false)
+		newConsumer(t, topic, false)
+	})
+
+	t.Run("exclusive consumers may use disjoint destinations", func(t *testing.T) {
+		newConsumer(t, topic, true)
+		newConsumer(t, otherTopic, true)
+	})
+
+	t.Run("separate connections admit independent claims", func(t *testing.T) {
+		opened, err := (Driver{}).Open(ctx, driver.Config{
+			Endpoints: []string{kafkaEndpoint},
+			ClientID:  "f1-kafka-exclusive-separate-connection",
+		})
+		if err != nil {
+			t.Fatalf("Open(second connection): %v", err)
+		}
+		secondConnection := opened.(*conn)
+		t.Cleanup(func() { _ = secondConnection.Close(ctx) })
+
+		newConsumer(t, topic, true)
+		second, err := secondConnection.Consumer(ctx, driver.ConsumerConfig{
+			Destinations: []string{topic},
+			Prefetch:     1,
+			Exclusive:    true,
+			Effective:    secondConnection.Capabilities(),
+		})
+		if err != nil {
+			t.Fatalf("Consumer(second connection): %v", err)
+		}
+		cleanupLifecycleConsumer(t, ctx, second)
+	})
+}
+
+func TestConsumerExclusiveClaimReleased(t *testing.T) {
+	ctx, connection, admin := openKafkaAdminTest(t)
+	topic := kafkaTestTopic(t, "consumer-exclusive-release")
+	cleanupKafkaTopics(t, admin, topic)
+	createKafkaTopic(t, admin, ctx, topic, 1)
+
+	newConsumer := func(t *testing.T) driver.Consumer {
+		t.Helper()
+		value, err := connection.Consumer(ctx, driver.ConsumerConfig{
+			Destinations: []string{topic},
+			Prefetch:     1,
+			Exclusive:    true,
+			Effective:    connection.Capabilities(),
+		})
+		if err != nil {
+			t.Fatalf("exclusive Consumer: %v", err)
+		}
+		cleanupLifecycleConsumer(t, ctx, value)
+		return value
+	}
+
+	t.Run("stop releases claim", func(t *testing.T) {
+		first := newConsumer(t)
+		if err := first.Stop(ctx); err != nil {
+			t.Fatalf("Stop(first): %v", err)
+		}
+		replacement := newConsumer(t)
+		if err := replacement.Stop(ctx); err != nil {
+			t.Fatalf("Stop(replacement): %v", err)
+		}
+	})
+
+	t.Run("release releases claim", func(t *testing.T) {
+		first := newConsumer(t)
+		if err := first.Release(ctx); err != nil {
+			t.Fatalf("Release(first): %v", err)
+		}
+		replacement := newConsumer(t)
+		if err := replacement.Stop(ctx); err != nil {
+			t.Fatalf("Stop(replacement): %v", err)
+		}
+	})
+
+	t.Run("concurrent construction admits one", func(t *testing.T) {
+		type result struct {
+			value driver.Consumer
+			err   error
+		}
+		const attempts = 8
+		results := make(chan result, attempts)
+		var group sync.WaitGroup
+		group.Add(attempts)
+		for range attempts {
+			go func() {
+				defer group.Done()
+				value, err := connection.Consumer(ctx, driver.ConsumerConfig{
+					Destinations: []string{topic},
+					Prefetch:     1,
+					Exclusive:    true,
+					Effective:    connection.Capabilities(),
+				})
+				results <- result{value: value, err: err}
+			}()
+		}
+		group.Wait()
+		close(results)
+
+		var admitted []driver.Consumer
+		for result := range results {
+			if result.err != nil {
+				assertExclusiveConsumerRefused(t, result.err)
+				continue
+			}
+			cleanupLifecycleConsumer(t, ctx, result.value)
+			admitted = append(admitted, result.value)
+		}
+		if len(admitted) != 1 {
+			t.Fatalf("concurrent exclusive consumers admitted = %d, want 1", len(admitted))
+		}
+		if err := admitted[0].Stop(ctx); err != nil {
+			t.Fatalf("Stop(admitted): %v", err)
+		}
+		replacement := newConsumer(t)
+		if err := replacement.Stop(ctx); err != nil {
+			t.Fatalf("Stop(after concurrent admission): %v", err)
+		}
+	})
 }
 
 func TestConsumerStopRefusesOutstanding(t *testing.T) {

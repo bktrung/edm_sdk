@@ -226,6 +226,8 @@ func classifySettlement(operation string, err error) error {
 }
 
 var (
+	errExclusiveConsumer = errors.New("exclusive consumer conflict")
+
 	_ driver.Consumer = (*consumer)(nil)
 	_ driver.Settler  = (*settler)(nil)
 )
@@ -309,7 +311,17 @@ func newConsumer(ctx context.Context, connection *conn, cfg driver.ConsumerConfi
 		return nil, classify("consumer", driver.KindFatal, err)
 	}
 	consumer.client = client
-	connection.registerConsumer(consumer)
+	reserved := false
+	defer func() {
+		if !reserved {
+			cancelPoll()
+			client.Close()
+		}
+	}()
+	if err := connection.reserveConsumer(consumer); err != nil {
+		return nil, classify("consumer", driver.KindFatal, err)
+	}
+	reserved = true
 	// The poll context is owned by the consumer and canceled by Drain or Stop.
 	//nolint:contextcheck // this goroutine uses the consumer-owned cancellation context.
 	go consumer.poll(pollCtx)
@@ -1290,13 +1302,29 @@ func (c *consumer) effectiveCapabilities() driver.Capabilities {
 	return c.cfg.Effective
 }
 
-func (c *conn) registerConsumer(csm *consumer) {
+func (c *conn) reserveConsumer(csm *consumer) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.consumers == nil {
 		c.consumers = make(map[*consumer]struct{})
 	}
+	// The conflict check and registry insertion stay under one lock. If they
+	// were separate, two constructors could both inspect the old registry
+	// before either one inserted its exclusive claim.
+	for active := range c.consumers {
+		if !csm.cfg.Exclusive && !active.cfg.Exclusive {
+			continue
+		}
+		for _, destination := range csm.destinations {
+			for _, activeDestination := range active.destinations {
+				if destination == activeDestination {
+					return fmt.Errorf("%w on destination %q", errExclusiveConsumer, destination)
+				}
+			}
+		}
+	}
 	c.consumers[csm] = struct{}{}
+	return nil
 }
 
 func (c *conn) removeConsumer(consumer *consumer) {
