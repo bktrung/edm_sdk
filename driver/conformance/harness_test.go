@@ -782,3 +782,114 @@ func TestRunScopedPersistentGroups(t *testing.T) {
 		t.Errorf("StartAt group shared across full and strict profiles: %q", startAt1_First)
 	}
 }
+
+func TestIsRevokedSettlementError(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{name: "nil", want: false},
+		{name: "unclassified revocation text", err: errors.New("partition assignment revoked"), want: false},
+		{
+			name: "classified transient revocation text",
+			err:  &driver.Error{Driver: "test", Op: "ack", K: driver.KindTransient, Err: errors.New("partition assignment revoked")},
+			want: false,
+		},
+		{
+			name: "classified fatal unrelated text",
+			err:  &driver.Error{Driver: "test", Op: "ack", K: driver.KindFatal, Err: errors.New("broker unavailable")},
+			want: false,
+		},
+		{
+			name: "classified fatal revocation text",
+			err:  &driver.Error{Driver: "test", Op: "ack", K: driver.KindFatal, Err: errors.New("PARTITION ASSIGNMENT REVOKED")},
+			want: true,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := isRevokedSettlementError(test.err); got != test.want {
+				t.Fatalf("isRevokedSettlementError(%v) = %t, want %t", test.err, got, test.want)
+			}
+		})
+	}
+}
+
+func TestWaitForRebalanceAssignmentError(t *testing.T) {
+	unexpected := &driver.Error{Driver: "test", Op: "consume", K: driver.KindFatal, Err: errors.New("broker unavailable")}
+	tests := []struct {
+		name      string
+		setup     func() (context.Context, <-chan error)
+		wantText  string
+		wantCause error
+	}{
+		{
+			name: "assigned notification",
+			setup: func() (context.Context, <-chan error) {
+				errs := make(chan error, 1)
+				errs <- errors.New("partitions assigned")
+				return context.Background(), errs
+			},
+		},
+		{
+			name: "closed channel",
+			setup: func() (context.Context, <-chan error) {
+				errs := make(chan error)
+				close(errs)
+				return context.Background(), errs
+			},
+			wantText: "Errors channel closed",
+		},
+		{
+			name: "nil error",
+			setup: func() (context.Context, <-chan error) {
+				errs := make(chan error, 1)
+				errs <- nil
+				return context.Background(), errs
+			},
+			wantText: "nil error",
+		},
+		{
+			name: "unexpected error",
+			setup: func() (context.Context, <-chan error) {
+				errs := make(chan error, 1)
+				errs <- unexpected
+				return context.Background(), errs
+			},
+			wantText:  "broker unavailable",
+			wantCause: unexpected,
+		},
+		{
+			name: "cancelled context",
+			setup: func() (context.Context, <-chan error) {
+				ctx, cancel := context.WithCancel(context.Background())
+				cancel()
+				return ctx, make(chan error)
+			},
+			wantText:  "timed out",
+			wantCause: context.Canceled,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			ctx, errs := test.setup()
+			err := waitForRebalanceAssignmentError(ctx, errs)
+			if test.wantText == "" {
+				if err != nil {
+					t.Fatalf("waitForRebalanceAssignmentError() = %v, want nil", err)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatal("waitForRebalanceAssignmentError() = nil, want error")
+			}
+			if !strings.Contains(err.Error(), test.wantText) {
+				t.Fatalf("error = %v, want text %q", err, test.wantText)
+			}
+			if test.wantCause != nil && !errors.Is(err, test.wantCause) {
+				t.Fatalf("error = %v, want cause %v", err, test.wantCause)
+			}
+		})
+	}
+}

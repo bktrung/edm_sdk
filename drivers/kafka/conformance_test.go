@@ -22,8 +22,12 @@ func TestConformance(t *testing.T) {
 	}
 	requireBroker(t)
 	conformance.Run(t, conformance.Suite{
-		Driver:       Driver{},
-		Config:       driver.Config{Endpoints: []string{kafkaEndpoint}, ClientID: "f1-kafka-conformance"},
+		Driver: Driver{},
+		Config: driver.Config{
+			Endpoints:             []string{kafkaEndpoint},
+			ClientID:              "f1-kafka-conformance",
+			RebalanceDrainTimeout: 250 * time.Millisecond,
+		},
 		NewInspector: kafkaInspector,
 	})
 }
@@ -47,18 +51,23 @@ func kafkaInspector(raw driver.Conn) (conformance.Inspect, error) {
 		connection.mu.RUnlock()
 
 		var (
-			group     string
-			unsettled int64
-			discarded int64
+			sharedGroup string
+			unsettled   int64
+			discarded   int64
 		)
 		matches := 0
 		for _, consumer := range active {
 			consumer.mu.Lock()
 			_, subscribed := consumer.budgets[destination]
 			if subscribed && !consumer.stopped {
+				if matches == 0 {
+					sharedGroup = consumer.group
+				} else if consumer.group == "" || consumer.group != sharedGroup {
+					consumer.mu.Unlock()
+					return conformance.BrokerView{}, fmt.Errorf("kafka inspector: destination %q has multiple live consumers with different groups (%q vs %q)", destination, sharedGroup, consumer.group)
+				}
 				matches++
-				group = consumer.group
-				unsettled = int64(consumer.unsettled[destination])
+				unsettled += int64(consumer.unsettled[destination])
 				for key, offsets := range consumer.discarded {
 					if key.destination == destination {
 						discarded += int64(len(offsets))
@@ -67,10 +76,6 @@ func kafkaInspector(raw driver.Conn) (conformance.Inspect, error) {
 			}
 			consumer.mu.Unlock()
 		}
-		if matches > 1 {
-			return conformance.BrokerView{}, fmt.Errorf("kafka inspector: destination %q has multiple live consumers", destination)
-		}
-
 		starts, err := listKafkaOffsets(ctx, func(listCtx context.Context) (kadm.ListedOffsets, error) {
 			return admin.ListStartOffsets(listCtx, destination)
 		})
@@ -89,8 +94,8 @@ func kafkaInspector(raw driver.Conn) (conformance.Inspect, error) {
 		}
 
 		var committed kadm.OffsetResponses
-		if matches == 1 {
-			committed, err = admin.FetchOffsets(ctx, group)
+		if matches > 0 && sharedGroup != "" {
+			committed, err = admin.FetchOffsets(ctx, sharedGroup)
 			if err != nil && !errors.Is(err, kerr.GroupIDNotFound) {
 				return conformance.BrokerView{}, classifyKafkaOffsetError("inspect", err)
 			}
@@ -104,7 +109,7 @@ func kafkaInspector(raw driver.Conn) (conformance.Inspect, error) {
 				return conformance.BrokerView{}, fmt.Errorf("kafka inspector: destination %q partition %d has no start offset", destination, partition)
 			}
 			committedOffset := start.Offset
-			if matches == 1 {
+			if matches > 0 && sharedGroup != "" {
 				if response, exists := committed.Lookup(destination, partition); exists {
 					if response.Err != nil {
 						return conformance.BrokerView{}, classifyKafkaOffsetError("inspect", response.Err)

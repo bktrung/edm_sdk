@@ -693,7 +693,14 @@ func endPublish(c *Client) {
 }
 
 func driverConfig(cfg Config) driver.Config {
-	result := driver.Config{Endpoints: append([]string(nil), cfg.Broker.Endpoints...), ClientID: cfg.InstanceID, ConnectTimeout: cfg.Broker.ConnectTimeout, DriverOptions: cloneOptions(cfg.Broker.DriverOptions)}
+	result := driver.Config{
+		Endpoints:             append([]string(nil), cfg.Broker.Endpoints...),
+		ClientID:              cfg.InstanceID,
+		InstanceID:            cfg.InstanceID,
+		RebalanceDrainTimeout: cfg.Lifecycle.RebalanceDrainTimeout,
+		ConnectTimeout:        cfg.Broker.ConnectTimeout,
+		DriverOptions:         cloneOptions(cfg.Broker.DriverOptions),
+	}
 	if result.ClientID == "" {
 		result.ClientID = cfg.Service
 	}
