@@ -3,6 +3,7 @@ package kafka
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strconv"
 	"time"
 
@@ -18,6 +19,7 @@ const delayUntilHeader = "x-f1-delay-until"
 type producer struct {
 	client *kgo.Client
 	conn   *conn
+	cfg    driver.ProducerConfig
 	now    func() time.Time
 }
 
@@ -36,16 +38,29 @@ func (p *producer) Publish(ctx context.Context, msgs ...driver.OutboundMessage) 
 		}
 	}
 
-	records := make([]*kgo.Record, len(msgs))
+	failed := make(map[int]error)
+	records := make([]*kgo.Record, 0, len(msgs))
+	recordIndexes := make([]int, 0, len(msgs))
 	for i, msg := range msgs {
+		if p.cfg.Effective.MaxMessageBytes > 0 && len(msg.Body) > p.cfg.Effective.MaxMessageBytes {
+			failed[i] = classify("publish", driver.KindTooLarge, fmt.Errorf("message body exceeds MaxMessageBytes (%d)", p.cfg.Effective.MaxMessageBytes))
+			continue
+		}
 		delay, known := p.destinationDelay(msg.Destination)
-		records[i] = recordForMessage(msg, delay, known, p.currentTime())
+		records = append(records, recordForMessage(msg, delay, known, p.currentTime()))
+		recordIndexes = append(recordIndexes, i)
+	}
+	if len(records) == 0 {
+		return &driver.PublishError{Failed: failed}
 	}
 
 	results := p.client.ProduceSync(ctx, records...)
-	failed, err := failedPublishIndexes(records, results)
+	brokerFailed, err := failedPublishIndexes(records, results)
 	if err != nil {
 		return classify("publish", driver.KindFatal, err)
+	}
+	for index, cause := range brokerFailed {
+		failed[recordIndexes[index]] = cause
 	}
 	if len(failed) != 0 {
 		return &driver.PublishError{Failed: failed}
