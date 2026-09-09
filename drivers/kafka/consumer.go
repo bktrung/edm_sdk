@@ -17,6 +17,7 @@ import (
 	"github.com/twmb/franz-go/pkg/kmsg"
 
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/driver"
+	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/clock"
 )
 
 type pauseReason string
@@ -81,6 +82,7 @@ type consumer struct {
 	messages              chan driver.InboundMessage
 	errors                chan error
 	errorsMu              sync.Mutex
+	errorsClosed          bool
 	pollCtx               context.Context
 	cancelPoll            context.CancelFunc
 	pollDone              chan struct{}
@@ -100,7 +102,8 @@ type consumer struct {
 	discarded             map[partitionKey]map[int64]struct{}
 	reportedDeferrals     map[string]struct{}
 	maxAckGap             int64
-	now                   func() time.Time
+	laneFaultDestination  string
+	clock                 clock.Clock
 	// offsetMu serializes CommitOffsetsSync with SetOffsets because franz-go
 	// forbids those operations from running concurrently.
 	offsetMu          sync.Mutex
@@ -236,6 +239,9 @@ func newConsumer(ctx context.Context, connection *conn, cfg driver.ConsumerConfi
 	if err := ctx.Err(); err != nil {
 		return nil, classify("consumer", driver.KindTransient, err)
 	}
+	if err := connection.admissionError("consumer"); err != nil {
+		return nil, err
+	}
 	maxAckGap, err := resolveMaxAckGap(connection.driverOptions)
 	if err != nil {
 		return nil, classify("consumer", driver.KindFatal, err)
@@ -294,7 +300,7 @@ func newConsumer(ctx context.Context, connection *conn, cfg driver.ConsumerConfi
 		discarded:             make(map[partitionKey]map[int64]struct{}),
 		reportedDeferrals:     make(map[string]struct{}),
 		maxAckGap:             maxAckGap,
-		now:                   kafkaNow,
+		clock:                 clock.NewReal(),
 	}
 	for index, destination := range cfg.Destinations {
 		consumer.budgets[destination] = destinationPrefetch(cfg, destination, index)
@@ -319,6 +325,9 @@ func newConsumer(ctx context.Context, connection *conn, cfg driver.ConsumerConfi
 		}
 	}()
 	if err := connection.reserveConsumer(consumer); err != nil {
+		if errors.Is(err, errConnClosing) {
+			return nil, classify("consumer", driver.KindTransient, err)
+		}
 		return nil, classify("consumer", driver.KindFatal, err)
 	}
 	reserved = true
@@ -555,6 +564,9 @@ func (c *consumer) canDeliver(record *kgo.Record) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.stopped || c.draining {
+		return false
+	}
+	if c.laneFaultDestination == record.Topic {
 		return false
 	}
 	if c.isRecordStaleLocked(record) {
@@ -981,7 +993,14 @@ func (c *consumer) setUserPaused(destinations []string, paused bool) error {
 		if _, ok := c.budgets[destination]; !ok {
 			return classify("consumer", driver.KindNotFound, driver.ErrDestinationMissing)
 		}
+		laneFaulted := !paused && c.laneFaultDestination == destination
+		if laneFaulted {
+			c.laneFaultDestination = ""
+		}
 		c.setPauseReasonLocked(destination, pauseReasonUserPaused, paused)
+		if laneFaulted && c.pauseReasons[destination].empty() && !c.draining && !c.stopped {
+			c.client.ResumeFetchTopics(destination)
+		}
 		if !paused {
 			c.resumeForRedeliveryLocked(destination)
 		}
@@ -1113,8 +1132,13 @@ func (c *consumer) closeTeardown(ctx context.Context) {
 			c.sendError(err)
 		}
 	}
+	c.errorsMu.Lock()
+	if !c.errorsClosed {
+		c.errorsClosed = true
+		close(c.errors)
+	}
+	c.errorsMu.Unlock()
 	close(c.messages)
-	close(c.errors)
 	close(c.stopDone)
 }
 
@@ -1282,7 +1306,7 @@ func listKafkaOffsets(ctx context.Context, list func(context.Context) (kadm.List
 		if err == nil || !errors.Is(err, kerr.UnknownTopicOrPartition) {
 			return offsets, err
 		}
-		timer := time.NewTimer(50 * time.Millisecond) //nolint:forbidigo // Kafka metadata propagation needs a bounded retry
+		timer := time.NewTimer(50 * time.Millisecond) //nolint:forbidigo // Kafka metadata propagation is broker-driven and requires a wall-clock retry
 		select {
 		case <-retryCtx.Done():
 			timer.Stop()
@@ -1305,6 +1329,9 @@ func (c *consumer) effectiveCapabilities() driver.Capabilities {
 func (c *conn) reserveConsumer(csm *consumer) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if c.closing || c.closed {
+		return errConnClosing
+	}
 	if c.consumers == nil {
 		c.consumers = make(map[*consumer]struct{})
 	}
@@ -1340,6 +1367,9 @@ func (c *consumer) sendError(err error) {
 	kind, classified := driver.Classify(err)
 	c.errorsMu.Lock()
 	defer c.errorsMu.Unlock()
+	if c.errorsClosed {
+		return
+	}
 	if classified && kind != driver.KindTransient {
 		select {
 		case c.errors <- err:
@@ -1385,7 +1415,7 @@ func (c *consumer) signalSettlerDoneLocked() {
 }
 
 func (c *consumer) waitForSettlers(keys map[partitionKey]struct{}, timeout time.Duration) {
-	timer := time.NewTimer(timeout) //nolint:forbidigo // bounded revoke drain needs a wall-clock timeout
+	timer := c.clock.Timer(timeout)
 	defer timer.Stop()
 	for {
 		c.mu.Lock()

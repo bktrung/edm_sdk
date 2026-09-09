@@ -3,12 +3,15 @@ package kafka
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strconv"
+	"sync"
 	"time"
 
 	"github.com/twmb/franz-go/pkg/kgo"
 
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/driver"
+	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/clock"
 )
 
 // delayUntilHeader is reserved for deferred Kafka delivery. It is driver-internal,
@@ -16,9 +19,38 @@ import (
 const delayUntilHeader = "x-f1-delay-until"
 
 type producer struct {
-	client *kgo.Client
-	conn   *conn
-	now    func() time.Time
+	client     *kgo.Client
+	conn       *conn
+	cfg        driver.ProducerConfig
+	clock      clock.Clock
+	mu         sync.Mutex
+	closed     bool
+	closing    bool
+	active     int
+	activeDone chan struct{}
+}
+
+func (p *producer) beginOperation(operation string) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.closed || p.closing {
+		return classify(operation, driver.KindTransient, errors.New("kafka: producer is closed"))
+	}
+	p.active++
+	if p.activeDone == nil {
+		p.activeDone = make(chan struct{})
+	}
+	return nil
+}
+
+func (p *producer) endOperation() {
+	p.mu.Lock()
+	p.active--
+	if p.active == 0 {
+		close(p.activeDone)
+		p.activeDone = nil
+	}
+	p.mu.Unlock()
 }
 
 var _ driver.Producer = (*producer)(nil)
@@ -30,22 +62,48 @@ func (p *producer) Publish(ctx context.Context, msgs ...driver.OutboundMessage) 
 	if len(msgs) == 0 {
 		return nil
 	}
+	if err := p.beginOperation("publish"); err != nil {
+		return err
+	}
+	defer p.endOperation()
+	if p.conn != nil {
+		if raw := p.conn.publishFault.Swap(0); raw != 0 {
+			kind := driver.Kind(raw - 1)
+			failed := make(map[int]error, len(msgs))
+			for index := range msgs {
+				failed[index] = classify("publish", kind, errors.New("injected publish fault"))
+			}
+			return &driver.PublishError{Failed: failed}
+		}
+	}
 	for _, msg := range msgs {
 		if msg.EntryPoint {
 			return classify("publish", driver.KindFatal, errors.New("kafka: entry-point publishing is unsupported"))
 		}
 	}
-
-	records := make([]*kgo.Record, len(msgs))
+	failed := make(map[int]error)
+	records := make([]*kgo.Record, 0, len(msgs))
+	recordIndexes := make([]int, 0, len(msgs))
 	for i, msg := range msgs {
+		if p.cfg.Effective.MaxMessageBytes > 0 && len(msg.Body) > p.cfg.Effective.MaxMessageBytes {
+			failed[i] = classify("publish", driver.KindTooLarge, fmt.Errorf("message body exceeds MaxMessageBytes (%d)", p.cfg.Effective.MaxMessageBytes))
+			continue
+		}
 		delay, known := p.destinationDelay(msg.Destination)
-		records[i] = recordForMessage(msg, delay, known, p.currentTime())
+		records = append(records, recordForMessage(msg, delay, known, p.currentTime()))
+		recordIndexes = append(recordIndexes, i)
+	}
+	if len(records) == 0 {
+		return &driver.PublishError{Failed: failed}
 	}
 
 	results := p.client.ProduceSync(ctx, records...)
-	failed, err := failedPublishIndexes(records, results)
+	brokerFailed, err := failedPublishIndexes(records, results)
 	if err != nil {
 		return classify("publish", driver.KindFatal, err)
+	}
+	for index, cause := range brokerFailed {
+		failed[recordIndexes[index]] = cause
 	}
 	if len(failed) != 0 {
 		return &driver.PublishError{Failed: failed}
@@ -61,10 +119,7 @@ func (p *producer) destinationDelay(destination string) (time.Duration, bool) {
 }
 
 func (p *producer) currentTime() time.Time {
-	if p.now != nil {
-		return p.now()
-	}
-	return kafkaNow()
+	return p.clock.Now()
 }
 
 func recordForMessage(msg driver.OutboundMessage, destinationDelay time.Duration, known bool, now time.Time) *kgo.Record {
@@ -130,6 +185,10 @@ func (p *producer) Flush(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
 		return classify("flush", driver.KindTransient, err)
 	}
+	if err := p.beginOperation("flush"); err != nil {
+		return err
+	}
+	defer p.endOperation()
 	if err := p.client.Flush(ctx); err != nil {
 		return classify("flush", kafkaErrorKind(err), err)
 	}
@@ -140,7 +199,30 @@ func (p *producer) Close(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
 		return classify("producer.close", driver.KindTransient, err)
 	}
-	// The Kafka client belongs to conn and is closed by Conn.Close after all
-	// resources have been closed. A Producer only borrows that client.
+	p.mu.Lock()
+	if p.closed {
+		p.mu.Unlock()
+		return nil
+	}
+	p.closing = true
+	done := p.activeDone
+	p.mu.Unlock()
+
+	if done != nil {
+		select {
+		case <-done:
+		case <-ctx.Done():
+			return classify("producer.close", driver.KindTransient, ctx.Err())
+		}
+	}
+
+	p.mu.Lock()
+	if !p.closed {
+		p.closed = true
+	}
+	p.mu.Unlock()
+	if p.conn != nil {
+		p.conn.removeProducer(p)
+	}
 	return nil
 }

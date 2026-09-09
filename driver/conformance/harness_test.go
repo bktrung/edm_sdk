@@ -50,6 +50,31 @@ func TestRunReportsMultipleFailedGroups(t *testing.T) {
 	}
 }
 
+func TestRunContinuesAfterProfileFailure(t *testing.T) {
+	output := runFailureOutput(t, "profile-failure")
+	if !strings.Contains(string(output), "TestRunFailureHelper/strict") {
+		t.Fatalf("strict profile did not run after full profile failure:\n%s", output)
+	}
+}
+
+func TestRunContinuesAfterProfileSetupFailure(t *testing.T) {
+	output := runFailureOutput(t, "profile-setup-failure")
+	if !strings.Contains(string(output), "TestRunFailureHelper/strict") {
+		t.Fatalf("strict profile did not run after full profile setup failure:\n%s", output)
+	}
+}
+
+func TestRunEmitsReportWhenVectorComparisonFails(t *testing.T) {
+	output := runFailureOutput(t, "vector-diff")
+	text := string(output)
+	if !strings.Contains(text, "full and strict behavior vectors differ") {
+		t.Fatalf("vector comparison did not fail:\n%s", text)
+	}
+	if !strings.Contains(text, "conformance report:") {
+		t.Fatalf("conformance report was not emitted after vector comparison failure:\n%s", text)
+	}
+}
+
 func TestRunValidatesCountAfterFailedGroup(t *testing.T) {
 	output := runFailureOutput(t, "failed-short-group")
 	if !strings.Contains(string(output), `conformance group "publish" ran 1 checks; manifest declares 2`) {
@@ -226,6 +251,7 @@ func TestRunFailureHelper(t *testing.T) {
 	}
 
 	var factory InspectorFactory
+	var runDriver driver.Driver = runTestDriver{}
 	switch mode {
 	case "zero-inspector":
 		factory = func(driver.Conn) (Inspect, error) {
@@ -298,16 +324,54 @@ func TestRunFailureHelper(t *testing.T) {
 			})
 		})
 		factory = runTestInspector
+	case "profile-failure":
+		groupManifest = []manifestEntry{{name: "publish", declared: 1}}
+		pendingGroups = nil
+		groupRunners = map[string]groupRunner{}
+		registerGroup("publish", func(group *groupContext) {
+			group.Check("deliberate full profile failure", func(checkTest *testing.T) {
+				if group.profile == ProfileFull {
+					checkTest.Fatal("deliberate full profile failure")
+				}
+			})
+		})
+		factory = runTestInspector
+	case "profile-setup-failure":
+		groupManifest = []manifestEntry{{name: "publish", declared: 1}}
+		pendingGroups = nil
+		groupRunners = map[string]groupRunner{}
+		registerGroup("publish", func(group *groupContext) {
+			group.Check("strict profile setup continued", func(*testing.T) {})
+		})
+		runDriver = runTestDriver{failFullProfileSetup: true}
+		factory = runTestInspector
+	case "vector-diff":
+		groupManifest = []manifestEntry{{name: "publish", declared: 1}}
+		pendingGroups = nil
+		groupRunners = map[string]groupRunner{}
+		registerGroup("publish", func(group *groupContext) {
+			group.Check("profile behavior differs", func(*testing.T) {
+				group.vector.Add(BehaviorEvent{ID: "profile", Outcome: group.profile.String()})
+			})
+		})
+		factory = runTestInspector
 	default:
 		t.Fatalf("unknown conformance failure mode %q", mode)
 	}
 
-	Run(t, Suite{Driver: runTestDriver{}, NewInspector: factory})
+	Run(t, Suite{Driver: runDriver, NewInspector: factory})
+	if mode == "profile-failure" || mode == "profile-setup-failure" {
+		if !t.Failed() {
+			t.Fatal("Run returned without preserving the profile failure")
+		}
+		return
+	}
 	t.Fatal("Run returned after an expected failure")
 }
 
 type runTestDriver struct {
-	opens *int
+	opens                *int
+	failFullProfileSetup bool
 }
 
 func (runTestDriver) Name() string                      { return "run-test" }
@@ -317,9 +381,11 @@ func (d runTestDriver) Open(context.Context, driver.Config) (driver.Conn, error)
 		(*d.opens)++
 	}
 	return &runTestConn{
-		queues:    make(map[string][]driver.OutboundMessage),
-		unsettled: make(map[string]int),
-		specs:     make(map[string]driver.DestinationSpec),
+		caps:                 driver.Capabilities{},
+		failFullProfileSetup: d.failFullProfileSetup,
+		queues:               make(map[string][]driver.OutboundMessage),
+		unsettled:            make(map[string]int),
+		specs:                make(map[string]driver.DestinationSpec),
 	}, nil
 }
 
@@ -348,10 +414,11 @@ type maintenanceLessAdmin struct {
 }
 
 type runTestConn struct {
-	caps      driver.Capabilities
-	queues    map[string][]driver.OutboundMessage
-	unsettled map[string]int
-	specs     map[string]driver.DestinationSpec
+	caps                 driver.Capabilities
+	failFullProfileSetup bool
+	queues               map[string][]driver.OutboundMessage
+	unsettled            map[string]int
+	specs                map[string]driver.DestinationSpec
 }
 
 func (c *runTestConn) Capabilities() driver.Capabilities { return c.caps }
@@ -502,6 +569,9 @@ type runTestAdmin struct{ conn *runTestConn }
 
 func (a runTestAdmin) EnsureTopology(_ context.Context, spec driver.TopologySpec) (driver.TopologyDiff, error) {
 	var diff driver.TopologyDiff
+	if a.conn.failFullProfileSetup && len(spec.Destinations) == 1 && strings.Contains(spec.Destinations[0].Name, ".full.") {
+		return diff, errors.New("deliberate full profile setup failure")
+	}
 	if spec.Policy == driver.TopologyNone {
 		return diff, nil
 	}

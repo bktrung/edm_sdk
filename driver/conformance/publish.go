@@ -16,7 +16,7 @@ func init() {
 
 func runPublish(group *groupContext) {
 	group.Check("confirmed publish is visible in the destination", func(t *testing.T) {
-		producer := newProducer(t, group, "publish.visible", driver.ProducerConfig{RequireDurableAck: true, Effective: group.effective})
+		producer := newProducer(t, group, profileDestination(group, "publish.visible"), driver.ProducerConfig{RequireDurableAck: true, Effective: group.effective})
 		publish := driver.OutboundMessage{Destination: "publish.visible", Body: []byte("visible")}
 		if err := producer.Publish(group.ctx, publish); err != nil {
 			t.Fatalf("Publish() error = %v", err)
@@ -29,7 +29,7 @@ func runPublish(group *groupContext) {
 	})
 
 	group.Check("zero-value publish config accepts a normal message", func(t *testing.T) {
-		producer := newProducer(t, group, "publish.zero", driver.ProducerConfig{})
+		producer := newProducer(t, group, profileDestination(group, "publish.zero"), driver.ProducerConfig{})
 		if err := producer.Publish(group.ctx, driver.OutboundMessage{Destination: "publish.zero", Body: []byte("default")}); err != nil {
 			t.Fatalf("Publish() with zero-value config error = %v", err)
 		}
@@ -40,7 +40,7 @@ func runPublish(group *groupContext) {
 	})
 
 	group.Check("flush is safe after a confirmed publish", func(t *testing.T) {
-		producer := newProducer(t, group, "publish.flush", driver.ProducerConfig{RequireDurableAck: true, Effective: group.effective})
+		producer := newProducer(t, group, profileDestination(group, "publish.flush"), driver.ProducerConfig{RequireDurableAck: true, Effective: group.effective})
 		if err := producer.Publish(group.ctx, driver.OutboundMessage{Destination: "publish.flush", Body: []byte("flush")}); err != nil {
 			t.Fatalf("Publish() error = %v", err)
 		}
@@ -75,7 +75,7 @@ func runPublish(group *groupContext) {
 
 	group.Check("cancelled Flush returns transient and leaves the producer usable", func(t *testing.T) {
 		name := "publish.cancel-flush"
-		producer := newProducer(t, group, name, driver.ProducerConfig{Effective: group.effective})
+		producer := newProducer(t, group, profileDestination(group, name), driver.ProducerConfig{Effective: group.effective})
 		ctx, cancel := context.WithCancel(group.ctx)
 		cancel()
 		assertCancelled(t, "Flush", producer.Flush(ctx))
@@ -90,7 +90,7 @@ func runPublish(group *groupContext) {
 
 	group.Check("cancelled producer Close returns transient and leaves the producer usable", func(t *testing.T) {
 		name := "publish.cancel-close"
-		producer := newProducer(t, group, name, driver.ProducerConfig{Effective: group.effective})
+		producer := newProducer(t, group, profileDestination(group, name), driver.ProducerConfig{Effective: group.effective})
 		ctx, cancel := context.WithCancel(group.ctx)
 		cancel()
 		assertCancelled(t, "Producer.Close", producer.Close(ctx))
@@ -104,7 +104,7 @@ func runPublish(group *groupContext) {
 	})
 
 	group.Check("partial publish reports only the missing message", func(t *testing.T) {
-		producer := newProducer(t, group, "publish.partial", driver.ProducerConfig{RequireDurableAck: true, Effective: group.effective})
+		producer := newProducer(t, group, profileDestination(group, "publish.partial"), driver.ProducerConfig{RequireDurableAck: true, Effective: group.effective})
 		err := producer.Publish(group.ctx,
 			driver.OutboundMessage{Destination: "publish.partial", Body: []byte("accepted")},
 			driver.OutboundMessage{Destination: "publish.missing", Body: []byte("rejected")},
@@ -126,7 +126,7 @@ func runPublish(group *groupContext) {
 	})
 
 	group.Check("publishing only to a missing destination is classified", func(t *testing.T) {
-		producer := newProducer(t, group, "publish.missing-only", driver.ProducerConfig{RequireDurableAck: true, Effective: group.effective})
+		producer := newProducer(t, group, profileDestination(group, "publish.missing-only"), driver.ProducerConfig{RequireDurableAck: true, Effective: group.effective})
 		err := producer.Publish(group.ctx, driver.OutboundMessage{Destination: "publish.no-such-destination"})
 		if err == nil {
 			t.Fatal("Publish() error = nil, want missing-destination error")
@@ -141,7 +141,7 @@ func runPublish(group *groupContext) {
 	})
 
 	group.Check("total publish failure reports every message", func(t *testing.T) {
-		producer := newProducer(t, group, "publish.total", driver.ProducerConfig{RequireDurableAck: true, Effective: group.effective})
+		producer := newProducer(t, group, profileDestination(group, "publish.total"), driver.ProducerConfig{RequireDurableAck: true, Effective: group.effective})
 		err := producer.Publish(group.ctx,
 			driver.OutboundMessage{Destination: "publish.total.missing-a"},
 			driver.OutboundMessage{Destination: "publish.total.missing-b"},
@@ -165,7 +165,7 @@ func runPublish(group *groupContext) {
 	})
 
 	group.Check("empty publish is a no-op", func(t *testing.T) {
-		producer := newProducer(t, group, "publish.empty", driver.ProducerConfig{RequireDurableAck: true, Effective: group.effective})
+		producer := newProducer(t, group, profileDestination(group, "publish.empty"), driver.ProducerConfig{RequireDurableAck: true, Effective: group.effective})
 		if err := producer.Publish(group.ctx); err != nil {
 			t.Fatalf("empty Publish() error = %v", err)
 		}
@@ -176,7 +176,7 @@ func runPublish(group *groupContext) {
 	})
 
 	group.Check("cancelled context prevents publishing", func(t *testing.T) {
-		producer := newProducer(t, group, "publish.cancelled", driver.ProducerConfig{RequireDurableAck: true, Effective: group.effective})
+		producer := newProducer(t, group, profileDestination(group, "publish.cancelled"), driver.ProducerConfig{RequireDurableAck: true, Effective: group.effective})
 		ctx, cancel := context.WithCancel(group.ctx)
 		cancel()
 		err := producer.Publish(ctx, driver.OutboundMessage{Destination: "publish.cancelled"})
@@ -193,12 +193,12 @@ func runPublish(group *groupContext) {
 	})
 
 	group.Check("body bytes survive publish", func(t *testing.T) {
-		producer := newProducer(t, group, "publish.body", driver.ProducerConfig{RequireDurableAck: true, Effective: group.effective})
+		producer := newProducer(t, group, profileDestination(group, "publish.body"), driver.ProducerConfig{RequireDurableAck: true, Effective: group.effective})
 		body := []byte{0, 1, 2, 255}
 		if err := producer.Publish(group.ctx, driver.OutboundMessage{Destination: "publish.body", Body: body}); err != nil {
 			t.Fatalf("Publish() error = %v", err)
 		}
-		consumer := newConsumer(t, group, "publish.body", 2)
+		consumer := newConsumer(t, group, profileDestination(group, "publish.body"), 2)
 		message := receiveMessage(t, group, consumer)
 		if string(message.Body) != string(body) {
 			t.Fatalf("Body = %v, want %v", message.Body, body)
@@ -208,12 +208,12 @@ func runPublish(group *groupContext) {
 	})
 
 	group.Check("headers survive publish", func(t *testing.T) {
-		producer := newProducer(t, group, "publish.headers", driver.ProducerConfig{RequireDurableAck: true, Effective: group.effective})
+		producer := newProducer(t, group, profileDestination(group, "publish.headers"), driver.ProducerConfig{RequireDurableAck: true, Effective: group.effective})
 		headers := []driver.Header{{Key: "x-trace", Value: []byte("trace-1")}, {Key: "x-empty", Value: nil}}
 		if err := producer.Publish(group.ctx, driver.OutboundMessage{Destination: "publish.headers", Headers: headers}); err != nil {
 			t.Fatalf("Publish() error = %v", err)
 		}
-		consumer := newConsumer(t, group, "publish.headers", 2)
+		consumer := newConsumer(t, group, profileDestination(group, "publish.headers"), 2)
 		message := receiveMessage(t, group, consumer)
 		if len(message.Headers) != len(headers) {
 			t.Fatalf("Headers = %#v, want %d headers", message.Headers, len(headers))
@@ -231,12 +231,12 @@ func runPublish(group *groupContext) {
 	})
 
 	group.Check("routing key survives publish", func(t *testing.T) {
-		producer := newProducer(t, group, "publish.key", driver.ProducerConfig{RequireDurableAck: true, Effective: group.effective})
+		producer := newProducer(t, group, profileDestination(group, "publish.key"), driver.ProducerConfig{RequireDurableAck: true, Effective: group.effective})
 		key := []byte("order-42")
 		if err := producer.Publish(group.ctx, driver.OutboundMessage{Destination: "publish.key", Key: key}); err != nil {
 			t.Fatalf("Publish() error = %v", err)
 		}
-		consumer := newConsumer(t, group, "publish.key", 2)
+		consumer := newConsumer(t, group, profileDestination(group, "publish.key"), 2)
 		message := receiveMessage(t, group, consumer)
 		if string(message.Key) != string(key) {
 			t.Fatalf("Key = %q, want %q", message.Key, key)
@@ -246,7 +246,7 @@ func runPublish(group *groupContext) {
 	})
 
 	group.Check("message and header inputs are not mutated by publish", func(t *testing.T) {
-		producer := newProducer(t, group, "publish.clone", driver.ProducerConfig{RequireDurableAck: true, Effective: group.effective})
+		producer := newProducer(t, group, profileDestination(group, "publish.clone"), driver.ProducerConfig{RequireDurableAck: true, Effective: group.effective})
 		message := driver.OutboundMessage{
 			Destination: "publish.clone",
 			Key:         []byte("original-key"),
@@ -260,7 +260,7 @@ func runPublish(group *groupContext) {
 		message.Key[0] = 'X'
 		headerByKey(t, message.Headers, "x").Value[0] = 'X'
 		message.Body[0] = 'X'
-		consumer := newConsumer(t, group, "publish.clone", 2)
+		consumer := newConsumer(t, group, profileDestination(group, "publish.clone"), 2)
 		got := receiveMessage(t, group, consumer)
 		actual := fmt.Sprintf("%s|%s|%s", got.Key, headerByKey(t, got.Headers, "x").Value, got.Body)
 		if actual != want {
@@ -272,7 +272,7 @@ func runPublish(group *groupContext) {
 
 	group.Check("over-limit publish is rejected", func(t *testing.T) {
 		caps := group.effective
-		producer := newProducer(t, group, "publish.limits", driver.ProducerConfig{RequireDurableAck: true, Effective: group.effective})
+		producer := newProducer(t, group, profileDestination(group, "publish.limits"), driver.ProducerConfig{RequireDurableAck: true, Effective: group.effective})
 		if caps.MaxMessageBytes > 0 {
 			err := producer.Publish(group.ctx, driver.OutboundMessage{
 				Destination: "publish.limits",
@@ -294,7 +294,7 @@ func runPublish(group *groupContext) {
 		}
 	})
 	group.Check("concurrent publishes are all confirmed", func(t *testing.T) {
-		producer := newProducer(t, group, "publish.concurrent", driver.ProducerConfig{RequireDurableAck: true, Effective: group.effective})
+		producer := newProducer(t, group, profileDestination(group, "publish.concurrent"), driver.ProducerConfig{RequireDurableAck: true, Effective: group.effective})
 		const count = 8
 		var wg sync.WaitGroup
 		start := make(chan struct{})

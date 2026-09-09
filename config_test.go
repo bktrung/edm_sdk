@@ -283,6 +283,48 @@ func TestLoadConfigRejectsExplicitZeroPrefetch(t *testing.T) {
 	}
 }
 
+func TestLoadConfigRejectsPrefetchAboveCeiling(t *testing.T) {
+	t.Parallel()
+	path := writeConfig(t, `
+f1:
+  env: test
+  service: orders
+  broker:
+    driver: inmem
+  subscriptions:
+    orders:
+      topics: [orders]
+      prefetch: 65536
+`)
+	_, err := LoadConfig(path)
+	want := "f1: subscriptions.orders.prefetch 65536 must be at most 65535"
+	if err == nil || err.Error() != want {
+		t.Fatalf("LoadConfig() error = %v, want %q", err, want)
+	}
+}
+
+func TestLoadConfigAcceptsPrefetchAtCeiling(t *testing.T) {
+	t.Parallel()
+	path := writeConfig(t, `
+f1:
+  env: test
+  service: orders
+  broker:
+    driver: inmem
+  subscriptions:
+    orders:
+      topics: [orders]
+      prefetch: 65535
+`)
+	cfg, err := LoadConfig(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := cfg.Subscriptions["orders"].Prefetch, 65535; got != want {
+		t.Fatalf("Prefetch = %d, want %d", got, want)
+	}
+}
+
 func TestLoadConfigSubscriptionUsesPackagePrefetchFallback(t *testing.T) {
 	t.Parallel()
 	path := writeConfig(t, "f1:\n  env: test\n  service: orders\n  broker:\n    driver: inmem\n  subscriptions:\n    orders:\n      topics: [orders]\n")

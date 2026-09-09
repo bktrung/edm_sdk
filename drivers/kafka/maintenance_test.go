@@ -245,6 +245,21 @@ func TestPruneDeletesAfterConsumerCloses(t *testing.T) {
 	if len(results) != 1 || !results[0].Deleted {
 		t.Fatalf("Prune result = %#v, want deleted result", results)
 	}
+
+	details, err := admin.ListTopics(kadm.WithAuthorizedOps(ctx), topic)
+	if err != nil {
+		t.Fatalf("ListTopics after Prune: %v", err)
+	}
+	detail, ok := details[topic]
+	switch {
+	case !ok,
+		errors.Is(detail.Err, kerr.UnknownTopicOrPartition),
+		errors.Is(detail.Err, kerr.UnknownTopicID):
+	case detail.Err != nil:
+		t.Fatalf("ListTopics after Prune returned %q with error: %v", topic, detail.Err)
+	default:
+		t.Fatalf("topic %q remained visible after deleted Prune result", topic)
+	}
 }
 
 func TestPruneReportsMissingTopic(t *testing.T) {

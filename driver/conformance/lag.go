@@ -12,8 +12,8 @@ func init() { registerGroup("lag", runLag) }
 func runLag(group *groupContext) {
 	group.Check("lag covers each subscribed destination and no others", func(t *testing.T) {
 		first, second := "lag.coverage.first", "lag.coverage.second"
-		firstProducer := newProducer(t, group, first, driver.ProducerConfig{Effective: group.effective})
-		secondProducer := newProducer(t, group, second, driver.ProducerConfig{Effective: group.effective})
+		firstProducer := newProducer(t, group, profileDestination(group, first), driver.ProducerConfig{Effective: group.effective})
+		secondProducer := newProducer(t, group, profileDestination(group, second), driver.ProducerConfig{Effective: group.effective})
 		consumer := newConsumerFor(t, group, driver.ConsumerConfig{Destinations: []string{first, second}, Prefetch: 1, Effective: group.effective})
 		if err := consumer.Drain(group.ctx); err != nil {
 			t.Fatal(err)
@@ -32,8 +32,8 @@ func runLag(group *groupContext) {
 	})
 	group.Check("lag rises across each published backlog step", func(t *testing.T) {
 		name := "lag.rises"
-		producer := newProducer(t, group, name, driver.ProducerConfig{Effective: group.effective})
-		consumer := newConsumer(t, group, name, 1)
+		producer := newProducer(t, group, profileDestination(group, name), driver.ProducerConfig{Effective: group.effective})
+		consumer := newConsumer(t, group, profileDestination(group, name), 1)
 		previous, available := lagFor(t, group, consumer, name)
 		if !available {
 			return
@@ -52,8 +52,8 @@ func runLag(group *groupContext) {
 	})
 	group.Check("lag falls across each settled backlog step", func(t *testing.T) {
 		name := "lag.falls"
-		producer := newProducer(t, group, name, driver.ProducerConfig{Effective: group.effective})
-		consumer := newConsumer(t, group, name, 1)
+		producer := newProducer(t, group, profileDestination(group, name), driver.ProducerConfig{Effective: group.effective})
+		consumer := newConsumer(t, group, profileDestination(group, name), 1)
 		publishCount(t, group, producer, name, 3)
 		previous, available := lagFor(t, group, consumer, name)
 		if !available {
@@ -71,8 +71,8 @@ func runLag(group *groupContext) {
 	})
 	group.Check("lag equals broker ready depth at the same observation", func(t *testing.T) {
 		name := "lag.accuracy"
-		producer := newProducer(t, group, name, driver.ProducerConfig{Effective: group.effective})
-		consumer := newConsumer(t, group, name, 1)
+		producer := newProducer(t, group, profileDestination(group, name), driver.ProducerConfig{Effective: group.effective})
+		consumer := newConsumer(t, group, profileDestination(group, name), 1)
 		if err := consumer.Drain(group.ctx); err != nil {
 			t.Fatal(err)
 		}
@@ -86,8 +86,8 @@ func runLag(group *groupContext) {
 	})
 	group.Check("unavailable lag returns a classified unsupported error", func(t *testing.T) {
 		name := "lag.unsupported"
-		newProducer(t, group, name, driver.ProducerConfig{Effective: group.effective})
-		consumer := newConsumer(t, group, name, 1)
+		newProducer(t, group, profileDestination(group, name), driver.ProducerConfig{Effective: group.effective})
+		consumer := newConsumer(t, group, profileDestination(group, name), 1)
 		_, err := consumer.Lag(group.ctx)
 		if group.effective.LagQueryable {
 			if err != nil {

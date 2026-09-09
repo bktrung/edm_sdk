@@ -6,11 +6,13 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/twmb/franz-go/pkg/kadm"
 	"github.com/twmb/franz-go/pkg/kerr"
 
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/driver"
+	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/clock"
 )
 
 type kafkaTopicSpec struct {
@@ -25,6 +27,15 @@ type kafkaTopologyPlan struct {
 	exchanges    []string
 	bindings     []driver.BindingSpec
 }
+
+type topicVisibility uint8
+
+const (
+	kafkaTopologyVisibilityTimeout                 = 5 * time.Second
+	kafkaTopologyVisibilityPoll                    = 10 * time.Millisecond
+	topicMustExist                 topicVisibility = iota
+	topicMustBeAbsent
+)
 
 func translateTopology(spec driver.TopologySpec) kafkaTopologyPlan {
 	plan := kafkaTopologyPlan{
@@ -63,6 +74,7 @@ func (a *admin) ensureTopology(ctx context.Context, spec driver.TopologySpec) (d
 	}
 
 	var diff driver.TopologyDiff
+	created := make([]string, 0, len(spec.Destinations))
 	plan := translateTopology(spec)
 	for _, destination := range plan.destinations {
 		if destination.err != nil {
@@ -78,11 +90,15 @@ func (a *admin) ensureTopology(ctx context.Context, spec driver.TopologySpec) (d
 		switch {
 		case response.Err == nil:
 			diff.CreatedDestinations = append(diff.CreatedDestinations, destination.name)
+			created = append(created, destination.name)
 		case errors.Is(response.Err, kerr.TopicAlreadyExists):
 			diff.ExistingDestinations = append(diff.ExistingDestinations, destination.name)
 		default:
 			return driver.TopologyDiff{}, classifyAdminError("ensure_topology", response.Err)
 		}
+	}
+	if err := a.waitForTopicState(ctx, "ensure_topology", created, topicMustExist); err != nil {
+		return driver.TopologyDiff{}, err
 	}
 
 	// Kafka is FanoutAtConsume: exchanges and bindings are routing concepts
@@ -93,12 +109,63 @@ func (a *admin) ensureTopology(ctx context.Context, spec driver.TopologySpec) (d
 	return diff, nil
 }
 
+func (a *admin) waitForTopicState(ctx context.Context, operation string, names []string, visibility topicVisibility) error {
+	if len(names) == 0 {
+		return nil
+	}
+	waitCtx, cancel := context.WithTimeout(ctx, kafkaTopologyVisibilityTimeout)
+	defer cancel()
+	ticker := clock.NewReal().Ticker(kafkaTopologyVisibilityPoll)
+	defer ticker.Stop()
+	state := "present"
+	if visibility == topicMustBeAbsent {
+		state = "absent"
+	}
+	for {
+		topics, err := a.listTopics(waitCtx, operation, names...)
+		if err != nil {
+			return err
+		}
+		visible := true
+		for _, name := range names {
+			detail, ok := topics[name]
+			present, known := false, true
+			if ok && detail.Err == nil {
+				present = visibility == topicMustBeAbsent || len(detail.Partitions) > 0
+			} else if ok && detail.Err != nil {
+				switch {
+				case errors.Is(detail.Err, kerr.UnknownTopicOrPartition),
+					errors.Is(detail.Err, kerr.UnknownTopicID):
+					present = false
+				case kafkaErrorKind(detail.Err) == driver.KindTransient:
+					known = false
+				default:
+					return classifyAdminError(operation, detail.Err)
+				}
+			}
+			wantPresent := visibility == topicMustExist
+			if !known || present != wantPresent {
+				visible = false
+				break
+			}
+		}
+		if visible {
+			return nil
+		}
+		select {
+		case <-waitCtx.Done():
+			return classify(operation, driver.KindTransient, fmt.Errorf("kafka: topics did not become %s: %w", state, waitCtx.Err()))
+		case <-ticker.C:
+		}
+	}
+}
+
 func (a *admin) verifyTopology(ctx context.Context, spec driver.TopologySpec) (driver.TopologyDiff, error) {
 	var diff driver.TopologyDiff
 	if len(spec.Destinations) == 0 {
 		return diff, nil
 	}
-	topics, err := a.listTopics(ctx, destinationNames(spec.Destinations)...)
+	topics, err := a.listTopics(ctx, "ensure_topology", destinationNames(spec.Destinations)...)
 	if err != nil {
 		return driver.TopologyDiff{}, err
 	}
@@ -222,7 +289,7 @@ func (a *admin) scanOrphans(ctx context.Context, spec driver.TopologySpec, diff 
 		diff.OrphanScanError = "orphan scan disabled because no scope was supplied"
 		return
 	}
-	topics, err := a.listTopics(ctx)
+	topics, err := a.listTopics(ctx, "ensure_topology")
 	if err != nil {
 		diff.OrphanScanError = err.Error()
 		return

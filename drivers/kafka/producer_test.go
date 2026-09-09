@@ -116,9 +116,10 @@ func TestFailedPublishIndexesRejectsUnaccountedResults(t *testing.T) {
 func TestPublishRejectsEntryPoint(t *testing.T) {
 	t.Parallel()
 
-	p := &producer{}
+	p := &producer{cfg: driver.ProducerConfig{Effective: driver.Capabilities{MaxMessageBytes: 1}}}
 	err := p.Publish(context.Background(), driver.OutboundMessage{
 		Destination: "topic",
+		Body:        []byte("oversized"),
 		EntryPoint:  true,
 	})
 	if err == nil {
@@ -142,6 +143,136 @@ func TestOversizeClassifiesTooLarge(t *testing.T) {
 	if kind != driver.KindTooLarge {
 		t.Fatalf("driver.Classify(%v) kind = %v, want too_large", err, kind)
 	}
+}
+
+func assertKafkaTopicDepth(t *testing.T, admin *kadm.Client, ctx context.Context, topic string, want int64) {
+	t.Helper()
+	starts, err := admin.ListStartOffsets(ctx, topic)
+	if err != nil {
+		t.Fatalf("ListStartOffsets(%q): %v", topic, err)
+	}
+	ends, err := admin.ListEndOffsets(ctx, topic)
+	if err != nil {
+		t.Fatalf("ListEndOffsets(%q): %v", topic, err)
+	}
+	depth, present, err := topicDepth(topic, starts, ends)
+	if err != nil {
+		t.Fatalf("topicDepth(%q): %v", topic, err)
+	}
+	if !present {
+		t.Fatalf("topicDepth(%q) present = false, want true", topic)
+	}
+	if depth != want {
+		t.Fatalf("topicDepth(%q) = %d, want %d", topic, depth, want)
+	}
+}
+
+func TestPublishBodyLimitUsesProducerConfig(t *testing.T) {
+	ctx, connection, admin := openKafkaAdminTest(t)
+	topic := kafkaTestTopic(t, "producer-body-limit-config")
+	cleanupKafkaTopics(t, admin, topic)
+	createKafkaTopic(t, admin, ctx, topic, 1)
+
+	producer, err := connection.Producer(ctx, driver.ProducerConfig{
+		Effective: driver.Capabilities{MaxMessageBytes: 4},
+	})
+	if err != nil {
+		t.Fatalf("Producer: %v", err)
+	}
+	t.Cleanup(func() { _ = producer.Close(context.Background()) })
+
+	err = producer.Publish(ctx, driver.OutboundMessage{Destination: topic, Body: []byte("12345")})
+	var publishErr *driver.PublishError
+	if !errors.As(err, &publishErr) {
+		t.Fatalf("Publish() error = %v, want *driver.PublishError", err)
+	}
+	if len(publishErr.Failed) != 1 {
+		t.Fatalf("Publish() Failed = %#v, want one local failure", publishErr.Failed)
+	}
+	failed, ok := publishErr.Failed[0]
+	if !ok {
+		t.Fatalf("Publish() Failed = %#v, want failure at input index 0", publishErr.Failed)
+	}
+	kind, classified := driver.Classify(failed)
+	if !classified || kind != driver.KindTooLarge {
+		t.Fatalf("failed[0] classification = (%v, %t), want (too_large, true)", kind, classified)
+	}
+	assertKafkaTopicDepth(t, admin, ctx, topic, 0)
+}
+
+func TestPublishBodyLimitMixedBatch(t *testing.T) {
+	ctx, connection, admin := openKafkaAdminTest(t)
+	topic := kafkaTestTopic(t, "producer-body-limit-mixed")
+	cleanupKafkaTopics(t, admin, topic)
+	createKafkaTopic(t, admin, ctx, topic, 1)
+
+	producer, err := connection.Producer(ctx, driver.ProducerConfig{
+		Effective: driver.Capabilities{MaxMessageBytes: 4},
+	})
+	if err != nil {
+		t.Fatalf("Producer: %v", err)
+	}
+	t.Cleanup(func() { _ = producer.Close(context.Background()) })
+
+	err = producer.Publish(ctx,
+		driver.OutboundMessage{Destination: topic, Body: []byte("one")},
+		driver.OutboundMessage{Destination: topic, Body: []byte("too-large")},
+		driver.OutboundMessage{Destination: topic, Body: []byte("two")},
+	)
+	var publishErr *driver.PublishError
+	if !errors.As(err, &publishErr) {
+		t.Fatalf("Publish() error = %v, want *driver.PublishError", err)
+	}
+	if len(publishErr.Failed) != 1 {
+		t.Fatalf("Publish() Failed = %#v, want one local failure", publishErr.Failed)
+	}
+	failed, ok := publishErr.Failed[1]
+	if !ok {
+		t.Fatalf("Publish() Failed = %#v, want failure at input index 1", publishErr.Failed)
+	}
+	kind, classified := driver.Classify(failed)
+	if !classified || kind != driver.KindTooLarge {
+		t.Fatalf("failed[1] classification = (%v, %t), want (too_large, true)", kind, classified)
+	}
+	assertKafkaTopicDepth(t, admin, ctx, topic, 2)
+}
+
+func TestPublishBodyLimitAllOversized(t *testing.T) {
+	ctx, connection, admin := openKafkaAdminTest(t)
+	topic := kafkaTestTopic(t, "producer-body-limit-all")
+	cleanupKafkaTopics(t, admin, topic)
+	createKafkaTopic(t, admin, ctx, topic, 1)
+
+	producer, err := connection.Producer(ctx, driver.ProducerConfig{
+		Effective: driver.Capabilities{MaxMessageBytes: 4},
+	})
+	if err != nil {
+		t.Fatalf("Producer: %v", err)
+	}
+	t.Cleanup(func() { _ = producer.Close(context.Background()) })
+
+	err = producer.Publish(ctx,
+		driver.OutboundMessage{Destination: topic, Body: []byte("first-too-large")},
+		driver.OutboundMessage{Destination: topic, Body: []byte("second-too-large")},
+	)
+	var publishErr *driver.PublishError
+	if !errors.As(err, &publishErr) {
+		t.Fatalf("Publish() error = %v, want *driver.PublishError", err)
+	}
+	if len(publishErr.Failed) != 2 {
+		t.Fatalf("Publish() Failed = %#v, want both input failures", publishErr.Failed)
+	}
+	for index := range 2 {
+		failed, ok := publishErr.Failed[index]
+		if !ok {
+			t.Fatalf("Publish() Failed = %#v, want failure at input index %d", publishErr.Failed, index)
+		}
+		kind, classified := driver.Classify(failed)
+		if !classified || kind != driver.KindTooLarge {
+			t.Fatalf("failed[%d] classification = (%v, %t), want (too_large, true)", index, kind, classified)
+		}
+	}
+	assertKafkaTopicDepth(t, admin, ctx, topic, 0)
 }
 
 func TestPublishDurableAck(t *testing.T) {
@@ -195,37 +326,66 @@ func TestPublishPartialFailureNamesInputIndex(t *testing.T) {
 	cleanupKafkaTopics(t, admin, validTopic, missingTopic)
 	createKafkaTopic(t, admin, ctx, validTopic, 1)
 
-	producer, err := connection.Producer(ctx, driver.ProducerConfig{Effective: connection.Capabilities()})
+	producer, err := connection.Producer(ctx, driver.ProducerConfig{
+		Effective: driver.Capabilities{MaxMessageBytes: 4},
+	})
 	if err != nil {
 		t.Fatalf("Producer: %v", err)
 	}
 	t.Cleanup(func() { _ = producer.Close(context.Background()) })
 
 	err = producer.Publish(ctx,
-		driver.OutboundMessage{Destination: validTopic, Body: []byte("accepted-before")},
-		driver.OutboundMessage{Destination: missingTopic, Body: []byte("rejected")},
-		driver.OutboundMessage{Destination: validTopic, Body: []byte("accepted-after")},
+		driver.OutboundMessage{Destination: validTopic, Body: []byte("ok")},
+		driver.OutboundMessage{Destination: validTopic, Body: []byte("too-large")},
+		driver.OutboundMessage{Destination: missingTopic, Body: []byte("ok")},
+		driver.OutboundMessage{Destination: validTopic, Body: []byte("go")},
 	)
 	var publishErr *driver.PublishError
 	if !errors.As(err, &publishErr) {
 		t.Fatalf("Publish() error = %v, want *driver.PublishError", err)
 	}
-	if len(publishErr.Failed) != 1 {
-		t.Fatalf("Publish() Failed = %#v, want exactly one failure", publishErr.Failed)
+	if len(publishErr.Failed) != 2 {
+		t.Fatalf("Publish() Failed = %#v, want local and broker failures", publishErr.Failed)
 	}
-	failed, ok := publishErr.Failed[1]
+
+	localFailed, ok := publishErr.Failed[1]
 	if !ok {
-		t.Fatalf("Publish() Failed = %#v, want missing topic at input index 1", publishErr.Failed)
+		t.Fatalf("Publish() Failed = %#v, want local failure at input index 1", publishErr.Failed)
 	}
-	kind, classified := driver.Classify(failed)
+	kind, classified := driver.Classify(localFailed)
+	if !classified || kind != driver.KindTooLarge {
+		t.Fatalf("failed[1] classification = (%v, %t), want (too_large, true)", kind, classified)
+	}
+
+	brokerFailed, ok := publishErr.Failed[2]
+	if !ok {
+		t.Fatalf("Publish() Failed = %#v, want missing topic at input index 2", publishErr.Failed)
+	}
+	kind, classified = driver.Classify(brokerFailed)
 	if !classified || kind != driver.KindNotFound {
-		t.Fatalf("failed[1] classification = (%v, %t), want (not_found, true)", kind, classified)
+		t.Fatalf("failed[2] classification = (%v, %t), want (not_found, true)", kind, classified)
 	}
-	if !errors.Is(failed, driver.ErrDestinationMissing) {
-		t.Fatalf("failed[1] = %v, want ErrDestinationMissing", failed)
+	if !errors.Is(brokerFailed, driver.ErrDestinationMissing) {
+		t.Fatalf("failed[2] = %v, want ErrDestinationMissing", brokerFailed)
 	}
-	if !errors.Is(failed, kerr.UnknownTopicOrPartition) {
-		t.Fatalf("failed[1] = %v, want Kafka unknown-topic cause", failed)
+	if !errors.Is(brokerFailed, kerr.UnknownTopicOrPartition) {
+		t.Fatalf("failed[2] = %v, want Kafka unknown-topic cause", brokerFailed)
+	}
+
+	starts, err := admin.ListStartOffsets(ctx, validTopic)
+	if err != nil {
+		t.Fatalf("ListStartOffsets(%q): %v", validTopic, err)
+	}
+	ends, err := admin.ListEndOffsets(ctx, validTopic)
+	if err != nil {
+		t.Fatalf("ListEndOffsets(%q): %v", validTopic, err)
+	}
+	depth, present, err := topicDepth(validTopic, starts, ends)
+	if err != nil {
+		t.Fatalf("topicDepth(%q): %v", validTopic, err)
+	}
+	if !present || depth != 2 {
+		t.Fatalf("topicDepth(%q) present=%t depth=%d, want two admissible records", validTopic, present, depth)
 	}
 }
 
@@ -248,7 +408,7 @@ func TestPublishOversizeRejected(t *testing.T) {
 		t.Fatalf("CreateTopic(%q) response: %v", topic, response.Err)
 	}
 
-	producer, err := connection.Producer(ctx, driver.ProducerConfig{Effective: connection.Capabilities()})
+	producer, err := connection.Producer(ctx, driver.ProducerConfig{Effective: driver.Capabilities{}})
 	if err != nil {
 		t.Fatalf("Producer: %v", err)
 	}
@@ -262,6 +422,9 @@ func TestPublishOversizeRejected(t *testing.T) {
 	kind, classified := driver.Classify(err)
 	if !classified || kind != driver.KindTooLarge {
 		t.Fatalf("Publish() classification = (%v, %t), want (too_large, true): %v", kind, classified, err)
+	}
+	if !errors.Is(err, kerr.MessageTooLarge) {
+		t.Fatalf("Publish() error = %v, want broker MessageTooLarge cause", err)
 	}
 
 	starts, err := admin.ListStartOffsets(ctx, topic)

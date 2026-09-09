@@ -15,6 +15,7 @@ import (
 	"github.com/twmb/franz-go/pkg/kgo"
 
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/driver"
+	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/clock"
 )
 
 func openKafkaAdminTest(t *testing.T) (context.Context, *conn, *kadm.Client) {
@@ -69,6 +70,46 @@ func cleanupKafkaTopics(t *testing.T, admin *kadm.Client, names ...string) {
 	})
 }
 
+const (
+	kafkaTopicVisibilityTimeout = 5 * time.Second
+	kafkaTopicVisibilityPoll    = 10 * time.Millisecond
+)
+
+type kafkaTopicVisibilityProbe func(context.Context, *kadm.Client, string) (bool, error)
+
+var kafkaTopicVisibilityCheck kafkaTopicVisibilityProbe = kafkaTopicVisibleFromBroker
+
+func kafkaTopicVisibleFromBroker(ctx context.Context, admin *kadm.Client, name string) (bool, error) {
+	details, err := admin.ListTopics(kadm.WithAuthorizedOps(ctx), name)
+	if err != nil {
+		return false, err
+	}
+	detail, ok := details[name]
+	return ok && detail.Err == nil && len(detail.Partitions) > 0, nil
+}
+
+func waitKafkaTopicVisible(t *testing.T, ctx context.Context, admin *kadm.Client, name string) {
+	t.Helper()
+	waitCtx, cancel := context.WithTimeout(ctx, kafkaTopicVisibilityTimeout)
+	defer cancel()
+	ticker := time.NewTicker(kafkaTopicVisibilityPoll) //nolint:forbidigo // broker visibility polling needs a bounded wall-clock retry
+	defer ticker.Stop()
+	for {
+		visible, err := kafkaTopicVisibilityCheck(waitCtx, admin, name)
+		if err != nil {
+			t.Fatalf("ListTopics(%q) while waiting for visibility: %v", name, err)
+		}
+		if visible {
+			return
+		}
+		select {
+		case <-waitCtx.Done():
+			t.Fatalf("topic %q did not become visible within %s: %v", name, kafkaTopicVisibilityTimeout, waitCtx.Err())
+		case <-ticker.C:
+		}
+	}
+}
+
 func createKafkaTopic(t *testing.T, admin *kadm.Client, ctx context.Context, name string, partitions int32) {
 	t.Helper()
 	response, err := admin.CreateTopic(ctx, partitions, -1, nil, name)
@@ -78,6 +119,7 @@ func createKafkaTopic(t *testing.T, admin *kadm.Client, ctx context.Context, nam
 	if response.Err != nil {
 		t.Fatalf("CreateTopic(%q) response: %v", name, response.Err)
 	}
+	waitKafkaTopicVisible(t, ctx, admin, name)
 }
 
 func produceKafkaRecords(t *testing.T, client *kgo.Client, ctx context.Context, topic string, count int) {
@@ -102,6 +144,32 @@ func namesContainAll(got []string, want ...string) bool {
 		}
 	}
 	return true
+}
+
+func TestCreateKafkaTopicWaitsForVisibility(t *testing.T) {
+	ctx, _, admin := openKafkaAdminTest(t)
+	topic := kafkaTestTopic(t, "visibility-wait")
+	cleanupKafkaTopics(t, admin, topic)
+
+	readyAt := time.Now().Add(2 * time.Second) //nolint:forbidigo // deterministic mutation keeps the forced state hidden
+	originalCheck := kafkaTopicVisibilityCheck
+	t.Cleanup(func() { kafkaTopicVisibilityCheck = originalCheck })
+	kafkaTopicVisibilityCheck = func(ctx context.Context, admin *kadm.Client, name string) (bool, error) {
+		now := time.Now() //nolint:forbidigo // deterministic mutation controls the forced state
+		if now.Before(readyAt) {
+			return false, nil
+		}
+		return kafkaTopicVisibleFromBroker(ctx, admin, name)
+	}
+
+	createKafkaTopic(t, admin, ctx, topic, 1)
+	visible, err := kafkaTopicVisibilityCheck(ctx, admin, topic)
+	if err != nil {
+		t.Fatalf("topic visibility probe: %v", err)
+	}
+	if !visible {
+		t.Fatalf("topic %q is not visible after createKafkaTopic returned", topic)
+	}
 }
 
 func TestClassifyAdminErrorKinds(t *testing.T) {
@@ -176,16 +244,25 @@ func TestEnsureTopologyCreatesAndIsIdempotent(t *testing.T) {
 		},
 		Effective: connection.Capabilities(),
 	}
-
+	started := clock.NewReal().Now()
 	firstDiff, err := connection.Admin().EnsureTopology(ctx, spec)
+	elapsed := clock.NewReal().Since(started)
 	if err != nil {
 		t.Fatalf("first EnsureTopology: %v", err)
 	}
+	t.Logf("EnsureTopology create visibility wait: %s", elapsed)
 	if !namesContainAll(firstDiff.CreatedDestinations, first, second) || len(firstDiff.CreatedDestinations) != 2 {
 		t.Fatalf("first CreatedDestinations = %v, want exactly %q and %q", firstDiff.CreatedDestinations, first, second)
 	}
 	if len(firstDiff.ExistingDestinations) != 0 {
 		t.Fatalf("first ExistingDestinations = %v, want empty", firstDiff.ExistingDestinations)
+	}
+	state, err := connection.Admin().DescribeTopology(ctx, []string{first, second})
+	if err != nil {
+		t.Fatalf("DescribeTopology immediately after EnsureTopology: %v", err)
+	}
+	if len(state.Depth) != 2 {
+		t.Fatalf("DescribeTopology depth = %#v, want both created topics", state.Depth)
 	}
 
 	secondDiff, err := connection.Admin().EnsureTopology(ctx, spec)

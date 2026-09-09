@@ -12,9 +12,11 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/twmb/franz-go/pkg/kadm"
+	"github.com/twmb/franz-go/pkg/kbin"
 	"github.com/twmb/franz-go/pkg/kerr"
 	"github.com/twmb/franz-go/pkg/kgo"
 	"github.com/twmb/franz-go/pkg/kmsg"
@@ -23,6 +25,7 @@ import (
 	"github.com/twmb/franz-go/pkg/sasl/scram"
 
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/driver"
+	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/clock"
 )
 
 // A Conn owns one client for Ping, metadata, and broker configuration. The
@@ -43,6 +46,7 @@ var (
 	errShareGroups      = errors.New("kafka: share groups mode is not implemented")
 	errBrokerConfig     = errors.New("kafka: invalid broker configuration")
 	errProtocolResponse = errors.New("kafka: invalid protocol response")
+	errConnClosing      = errors.New("kafka: connection is closing")
 )
 
 // Driver is a stateless Kafka driver factory.
@@ -50,7 +54,12 @@ type Driver struct{}
 
 type consumeMode string
 
-const classicMode consumeMode = "classic"
+const (
+	classicMode                 consumeMode = "classic"
+	franzMinProducerBatchBytes              = 512
+	franzMaxProducerBatchBytes              = 1 << 30
+	kafkaV2RecordBatchBaseBytes             = 65
+)
 
 // conn owns the single client used for connection, producer, and metadata
 // operations. Consumer instances use cloned options so each can own its group.
@@ -65,8 +74,15 @@ type conn struct {
 	caps                  driver.Capabilities
 	info                  driver.BrokerInfo
 	consumers             map[*consumer]struct{}
+	producers             map[*producer]struct{}
 	mu                    sync.RWMutex
+	lifecycleMu           sync.RWMutex
 	closeOnce             sync.Once
+	closeAttempt          bool
+	publishFault          atomic.Int32
+	closeFault            atomic.Bool
+	closing               bool
+	closed                bool
 }
 
 // Name returns the stable Kafka driver key.
@@ -138,6 +154,10 @@ func (Driver) Open(ctx context.Context, cfg driver.Config) (driver.Conn, error) 
 	if mechanism != nil {
 		opts = append(opts, kgo.SASL(mechanism))
 	}
+	producerBatchBytes := int32(franzMinProducerBatchBytes)
+	opts = append(opts, kgo.ProducerBatchMaxBytesFn(func(string) int32 {
+		return producerBatchBytes
+	}))
 
 	client, err := kgo.NewClient(opts...)
 	if err != nil {
@@ -187,8 +207,14 @@ func (Driver) Open(ctx context.Context, cfg driver.Config) (driver.Conn, error) 
 		break
 	}
 
+	effectiveBatchBytes, err := effectiveProducerBatchBytes(messageMaxBytes)
+	if err != nil {
+		return nil, classify("open", driver.KindFatal, err)
+	}
+	producerBatchBytes = int32(effectiveBatchBytes) //nolint:gosec // effectiveProducerBatchBytes bounds the value to the int32 range.
+
 	info := brokerInfo(metadata, versionResponse)
-	caps := classicCapabilities(messageMaxBytes)
+	caps := classicCapabilities(maxKafkaBodyBytes(effectiveBatchBytes))
 	keepClient = true
 	rebalanceDrainTimeout := cfg.RebalanceDrainTimeout
 	if rebalanceDrainTimeout == 0 {
@@ -205,6 +231,7 @@ func (Driver) Open(ctx context.Context, cfg driver.Config) (driver.Conn, error) 
 		caps:                  caps,
 		info:                  info,
 		consumers:             make(map[*consumer]struct{}),
+		producers:             make(map[*producer]struct{}),
 	}, nil
 }
 
@@ -235,13 +262,69 @@ func resolveStaticMembership(options map[string]string) (bool, error) {
 	return enabled, nil
 }
 
+func effectiveProducerBatchBytes(brokerLimit int) (int, error) {
+	if brokerLimit < franzMinProducerBatchBytes {
+		return 0, fmt.Errorf(
+			"%w: message.max.bytes %d is below franz-go minimum %d",
+			errBrokerConfig,
+			brokerLimit,
+			franzMinProducerBatchBytes,
+		)
+	}
+	if brokerLimit > franzMaxProducerBatchBytes {
+		return franzMaxProducerBatchBytes, nil
+	}
+	return brokerLimit, nil
+}
+
+func maxKafkaBodyBytes(batchLimit int) int {
+	if batchLimit <= kafkaV2RecordBatchBaseBytes {
+		return 0
+	}
+
+	low, high := 0, batchLimit-kafkaV2RecordBatchBaseBytes
+	for low < high {
+		mid := low + (high-low+1)/2
+		if kafkaBareRecordBatchBytes(mid) <= batchLimit {
+			low = mid
+		} else {
+			high = mid - 1
+		}
+	}
+	return low
+}
+
+func kafkaPositiveVarintLen(value int) int {
+	switch {
+	case value < 1<<6:
+		return 1
+	case value < 1<<13:
+		return 2
+	case value < 1<<20:
+		return 3
+	case value < 1<<27:
+		return 4
+	default:
+		return 5
+	}
+}
+
+func kafkaBareRecordBatchBytes(bodyBytes int) int {
+	recordLength := 1 + // attributes
+		kbin.VarlongLen(0) + // timestamp delta
+		kbin.VarintLen(0) + // offset delta
+		kbin.VarintLen(0) + // empty key length
+		kafkaPositiveVarintLen(bodyBytes) +
+		bodyBytes +
+		kbin.VarintLen(0) // empty header count
+	return kafkaV2RecordBatchBaseBytes + kafkaPositiveVarintLen(recordLength) + recordLength
+}
+
 func classicCapabilities(maxMessageBytes int) driver.Capabilities {
 	caps := Driver{}.Capabilities()
 	caps.PerMessageAck = false
 	caps.NativeDeliveryCount = false
 	caps.ConsumerScaling = driver.ScalingPartitionBound
-	// message.max.bytes bounds the record batch, not the value alone; whether
-	// an exactly-MaxMessageBytes body is accepted remains an open question.
 	caps.MaxMessageBytes = maxMessageBytes
 	// Kafka exposes no header limit, so MaxHeaderBytes remains undeclared.
 	caps.MaxHeaderBytes = 0
@@ -330,11 +413,30 @@ func (c *conn) BrokerInfo() driver.BrokerInfo {
 }
 
 func (c *conn) Producer(ctx context.Context, cfg driver.ProducerConfig) (driver.Producer, error) {
-	_ = cfg
 	if err := ctx.Err(); err != nil {
 		return nil, classify("producer", driver.KindTransient, err)
 	}
-	return &producer{client: c.client, conn: c, now: kafkaNow}, nil
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.closing || c.closed {
+		return nil, classify("producer", driver.KindTransient, errConnClosing)
+	}
+	p := &producer{client: c.client, conn: c, cfg: cfg, clock: clock.NewReal()}
+	if c.producers == nil {
+		c.producers = make(map[*producer]struct{})
+	}
+	c.producers[p] = struct{}{}
+	return p, nil
+}
+
+func (c *conn) admissionError(operation string) error {
+	c.mu.RLock()
+	closing := c.closing || c.closed
+	c.mu.RUnlock()
+	if closing {
+		return classify(operation, driver.KindTransient, errConnClosing)
+	}
+	return nil
 }
 
 func (c *conn) Consumer(ctx context.Context, cfg driver.ConsumerConfig) (driver.Consumer, error) {
@@ -364,8 +466,52 @@ func (c *conn) Close(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
 		return classify("close", driver.KindTransient, err)
 	}
+	c.lifecycleMu.Lock()
+	defer c.lifecycleMu.Unlock()
+	c.mu.Lock()
+	if c.closed {
+		c.mu.Unlock()
+		return nil
+	}
+	if c.closeAttempt {
+		c.mu.Unlock()
+		return classify("close", driver.KindTransient, errConnClosing)
+	}
+	if !c.closing && (len(c.consumers) != 0 || len(c.producers) != 0) {
+		c.mu.Unlock()
+		return classify("close", driver.KindFatal, driver.ErrResourcesOutstanding)
+	}
+	c.closing = true
+	c.closeAttempt = true
+	injected := c.closeFault.Swap(false)
+	c.mu.Unlock()
+
+	if injected {
+		if _, hasDeadline := ctx.Deadline(); hasDeadline {
+			<-ctx.Done()
+			c.mu.Lock()
+			c.closeAttempt = false
+			c.mu.Unlock()
+			return classify("close", driver.KindTransient, ctx.Err())
+		}
+		c.mu.Lock()
+		c.closeAttempt = false
+		c.mu.Unlock()
+		return classify("close", driver.KindTransient, errors.New("injected close failure"))
+	}
+
 	c.closeOnce.Do(c.client.Close)
+	c.mu.Lock()
+	c.closeAttempt = false
+	c.closed = true
+	c.mu.Unlock()
 	return nil
+}
+
+func (c *conn) removeProducer(producer *producer) {
+	c.mu.Lock()
+	delete(c.producers, producer)
+	c.mu.Unlock()
 }
 
 func validateSASLCredentials(settings *driver.SASLConfig) error {
@@ -499,7 +645,7 @@ func kafkaErrorKind(err error) driver.Kind {
 }
 
 func waitRetry(ctx context.Context) error {
-	timer := time.NewTimer(250 * time.Millisecond) //nolint:forbidigo // Open retries need a wall-clock wait
+	timer := time.NewTimer(250 * time.Millisecond) //nolint:forbidigo // Open retries wait for broker recovery and require a wall-clock delay
 	defer timer.Stop()
 	select {
 	case <-ctx.Done():

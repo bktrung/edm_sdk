@@ -61,9 +61,24 @@ func (f *Fake) Ticker(d time.Duration) Ticker {
 // Sleep waits until Advance reaches d or until ctx is done. Use BlockUntil
 // before advancing when Sleep is started in another goroutine.
 func (f *Fake) Sleep(ctx context.Context, d time.Duration) error {
+	return f.sleep(ctx, d, nil)
+}
+
+// SleepWithRegistration waits like Sleep and calls registered exactly once after
+// its waiter is registered, before it waits for the waiter to fire or ctx. The
+// callback runs without Fake's mutex held and may call Fake methods. A nil
+// callback is allowed; use NewFake rather than a zero Fake.
+func (f *Fake) SleepWithRegistration(ctx context.Context, d time.Duration, registered func()) error {
+	return f.sleep(ctx, d, registered)
+}
+
+func (f *Fake) sleep(ctx context.Context, d time.Duration, registered func()) error {
 	f.mu.Lock()
 	w := f.registerLocked(d, 0)
 	f.mu.Unlock()
+	if registered != nil {
+		registered()
+	}
 
 	select {
 	case <-w.c:

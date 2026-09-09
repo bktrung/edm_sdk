@@ -82,6 +82,79 @@ func TestCapabilityCeilingAndReduction(t *testing.T) {
 	}
 }
 
+func TestEffectiveProducerBatchBytes(t *testing.T) {
+	const maxBatchBytes = 1 << 30
+	cases := []struct {
+		name        string
+		brokerLimit int
+		want        int
+		wantErr     bool
+	}{
+		{name: "below minimum", brokerLimit: 511, wantErr: true},
+		{name: "minimum", brokerLimit: 512, want: 512},
+		{name: "broker limit", brokerLimit: 123456, want: 123456},
+		{name: "above maximum", brokerLimit: maxBatchBytes + 1, want: maxBatchBytes},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := effectiveProducerBatchBytes(tc.brokerLimit)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatal("effectiveProducerBatchBytes() error = nil, want error")
+				}
+				if !errors.Is(err, errBrokerConfig) {
+					t.Fatalf("effectiveProducerBatchBytes() error = %v, want errBrokerConfig", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("effectiveProducerBatchBytes() error = %v", err)
+			}
+			if got != tc.want {
+				t.Errorf("effectiveProducerBatchBytes() = %d, want %d", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestKafkaBodyLimitSizing(t *testing.T) {
+	cases := []struct {
+		name       string
+		batchLimit int
+		wantBody   int
+	}{
+		{name: "empty body", batchLimit: 72, wantBody: 0},
+		{name: "record length varint first boundary", batchLimit: 131, wantBody: 58},
+		{name: "body length varint first boundary", batchLimit: 138, wantBody: 64},
+		{name: "record length varint second boundary", batchLimit: 8260, wantBody: 8185},
+		{name: "body length varint second boundary", batchLimit: 8268, wantBody: 8192},
+		{name: "record length varint third boundary", batchLimit: 1048645, wantBody: 1048568},
+		{name: "body length varint third boundary", batchLimit: 1048654, wantBody: 1048576},
+		{name: "record length varint fourth boundary", batchLimit: 134217798, wantBody: 134217719},
+		{name: "body length varint fourth boundary", batchLimit: 134217808, wantBody: 134217728},
+		{name: "maximum batch limit", batchLimit: 1 << 30, wantBody: (1 << 30) - 80},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := maxKafkaBodyBytes(tc.batchLimit)
+			if got != tc.wantBody {
+				t.Fatalf("maxKafkaBodyBytes(%d) = %d, want %d", tc.batchLimit, got, tc.wantBody)
+			}
+			if got > 0 {
+				if previous := maxKafkaBodyBytes(tc.batchLimit - 1); previous != got-1 {
+					t.Fatalf("maxKafkaBodyBytes(%d) = %d, want %d", tc.batchLimit-1, previous, got-1)
+				}
+			}
+			if encoded := kafkaBareRecordBatchBytes(got); encoded > tc.batchLimit {
+				t.Fatalf("kafkaBareRecordBatchBytes(%d) = %d, exceeds limit %d", got, encoded, tc.batchLimit)
+			}
+			if encoded := kafkaBareRecordBatchBytes(got + 1); encoded <= tc.batchLimit {
+				t.Fatalf("kafkaBareRecordBatchBytes(%d) = %d, fits limit %d", got+1, encoded, tc.batchLimit)
+			}
+		})
+	}
+}
+
 func TestKafkaErrorKind(t *testing.T) {
 	cases := []struct {
 		name string
@@ -241,7 +314,7 @@ func TestCapabilitiesReadBrokerLimits(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewClient: %v", err)
 	}
-	defer client.Close()
+	t.Cleanup(client.Close)
 	if err := client.Ping(ctx); err != nil {
 		t.Fatalf("independent Ping: %v", err)
 	}
@@ -277,13 +350,57 @@ func TestCapabilitiesReadBrokerLimits(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
-	defer opened.Close(context.Background())
+	t.Cleanup(func() { _ = opened.Close(context.Background()) })
 	caps := opened.Capabilities()
-	if caps.MaxMessageBytes != wantMessageBytes {
-		t.Errorf("MaxMessageBytes = %d, want independently read %d", caps.MaxMessageBytes, wantMessageBytes)
+	if caps.MaxMessageBytes <= 0 {
+		t.Fatalf("MaxMessageBytes = %d, want positive declaration", caps.MaxMessageBytes)
 	}
-	if caps.MaxHeaderBytes != 0 {
-		t.Errorf("MaxHeaderBytes = %d, want 0", caps.MaxHeaderBytes)
+
+	connection, ok := opened.(*conn)
+	if !ok {
+		t.Fatalf("Open() returned %T, want *conn", opened)
+	}
+	topic := kafkaTestTopic(t, "capability-boundary")
+	cleanupKafkaTopics(t, admin, topic)
+	createKafkaTopic(t, admin, ctx, topic, 1)
+
+	producer, err := connection.Producer(ctx, driver.ProducerConfig{Effective: caps})
+	if err != nil {
+		t.Fatalf("Producer: %v", err)
+	}
+	t.Cleanup(func() { _ = producer.Close(context.Background()) })
+
+	body := make([]byte, caps.MaxMessageBytes)
+	if err := producer.Publish(ctx, driver.OutboundMessage{Destination: topic, Body: body}); err != nil {
+		t.Fatalf("Publish(exact declared body): %v", err)
+	}
+	if caps.MaxMessageBytes >= wantMessageBytes {
+		t.Fatalf("MaxMessageBytes = %d, want below raw message.max.bytes %d", caps.MaxMessageBytes, wantMessageBytes)
+	}
+	oversized := make([]byte, caps.MaxMessageBytes+1)
+	err = producer.Publish(ctx, driver.OutboundMessage{Destination: topic, Body: oversized})
+	kind, classified := driver.Classify(err)
+	if err == nil || !classified || kind != driver.KindTooLarge {
+		t.Fatalf("Publish(declared body plus one) classification = (%v, %t), want (too_large, true): %v", kind, classified, err)
+	}
+
+	starts, err := admin.ListStartOffsets(ctx, topic)
+	if err != nil {
+		t.Fatalf("ListStartOffsets(%q): %v", topic, err)
+	}
+	ends, err := admin.ListEndOffsets(ctx, topic)
+	if err != nil {
+		t.Fatalf("ListEndOffsets(%q): %v", topic, err)
+	}
+	depth, present, err := topicDepth(topic, starts, ends)
+	if err != nil {
+		t.Fatalf("topicDepth(%q): %v", topic, err)
+	}
+	if !present {
+		t.Fatalf("topicDepth(%q) present = false, want true", topic)
+	}
+	if depth != 1 {
+		t.Fatalf("topicDepth(%q) = %d, want exactly one retained boundary message", topic, depth)
 	}
 }
 

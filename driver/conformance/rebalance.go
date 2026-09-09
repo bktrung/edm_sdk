@@ -427,6 +427,7 @@ const rebalancePartitionCount = 4
 
 func newRebalanceProducer(t *testing.T, group *groupContext, destination string, config driver.ProducerConfig) driver.Producer {
 	t.Helper()
+	destination = profileDestination(group, destination)
 	if _, err := group.conn.Admin().EnsureTopology(group.ctx, driver.TopologySpec{
 		Destinations: []driver.DestinationSpec{{Name: destination, Partitions: rebalancePartitionCount}},
 		Effective:    group.effective,
@@ -447,7 +448,7 @@ func newRebalanceProducer(t *testing.T, group *groupContext, destination string,
 			t.Errorf("purge destination %q: %v", destination, err)
 		}
 	})
-	return producer
+	return &profileProducer{group: group, producer: producer, scoped: true}
 }
 
 func publishRebalanceCount(t *testing.T, group *groupContext, producer driver.Producer, destination string, count int) {
@@ -477,16 +478,18 @@ func newRebalanceConsumer(t *testing.T, group *groupContext, destination string,
 		Prefetch:     prefetch,
 		Effective:    group.effective,
 	}
+	cfg, logical := profileConsumerConfig(group, cfg)
 	consumer, err := group.conn.Consumer(group.ctx, cfg)
 	if err != nil {
-		t.Fatalf("Consumer(%q): %v", destination, err)
+		t.Fatalf("Consumer(%v): %v", destination, err)
 	}
+	wrapped := newProfileConsumer(group, consumer, logical)
 	t.Cleanup(func() {
-		if err := consumer.Stop(group.ctx); err != nil {
-			t.Errorf("stop consumer %q: %v", destination, err)
+		if err := wrapped.Stop(group.ctx); err != nil {
+			t.Errorf("stop consumer %v: %v", destination, err)
 		}
 	})
-	return consumer
+	return wrapped
 }
 
 func newRebalanceConsumerFor(t *testing.T, group *groupContext, cfg driver.ConsumerConfig) driver.Consumer {
@@ -494,16 +497,18 @@ func newRebalanceConsumerFor(t *testing.T, group *groupContext, cfg driver.Consu
 	if cfg.Group == "" {
 		cfg.Group = rebalanceGroupName(group)
 	}
+	cfg, logical := profileConsumerConfig(group, cfg)
 	consumer, err := group.conn.Consumer(group.ctx, cfg)
 	if err != nil {
 		t.Fatalf("Consumer(%v): %v", cfg.Destinations, err)
 	}
+	wrapped := newProfileConsumer(group, consumer, logical)
 	t.Cleanup(func() {
-		if err := consumer.Stop(group.ctx); err != nil {
+		if err := wrapped.Stop(group.ctx); err != nil {
 			t.Errorf("stop consumer %v: %v", cfg.Destinations, err)
 		}
 	})
-	return consumer
+	return wrapped
 }
 
 func waitForRebalanceAssignment(t *testing.T, group *groupContext, consumer driver.Consumer) {

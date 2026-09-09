@@ -12,7 +12,7 @@ func init() { registerGroup("ordering", runOrdering) }
 func runOrdering(group *groupContext) {
 	group.Check("initial same-key prefetch retains receipt order", func(t *testing.T) {
 		const destination = "ordering.initial"
-		producer := newProducer(t, group, destination, driver.ProducerConfig{Effective: group.effective})
+		producer := newProducer(t, group, profileDestination(group, destination), driver.ProducerConfig{Effective: group.effective})
 		consumer := orderingConsumer(t, group, destination, 3, false)
 		publishKeyed(t, group, producer, destination, "k", "one", "two", "three")
 		waitForSaturation(t, group, destination, 3, 0)
@@ -22,7 +22,7 @@ func runOrdering(group *groupContext) {
 
 	group.Check("same-key receipt order survives irregular prefetch refills", func(t *testing.T) {
 		const destination = "ordering.refill"
-		producer := newProducer(t, group, destination, driver.ProducerConfig{Effective: group.effective})
+		producer := newProducer(t, group, profileDestination(group, destination), driver.ProducerConfig{Effective: group.effective})
 		consumer := orderingConsumer(t, group, destination, 3, false)
 		publishKeyed(t, group, producer, destination, "k", "one", "two", "three", "four", "five", "six")
 		waitForSaturation(t, group, destination, 3, 3)
@@ -40,7 +40,7 @@ func runOrdering(group *groupContext) {
 
 	group.Check("independent keys retain independent receipt sequences", func(t *testing.T) {
 		const destination = "ordering.keys"
-		producer := newProducer(t, group, destination, driver.ProducerConfig{Effective: group.effective})
+		producer := newProducer(t, group, profileDestination(group, destination), driver.ProducerConfig{Effective: group.effective})
 		consumer := orderingConsumer(t, group, destination, 4, false)
 		publishKeyed(t, group, producer, destination, "a", "a1", "a2")
 		publishKeyed(t, group, producer, destination, "b", "b1", "b2")
@@ -58,7 +58,7 @@ func runOrdering(group *groupContext) {
 
 	group.Check("distinct keys progress while another key is unsettled", func(t *testing.T) {
 		const destination = "ordering.progress"
-		producer := newProducer(t, group, destination, driver.ProducerConfig{Effective: group.effective})
+		producer := newProducer(t, group, profileDestination(group, destination), driver.ProducerConfig{Effective: group.effective})
 		consumer := orderingConsumer(t, group, destination, 2, false)
 		publishKeyed(t, group, producer, destination, "held", "held")
 		held := receiveMessages(t, group, consumer, 1)[0]
@@ -74,7 +74,7 @@ func runOrdering(group *groupContext) {
 
 	group.Check("requeued key returns before an undelivered successor", func(t *testing.T) {
 		const destination = "ordering.requeue"
-		producer := newProducer(t, group, destination, driver.ProducerConfig{Effective: group.effective})
+		producer := newProducer(t, group, profileDestination(group, destination), driver.ProducerConfig{Effective: group.effective})
 		consumer := orderingConsumer(t, group, destination, 1, false)
 		publishKeyed(t, group, producer, destination, "k", "one", "two")
 		first := receiveMessages(t, group, consumer, 1)[0]
@@ -96,7 +96,7 @@ func runOrdering(group *groupContext) {
 
 	group.Check("nil-key messages deliver exactly once", func(t *testing.T) {
 		const destination = "ordering.nil"
-		producer := newProducer(t, group, destination, driver.ProducerConfig{Effective: group.effective})
+		producer := newProducer(t, group, profileDestination(group, destination), driver.ProducerConfig{Effective: group.effective})
 		consumer := orderingConsumer(t, group, destination, 1, false)
 		if err := producer.Publish(group.ctx, driver.OutboundMessage{Destination: destination, Body: []byte("nil")}); err != nil {
 			t.Fatal(err)
@@ -115,7 +115,7 @@ func runOrdering(group *groupContext) {
 
 	group.Check("exclusive ordering request creates a usable consumer", func(t *testing.T) {
 		const destination = "ordering.exclusive"
-		producer := newProducer(t, group, destination, driver.ProducerConfig{Effective: group.effective})
+		producer := newProducer(t, group, profileDestination(group, destination), driver.ProducerConfig{Effective: group.effective})
 		consumer := orderingConsumer(t, group, destination, 2, true)
 		publishKeyed(t, group, producer, destination, "k", "one", "two")
 		assertOrderedBodies(t, group, consumer, "one", "two")
@@ -124,7 +124,7 @@ func runOrdering(group *groupContext) {
 
 	group.Check("zero-value producer configuration preserves ordered receipt", func(t *testing.T) {
 		const destination = "ordering.zero"
-		producer := newProducer(t, group, destination, driver.ProducerConfig{
+		producer := newProducer(t, group, profileDestination(group, destination), driver.ProducerConfig{
 			RequireDurableAck: true,
 			Effective:         group.effective,
 		})
@@ -137,23 +137,26 @@ func runOrdering(group *groupContext) {
 
 func orderingConsumer(t *testing.T, group *groupContext, destination string, prefetch int, exclusive bool) driver.Consumer {
 	t.Helper()
+	scopedDestination := profileDestination(group, destination)
 	if _, err := group.conn.Admin().EnsureTopology(group.ctx, driver.TopologySpec{
-		Destinations: []driver.DestinationSpec{{Name: destination}}, Effective: group.effective,
+		Destinations: []driver.DestinationSpec{{Name: scopedDestination}}, Effective: group.effective,
 	}); err != nil {
 		t.Fatal(err)
 	}
-	consumer, err := group.conn.Consumer(group.ctx, driver.ConsumerConfig{
+	cfg, logical := profileConsumerConfig(group, driver.ConsumerConfig{
 		Destinations: []string{destination}, Prefetch: prefetch, Exclusive: exclusive, Effective: group.effective,
 	})
+	consumer, err := group.conn.Consumer(group.ctx, cfg)
 	if err != nil {
 		t.Fatalf("Consumer(%q): %v", destination, err)
 	}
+	wrapped := newProfileConsumer(group, consumer, logical)
 	t.Cleanup(func() {
-		if err := consumer.Stop(group.ctx); err != nil {
+		if err := wrapped.Stop(group.ctx); err != nil {
 			t.Errorf("stop ordering consumer %q: %v", destination, err)
 		}
 	})
-	return consumer
+	return wrapped
 }
 
 func publishKeyed(t *testing.T, group *groupContext, producer driver.Producer, destination, key string, bodies ...string) {

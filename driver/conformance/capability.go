@@ -40,8 +40,8 @@ func runCapability(group *groupContext) {
 
 	group.Check("per-message settlement leaves sibling deliveries unsettled", func(t *testing.T) {
 		name := "capability.ack.independent"
-		producer := newProducer(t, group, name, driver.ProducerConfig{Effective: group.effective})
-		consumer := newConsumer(t, group, name, 2)
+		producer := newProducer(t, group, profileDestination(group, name), driver.ProducerConfig{Effective: group.effective})
+		consumer := newConsumer(t, group, profileDestination(group, name), 2)
 		if err := producer.Publish(group.ctx,
 			driver.OutboundMessage{Destination: name, Body: []byte("one")},
 			driver.OutboundMessage{Destination: name, Body: []byte("two")},
@@ -69,8 +69,8 @@ func runCapability(group *groupContext) {
 			group.capability("OrderedByKey/receipt", strconv.FormatBool(group.effective.OrderedByKey), "denied", "the effective declaration is denied; the port has no ordering request to probe")
 			return
 		}
-		producer := newProducer(t, group, name, driver.ProducerConfig{Effective: group.effective})
-		consumer := newConsumer(t, group, name, 3)
+		producer := newProducer(t, group, profileDestination(group, name), driver.ProducerConfig{Effective: group.effective})
+		consumer := newConsumer(t, group, profileDestination(group, name), 3)
 		for i := range 3 {
 			if err := producer.Publish(group.ctx, driver.OutboundMessage{
 				Destination: name, Key: []byte("same"), Body: fmt.Appendf(nil, "order-%d", i),
@@ -90,8 +90,8 @@ func runCapability(group *groupContext) {
 
 	group.Check("priority hints remain deliverable without scheduling delegation", func(t *testing.T) {
 		name := "capability.priority"
-		producer := newProducer(t, group, name, driver.ProducerConfig{Effective: group.effective})
-		consumer := newConsumer(t, group, name, 2)
+		producer := newProducer(t, group, profileDestination(group, name), driver.ProducerConfig{Effective: group.effective})
+		consumer := newConsumer(t, group, profileDestination(group, name), 2)
 		messages := []driver.OutboundMessage{
 			{Destination: name, Priority: 1, Body: []byte("low")},
 			{Destination: name, Priority: 200, Body: []byte("high")},
@@ -115,7 +115,7 @@ func runCapability(group *groupContext) {
 
 	group.Check("delayed delivery works with native and portable paths", func(t *testing.T) {
 		name := "capability.delay"
-		producer := newDeferredProducer(t, group, name, deferredDelay)
+		producer := newDeferredProducer(t, group, profileDestination(group, name), deferredDelay)
 		consumer := deferredConsumer(t, group, []string{name}, 1)
 		due := deferredNow(group).Add(deferredDelay)
 		if err := producer.Publish(group.ctx, driver.OutboundMessage{Destination: name, Body: []byte("delayed"), DelayUntil: due}); err != nil {
@@ -133,8 +133,8 @@ func runCapability(group *groupContext) {
 
 	group.Check("delivery count reports first delivery and redelivery distinctly", func(t *testing.T) {
 		name := "capability.delivery-count"
-		producer := newProducer(t, group, name, driver.ProducerConfig{Effective: group.effective})
-		consumer := newConsumer(t, group, name, 1)
+		producer := newProducer(t, group, profileDestination(group, name), driver.ProducerConfig{Effective: group.effective})
+		consumer := newConsumer(t, group, profileDestination(group, name), 1)
 		if err := producer.Publish(group.ctx, driver.OutboundMessage{Destination: name, Body: []byte("count")}); err != nil {
 			t.Fatal(err)
 		}
@@ -163,8 +163,8 @@ func runCapability(group *groupContext) {
 
 	group.Check("zero-requeue settlement does not redeliver to the source", func(t *testing.T) {
 		name := "capability.dlq"
-		producer := newProducer(t, group, name, driver.ProducerConfig{Effective: group.effective})
-		consumer := newConsumer(t, group, name, 1)
+		producer := newProducer(t, group, profileDestination(group, name), driver.ProducerConfig{Effective: group.effective})
+		consumer := newConsumer(t, group, profileDestination(group, name), 1)
 		if err := producer.Publish(group.ctx, driver.OutboundMessage{Destination: name, Body: []byte("discard")}); err != nil {
 			t.Fatal(err)
 		}
@@ -186,9 +186,9 @@ func runCapability(group *groupContext) {
 
 	group.Check("consumer scaling gives each attached consumer work", func(t *testing.T) {
 		name := "capability.scaling"
-		producer := newProducer(t, group, name, driver.ProducerConfig{Effective: group.effective})
+		producer := newProducer(t, group, profileDestination(group, name), driver.ProducerConfig{Effective: group.effective})
 		if group.effective.ConsumerScaling == driver.ScalingPartitionBound {
-			consumer := newConsumer(t, group, name, 1)
+			consumer := newConsumer(t, group, profileDestination(group, name), 1)
 			if err := producer.Publish(group.ctx, driver.OutboundMessage{Destination: name, Body: []byte("partition-bound")}); err != nil {
 				t.Fatal(err)
 			}
@@ -219,8 +219,8 @@ func runCapability(group *groupContext) {
 
 	group.Check("lag query follows the effective declaration", func(t *testing.T) {
 		name := "capability.lag"
-		producer := newProducer(t, group, name, driver.ProducerConfig{Effective: group.effective})
-		consumer := newConsumer(t, group, name, 2)
+		producer := newProducer(t, group, profileDestination(group, name), driver.ProducerConfig{Effective: group.effective})
+		consumer := newConsumer(t, group, profileDestination(group, name), 2)
 		if err := consumer.Drain(group.ctx); err != nil {
 			t.Fatal(err)
 		}
@@ -254,7 +254,7 @@ func runCapability(group *groupContext) {
 			return
 		}
 		name := "capability.max-message"
-		producer := newProducer(t, group, name, driver.ProducerConfig{Effective: group.effective})
+		producer := newProducer(t, group, profileDestination(group, name), driver.ProducerConfig{Effective: group.effective})
 		if err := producer.Publish(group.ctx, driver.OutboundMessage{Destination: name, Body: bytes.Repeat([]byte{'x'}, limit)}); err != nil {
 			t.Fatalf("exact message limit rejected: %v", err)
 		}
@@ -273,7 +273,7 @@ func runCapability(group *groupContext) {
 			return
 		}
 		name := "capability.max-header"
-		producer := newProducer(t, group, name, driver.ProducerConfig{Effective: group.effective})
+		producer := newProducer(t, group, profileDestination(group, name), driver.ProducerConfig{Effective: group.effective})
 		key := "k"
 		exact := driver.Header{Key: key, Value: bytes.Repeat([]byte{'v'}, limit-len(key))}
 		if err := producer.Publish(group.ctx, driver.OutboundMessage{Destination: name, Headers: []driver.Header{exact}}); err != nil {
@@ -308,10 +308,10 @@ func runCapability(group *groupContext) {
 	})
 
 	group.Check("competing exclusive consumer is refused", func(t *testing.T) {
-		name := "capability.exclusive"
-		if _, err := group.conn.Admin().EnsureTopology(group.ctx, driver.TopologySpec{
+		name := profileDestination(group, "capability.exclusive")
+		if _, err := group.conn.Admin().EnsureTopology(group.ctx, profileTopologySpec(group, driver.TopologySpec{
 			Destinations: []driver.DestinationSpec{{Name: name}}, Effective: group.effective,
-		}); err != nil {
+		})); err != nil {
 			t.Fatal(err)
 		}
 		first, err := group.conn.Consumer(group.ctx, driver.ConsumerConfig{Destinations: []string{name}, Prefetch: 1, Exclusive: true, Effective: group.effective})
@@ -404,10 +404,10 @@ func checkFanoutDeclaration(group *groupContext) {
 			return
 		}
 
-		exchange := "capability.fanout." + group.profile.String() + ".exchange"
-		firstDestination := "capability.fanout." + group.profile.String() + ".first"
-		secondDestination := "capability.fanout." + group.profile.String() + ".second"
-		if _, err := group.conn.Admin().EnsureTopology(group.ctx, driver.TopologySpec{
+		exchange := "capability.fanout.exchange"
+		firstDestination := "capability.fanout.first"
+		secondDestination := "capability.fanout.second"
+		if _, err := group.conn.Admin().EnsureTopology(group.ctx, profileTopologySpec(group, driver.TopologySpec{
 			Exchanges: []driver.ExchangeSpec{{Name: exchange, Kind: "fanout", Durable: true}},
 			Destinations: []driver.DestinationSpec{
 				{Name: firstDestination, Durable: true},
@@ -418,7 +418,7 @@ func checkFanoutDeclaration(group *groupContext) {
 				{Source: exchange, Destination: secondDestination},
 			},
 			Effective: group.effective,
-		}); err != nil {
+		})); err != nil {
 			t.Fatalf("EnsureTopology fanout probe: %v", err)
 		}
 		producer, err := group.conn.Producer(group.ctx, driver.ProducerConfig{
@@ -427,6 +427,7 @@ func checkFanoutDeclaration(group *groupContext) {
 		if err != nil {
 			t.Fatalf("Producer fanout probe: %v", err)
 		}
+		producer = &profileProducer{group: group, producer: producer, scoped: true}
 		t.Cleanup(func() {
 			if err := producer.Close(group.ctx); err != nil {
 				t.Errorf("close fanout probe producer: %v", err)
@@ -434,7 +435,7 @@ func checkFanoutDeclaration(group *groupContext) {
 		})
 		t.Cleanup(func() {
 			for _, destination := range []string{firstDestination, secondDestination} {
-				if err := purgeIfSupported(group.ctx, group.conn, destination); err != nil {
+				if err := purgeIfSupported(group.ctx, group.conn, profileDestination(group, destination)); err != nil {
 					t.Errorf("purge fanout probe destination %q: %v", destination, err)
 				}
 			}

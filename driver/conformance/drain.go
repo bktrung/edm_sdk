@@ -19,8 +19,8 @@ func init() {
 
 func runDrain(group *groupContext) {
 	group.Check("drain returns without waiting for outstanding work", func(t *testing.T) {
-		producer := newProducer(t, group, "drain.prompt", driver.ProducerConfig{Effective: group.effective})
-		consumer := newConsumer(t, group, "drain.prompt", 1)
+		producer := newProducer(t, group, profileDestination(group, "drain.prompt"), driver.ProducerConfig{Effective: group.effective})
+		consumer := newConsumer(t, group, profileDestination(group, "drain.prompt"), 1)
 		if err := producer.Publish(group.ctx, driver.OutboundMessage{Destination: "drain.prompt"}); err != nil {
 			t.Fatal(err)
 		}
@@ -43,12 +43,12 @@ func runDrain(group *groupContext) {
 	})
 
 	group.Check("drained consumer receives no new messages", func(t *testing.T) {
-		producer := newProducer(t, group, "drain.no-new", driver.ProducerConfig{Effective: group.effective})
-		drained := newConsumer(t, group, "drain.no-new", 1)
+		producer := newProducer(t, group, profileDestination(group, "drain.no-new"), driver.ProducerConfig{Effective: group.effective})
+		drained := newConsumer(t, group, profileDestination(group, "drain.no-new"), 1)
 		if err := drained.Drain(group.ctx); err != nil {
 			t.Fatalf("Drain() error = %v", err)
 		}
-		survivor := newConsumer(t, group, "drain.no-new", 1)
+		survivor := newConsumer(t, group, profileDestination(group, "drain.no-new"), 1)
 		publishCount(t, group, producer, "drain.no-new", 4)
 		ackAll(t, group, survivor, 4)
 		waitForStable(t, group, "drained consumer to stay empty while survivor receives", func() (bool, string) {
@@ -66,8 +66,8 @@ func runDrain(group *groupContext) {
 	})
 
 	group.Check("outstanding delivery remains settleable after drain", func(t *testing.T) {
-		producer := newProducer(t, group, "drain.settleable", driver.ProducerConfig{Effective: group.effective})
-		consumer := newConsumer(t, group, "drain.settleable", 1)
+		producer := newProducer(t, group, profileDestination(group, "drain.settleable"), driver.ProducerConfig{Effective: group.effective})
+		consumer := newConsumer(t, group, profileDestination(group, "drain.settleable"), 1)
 		if err := producer.Publish(group.ctx, driver.OutboundMessage{Destination: "drain.settleable"}); err != nil {
 			t.Fatal(err)
 		}
@@ -80,12 +80,12 @@ func runDrain(group *groupContext) {
 	})
 
 	group.Check("drain leaves Messages open", func(t *testing.T) {
-		producer := newProducer(t, group, "drain.messages-open", driver.ProducerConfig{Effective: group.effective})
-		consumer := newConsumer(t, group, "drain.messages-open", 1)
+		producer := newProducer(t, group, profileDestination(group, "drain.messages-open"), driver.ProducerConfig{Effective: group.effective})
+		consumer := newConsumer(t, group, profileDestination(group, "drain.messages-open"), 1)
 		if err := consumer.Drain(group.ctx); err != nil {
 			t.Fatal(err)
 		}
-		survivor := newConsumer(t, group, "drain.messages-open", 1)
+		survivor := newConsumer(t, group, profileDestination(group, "drain.messages-open"), 1)
 		if err := producer.Publish(group.ctx, driver.OutboundMessage{Destination: "drain.messages-open", Body: []byte("control")}); err != nil {
 			t.Fatal(err)
 		}
@@ -105,8 +105,8 @@ func runDrain(group *groupContext) {
 	})
 
 	group.Check("settlement clears broker unsettled count after drain", func(t *testing.T) {
-		producer := newProducer(t, group, "drain.unsettled", driver.ProducerConfig{Effective: group.effective})
-		consumer := newConsumer(t, group, "drain.unsettled", 1)
+		producer := newProducer(t, group, profileDestination(group, "drain.unsettled"), driver.ProducerConfig{Effective: group.effective})
+		consumer := newConsumer(t, group, profileDestination(group, "drain.unsettled"), 1)
 		if err := producer.Publish(group.ctx, driver.OutboundMessage{Destination: "drain.unsettled"}); err != nil {
 			t.Fatal(err)
 		}
@@ -127,8 +127,8 @@ func runDrain(group *groupContext) {
 	})
 
 	group.Check("drain cycle accounts for every published message", func(t *testing.T) {
-		producer := newProducer(t, group, "drain.accounting", driver.ProducerConfig{Effective: group.effective})
-		consumer := newConsumer(t, group, "drain.accounting", 1)
+		producer := newProducer(t, group, profileDestination(group, "drain.accounting"), driver.ProducerConfig{Effective: group.effective})
+		consumer := newConsumer(t, group, profileDestination(group, "drain.accounting"), 1)
 		if err := producer.Publish(group.ctx,
 			driver.OutboundMessage{Destination: "drain.accounting", Body: []byte("in-flight")},
 			driver.OutboundMessage{Destination: "drain.accounting", Body: []byte("ready")},
@@ -148,8 +148,8 @@ func runDrain(group *groupContext) {
 	})
 
 	group.Check("stop refuses outstanding work as a fatal error", func(t *testing.T) {
-		producer := newProducer(t, group, "drain.refusal", driver.ProducerConfig{Effective: group.effective})
-		consumer := newConsumer(t, group, "drain.refusal", 1)
+		producer := newProducer(t, group, profileDestination(group, "drain.refusal"), driver.ProducerConfig{Effective: group.effective})
+		consumer := newConsumer(t, group, profileDestination(group, "drain.refusal"), 1)
 		if err := producer.Publish(group.ctx, driver.OutboundMessage{Destination: "drain.refusal"}); err != nil {
 			t.Fatal(err)
 		}
@@ -169,8 +169,8 @@ func runDrain(group *groupContext) {
 	})
 
 	group.Check("expired stop deadline returns drain timeout", func(t *testing.T) {
-		_ = newProducer(t, group, "drain.timeout", driver.ProducerConfig{Effective: group.effective})
-		consumer := newConsumer(t, group, "drain.timeout", 1)
+		_ = newProducer(t, group, profileDestination(group, "drain.timeout"), driver.ProducerConfig{Effective: group.effective})
+		consumer := newConsumer(t, group, profileDestination(group, "drain.timeout"), 1)
 		// inmem has no asynchronous flush window. An already-expired deadline
 		// is a fixture-only probe of ErrDrainTimeout identity; real drivers must
 		// prove expiration while their final flush is in progress.
@@ -188,8 +188,8 @@ func runDrain(group *groupContext) {
 	})
 
 	group.Check("stop refusal and timeout remain distinguishable", func(t *testing.T) {
-		producer := newProducer(t, group, "drain.distinguishable", driver.ProducerConfig{Effective: group.effective})
-		consumer := newConsumer(t, group, "drain.distinguishable", 1)
+		producer := newProducer(t, group, profileDestination(group, "drain.distinguishable"), driver.ProducerConfig{Effective: group.effective})
+		consumer := newConsumer(t, group, profileDestination(group, "drain.distinguishable"), 1)
 		if err := producer.Publish(group.ctx, driver.OutboundMessage{Destination: "drain.distinguishable"}); err != nil {
 			t.Fatal(err)
 		}
@@ -207,8 +207,8 @@ func runDrain(group *groupContext) {
 	})
 
 	group.Check("drain is idempotent", func(t *testing.T) {
-		_ = newProducer(t, group, "drain.idempotent", driver.ProducerConfig{Effective: group.effective})
-		consumer := newConsumer(t, group, "drain.idempotent", 1)
+		_ = newProducer(t, group, profileDestination(group, "drain.idempotent"), driver.ProducerConfig{Effective: group.effective})
+		consumer := newConsumer(t, group, profileDestination(group, "drain.idempotent"), 1)
 		if err := consumer.Drain(group.ctx); err != nil {
 			t.Fatalf("first Drain() error = %v", err)
 		}
@@ -219,8 +219,8 @@ func runDrain(group *groupContext) {
 	})
 
 	group.Check("stop is idempotent", func(t *testing.T) {
-		_ = newProducer(t, group, "drain.stop-idempotent", driver.ProducerConfig{Effective: group.effective})
-		consumer := newConsumer(t, group, "drain.stop-idempotent", 1)
+		_ = newProducer(t, group, profileDestination(group, "drain.stop-idempotent"), driver.ProducerConfig{Effective: group.effective})
+		consumer := newConsumer(t, group, profileDestination(group, "drain.stop-idempotent"), 1)
 		if err := consumer.Stop(group.ctx); err != nil {
 			t.Fatalf("first Stop() error = %v", err)
 		}
@@ -231,8 +231,8 @@ func runDrain(group *groupContext) {
 	})
 
 	group.Check("stop completes a settled drain cycle", func(t *testing.T) {
-		producer := newProducer(t, group, "drain.stop", driver.ProducerConfig{Effective: group.effective})
-		consumer := newConsumer(t, group, "drain.stop", 1)
+		producer := newProducer(t, group, profileDestination(group, "drain.stop"), driver.ProducerConfig{Effective: group.effective})
+		consumer := newConsumer(t, group, profileDestination(group, "drain.stop"), 1)
 		if err := producer.Publish(group.ctx, driver.OutboundMessage{Destination: "drain.stop"}); err != nil {
 			t.Fatal(err)
 		}
@@ -248,8 +248,8 @@ func runDrain(group *groupContext) {
 	})
 
 	group.Check("successful stop closes Messages", func(t *testing.T) {
-		_ = newProducer(t, group, "drain.messages-closed", driver.ProducerConfig{Effective: group.effective})
-		consumer := newConsumer(t, group, "drain.messages-closed", 1)
+		_ = newProducer(t, group, profileDestination(group, "drain.messages-closed"), driver.ProducerConfig{Effective: group.effective})
+		consumer := newConsumer(t, group, profileDestination(group, "drain.messages-closed"), 1)
 		if err := consumer.Stop(group.ctx); err != nil {
 			t.Fatal(err)
 		}
@@ -265,8 +265,8 @@ func runDrain(group *groupContext) {
 	})
 
 	group.Check("release redelivers outstanding work", func(t *testing.T) {
-		producer := newProducer(t, group, "drain.release", driver.ProducerConfig{Effective: group.effective})
-		consumer := newConsumer(t, group, "drain.release", 1)
+		producer := newProducer(t, group, profileDestination(group, "drain.release"), driver.ProducerConfig{Effective: group.effective})
+		consumer := newConsumer(t, group, profileDestination(group, "drain.release"), 1)
 		if err := producer.Publish(group.ctx, driver.OutboundMessage{Destination: "drain.release", Body: []byte("release")}); err != nil {
 			t.Fatal(err)
 		}
@@ -274,7 +274,7 @@ func runDrain(group *groupContext) {
 		if err := consumer.Release(group.ctx); err != nil {
 			t.Fatalf("Release() error = %v", err)
 		}
-		receiver := newConsumer(t, group, "drain.release", 1)
+		receiver := newConsumer(t, group, profileDestination(group, "drain.release"), 1)
 		redelivered := receiveMessage(t, group, receiver)
 		if string(redelivered.Body) != string(message.Body) {
 			t.Fatalf("redelivered body = %q, want %q", redelivered.Body, message.Body)
@@ -284,8 +284,8 @@ func runDrain(group *groupContext) {
 	})
 
 	group.Check("release with no outstanding work closes Messages", func(t *testing.T) {
-		_ = newProducer(t, group, "drain.release-closed", driver.ProducerConfig{Effective: group.effective})
-		consumer := newConsumer(t, group, "drain.release-closed", 1)
+		_ = newProducer(t, group, profileDestination(group, "drain.release-closed"), driver.ProducerConfig{Effective: group.effective})
+		consumer := newConsumer(t, group, profileDestination(group, "drain.release-closed"), 1)
 		if err := consumer.Release(group.ctx); err != nil {
 			t.Fatalf("Release() error = %v", err)
 		}
@@ -301,8 +301,8 @@ func runDrain(group *groupContext) {
 	})
 
 	group.Check("release is idempotent", func(t *testing.T) {
-		_ = newProducer(t, group, "drain.release-idempotent", driver.ProducerConfig{Effective: group.effective})
-		consumer := newConsumer(t, group, "drain.release-idempotent", 1)
+		_ = newProducer(t, group, profileDestination(group, "drain.release-idempotent"), driver.ProducerConfig{Effective: group.effective})
+		consumer := newConsumer(t, group, profileDestination(group, "drain.release-idempotent"), 1)
 		if err := consumer.Release(group.ctx); err != nil {
 			t.Fatalf("first Release() error = %v", err)
 		}
@@ -312,7 +312,7 @@ func runDrain(group *groupContext) {
 		if err := consumer.Stop(group.ctx); err != nil {
 			t.Fatalf("Stop() after Release error = %v", err)
 		}
-		stopped := newConsumer(t, group, "drain.release-idempotent", 1)
+		stopped := newConsumer(t, group, profileDestination(group, "drain.release-idempotent"), 1)
 		if err := stopped.Stop(group.ctx); err != nil {
 			t.Fatalf("Stop() error = %v", err)
 		}

@@ -87,6 +87,33 @@ func TestSubscribeRejectsPrefetchBelowLaneCount(t *testing.T) {
 	}
 }
 
+func TestSubscribeRejectsPrefetchAboveCeilingFromExplicitConfig(t *testing.T) {
+	t.Parallel()
+	client := newPublishClient(t, &recordingProducer{})
+	_, err := client.Subscribe(context.Background(), Subscription{
+		Name:     "orders",
+		Topics:   []string{"orders.created"},
+		Prefetch: 65536,
+	})
+	want := "f1: subscriptions.orders.prefetch 65536 must be at most 65535"
+	if err == nil || err.Error() != want {
+		t.Fatalf("Subscribe() error = %v, want %q", err, want)
+	}
+}
+
+func TestSubscribeRejectsPrefetchAboveCeilingFromEnvironment(t *testing.T) {
+	t.Setenv("F1_SUBSCRIPTIONS_ORDERS_PREFETCH", "65536")
+	client := newPublishClient(t, &recordingProducer{})
+	_, err := client.Subscribe(context.Background(), Subscription{
+		Name:   "orders",
+		Topics: []string{"orders.created"},
+	})
+	want := "f1: subscriptions.orders.prefetch 65536 must be at most 65535"
+	if err == nil || err.Error() != want {
+		t.Fatalf("Subscribe() error = %v, want %q", err, want)
+	}
+}
+
 func TestSubscribeMergesExplicitGoOverEnvironmentAndYAML(t *testing.T) {
 	t.Setenv("F1_SUBSCRIPTIONS_ORDERS_CONCURRENCY", "6")
 	cfg, err := LoadConfig(writeConfig(t, `
