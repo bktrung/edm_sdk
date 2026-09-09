@@ -58,21 +58,22 @@ func runFailure(group *groupContext) {
 
 	group.Check("failed Close keeps admission closed and remains retryable", func(t *testing.T) {
 		conn, inject := newPrivateFailureConnection(t, group)
-		assertPrivateCloseFailure(t, group, conn, inject, 100*time.Millisecond, group.ctx)
+		assertPrivateCloseFailure(t, group, conn, inject, profileDestination(group, privateCloseDestination), 100*time.Millisecond, group.ctx)
 
 		conn, inject = newPrivateFailureConnection(t, group)
-		assertPrivateCloseFailure(t, group, conn, inject, 0, group.ctx)
+		assertPrivateCloseFailure(t, group, conn, inject, profileDestination(group, privateCloseDestination), 0, group.ctx)
 		group.vector.Add(BehaviorEvent{ID: "failure-close-admission", Outcome: "closed-and-retryable", FinalDestination: "failure.close"})
 	})
 
 	group.Check("rejected Close leaves admission open", func(t *testing.T) {
 		conn, _ := newPrivateFailureConnection(t, group)
 		admin := conn.Admin()
-		if _, err := admin.EnsureTopology(group.ctx, driver.TopologySpec{
-			Destinations: []driver.DestinationSpec{{Name: privateCloseDestination}},
+		destination := profileDestination(group, privateCloseDestination)
+		if _, err := admin.EnsureTopology(group.ctx, profileTopologySpec(group, driver.TopologySpec{
+			Destinations: []driver.DestinationSpec{{Name: destination}},
 			Scope:        []string{"failure.close."},
 			Effective:    group.effective,
-		}); err != nil {
+		})); err != nil {
 			t.Fatalf("declare precondition destination: %v", err)
 		}
 		producer, err := conn.Producer(group.ctx, driver.ProducerConfig{})
@@ -87,7 +88,7 @@ func runFailure(group *groupContext) {
 		} else {
 			_ = next.Close(group.ctx)
 		}
-		if _, err := admin.DescribeTopology(group.ctx, []string{privateCloseDestination}); err != nil {
+		if _, err := admin.DescribeTopology(group.ctx, []string{destination}); err != nil {
 			t.Fatalf("Admin.DescribeTopology() after rejected Close: %v", err)
 		}
 		if err := producer.Close(group.ctx); err != nil {
@@ -101,7 +102,7 @@ func runFailure(group *groupContext) {
 
 	group.Check("transient publish failure is classified", func(t *testing.T) {
 		name := "failure.publish.transient"
-		producer := newProducer(t, group, name, driver.ProducerConfig{Effective: group.effective})
+		producer := newProducer(t, group, profileDestination(group, name), driver.ProducerConfig{Effective: group.effective})
 		injectFailure(t, group, FaultPublishFailure)
 		err := producer.Publish(group.ctx, driver.OutboundMessage{Destination: name})
 		assertFaultError(t, err, driver.KindTransient)
@@ -110,7 +111,7 @@ func runFailure(group *groupContext) {
 
 	group.Check("publish recovers after a transient outage", func(t *testing.T) {
 		name := "failure.publish.recovery"
-		producer := newProducer(t, group, name, driver.ProducerConfig{Effective: group.effective})
+		producer := newProducer(t, group, profileDestination(group, name), driver.ProducerConfig{Effective: group.effective})
 		injectFailure(t, group, FaultPublishFailure)
 		if err := producer.Publish(group.ctx, driver.OutboundMessage{Destination: name, Body: []byte("failed")}); err == nil {
 			t.Fatal("outage Publish() error = nil")
@@ -126,7 +127,7 @@ func runFailure(group *groupContext) {
 
 	group.Check("failed publish leaves no phantom message", func(t *testing.T) {
 		name := "failure.publish.no-phantom"
-		producer := newProducer(t, group, name, driver.ProducerConfig{Effective: group.effective})
+		producer := newProducer(t, group, profileDestination(group, name), driver.ProducerConfig{Effective: group.effective})
 		injectFailure(t, group, FaultPublishFailure)
 		if err := producer.Publish(group.ctx, driver.OutboundMessage{Destination: name, Body: []byte("lost")}); err == nil {
 			t.Fatal("Publish() error = nil")
@@ -140,8 +141,8 @@ func runFailure(group *groupContext) {
 
 	group.Check("connection fault reports a transient error", func(t *testing.T) {
 		name := "failure.errors.classified"
-		_ = newProducer(t, group, name, driver.ProducerConfig{Effective: group.effective})
-		consumer := newConsumer(t, group, name, 1)
+		_ = newProducer(t, group, profileDestination(group, name), driver.ProducerConfig{Effective: group.effective})
+		consumer := newConsumer(t, group, profileDestination(group, name), 1)
 		injectFailure(t, group, FaultConnectionDrop)
 		err := receiveFailureError(t, group, consumer)
 		assertFaultError(t, err, driver.KindTransient)
@@ -150,8 +151,8 @@ func runFailure(group *groupContext) {
 
 	group.Check("transient error does not close Errors", func(t *testing.T) {
 		name := "failure.errors.open"
-		_ = newProducer(t, group, name, driver.ProducerConfig{Effective: group.effective})
-		consumer := newConsumer(t, group, name, 1)
+		_ = newProducer(t, group, profileDestination(group, name), driver.ProducerConfig{Effective: group.effective})
+		consumer := newConsumer(t, group, profileDestination(group, name), 1)
 		injectFailure(t, group, FaultConnectionDrop)
 		_ = receiveFailureError(t, group, consumer)
 		injectFailure(t, group, FaultConnectionDrop)
@@ -162,8 +163,8 @@ func runFailure(group *groupContext) {
 
 	group.Check("transient error does not close Messages", func(t *testing.T) {
 		name := "failure.messages.open"
-		producer := newProducer(t, group, name, driver.ProducerConfig{Effective: group.effective})
-		consumer := newConsumer(t, group, name, 1)
+		producer := newProducer(t, group, profileDestination(group, name), driver.ProducerConfig{Effective: group.effective})
+		consumer := newConsumer(t, group, profileDestination(group, name), 1)
 		injectFailure(t, group, FaultConnectionDrop)
 		if err := producer.Publish(group.ctx, driver.OutboundMessage{Destination: name, Body: []byte("control")}); err != nil {
 			t.Fatal(err)
@@ -178,8 +179,8 @@ func runFailure(group *groupContext) {
 
 	group.Check("unread Errors do not block delivery", func(t *testing.T) {
 		name := "failure.errors.unread"
-		producer := newProducer(t, group, name, driver.ProducerConfig{Effective: group.effective})
-		consumer := newConsumer(t, group, name, 1)
+		producer := newProducer(t, group, profileDestination(group, name), driver.ProducerConfig{Effective: group.effective})
+		consumer := newConsumer(t, group, profileDestination(group, name), 1)
 		injectFailureAsync(t, group, FaultConnectionDrop)
 		if err := producer.Publish(group.ctx, driver.OutboundMessage{Destination: name, Body: []byte("unblocked")}); err != nil {
 			t.Fatal(err)
@@ -191,8 +192,8 @@ func runFailure(group *groupContext) {
 
 	group.Check("connection drop redelivers an unsettled message", func(t *testing.T) {
 		name := "failure.redelivery.once"
-		producer := newProducer(t, group, name, driver.ProducerConfig{Effective: group.effective})
-		consumer := newConsumer(t, group, name, 1)
+		producer := newProducer(t, group, profileDestination(group, name), driver.ProducerConfig{Effective: group.effective})
+		consumer := newConsumer(t, group, profileDestination(group, name), 1)
 		if err := producer.Publish(group.ctx, driver.OutboundMessage{Destination: name, Body: []byte("redeliver")}); err != nil {
 			t.Fatal(err)
 		}
@@ -208,8 +209,8 @@ func runFailure(group *groupContext) {
 
 	group.Check("delivery failure causes no duplicate after recovery", func(t *testing.T) {
 		name := "failure.redelivery.no-duplicate"
-		producer := newProducer(t, group, name, driver.ProducerConfig{Effective: group.effective})
-		consumer := newConsumer(t, group, name, 1)
+		producer := newProducer(t, group, profileDestination(group, name), driver.ProducerConfig{Effective: group.effective})
+		consumer := newConsumer(t, group, profileDestination(group, name), 1)
 		if err := producer.Publish(group.ctx, driver.OutboundMessage{Destination: name, Body: []byte("unique")}); err != nil {
 			t.Fatal(err)
 		}
@@ -230,8 +231,8 @@ func runFailure(group *groupContext) {
 
 	group.Check("delivery count survives a delivery fault", func(t *testing.T) {
 		name := "failure.redelivery.count"
-		producer := newProducer(t, group, name, driver.ProducerConfig{Effective: group.effective})
-		consumer := newConsumer(t, group, name, 1)
+		producer := newProducer(t, group, profileDestination(group, name), driver.ProducerConfig{Effective: group.effective})
+		consumer := newConsumer(t, group, profileDestination(group, name), 1)
 		if err := producer.Publish(group.ctx, driver.OutboundMessage{Destination: name}); err != nil {
 			t.Fatal(err)
 		}
@@ -251,8 +252,8 @@ func runFailure(group *groupContext) {
 
 	group.Check("stale settlement after connection drop is fatal", func(t *testing.T) {
 		name := "failure.settlement.fatal"
-		producer := newProducer(t, group, name, driver.ProducerConfig{Effective: group.effective})
-		consumer := newConsumer(t, group, name, 1)
+		producer := newProducer(t, group, profileDestination(group, name), driver.ProducerConfig{Effective: group.effective})
+		consumer := newConsumer(t, group, profileDestination(group, name), 1)
 		if err := producer.Publish(group.ctx, driver.OutboundMessage{Destination: name}); err != nil {
 			t.Fatal(err)
 		}
@@ -266,8 +267,8 @@ func runFailure(group *groupContext) {
 
 	group.Check("recovered delivery remains settleable", func(t *testing.T) {
 		name := "failure.settlement.recovered"
-		producer := newProducer(t, group, name, driver.ProducerConfig{Effective: group.effective})
-		consumer := newConsumer(t, group, name, 1)
+		producer := newProducer(t, group, profileDestination(group, name), driver.ProducerConfig{Effective: group.effective})
+		consumer := newConsumer(t, group, profileDestination(group, name), 1)
 		if err := producer.Publish(group.ctx, driver.OutboundMessage{Destination: name}); err != nil {
 			t.Fatal(err)
 		}
@@ -286,7 +287,7 @@ func runFailure(group *groupContext) {
 
 	group.Check("fatal publish failure is non-retryable", func(t *testing.T) {
 		name := "failure.publish.fatal"
-		producer := newProducer(t, group, name, driver.ProducerConfig{Effective: group.effective})
+		producer := newProducer(t, group, profileDestination(group, name), driver.ProducerConfig{Effective: group.effective})
 		injectFailure(t, group, FaultFatalPublish)
 		err := producer.Publish(group.ctx, driver.OutboundMessage{Destination: name})
 		assertFaultError(t, err, driver.KindFatal)
@@ -295,8 +296,8 @@ func runFailure(group *groupContext) {
 
 	group.Check("stale settlement preserves its sentinel", func(t *testing.T) {
 		name := "failure.settlement.sentinel"
-		producer := newProducer(t, group, name, driver.ProducerConfig{Effective: group.effective})
-		consumer := newConsumer(t, group, name, 1)
+		producer := newProducer(t, group, profileDestination(group, name), driver.ProducerConfig{Effective: group.effective})
+		consumer := newConsumer(t, group, profileDestination(group, name), 1)
 		if err := producer.Publish(group.ctx, driver.OutboundMessage{Destination: name}); err != nil {
 			t.Fatal(err)
 		}
@@ -368,14 +369,14 @@ func runFailure(group *groupContext) {
 	})
 }
 
-func assertPrivateCloseFailure(t *testing.T, group *groupContext, conn driver.Conn, inject FaultInjector, closeTimeout time.Duration, activeCtx context.Context) {
+func assertPrivateCloseFailure(t *testing.T, group *groupContext, conn driver.Conn, inject FaultInjector, destination string, closeTimeout time.Duration, activeCtx context.Context) {
 	t.Helper()
 	admin := conn.Admin()
-	if _, err := admin.EnsureTopology(activeCtx, driver.TopologySpec{
-		Destinations: []driver.DestinationSpec{{Name: privateCloseDestination}},
+	if _, err := admin.EnsureTopology(activeCtx, profileTopologySpec(group, driver.TopologySpec{
+		Destinations: []driver.DestinationSpec{{Name: destination}},
 		Scope:        []string{"failure.close."},
 		Effective:    group.effective,
-	}); err != nil {
+	})); err != nil {
 		t.Fatalf("declare close destination: %v", err)
 	}
 	if err := inject(activeCtx, FaultCloseFailure); err != nil {
@@ -394,11 +395,11 @@ func assertPrivateCloseFailure(t *testing.T, group *groupContext, conn driver.Co
 		_ = producer.Close(activeCtx)
 		t.Fatal("Producer() succeeded after Close teardown began")
 	}
-	if _, err := admin.DescribeTopology(activeCtx, []string{privateCloseDestination}); err == nil {
+	if _, err := admin.DescribeTopology(activeCtx, []string{destination}); err == nil {
 		t.Error("Admin.DescribeTopology() succeeded after Close teardown began")
 	}
 	if consumer, err := conn.Consumer(activeCtx, driver.ConsumerConfig{
-		Destinations: []string{privateCloseDestination},
+		Destinations: []string{destination},
 	}); err == nil {
 		_ = consumer.Stop(activeCtx)
 		t.Fatal("Consumer() succeeded after Close teardown began")
@@ -442,10 +443,10 @@ func newLaneCloseFixture(t *testing.T, group *groupContext, suffix string) (driv
 	t.Helper()
 	first := "failure.lane-close." + suffix + ".first"
 	second := "failure.lane-close." + suffix + ".second"
-	if _, err := group.conn.Admin().EnsureTopology(group.ctx, driver.TopologySpec{
+	if _, err := group.conn.Admin().EnsureTopology(group.ctx, profileTopologySpec(group, driver.TopologySpec{
 		Destinations: []driver.DestinationSpec{{Name: first}, {Name: second}},
 		Effective:    group.effective,
-	}); err != nil {
+	})); err != nil {
 		t.Fatalf("EnsureTopology lane close: %v", err)
 	}
 	producer, err := group.conn.Producer(group.ctx, driver.ProducerConfig{Effective: group.effective})
@@ -459,7 +460,7 @@ func newLaneCloseFixture(t *testing.T, group *groupContext, suffix string) (driv
 	})
 	for _, destination := range []string{first, second} {
 		t.Cleanup(func() {
-			if err := purgeIfSupported(group.ctx, group.conn, destination); err != nil {
+			if err := purgeIfSupported(group.ctx, group.conn, profileDestination(group, destination)); err != nil {
 				t.Errorf("purge lane close destination %q: %v", destination, err)
 			}
 		})
@@ -473,7 +474,7 @@ func newLaneCloseFixture(t *testing.T, group *groupContext, suffix string) (driv
 		},
 		Effective: group.effective,
 	})
-	return producer, consumer, first, second
+	return &profileProducer{group: group, producer: producer, scoped: true}, consumer, first, second
 }
 
 func primeLaneClose(t *testing.T, group *groupContext, producer driver.Producer, consumer driver.Consumer, first, second string) {
@@ -559,8 +560,8 @@ func assertFaultError(t *testing.T, err error, wantKind driver.Kind) {
 
 func runDeterministicFaultSequence(t *testing.T, group *groupContext, name string) string {
 	t.Helper()
-	producer := newProducer(t, group, name, driver.ProducerConfig{Effective: group.effective})
-	consumer := newConsumer(t, group, name, 1)
+	producer := newProducer(t, group, profileDestination(group, name), driver.ProducerConfig{Effective: group.effective})
+	consumer := newConsumer(t, group, profileDestination(group, name), 1)
 	injectFailure(t, group, FaultPublishFailure)
 	failed := producer.Publish(group.ctx, driver.OutboundMessage{Destination: name, Body: []byte("failed")})
 	kind, classified := driver.Classify(failed)

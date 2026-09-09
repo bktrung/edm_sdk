@@ -22,10 +22,10 @@ func runTopology(group *groupContext) {
 	runTopologyPolicyChecks(group)
 	group.Check("EnsureTopology creates missing destinations", func(t *testing.T) {
 		maintenance := group.maintenance(t)
-		admin := group.conn.Admin()
-		// Suffixed by profile: Run shares one Conn across both profile passes,
+		admin := newProfileAdmin(group, group.conn.Admin())
+		// Profile-scoped: Run shares one Conn across both profile passes,
 		// so a fixed name would already exist as Existing on the second pass.
-		name := "topology.create." + group.profile.String()
+		name := "topology.create"
 		diff, err := admin.EnsureTopology(group.ctx, driver.TopologySpec{
 			Destinations: []driver.DestinationSpec{{Name: name}},
 			Effective:    group.effective,
@@ -41,14 +41,14 @@ func runTopology(group *groupContext) {
 		}
 		cleanupTopologyDestinations(t, admin, maintenance, group.ctx, name)
 		// FinalDestination is the profile-independent label: the two profile
-		// passes must record identical vectors, but the actual destination name
-		// is suffixed per profile to stay unique across the shared Conn.
+		// passes must record identical vectors, while the broker name stays
+		// profile-scoped on the shared Conn.
 		group.vector.Add(BehaviorEvent{ID: "topology-create", Outcome: "created", FinalDestination: "topology.create"})
 	})
 
 	group.Check("EnsureTopology is idempotent on a repeat call", func(t *testing.T) {
 		maintenance := group.maintenance(t)
-		admin := group.conn.Admin()
+		admin := newProfileAdmin(group, group.conn.Admin())
 		name := "topology.idempotent"
 		spec := driver.TopologySpec{
 			Destinations: []driver.DestinationSpec{{Name: name}},
@@ -74,7 +74,7 @@ func runTopology(group *groupContext) {
 		}
 		// Positive control: the destination still functions after the repeat
 		// call, proving idempotency did not tear anything down.
-		producer := newProducer(t, group, name, driver.ProducerConfig{Effective: group.effective})
+		producer := newProducer(t, group, profileDestination(group, name), driver.ProducerConfig{Effective: group.effective})
 		if err := producer.Publish(group.ctx, driver.OutboundMessage{Destination: name}); err != nil {
 			t.Fatalf("Publish(%q) after repeat EnsureTopology: %v", name, err)
 		}
@@ -87,11 +87,11 @@ func runTopology(group *groupContext) {
 
 	group.Check("EnsureTopology reports created and existing destinations together in one call", func(t *testing.T) {
 		maintenance := group.maintenance(t)
-		admin := group.conn.Admin()
+		admin := newProfileAdmin(group, group.conn.Admin())
 		existing := "topology.mixed.existing"
-		// Suffixed by profile: Run shares one Conn across both profile passes,
+		// Profile-scoped: Run shares one Conn across both profile passes,
 		// so a fixed name would already exist as Existing on the second pass.
-		created := "topology.mixed.created." + group.profile.String()
+		created := "topology.mixed.created"
 		if _, err := admin.EnsureTopology(group.ctx, driver.TopologySpec{
 			Destinations: []driver.DestinationSpec{{Name: existing}},
 			Effective:    group.effective,
@@ -117,7 +117,7 @@ func runTopology(group *groupContext) {
 
 	group.Check("EnsureTopology reports a destination dropped from the spec but still in scope", func(t *testing.T) {
 		maintenance := group.maintenance(t)
-		admin := group.conn.Admin()
+		admin := newProfileAdmin(group, group.conn.Admin())
 		kept := "topology.orphan.under.high"
 		dropped := "topology.orphan.under.low"
 		scope := []string{"topology.orphan.under."}
@@ -154,7 +154,7 @@ func runTopology(group *groupContext) {
 
 	group.Check("EnsureTopology does not report a destination outside the requested scope", func(t *testing.T) {
 		maintenance := group.maintenance(t)
-		admin := group.conn.Admin()
+		admin := newProfileAdmin(group, group.conn.Admin())
 		inSpec := "topology.orphan.over.sub1.main"
 		droppedInScope := "topology.orphan.over.sub1.retry"
 		siblingOutsideScope := "topology.orphan.over.sub2.main"
@@ -196,7 +196,7 @@ func runTopology(group *groupContext) {
 
 	group.Check("EnsureTopology scope prefix matches only at a component boundary", func(t *testing.T) {
 		maintenance := group.maintenance(t)
-		admin := group.conn.Admin()
+		admin := newProfileAdmin(group, group.conn.Admin())
 		inSpec := "topology.orphan.boundary.worker.main"
 		continuation := "topology.orphan.boundary.worker-v2.main"
 		droppedInScope := "topology.orphan.boundary.worker.retry"
@@ -253,7 +253,7 @@ func runTopology(group *groupContext) {
 
 	group.Check("EnsureTopology with an empty scope disables orphan scanning", func(t *testing.T) {
 		maintenance := group.maintenance(t)
-		admin := group.conn.Admin()
+		admin := newProfileAdmin(group, group.conn.Admin())
 		kept := "topology.orphan.noscan.kept"
 		dropped := "topology.orphan.noscan.dropped"
 		scope := []string{"topology.orphan.noscan."}
@@ -304,7 +304,7 @@ func runTopology(group *groupContext) {
 
 	group.Check("EnsureTopology folds deferred messages into an orphaned destination's message count", func(t *testing.T) {
 		maintenance := group.maintenance(t)
-		admin := group.conn.Admin()
+		admin := newProfileAdmin(group, group.conn.Admin())
 		kept := "topology.orphan.aux.kept"
 		dropped := "topology.orphan.aux.dropped"
 		scope := []string{"topology.orphan.aux."}
@@ -322,11 +322,11 @@ func runTopology(group *groupContext) {
 				}
 			}
 		})
-		producer := newProducer(t, group, dropped, driver.ProducerConfig{Effective: group.effective})
+		producer := newProducer(t, group, profileDestination(group, dropped), driver.ProducerConfig{Effective: group.effective})
 		if err := producer.Publish(group.ctx, driver.OutboundMessage{Destination: dropped}); err != nil {
 			t.Fatalf("Publish(%q): %v", dropped, err)
 		}
-		deferredProducer := newDeferredProducer(t, group, dropped, topologyParkDelay)
+		deferredProducer := newDeferredProducer(t, group, profileDestination(group, dropped), topologyParkDelay)
 		due := deferredNow(group).Add(topologyParkDelay)
 		if err := deferredProducer.Publish(group.ctx, driver.OutboundMessage{Destination: dropped, DelayUntil: due}); err != nil {
 			t.Fatalf("Publish(%q): %v", dropped, err)
@@ -357,13 +357,13 @@ func runTopology(group *groupContext) {
 	})
 
 	group.Check("DescribeTopology reports depth including deferred messages", func(t *testing.T) {
-		admin := group.conn.Admin()
-		name := "topology.describe.depth." + group.profile.String()
-		producer := newProducer(t, group, name, driver.ProducerConfig{Effective: group.effective})
+		admin := newProfileAdmin(group, group.conn.Admin())
+		name := "topology.describe.depth"
+		producer := newProducer(t, group, profileDestination(group, name), driver.ProducerConfig{Effective: group.effective})
 		if err := producer.Publish(group.ctx, driver.OutboundMessage{Destination: name}); err != nil {
 			t.Fatalf("Publish(%q): %v", name, err)
 		}
-		deferredProducer := newDeferredProducer(t, group, name, topologyParkDelay)
+		deferredProducer := newDeferredProducer(t, group, profileDestination(group, name), topologyParkDelay)
 		due := deferredNow(group).Add(topologyParkDelay)
 		if err := deferredProducer.Publish(group.ctx,
 			driver.OutboundMessage{Destination: name, DelayUntil: due},
@@ -388,7 +388,7 @@ func runTopology(group *groupContext) {
 
 	group.Check("Prune refuses a destination that still holds ready messages", func(t *testing.T) {
 		maintenance := group.maintenance(t)
-		admin := group.conn.Admin()
+		admin := newProfileAdmin(group, group.conn.Admin())
 		nonEmpty := "topology.prune.ready"
 		eligible := "topology.prune.ready.eligible"
 		if _, err := admin.EnsureTopology(group.ctx, driver.TopologySpec{
@@ -397,7 +397,7 @@ func runTopology(group *groupContext) {
 		}); err != nil {
 			t.Fatalf("EnsureTopology(eligible): %v", err)
 		}
-		producer := newProducer(t, group, nonEmpty, driver.ProducerConfig{Effective: group.effective})
+		producer := newProducer(t, group, profileDestination(group, nonEmpty), driver.ProducerConfig{Effective: group.effective})
 		if err := producer.Publish(group.ctx, driver.OutboundMessage{Destination: nonEmpty}); err != nil {
 			t.Fatalf("Publish(%q): %v", nonEmpty, err)
 		}
@@ -425,7 +425,7 @@ func runTopology(group *groupContext) {
 
 	group.Check("Prune refuses an empty destination whose park still holds messages", func(t *testing.T) {
 		maintenance := group.maintenance(t)
-		admin := group.conn.Admin()
+		admin := newProfileAdmin(group, group.conn.Admin())
 		parked := "topology.prune.park"
 		eligible := "topology.prune.park.eligible"
 		if _, err := admin.EnsureTopology(group.ctx, driver.TopologySpec{
@@ -434,7 +434,7 @@ func runTopology(group *groupContext) {
 		}); err != nil {
 			t.Fatalf("EnsureTopology(eligible): %v", err)
 		}
-		producer := newDeferredProducer(t, group, parked, topologyParkDelay)
+		producer := newDeferredProducer(t, group, profileDestination(group, parked), topologyParkDelay)
 		due := deferredNow(group).Add(topologyParkDelay)
 		if err := producer.Publish(group.ctx, driver.OutboundMessage{Destination: parked, DelayUntil: due}); err != nil {
 			t.Fatalf("Publish(%q): %v", parked, err)
@@ -462,7 +462,7 @@ func runTopology(group *groupContext) {
 
 	group.Check("Prune refuses a destination with an attached consumer", func(t *testing.T) {
 		maintenance := group.maintenance(t)
-		admin := group.conn.Admin()
+		admin := newProfileAdmin(group, group.conn.Admin())
 		attached := "topology.prune.consumer"
 		eligible := "topology.prune.consumer.eligible"
 		if _, err := admin.EnsureTopology(group.ctx, driver.TopologySpec{
@@ -471,7 +471,7 @@ func runTopology(group *groupContext) {
 		}); err != nil {
 			t.Fatalf("EnsureTopology(seed): %v", err)
 		}
-		_ = newConsumer(t, group, attached, 1)
+		_ = newConsumer(t, group, profileDestination(group, attached), 1)
 		results, err := maintenance.Prune(group.ctx, []string{attached, eligible})
 		if err != nil {
 			t.Fatalf("Prune(): %v", err)
@@ -502,9 +502,9 @@ func runTopology(group *groupContext) {
 
 	group.Check("Purge empties a destination and keeps it", func(t *testing.T) {
 		maintenance := group.maintenance(t)
-		admin := group.conn.Admin()
+		admin := newProfileAdmin(group, group.conn.Admin())
 		name := "topology.purge"
-		producer := newProducer(t, group, name, driver.ProducerConfig{Effective: group.effective})
+		producer := newProducer(t, group, profileDestination(group, name), driver.ProducerConfig{Effective: group.effective})
 		if err := producer.Publish(group.ctx,
 			driver.OutboundMessage{Destination: name},
 			driver.OutboundMessage{Destination: name},
@@ -548,7 +548,7 @@ func runTopology(group *groupContext) {
 
 	group.Check("cancelled context prevents topology admin calls without a partial effect", func(t *testing.T) {
 		maintenance := group.maintenance(t)
-		admin := group.conn.Admin()
+		admin := newProfileAdmin(group, group.conn.Admin())
 		name := "topology.cancel"
 		newName := "topology.cancel.new"
 		if _, err := admin.EnsureTopology(group.ctx, driver.TopologySpec{
@@ -570,7 +570,7 @@ func runTopology(group *groupContext) {
 		// Seed a message so the cancelled Purge below has real state to leave
 		// behind: an already-empty destination cannot distinguish "refused"
 		// from "did nothing because there was nothing to do."
-		producer := newProducer(t, group, name, driver.ProducerConfig{Effective: group.effective})
+		producer := newProducer(t, group, profileDestination(group, name), driver.ProducerConfig{Effective: group.effective})
 		if err := producer.Publish(group.ctx, driver.OutboundMessage{Destination: name}); err != nil {
 			t.Fatalf("Publish(%q): %v", name, err)
 		}
@@ -693,10 +693,10 @@ func findPruneResult(results []driver.PruneResult, name string) driver.PruneResu
 func runTopologyPolicyChecks(group *groupContext) {
 	group.Check("TopologyVerify reports the first missing destination without creating", func(t *testing.T) {
 		maintenance := group.maintenance(t)
-		admin := group.conn.Admin()
-		existing := "topology.verify.existing." + group.profile.String()
-		missing := "topology.verify.missing." + group.profile.String()
-		second := "topology.verify.second." + group.profile.String()
+		admin := newProfileAdmin(group, group.conn.Admin())
+		existing := "topology.verify.existing"
+		missing := "topology.verify.missing"
+		second := "topology.verify.second"
 		if _, err := admin.EnsureTopology(group.ctx, driver.TopologySpec{
 			Destinations: []driver.DestinationSpec{{Name: existing}},
 			Effective:    group.effective,
@@ -722,18 +722,18 @@ func runTopologyPolicyChecks(group *groupContext) {
 		if !strings.Contains(err.Error(), missing) || strings.Contains(err.Error(), second) {
 			t.Fatalf("TopologyVerify error = %q, want first missing %q only", err, missing)
 		}
-		if _, inspectErr := group.inspect(group.ctx, missing); inspectErr == nil {
+		if _, inspectErr := group.inspect(group.ctx, profileDestination(group, missing)); inspectErr == nil {
 			t.Fatalf("TopologyVerify created %q", missing)
 		}
-		if _, inspectErr := group.inspect(group.ctx, second); inspectErr == nil {
+		if _, inspectErr := group.inspect(group.ctx, profileDestination(group, second)); inspectErr == nil {
 			t.Fatalf("TopologyVerify created %q", second)
 		}
 		group.vector.Add(BehaviorEvent{ID: "topology-verify-missing", Outcome: "not-found", FinalDestination: "topology.verify.missing"})
 	})
 
 	group.Check("TopologyVerify reports argument drift or fails verification", func(t *testing.T) {
-		admin := group.conn.Admin()
-		name := "topology.verify.drift." + group.profile.String()
+		admin := newProfileAdmin(group, group.conn.Admin())
+		name := "topology.verify.drift"
 		declared := driver.DestinationSpec{Name: name, DeliveryLimit: 7}
 		if _, err := admin.EnsureTopology(group.ctx, driver.TopologySpec{
 			Destinations: []driver.DestinationSpec{declared},
@@ -772,14 +772,14 @@ func runTopologyPolicyChecks(group *groupContext) {
 		}
 		maintenance := group.maintenance(t)
 		effective := group.effective
-		prefix := "topology.consume-fanout." + group.profile.String()
+		prefix := "topology.consume-fanout"
 		first := prefix + ".first"
 		second := prefix + ".second"
-		diff, err := group.conn.Admin().EnsureTopology(group.ctx, driver.TopologySpec{
+		diff, err := newProfileAdmin(group, group.conn.Admin()).EnsureTopology(group.ctx, profileTopologySpec(group, driver.TopologySpec{
 			Destinations: []driver.DestinationSpec{{Name: first}, {Name: second}},
 			Bindings:     []driver.BindingSpec{{Source: prefix + ".exchange", Destination: first}},
 			Effective:    effective,
-		})
+		}))
 		if err != nil {
 			t.Fatalf("FanoutAtConsume EnsureTopology: %v", err)
 		}
@@ -791,17 +791,20 @@ func runTopologyPolicyChecks(group *groupContext) {
 		if err != nil {
 			t.Fatalf("FanoutAtConsume producer: %v", err)
 		}
+		producer = &profileProducer{group: group, producer: producer, scoped: true}
 		t.Cleanup(func() {
 			if err := producer.Close(group.ctx); err != nil {
 				t.Errorf("close FanoutAtConsume producer: %v", err)
 			}
 		})
-		consumer, err := group.conn.Consumer(group.ctx, driver.ConsumerConfig{
+		cfg, logical := profileConsumerConfig(group, driver.ConsumerConfig{
 			Destinations: []string{first}, Prefetch: 1, Effective: effective,
 		})
+		consumer, err := group.conn.Consumer(group.ctx, cfg)
 		if err != nil {
 			t.Fatalf("FanoutAtConsume consumer: %v", err)
 		}
+		consumer = newProfileConsumer(group, consumer, logical)
 		t.Cleanup(func() {
 			if err := consumer.Stop(group.ctx); err != nil {
 				t.Errorf("stop FanoutAtConsume consumer: %v", err)
@@ -819,8 +822,8 @@ func runTopologyPolicyChecks(group *groupContext) {
 	})
 
 	group.Check("TopologyNone leaves missing topology untouched", func(t *testing.T) {
-		admin := group.conn.Admin()
-		name := "topology.none." + group.profile.String()
+		admin := newProfileAdmin(group, group.conn.Admin())
+		name := "topology.none"
 		diff, err := admin.EnsureTopology(group.ctx, driver.TopologySpec{
 			Destinations: []driver.DestinationSpec{{Name: name}},
 			Policy:       driver.TopologyNone,
@@ -836,6 +839,7 @@ func runTopologyPolicyChecks(group *groupContext) {
 		if err != nil {
 			t.Fatalf("producer: %v", err)
 		}
+		producer = &profileProducer{group: group, producer: producer, scoped: true}
 		t.Cleanup(func() {
 			if err := producer.Close(group.ctx); err != nil {
 				t.Errorf("close producer: %v", err)

@@ -66,13 +66,17 @@ func Run(t *testing.T, suite Suite) Report {
 	if validationErr := validateInspectorFactory(inspect, err); validationErr != nil {
 		t.Fatalf("conformance: NewInspector: %v", validationErr)
 	}
+	runID, err := newRunID()
+	if err != nil {
+		t.Fatalf("conformance: generate run id: %v", err)
+	}
 	var inject FaultInjector
 	if suite.NewFaultInjector != nil {
 		inject, err = suite.NewFaultInjector(conn)
 		if err != nil {
 			t.Fatalf("conformance: NewFaultInjector: %v", err)
 		}
-		validateFaultInjector(t, ctx, conn, inject)
+		validateFaultInjector(t, ctx, conn, inject, runID)
 	}
 	var deadline DeadlineFixture
 	if suite.NewDeadlineFixture != nil {
@@ -80,7 +84,7 @@ func Run(t *testing.T, suite Suite) Report {
 		if err != nil {
 			t.Fatalf("conformance: NewDeadlineFixture: %v", err)
 		}
-		validateDeadlineFixture(t, ctx, conn, deadline)
+		validateDeadlineFixture(t, ctx, conn, deadline, runID)
 	}
 
 	report := Report{
@@ -97,10 +101,6 @@ func Run(t *testing.T, suite Suite) Report {
 	profileReports := make([]ProfileReport, 0, 2)
 	profilesRan := 0
 	groupsRan := 0
-	runID, err := newRunID()
-	if err != nil {
-		t.Fatalf("conformance: generate run id: %v", err)
-	}
 	for _, profile := range []Profile{ProfileFull, ProfileStrictPortability} {
 		var result ProfileReport
 		profileStarted := false
@@ -522,20 +522,41 @@ func purgeIfSupported(ctx context.Context, conn driver.Conn, destination string)
 	return err
 }
 
-func validateFaultInjector(t *testing.T, ctx context.Context, conn driver.Conn, inject FaultInjector) {
+func purgeAndPruneIfSupported(ctx context.Context, conn driver.Conn, destination string) error {
+	maintenance, ok := conn.Admin().(driver.Maintenance)
+	if !ok {
+		return nil
+	}
+	if _, err := maintenance.Purge(ctx, destination); err != nil && !errors.Is(err, driver.ErrDestinationMissing) {
+		return err
+	}
+	return pruneProfileDestination(ctx, maintenance, destination)
+}
+
+func runScopedDestination(runID, destination string) string {
+	return destination + "." + runID
+}
+
+func validateFaultInjector(t *testing.T, ctx context.Context, conn driver.Conn, inject FaultInjector, runID string) {
 	t.Helper()
 	if inject == nil {
 		t.Fatal("conformance: NewFaultInjector returned nil")
 	}
-	const destination = "conformance.fault-probe"
+	destination := runScopedDestination(runID, "conformance.fault-probe")
 	if _, err := conn.Admin().EnsureTopology(ctx, driver.TopologySpec{Destinations: []driver.DestinationSpec{{Name: destination}}}); err != nil {
 		t.Fatalf("conformance: fault injector topology: %v", err)
 	}
 	producer, err := conn.Producer(ctx, driver.ProducerConfig{})
 	if err != nil {
+		_ = purgeAndPruneIfSupported(ctx, conn, destination)
 		t.Fatalf("conformance: fault injector producer: %v", err)
 	}
-	defer func() { _ = producer.Close(ctx) }()
+	defer func() {
+		_ = producer.Close(ctx)
+		if err := purgeAndPruneIfSupported(ctx, conn, destination); err != nil {
+			t.Errorf("conformance: fault injector purge: %v", err)
+		}
+	}()
 	if err := inject(ctx, FaultPublishFailure); err != nil {
 		t.Fatalf("conformance: inject %s: %v", FaultPublishFailure, err)
 	}
@@ -545,22 +566,23 @@ func validateFaultInjector(t *testing.T, ctx context.Context, conn driver.Conn, 
 		t.Fatalf("conformance: fault injector %s was not observed as transient publish failure: %v", FaultPublishFailure, err)
 	}
 	for _, fault := range []FaultKind{FaultConnectionDrop, FaultDeliveryFailure} {
-		validateFaultRedelivery(t, ctx, conn, inject, fault)
+		validateFaultRedelivery(t, ctx, conn, inject, runID, fault)
 	}
-	validateFaultLaneClose(t, ctx, conn, inject)
-	const fatalDestination = "conformance.fault-fatal-probe"
+	validateFaultLaneClose(t, ctx, conn, inject, runID)
+	fatalDestination := runScopedDestination(runID, "conformance.fault-fatal-probe")
 	if _, err := conn.Admin().EnsureTopology(ctx, driver.TopologySpec{Destinations: []driver.DestinationSpec{{Name: fatalDestination}}}); err != nil {
 		t.Fatalf("conformance: fatal fault topology: %v", err)
 	}
 	fatalProducer, err := conn.Producer(ctx, driver.ProducerConfig{Effective: conn.Capabilities()})
 	if err != nil {
+		_ = purgeAndPruneIfSupported(ctx, conn, fatalDestination)
 		t.Fatalf("conformance: fatal fault producer: %v", err)
 	}
 	defer func() {
 		if err := fatalProducer.Close(ctx); err != nil {
 			t.Errorf("conformance: fatal fault producer close: %v", err)
 		}
-		if err := purgeIfSupported(ctx, conn, fatalDestination); err != nil {
+		if err := purgeAndPruneIfSupported(ctx, conn, fatalDestination); err != nil {
 			t.Errorf("conformance: fatal fault purge: %v", err)
 		}
 	}()
@@ -574,10 +596,10 @@ func validateFaultInjector(t *testing.T, ctx context.Context, conn driver.Conn, 
 	}
 }
 
-func validateFaultLaneClose(t *testing.T, ctx context.Context, conn driver.Conn, inject FaultInjector) {
+func validateFaultLaneClose(t *testing.T, ctx context.Context, conn driver.Conn, inject FaultInjector, runID string) {
 	t.Helper()
-	const firstDestination = "conformance.fault-lane-close.first"
-	const secondDestination = "conformance.fault-lane-close.second"
+	firstDestination := runScopedDestination(runID, "conformance.fault-lane-close.first")
+	secondDestination := runScopedDestination(runID, "conformance.fault-lane-close.second")
 	if _, err := conn.Admin().EnsureTopology(ctx, driver.TopologySpec{Destinations: []driver.DestinationSpec{
 		{Name: firstDestination}, {Name: secondDestination},
 	}}); err != nil {
@@ -585,6 +607,8 @@ func validateFaultLaneClose(t *testing.T, ctx context.Context, conn driver.Conn,
 	}
 	producer, err := conn.Producer(ctx, driver.ProducerConfig{Effective: conn.Capabilities()})
 	if err != nil {
+		_ = purgeAndPruneIfSupported(ctx, conn, firstDestination)
+		_ = purgeAndPruneIfSupported(ctx, conn, secondDestination)
 		t.Fatalf("conformance: lane close producer: %v", err)
 	}
 	consumer, err := conn.Consumer(ctx, driver.ConsumerConfig{
@@ -598,6 +622,8 @@ func validateFaultLaneClose(t *testing.T, ctx context.Context, conn driver.Conn,
 	})
 	if err != nil {
 		_ = producer.Close(ctx)
+		_ = purgeAndPruneIfSupported(ctx, conn, firstDestination)
+		_ = purgeAndPruneIfSupported(ctx, conn, secondDestination)
 		t.Fatalf("conformance: lane close consumer: %v", err)
 	}
 	defer func() {
@@ -608,7 +634,7 @@ func validateFaultLaneClose(t *testing.T, ctx context.Context, conn driver.Conn,
 			t.Errorf("conformance: lane close producer close: %v", err)
 		}
 		for _, destination := range []string{firstDestination, secondDestination} {
-			if err := purgeIfSupported(ctx, conn, destination); err != nil {
+			if err := purgeAndPruneIfSupported(ctx, conn, destination); err != nil {
 				t.Errorf("conformance: lane close purge %q: %v", destination, err)
 			}
 		}
@@ -666,14 +692,15 @@ func validateFaultLaneClose(t *testing.T, ctx context.Context, conn driver.Conn,
 	}
 }
 
-func validateFaultRedelivery(t *testing.T, ctx context.Context, conn driver.Conn, inject FaultInjector, fault FaultKind) {
+func validateFaultRedelivery(t *testing.T, ctx context.Context, conn driver.Conn, inject FaultInjector, runID string, fault FaultKind) {
 	t.Helper()
-	destination := "conformance.fault-" + string(fault)
+	destination := runScopedDestination(runID, "conformance.fault-"+string(fault))
 	if _, err := conn.Admin().EnsureTopology(ctx, driver.TopologySpec{Destinations: []driver.DestinationSpec{{Name: destination}}}); err != nil {
 		t.Fatalf("conformance: %s topology: %v", fault, err)
 	}
 	producer, err := conn.Producer(ctx, driver.ProducerConfig{Effective: conn.Capabilities()})
 	if err != nil {
+		_ = purgeAndPruneIfSupported(ctx, conn, destination)
 		t.Fatalf("conformance: %s producer: %v", fault, err)
 	}
 	consumer, err := conn.Consumer(ctx, driver.ConsumerConfig{
@@ -681,6 +708,7 @@ func validateFaultRedelivery(t *testing.T, ctx context.Context, conn driver.Conn
 	})
 	if err != nil {
 		_ = producer.Close(ctx)
+		_ = purgeAndPruneIfSupported(ctx, conn, destination)
 		t.Fatalf("conformance: %s consumer: %v", fault, err)
 	}
 	defer func() {
@@ -690,7 +718,7 @@ func validateFaultRedelivery(t *testing.T, ctx context.Context, conn driver.Conn
 		if err := producer.Close(ctx); err != nil {
 			t.Errorf("conformance: %s producer close: %v", fault, err)
 		}
-		if err := purgeIfSupported(ctx, conn, destination); err != nil {
+		if err := purgeAndPruneIfSupported(ctx, conn, destination); err != nil {
 			t.Errorf("conformance: %s purge: %v", fault, err)
 		}
 	}()
@@ -750,12 +778,12 @@ func receiveFaultErrorProbe(t *testing.T, ctx context.Context, consumer driver.C
 	}
 }
 
-func validateDeadlineFixture(t *testing.T, ctx context.Context, conn driver.Conn, fixture DeadlineFixture) {
+func validateDeadlineFixture(t *testing.T, ctx context.Context, conn driver.Conn, fixture DeadlineFixture, runID string) {
 	t.Helper()
 	if fixture == nil {
 		t.Fatal("conformance: NewDeadlineFixture returned nil")
 	}
-	const destination = "conformance.deadline-probe"
+	destination := runScopedDestination(runID, "conformance.deadline-probe")
 	if _, err := conn.Admin().EnsureTopology(ctx, driver.TopologySpec{
 		Destinations: []driver.DestinationSpec{{Name: destination}},
 	}); err != nil {
@@ -766,6 +794,7 @@ func validateDeadlineFixture(t *testing.T, ctx context.Context, conn driver.Conn
 		Effective:         conn.Capabilities(),
 	})
 	if err != nil {
+		_ = purgeAndPruneIfSupported(ctx, conn, destination)
 		t.Fatalf("conformance: deadline fixture producer: %v", err)
 	}
 	consumer, err := fixture.Consumer(ctx, 10*time.Millisecond, driver.ConsumerConfig{
@@ -775,6 +804,7 @@ func validateDeadlineFixture(t *testing.T, ctx context.Context, conn driver.Conn
 	})
 	if err != nil {
 		_ = producer.Close(ctx)
+		_ = purgeAndPruneIfSupported(ctx, conn, destination)
 		t.Fatalf("conformance: deadline fixture consumer: %v", err)
 	}
 	cleanup := func() {
@@ -784,7 +814,7 @@ func validateDeadlineFixture(t *testing.T, ctx context.Context, conn driver.Conn
 		if err := producer.Close(ctx); err != nil {
 			t.Errorf("conformance: deadline fixture close producer: %v", err)
 		}
-		if err := purgeIfSupported(ctx, conn, destination); err != nil {
+		if err := purgeAndPruneIfSupported(ctx, conn, destination); err != nil {
 			t.Errorf("conformance: deadline fixture purge: %v", err)
 		}
 	}

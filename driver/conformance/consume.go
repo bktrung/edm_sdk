@@ -16,14 +16,14 @@ func init() {
 
 func runConsume(group *groupContext) {
 	group.Check("delivered message preserves portable identity", func(t *testing.T) {
-		producer := newProducer(t, group, "consume.identity", driver.ProducerConfig{Effective: group.effective})
+		producer := newProducer(t, group, profileDestination(group, "consume.identity"), driver.ProducerConfig{Effective: group.effective})
 		wantHeaders := []driver.Header{{Key: "x-trace", Value: []byte("trace-1")}, {Key: "x-empty", Value: nil}}
 		if err := producer.Publish(group.ctx, driver.OutboundMessage{
 			Destination: "consume.identity", Key: []byte("order-42"), Headers: wantHeaders, Body: []byte("body"),
 		}); err != nil {
 			t.Fatalf("Publish() error = %v", err)
 		}
-		message := receiveMessage(t, group, newConsumer(t, group, "consume.identity", 1))
+		message := receiveMessage(t, group, newConsumer(t, group, profileDestination(group, "consume.identity"), 1))
 		if message.Destination != "consume.identity" {
 			t.Fatalf("Destination = %q, want %q", message.Destination, "consume.identity")
 		}
@@ -47,11 +47,11 @@ func runConsume(group *groupContext) {
 	})
 
 	group.Check("delivery count uses minus one when unavailable", func(t *testing.T) {
-		producer := newProducer(t, group, "consume.delivery-count", driver.ProducerConfig{Effective: group.effective})
+		producer := newProducer(t, group, profileDestination(group, "consume.delivery-count"), driver.ProducerConfig{Effective: group.effective})
 		if err := producer.Publish(group.ctx, driver.OutboundMessage{Destination: "consume.delivery-count"}); err != nil {
 			t.Fatalf("Publish() error = %v", err)
 		}
-		message := receiveMessage(t, group, newConsumer(t, group, "consume.delivery-count", 1))
+		message := receiveMessage(t, group, newConsumer(t, group, profileDestination(group, "consume.delivery-count"), 1))
 		if group.effective.NativeDeliveryCount {
 			if message.DeliveryCount < 0 {
 				t.Fatalf("DeliveryCount = %d, want a usable count", message.DeliveryCount)
@@ -64,8 +64,8 @@ func runConsume(group *groupContext) {
 	})
 
 	group.Check("one consumer receives every configured destination", func(t *testing.T) {
-		producerA := newProducer(t, group, "consume.dest-a", driver.ProducerConfig{Effective: group.effective})
-		producerB := newProducer(t, group, "consume.dest-b", driver.ProducerConfig{Effective: group.effective})
+		producerA := newProducer(t, group, profileDestination(group, "consume.dest-a"), driver.ProducerConfig{Effective: group.effective})
+		producerB := newProducer(t, group, profileDestination(group, "consume.dest-b"), driver.ProducerConfig{Effective: group.effective})
 		if err := producerA.Publish(group.ctx, driver.OutboundMessage{Destination: "consume.dest-a", Body: []byte("a")}); err != nil {
 			t.Fatalf("Publish(a) error = %v", err)
 		}
@@ -88,8 +88,8 @@ func runConsume(group *groupContext) {
 	})
 
 	group.Check("prefetch saturates at the subscription budget", func(t *testing.T) {
-		producerA := newProducer(t, group, "consume.prefetch-total-a", driver.ProducerConfig{Effective: group.effective})
-		producerB := newProducer(t, group, "consume.prefetch-total-b", driver.ProducerConfig{Effective: group.effective})
+		producerA := newProducer(t, group, profileDestination(group, "consume.prefetch-total-a"), driver.ProducerConfig{Effective: group.effective})
+		producerB := newProducer(t, group, profileDestination(group, "consume.prefetch-total-b"), driver.ProducerConfig{Effective: group.effective})
 		consumer := newConsumerFor(t, group, driver.ConsumerConfig{
 			Destinations: []string{"consume.prefetch-total-a", "consume.prefetch-total-b"}, Prefetch: 4,
 			PerDestination: map[string]int{"consume.prefetch-total-a": 2, "consume.prefetch-total-b": 2}, Effective: group.effective,
@@ -115,8 +115,8 @@ func runConsume(group *groupContext) {
 	})
 
 	group.Check("prefetch applies each destination share", func(t *testing.T) {
-		producerA := newProducer(t, group, "consume.prefetch-share-a", driver.ProducerConfig{Effective: group.effective})
-		producerB := newProducer(t, group, "consume.prefetch-share-b", driver.ProducerConfig{Effective: group.effective})
+		producerA := newProducer(t, group, profileDestination(group, "consume.prefetch-share-a"), driver.ProducerConfig{Effective: group.effective})
+		producerB := newProducer(t, group, profileDestination(group, "consume.prefetch-share-b"), driver.ProducerConfig{Effective: group.effective})
 		consumer := newConsumerFor(t, group, driver.ConsumerConfig{
 			Destinations: []string{"consume.prefetch-share-a", "consume.prefetch-share-b"}, Prefetch: 4,
 			PerDestination: map[string]int{"consume.prefetch-share-a": 1, "consume.prefetch-share-b": 3}, Effective: group.effective,
@@ -133,8 +133,8 @@ func runConsume(group *groupContext) {
 	})
 
 	group.Check("pause stops only the requested destination", func(t *testing.T) {
-		producerA := newProducer(t, group, "consume.pause-a", driver.ProducerConfig{Effective: group.effective})
-		producerB := newProducer(t, group, "consume.pause-b", driver.ProducerConfig{Effective: group.effective})
+		producerA := newProducer(t, group, profileDestination(group, "consume.pause-a"), driver.ProducerConfig{Effective: group.effective})
+		producerB := newProducer(t, group, profileDestination(group, "consume.pause-b"), driver.ProducerConfig{Effective: group.effective})
 		consumer := newConsumerFor(t, group, driver.ConsumerConfig{
 			Destinations: []string{"consume.pause-a", "consume.pause-b"}, Prefetch: 2, Effective: group.effective,
 		})
@@ -171,8 +171,8 @@ func runConsume(group *groupContext) {
 	})
 
 	group.Check("empty pause stops every destination and resume restarts delivery", func(t *testing.T) {
-		producerA := newProducer(t, group, "consume.pause-all-a", driver.ProducerConfig{Effective: group.effective})
-		producerB := newProducer(t, group, "consume.pause-all-b", driver.ProducerConfig{Effective: group.effective})
+		producerA := newProducer(t, group, profileDestination(group, "consume.pause-all-a"), driver.ProducerConfig{Effective: group.effective})
+		producerB := newProducer(t, group, profileDestination(group, "consume.pause-all-b"), driver.ProducerConfig{Effective: group.effective})
 		consumer := newConsumerFor(t, group, driver.ConsumerConfig{
 			Destinations: []string{"consume.pause-all-a", "consume.pause-all-b"}, Prefetch: 2, Effective: group.effective,
 		})
@@ -212,8 +212,8 @@ func runConsume(group *groupContext) {
 	})
 
 	group.Check("repeated pause is idempotent", func(t *testing.T) {
-		producerA := newProducer(t, group, "consume.pause-repeat-a", driver.ProducerConfig{Effective: group.effective})
-		producerB := newProducer(t, group, "consume.pause-repeat-b", driver.ProducerConfig{Effective: group.effective})
+		producerA := newProducer(t, group, profileDestination(group, "consume.pause-repeat-a"), driver.ProducerConfig{Effective: group.effective})
+		producerB := newProducer(t, group, profileDestination(group, "consume.pause-repeat-b"), driver.ProducerConfig{Effective: group.effective})
 		consumer := newConsumerFor(t, group, driver.ConsumerConfig{
 			Destinations: []string{"consume.pause-repeat-a", "consume.pause-repeat-b"}, Prefetch: 2, Effective: group.effective,
 		})
@@ -253,8 +253,8 @@ func runConsume(group *groupContext) {
 	})
 
 	group.Check("resume delivers every message that arrived while paused", func(t *testing.T) {
-		producer := newProducer(t, group, "consume.resume", driver.ProducerConfig{Effective: group.effective})
-		consumer := newConsumer(t, group, "consume.resume", 3)
+		producer := newProducer(t, group, profileDestination(group, "consume.resume"), driver.ProducerConfig{Effective: group.effective})
+		consumer := newConsumer(t, group, profileDestination(group, "consume.resume"), 3)
 		if err := consumer.Pause("consume.resume"); err != nil {
 			t.Fatalf("Pause() error = %v", err)
 		}
@@ -270,8 +270,8 @@ func runConsume(group *groupContext) {
 	})
 
 	group.Check("paused destination stays within its prefetch share", func(t *testing.T) {
-		producer := newProducer(t, group, "consume.pause-bound", driver.ProducerConfig{Effective: group.effective})
-		consumer := newConsumer(t, group, "consume.pause-bound", 2)
+		producer := newProducer(t, group, profileDestination(group, "consume.pause-bound"), driver.ProducerConfig{Effective: group.effective})
+		consumer := newConsumer(t, group, profileDestination(group, "consume.pause-bound"), 2)
 		publishCount(t, group, producer, "consume.pause-bound", 2)
 		first := receiveMessage(t, group, consumer)
 		second := receiveMessage(t, group, consumer)
@@ -297,8 +297,8 @@ func runConsume(group *groupContext) {
 	})
 
 	group.Check("errors remains open across lifecycle controls", func(t *testing.T) {
-		_ = newProducer(t, group, "consume.errors", driver.ProducerConfig{Effective: group.effective})
-		consumer := newConsumer(t, group, "consume.errors", 1)
+		_ = newProducer(t, group, profileDestination(group, "consume.errors"), driver.ProducerConfig{Effective: group.effective})
+		consumer := newConsumer(t, group, profileDestination(group, "consume.errors"), 1)
 		select {
 		case _, ok := <-consumer.Errors():
 			if !ok {
@@ -326,11 +326,11 @@ func runConsume(group *groupContext) {
 	})
 
 	group.Check("StartEarliest includes retained messages for a new group", func(t *testing.T) {
-		destination := "consume.earliest." + group.profile.String()
+		destination := "consume.earliest"
 		groupName := "consume-earliest-new-" + group.runID + "-" + group.profile.String()
 		maintenance := group.maintenance(t)
 		purgeAndCleanupTopologyDestinations(t, maintenance, group.ctx, destination)
-		producer := newProducer(t, group, destination, driver.ProducerConfig{Effective: group.effective})
+		producer := newProducer(t, group, profileDestination(group, destination), driver.ProducerConfig{Effective: group.effective})
 		if err := producer.Publish(group.ctx, driver.OutboundMessage{Destination: destination, Body: []byte("retained")}); err != nil {
 			t.Fatalf("Publish() error = %v", err)
 		}
@@ -347,11 +347,11 @@ func runConsume(group *groupContext) {
 	})
 
 	group.Check("StartAt does not reposition an existing group", func(t *testing.T) {
-		destination := "consume.existing-group." + group.profile.String()
+		destination := "consume.existing-group"
 		groupName := "consume-existing-" + group.runID + "-" + group.profile.String()
 		maintenance := group.maintenance(t)
 		purgeAndCleanupTopologyDestinations(t, maintenance, group.ctx, destination)
-		producer := newProducer(t, group, destination, driver.ProducerConfig{Effective: group.effective})
+		producer := newProducer(t, group, profileDestination(group, destination), driver.ProducerConfig{Effective: group.effective})
 		if err := producer.Publish(group.ctx, driver.OutboundMessage{Destination: destination, Body: []byte("first")}); err != nil {
 			t.Fatalf("Publish(first) error = %v", err)
 		}
@@ -380,7 +380,7 @@ func runConsume(group *groupContext) {
 	})
 
 	group.Check("zero-value consumer configuration delivers", func(t *testing.T) {
-		producer := newProducer(t, group, "consume.zero", driver.ProducerConfig{Effective: group.effective})
+		producer := newProducer(t, group, profileDestination(group, "consume.zero"), driver.ProducerConfig{Effective: group.effective})
 		if err := producer.Publish(group.ctx, driver.OutboundMessage{Destination: "consume.zero", Body: []byte("default")}); err != nil {
 			t.Fatalf("Publish() error = %v", err)
 		}
@@ -395,9 +395,10 @@ func runConsume(group *groupContext) {
 
 	group.Check("canceled consumer creation returns context cancellation", func(t *testing.T) {
 		ctx, cancel := context.WithCancel(group.ctx)
-		producer := newProducer(t, group, "consume.cancel-create", driver.ProducerConfig{Effective: group.effective})
+		producer := newProducer(t, group, profileDestination(group, "consume.cancel-create"), driver.ProducerConfig{Effective: group.effective})
 		cancel()
-		_, err := group.conn.Consumer(ctx, driver.ConsumerConfig{Destinations: []string{"consume.cancel-create"}})
+		cfg, _ := profileConsumerConfig(group, driver.ConsumerConfig{Destinations: []string{"consume.cancel-create"}})
+		_, err := group.conn.Consumer(ctx, cfg)
 		if !errors.Is(err, context.Canceled) {
 			t.Fatalf("Consumer() error = %v, want context.Canceled", err)
 		}
@@ -405,14 +406,14 @@ func runConsume(group *groupContext) {
 			t.Fatalf("Consumer() classification = (%v, %t), want transient", kind, ok)
 		}
 		publishCount(t, group, producer, "consume.cancel-create", 3)
-		consumer := newConsumer(t, group, "consume.cancel-create", 1)
+		consumer := newConsumer(t, group, profileDestination(group, "consume.cancel-create"), 1)
 		ackAll(t, group, consumer, 3)
 		group.vector.Add(BehaviorEvent{ID: "cancel-consumer", Outcome: "cancelled", FinalDestination: "consume.cancel-create"})
 	})
 
 	group.Check("canceled Drain returns without changing consumer state", func(t *testing.T) {
-		producer := newProducer(t, group, "consume.cancel-drain", driver.ProducerConfig{Effective: group.effective})
-		consumer := newConsumer(t, group, "consume.cancel-drain", 1)
+		producer := newProducer(t, group, profileDestination(group, "consume.cancel-drain"), driver.ProducerConfig{Effective: group.effective})
+		consumer := newConsumer(t, group, profileDestination(group, "consume.cancel-drain"), 1)
 		ctx, cancel := context.WithCancel(group.ctx)
 		cancel()
 		assertCancelled(t, "Drain", consumer.Drain(ctx))
@@ -428,8 +429,8 @@ func runConsume(group *groupContext) {
 	})
 
 	group.Check("canceled Lag returns context cancellation", func(t *testing.T) {
-		_ = newProducer(t, group, "consume.cancel-lag", driver.ProducerConfig{Effective: group.effective})
-		consumer := newConsumer(t, group, "consume.cancel-lag", 1)
+		_ = newProducer(t, group, profileDestination(group, "consume.cancel-lag"), driver.ProducerConfig{Effective: group.effective})
+		consumer := newConsumer(t, group, profileDestination(group, "consume.cancel-lag"), 1)
 		ctx, cancel := context.WithCancel(group.ctx)
 		cancel()
 		_, err := consumer.Lag(ctx)
@@ -438,8 +439,8 @@ func runConsume(group *groupContext) {
 	})
 
 	group.Check("canceled Stop returns context cancellation", func(t *testing.T) {
-		producer := newProducer(t, group, "consume.cancel-stop", driver.ProducerConfig{Effective: group.effective})
-		consumer := newConsumer(t, group, "consume.cancel-stop", 1)
+		producer := newProducer(t, group, profileDestination(group, "consume.cancel-stop"), driver.ProducerConfig{Effective: group.effective})
+		consumer := newConsumer(t, group, profileDestination(group, "consume.cancel-stop"), 1)
 		ctx, cancel := context.WithCancel(group.ctx)
 		cancel()
 		assertCancelled(t, "Stop", consumer.Stop(ctx))
@@ -455,8 +456,8 @@ func runConsume(group *groupContext) {
 	})
 	group.Check("canceled Release returns transient and leaves consumer usable", func(t *testing.T) {
 		name := "consume.cancel-release"
-		producer := newProducer(t, group, name, driver.ProducerConfig{Effective: group.effective})
-		consumer := newConsumer(t, group, name, 1)
+		producer := newProducer(t, group, profileDestination(group, name), driver.ProducerConfig{Effective: group.effective})
+		consumer := newConsumer(t, group, profileDestination(group, name), 1)
 		ctx, cancel := context.WithCancel(group.ctx)
 		cancel()
 		assertCancelled(t, "Release", consumer.Release(ctx))
@@ -474,16 +475,18 @@ func runConsume(group *groupContext) {
 
 func newConsumerFor(t *testing.T, group *groupContext, cfg driver.ConsumerConfig) driver.Consumer {
 	t.Helper()
+	cfg, logical := profileConsumerConfig(group, cfg)
 	consumer, err := group.conn.Consumer(group.ctx, cfg)
 	if err != nil {
 		t.Fatalf("Consumer(%v): %v", cfg.Destinations, err)
 	}
+	wrapped := newProfileConsumer(group, consumer, logical)
 	t.Cleanup(func() {
-		if err := consumer.Stop(group.ctx); err != nil {
+		if err := wrapped.Stop(group.ctx); err != nil {
 			t.Errorf("stop consumer %v: %v", cfg.Destinations, err)
 		}
 	})
-	return consumer
+	return wrapped
 }
 
 func publishCount(t *testing.T, group *groupContext, producer driver.Producer, destination string, count int) {

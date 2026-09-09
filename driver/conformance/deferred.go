@@ -21,8 +21,8 @@ func runDeferred(group *groupContext) {
 	group.Check("explicit due time is never delivered early", func(t *testing.T) {
 		deferred := "deferred.never-early"
 		control := "deferred.never-early.control"
-		producer := newDeferredProducer(t, group, deferred, deferredDelay)
-		controlProducer := newProducer(t, group, control, driver.ProducerConfig{Effective: group.effective})
+		producer := newDeferredProducer(t, group, profileDestination(group, deferred), deferredDelay)
+		controlProducer := newProducer(t, group, profileDestination(group, control), driver.ProducerConfig{Effective: group.effective})
 		consumer := deferredConsumer(t, group, []string{deferred, control}, 2)
 		publishedAt := deferredNow(group)
 		due := publishedAt.Add(deferredDelay)
@@ -49,7 +49,7 @@ func runDeferred(group *groupContext) {
 
 	group.Check("deferred delivery is bounded in lateness", func(t *testing.T) {
 		name := "deferred.bounded-late"
-		producer := newDeferredProducer(t, group, name, deferredDelay)
+		producer := newDeferredProducer(t, group, profileDestination(group, name), deferredDelay)
 		consumer := deferredConsumer(t, group, []string{name}, 1)
 		due := deferredNow(group).Add(deferredDelay)
 		if err := producer.Publish(group.ctx, driver.OutboundMessage{Destination: name, Body: []byte("bounded"), DelayUntil: due}); err != nil {
@@ -66,7 +66,7 @@ func runDeferred(group *groupContext) {
 
 	group.Check("each in-band due time is delivered", func(t *testing.T) {
 		name := "deferred.band"
-		producer := newDeferredProducer(t, group, name, deferredDelay)
+		producer := newDeferredProducer(t, group, profileDestination(group, name), deferredDelay)
 		consumer := deferredConsumer(t, group, []string{name}, 3)
 		base := deferredNow(group)
 		offsets := []time.Duration{deferredDelay * 4 / 5, deferredDelay, deferredDelay * 6 / 5}
@@ -110,8 +110,8 @@ func runDeferred(group *groupContext) {
 	group.Check("destination delay supplies a zero due time", func(t *testing.T) {
 		name := "deferred.destination-delay"
 		control := "deferred.destination-delay.control"
-		producer := newDeferredProducer(t, group, name, deferredDelay)
-		controlProducer := newProducer(t, group, control, driver.ProducerConfig{Effective: group.effective})
+		producer := newDeferredProducer(t, group, profileDestination(group, name), deferredDelay)
+		controlProducer := newProducer(t, group, profileDestination(group, control), driver.ProducerConfig{Effective: group.effective})
 		consumer := deferredConsumer(t, group, []string{name, control}, 2)
 		publishedAt := deferredNow(group)
 		if err := producer.Publish(group.ctx, driver.OutboundMessage{Destination: name, Body: []byte("destination-delay")}); err != nil {
@@ -138,7 +138,7 @@ func runDeferred(group *groupContext) {
 
 	group.Check("zero destination delay and zero due time deliver immediately", func(t *testing.T) {
 		name := "deferred.zero"
-		producer := newProducer(t, group, name, driver.ProducerConfig{Effective: group.effective})
+		producer := newProducer(t, group, profileDestination(group, name), driver.ProducerConfig{Effective: group.effective})
 		consumer := deferredConsumer(t, group, []string{name}, 1)
 		publishedAt := deferredNow(group)
 		if err := producer.Publish(group.ctx, driver.OutboundMessage{Destination: name, Body: []byte("zero")}); err != nil {
@@ -158,8 +158,8 @@ func runDeferred(group *groupContext) {
 	group.Check("Auxiliary counts not-yet-due messages separately", func(t *testing.T) {
 		name := "deferred.auxiliary"
 		control := "deferred.auxiliary.control"
-		producer := newDeferredProducer(t, group, name, deferredDelay)
-		controlProducer := newProducer(t, group, control, driver.ProducerConfig{Effective: group.effective})
+		producer := newDeferredProducer(t, group, profileDestination(group, name), deferredDelay)
+		controlProducer := newProducer(t, group, profileDestination(group, control), driver.ProducerConfig{Effective: group.effective})
 		due := deferredNow(group).Add(deferredDelay)
 		if err := producer.Publish(group.ctx, driver.OutboundMessage{Destination: name, DelayUntil: due}); err != nil {
 			t.Fatal(err)
@@ -179,8 +179,8 @@ func runDeferred(group *groupContext) {
 	group.Check("Ready excludes Auxiliary messages and preserves total depth", func(t *testing.T) {
 		name := "deferred.ready"
 		control := "deferred.ready.control"
-		producer := newDeferredProducer(t, group, name, deferredDelay)
-		controlProducer := newProducer(t, group, control, driver.ProducerConfig{Effective: group.effective})
+		producer := newDeferredProducer(t, group, profileDestination(group, name), deferredDelay)
+		controlProducer := newProducer(t, group, profileDestination(group, control), driver.ProducerConfig{Effective: group.effective})
 		due := deferredNow(group).Add(deferredDelay)
 		if err := producer.Publish(group.ctx, driver.OutboundMessage{Destination: name, DelayUntil: due}); err != nil {
 			t.Fatal(err)
@@ -200,8 +200,8 @@ func runDeferred(group *groupContext) {
 	group.Check("Auxiliary messages become Ready at their due time", func(t *testing.T) {
 		name := "deferred.release"
 		control := "deferred.release.control"
-		producer := newDeferredProducer(t, group, name, deferredDelay)
-		controlProducer := newProducer(t, group, control, driver.ProducerConfig{Effective: group.effective})
+		producer := newDeferredProducer(t, group, profileDestination(group, name), deferredDelay)
+		controlProducer := newProducer(t, group, profileDestination(group, control), driver.ProducerConfig{Effective: group.effective})
 		due := deferredNow(group).Add(deferredDelay)
 		if err := producer.Publish(group.ctx, driver.OutboundMessage{Destination: name, Body: []byte("release"), DelayUntil: due}); err != nil {
 			t.Fatal(err)
@@ -232,14 +232,16 @@ func runDeferred(group *groupContext) {
 		}
 		name := "deferred.deadline"
 		control := "deferred.deadline.control"
-		producer := newDeferredProducer(t, group, name, deferredDelay)
-		controlProducer := newProducer(t, group, control, driver.ProducerConfig{Effective: group.effective})
-		consumer, err := group.deadline.Consumer(group.ctx, 10*time.Millisecond, driver.ConsumerConfig{
+		producer := newDeferredProducer(t, group, profileDestination(group, name), deferredDelay)
+		controlProducer := newProducer(t, group, profileDestination(group, control), driver.ProducerConfig{Effective: group.effective})
+		cfg, logical := profileConsumerConfig(group, driver.ConsumerConfig{
 			Destinations: []string{name, control}, Prefetch: 2, Effective: group.effective,
 		})
+		rawConsumer, err := group.deadline.Consumer(group.ctx, 10*time.Millisecond, cfg)
 		if err != nil {
 			t.Fatal(err)
 		}
+		consumer := newProfileConsumer(group, rawConsumer, logical)
 		t.Cleanup(func() {
 			if err := consumer.Stop(group.ctx); err != nil {
 				t.Errorf("stop deadline consumer: %v", err)
@@ -303,23 +305,25 @@ func newDeferredProducer(t *testing.T, group *groupContext, destination string, 
 			t.Errorf("purge destination %q: %v", destination, err)
 		}
 	})
-	return producer
+	return &profileProducer{group: group, producer: producer, scoped: destination != unprofileDestination(group, destination)}
 }
 
 func deferredConsumer(t *testing.T, group *groupContext, destinations []string, prefetch int) driver.Consumer {
 	t.Helper()
+	scoped, logical := profileDestinations(group, destinations)
 	consumer, err := group.conn.Consumer(group.ctx, driver.ConsumerConfig{
-		Destinations: destinations, Prefetch: prefetch, Effective: group.effective,
+		Destinations: scoped, Prefetch: prefetch, Effective: group.effective,
 	})
 	if err != nil {
-		t.Fatalf("Consumer(%v): %v", destinations, err)
+		t.Fatalf("Consumer(%v): %v", scoped, err)
 	}
+	wrapped := newProfileConsumer(group, consumer, logical)
 	t.Cleanup(func() {
-		if err := consumer.Stop(group.ctx); err != nil {
-			t.Errorf("stop consumer %v: %v", destinations, err)
+		if err := wrapped.Stop(group.ctx); err != nil {
+			t.Errorf("stop consumer %v: %v", scoped, err)
 		}
 	})
-	return consumer
+	return wrapped
 }
 
 func deferredNow(group *groupContext) time.Time {

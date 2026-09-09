@@ -16,8 +16,8 @@ func init() {
 
 func runSettle(group *groupContext) {
 	group.Check("ack removes delivered message from broker view", func(t *testing.T) {
-		producer := newProducer(t, group, "settle.ack", driver.ProducerConfig{Effective: group.effective})
-		consumer := newConsumer(t, group, "settle.ack", 1)
+		producer := newProducer(t, group, profileDestination(group, "settle.ack"), driver.ProducerConfig{Effective: group.effective})
+		consumer := newConsumer(t, group, profileDestination(group, "settle.ack"), 1)
 		if err := producer.Publish(group.ctx, driver.OutboundMessage{Destination: "settle.ack"}); err != nil {
 			t.Fatal(err)
 		}
@@ -33,8 +33,8 @@ func runSettle(group *groupContext) {
 	})
 
 	group.Check("requeue nack returns the message for redelivery", func(t *testing.T) {
-		producer := newProducer(t, group, "settle.requeue", driver.ProducerConfig{Effective: group.effective})
-		consumer := newConsumer(t, group, "settle.requeue", 1)
+		producer := newProducer(t, group, profileDestination(group, "settle.requeue"), driver.ProducerConfig{Effective: group.effective})
+		consumer := newConsumer(t, group, profileDestination(group, "settle.requeue"), 1)
 		if err := producer.Publish(group.ctx, driver.OutboundMessage{Destination: "settle.requeue"}); err != nil {
 			t.Fatal(err)
 		}
@@ -70,8 +70,8 @@ func runSettle(group *groupContext) {
 	})
 
 	group.Check("zero-value nack does not requeue", func(t *testing.T) {
-		producer := newProducer(t, group, "settle.discard", driver.ProducerConfig{Effective: group.effective})
-		consumer := newConsumer(t, group, "settle.discard", 2)
+		producer := newProducer(t, group, profileDestination(group, "settle.discard"), driver.ProducerConfig{Effective: group.effective})
+		consumer := newConsumer(t, group, profileDestination(group, "settle.discard"), 2)
 		if err := producer.Publish(group.ctx, driver.OutboundMessage{Destination: "settle.discard"}); err != nil {
 			t.Fatal(err)
 		}
@@ -97,8 +97,8 @@ func runSettle(group *groupContext) {
 	})
 
 	group.Check("discard nack does not deliver after settlement", func(t *testing.T) {
-		producer := newProducer(t, group, "settle.no-redelivery", driver.ProducerConfig{Effective: group.effective})
-		consumer := newConsumer(t, group, "settle.no-redelivery", 2)
+		producer := newProducer(t, group, profileDestination(group, "settle.no-redelivery"), driver.ProducerConfig{Effective: group.effective})
+		consumer := newConsumer(t, group, profileDestination(group, "settle.no-redelivery"), 2)
 		if err := producer.Publish(group.ctx, driver.OutboundMessage{Destination: "settle.no-redelivery"}); err != nil {
 			t.Fatal(err)
 		}
@@ -131,8 +131,8 @@ func runSettle(group *groupContext) {
 	})
 
 	group.Check("acked message is never redelivered", func(t *testing.T) {
-		producer := newProducer(t, group, "settle.ack-no-redelivery", driver.ProducerConfig{Effective: group.effective})
-		consumer := newConsumer(t, group, "settle.ack-no-redelivery", 2)
+		producer := newProducer(t, group, profileDestination(group, "settle.ack-no-redelivery"), driver.ProducerConfig{Effective: group.effective})
+		consumer := newConsumer(t, group, profileDestination(group, "settle.ack-no-redelivery"), 2)
 		if err := producer.Publish(group.ctx, driver.OutboundMessage{Destination: "settle.ack-no-redelivery"}); err != nil {
 			t.Fatal(err)
 		}
@@ -167,8 +167,8 @@ func runSettle(group *groupContext) {
 		// A clean Stop requires zero outstanding messages, so this can only ever
 		// reach the message through its already-settled path; it does not exercise
 		// a stop-while-unsettled state (that needs Drain, from a different group).
-		producer := newProducer(t, group, "settle.after-stop", driver.ProducerConfig{Effective: group.effective})
-		consumer := newConsumer(t, group, "settle.after-stop", 1)
+		producer := newProducer(t, group, profileDestination(group, "settle.after-stop"), driver.ProducerConfig{Effective: group.effective})
+		consumer := newConsumer(t, group, profileDestination(group, "settle.after-stop"), 1)
 		if err := producer.Publish(group.ctx, driver.OutboundMessage{Destination: "settle.after-stop"}); err != nil {
 			t.Fatal(err)
 		}
@@ -231,8 +231,8 @@ func runSettle(group *groupContext) {
 	})
 
 	group.Check("out-of-order settlement accounts for every message", func(t *testing.T) {
-		producer := newProducer(t, group, "settle.out-of-order", driver.ProducerConfig{Effective: group.effective})
-		consumer := newConsumer(t, group, "settle.out-of-order", 3)
+		producer := newProducer(t, group, profileDestination(group, "settle.out-of-order"), driver.ProducerConfig{Effective: group.effective})
+		consumer := newConsumer(t, group, profileDestination(group, "settle.out-of-order"), 3)
 		publishCount(t, group, producer, "settle.out-of-order", 3)
 		messages := []driver.InboundMessage{
 			receiveMessage(t, group, consumer),
@@ -252,8 +252,8 @@ func runSettle(group *groupContext) {
 	})
 
 	group.Check("out-of-order requeue and ack lose nothing", func(t *testing.T) {
-		producer := newProducer(t, group, "settle.mixed-order", driver.ProducerConfig{Effective: group.effective})
-		consumer := newConsumer(t, group, "settle.mixed-order", 3)
+		producer := newProducer(t, group, profileDestination(group, "settle.mixed-order"), driver.ProducerConfig{Effective: group.effective})
+		consumer := newConsumer(t, group, profileDestination(group, "settle.mixed-order"), 3)
 		publishCount(t, group, producer, "settle.mixed-order", 3)
 		messages := []driver.InboundMessage{
 			receiveMessage(t, group, consumer),
@@ -294,8 +294,8 @@ func runSettle(group *groupContext) {
 	})
 
 	group.Check("settlement after failed stop is safe", func(t *testing.T) {
-		producer := newProducer(t, group, "settle.stop", driver.ProducerConfig{Effective: group.effective})
-		consumer := newConsumer(t, group, "settle.stop", 1)
+		producer := newProducer(t, group, profileDestination(group, "settle.stop"), driver.ProducerConfig{Effective: group.effective})
+		consumer := newConsumer(t, group, profileDestination(group, "settle.stop"), 1)
 		if err := producer.Publish(group.ctx, driver.OutboundMessage{Destination: "settle.stop"}); err != nil {
 			t.Fatal(err)
 		}
@@ -313,8 +313,8 @@ func runSettle(group *groupContext) {
 	})
 
 	group.Check("distinct messages settle concurrently", func(t *testing.T) {
-		producer := newProducer(t, group, "settle.concurrent", driver.ProducerConfig{Effective: group.effective})
-		consumer := newConsumer(t, group, "settle.concurrent", 4)
+		producer := newProducer(t, group, profileDestination(group, "settle.concurrent"), driver.ProducerConfig{Effective: group.effective})
+		consumer := newConsumer(t, group, profileDestination(group, "settle.concurrent"), 4)
 		publishCount(t, group, producer, "settle.concurrent", 4)
 		messages := make([]driver.InboundMessage, 4)
 		for i := range messages {
@@ -342,8 +342,8 @@ func runSettle(group *groupContext) {
 	})
 
 	group.Check("cancelled ack leaves the message unsettled", func(t *testing.T) {
-		producer := newProducer(t, group, "settle.cancel-ack", driver.ProducerConfig{Effective: group.effective})
-		consumer := newConsumer(t, group, "settle.cancel-ack", 1)
+		producer := newProducer(t, group, profileDestination(group, "settle.cancel-ack"), driver.ProducerConfig{Effective: group.effective})
+		consumer := newConsumer(t, group, profileDestination(group, "settle.cancel-ack"), 1)
 		if err := producer.Publish(group.ctx, driver.OutboundMessage{Destination: "settle.cancel-ack"}); err != nil {
 			t.Fatal(err)
 		}
@@ -364,8 +364,8 @@ func runSettle(group *groupContext) {
 	})
 
 	group.Check("cancelled nack leaves the message unsettled", func(t *testing.T) {
-		producer := newProducer(t, group, "settle.cancel-nack", driver.ProducerConfig{Effective: group.effective})
-		consumer := newConsumer(t, group, "settle.cancel-nack", 1)
+		producer := newProducer(t, group, profileDestination(group, "settle.cancel-nack"), driver.ProducerConfig{Effective: group.effective})
+		consumer := newConsumer(t, group, profileDestination(group, "settle.cancel-nack"), 1)
 		if err := producer.Publish(group.ctx, driver.OutboundMessage{Destination: "settle.cancel-nack"}); err != nil {
 			t.Fatal(err)
 		}
@@ -397,8 +397,8 @@ func runSettle(group *groupContext) {
 // baseline can never absorb second's effect the way a post-hoc read would.
 func assertDoubleSettlement(t *testing.T, group *groupContext, destination string, first, second func(driver.InboundMessage) error, wantAfterFirst BrokerView) {
 	t.Helper()
-	producer := newProducer(t, group, destination, driver.ProducerConfig{Effective: group.effective})
-	consumer := newConsumer(t, group, destination, 1)
+	producer := newProducer(t, group, profileDestination(group, destination), driver.ProducerConfig{Effective: group.effective})
+	consumer := newConsumer(t, group, profileDestination(group, destination), 1)
 	if err := producer.Publish(group.ctx, driver.OutboundMessage{Destination: destination}); err != nil {
 		t.Fatal(err)
 	}
