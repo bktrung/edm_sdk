@@ -15,6 +15,7 @@ import (
 	"github.com/twmb/franz-go/pkg/kgo"
 
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/driver"
+	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/clock"
 )
 
 func openKafkaAdminTest(t *testing.T) (context.Context, *conn, *kadm.Client) {
@@ -243,16 +244,25 @@ func TestEnsureTopologyCreatesAndIsIdempotent(t *testing.T) {
 		},
 		Effective: connection.Capabilities(),
 	}
-
+	started := clock.NewReal().Now()
 	firstDiff, err := connection.Admin().EnsureTopology(ctx, spec)
+	elapsed := clock.NewReal().Since(started)
 	if err != nil {
 		t.Fatalf("first EnsureTopology: %v", err)
 	}
+	t.Logf("EnsureTopology create visibility wait: %s", elapsed)
 	if !namesContainAll(firstDiff.CreatedDestinations, first, second) || len(firstDiff.CreatedDestinations) != 2 {
 		t.Fatalf("first CreatedDestinations = %v, want exactly %q and %q", firstDiff.CreatedDestinations, first, second)
 	}
 	if len(firstDiff.ExistingDestinations) != 0 {
 		t.Fatalf("first ExistingDestinations = %v, want empty", firstDiff.ExistingDestinations)
+	}
+	state, err := connection.Admin().DescribeTopology(ctx, []string{first, second})
+	if err != nil {
+		t.Fatalf("DescribeTopology immediately after EnsureTopology: %v", err)
+	}
+	if len(state.Depth) != 2 {
+		t.Fatalf("DescribeTopology depth = %#v, want both created topics", state.Depth)
 	}
 
 	secondDiff, err := connection.Admin().EnsureTopology(ctx, spec)

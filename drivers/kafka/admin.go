@@ -126,6 +126,7 @@ func (a *admin) Prune(ctx context.Context, names []string) ([]driver.PruneResult
 	}
 	defer releaseMaintenance()
 	results := make([]driver.PruneResult, 0, len(names))
+	deleted := make([]string, 0, len(names))
 	for _, name := range names {
 		reason, err := a.pruneGuard(ctx, name)
 		if err != nil {
@@ -171,7 +172,11 @@ func (a *admin) Prune(ctx context.Context, names []string) ([]driver.PruneResult
 			return nil, classifyAdminError("prune", response.Err)
 		}
 		a.clearDestinationDelay(name)
+		deleted = append(deleted, name)
 		results = append(results, driver.PruneResult{Name: name, Deleted: true})
+	}
+	if err := a.waitForTopicState(ctx, "prune", deleted, topicMustBeAbsent); err != nil {
+		return nil, err
 	}
 	return results, nil
 }
@@ -295,20 +300,22 @@ func (a *admin) createTopic(ctx context.Context, topic kafkaTopicSpec) (kadm.Cre
 	return response, nil
 }
 
-func (a *admin) listTopics(ctx context.Context, names ...string) (kadm.TopicDetails, error) {
+func (a *admin) listTopics(ctx context.Context, operation string, names ...string) (kadm.TopicDetails, error) {
 	topics, err := a.client.ListTopics(kadm.WithAuthorizedOps(ctx), names...)
 	if err != nil {
-		return nil, classifyAdminError("ensure_topology", err)
+		return nil, classifyAdminError(operation, err)
 	}
 	return topics, nil
 }
 
+// listTopicOffsets must observe topic creation and deletion performed through
+// this admin, so both offset lookups bypass cached metadata.
 func (a *admin) listTopicOffsets(ctx context.Context, operation string, names ...string) (kadm.ListedOffsets, kadm.ListedOffsets, error) {
-	starts, err := a.client.ListStartOffsets(ctx, names...)
+	starts, err := a.client.ListStartOffsets(kadm.WithAuthorizedOps(ctx), names...)
 	if err != nil {
 		return nil, nil, classifyAdminError(operation, err)
 	}
-	ends, err := a.client.ListEndOffsets(ctx, names...)
+	ends, err := a.client.ListEndOffsets(kadm.WithAuthorizedOps(ctx), names...)
 	if err != nil {
 		return nil, nil, classifyAdminError(operation, err)
 	}
