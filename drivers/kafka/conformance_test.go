@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -30,6 +32,54 @@ func TestConformance(t *testing.T) {
 		},
 		NewInspector: kafkaInspector,
 	})
+}
+
+func TestInspectorReportsInvalidDeferralHeader(t *testing.T) {
+	ctx, connection, admin := openKafkaAdminTest(t)
+	destination := kafkaTestTopic(t, "inspector-invalid-deferral")
+	cleanupKafkaTopics(t, admin, destination)
+	const delay = time.Second
+	if _, err := connection.Admin().EnsureTopology(ctx, driver.TopologySpec{
+		Destinations: []driver.DestinationSpec{{Name: destination, Delay: delay}},
+		Effective:    connection.Capabilities(),
+	}); err != nil {
+		t.Fatalf("EnsureTopology(%q): %v", destination, err)
+	}
+
+	inspect, err := kafkaInspector(connection)
+	if err != nil {
+		t.Fatalf("kafkaInspector(): %v", err)
+	}
+	record := &kgo.Record{
+		Topic: destination,
+		Value: []byte("invalid-deferred-header"),
+		Headers: []kgo.RecordHeader{{
+			Key:   delayUntilHeader,
+			Value: []byte("not-a-time"),
+		}},
+	}
+	if err := connection.client.ProduceSync(ctx, record).FirstErr(); err != nil {
+		t.Fatalf("ProduceSync(%q): %v", destination, err)
+	}
+
+	_, err = inspect(ctx, destination)
+	if err == nil {
+		t.Fatal("Inspect() error = nil, want invalid deferred header error")
+	}
+	for _, want := range []string{
+		destination,
+		fmt.Sprintf("partition %d", record.Partition),
+		fmt.Sprintf("offset %d", record.Offset),
+		"invalid deferred due-time header",
+	} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("Inspect() error = %v, want %q", err, want)
+		}
+	}
+	var parseErr *strconv.NumError
+	if !errors.As(err, &parseErr) {
+		t.Fatalf("Inspect() error = %v, want wrapped strconv.NumError", err)
+	}
 }
 
 func kafkaInspector(raw driver.Conn) (conformance.Inspect, error) {
@@ -199,7 +249,17 @@ func countDeferredRecords(ctx context.Context, connection *conn, destination str
 			continue
 		}
 		for _, record := range records {
-			if evaluateDeferral(record, delay, true, kafkaNow()).wait {
+			decision := evaluateDeferral(record, delay, true, kafkaNow())
+			if decision.err != nil {
+				if !decision.present {
+					continue
+				}
+				return 0, fmt.Errorf(
+					"kafka inspector: destination %q partition %d offset %d: %w",
+					record.Topic, record.Partition, record.Offset, decision.err,
+				)
+			}
+			if decision.wait {
 				auxiliary++
 			}
 		}

@@ -34,15 +34,73 @@ func TestEvaluateDeferralDueInFutureWaits(t *testing.T) {
 	}
 }
 
+func TestEvaluateDeferralAcceptsLowerBandEdge(t *testing.T) {
+	published := time.Unix(100, 0)
+	delay := 10 * time.Second
+	record := deferredTestRecord(published, published.Add(delay/2))
+
+	decision := evaluateDeferral(record, delay, true, published.Add(delay/2))
+	if decision.err != nil || decision.wait {
+		t.Fatalf("evaluateDeferral() = %#v, want accepted lower edge at due time", decision)
+	}
+}
+
+func TestEvaluateDeferralJitterHalfWaitsUntilDue(t *testing.T) {
+	published := time.Unix(100, 0)
+	delay := 10 * time.Second
+	due := published.Add(delay / 2)
+	record := deferredTestRecord(published, due)
+
+	decision := evaluateDeferral(record, delay, true, published)
+	if decision.err != nil || !decision.wait {
+		t.Fatalf("evaluateDeferral() = %#v, want legal jitter-0.5 due time to wait", decision)
+	}
+}
+
+func TestEvaluateDeferralRejectsJustBelowLowerBand(t *testing.T) {
+	published := time.Unix(100, 0)
+	delay := 10 * time.Second
+	record := deferredTestRecord(published, published.Add(delay/2-time.Nanosecond))
+
+	decision := evaluateDeferral(record, delay, true, published)
+	if decision.err == nil || decision.wait {
+		t.Fatalf("evaluateDeferral() = %#v, want lower-edge rejection without waiting", decision)
+	}
+}
+
 func TestEvaluateDeferralAllowsKafkaTimestampPrecisionAtUpperBand(t *testing.T) {
 	published := time.Unix(100, 0)
 	delay := 10 * time.Second
-	due := published.Add(delay*6/5 + 500*time.Microsecond)
-	record := deferredTestRecord(published.Truncate(time.Millisecond), due)
+	due := published.Add(delay + delay/2 + time.Millisecond)
+	record := deferredTestRecord(published, due)
 
 	decision := evaluateDeferral(record, delay, true, due)
 	if decision.err != nil || decision.wait {
 		t.Fatalf("evaluateDeferral() = %#v, want no error and no wait", decision)
+	}
+}
+
+func TestEvaluateDeferralRejectsJustAboveUpperBand(t *testing.T) {
+	published := time.Unix(100, 0)
+	delay := 10 * time.Second
+	upper := delay + delay/2 + time.Millisecond
+	record := deferredTestRecord(published, published.Add(upper+time.Nanosecond))
+
+	decision := evaluateDeferral(record, delay, true, published)
+	if decision.err == nil || decision.wait {
+		t.Fatalf("evaluateDeferral() = %#v, want upper-edge rejection without waiting", decision)
+	}
+}
+
+func TestEvaluateDeferralAcceptsLargeDelayWithoutUpperOverflow(t *testing.T) {
+	published := time.Unix(0, 0)
+	delay := time.Duration(1<<63 - 1)
+	due := published.Add(delay)
+	record := deferredTestRecord(published, due)
+
+	decision := evaluateDeferral(record, delay, true, due)
+	if decision.err != nil || decision.wait {
+		t.Fatalf("evaluateDeferral() = %#v, want no error and no wait for a large nominal delay", decision)
 	}
 }
 
@@ -120,6 +178,31 @@ func TestEvaluateDeferralUnknownDestinationSurfacesErrorAndDoesNotWait(t *testin
 	}
 	if decision.wait {
 		t.Fatal("evaluateDeferral() wait = true, want delivery after surfacing error")
+	}
+}
+
+func TestEvaluateDeferralMalformedHeaderSurfacesErrorAndDelivers(t *testing.T) {
+	published := time.Unix(100, 0)
+	record := deferredTestRecord(published, published.Add(10*time.Second))
+	record.Headers[0].Value = []byte("not-a-time")
+
+	decision := evaluateDeferral(record, 10*time.Second, true, published)
+	if decision.err == nil || decision.wait {
+		t.Fatalf("evaluateDeferral() = %#v, want malformed-header error without waiting", decision)
+	}
+}
+
+func TestEvaluateDeferralDuplicateHeadersSurfacesErrorAndDelivers(t *testing.T) {
+	published := time.Unix(100, 0)
+	record := deferredTestRecord(published, published.Add(10*time.Second))
+	record.Headers = append(record.Headers, record.Headers[0])
+
+	decision := evaluateDeferral(record, 10*time.Second, true, published)
+	if decision.err == nil || decision.wait {
+		t.Fatalf("evaluateDeferral() = %#v, want duplicate-header error without waiting", decision)
+	}
+	if !strings.Contains(decision.err.Error(), "duplicate deferred due-time headers") {
+		t.Fatalf("evaluateDeferral() error = %v, want duplicate-header error", decision.err)
 	}
 }
 

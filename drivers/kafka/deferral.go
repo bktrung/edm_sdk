@@ -10,12 +10,18 @@ import (
 	"github.com/twmb/franz-go/pkg/kgo"
 )
 
-const kafkaTimestampPrecision = time.Millisecond
+const (
+	kafkaTimestampPrecision      = time.Millisecond
+	kafkaDeferralUpperNumerator  = 3
+	kafkaDeferralBandDenominator = 2
+	kafkaMaxDuration             = time.Duration(1<<63 - 1)
+)
 
 type deferralDecision struct {
-	due  time.Time
-	wait bool
-	err  error
+	due     time.Time
+	present bool
+	wait    bool
+	err     error
 }
 
 func kafkaNow() time.Time {
@@ -25,10 +31,10 @@ func kafkaNow() time.Time {
 func evaluateDeferral(record *kgo.Record, delay time.Duration, known bool, now time.Time) deferralDecision {
 	due, present, err := recordDelayUntil(record)
 	if err != nil {
-		return deferralDecision{err: err}
+		return deferralDecision{present: present, err: err}
 	}
 	if !known {
-		return deferralDecision{err: errors.New("destination delay is unknown")}
+		return deferralDecision{present: present, err: errors.New("destination delay is unknown")}
 	}
 	if !present {
 		if delay > 0 {
@@ -37,18 +43,35 @@ func evaluateDeferral(record *kgo.Record, delay time.Duration, known bool, now t
 		return deferralDecision{}
 	}
 	if delay <= 0 {
-		return deferralDecision{err: errors.New("destination delay is zero")}
+		return deferralDecision{present: true, err: errors.New("destination delay is zero")}
 	}
 	if record.Timestamp.IsZero() {
-		return deferralDecision{err: errors.New("record timestamp is missing")}
+		return deferralDecision{present: true, err: errors.New("record timestamp is missing")}
 	}
-	lower := record.Timestamp.Add(delay * 4 / 5)
-	// Kafka serializes record timestamps to milliseconds, so the upper edge can round down.
-	upper := record.Timestamp.Add(delay*6/5 + kafkaTimestampPrecision)
-	if due.Before(lower) || due.After(upper) {
-		return deferralDecision{due: due, err: fmt.Errorf("due time %s is outside destination delay band [%s, %s]", due, lower, upper)}
+	lower := record.Timestamp.Add(delay / kafkaDeferralBandDenominator)
+	upperOffset, upperRepresentable := kafkaDeferralUpperOffset(delay)
+	upper := time.Time{}
+	if upperRepresentable {
+		upper = record.Timestamp.Add(upperOffset)
 	}
-	return deferralDecision{due: due, wait: due.After(now)}
+	if due.Before(lower) || (upperRepresentable && due.After(upper)) {
+		if !upperRepresentable {
+			return deferralDecision{due: due, present: true, err: fmt.Errorf("due time %s is outside destination delay band [%s, unbounded]", due, lower)}
+		}
+		return deferralDecision{due: due, present: true, err: fmt.Errorf("due time %s is outside destination delay band [%s, %s]", due, lower, upper)}
+	}
+	return deferralDecision{due: due, present: true, wait: due.After(now)}
+}
+
+func kafkaDeferralUpperOffset(delay time.Duration) (time.Duration, bool) {
+	// Split before multiplying so a legal delay near MaxInt64 cannot wrap.
+	half := delay / kafkaDeferralBandDenominator
+	remainder := delay % kafkaDeferralBandDenominator
+	available := kafkaMaxDuration - kafkaTimestampPrecision - remainder
+	if half > available/kafkaDeferralUpperNumerator {
+		return 0, false
+	}
+	return half*kafkaDeferralUpperNumerator + remainder + kafkaTimestampPrecision, true
 }
 
 func recordDelayUntil(record *kgo.Record) (time.Time, bool, error) {
