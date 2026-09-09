@@ -87,6 +87,13 @@ func Run(t *testing.T, suite Suite) Report {
 		Driver:  suite.Driver.Name(),
 		Pending: append([]string(nil), pendingGroups...),
 	}
+	defer func() {
+		if data, err := json.Marshal(report); err == nil {
+			t.Logf("conformance report: %s", data)
+		} else {
+			t.Errorf("conformance: marshal report: %v", err)
+		}
+	}()
 	profileReports := make([]ProfileReport, 0, 2)
 	profilesRan := 0
 	groupsRan := 0
@@ -96,40 +103,37 @@ func Run(t *testing.T, suite Suite) Report {
 	}
 	for _, profile := range []Profile{ProfileFull, ProfileStrictPortability} {
 		var result ProfileReport
-		profileRan := false
-		ok := t.Run(profile.String(), func(profileTest *testing.T) {
-			profileRan = true
+		profileStarted := false
+		profileCompleted := false
+		t.Run(profile.String(), func(profileTest *testing.T) {
+			profileStarted = true
 			result = runProfile(profileTest, ctx, conn, inspect, runID, profile, factoryCapabilities, inject, deadline, &report, suite.Driver, suite.Config, suite.NewFaultInjector)
+			profileCompleted = true
 		})
-		if !ok {
-			t.Fatalf("conformance: %s profile failed", profile)
-		}
-		if profileRan {
+		if profileCompleted {
 			profilesRan++
 			groupsRan += len(result.Groups)
 			profileReports = append(profileReports, result)
+		} else if profileStarted {
+			t.Logf("conformance: profile=%s did not complete; behavior vector comparison may be skipped", profile)
 		} else {
 			t.Logf("conformance: profile=%s filtered out", profile)
 		}
 	}
 	report.Profiles = profileReports
 	if len(groupRunners) != 0 && groupsRan == 0 {
+		t.Logf("conformance: behavior vector comparison skipped: no groups completed")
 		t.Fatalf("conformance: filtered run executed no groups")
 	}
 	if profilesRan == 2 {
 		if diff := report.Profiles[0].Vector.Diff(report.Profiles[1].Vector); diff != "" {
 			t.Fatalf("conformance: full and strict behavior vectors differ: %s", diff)
 		}
-	} else if profilesRan != 0 {
-		t.Logf("conformance: filtered run executed %d profile(s); behavior vector comparison skipped", profilesRan)
+	} else {
+		t.Logf("conformance: behavior vector comparison skipped: %d of 2 profiles completed", profilesRan)
 	}
 	for _, pending := range report.Pending {
 		t.Logf("conformance: pending group=%s", pending)
-	}
-	if data, err := json.Marshal(report); err == nil {
-		t.Logf("conformance report: %s", data)
-	} else {
-		t.Errorf("conformance: marshal report: %v", err)
 	}
 	return report
 }
