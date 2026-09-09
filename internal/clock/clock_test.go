@@ -55,6 +55,24 @@ func TestFake_SleepIsDeterministicUnderParallel(t *testing.T) {
 	}
 }
 
+func TestFake_SleepWithRegistrationReportsWaiter(t *testing.T) {
+	t.Parallel()
+
+	fc := clock.NewFake(time.Unix(0, 0))
+	registered := make(chan struct{}, 1)
+	result := make(chan error, 1)
+	go func() {
+		result <- fc.SleepWithRegistration(context.Background(), time.Second, func() {
+			registered <- struct{}{}
+		})
+	}()
+
+	<-registered
+	require.Equal(t, 1, fc.NumWaiters())
+	fc.Advance(time.Second)
+	require.NoError(t, <-result)
+}
+
 func TestFake_NowAndSinceTrackAdvance(t *testing.T) {
 	t.Parallel()
 

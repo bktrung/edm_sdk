@@ -235,22 +235,24 @@ type recordingClock struct {
 	*clock.Fake
 	mu           sync.Mutex
 	sleeps       []time.Duration
-	sleepStarted chan int
+	sleepStarted chan chan struct{}
 }
 
 func (c *recordingClock) Sleep(ctx context.Context, duration time.Duration) error {
-	before := c.NumWaiters()
 	c.mu.Lock()
 	c.sleeps = append(c.sleeps, duration)
 	started := c.sleepStarted
 	c.mu.Unlock()
+
+	var registered func()
 	if started != nil {
-		select {
-		case started <- before:
-		default:
+		token := make(chan struct{})
+		registered = func() {
+			close(token)
+			started <- token
 		}
 	}
-	return c.Fake.Sleep(ctx, duration)
+	return c.SleepWithRegistration(ctx, duration, registered)
 }
 
 func (c *recordingClock) sleepCount() int {
@@ -263,6 +265,82 @@ func (c *recordingClock) sleepAt(index int) time.Duration {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.sleeps[index]
+}
+
+func TestRecordingClockSleepSignalsItsOwnRegistration(t *testing.T) {
+	t.Parallel()
+
+	fake := clock.NewFake(time.Unix(0, 0))
+	unrelated := fake.Timer(time.Hour)
+	before := fake.NumWaiters()
+	if before != 1 {
+		t.Fatalf("waiters before tracked sleep = %d, want 1", before)
+	}
+	if !unrelated.Stop() {
+		t.Fatal("unrelated timer did not stop")
+	}
+
+	recorded := &recordingClock{
+		Fake:         fake,
+		sleepStarted: make(chan chan struct{}, 1),
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	sleepDone := make(chan error, 1)
+	go func() {
+		sleepDone <- recorded.Sleep(ctx, time.Hour)
+	}()
+
+	registrationDone := make(chan struct{})
+	go func() {
+		token := <-recorded.sleepStarted
+		<-token
+		close(registrationDone)
+	}()
+	registrationTimer := clock.NewReal().Timer(time.Second)
+	select {
+	case <-registrationDone:
+		registrationTimer.Stop()
+	case <-registrationTimer.C:
+		rescue := fake.Timer(time.Hour)
+		unblockTimer := clock.NewReal().Timer(time.Second)
+		select {
+		case <-registrationDone:
+		case <-unblockTimer.C:
+			t.Fatal("registration wait did not unblock")
+		}
+		unblockTimer.Stop()
+		rescue.Stop()
+		t.Fatal("sleep registration signal timed out")
+	}
+
+	oldWaitDone := make(chan struct{})
+	go func() {
+		fake.BlockUntil(before + 1)
+		close(oldWaitDone)
+	}()
+	oldWaitTimer := clock.NewReal().Timer(20 * time.Millisecond)
+	select {
+	case <-oldWaitDone:
+		t.Fatal("shared waiter count reached the stale baseline")
+	case <-oldWaitTimer.C:
+	}
+
+	rescue := fake.Timer(time.Hour)
+	unblockTimer := clock.NewReal().Timer(time.Second)
+	select {
+	case <-oldWaitDone:
+	case <-unblockTimer.C:
+		t.Fatal("stale-baseline waiter did not unblock")
+	}
+	unblockTimer.Stop()
+	if !rescue.Stop() {
+		t.Fatal("rescue timer did not stop")
+	}
+
+	cancel()
+	if err := <-sleepDone; !errors.Is(err, context.Canceled) {
+		t.Fatalf("tracked sleep error = %v, want context canceled", err)
+	}
 }
 
 func newReconnectTestClient(t *testing.T, d *reconnectTestDriver, c clock.Clock, maxAttempts int, extra ...Option) *Client {
@@ -1152,7 +1230,7 @@ func TestRunnerRepairsConsumerAndResumesDelivery(t *testing.T) {
 
 func TestSupervisorReconnectKeepsAbandonedSiblingRunning(t *testing.T) {
 	fake := clock.NewFake(time.Unix(350, 0))
-	recorded := &recordingClock{Fake: fake, sleepStarted: make(chan int, 8)}
+	recorded := &recordingClock{Fake: fake, sleepStarted: make(chan chan struct{}, 8)}
 	d := &reconnectTestDriver{created: make(chan *reconnectTestConsumer, 8)}
 	var handlerCalls atomic.Int32
 	client := newReconnectTestClient(t, d, recorded, 0, WithErrorHandler(func(context.Context, *Event, error) {
@@ -1257,8 +1335,8 @@ func TestSupervisorReconnectKeepsAbandonedSiblingRunning(t *testing.T) {
 	waitReconnectCondition(t, func() bool { return recorded.sleepCount() == 1 })
 	releaseCausing.Do(func() { close(causingRelease) })
 	select {
-	case before := <-recorded.sleepStarted:
-		fake.BlockUntil(before + 1)
+	case token := <-recorded.sleepStarted:
+		<-token
 		fake.Advance(0)
 	case <-clock.NewReal().Timer(2 * time.Second).C:
 		t.Fatal("reconnect sleep did not start")
@@ -1291,8 +1369,8 @@ func TestSupervisorReconnectKeepsAbandonedSiblingRunning(t *testing.T) {
 			case "victim":
 				consumer.send(validReconnectMessage(t, "victim-after-reconnect"))
 			}
-		case before := <-recorded.sleepStarted:
-			fake.BlockUntil(before + 1)
+		case token := <-recorded.sleepStarted:
+			<-token
 			fake.Advance(0)
 		case <-replacementTimer.C:
 			if causingHandled.Load() >= 1 && victimHandled.Load() >= 1 && !client.isReconnecting() {
@@ -1326,7 +1404,7 @@ func TestSupervisorReconnectKeepsAbandonedSiblingRunning(t *testing.T) {
 // otherwise receive.
 func TestAbandonForReconnectPreservesRunnerOwnCause(t *testing.T) {
 	fake := clock.NewFake(time.Unix(350, 0))
-	recorded := &recordingClock{Fake: fake, sleepStarted: make(chan int, 8)}
+	recorded := &recordingClock{Fake: fake, sleepStarted: make(chan chan struct{}, 8)}
 	d := &reconnectTestDriver{created: make(chan *reconnectTestConsumer, 8)}
 	client := newReconnectTestClient(t, d, recorded, 0)
 	client.config.Lifecycle.DrainTimeout = 20 * time.Millisecond
@@ -1437,8 +1515,8 @@ func TestAbandonForReconnectPreservesRunnerOwnCause(t *testing.T) {
 
 	releaseCausing.Do(func() { close(causingRelease) })
 	select {
-	case before := <-recorded.sleepStarted:
-		fake.BlockUntil(before + 1)
+	case token := <-recorded.sleepStarted:
+		<-token
 		fake.Advance(0)
 	case <-clock.NewReal().Timer(2 * time.Second).C:
 		t.Fatal("reconnect sleep did not start")
@@ -1466,8 +1544,8 @@ func TestAbandonForReconnectPreservesRunnerOwnCause(t *testing.T) {
 		case err := <-causingDone:
 			t.Fatalf("causing Run returned after supervisor reconnect: %v", err)
 		case <-d.created:
-		case before := <-recorded.sleepStarted:
-			fake.BlockUntil(before + 1)
+		case token := <-recorded.sleepStarted:
+			<-token
 			fake.Advance(0)
 		case <-settleTimer.C:
 			t.Fatalf("timed out settling after abandonment: reconnecting=%t", client.isReconnecting())
