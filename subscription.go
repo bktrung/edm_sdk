@@ -422,8 +422,8 @@ func validateSubscription(cfg Config, name string, sub SubscriptionConfig) error
 	}
 	tiers := retryTiers(sub.Retry)
 	lanes := len(sub.Topics) * len(sub.Priorities) * (1 + tiers)
-	if sub.Prefetch < lanes {
-		return fmt.Errorf("f1: subscriptions.%s.prefetch %d must be at least lane count %d (topics x priorities x (1 + retryTiers))", name, sub.Prefetch, lanes)
+	if err := validatePrefetch(name, sub.Prefetch, lanes); err != nil {
+		return err
 	}
 	if sub.HandlerTimeout <= 0 {
 		return fmt.Errorf("f1: subscriptions.%s.handlerTimeout must be positive", name)

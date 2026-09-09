@@ -15,6 +15,11 @@ import (
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/retry"
 )
 
+// maxPrefetch is the largest value the AMQP 0-9-1 basic.qos prefetch-count
+// field can carry; above it the client library's unchecked narrowing turns
+// the request into its opposite.
+const maxPrefetch = 65535
+
 // Config is the fully resolved configuration used to construct a Client.
 // LoadConfig validates YAML and environment values before returning it.
 type Config struct {
@@ -363,8 +368,8 @@ func validateConfig(cfg Config) error {
 			return err
 		}
 		lanes := len(subscription.Topics) * len(subscription.Priorities) * (1 + retryTiers(subscription.Retry))
-		if subscription.Prefetch < lanes {
-			return fmt.Errorf("f1: subscriptions.%s.prefetch %d must be at least lane count %d (topics x priorities x (1 + retryTiers))", name, subscription.Prefetch, lanes)
+		if err := validatePrefetch(name, subscription.Prefetch, lanes); err != nil {
+			return err
 		}
 		for priority, weight := range subscription.Fairness.Weights {
 			if !priority.Valid() || weight < 1 {
@@ -396,6 +401,16 @@ func validateConfig(cfg Config) error {
 				return fmt.Errorf("f1: broker.rabbitmq.consumerTimeout must be at least subscriptions.%s.handlerTimeout x 3", name)
 			}
 		}
+	}
+	return nil
+}
+
+func validatePrefetch(name string, prefetch, lanes int) error {
+	if prefetch < lanes {
+		return fmt.Errorf("f1: subscriptions.%s.prefetch %d must be at least lane count %d (topics x priorities x (1 + retryTiers))", name, prefetch, lanes)
+	}
+	if prefetch > maxPrefetch {
+		return fmt.Errorf("f1: subscriptions.%s.prefetch %d must be at most %d", name, prefetch, maxPrefetch)
 	}
 	return nil
 }
