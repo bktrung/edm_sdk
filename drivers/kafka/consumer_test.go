@@ -16,6 +16,7 @@ import (
 
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/driver"
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/driver/conformance"
+	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/clock"
 )
 
 func TestPauseReasonSet(t *testing.T) {
@@ -1522,6 +1523,7 @@ func TestConsumerRevokeWaitsForSettlerInsideBound(t *testing.T) {
 
 	c := &consumer{
 		rebalanceDrainTimeout: 500 * time.Millisecond,
+		clock:                 clock.NewReal(),
 		trackers:              map[partitionKey]*ackTracker{key: tracker},
 		activeGenerations:     map[partitionKey]uint64{key: 1},
 		fenced:                make(map[partitionKey]bool),
@@ -1582,6 +1584,7 @@ func TestConsumerRevokeTombstonesAfterBound(t *testing.T) {
 
 	c := &consumer{
 		rebalanceDrainTimeout: 60 * time.Millisecond,
+		clock:                 clock.NewReal(),
 		trackers:              map[partitionKey]*ackTracker{key: tracker},
 		activeGenerations:     map[partitionKey]uint64{key: 1},
 		fenced:                make(map[partitionKey]bool),
@@ -1622,6 +1625,79 @@ func TestConsumerRevokeTombstonesAfterBound(t *testing.T) {
 	if err := tracker.Ack(0, nil); !errors.Is(err, ErrRevoked) {
 		t.Fatalf("Ack after bound expired = %v, want ErrRevoked", err)
 	}
+}
+
+func TestWaitForSettlersTimesOutOnFakeClock(t *testing.T) {
+	key := partitionKey{destination: "topic", partition: 0}
+	waitForFakeTimer := func(t *testing.T, fake *clock.Fake) {
+		t.Helper()
+		guard := clock.NewReal().Timer(time.Second)
+		defer guard.Stop()
+		for fake.NumWaiters() == 0 {
+			select {
+			case <-guard.C:
+				t.Fatal("waitForSettlers did not register its fake timer")
+			default:
+				runtime.Gosched()
+			}
+		}
+	}
+
+	t.Run("settlement releases the wait", func(t *testing.T) {
+		fake := clock.NewFake(time.Unix(0, 0))
+		s := &settler{key: key}
+		c := &consumer{
+			clock:     fake,
+			settlerCh: make(chan struct{}, 1),
+			settlers:  map[*settler]struct{}{s: {}},
+		}
+		done := make(chan struct{})
+		go func() {
+			c.waitForSettlers(map[partitionKey]struct{}{key: {}}, time.Second)
+			close(done)
+		}()
+		waitForFakeTimer(t, fake)
+
+		c.mu.Lock()
+		delete(c.settlers, s)
+		c.mu.Unlock()
+		c.settlerCh <- struct{}{}
+
+		select {
+		case <-done:
+		case <-clock.NewReal().Timer(time.Second).C:
+			t.Fatal("waitForSettlers did not return after settlers cleared")
+		}
+	})
+
+	t.Run("timeout advances the fake clock", func(t *testing.T) {
+		fake := clock.NewFake(time.Unix(0, 0))
+		s := &settler{key: key}
+		c := &consumer{
+			clock:     fake,
+			settlerCh: make(chan struct{}, 1),
+			settlers:  map[*settler]struct{}{s: {}},
+		}
+		done := make(chan struct{})
+		go func() {
+			c.waitForSettlers(map[partitionKey]struct{}{key: {}}, 60*time.Millisecond)
+			close(done)
+		}()
+		waitForFakeTimer(t, fake)
+
+		select {
+		case <-done:
+			t.Fatal("waitForSettlers returned before fake clock advance")
+		default:
+		}
+		fake.Advance(60 * time.Millisecond)
+
+		select {
+		case <-done:
+		case <-clock.NewReal().Timer(time.Second).C:
+			t.Fatal("waitForSettlers did not return after fake clock advance")
+		}
+	})
 }
 
 func TestConsumerLostDropsImmediatelyWithoutWaiting(t *testing.T) {
@@ -1676,7 +1752,7 @@ func TestConsumerBufferedRecordFencedAfterReassignment(t *testing.T) {
 		budgets:               map[string]int{"topic": 10},
 		unsettled:             map[string]int{"topic": 0},
 		pauseReasons:          make(map[string]pauseReasonSet),
-		now:                   kafkaNow,
+		clock:                 clock.NewFake(time.Unix(0, 0)),
 	}
 
 	// 1. Initial assignment at generation 1.
@@ -1723,7 +1799,7 @@ func TestConsumerUnassignedRecordIsDiscarded(t *testing.T) {
 		budgets:           map[string]int{"topic": 10},
 		unsettled:         map[string]int{"topic": 0},
 		pauseReasons:      make(map[string]pauseReasonSet),
-		now:               kafkaNow,
+		clock:             clock.NewFake(time.Unix(0, 0)),
 	}
 	pending := []*kgo.Record{{Topic: key.destination, Partition: key.partition, Offset: 7, Value: []byte("unassigned")}}
 	c.tagRecord(pending[0])
@@ -1761,7 +1837,7 @@ func TestConsumerUnassignedRecordCannotReviveAfterAssignment(t *testing.T) {
 		budgets:               map[string]int{"topic": 1},
 		unsettled:             map[string]int{"topic": 0},
 		pauseReasons:          make(map[string]pauseReasonSet),
-		now:                   kafkaNow,
+		clock:                 clock.NewFake(time.Unix(0, 0)),
 	}
 	c.tagRecord(record)
 	if got, tagged := c.recordGenerations[record]; !tagged || got != 0 {
@@ -1834,7 +1910,7 @@ func TestConsumerNotificationsObservableAndQuietOnClose(t *testing.T) {
 		trackers:     make(map[partitionKey]*ackTracker),
 		fenced:       make(map[partitionKey]bool),
 		settlers:     make(map[*settler]struct{}),
-		now:          kafkaNow,
+		clock:        clock.NewFake(time.Unix(0, 0)),
 	}
 	c.onPartitionsAssigned(context.Background(), nil, map[string][]int32{"topic": {0}})
 	select {

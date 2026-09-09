@@ -24,6 +24,7 @@ import (
 	"github.com/twmb/franz-go/pkg/sasl/scram"
 
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/driver"
+	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/clock"
 )
 
 // A Conn owns one client for Ping, metadata, and broker configuration. The
@@ -405,7 +406,7 @@ func (c *conn) Producer(ctx context.Context, cfg driver.ProducerConfig) (driver.
 	if err := ctx.Err(); err != nil {
 		return nil, classify("producer", driver.KindTransient, err)
 	}
-	return &producer{client: c.client, conn: c, cfg: cfg, now: kafkaNow}, nil
+	return &producer{client: c.client, conn: c, cfg: cfg, clock: clock.NewReal()}, nil
 }
 
 func (c *conn) Consumer(ctx context.Context, cfg driver.ConsumerConfig) (driver.Consumer, error) {
@@ -570,7 +571,7 @@ func kafkaErrorKind(err error) driver.Kind {
 }
 
 func waitRetry(ctx context.Context) error {
-	timer := time.NewTimer(250 * time.Millisecond) //nolint:forbidigo // Open retries need a wall-clock wait
+	timer := time.NewTimer(250 * time.Millisecond) //nolint:forbidigo // Open retries wait for broker recovery and require a wall-clock delay
 	defer timer.Stop()
 	select {
 	case <-ctx.Done():

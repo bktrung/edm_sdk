@@ -17,6 +17,7 @@ import (
 	"github.com/twmb/franz-go/pkg/kmsg"
 
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/driver"
+	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/clock"
 )
 
 type pauseReason string
@@ -100,7 +101,7 @@ type consumer struct {
 	discarded             map[partitionKey]map[int64]struct{}
 	reportedDeferrals     map[string]struct{}
 	maxAckGap             int64
-	now                   func() time.Time
+	clock                 clock.Clock
 	// offsetMu serializes CommitOffsetsSync with SetOffsets because franz-go
 	// forbids those operations from running concurrently.
 	offsetMu          sync.Mutex
@@ -294,7 +295,7 @@ func newConsumer(ctx context.Context, connection *conn, cfg driver.ConsumerConfi
 		discarded:             make(map[partitionKey]map[int64]struct{}),
 		reportedDeferrals:     make(map[string]struct{}),
 		maxAckGap:             maxAckGap,
-		now:                   kafkaNow,
+		clock:                 clock.NewReal(),
 	}
 	for index, destination := range cfg.Destinations {
 		consumer.budgets[destination] = destinationPrefetch(cfg, destination, index)
@@ -1282,7 +1283,7 @@ func listKafkaOffsets(ctx context.Context, list func(context.Context) (kadm.List
 		if err == nil || !errors.Is(err, kerr.UnknownTopicOrPartition) {
 			return offsets, err
 		}
-		timer := time.NewTimer(50 * time.Millisecond) //nolint:forbidigo // Kafka metadata propagation needs a bounded retry
+		timer := time.NewTimer(50 * time.Millisecond) //nolint:forbidigo // Kafka metadata propagation is broker-driven and requires a wall-clock retry
 		select {
 		case <-retryCtx.Done():
 			timer.Stop()
@@ -1385,7 +1386,7 @@ func (c *consumer) signalSettlerDoneLocked() {
 }
 
 func (c *consumer) waitForSettlers(keys map[partitionKey]struct{}, timeout time.Duration) {
-	timer := time.NewTimer(timeout) //nolint:forbidigo // bounded revoke drain needs a wall-clock timeout
+	timer := c.clock.Timer(timeout)
 	defer timer.Stop()
 	for {
 		c.mu.Lock()

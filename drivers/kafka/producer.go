@@ -10,6 +10,7 @@ import (
 	"github.com/twmb/franz-go/pkg/kgo"
 
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/driver"
+	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/clock"
 )
 
 // delayUntilHeader is reserved for deferred Kafka delivery. It is driver-internal,
@@ -20,7 +21,7 @@ type producer struct {
 	client *kgo.Client
 	conn   *conn
 	cfg    driver.ProducerConfig
-	now    func() time.Time
+	clock  clock.Clock
 }
 
 var _ driver.Producer = (*producer)(nil)
@@ -76,10 +77,7 @@ func (p *producer) destinationDelay(destination string) (time.Duration, bool) {
 }
 
 func (p *producer) currentTime() time.Time {
-	if p.now != nil {
-		return p.now()
-	}
-	return kafkaNow()
+	return p.clock.Now()
 }
 
 func recordForMessage(msg driver.OutboundMessage, destinationDelay time.Duration, known bool, now time.Time) *kgo.Record {

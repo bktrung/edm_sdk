@@ -12,6 +12,7 @@ import (
 	"github.com/twmb/franz-go/pkg/kgo"
 
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/driver"
+	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/clock"
 )
 
 func TestEvaluateDeferralDueInPastDelivers(t *testing.T) {
@@ -225,7 +226,7 @@ func deferredTestTopicRecord(topic string, partition int32, offset int64, publis
 }
 
 func TestPendingDeadlineEmptyPendingReturnsFalse(t *testing.T) {
-	c := &consumer{now: func() time.Time { return time.Unix(100, 0) }}
+	c := &consumer{clock: clock.NewFake(time.Unix(100, 0))}
 	if deadline, ok := c.pendingDeadline(nil); ok || !deadline.IsZero() {
 		t.Fatalf("pendingDeadline(nil) = %s, %t; want zero time, false", deadline, ok)
 	}
@@ -237,8 +238,8 @@ func TestPendingDeadlineEmptyPendingReturnsFalse(t *testing.T) {
 func TestPendingDeadlineAllRecordsDueReturnsFalse(t *testing.T) {
 	now := time.Unix(100, 0)
 	c := &consumer{
-		conn: &conn{delays: map[string]time.Duration{"retry": 10 * time.Second}},
-		now:  func() time.Time { return now },
+		conn:  &conn{delays: map[string]time.Duration{"retry": 10 * time.Second}},
+		clock: clock.NewFake(now),
 	}
 	r1 := deferredTestTopicRecord("retry", 0, 1, now.Add(-10*time.Second), now)
 	r2 := deferredTestTopicRecord("retry", 0, 2, now.Add(-15*time.Second), now.Add(-5*time.Second))
@@ -256,7 +257,7 @@ func TestPendingDeadlineReturnsEarliestDueWhenNotFirstElement(t *testing.T) {
 			"retry.fast": 10 * time.Second,
 			"retry.slow": 30 * time.Second,
 		}},
-		now: func() time.Time { return now },
+		clock: clock.NewFake(now),
 	}
 	r1 := deferredTestTopicRecord("retry.mid", 0, 1, now, now.Add(20*time.Second))
 	r2 := deferredTestTopicRecord("retry.fast", 0, 2, now, now.Add(10*time.Second))
@@ -275,7 +276,7 @@ func TestPendingDeadlineIgnoresUnknownDestinationAlongsideDeferrable(t *testing.
 		conn: &conn{delays: map[string]time.Duration{
 			"retry.known": 10 * time.Second,
 		}},
-		now: func() time.Time { return now },
+		clock: clock.NewFake(now),
 	}
 	rUnknown := deferredTestTopicRecord("unknown.topic", 0, 1, now, now.Add(10*time.Second))
 	wantDue := now.Add(10 * time.Second)
@@ -299,7 +300,7 @@ func TestConsumerDeferralFaultDoesNotSendError(t *testing.T) {
 		unsettled:         make(map[string]int),
 		trackers:          make(map[partitionKey]*ackTracker),
 		reportedDeferrals: make(map[string]struct{}),
-		now:               func() time.Time { return time.Unix(100, 0) },
+		clock:             clock.NewFake(time.Unix(100, 0)),
 	}
 	record := &kgo.Record{Topic: "retry", Partition: 0, Offset: 42}
 	c.mu.Lock()
@@ -330,7 +331,7 @@ func TestConsumerDeferralFaultLogsOncePerDestination(t *testing.T) {
 		unsettled:         make(map[string]int),
 		trackers:          make(map[partitionKey]*ackTracker),
 		reportedDeferrals: make(map[string]struct{}),
-		now:               func() time.Time { return time.Unix(100, 0) },
+		clock:             clock.NewFake(time.Unix(100, 0)),
 	}
 
 	r1 := &kgo.Record{Topic: "retry", Partition: 0, Offset: 1}

@@ -107,10 +107,7 @@ func outboundDue(messageDelay time.Time, destinationDelay time.Duration, known b
 }
 
 func (c *consumer) currentTime() time.Time {
-	if c.now != nil {
-		return c.now()
-	}
-	return kafkaNow()
+	return c.clock.Now()
 }
 
 func (c *consumer) destinationDelay(destination string) (time.Duration, bool) {

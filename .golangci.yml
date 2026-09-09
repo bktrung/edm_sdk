@@ -175,11 +175,12 @@ linters:
             - $gostd
             - github.com/twmb/franz-go
             - fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/driver
+            - fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/clock
           deny:
             - pkg: fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/drivers
               desc: "a driver must not import another driver"
             - pkg: $all
-              desc: "a driver may import the standard library and its own broker client"
+              desc: "a driver may import the standard library, its own broker client, and the shared clock"
 
         drivers-rabbitmq:
           files:
