@@ -41,6 +41,21 @@ func releaseMaintenance() {
 	<-maintenanceGate
 }
 
+func (a *admin) admission(ctx context.Context, operation string) (func(), error) {
+	if err := ctx.Err(); err != nil {
+		return nil, classify(operation, driver.KindTransient, err)
+	}
+	if a.conn == nil {
+		return func() {}, nil
+	}
+	a.conn.lifecycleMu.RLock()
+	if err := a.conn.admissionError(operation); err != nil {
+		a.conn.lifecycleMu.RUnlock()
+		return nil, err
+	}
+	return a.conn.lifecycleMu.RUnlock, nil
+}
+
 func missingPurgeDestinationError(destination string, cause error) error {
 	if cause == nil {
 		cause = driver.ErrDestinationMissing
@@ -53,13 +68,20 @@ func missingPurgeDestinationError(destination string, cause error) error {
 // Purge advances every partition's low watermark to its current end offset
 // and returns the number of records removed. The destination remains present.
 func (a *admin) Purge(ctx context.Context, destination string) (int64, error) {
-	if err := ctx.Err(); err != nil {
-		return 0, classify("purge", driver.KindTransient, err)
+	release, err := a.admission(ctx, "purge")
+	if err != nil {
+		return 0, err
 	}
+	release()
 	if err := acquireMaintenance(ctx); err != nil {
 		return 0, classify("purge", driver.KindTransient, err)
 	}
 	defer releaseMaintenance()
+	release, err = a.admission(ctx, "purge")
+	if err != nil {
+		return 0, err
+	}
+	defer release()
 	starts, ends, err := a.listTopicOffsets(ctx, "purge", destination)
 	if err != nil {
 		if errors.Is(err, kerr.UnknownTopicOrPartition) {
@@ -118,13 +140,20 @@ func (a *admin) Purge(ctx context.Context, destination string) (int64, error) {
 // Prune deletes empty, unattached destinations and reports a reason for each
 // destination that is missing, non-empty, or still assigned to a consumer.
 func (a *admin) Prune(ctx context.Context, names []string) ([]driver.PruneResult, error) {
-	if err := ctx.Err(); err != nil {
-		return nil, classify("prune", driver.KindTransient, err)
+	release, err := a.admission(ctx, "prune")
+	if err != nil {
+		return nil, err
 	}
+	release()
 	if err := acquireMaintenance(ctx); err != nil {
 		return nil, classify("prune", driver.KindTransient, err)
 	}
 	defer releaseMaintenance()
+	release, err = a.admission(ctx, "prune")
+	if err != nil {
+		return nil, err
+	}
+	defer release()
 	results := make([]driver.PruneResult, 0, len(names))
 	deleted := make([]string, 0, len(names))
 	for _, name := range names {
@@ -248,9 +277,11 @@ func (a *admin) pruneGuard(ctx context.Context, name string) (string, error) {
 // fields, but Kafka does not honor them: routing is FanoutAtConsume, native
 // dead lettering is unavailable, and the core retry ladder owns those semantics.
 func (a *admin) EnsureTopology(ctx context.Context, spec driver.TopologySpec) (driver.TopologyDiff, error) {
-	if err := ctx.Err(); err != nil {
-		return driver.TopologyDiff{}, classify("ensure_topology", driver.KindTransient, err)
+	release, err := a.admission(ctx, "ensure_topology")
+	if err != nil {
+		return driver.TopologyDiff{}, err
 	}
+	defer release()
 	diff, err := a.ensureTopology(ctx, spec)
 	if err != nil {
 		return driver.TopologyDiff{}, err
@@ -273,9 +304,11 @@ func (a *admin) recordDestinationDelays(destinations []driver.DestinationSpec) {
 }
 
 func (a *admin) DescribeTopology(ctx context.Context, names []string) (driver.TopologyState, error) {
-	if err := ctx.Err(); err != nil {
-		return driver.TopologyState{}, classify("describe_topology", driver.KindTransient, err)
+	release, err := a.admission(ctx, "describe_topology")
+	if err != nil {
+		return driver.TopologyState{}, err
 	}
+	defer release()
 	return a.describeTopology(ctx, names)
 }
 

@@ -30,7 +30,8 @@ func TestConformance(t *testing.T) {
 			ClientID:              "f1-kafka-conformance",
 			RebalanceDrainTimeout: 250 * time.Millisecond,
 		},
-		NewInspector: kafkaInspector,
+		NewInspector:     kafkaInspector,
+		NewFaultInjector: kafkaFaultInjector,
 	})
 }
 
