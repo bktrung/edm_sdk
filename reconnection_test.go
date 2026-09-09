@@ -1352,33 +1352,61 @@ func TestSupervisorReconnectKeepsAbandonedSiblingRunning(t *testing.T) {
 	releaseVictim.Do(func() { close(victimRelease) })
 
 	sent := make(map[*reconnectTestConsumer]bool)
-	replacementTimer := clock.NewReal().Timer(2 * time.Second)
-	defer replacementTimer.Stop()
-	for causingHandled.Load() < 1 || victimHandled.Load() < 1 || client.isReconnecting() {
-		select {
-		case err := <-victimDone:
-			t.Fatalf("victim Run returned after supervisor reconnect: %v", err)
-		case consumer := <-d.created:
-			if sent[consumer] {
-				continue
+	causingMessage := validReconnectMessage(t, "causing-after-reconnect")
+	victimMessage := validReconnectMessage(t, "victim-after-reconnect")
+	serviceCtx, stopServing := context.WithCancel(context.Background())
+	servingDone := make(chan struct{})
+	var serviceMu sync.Mutex
+	go func() {
+		defer close(servingDone)
+		for {
+			select {
+			case <-serviceCtx.Done():
+				return
+			case consumer := <-d.created:
+				serviceMu.Lock()
+				if serviceCtx.Err() != nil {
+					serviceMu.Unlock()
+					return
+				}
+				if sent[consumer] {
+					serviceMu.Unlock()
+					continue
+				}
+				sent[consumer] = true
+				switch consumer.group {
+				case "causing":
+					consumer.send(causingMessage)
+				case "victim":
+					consumer.send(victimMessage)
+				}
+				serviceMu.Unlock()
+			case token := <-recorded.sleepStarted:
+				serviceMu.Lock()
+				if serviceCtx.Err() != nil {
+					serviceMu.Unlock()
+					return
+				}
+				<-token
+				fake.Advance(0)
+				serviceMu.Unlock()
 			}
-			sent[consumer] = true
-			switch consumer.group {
-			case "causing":
-				consumer.send(validReconnectMessage(t, "causing-after-reconnect"))
-			case "victim":
-				consumer.send(validReconnectMessage(t, "victim-after-reconnect"))
-			}
-		case token := <-recorded.sleepStarted:
-			<-token
-			fake.Advance(0)
-		case <-replacementTimer.C:
-			if causingHandled.Load() >= 1 && victimHandled.Load() >= 1 && !client.isReconnecting() {
-				break
-			}
-			t.Fatalf("timed out waiting for deliveries: causing=%d victim=%d reconnecting=%t", causingHandled.Load(), victimHandled.Load(), client.isReconnecting())
 		}
+	}()
+	stopService := func() {
+		serviceMu.Lock()
+		stopServing()
+		serviceMu.Unlock()
+		<-servingDone
 	}
+	defer stopService()
+	waitReconnectCondition(t, func() bool {
+		serviceMu.Lock()
+		defer serviceMu.Unlock()
+		return causingHandled.Load() >= 1 &&
+			victimHandled.Load() >= 1 &&
+			!client.isReconnecting()
+	})
 	if err := client.Health(context.Background()); err != nil {
 		t.Fatalf("Health after supervisor reconnect = %v, want nil", err)
 	}
@@ -1395,6 +1423,7 @@ func TestSupervisorReconnectKeepsAbandonedSiblingRunning(t *testing.T) {
 	if got := handlerCalls.Load(); got != 0 {
 		t.Fatalf("error handler calls = %d, want 0", got)
 	}
+	stopService()
 }
 
 // TestAbandonForReconnectPreservesRunnerOwnCause proves that a runner which
@@ -1535,22 +1564,51 @@ func TestAbandonForReconnectPreservesRunnerOwnCause(t *testing.T) {
 	// bottom-of-loop reconnect request (client.reconnecting has already gone
 	// false by now) starts a second reconnect cycle on the same fake clock,
 	// exactly as in TestSupervisorReconnectKeepsAbandonedSiblingRunning.
-	settleTimer := clock.NewReal().Timer(2 * time.Second)
-	defer settleTimer.Stop()
-	for !causingRunner.lifecycle.Ready() || !victimRunner.lifecycle.Ready() || client.isReconnecting() {
-		select {
-		case err := <-victimDone:
-			t.Fatalf("victim Run returned after supervisor reconnect: %v", err)
-		case err := <-causingDone:
-			t.Fatalf("causing Run returned after supervisor reconnect: %v", err)
-		case <-d.created:
-		case token := <-recorded.sleepStarted:
-			<-token
-			fake.Advance(0)
-		case <-settleTimer.C:
-			t.Fatalf("timed out settling after abandonment: reconnecting=%t", client.isReconnecting())
+	serviceCtx, stopServing := context.WithCancel(context.Background())
+	servingDone := make(chan struct{})
+	var serviceMu sync.Mutex
+	go func() {
+		defer close(servingDone)
+		for {
+			select {
+			case <-serviceCtx.Done():
+				return
+			case <-d.created:
+				serviceMu.Lock()
+				if serviceCtx.Err() != nil {
+					serviceMu.Unlock()
+					return
+				}
+				serviceMu.Unlock()
+			case token := <-recorded.sleepStarted:
+				serviceMu.Lock()
+				if serviceCtx.Err() != nil {
+					serviceMu.Unlock()
+					return
+				}
+				<-token
+				fake.Advance(0)
+				serviceMu.Unlock()
+			}
 		}
+	}()
+	stopService := func() {
+		serviceMu.Lock()
+		stopServing()
+		serviceMu.Unlock()
+		<-servingDone
 	}
+	defer stopService()
+	waitReconnectCondition(t, func() bool {
+		serviceMu.Lock()
+		defer serviceMu.Unlock()
+		settled := causingRunner.lifecycle.Ready() && victimRunner.lifecycle.Ready() && !client.isReconnecting()
+		if settled {
+			stopServing()
+		}
+		return settled
+	})
+	stopService()
 	select {
 	case err := <-victimDone:
 		t.Fatalf("victim Run returned after rebuilding its generation: %v", err)
