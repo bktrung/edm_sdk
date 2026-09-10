@@ -469,8 +469,8 @@ func TestConsumerIntake(t *testing.T) {
 	if len(message.Headers) != 1 || message.Headers[0].Key != "header" || !bytes.Equal(message.Headers[0].Value, []byte("value")) {
 		t.Fatalf("message headers = %#v", message.Headers)
 	}
-	if message.Ref.Partition != 0 || message.Ref.Offset != 0 || message.Ref.Tag != 0 || message.Ref.Raw != "" {
-		t.Fatalf("BrokerRef = %+v, want partition 0 offset 0 and zero tag/raw", message.Ref)
+	if message.Ref.Partition != 0 || message.Ref.Offset != 0 || message.Ref.Tag != 0 || message.Ref.Raw != topic+"/0/0" {
+		t.Fatalf("BrokerRef = %+v, want partition 0 offset 0, zero tag, and raw %q", message.Ref, topic+"/0/0")
 	}
 	if message.DeliveryCount != -1 {
 		t.Fatalf("DeliveryCount = %d, want -1", message.DeliveryCount)

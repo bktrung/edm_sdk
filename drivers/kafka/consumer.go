@@ -964,6 +964,7 @@ func inboundMessage(record *kgo.Record, settler *settler) driver.InboundMessage 
 		Ref: driver.BrokerRef{
 			Partition: record.Partition,
 			Offset:    record.Offset,
+			Raw:       fmt.Sprintf("%s/%d/%d", record.Topic, record.Partition, record.Offset),
 		},
 		Settle: settler,
 	}
