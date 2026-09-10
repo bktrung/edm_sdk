@@ -16,6 +16,9 @@ APIDIFF_NORMALIZE := $(CURDIR)/.tools/bin/apidiff-normalize
 API_DIFF_BASELINE_DIR := $(CURDIR)/testdata/api-diff
 API_DIFF_BREAKING_CHANGE ?= 0
 API_DIFF_ENFORCE ?= 1
+KAFKA_PORT ?= 19092
+KAFKA_PROJECT ?= docker
+KAFKA_COMPOSE := KAFKA_PORT=$(KAFKA_PORT) docker compose --project-name "$(KAFKA_PROJECT)" -f docker/docker-compose.yml
 
 .PHONY: build test-fast test lint verify-agnostic verify-self-contained check-fixture check-api-surface check-api-surface-codec check-api-surface-driver check-api-surface-f1test check-api-diff record-api-diff-baseline
 
@@ -154,25 +157,27 @@ test-rabbitmq: broker-up broker-smoke
 ## test-kafka: run the Kafka driver suite against the fixture, starting it first.
 ## F1_REQUIRE_KAFKA makes an unreachable broker a failure rather than a skip.
 test-kafka: kafka-up
-	F1_REQUIRE_KAFKA=1 go test -race -count=1 ./drivers/kafka/...
+	F1_KAFKA_ENDPOINT=$${F1_KAFKA_ENDPOINT:-localhost:$(KAFKA_PORT)} F1_REQUIRE_KAFKA=1 go test -race -count=1 ./drivers/kafka/...
 
 ## test-infra: run the tests that need a broker. Fails, never skips, when one is missing.
 test-infra: kafka-up
-	go test -count=1 -tags integration ./...
+	F1_KAFKA_ENDPOINT=$${F1_KAFKA_ENDPOINT:-localhost:$(KAFKA_PORT)} F1_ACCEPTANCE_ENDPOINT=$${F1_ACCEPTANCE_ENDPOINT:-localhost:$(KAFKA_PORT)} F1_REQUIRE_KAFKA=1 go test -count=1 -tags integration ./...
 
 ## test-kafka-conformance: run both Kafka conformance profiles against the fixture.
-## This takes about 250s and requires a live Kafka broker. F1_REQUIRE_KAFKA
-## makes an unreachable broker a failure rather than a skip.
+## This takes about 250s and requires a live Kafka broker. F1_KAFKA_CONFORMANCE
+## and F1_REQUIRE_KAFKA make the conformance run explicit and required.
 test-kafka-conformance: kafka-up
-	F1_KAFKA_CONFORMANCE=1 F1_REQUIRE_KAFKA=1 go test -v -count=1 -run TestConformance -timeout 20m ./drivers/kafka/...
+	F1_KAFKA_ENDPOINT=$${F1_KAFKA_ENDPOINT:-localhost:$(KAFKA_PORT)} F1_KAFKA_CONFORMANCE=1 F1_REQUIRE_KAFKA=1 go test -v -count=1 -run TestConformance -timeout 20m ./drivers/kafka/...
 
-## kafka-up: start the pinned local Kafka fixture without starting RabbitMQ.
+## kafka-up: start the Kafka fixture without starting RabbitMQ. KAFKA_PORT
+## defaults to the historical port and KAFKA_PROJECT to the existing compose
+## project name, docker.
 kafka-up:
-	docker compose -f docker/docker-compose.yml up -d kafka
+	$(KAFKA_COMPOSE) up -d kafka
 
-## kafka-down: stop the Kafka fixture and keep its named volume.
+## kafka-down: stop the Kafka service for the selected project.
 kafka-down:
-	docker compose -f docker/docker-compose.yml stop kafka
+	$(KAFKA_COMPOSE) stop kafka
 
 ## broker-up: start the pinned local RabbitMQ fixture.
 broker-up:

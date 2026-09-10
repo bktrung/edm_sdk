@@ -9,9 +9,38 @@ import (
 )
 
 const (
-	kafkaEndpoint    = "localhost:19092"
-	requireBrokerEnv = "F1_REQUIRE_KAFKA"
+	defaultKafkaEndpoint = "localhost:19092"
+	kafkaEndpointEnv     = "F1_KAFKA_ENDPOINT"
+	requireBrokerEnv     = "F1_REQUIRE_KAFKA"
 )
+
+var kafkaEndpoint = resolveKafkaEndpoint()
+
+func resolveKafkaEndpoint() string {
+	if endpoint := os.Getenv(kafkaEndpointEnv); endpoint != "" {
+		return endpoint
+	}
+	return defaultKafkaEndpoint
+}
+
+func TestResolveKafkaEndpoint(t *testing.T) {
+	tests := []struct {
+		name       string
+		configured string
+		want       string
+	}{
+		{name: "default", want: "localhost:19092"},
+		{name: "configured", configured: "localhost:29092", want: "localhost:29092"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv(kafkaEndpointEnv, tc.configured)
+			if got := resolveKafkaEndpoint(); got != tc.want {
+				t.Fatalf("resolveKafkaEndpoint() = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
 
 var brokerProbe struct {
 	once   sync.Once
