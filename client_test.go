@@ -39,6 +39,79 @@ func TestNewRejectsNilConnection(t *testing.T) {
 	}
 }
 
+func TestNewRejectsProductionInmemDriverInjection(t *testing.T) {
+	t.Parallel()
+	cfg, err := LoadConfig(writeConfig(t, `
+f1:
+  env: prod
+  service: orders
+  broker:
+    driver: rabbitmq
+    endpoints: [amqp://broker:5672/]
+    rabbitmq:
+      queueType: quorum
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var logs logSink
+	_, err = New(context.Background(), cfg,
+		WithDriver(&testDriver{name: "inmem", conn: &testConn{}}),
+		WithLogger(slog.New(slog.NewTextHandler(&logs, nil))),
+	)
+	if err == nil || err.Error() != "f1: broker.driver inmem is not allowed in prod" {
+		t.Fatalf("New() error = %v, want inmem production safeguard", err)
+	}
+	output := logs.String()
+	if got := strings.Count(output, "f1 driver identity mismatch"); got != 1 {
+		t.Fatalf("identity mismatch log count = %d, want 1; output = %q", got, output)
+	}
+	if !strings.Contains(output, "configured_driver=rabbitmq") || !strings.Contains(output, "injected_driver=inmem") {
+		t.Fatalf("identity mismatch log = %q, want both driver names", output)
+	}
+}
+
+func TestNewRejectsProductionRabbitMQRailForInjectedDriver(t *testing.T) {
+	t.Parallel()
+	cfg, err := LoadConfig(writeConfig(t, `
+f1:
+  env: prod
+  service: orders
+  broker:
+    driver: kafka
+    endpoints: [localhost:19092]
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = New(context.Background(), cfg, WithDriver(&testDriver{name: "rabbitmq", conn: &testConn{}}))
+	if err == nil || err.Error() != "f1: broker.rabbitmq.queueType must be quorum in prod" {
+		t.Fatalf("New() error = %v, want RabbitMQ production safeguard", err)
+	}
+}
+
+func TestNewAllowsThirdPartyDriverIdentity(t *testing.T) {
+	t.Parallel()
+	cfg, err := LoadConfig(writeConfig(t, `
+f1:
+  env: prod
+  service: orders
+  broker:
+    driver: kafka
+    endpoints: [localhost:19092]
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	client, err := New(context.Background(), cfg,
+		WithDriver(&testDriver{name: "third-party", conn: &testConn{}}),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = client.Close(context.Background()) })
+}
+
 func TestLogCapabilitiesWarnsForConfiguredUnavailableFeature(t *testing.T) {
 	var logs logSink
 	cfg, err := LoadConfig(writeConfig(t, `
@@ -314,6 +387,7 @@ func testClientConfig(t *testing.T) Config {
 
 type testDriver struct {
 	conn   *testConn
+	name   string
 	opened bool
 }
 
@@ -325,7 +399,13 @@ func (nilConnectionDriver) Open(context.Context, driver.Config) (driver.Conn, er
 	return nil, nil
 }
 
-func (*testDriver) Name() string                      { return "test" }
+func (d *testDriver) Name() string {
+	if d.name != "" {
+		return d.name
+	}
+	return "test"
+}
+
 func (*testDriver) Capabilities() driver.Capabilities { return driver.Capabilities{} }
 func (d *testDriver) Open(context.Context, driver.Config) (driver.Conn, error) {
 	d.opened = true

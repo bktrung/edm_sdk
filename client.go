@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"maps"
 	"math/rand/v2"
+	"slices"
 	"sync"
 	"time"
 
@@ -120,6 +121,14 @@ func New(ctx context.Context, cfg Config, opts ...Option) (*Client, error) {
 	if err := validateConfig(cfg); err != nil {
 		return nil, err
 	}
+	driverName := options.driver.Name()
+	if driverName != cfg.Broker.Driver {
+		logDriverIdentityMismatch(options.logger, cfg.Broker.Driver, driverName)
+	}
+	if err := validateDriverProductionSafeguards(cfg, driverName); err != nil {
+		return nil, err
+	}
+
 	if _, ok := options.codecsByName[cfg.Codec.Default]; !ok {
 		return nil, fmt.Errorf("f1: codec.default %q is not registered", cfg.Codec.Default)
 	}
@@ -159,6 +168,29 @@ func New(ctx context.Context, cfg Config, opts ...Option) (*Client, error) {
 	}
 	go client.reconnectSupervisor()
 	return client, nil
+}
+
+func validateDriverProductionSafeguards(cfg Config, driverName string) error {
+	if cfg.Env != "prod" || !slices.Contains([]string{"inmem", "rabbitmq"}, driverName) {
+		return nil
+	}
+	if driverName == "inmem" {
+		return fmt.Errorf("f1: broker.driver inmem is not allowed in prod")
+	}
+	if cfg.Broker.DriverOptions["rabbitmq.queueType"] != "quorum" {
+		return fmt.Errorf("f1: broker.rabbitmq.queueType must be quorum in prod")
+	}
+	return nil
+}
+
+func logDriverIdentityMismatch(logger *slog.Logger, configuredName, injectedName string) {
+	if logger == nil {
+		return
+	}
+	logger.Warn("f1 driver identity mismatch",
+		"configured_driver", configuredName,
+		"injected_driver", injectedName,
+	)
 }
 
 func (c *Client) topologyPolicy() driver.TopologyPolicy {
