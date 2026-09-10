@@ -396,6 +396,23 @@ func TestLoadConfigRequiresQuorumRabbitMQInProd(t *testing.T) {
 	}
 }
 
+func TestLoadConfigValidatesAgainstConfiguredDriverIdentity(t *testing.T) {
+	t.Parallel()
+	path := writeConfig(t, `
+f1:
+  env: test
+  service: orders
+  broker:
+    driver: rabbitmq
+    endpoints: [amqp://broker:5672/]
+    tls:
+      enabled: true
+`)
+	if _, err := LoadConfig(path); err == nil || !strings.Contains(err.Error(), "amqps://") {
+		t.Fatalf("LoadConfig() error = %v, want configured RabbitMQ TLS endpoint validation", err)
+	}
+}
+
 func TestValidateConfigRequiresEndpointsForNetworkDrivers(t *testing.T) {
 	t.Parallel()
 	cases := []struct {
@@ -410,7 +427,7 @@ func TestValidateConfigRequiresEndpointsForNetworkDrivers(t *testing.T) {
 		t.Run(tc.driver, func(t *testing.T) {
 			cfg := validValidationConfig()
 			cfg.Broker.Driver = tc.driver
-			err := validateConfig(cfg)
+			err := validateConfiguredConfig(cfg)
 			if tc.wantErr {
 				if err == nil || !strings.Contains(err.Error(), "broker.endpoints") {
 					t.Fatalf("validateConfig() error = %v, want broker.endpoints error", err)
@@ -446,7 +463,7 @@ func TestValidateConfigRejectsProductionAliasEnvironments(t *testing.T) {
 			cfg.Env = tc.env
 			cfg.Broker.Driver = "kafka"
 			cfg.Broker.Endpoints = []string{"kafka://broker:9092"}
-			err := validateConfig(cfg)
+			err := validateConfiguredConfig(cfg)
 			if tc.wantErr {
 				if err == nil || !strings.Contains(err.Error(), tc.env) || !strings.Contains(err.Error(), "prod") {
 					t.Fatalf("validateConfig() error = %v, want offending env and prod", err)
@@ -482,7 +499,7 @@ func TestValidateConfigRequiresTLSForProductionSASL(t *testing.T) {
 			cfg.Broker.Endpoints = []string{"kafka://broker:9092"}
 			cfg.Broker.SASL.Mechanism = tc.sasl
 			cfg.Broker.TLS.Enabled = tc.tls
-			err := validateConfig(cfg)
+			err := validateConfiguredConfig(cfg)
 			if tc.wantError {
 				if err == nil || !strings.Contains(err.Error(), "broker.sasl.mechanism") || !strings.Contains(err.Error(), "broker.tls.enabled") {
 					t.Fatalf("validateConfig() error = %v, want SASL and TLS keys", err)
@@ -503,7 +520,7 @@ func TestValidateConfigRejectsTLSWithNonAmqpsEndpoint(t *testing.T) {
 	cfg.Broker.Endpoints = []string{"amqp://broker:5672/"}
 	cfg.Broker.TLS.Enabled = true
 
-	err := validateConfig(cfg)
+	err := validateConfiguredConfig(cfg)
 	if err == nil || !strings.Contains(err.Error(), "amqp") || !strings.Contains(err.Error(), "amqps://") {
 		t.Fatalf("validateConfig() error = %v, want non-amqps TLS endpoint error", err)
 	}
@@ -516,7 +533,7 @@ func TestValidateConfigAcceptsTLSWithAmqpsEndpoint(t *testing.T) {
 	cfg.Broker.Endpoints = []string{"amqps://broker:5671/"}
 	cfg.Broker.TLS.Enabled = true
 
-	if err := validateConfig(cfg); err != nil {
+	if err := validateConfiguredConfig(cfg); err != nil {
 		t.Fatalf("validateConfig() error = %v, want amqps TLS endpoint to validate", err)
 	}
 }
@@ -556,7 +573,7 @@ func TestValidateConfigRejectsInvalidRetryValues(t *testing.T) {
 			retry := cfg.Subscriptions["orders"].Retry
 			test.set(&retry)
 			cfg.Subscriptions["orders"] = withRetry(cfg.Subscriptions["orders"], retry)
-			if err := validateConfig(cfg); err == nil || !strings.Contains(err.Error(), test.field) {
+			if err := validateConfiguredConfig(cfg); err == nil || !strings.Contains(err.Error(), test.field) {
 				t.Fatalf("validateConfig() error = %v, want %s validation", err, test.field)
 			}
 		})
@@ -567,18 +584,18 @@ func TestValidateConfigRejectsInvalidSubscriptionModeAndPolicy(t *testing.T) {
 	cfg := validValidationConfig()
 	sub := cfg.Subscriptions["orders"]
 	sub.Mode = Mode(99)
-	if err := validateConfig(func() Config {
+	if err := validateConfiguredConfig(func() Config {
 		copy := cfg
 		copy.Subscriptions = map[string]SubscriptionConfig{"orders": sub}
 		return copy
 	}()); err == nil || !strings.Contains(err.Error(), "subscriptions.orders.mode") {
-		t.Fatalf("validateConfig() mode error = %v, want unsupported mode", err)
+		t.Fatalf("validateConfiguredConfig() mode error = %v, want unsupported mode", err)
 	}
 	sub = cfg.Subscriptions["orders"]
 	sub.UnmatchedPolicy = UnmatchedPolicy(99)
 	cfg.Subscriptions["orders"] = sub
-	if err := validateConfig(cfg); err == nil || !strings.Contains(err.Error(), "subscriptions.orders.unmatchedPolicy") {
-		t.Fatalf("validateConfig() unmatched policy error = %v, want unsupported policy", err)
+	if err := validateConfiguredConfig(cfg); err == nil || !strings.Contains(err.Error(), "subscriptions.orders.unmatchedPolicy") {
+		t.Fatalf("validateConfiguredConfig() unmatched policy error = %v, want unsupported policy", err)
 	}
 }
 
@@ -588,7 +605,7 @@ func TestValidateSubscriptionRejectsInvalidRetryValues(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			sub := cfg.Subscriptions["orders"]
 			test.set(&sub.Retry)
-			if err := validateSubscription(cfg, "orders", sub); err == nil || !strings.Contains(err.Error(), test.field) {
+			if err := validateSubscription(cfg, cfg.Broker.Driver, "orders", sub); err == nil || !strings.Contains(err.Error(), test.field) {
 				t.Fatalf("validateSubscription() error = %v, want %s validation", err, test.field)
 			}
 		})
@@ -613,7 +630,7 @@ func TestValidateConfigRejectsNegativeLifecycleDurations(t *testing.T) {
 			cfg := validValidationConfig()
 			cfg.Subscriptions = nil
 			test.set(&cfg.Lifecycle)
-			if err := validateConfig(cfg); err == nil || !strings.Contains(err.Error(), "lifecycle") {
+			if err := validateConfiguredConfig(cfg); err == nil || !strings.Contains(err.Error(), "lifecycle") {
 				t.Fatalf("validateConfig() error = %v, want lifecycle validation", err)
 			}
 		})
@@ -655,7 +672,7 @@ func TestValidateConfigRejectsZeroDrainTimeout(t *testing.T) {
 	cfg := validValidationConfig()
 	cfg.Subscriptions = nil
 	cfg.Lifecycle.DrainTimeout = 0
-	if err := validateConfig(cfg); err == nil || !strings.Contains(err.Error(), "drainTimeout") {
+	if err := validateConfiguredConfig(cfg); err == nil || !strings.Contains(err.Error(), "drainTimeout") {
 		t.Fatalf("validateConfig() error = %v, want drainTimeout validation", err)
 	}
 }
@@ -760,7 +777,7 @@ func TestValidateRetryMatchesDelayForSafety(t *testing.T) {
 			}
 			cfg := validValidationConfig()
 			cfg.Subscriptions["orders"] = withRetry(cfg.Subscriptions["orders"], test.retry)
-			err := validateConfig(cfg)
+			err := validateConfiguredConfig(cfg)
 			if (err != nil) != test.wantErr {
 				t.Fatalf("validateConfig() error = %v, want error=%v", err, test.wantErr)
 			}
@@ -772,9 +789,13 @@ func TestValidateSubscriptionRejectsZeroDrainTimeout(t *testing.T) {
 	cfg := validValidationConfig()
 	cfg.Lifecycle.DrainTimeout = 0
 	sub := cfg.Subscriptions["orders"]
-	if err := validateSubscription(cfg, "orders", sub); err == nil || !strings.Contains(err.Error(), "drainTimeout") {
+	if err := validateSubscription(cfg, cfg.Broker.Driver, "orders", sub); err == nil || !strings.Contains(err.Error(), "drainTimeout") {
 		t.Fatalf("validateSubscription() error = %v, want drainTimeout validation", err)
 	}
+}
+
+func validateConfiguredConfig(cfg Config) error {
+	return validateConfig(cfg, cfg.Broker.Driver)
 }
 
 func validValidationConfig() Config {
@@ -860,7 +881,7 @@ func TestValidateConfigRejectsInvalidPriorityLists(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			cfg := validValidationConfig()
 			test.set(&cfg)
-			if err := validateConfig(cfg); err == nil || !strings.Contains(err.Error(), test.want) {
+			if err := validateConfiguredConfig(cfg); err == nil || !strings.Contains(err.Error(), test.want) {
 				t.Fatalf("validateConfig() error = %v, want %s validation", err, test.want)
 			}
 		})
@@ -882,8 +903,8 @@ func TestNormalizeConfigAcceptsMinimalHandBuiltConfig(t *testing.T) {
 			"orders": {Topics: []string{"orders.created"}},
 		},
 	})
-	if err := validateConfig(cfg); err != nil {
-		t.Fatalf("validateConfig() after normalization: %v", err)
+	if err := validateConfiguredConfig(cfg); err != nil {
+		t.Fatalf("validateConfiguredConfig() after normalization: %v", err)
 	}
 	defaults := defaultConfig()
 	if cfg.Codec.ContentMode != defaults.Codec.ContentMode || cfg.Codec.MaxHeaderBytes != defaults.Codec.MaxHeaderBytes || cfg.Codec.MaxBodyBytes != defaults.Codec.MaxBodyBytes {
@@ -911,7 +932,7 @@ func TestValidateConfigRejectsInvalidMaxHeaderBytes(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			cfg := validValidationConfig()
 			cfg.Codec.MaxHeaderBytes = test.value
-			err := validateConfig(cfg)
+			err := validateConfiguredConfig(cfg)
 			if err == nil || err.Error() != "f1: codec.maxHeaderBytes must be positive" {
 				t.Fatalf("validateConfig() error = %v, want positive maxHeaderBytes error", err)
 			}

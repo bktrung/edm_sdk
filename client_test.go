@@ -90,6 +90,27 @@ f1:
 	}
 }
 
+func TestNewRejectsTLSForInjectedRabbitMQDriver(t *testing.T) {
+	t.Parallel()
+	cfg, err := LoadConfig(writeConfig(t, `
+f1:
+  env: test
+  service: orders
+  broker:
+    driver: kafka
+    endpoints: [amqp://broker:5672/]
+    tls:
+      enabled: true
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = New(context.Background(), cfg, WithDriver(&testDriver{name: "rabbitmq", conn: &testConn{}}))
+	if err == nil || !strings.Contains(err.Error(), "amqps://") {
+		t.Fatalf("New() error = %v, want injected RabbitMQ TLS endpoint validation", err)
+	}
+}
+
 func TestNewAllowsThirdPartyDriverIdentity(t *testing.T) {
 	t.Parallel()
 	cfg, err := LoadConfig(writeConfig(t, `

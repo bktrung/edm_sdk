@@ -7,7 +7,6 @@ import (
 	"log/slog"
 	"maps"
 	"math/rand/v2"
-	"slices"
 	"sync"
 	"time"
 
@@ -42,6 +41,7 @@ type Client struct {
 	limits         Limits
 	effective      driver.Capabilities
 	options        clientOptions
+	driverName     string
 	config         Config
 	source         string
 	producer       string
@@ -117,15 +117,13 @@ func New(ctx context.Context, cfg Config, opts ...Option) (*Client, error) {
 	if options.driver == nil {
 		return nil, fmt.Errorf("f1: New requires WithDriver")
 	}
-	cfg = normalizeConfig(cfg)
-	if err := validateConfig(cfg); err != nil {
-		return nil, err
-	}
 	driverName := options.driver.Name()
-	if driverName != cfg.Broker.Driver {
-		logDriverIdentityMismatch(options.logger, cfg.Broker.Driver, driverName)
+	configuredDriverName := cfg.Broker.Driver
+	if driverName != configuredDriverName {
+		logDriverIdentityMismatch(options.logger, configuredDriverName, driverName)
 	}
-	if err := validateDriverProductionSafeguards(cfg, driverName); err != nil {
+	cfg = normalizeConfig(cfg)
+	if err := validateConfig(cfg, driverName); err != nil {
 		return nil, err
 	}
 
@@ -134,10 +132,10 @@ func New(ctx context.Context, cfg Config, opts ...Option) (*Client, error) {
 	}
 	connection, err := options.driver.Open(ctx, driverConfig(cfg))
 	if err != nil {
-		return nil, fmt.Errorf("f1: open %s driver: %w", options.driver.Name(), err)
+		return nil, fmt.Errorf("f1: open %s driver: %w", driverName, err)
 	}
 	if connection == nil {
-		return nil, fmt.Errorf("f1: open %s driver: driver returned a nil connection", options.driver.Name())
+		return nil, fmt.Errorf("f1: open %s driver: driver returned a nil connection", driverName)
 	}
 	capabilities := connection.Capabilities()
 	effective := capabilities
@@ -149,6 +147,7 @@ func New(ctx context.Context, cfg Config, opts ...Option) (*Client, error) {
 		conn:              connection,
 		effective:         effective,
 		options:           options,
+		driverName:        driverName,
 		config:            cfg,
 		source:            fmt.Sprintf("/%s/%s", cfg.Env, cfg.Service),
 		producer:          fmt.Sprintf("%s/unknown/%s", cfg.Service, cfg.InstanceID),
@@ -159,7 +158,7 @@ func New(ctx context.Context, cfg Config, opts ...Option) (*Client, error) {
 		supervisorDone:    make(chan struct{}),
 		runners:           make(map[*Runner]struct{}),
 	}
-	client.limits = limitsFor(options.driver.Name(), connection.BrokerInfo(), effective)
+	client.limits = limitsFor(driverName, connection.BrokerInfo(), effective)
 	logCapabilities(client)
 	if err := client.ensurePublisherTopology(ctx); err != nil {
 		supervisorCancel()
@@ -168,19 +167,6 @@ func New(ctx context.Context, cfg Config, opts ...Option) (*Client, error) {
 	}
 	go client.reconnectSupervisor()
 	return client, nil
-}
-
-func validateDriverProductionSafeguards(cfg Config, driverName string) error {
-	if cfg.Env != "prod" || !slices.Contains([]string{"inmem", "rabbitmq"}, driverName) {
-		return nil
-	}
-	if driverName == "inmem" {
-		return fmt.Errorf("f1: broker.driver inmem is not allowed in prod")
-	}
-	if cfg.Broker.DriverOptions["rabbitmq.queueType"] != "quorum" {
-		return fmt.Errorf("f1: broker.rabbitmq.queueType must be quorum in prod")
-	}
-	return nil
 }
 
 func logDriverIdentityMismatch(logger *slog.Logger, configuredName, injectedName string) {
