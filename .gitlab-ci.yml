@@ -53,6 +53,109 @@ verify-agnostic:
 
 # Add coverage thresholds as packages gain dedicated coverage requirements.
 
+test-kafka:
+  stage: verify
+  extends: .go-cache
+  services:
+    - name: apache/kafka:4.2.1
+      alias: kafka
+      variables:
+        KAFKA_NODE_ID: "1"
+        KAFKA_PROCESS_ROLES: "broker,controller"
+        KAFKA_LISTENERS: "PLAINTEXT://:19092,CONTROLLER://:19093"
+        KAFKA_ADVERTISED_LISTENERS: "PLAINTEXT://kafka:19092"
+        KAFKA_CONTROLLER_LISTENER_NAMES: "CONTROLLER"
+        KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: "CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT"
+        KAFKA_CONTROLLER_QUORUM_VOTERS: "1@localhost:19093"
+        KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: "1"
+        KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: "1"
+        KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: "1"
+        KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: "0"
+        KAFKA_NUM_PARTITIONS: "3"
+  variables:
+    F1_KAFKA_ENDPOINT: "kafka:19092"
+    F1_REQUIRE_KAFKA: "1"
+  script:
+    - |
+      ready_timeout=120
+      deadline=$((SECONDS + ready_timeout))
+      host=${F1_KAFKA_ENDPOINT%:*}
+      port=${F1_KAFKA_ENDPOINT##*:}
+      while :; do
+        if (/usr/bin/timeout 2 bash -c 'echo >"/dev/tcp/$1/$2"' _ "${host}" "${port}") 2>/dev/null; then
+          echo "Kafka fixture ready at ${F1_KAFKA_ENDPOINT}"
+          break
+        fi
+        if (( SECONDS >= deadline )); then
+          echo "Kafka fixture never became ready at ${F1_KAFKA_ENDPOINT}" >&2
+          exit 1
+        fi
+        sleep 2
+      done
+    - make -o kafka-up test-kafka
+
+test-kafka-conformance:
+  stage: verify
+  extends: .go-cache
+  services:
+    - name: apache/kafka:4.2.1
+      alias: kafka
+      variables:
+        KAFKA_NODE_ID: "1"
+        KAFKA_PROCESS_ROLES: "broker,controller"
+        KAFKA_LISTENERS: "PLAINTEXT://:19092,CONTROLLER://:19093"
+        KAFKA_ADVERTISED_LISTENERS: "PLAINTEXT://kafka:19092"
+        KAFKA_CONTROLLER_LISTENER_NAMES: "CONTROLLER"
+        KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: "CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT"
+        KAFKA_CONTROLLER_QUORUM_VOTERS: "1@localhost:19093"
+        KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: "1"
+        KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: "1"
+        KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: "1"
+        KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: "0"
+        KAFKA_NUM_PARTITIONS: "3"
+  variables:
+    F1_KAFKA_ENDPOINT: "kafka:19092"
+    F1_REQUIRE_KAFKA: "1"
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_PIPELINE_SOURCE == "schedule"'
+  script:
+    - |
+      ready_timeout=120
+      deadline=$((SECONDS + ready_timeout))
+      host=${F1_KAFKA_ENDPOINT%:*}
+      port=${F1_KAFKA_ENDPOINT##*:}
+      while :; do
+        if (/usr/bin/timeout 2 bash -c 'echo >"/dev/tcp/$1/$2"' _ "${host}" "${port}") 2>/dev/null; then
+          echo "Kafka fixture ready at ${F1_KAFKA_ENDPOINT}"
+          break
+        fi
+        if (( SECONDS >= deadline )); then
+          echo "Kafka fixture never became ready at ${F1_KAFKA_ENDPOINT}" >&2
+          exit 1
+        fi
+        sleep 2
+      done
+    - make -o kafka-up test-kafka-conformance
+
+check-api-surface:
+  stage: verify
+  extends: .go-cache
+  script:
+    - make check-api-surface
+
+check-api-diff:
+  stage: verify
+  extends: .go-cache
+  script:
+    - make check-api-diff
+
+verify-self-contained:
+  stage: verify
+  extends: .go-cache
+  script:
+    - make verify-self-contained
+
 # New `// TENTATIVE` markers must include an issue link.
 # This check runs only on merge-request diffs.
 tentative-check:
