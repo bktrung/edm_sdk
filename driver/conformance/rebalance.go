@@ -533,7 +533,8 @@ func waitForRebalanceAssignmentError(ctx context.Context, errs <-chan error) err
 			if err == nil {
 				return fmt.Errorf("consumer emitted nil error before partition assignment")
 			}
-			if strings.Contains(err.Error(), "partitions assigned") {
+			kind, classified := driver.Classify(err)
+			if classified && kind == driver.KindNotification {
 				return nil
 			}
 			return fmt.Errorf("consumer error before partition assignment: %w", err)

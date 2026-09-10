@@ -899,6 +899,10 @@ func consumeRunnerErrors(r *Runner, ctx context.Context) error {
 				lastResortRunnerLogger(r).Error("f1 consumer error", "subscription", r.subscription.Name, "error", err)
 			}
 			kind, classified := driver.Classify(err)
+			if classified && kind == driver.KindNotification {
+				runnerNotifyError(r, context.WithoutCancel(ctx), nil, err)
+				continue
+			}
 			var cancel context.CancelFunc
 			if !classified || kind == driver.KindTransient {
 				r.mu.Lock()

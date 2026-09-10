@@ -1370,7 +1370,7 @@ func (c *consumer) sendError(err error) {
 	if c.errorsClosed {
 		return
 	}
-	if classified && kind != driver.KindTransient {
+	if classified && (kind == driver.KindFatal || kind == driver.KindNotFound || kind == driver.KindTooLarge || kind == driver.KindPermission) {
 		select {
 		case c.errors <- err:
 			return
@@ -1402,7 +1402,7 @@ func (c *consumer) sendRebalanceError(event string, partitions map[string][]int3
 	if intentionalClose {
 		return
 	}
-	c.sendError(classify("consumer", driver.KindTransient, fmt.Errorf("kafka partitions %s: %v", event, partitions)))
+	c.sendError(classify("consumer", driver.KindNotification, fmt.Errorf("kafka partitions %s: %v", event, partitions)))
 }
 
 func (c *consumer) signalSettlerDoneLocked() {

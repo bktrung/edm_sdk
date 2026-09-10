@@ -294,7 +294,8 @@ receive:
 		case message = <-consumer.Messages():
 			break receive
 		case err := <-consumer.Errors():
-			if strings.Contains(err.Error(), "partitions assigned") {
+			kind, classified := driver.Classify(err)
+			if classified && kind == driver.KindNotification {
 				continue
 			}
 			t.Fatalf("consumer error: %v", err)
@@ -1903,6 +1904,47 @@ func TestConsumerOnePartitionChangeDoesNotResetDestinationAccounting(t *testing.
 	}
 }
 
+func TestConsumerNotificationDoesNotDisplaceQueuedFailure(t *testing.T) {
+	fatalCause := errors.New("fatal consumer failure")
+	const errorCapacity = 8
+	c := &consumer{errors: make(chan error, errorCapacity)}
+	c.sendError(classify("consumer", driver.KindFatal, fatalCause))
+	for sequence := range errorCapacity - 1 {
+		c.sendError(classify("consumer", driver.KindTransient, fmt.Errorf("transient consumer failure %d", sequence)))
+	}
+
+	c.sendRebalanceError("assigned", map[string][]int32{"topic": {0}})
+	fatalSurvived := false
+	notificationObserved := false
+	for range errorCapacity {
+		err := <-c.Errors()
+		kind, classified := driver.Classify(err)
+		if classified && kind == driver.KindFatal {
+			fatalSurvived = true
+		}
+		if classified && kind == driver.KindNotification {
+			notificationObserved = true
+		}
+	}
+	if !fatalSurvived {
+		t.Fatal("queued fatal error was displaced by a notification")
+	}
+	if notificationObserved {
+		t.Fatal("full error channel delivered a notification")
+	}
+
+	c.sendRebalanceError("assigned", map[string][]int32{"topic": {0}})
+	select {
+	case err := <-c.Errors():
+		kind, classified := driver.Classify(err)
+		if !classified || kind != driver.KindNotification {
+			t.Fatalf("empty error channel received (%v, %t), want notification", kind, classified)
+		}
+	default:
+		t.Fatal("notification was not delivered when error channel had capacity")
+	}
+}
+
 func TestConsumerNotificationsObservableAndQuietOnClose(t *testing.T) {
 	c := &consumer{
 		errors:       make(chan error, 8),
@@ -1913,34 +1955,28 @@ func TestConsumerNotificationsObservableAndQuietOnClose(t *testing.T) {
 		clock:        clock.NewFake(time.Unix(0, 0)),
 	}
 	c.onPartitionsAssigned(context.Background(), nil, map[string][]int32{"topic": {0}})
-	select {
-	case err := <-c.Errors():
-		if !strings.Contains(err.Error(), "assigned") {
-			t.Fatalf("expected assigned error, got %v", err)
+	assertNotification := func(name string) {
+		t.Helper()
+		select {
+		case err := <-c.Errors():
+			kind, classified := driver.Classify(err)
+			if !classified || kind != driver.KindNotification {
+				t.Fatalf("expected %s notification kind, got %v (kind=%v classified=%t)", name, err, kind, classified)
+			}
+			if !strings.Contains(err.Error(), name) {
+				t.Fatalf("expected %s notification message, got %v", name, err)
+			}
+		default:
+			t.Fatalf("expected %s notification on Errors", name)
 		}
-	default:
-		t.Fatal("expected assigned notification on Errors")
 	}
+	assertNotification("assigned")
 
 	c.onPartitionsRevoked(context.Background(), nil, map[string][]int32{"topic": {0}})
-	select {
-	case err := <-c.Errors():
-		if !strings.Contains(err.Error(), "revoked") {
-			t.Fatalf("expected revoked error, got %v", err)
-		}
-	default:
-		t.Fatal("expected revoked notification on Errors")
-	}
+	assertNotification("revoked")
 
 	c.onPartitionsLost(context.Background(), nil, map[string][]int32{"topic": {0}})
-	select {
-	case err := <-c.Errors():
-		if !strings.Contains(err.Error(), "lost") {
-			t.Fatalf("expected lost error, got %v", err)
-		}
-	default:
-		t.Fatal("expected lost notification on Errors")
-	}
+	assertNotification("lost")
 
 	// Quiet on close:
 	c.mu.Lock()
