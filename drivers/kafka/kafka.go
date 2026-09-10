@@ -70,6 +70,7 @@ type conn struct {
 	instanceID            string
 	rebalanceDrainTimeout time.Duration
 	staticMembership      bool
+	balancer              kgo.GroupBalancer
 	delays                map[string]time.Duration
 	caps                  driver.Capabilities
 	info                  driver.BrokerInfo
@@ -114,6 +115,10 @@ func (Driver) Open(ctx context.Context, cfg driver.Config) (driver.Conn, error) 
 		return nil, classify("open", driver.KindFatal, err)
 	}
 	staticMembership, err := resolveStaticMembership(cfg.DriverOptions)
+	if err != nil {
+		return nil, classify("open", driver.KindFatal, err)
+	}
+	balancer, err := resolveBalancer(cfg.DriverOptions)
 	if err != nil {
 		return nil, classify("open", driver.KindFatal, err)
 	}
@@ -227,6 +232,7 @@ func (Driver) Open(ctx context.Context, cfg driver.Config) (driver.Conn, error) 
 		instanceID:            cfg.InstanceID,
 		rebalanceDrainTimeout: rebalanceDrainTimeout,
 		staticMembership:      staticMembership,
+		balancer:              balancer,
 		delays:                make(map[string]time.Duration),
 		caps:                  caps,
 		info:                  info,

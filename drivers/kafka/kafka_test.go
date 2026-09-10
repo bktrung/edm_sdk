@@ -258,6 +258,57 @@ func TestStaticMembershipResolution(t *testing.T) {
 	}
 }
 
+func TestBalancerResolution(t *testing.T) {
+	cases := []struct {
+		name        string
+		value       string
+		want        string
+		cooperative bool
+		lane        bool
+	}{
+		{name: "default", want: "lane", lane: true},
+		{name: "lane", value: "lane", want: "lane", lane: true},
+		{name: "cooperative sticky", value: "cooperative-sticky", want: "cooperative-sticky", cooperative: true},
+		{name: "sticky", value: "sticky", want: "sticky"},
+		{name: "range", value: "range", want: "range"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			options := map[string]string{}
+			if tc.value != "" {
+				options["kafka.balancer"] = tc.value
+			}
+			balancer, err := resolveBalancer(options)
+			if err != nil {
+				t.Fatalf("resolveBalancer(%q) error = %v", tc.value, err)
+			}
+			if got := balancer.ProtocolName(); got != tc.want {
+				t.Fatalf("resolveBalancer(%q) protocol = %q, want %q", tc.value, got, tc.want)
+			}
+			if got := balancer.IsCooperative(); got != tc.cooperative {
+				t.Fatalf("resolveBalancer(%q) cooperative = %v, want %v", tc.value, got, tc.cooperative)
+			}
+			if tc.lane {
+				if _, ok := balancer.(*laneBalancer); !ok {
+					t.Fatalf("resolveBalancer(%q) type = %T, want *laneBalancer", tc.value, balancer)
+				}
+			}
+		})
+	}
+
+	const invalid = "not-a-balancer"
+	_, err := (Driver{}).Open(context.Background(), driver.Config{
+		DriverOptions: map[string]string{"kafka.balancer": invalid},
+	})
+	if err == nil || !strings.Contains(err.Error(), "kafka.balancer") || !strings.Contains(err.Error(), invalid) {
+		t.Fatalf("Open(%q) error = %v, want kafka.balancer and value", invalid, err)
+	}
+	var classified *driver.Error
+	if !errors.As(err, &classified) || classified.Kind() != driver.KindFatal {
+		t.Fatalf("Open(%q) error = %T/%v, want fatal classified error", invalid, err, err)
+	}
+}
+
 func TestOpenPingClose(t *testing.T) {
 	requireBroker(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -65,9 +66,62 @@ func translateDestination(spec driver.DestinationSpec) kafkaTopicSpec {
 	return topic
 }
 
+func resolveMaxExpectedInstances(options map[string]string) (int32, error) {
+	value, ok := options["kafka.maxExpectedInstances"]
+	if !ok {
+		return 0, nil
+	}
+	instances, err := strconv.ParseInt(value, 10, 32)
+	if err != nil || instances < 0 {
+		return 0, fmt.Errorf("kafka: invalid maxExpectedInstances %q; must be a non-negative integer", value)
+	}
+	return int32(instances), nil
+}
+
+func (a *admin) maxExpectedInstances() (int32, error) {
+	if a.conn == nil {
+		return 0, nil
+	}
+	return resolveMaxExpectedInstances(a.conn.driverOptions)
+}
+
+func partitionFloorError(destination string, partitions int, floor int32) error {
+	return classify("ensure_topology", driver.KindFatal, fmt.Errorf(
+		"destination %q has %d partitions, fewer than maxExpectedInstances %d",
+		destination,
+		partitions,
+		floor,
+	))
+}
+
+func (a *admin) checkTopicPartitionFloor(ctx context.Context, destination string, floor int32) error {
+	if err := a.waitForTopicState(ctx, "ensure_topology", []string{destination}, topicMustExist); err != nil {
+		return err
+	}
+	topics, err := a.listTopics(ctx, "ensure_topology", destination)
+	if err != nil {
+		return err
+	}
+	detail, ok := topics[destination]
+	if !ok {
+		return classify("ensure_topology", driver.KindFatal, fmt.Errorf("destination %q was not returned while checking partition floor", destination))
+	}
+	if detail.Err != nil {
+		return classifyAdminError("ensure_topology", detail.Err)
+	}
+	if got := len(detail.Partitions); got < int(floor) {
+		return partitionFloorError(destination, got, floor)
+	}
+	return nil
+}
+
 func (a *admin) ensureTopology(ctx context.Context, spec driver.TopologySpec) (driver.TopologyDiff, error) {
 	if spec.Policy == driver.TopologyNone {
 		return driver.TopologyDiff{}, nil
+	}
+	maxExpectedInstances, err := a.maxExpectedInstances()
+	if err != nil {
+		return driver.TopologyDiff{}, classify("ensure_topology", driver.KindFatal, err)
 	}
 	if spec.Policy == driver.TopologyVerify {
 		return a.verifyTopology(ctx, spec)
@@ -76,9 +130,20 @@ func (a *admin) ensureTopology(ctx context.Context, spec driver.TopologySpec) (d
 	var diff driver.TopologyDiff
 	created := make([]string, 0, len(spec.Destinations))
 	plan := translateTopology(spec)
-	for _, destination := range plan.destinations {
+	for i := range plan.destinations {
+		destination := plan.destinations[i]
 		if destination.err != nil {
 			return driver.TopologyDiff{}, destination.err
+		}
+		if maxExpectedInstances > 0 && destination.partitions < 0 {
+			destination.partitions = maxExpectedInstances
+		}
+		if maxExpectedInstances > 0 && destination.partitions < maxExpectedInstances {
+			return driver.TopologyDiff{}, partitionFloorError(
+				destination.name,
+				int(destination.partitions),
+				maxExpectedInstances,
+			)
 		}
 		if err := ctx.Err(); err != nil {
 			return driver.TopologyDiff{}, classify("ensure_topology", driver.KindTransient, err)
@@ -92,6 +157,11 @@ func (a *admin) ensureTopology(ctx context.Context, spec driver.TopologySpec) (d
 			diff.CreatedDestinations = append(diff.CreatedDestinations, destination.name)
 			created = append(created, destination.name)
 		case errors.Is(response.Err, kerr.TopicAlreadyExists):
+			if maxExpectedInstances > 0 {
+				if err := a.checkTopicPartitionFloor(ctx, destination.name, maxExpectedInstances); err != nil {
+					return driver.TopologyDiff{}, err
+				}
+			}
 			diff.ExistingDestinations = append(diff.ExistingDestinations, destination.name)
 		default:
 			return driver.TopologyDiff{}, classifyAdminError("ensure_topology", response.Err)
@@ -165,6 +235,10 @@ func (a *admin) verifyTopology(ctx context.Context, spec driver.TopologySpec) (d
 	if len(spec.Destinations) == 0 {
 		return diff, nil
 	}
+	maxExpectedInstances, err := a.maxExpectedInstances()
+	if err != nil {
+		return driver.TopologyDiff{}, classify("ensure_topology", driver.KindFatal, err)
+	}
 	topics, err := a.listTopics(ctx, "ensure_topology", destinationNames(spec.Destinations)...)
 	if err != nil {
 		return driver.TopologyDiff{}, err
@@ -184,6 +258,9 @@ func (a *admin) verifyTopology(ctx context.Context, spec driver.TopologySpec) (d
 			return driver.TopologyDiff{}, classifyAdminError("ensure_topology", detail.Err)
 		}
 		diff.ExistingDestinations = append(diff.ExistingDestinations, destination.Name)
+		if maxExpectedInstances > 0 && len(detail.Partitions) < int(maxExpectedInstances) {
+			return driver.TopologyDiff{}, partitionFloorError(destination.Name, len(detail.Partitions), maxExpectedInstances)
+		}
 		if destination.Partitions > 0 {
 			got := len(detail.Partitions)
 			if got != destination.Partitions {

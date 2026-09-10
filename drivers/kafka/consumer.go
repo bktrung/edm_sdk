@@ -346,6 +346,13 @@ func consumerClientOpts(connection *conn, cfg driver.ConsumerConfig, group strin
 			return nil, err
 		}
 	}
+	balancer := connection.balancer
+	if balancer == nil {
+		// Directly constructed connection facades predate the stored selection;
+		// preserve franz-go's cooperative default for those paths. Open always
+		// stores the configured balancer before a consumer can be created.
+		balancer = kgo.CooperativeStickyBalancer()
+	}
 
 	opts := append([]kgo.Opt(nil), connection.clientOpts...)
 	opts = append(opts,
@@ -353,6 +360,7 @@ func consumerClientOpts(connection *conn, cfg driver.ConsumerConfig, group strin
 		kgo.ConsumeTopics(cfg.Destinations...),
 		kgo.DisableAutoCommit(),
 		consumerStartOffset(cfg.StartAt),
+		kgo.Balancers(balancer),
 		// Franz-go defaults FetchMaxWait to 5000ms for non-share groups. When a
 		// multi-destination consumer settles a message on a destination whose
 		// broker partition is currently exhausted, franz-go issues a Fetch

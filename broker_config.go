@@ -102,7 +102,7 @@ func (r rawSASL) config() driver.SASLConfig {
 
 func validKafkaOption(key string) bool {
 	switch key {
-	case "compression", "batchLinger", "fetchMaxBytes", "sessionTimeout", "rebalanceTimeout", "useShareGroups", "staticMembership", "maxAckGap", "balancer":
+	case "compression", "batchLinger", "fetchMaxBytes", "sessionTimeout", "rebalanceTimeout", "useShareGroups", "staticMembership", "maxAckGap", "balancer", "maxExpectedInstances":
 		return true
 	}
 	return false

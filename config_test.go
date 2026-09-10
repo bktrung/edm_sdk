@@ -81,6 +81,7 @@ f1:
     kafka:
       compression: lz4
       sessionTimeout: 60s
+      maxExpectedInstances: "3"
   codec:
     contentMode: binary
 `)
@@ -90,6 +91,9 @@ f1:
 	}
 	if got, want := cfg.Broker.DriverOptions["kafka.compression"], "lz4"; got != want {
 		t.Fatalf("compression = %q, want %q", got, want)
+	}
+	if got, want := cfg.Broker.DriverOptions["kafka.maxExpectedInstances"], "3"; got != want {
+		t.Fatalf("max expected instances = %q, want %q", got, want)
 	}
 	if got, want := cfg.Broker.ConnectTimeout, 4*time.Second; got != want {
 		t.Fatalf("connect timeout = %s, want %s", got, want)
