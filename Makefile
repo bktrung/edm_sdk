@@ -38,11 +38,11 @@ $(GOLANGCI_LINT):
 	GOBIN=$(CURDIR)/.tools/bin go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@$(GOLANGCI_LINT_VERSION)
 
 lint: $(GOLANGCI_LINT)
-	$(GOLANGCI_LINT) run ./...
+	$(GOLANGCI_LINT) run --build-tags integration ./...
 
 ## verify-agnostic: check broker import boundaries with depguard.
 verify-agnostic: $(GOLANGCI_LINT)
-	$(GOLANGCI_LINT) run --enable-only depguard ./...
+	$(GOLANGCI_LINT) run --build-tags integration --enable-only depguard ./...
 
 ## verify-self-contained: fail on citations no reader of this repository can resolve.
 # Design records live elsewhere. A reader here - a broker vendor, an auditor, a
@@ -142,7 +142,7 @@ $(APIDIFF): tools/apidiff/go.mod tools/apidiff/go.sum
 $(APIDIFF_NORMALIZE): tools/apidiff/normalize.go tools/apidiff/go.mod tools/apidiff/go.sum
 	cd tools/apidiff && go build -o ../../.tools/bin/apidiff-normalize .
 
-.PHONY: broker-up broker-down broker-reset broker-smoke test-rabbitmq test-kafka test-kafka-conformance kafka-up kafka-down
+.PHONY: broker-up broker-down broker-reset broker-smoke test-rabbitmq test-kafka test-infra test-kafka-conformance kafka-up kafka-down
 
 ## test-rabbitmq: run the RabbitMQ driver suite against the fixture, starting it
 ## first. F1_REQUIRE_RABBITMQ makes an unreachable broker a failure rather than a
@@ -155,6 +155,10 @@ test-rabbitmq: broker-up broker-smoke
 ## F1_REQUIRE_KAFKA makes an unreachable broker a failure rather than a skip.
 test-kafka: kafka-up
 	F1_REQUIRE_KAFKA=1 go test -race -count=1 ./drivers/kafka/...
+
+## test-infra: run the tests that need a broker. Fails, never skips, when one is missing.
+test-infra: kafka-up
+	go test -count=1 -tags integration ./...
 
 ## test-kafka-conformance: run both Kafka conformance profiles against the fixture.
 ## This takes about 250s and requires a live Kafka broker. F1_REQUIRE_KAFKA
