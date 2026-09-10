@@ -67,6 +67,222 @@ func fullEnvelope() f1.Envelope {
 	}
 }
 
+func minimalEnvelope() f1.Envelope {
+	return f1.Envelope{
+		SpecVersion: "1.0",
+		ID:          "i",
+		Source:      "s",
+		Type:        "t",
+		Time:        time.Date(2026, 8, 5, 11, 0, 0, 0, time.UTC),
+		Priority:    f1.PriorityNormal,
+	}
+}
+
+func TestEnvelope_EncodeHeadersEnforcesCapAcrossTiers(t *testing.T) {
+	t.Parallel()
+
+	base := minimalEnvelope()
+	protocol := base
+	protocol.IdempotencyKey = strings.Repeat("p", 512)
+	descriptive := base
+	descriptive.Subject = strings.Repeat("s", 300)
+	death := base
+	death.DeathError = strings.Repeat("e", 2048)
+
+	tests := []struct {
+		name     string
+		envelope f1.Envelope
+		limit    int
+		wantErr  bool
+	}{
+		{name: "mandatory", envelope: base, limit: 1, wantErr: true},
+		{name: "protocol", envelope: protocol, limit: 200, wantErr: true},
+		{name: "descriptive", envelope: descriptive, limit: 200},
+		{name: "death", envelope: death, limit: 200},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			headers, err := tt.envelope.EncodeHeaders(tt.limit)
+			if tt.wantErr {
+				require.ErrorIs(t, err, f1.ErrEnvelopeTooLarge)
+				require.Nil(t, headers)
+				return
+			}
+			require.NoError(t, err)
+			require.LessOrEqual(t, headerBytesOf(headers), tt.limit)
+		})
+	}
+}
+
+func TestEnvelope_EncodeHeadersBackstopRejectsUnsheddableProtocolOverflow(t *testing.T) {
+	t.Parallel()
+
+	e := minimalEnvelope()
+	e.Subject = strings.Repeat("s", 300)
+	e.IdempotencyKey = strings.Repeat("p", 300)
+
+	headers, err := e.EncodeHeaders(200)
+	require.ErrorIs(t, err, f1.ErrEnvelopeTooLarge)
+	require.Nil(t, headers)
+}
+
+func TestEnvelope_HeaderSizeGuardShedsLargeSubjectAtDriverLimit(t *testing.T) {
+	t.Parallel()
+
+	e := minimalEnvelope()
+	e.Subject = strings.Repeat("s", 300)
+
+	headers, err := e.EncodeHeaders(200)
+	require.NoError(t, err)
+	require.NotContains(t, headers, "subject")
+	require.LessOrEqual(t, headerBytesOf(headers), 200)
+}
+
+func TestEnvelope_EncodeHeadersNeverShedsProtocolHeaders(t *testing.T) {
+	t.Parallel()
+
+	due := time.Date(2026, 8, 5, 12, 0, 0, 0, time.UTC)
+	expiry := time.Date(2026, 8, 6, 0, 0, 0, 0, time.UTC)
+	e := minimalEnvelope()
+	e.Subject = strings.Repeat("s", 300)
+	e.IdempotencyKey = "idempotency"
+	e.Attempt = 7
+	e.MaxAttempts = 9
+	e.DueTime = &due
+	e.OriginalDest = "orders.created"
+	e.CorrelationID = "correlation"
+	e.CausationID = "causation"
+	e.Producer = "producer"
+	e.PartitionKey = "partition"
+	e.Expiry = &expiry
+
+	withoutSubject := e
+	withoutSubject.Subject = ""
+	expected, err := withoutSubject.EncodeHeaders(0)
+	require.NoError(t, err)
+
+	headers, err := e.EncodeHeaders(headerBytesOf(expected))
+	require.NoError(t, err)
+	require.Equal(t, expected["f1idempotencykey"], headers["f1idempotencykey"])
+	require.Equal(t, expected["f1priority"], headers["f1priority"])
+	require.Equal(t, expected["f1attempt"], headers["f1attempt"])
+	require.Equal(t, expected["f1maxattempts"], headers["f1maxattempts"])
+	require.Equal(t, expected["f1duetime"], headers["f1duetime"])
+	require.Equal(t, expected["f1originaldest"], headers["f1originaldest"])
+	require.Equal(t, expected["f1correlationid"], headers["f1correlationid"])
+	require.Equal(t, expected["f1causationid"], headers["f1causationid"])
+	require.Equal(t, expected["f1producer"], headers["f1producer"])
+	require.Equal(t, expected["f1partitionkey"], headers["f1partitionkey"])
+	require.Equal(t, expected["f1expiry"], headers["f1expiry"])
+	require.NotContains(t, headers, "subject")
+	e.IdempotencyKey = strings.Repeat("p", 512)
+	_, err = e.EncodeHeaders(headerBytesOf(expected))
+	require.ErrorIs(t, err, f1.ErrEnvelopeTooLarge)
+}
+
+func TestEnvelope_EncodeHeadersShedsDescriptiveHeadersInOrder(t *testing.T) {
+	t.Parallel()
+
+	value := strings.Repeat("x", 100)
+	e := minimalEnvelope()
+	e.Forwarded = map[string]string{"f1future": value}
+	e.TraceState = value
+	e.DataSchema = value
+	e.DataContentType = value
+	e.Subject = value
+	e.TraceParent = value
+
+	all, err := e.EncodeHeaders(0)
+	require.NoError(t, err)
+	order := []string{"f1future", "tracestate", "dataschema", "datacontenttype", "subject", "traceparent"}
+	for i := range order {
+		after := cloneHeaders(all)
+		for _, shed := range order[:i+1] {
+			delete(after, shed)
+		}
+
+		headers, err := e.EncodeHeaders(headerBytesOf(after))
+		require.NoError(t, err)
+		require.LessOrEqual(t, headerBytesOf(headers), headerBytesOf(after))
+		for j, candidate := range order {
+			if j <= i {
+				require.NotContains(t, headers, candidate)
+			} else {
+				require.Equal(t, value, headers[candidate])
+			}
+		}
+	}
+}
+
+func TestEnvelope_EncodeHeadersShedTiersRetainMandatoryHeaders(t *testing.T) {
+	t.Parallel()
+
+	e := minimalEnvelope()
+	e.Extensions = map[string]string{"x-extension": strings.Repeat("x", 100)}
+	e.Subject = strings.Repeat("s", 100)
+	e.DeathError = strings.Repeat("e", 2048)
+
+	base, err := minimalEnvelope().EncodeHeaders(0)
+	require.NoError(t, err)
+	limit := headerBytesOf(base) + 20
+
+	headers, err := e.EncodeHeaders(limit)
+	require.NoError(t, err)
+	require.LessOrEqual(t, headerBytesOf(headers), limit)
+	require.Equal(t, "1.0", headers["specversion"])
+	require.Equal(t, "i", headers["id"])
+	require.Equal(t, "s", headers["source"])
+	require.Equal(t, "t", headers["type"])
+	require.NotEmpty(t, headers["time"])
+	require.NotContains(t, headers, "x-extension")
+	require.NotContains(t, headers, "subject")
+	expectedDeathErrorBytes := limit - headerBytesOf(base) - len("f1deatherror")
+	require.Equal(t, expectedDeathErrorBytes, len(headers["f1deatherror"]))
+}
+
+func TestEnvelope_EncodeHeadersKeepsForwardedWhenDeathDetailsShedFits(t *testing.T) {
+	t.Parallel()
+
+	e := minimalEnvelope()
+	e.Forwarded = map[string]string{"f1future": strings.Repeat("f", 100)}
+	e.DeathError = strings.Repeat("e", 900)
+	e.DeathDetails = map[string]string{"tenant": strings.Repeat("d", 100)}
+
+	atFloor := e
+	atFloor.DeathError = strings.Repeat("e", 512)
+	atFloor.DeathDetails = nil
+	expected, err := atFloor.EncodeHeaders(0)
+	require.NoError(t, err)
+
+	headers, err := e.EncodeHeaders(headerBytesOf(expected))
+	require.NoError(t, err)
+	require.Equal(t, strings.Repeat("f", 100), headers["f1future"])
+	require.NotContains(t, headers, "f1detailtenant")
+	require.Equal(t, 512, len(headers["f1deatherror"]))
+	require.LessOrEqual(t, headerBytesOf(headers), headerBytesOf(expected))
+}
+
+func TestEnvelope_EncodeHeadersPreservesDeathErrorFloorBeforeDescriptive(t *testing.T) {
+	t.Parallel()
+
+	e := minimalEnvelope()
+	e.DeathError = strings.Repeat("e", 900)
+	e.Subject = strings.Repeat("s", 300)
+
+	atFloor := e
+	atFloor.DeathError = strings.Repeat("e", 512)
+	atFloor.Subject = ""
+	expected, err := atFloor.EncodeHeaders(0)
+	require.NoError(t, err)
+
+	headers, err := e.EncodeHeaders(headerBytesOf(expected))
+	require.NoError(t, err)
+	require.Equal(t, 512, len(headers["f1deatherror"]))
+	require.NotContains(t, headers, "subject")
+	require.LessOrEqual(t, headerBytesOf(headers), headerBytesOf(expected))
+}
+
 func TestEnvelope_MatchesDoc03Table(t *testing.T) {
 	t.Parallel()
 
@@ -318,13 +534,16 @@ func TestEnvelope_HeaderSizeGuardShedsExtensionsThenTruncatesDeathError(t *testi
 	e := fullEnvelope()
 	e.Extensions = map[string]string{"ext-a": "aaaaaaaaaa", "ext-b": "bbbbbbbbbb"}
 
-	small := 200
 	withoutExt := e
 	withoutExt.Extensions = nil
 	withoutExtHeaders, err := withoutExt.EncodeHeaders(0)
 	require.NoError(t, err)
 	baseline := headerBytesOf(withoutExtHeaders)
-	require.Greater(t, baseline, small, "test setup: baseline must already exceed the limit before Extensions is even added")
+
+	withExtHeaders, err := e.EncodeHeaders(0)
+	require.NoError(t, err)
+	small := baseline + 5
+	require.Greater(t, headerBytesOf(withExtHeaders), small, "test setup: the Extensions must add more bytes than the available headroom")
 
 	h, err := e.EncodeHeaders(small)
 	require.NoError(t, err)
@@ -340,7 +559,7 @@ func TestEnvelope_HeaderSizeGuardShedsExtensionsThenTruncatesDeathError(t *testi
 	require.True(t, errors.Is(err, f1.ErrEnvelopeTooLarge))
 
 	e.DeathError = "a very long terminal error string that will need truncating to fit under the cap"
-	tight, err := e.EncodeHeaders(200)
+	tight, err := e.EncodeHeaders(small)
 	require.NoError(t, err)
 	require.LessOrEqual(t, len(tight["f1deatherror"]), len("a very long terminal error string that will need truncating to fit under the cap"))
 }
@@ -431,7 +650,14 @@ func TestEnvelope_SizeGuardTruncatesErrorBelowFloorWhenDetailsAbsent(t *testing.
 	e.DeathError = strings.Repeat("e", 2048)
 	headers, err := e.EncodeHeaders(headerBytesOf(baseHeaders))
 	require.NoError(t, err)
-	require.Empty(t, headers["f1deatherror"])
+	require.LessOrEqual(t, headerBytesOf(headers), headerBytesOf(baseHeaders))
+	withoutTrace := cloneHeaders(baseHeaders)
+	delete(withoutTrace, "traceparent")
+	delete(withoutTrace, "tracestate")
+	require.NotContains(t, headers, "traceparent")
+	require.NotContains(t, headers, "tracestate")
+	expectedDeathErrorBytes := headerBytesOf(baseHeaders) - headerBytesOf(withoutTrace) - len("f1deatherror")
+	require.Equal(t, expectedDeathErrorBytes, len(headers["f1deatherror"]))
 }
 
 func headerBytesOf(h map[string]string) int {

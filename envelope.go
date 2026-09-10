@@ -64,11 +64,20 @@ const timeLayout = time.RFC3339Nano
 // CoreMaxHeaderBytes is the SDK's maximum encoded header size.
 const CoreMaxHeaderBytes = 8 * 1024
 
-// EncodeHeaders serializes e to canonical wire headers. maxHeaderBytes is the
-// cap applied to this encoding; zero or a larger value uses CoreMaxHeaderBytes.
-// Oversized headers drop Extensions, preserve DeathError down to a floor, shed
-// DeathDetails, and then truncate DeathError further. Invalid priorities and
-// reserved extension keys return errors.
+// EncodeHeaders serializes e to canonical wire headers. A non-positive
+// maxHeaderBytes or a value above CoreMaxHeaderBytes uses CoreMaxHeaderBytes.
+// If the encoding exceeds the cap, user-defined Extensions are dropped first.
+// DeathError is then preserved down to a floor and DeathDetails are shed.
+// Descriptive attributes are then shed in this order: Forwarded, tracestate,
+// dataschema, datacontenttype, subject, and traceparent. DeathError is then
+// truncated further without a floor. The mandatory tier (specversion, id,
+// source, type, and time) and the protocol tier (f1idempotencykey, f1priority,
+// f1attempt, f1maxattempts, f1duetime, f1originaldest, f1correlationid,
+// f1causationid, f1producer, f1partitionkey, and f1expiry) are never shed.
+// Forwarded is shed despite carrying unknown reserved attributes so an older
+// hop can drop newer producer attributes under cap pressure. If the remaining
+// encoded headers exceed the cap, EncodeHeaders returns ErrEnvelopeTooLarge.
+// Invalid priorities and reserved extension keys return errors.
 func (e Envelope) EncodeHeaders(maxHeaderBytes int) (map[string]string, error) {
 	if !e.Priority.Valid() {
 		return nil, ErrInvalidPriority
@@ -149,8 +158,22 @@ func (e Envelope) EncodeHeaders(maxHeaderBytes int) (map[string]string, error) {
 	if headerBytes(h) <= limit {
 		return h, nil
 	}
+	for k := range e.Forwarded {
+		if !knownHeaders[k] {
+			delete(h, k)
+		}
+	}
+	if headerBytes(h) <= limit {
+		return h, nil
+	}
+	for _, k := range []string{"tracestate", "dataschema", "datacontenttype", "subject", "traceparent"} {
+		delete(h, k)
+		if headerBytes(h) <= limit {
+			return h, nil
+		}
+	}
 	shrinkDeathError(h, limit)
-	if headerBytes(h) > limit && mandatoryHeaderBytes(h) > limit {
+	if headerBytes(h) > limit {
 		return nil, fmt.Errorf("f1: envelope headers exceed cap for id=%q source=%q type=%q: %w", e.ID, e.Source, e.Type, ErrEnvelopeTooLarge)
 	}
 	return h, nil
@@ -174,14 +197,6 @@ func headerBytes(h map[string]string) int {
 		n += len(k) + len(v)
 	}
 	return n
-}
-
-func mandatoryHeaderBytes(h map[string]string) int {
-	return len("specversion") + len(h["specversion"]) +
-		len("id") + len(h["id"]) +
-		len("source") + len(h["source"]) +
-		len("type") + len(h["type"]) +
-		len("time") + len(h["time"])
 }
 
 const deathErrorFloor = 512
