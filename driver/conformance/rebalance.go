@@ -457,8 +457,8 @@ func publishRebalanceCount(t *testing.T, group *groupContext, producer driver.Pr
 	for i := range messages {
 		messages[i] = driver.OutboundMessage{
 			Destination: destination,
-			Key:         []byte(fmt.Sprintf("rebalance-key-%d", i)),
-			Body:        []byte(fmt.Sprintf("message-%d", i)),
+			Key:         fmt.Appendf(nil, "rebalance-key-%d", i),
+			Body:        fmt.Appendf(nil, "message-%d", i),
 		}
 	}
 	if err := producer.Publish(group.ctx, messages...); err != nil {
