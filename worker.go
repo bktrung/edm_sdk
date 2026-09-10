@@ -48,9 +48,10 @@ type deliveryState struct {
 	settled   bool
 	// operation records which settlement call was last made, so that a failed
 	// one can be retried in kind rather than guessed at.
-	operation   settlementOperation
-	nackOptions driver.NackOptions
-	poisonDrop  *poisonDropReport
+	operation      settlementOperation
+	nackOptions    driver.NackOptions
+	poisonDrop     *poisonDropReport
+	headerMaxBytes int
 }
 
 type poisonDropReport struct {
@@ -1131,6 +1132,10 @@ func effectiveMaxAttempts(eventMaxAttempts, policyMaxAttempts int) int {
 // completed; classification and settlement stay outside middleware.
 func dispatchMessage(r *Runner, ctx context.Context, message driver.InboundMessage, envelopeOut *Envelope, abandoned *bool, states ...*deliveryState) bool {
 	state := stateFor(states)
+	r.client.mu.Lock()
+	headerMaxBytes := effectiveHeaderLimit(r.client.config.Codec.MaxHeaderBytes, r.client.effective.MaxHeaderBytes)
+	r.client.mu.Unlock()
+	state.headerMaxBytes = headerMaxBytes
 	headers := inboundHeaders(message.Headers)
 	envelope, err := DecodeHeaders(headers)
 	if err != nil {
@@ -1164,7 +1169,7 @@ func dispatchMessage(r *Runner, ctx context.Context, message driver.InboundMessa
 	}
 	eventEnvelope := envelope
 	eventEnvelope.MaxAttempts = maxAttempts
-	event := &Event{envelope: eventEnvelope, raw: append([]byte(nil), message.Body...), codec: eventCodec, headers: headers}
+	event := &Event{envelope: eventEnvelope, raw: append([]byte(nil), message.Body...), codec: eventCodec, headers: headers, headerMaxBytes: state.headerMaxBytes}
 	result := invokeHandler(r, ctx, handler, event)
 	if result.stuck {
 		*abandoned = true
@@ -1378,7 +1383,7 @@ func nackDelivery(r *Runner, ctx context.Context, message driver.InboundMessage,
 
 func deadLetterAndSettle(r *Runner, ctx context.Context, message driver.InboundMessage, envelope Envelope, reason DeathReason, lastErr error, states ...*deliveryState) bool {
 	state := stateFor(states)
-	if err := deadLetter(r, ctx, message, envelope, reason, lastErr); err != nil {
+	if err := deadLetter(r, ctx, message, envelope, reason, lastErr, state.headerMaxBytes); err != nil {
 		if reason == ReasonPoison && isMissingDeadLetterRoute(err) {
 			state.poisonDrop = &poisonDropReport{envelope: envelope, cause: err}
 			sctx := runnerSettlementContext(r, ctx)
@@ -1388,7 +1393,7 @@ func deadLetterAndSettle(r *Runner, ctx context.Context, message driver.InboundM
 			}
 			return settled
 		}
-		failSuccessorHandoff(r, runnerSettlementContext(r, ctx), "dead_letter", eventFromDelivery(r, message, envelope), err)
+		failSuccessorHandoff(r, runnerSettlementContext(r, ctx), "dead_letter", eventFromDelivery(r, message, envelope, state.headerMaxBytes), err)
 		return false
 	}
 	return ackDeliveryAs(r, runnerSettlementContext(r, ctx), message, lifecycle.DeadLettered, state)
@@ -1402,7 +1407,7 @@ func isMissingDeadLetterRoute(err error) bool {
 	return classified && kind == driver.KindNotFound
 }
 
-func reportPoisonDrop(r *Runner, ctx context.Context, message driver.InboundMessage, envelope Envelope, cause error) {
+func reportPoisonDrop(r *Runner, ctx context.Context, message driver.InboundMessage, envelope Envelope, headerMaxBytes int, cause error) {
 	dropErr := fmt.Errorf("f1: poison message dropped: event_id=%q destination=%q attempt=%d: no dead-letter route available: %w", envelope.ID, message.Destination, envelope.Attempt, cause)
 	if r.client.options.errorHandler == nil {
 		lastResortRunnerLogger(r).Error("f1 poison message dropped; no dead-letter route",
@@ -1414,7 +1419,7 @@ func reportPoisonDrop(r *Runner, ctx context.Context, message driver.InboundMess
 		)
 		return
 	}
-	runnerNotifyError(r, ctx, eventFromDelivery(r, message, envelope), dropErr)
+	runnerNotifyError(r, ctx, eventFromDelivery(r, message, envelope, headerMaxBytes), dropErr)
 }
 
 func reportPendingPoisonDrop(r *Runner, ctx context.Context, message driver.InboundMessage, state *deliveryState) {
@@ -1423,7 +1428,7 @@ func reportPendingPoisonDrop(r *Runner, ctx context.Context, message driver.Inbo
 	}
 	report := state.poisonDrop
 	state.poisonDrop = nil
-	reportPoisonDrop(r, ctx, message, report.envelope, report.cause)
+	reportPoisonDrop(r, ctx, message, report.envelope, state.headerMaxBytes, report.cause)
 }
 
 // deadLetter republishes message to its dead-letter destination, carrying
@@ -1434,7 +1439,7 @@ func reportPendingPoisonDrop(r *Runner, ctx context.Context, message driver.Inbo
 // rejecting the same bytes here on their way to the dead-letter destination
 // would turn a successful delivery into a silent message-loss path instead
 // of the visible one dead-lettering exists to provide.
-func deadLetter(r *Runner, ctx context.Context, message driver.InboundMessage, envelope Envelope, reason DeathReason, lastErr error) error {
+func deadLetter(r *Runner, ctx context.Context, message driver.InboundMessage, envelope Envelope, reason DeathReason, lastErr error, headerMaxBytes int) error {
 	if reason == ReasonDecode && envelope.ID == "" {
 		// Preserve the raw headers when the envelope itself could not be decoded.
 		headers := inboundHeaders(message.Headers)
@@ -1482,7 +1487,7 @@ func deadLetter(r *Runner, ctx context.Context, message driver.InboundMessage, e
 	now := r.client.options.clock.Now().UTC()
 	death.DeathTime = &now
 	destination := deadLetterDestination(r, death, message)
-	encoded, err := death.EncodeHeaders(r.client.config.Codec.MaxHeaderBytes)
+	encoded, err := death.EncodeHeaders(headerMaxBytes)
 	if err != nil {
 		return err
 	}
@@ -1545,11 +1550,11 @@ func publishSuccessor(r *Runner, ctx context.Context, messages ...driver.Outboun
 // for handing to code outside the normal handler dispatch path (such as the
 // error handler) that still needs to identify which message an async
 // failure is about.
-func eventFromDelivery(r *Runner, message driver.InboundMessage, envelope Envelope) *Event {
+func eventFromDelivery(r *Runner, message driver.InboundMessage, envelope Envelope, headerMaxBytes int) *Event {
 	eventCodec, _ := r.client.codecForContentType(envelope.DataContentType)
 	eventEnvelope := envelope
 	eventEnvelope.MaxAttempts = effectiveMaxAttempts(envelope.MaxAttempts, r.subscription.Retry.MaxAttempts)
-	return &Event{envelope: eventEnvelope, raw: append([]byte(nil), message.Body...), codec: eventCodec, headers: inboundHeaders(message.Headers)}
+	return &Event{envelope: eventEnvelope, raw: append([]byte(nil), message.Body...), codec: eventCodec, headers: inboundHeaders(message.Headers), headerMaxBytes: headerMaxBytes}
 }
 
 // failSuccessorHandoff runs once a retry or dead-letter successor could not
@@ -1612,7 +1617,7 @@ func retryAndSettle(r *Runner, ctx context.Context, message driver.InboundMessag
 	now := r.client.options.clock.Now().UTC()
 	due := now.Add(delay)
 	copyEnvelope.DueTime = &due
-	encoded, err := copyEnvelope.EncodeHeaders(r.client.config.Codec.MaxHeaderBytes)
+	encoded, err := copyEnvelope.EncodeHeaders(state.headerMaxBytes)
 	if err != nil {
 		_ = nackDelivery(r, runnerSettlementContext(r, ctx), message, driver.NackOptions{CountAsFailure: true}, state)
 		return false
@@ -1624,7 +1629,7 @@ func retryAndSettle(r *Runner, ctx context.Context, message driver.InboundMessag
 	}
 	sort.Slice(out.Headers, func(i, j int) bool { return out.Headers[i].Key < out.Headers[j].Key })
 	if err := publishSuccessor(r, runnerSettlementContext(r, ctx), out); err != nil {
-		failSuccessorHandoff(r, runnerSettlementContext(r, ctx), "retry", eventFromDelivery(r, message, envelope), err)
+		failSuccessorHandoff(r, runnerSettlementContext(r, ctx), "retry", eventFromDelivery(r, message, envelope, state.headerMaxBytes), err)
 		return false
 	}
 	return ackDeliveryAs(r, runnerSettlementContext(r, ctx), message, lifecycle.Retried, state)

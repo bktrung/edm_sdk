@@ -176,6 +176,17 @@ func defaultConfig() Config {
 	}
 }
 
+func effectiveHeaderLimit(configured, driver int) int {
+	limit := CoreMaxHeaderBytes
+	if configured > 0 {
+		limit = min(limit, configured)
+	}
+	if driver > 0 {
+		limit = min(limit, driver)
+	}
+	return limit
+}
+
 func resolvePrefetch(prefetch, brokerDefault int) int {
 	if prefetch != 0 {
 		return prefetch
@@ -197,6 +208,10 @@ func normalizeConfig(cfg Config) Config {
 	if cfg.Codec.MaxBodyBytes == 0 {
 		cfg.Codec.MaxBodyBytes = defaults.Codec.MaxBodyBytes
 	}
+	if cfg.Codec.MaxHeaderBytes == 0 {
+		cfg.Codec.MaxHeaderBytes = defaults.Codec.MaxHeaderBytes
+	}
+
 	if len(cfg.Topology.Priorities) == 0 {
 		cfg.Topology.Priorities = append([]Priority(nil), defaults.Topology.Priorities...)
 	}
@@ -344,6 +359,9 @@ func validateConfig(cfg Config) error {
 	}
 	if cfg.Codec.MaxBodyBytes <= 0 {
 		return fmt.Errorf("f1: codec.maxBodyBytes must be positive")
+	}
+	if cfg.Codec.MaxHeaderBytes <= 0 {
+		return fmt.Errorf("f1: codec.maxHeaderBytes must be positive")
 	}
 	if err := validateLifecycleConfig(cfg.Lifecycle); err != nil {
 		return err

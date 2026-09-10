@@ -10,10 +10,11 @@ import (
 // Event is the message view passed to a Handler.
 // Dispatch fills its data when subscriptions are introduced.
 type Event struct {
-	envelope Envelope
-	raw      []byte
-	codec    codec.Codec
-	headers  map[string]string
+	envelope       Envelope
+	raw            []byte
+	codec          codec.Codec
+	headers        map[string]string
+	headerMaxBytes int
 }
 
 // ID returns the stable event identifier from the envelope.
@@ -105,7 +106,8 @@ func (e *Event) Header(key string) (string, bool) {
 		value, ok := e.headers[key]
 		return value, ok
 	}
-	encoded, err := e.envelope.EncodeHeaders(CoreMaxHeaderBytes)
+	headerMaxBytes := e.headerMaxBytes
+	encoded, err := e.envelope.EncodeHeaders(headerMaxBytes)
 	if err != nil {
 		return "", false
 	}

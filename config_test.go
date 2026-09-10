@@ -886,7 +886,7 @@ func TestNormalizeConfigAcceptsMinimalHandBuiltConfig(t *testing.T) {
 		t.Fatalf("validateConfig() after normalization: %v", err)
 	}
 	defaults := defaultConfig()
-	if cfg.Codec.ContentMode != defaults.Codec.ContentMode || cfg.Codec.MaxBodyBytes != defaults.Codec.MaxBodyBytes {
+	if cfg.Codec.ContentMode != defaults.Codec.ContentMode || cfg.Codec.MaxHeaderBytes != defaults.Codec.MaxHeaderBytes || cfg.Codec.MaxBodyBytes != defaults.Codec.MaxBodyBytes {
 		t.Fatalf("codec defaults = %#v, want %#v", cfg.Codec, defaults.Codec)
 	}
 	if !reflect.DeepEqual(cfg.Topology.Priorities, defaults.Topology.Priorities) || cfg.Lifecycle != defaults.Lifecycle {
@@ -896,6 +896,26 @@ func TestNormalizeConfigAcceptsMinimalHandBuiltConfig(t *testing.T) {
 	subDefaults := defaultSubscription()
 	if sub.Concurrency != subDefaults.Concurrency || sub.Prefetch != defaults.Broker.DefaultPrefetch || !reflect.DeepEqual(sub.Priorities, subDefaults.Priorities) || sub.Retry.MaxAttempts != subDefaults.Retry.MaxAttempts || sub.HandlerTimeout != subDefaults.HandlerTimeout {
 		t.Fatalf("subscription defaults = %#v, want concurrency=%d prefetch=%d priorities=%v maxAttempts=%d handlerTimeout=%s", sub, subDefaults.Concurrency, defaults.Broker.DefaultPrefetch, subDefaults.Priorities, subDefaults.Retry.MaxAttempts, subDefaults.HandlerTimeout)
+	}
+}
+
+func TestValidateConfigRejectsInvalidMaxHeaderBytes(t *testing.T) {
+	t.Parallel()
+	for _, test := range []struct {
+		name  string
+		value int
+	}{
+		{name: "zero", value: 0},
+		{name: "negative", value: -1},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			cfg := validValidationConfig()
+			cfg.Codec.MaxHeaderBytes = test.value
+			err := validateConfig(cfg)
+			if err == nil || err.Error() != "f1: codec.maxHeaderBytes must be positive" {
+				t.Fatalf("validateConfig() error = %v, want positive maxHeaderBytes error", err)
+			}
+		})
 	}
 }
 

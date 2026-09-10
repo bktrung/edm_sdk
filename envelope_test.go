@@ -3,6 +3,7 @@ package f1_test
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"log/slog"
 	"maps"
 	"os"
@@ -332,9 +333,14 @@ func TestEnvelope_HeaderSizeGuardShedsExtensionsThenTruncatesDeathError(t *testi
 	require.False(t, hasExtA)
 	require.False(t, hasExtB, "Extensions must be shed first, before DeathError is touched")
 
-	// An unachievable cap still returns the best-effort headers.
+	// An unachievable cap reports that the mandatory and non-sheddable headers cannot fit.
 	e.DeathError = "a very long terminal error string that will need truncating to fit under the cap"
-	tight, err := e.EncodeHeaders(120)
+	_, err = e.EncodeHeaders(80)
+	require.Error(t, err)
+	require.True(t, errors.Is(err, f1.ErrEnvelopeTooLarge))
+
+	e.DeathError = "a very long terminal error string that will need truncating to fit under the cap"
+	tight, err := e.EncodeHeaders(200)
 	require.NoError(t, err)
 	require.LessOrEqual(t, len(tight["f1deatherror"]), len("a very long terminal error string that will need truncating to fit under the cap"))
 }
@@ -441,10 +447,9 @@ func TestEnvelope_SizeGuardDriverLimitBelowCoreCap(t *testing.T) {
 
 	e := fullEnvelope()
 	e.Extensions = map[string]string{"ext-a": "aaaaaaaaaa"}
-	h, err := e.EncodeHeaders(50)
-	require.NoError(t, err)
-	_, hasExt := h["ext-a"]
-	require.False(t, hasExt)
+	_, err := e.EncodeHeaders(50)
+	require.Error(t, err)
+	require.True(t, errors.Is(err, f1.ErrEnvelopeTooLarge))
 }
 
 func TestEnvelope_SizeGuardDeathErrorEmptyStopsShrinking(t *testing.T) {

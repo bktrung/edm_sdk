@@ -64,12 +64,12 @@ const timeLayout = time.RFC3339Nano
 // CoreMaxHeaderBytes is the SDK's maximum encoded header size.
 const CoreMaxHeaderBytes = 8 * 1024
 
-// EncodeHeaders serializes e to canonical wire headers. driverMaxBytes is the
-// connected driver's limit; zero or a larger value uses CoreMaxHeaderBytes.
+// EncodeHeaders serializes e to canonical wire headers. maxHeaderBytes is the
+// cap applied to this encoding; zero or a larger value uses CoreMaxHeaderBytes.
 // Oversized headers drop Extensions, preserve DeathError down to a floor, shed
 // DeathDetails, and then truncate DeathError further. Invalid priorities and
 // reserved extension keys return errors.
-func (e Envelope) EncodeHeaders(driverMaxBytes int) (map[string]string, error) {
+func (e Envelope) EncodeHeaders(maxHeaderBytes int) (map[string]string, error) {
 	if !e.Priority.Valid() {
 		return nil, ErrInvalidPriority
 	}
@@ -80,8 +80,8 @@ func (e Envelope) EncodeHeaders(driverMaxBytes int) (map[string]string, error) {
 	}
 
 	limit := CoreMaxHeaderBytes
-	if driverMaxBytes > 0 && driverMaxBytes < limit {
-		limit = driverMaxBytes
+	if maxHeaderBytes > 0 && maxHeaderBytes < limit {
+		limit = maxHeaderBytes
 	}
 
 	h := make(map[string]string, len(e.Forwarded)+32)
@@ -150,6 +150,9 @@ func (e Envelope) EncodeHeaders(driverMaxBytes int) (map[string]string, error) {
 		return h, nil
 	}
 	shrinkDeathError(h, limit)
+	if headerBytes(h) > limit && mandatoryHeaderBytes(h) > limit {
+		return nil, fmt.Errorf("f1: envelope headers exceed cap for id=%q source=%q type=%q: %w", e.ID, e.Source, e.Type, ErrEnvelopeTooLarge)
+	}
 	return h, nil
 }
 
@@ -171,6 +174,14 @@ func headerBytes(h map[string]string) int {
 		n += len(k) + len(v)
 	}
 	return n
+}
+
+func mandatoryHeaderBytes(h map[string]string) int {
+	return len("specversion") + len(h["specversion"]) +
+		len("id") + len(h["id"]) +
+		len("source") + len(h["source"]) +
+		len("type") + len(h["type"]) +
+		len("time") + len(h["time"])
 }
 
 const deathErrorFloor = 512
