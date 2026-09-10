@@ -30,6 +30,10 @@ func runTopology(group *groupContext) {
 			Destinations: []driver.DestinationSpec{{Name: name}},
 			Effective:    group.effective,
 		})
+		// Registered before the first assertion that can end the check: a
+		// driver can create the destination and still fail, and a registration
+		// placed later is skipped by the failure it exists to clean up after.
+		cleanupTopologyDestinations(t, admin, maintenance, group.ctx, name)
 		if err != nil {
 			t.Fatalf("EnsureTopology(%q): %v", name, err)
 		}
@@ -39,7 +43,6 @@ func runTopology(group *groupContext) {
 		if containsName(diff.ExistingDestinations, name) {
 			t.Fatalf("ExistingDestinations=%v, want %q absent on first creation", diff.ExistingDestinations, name)
 		}
-		cleanupTopologyDestinations(t, admin, maintenance, group.ctx, name)
 		// FinalDestination is the profile-independent label: the two profile
 		// passes must record identical vectors, while the broker name stays
 		// profile-scoped on the shared Conn.
@@ -92,17 +95,21 @@ func runTopology(group *groupContext) {
 		// Profile-scoped: Run shares one Conn across both profile passes,
 		// so a fixed name would already exist as Existing on the second pass.
 		created := "topology.mixed.created"
-		if _, err := admin.EnsureTopology(group.ctx, driver.TopologySpec{
+		_, err := admin.EnsureTopology(group.ctx, driver.TopologySpec{
 			Destinations: []driver.DestinationSpec{{Name: existing}},
 			Effective:    group.effective,
-		}); err != nil {
+		})
+		// Each destination is registered at its own creation point, before the
+		// error check and before every assertion that can end the check.
+		cleanupTopologyDestinations(t, admin, maintenance, group.ctx, existing)
+		if err != nil {
 			t.Fatalf("EnsureTopology(seed): %v", err)
 		}
-		cleanupTopologyDestinations(t, admin, maintenance, group.ctx, existing, created)
 		diff, err := admin.EnsureTopology(group.ctx, driver.TopologySpec{
 			Destinations: []driver.DestinationSpec{{Name: existing}, {Name: created}},
 			Effective:    group.effective,
 		})
+		cleanupTopologyDestinations(t, admin, maintenance, group.ctx, created)
 		if err != nil {
 			t.Fatalf("EnsureTopology(mixed): %v", err)
 		}
@@ -780,10 +787,12 @@ func runTopologyPolicyChecks(group *groupContext) {
 			Bindings:     []driver.BindingSpec{{Source: prefix + ".exchange", Destination: first}},
 			Effective:    effective,
 		}))
+		// Registered before the error check: this call creates both
+		// destinations, so it can create the first and fail on the second.
+		purgeAndCleanupTopologyDestinations(t, maintenance, group.ctx, first, second)
 		if err != nil {
 			t.Fatalf("FanoutAtConsume EnsureTopology: %v", err)
 		}
-		purgeAndCleanupTopologyDestinations(t, maintenance, group.ctx, first, second)
 		if !containsName(diff.CreatedDestinations, first) || !containsName(diff.CreatedDestinations, second) {
 			t.Fatalf("FanoutAtConsume CreatedDestinations=%v, want %q and %q", diff.CreatedDestinations, first, second)
 		}
