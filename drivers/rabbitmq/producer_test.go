@@ -3,6 +3,7 @@ package rabbitmq
 import (
 	"context"
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 
@@ -236,6 +237,613 @@ func TestProducerConfirmedSequence(t *testing.T) {
 	}
 }
 
+// TestProducerBatchPublishesWindowBeforeReadingConfirmation proves a batch is
+// pipelined instead of confirmed one message at a time. The confirmation
+// channel is handed to the test, so no message can be confirmed while the
+// window is observed: a driver that published one message and waited for its
+// confirmation could never get a second message onto the broker. It counts
+// publishes in flight, not wall-clock time.
+func TestProducerBatchPublishesWindowBeforeReadingConfirmation(t *testing.T) {
+	requireBroker(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	const queue = "rabbitmq-driver-producer-batch-window"
+	conn, rawChannel := openProducerFixture(t, ctx, queue)
+	if _, err := conn.Admin().EnsureTopology(ctx, driver.TopologySpec{
+		Destinations: []driver.DestinationSpec{{Name: queue, Durable: true}},
+	}); err != nil {
+		t.Fatalf("EnsureTopology: %v", err)
+	}
+	rawProducer, err := conn.Producer(ctx, driver.ProducerConfig{RequireDurableAck: true})
+	if err != nil {
+		t.Fatalf("Producer: %v", err)
+	}
+	p := rawProducer.(*producer)
+	confirms := make(chan amqp.Confirmation, publishWindowSize)
+	p.confirms = confirms
+	t.Cleanup(func() { _ = rawProducer.Close(context.Background()) })
+	deliveries, err := rawChannel.Consume(queue, "producer-batch-window", false, false, false, false, nil)
+	if err != nil {
+		t.Fatalf("Consume: %v", err)
+	}
+	// One window, and every message carries the unique envelope id the core
+	// stamps: a window holds no repeated id, so it is published in one go.
+	messages := make([]driver.OutboundMessage, publishWindowSize)
+	for index := range messages {
+		messages[index] = driver.OutboundMessage{
+			Destination: queue,
+			Headers:     []driver.Header{{Key: "id", Value: fmt.Appendf(nil, "window-%d", index)}},
+			Body:        fmt.Appendf(nil, "window-body-%d", index),
+		}
+	}
+	done := make(chan error, 1)
+	go func() { done <- rawProducer.Publish(ctx, messages...) }()
+
+	// Two publishes in flight is the property that makes a batch cost less
+	// than one confirm round trip per message: with a single publish
+	// outstanding, the second message cannot reach the broker until the first
+	// one is confirmed.
+	awaitUnconfirmedDeliveries(t, ctx, deliveries, 2)
+
+	for index := range messages {
+		select {
+		case confirms <- amqp.Confirmation{DeliveryTag: uint64(index + 1), Ack: true}:
+		case <-ctx.Done():
+			t.Fatalf("confirming the batch: %v", ctx.Err())
+		}
+	}
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("batch Publish: %v", err)
+		}
+	case <-ctx.Done():
+		t.Fatalf("batch Publish result: %v", ctx.Err())
+	}
+}
+
+// TestProducerBatchReturnFailsItsOwnIndex proves the one thing a window can get
+// wrong: a broker return must fail the message it belongs to and no other.
+// The returns channel is fed by the test so the interleaving is fixed - the
+// return for the middle message is already queued when the first confirmation
+// is read - which is exactly the interleaving that fails the first index when
+// returns are matched by arrival order instead of by MessageId.
+func TestProducerBatchReturnFailsItsOwnIndex(t *testing.T) {
+	requireBroker(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	const queue = "rabbitmq-driver-producer-batch-return"
+	conn, rawChannel := openProducerFixture(t, ctx, queue)
+	if _, err := conn.Admin().EnsureTopology(ctx, driver.TopologySpec{
+		Destinations: []driver.DestinationSpec{{Name: queue, Durable: true}},
+	}); err != nil {
+		t.Fatalf("EnsureTopology: %v", err)
+	}
+	rawProducer, err := conn.Producer(ctx, driver.ProducerConfig{RequireDurableAck: true})
+	if err != nil {
+		t.Fatalf("Producer: %v", err)
+	}
+	p := rawProducer.(*producer)
+	confirms := make(chan amqp.Confirmation, 3)
+	p.confirms = confirms
+	returns := make(chan amqp.Return, 3)
+	p.returns = returns
+	t.Cleanup(func() { _ = rawProducer.Close(context.Background()) })
+	deliveries, err := rawChannel.Consume(queue, "producer-batch-return", false, false, false, false, nil)
+	if err != nil {
+		t.Fatalf("Consume: %v", err)
+	}
+	messages := make([]driver.OutboundMessage, 3)
+	for index := range messages {
+		messages[index] = driver.OutboundMessage{
+			Destination: queue,
+			Headers:     []driver.Header{{Key: "id", Value: fmt.Appendf(nil, "return-%d", index)}},
+			Body:        fmt.Appendf(nil, "return-body-%d", index),
+		}
+	}
+	done := make(chan error, 1)
+	go func() { done <- rawProducer.Publish(ctx, messages...) }()
+	awaitUnconfirmedDeliveries(t, ctx, deliveries, len(messages))
+
+	select {
+	case returns <- amqp.Return{ReplyCode: 312, ReplyText: "NO_ROUTE", MessageId: "return-1"}:
+	case <-ctx.Done():
+		t.Fatalf("returning the middle message: %v", ctx.Err())
+	}
+	for index := range messages {
+		select {
+		case confirms <- amqp.Confirmation{DeliveryTag: uint64(index + 1), Ack: true}:
+		case <-ctx.Done():
+			t.Fatalf("confirming the batch: %v", ctx.Err())
+		}
+	}
+
+	var publishErr *driver.PublishError
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("batch Publish error = nil, want the returned message to fail")
+		}
+		if !errors.As(err, &publishErr) {
+			t.Fatalf("batch Publish error = %v, want *driver.PublishError", err)
+		}
+	case <-ctx.Done():
+		t.Fatalf("batch Publish result: %v", ctx.Err())
+	}
+	if len(publishErr.Failed) != 1 {
+		t.Fatalf("failed indexes = %v, want only the returned message at index 1", publishErr.Failed)
+	}
+	failure, ok := publishErr.Failed[1]
+	if !ok {
+		t.Fatalf("failed indexes = %v, want index 1", publishErr.Failed)
+	}
+	if !errors.Is(failure, driver.ErrDestinationMissing) {
+		t.Fatalf("failed[1] = %v, want ErrDestinationMissing", failure)
+	}
+	if kind, classified := driver.Classify(failure); !classified || kind != driver.KindNotFound {
+		t.Fatalf("failed[1] classification = (%v, %t), want (not found, true)", kind, classified)
+	}
+}
+
+// TestProducerBatchReturnFromBrokerFailsOnlyItsOwnIndex is the same property
+// against a real broker return: one unroutable message in the middle of a
+// batch is reported against its own index and classified not-found, and its
+// neighbours are published in order.
+func TestProducerBatchReturnFromBrokerFailsOnlyItsOwnIndex(t *testing.T) {
+	requireBroker(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	const queue = "rabbitmq-driver-producer-batch-partial"
+	const missing = "rabbitmq-driver-producer-batch-partial-missing"
+	conn, rawChannel := openProducerFixture(t, ctx, queue)
+	if _, err := conn.Admin().EnsureTopology(ctx, driver.TopologySpec{
+		Destinations: []driver.DestinationSpec{{Name: queue, Durable: true}},
+	}); err != nil {
+		t.Fatalf("EnsureTopology: %v", err)
+	}
+	rawProducer, err := conn.Producer(ctx, driver.ProducerConfig{RequireDurableAck: true})
+	if err != nil {
+		t.Fatalf("Producer: %v", err)
+	}
+	t.Cleanup(func() { _ = rawProducer.Close(context.Background()) })
+	deliveries, err := rawChannel.Consume(queue, "producer-batch-partial", false, false, false, false, nil)
+	if err != nil {
+		t.Fatalf("Consume: %v", err)
+	}
+	body := func(index int, value string) driver.OutboundMessage {
+		return driver.OutboundMessage{
+			Destination: queue,
+			Headers:     []driver.Header{{Key: "id", Value: fmt.Appendf(nil, "partial-%d", index)}},
+			Body:        []byte(value),
+		}
+	}
+	err = rawProducer.Publish(ctx,
+		body(0, "first"),
+		driver.OutboundMessage{
+			Destination: missing,
+			Headers:     []driver.Header{{Key: "id", Value: []byte("partial-1")}},
+		},
+		body(2, "third"),
+	)
+	var publishErr *driver.PublishError
+	if !errors.As(err, &publishErr) {
+		t.Fatalf("batch Publish error = %v, want *driver.PublishError", err)
+	}
+	if len(publishErr.Failed) != 1 {
+		t.Fatalf("failed indexes = %v, want only the unroutable message at index 1", publishErr.Failed)
+	}
+	failure, ok := publishErr.Failed[1]
+	if !ok {
+		t.Fatalf("failed indexes = %v, want index 1", publishErr.Failed)
+	}
+	if !errors.Is(failure, driver.ErrDestinationMissing) {
+		t.Fatalf("failed[1] = %v, want ErrDestinationMissing", failure)
+	}
+	if kind, classified := driver.Classify(failure); !classified || kind != driver.KindNotFound {
+		t.Fatalf("failed[1] classification = (%v, %t), want (not found, true)", kind, classified)
+	}
+	for _, want := range []string{"first", "third"} {
+		select {
+		case delivery := <-deliveries:
+			if string(delivery.Body) != want {
+				t.Fatalf("delivered body = %q, want %q", delivery.Body, want)
+			}
+			if err := delivery.Ack(false); err != nil {
+				t.Fatalf("Ack: %v", err)
+			}
+		case <-ctx.Done():
+			t.Fatalf("receiving the published neighbours: %v", ctx.Err())
+		}
+	}
+}
+
+// TestProducerNegativeConfirmFailsItsOwnIndex proves a negative confirmation
+// fails only the message it confirms: the two acked neighbours of a nacked
+// message in the middle of a window are published and reported successful.
+func TestProducerNegativeConfirmFailsItsOwnIndex(t *testing.T) {
+	requireBroker(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	const queue = "rabbitmq-driver-producer-batch-negative"
+	conn, rawChannel := openProducerFixture(t, ctx, queue)
+	if _, err := conn.Admin().EnsureTopology(ctx, driver.TopologySpec{
+		Destinations: []driver.DestinationSpec{{Name: queue, Durable: true}},
+	}); err != nil {
+		t.Fatalf("EnsureTopology: %v", err)
+	}
+	rawProducer, err := conn.Producer(ctx, driver.ProducerConfig{RequireDurableAck: true})
+	if err != nil {
+		t.Fatalf("Producer: %v", err)
+	}
+	p := rawProducer.(*producer)
+	confirms := make(chan amqp.Confirmation, 3)
+	p.confirms = confirms
+	t.Cleanup(func() { _ = rawProducer.Close(context.Background()) })
+	deliveries, err := rawChannel.Consume(queue, "producer-batch-negative", false, false, false, false, nil)
+	if err != nil {
+		t.Fatalf("Consume: %v", err)
+	}
+	messages := make([]driver.OutboundMessage, 3)
+	for index := range messages {
+		messages[index] = driver.OutboundMessage{
+			Destination: queue,
+			Headers:     []driver.Header{{Key: "id", Value: fmt.Appendf(nil, "negative-%d", index)}},
+			Body:        fmt.Appendf(nil, "negative-body-%d", index),
+		}
+	}
+	done := make(chan error, 1)
+	go func() { done <- rawProducer.Publish(ctx, messages...) }()
+	awaitUnconfirmedDeliveries(t, ctx, deliveries, len(messages))
+
+	for index := range messages {
+		select {
+		case confirms <- amqp.Confirmation{DeliveryTag: uint64(index + 1), Ack: index != 1}:
+		case <-ctx.Done():
+			t.Fatalf("confirming the batch: %v", ctx.Err())
+		}
+	}
+	var publishErr *driver.PublishError
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("batch Publish error = nil, want the negatively confirmed message to fail")
+		}
+		if !errors.As(err, &publishErr) {
+			t.Fatalf("batch Publish error = %v, want *driver.PublishError", err)
+		}
+	case <-ctx.Done():
+		t.Fatalf("batch Publish result: %v", ctx.Err())
+	}
+	if len(publishErr.Failed) != 1 {
+		t.Fatalf("failed indexes = %v, want only the negatively confirmed message at index 1", publishErr.Failed)
+	}
+	failure, ok := publishErr.Failed[1]
+	if !ok {
+		t.Fatalf("failed indexes = %v, want index 1", publishErr.Failed)
+	}
+	if kind, classified := driver.Classify(failure); !classified || kind != driver.KindTransient {
+		t.Fatalf("failed[1] classification = (%v, %t), want (transient, true)", kind, classified)
+	}
+}
+
+// TestProducerConfirmsArriveInPublishOrder asserts the property the window
+// rests on rather than assuming it: the client re-sequences confirmations
+// before delivering them, so the i-th confirmation read from the channel is
+// the i-th message published. It registers a second listener on the same
+// channel, because Publish consumes its own confirmations.
+func TestProducerConfirmsArriveInPublishOrder(t *testing.T) {
+	requireBroker(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	const queue = "rabbitmq-driver-producer-confirm-order"
+	const batch = 8
+	conn, _ := openProducerFixture(t, ctx, queue)
+	if _, err := conn.Admin().EnsureTopology(ctx, driver.TopologySpec{
+		Destinations: []driver.DestinationSpec{{Name: queue, Durable: true}},
+	}); err != nil {
+		t.Fatalf("EnsureTopology: %v", err)
+	}
+	rawProducer, err := conn.Producer(ctx, driver.ProducerConfig{RequireDurableAck: true})
+	if err != nil {
+		t.Fatalf("Producer: %v", err)
+	}
+	t.Cleanup(func() { _ = rawProducer.Close(context.Background()) })
+	p := rawProducer.(*producer)
+	captured := p.channel.NotifyPublish(make(chan amqp.Confirmation, batch))
+	messages := make([]driver.OutboundMessage, batch)
+	for index := range messages {
+		messages[index] = driver.OutboundMessage{
+			Destination: queue,
+			Headers:     []driver.Header{{Key: "id", Value: fmt.Appendf(nil, "order-%d", index)}},
+			Body:        fmt.Appendf(nil, "order-body-%d", index),
+		}
+	}
+	if err := rawProducer.Publish(ctx, messages...); err != nil {
+		t.Fatalf("batch Publish: %v", err)
+	}
+	for index := range batch {
+		select {
+		case confirmation := <-captured:
+			if !confirmation.Ack {
+				t.Fatalf("confirmation %d is negative", index)
+			}
+			if confirmation.DeliveryTag != uint64(index+1) {
+				t.Fatalf("confirmation %d has delivery tag %d, want %d: confirmations are not delivered in publish order", index, confirmation.DeliveryTag, index+1)
+			}
+		case <-ctx.Done():
+			t.Fatalf("reading confirmation %d: %v", index, ctx.Err())
+		}
+	}
+}
+
+// TestProducerCancelledWindowInvalidatesChannel proves a cancelled batch
+// leaves nothing behind: every message the window published is reported
+// failed, the channel is invalidated so its unread confirmations can never be
+// read against a later publish, and a fresh producer on the same connection
+// publishes normally.
+func TestProducerCancelledWindowInvalidatesChannel(t *testing.T) {
+	requireBroker(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	const queue = "rabbitmq-driver-producer-cancelled-window"
+	conn, rawChannel := openProducerFixture(t, ctx, queue)
+	if _, err := conn.Admin().EnsureTopology(ctx, driver.TopologySpec{
+		Destinations: []driver.DestinationSpec{{Name: queue, Durable: true}},
+	}); err != nil {
+		t.Fatalf("EnsureTopology: %v", err)
+	}
+	rawProducer, err := conn.Producer(ctx, driver.ProducerConfig{RequireDurableAck: true})
+	if err != nil {
+		t.Fatalf("Producer: %v", err)
+	}
+	p := rawProducer.(*producer)
+	confirms := make(chan amqp.Confirmation, publishWindowSize)
+	p.confirms = confirms
+	t.Cleanup(func() { _ = rawProducer.Close(context.Background()) })
+	deliveries, err := rawChannel.Consume(queue, "producer-cancelled-window", false, false, false, false, nil)
+	if err != nil {
+		t.Fatalf("Consume: %v", err)
+	}
+	messages := make([]driver.OutboundMessage, 4)
+	for index := range messages {
+		messages[index] = driver.OutboundMessage{
+			Destination: queue,
+			Headers:     []driver.Header{{Key: "id", Value: fmt.Appendf(nil, "cancelled-%d", index)}},
+			Body:        fmt.Appendf(nil, "cancelled-body-%d", index),
+		}
+	}
+	publishCtx, cancelPublish := context.WithCancel(ctx)
+	done := make(chan error, 1)
+	go func() { done <- rawProducer.Publish(publishCtx, messages...) }()
+	awaitUnconfirmedDeliveries(t, ctx, deliveries, len(messages))
+	cancelPublish()
+
+	var publishErr *driver.PublishError
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("cancelled batch Publish error = nil, want the cancelled window to fail")
+		}
+		if !errors.As(err, &publishErr) {
+			t.Fatalf("cancelled batch Publish error = %v, want *driver.PublishError", err)
+		}
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("cancelled batch Publish error = %v, want context.Canceled", err)
+		}
+	case <-ctx.Done():
+		t.Fatalf("cancelled batch Publish result: %v", ctx.Err())
+	}
+	if len(publishErr.Failed) != len(messages) {
+		t.Fatalf("failed indexes = %v, want every index of the cancelled window", publishErr.Failed)
+	}
+	// The confirmations owed to the cancelled window must never be read
+	// against a later publish, so the channel is gone and no further publish
+	// is attempted on it.
+	if err := rawProducer.Publish(ctx, driver.OutboundMessage{Destination: queue}); !errors.Is(err, amqp.ErrClosed) {
+		t.Fatalf("Publish after a cancelled window = %v, want amqp.ErrClosed", err)
+	}
+
+	fresh, err := conn.Producer(ctx, driver.ProducerConfig{RequireDurableAck: true})
+	if err != nil {
+		t.Fatalf("Producer: %v", err)
+	}
+	defer func() { _ = fresh.Close(ctx) }()
+	if err := fresh.Publish(ctx, driver.OutboundMessage{
+		Destination: queue,
+		Headers:     []driver.Header{{Key: "id", Value: []byte("after-cancel")}},
+		Body:        []byte("after-cancel"),
+	}); err != nil {
+		t.Fatalf("Publish on a fresh producer: %v", err)
+	}
+	select {
+	case delivery := <-deliveries:
+		if string(delivery.Body) != "after-cancel" {
+			t.Fatalf("delivered body = %q, want after-cancel", delivery.Body)
+		}
+		if err := delivery.Ack(false); err != nil {
+			t.Fatalf("Ack: %v", err)
+		}
+	case <-ctx.Done():
+		t.Fatalf("receiving the fresh producer's message: %v", ctx.Err())
+	}
+}
+
+// TestProducerBatchWithoutMessageIDsFailsOnlyItsOwnIndex covers correlation
+// when no envelope id is available: amqpPublishing only sets the AMQP message
+// id from an "id" header, and the driver port is publishable without one. A
+// basic.return carries no delivery tag, so an id-less window must never hold
+// two messages: the driver shortens such a window to one, which costs one round
+// trip per message and keeps every return on its own index. The batch is
+// repeated because the interleaving that would break a wrongly pipelined
+// id-less batch (a return for a later message arriving before an earlier
+// message's confirmation) is a race between two broker frames.
+func TestProducerBatchWithoutMessageIDsFailsOnlyItsOwnIndex(t *testing.T) {
+	requireBroker(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	const queue = "rabbitmq-driver-producer-batch-no-id"
+	const missing = "rabbitmq-driver-producer-batch-no-id-missing"
+	conn, rawChannel := openProducerFixture(t, ctx, queue)
+	if _, err := conn.Admin().EnsureTopology(ctx, driver.TopologySpec{
+		Destinations: []driver.DestinationSpec{{Name: queue, Durable: true}},
+	}); err != nil {
+		t.Fatalf("EnsureTopology: %v", err)
+	}
+	rawProducer, err := conn.Producer(ctx, driver.ProducerConfig{RequireDurableAck: true})
+	if err != nil {
+		t.Fatalf("Producer: %v", err)
+	}
+	t.Cleanup(func() { _ = rawProducer.Close(context.Background()) })
+	deliveries, err := rawChannel.Consume(queue, "producer-batch-no-id", false, false, false, false, nil)
+	if err != nil {
+		t.Fatalf("Consume: %v", err)
+	}
+	for attempt := range 5 {
+		messages := make([]driver.OutboundMessage, 6)
+		for index := range messages {
+			messages[index] = driver.OutboundMessage{Destination: queue, Body: fmt.Appendf(nil, "no-id-%d-%d", attempt, index)}
+			if index%2 == 1 {
+				messages[index].Destination = missing
+			}
+		}
+		err := rawProducer.Publish(ctx, messages...)
+		var publishErr *driver.PublishError
+		if !errors.As(err, &publishErr) {
+			t.Fatalf("attempt %d: batch Publish error = %v, want *driver.PublishError", attempt, err)
+		}
+		if len(publishErr.Failed) != len(messages)/2 {
+			t.Fatalf("attempt %d: failed indexes = %v, want the odd indexes only", attempt, publishErr.Failed)
+		}
+		for index := range messages {
+			if index%2 == 0 {
+				continue
+			}
+			failure, ok := publishErr.Failed[index]
+			if !ok {
+				t.Fatalf("attempt %d: failed indexes = %v, want index %d", attempt, publishErr.Failed, index)
+			}
+			if !errors.Is(failure, driver.ErrDestinationMissing) {
+				t.Fatalf("attempt %d: failed[%d] = %v, want ErrDestinationMissing", attempt, index, failure)
+			}
+			if kind, classified := driver.Classify(failure); !classified || kind != driver.KindNotFound {
+				t.Fatalf("attempt %d: failed[%d] classification = (%v, %t), want (not found, true)", attempt, index, kind, classified)
+			}
+		}
+		for index := range messages {
+			if index%2 == 1 {
+				continue
+			}
+			select {
+			case delivery := <-deliveries:
+				if want := fmt.Appendf(nil, "no-id-%d-%d", attempt, index); string(delivery.Body) != string(want) {
+					t.Fatalf("attempt %d: delivered body = %q, want %q", attempt, delivery.Body, want)
+				}
+				if err := delivery.Ack(false); err != nil {
+					t.Fatalf("Ack: %v", err)
+				}
+			case <-ctx.Done():
+				t.Fatalf("attempt %d: receiving the published neighbours: %v", attempt, ctx.Err())
+			}
+		}
+	}
+}
+
+// TestProducerBatchLocalEncodingFailureDoesNotStallWindow covers a window whose
+// messages on the wire are fewer than the batch: a message that fails to encode
+// is never published, so it consumes no delivery tag and no confirmation for it
+// will ever arrive. The reader must therefore wait for one confirmation per
+// successful publish, not one per message in the batch. Getting that wrong
+// blocks Publish until its context expires.
+func TestProducerBatchLocalEncodingFailureDoesNotStallWindow(t *testing.T) {
+	requireBroker(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	const queue = "rabbitmq-driver-producer-batch-encode"
+	conn, rawChannel := openProducerFixture(t, ctx, queue)
+	if _, err := conn.Admin().EnsureTopology(ctx, driver.TopologySpec{
+		Destinations: []driver.DestinationSpec{{Name: queue, Durable: true}},
+	}); err != nil {
+		t.Fatalf("EnsureTopology: %v", err)
+	}
+	rawProducer, err := conn.Producer(ctx, driver.ProducerConfig{RequireDurableAck: true})
+	if err != nil {
+		t.Fatalf("Producer: %v", err)
+	}
+	t.Cleanup(func() { _ = rawProducer.Close(context.Background()) })
+	deliveries, err := rawChannel.Consume(queue, "producer-batch-encode", false, false, false, false, nil)
+	if err != nil {
+		t.Fatalf("Consume: %v", err)
+	}
+	messages := []driver.OutboundMessage{
+		{
+			Destination: queue,
+			Headers:     []driver.Header{{Key: "id", Value: []byte("encode-0")}},
+			Body:        []byte("encoded-first"),
+		},
+		{
+			Destination: queue,
+			Headers: []driver.Header{
+				{Key: "id", Value: []byte("encode-1")},
+				{Key: "time", Value: []byte("not-a-timestamp")},
+			},
+		},
+		{
+			Destination: queue,
+			Headers:     []driver.Header{{Key: "id", Value: []byte("encode-2")}},
+			Body:        []byte("encoded-third"),
+		},
+	}
+	done := make(chan error, 1)
+	go func() { done <- rawProducer.Publish(ctx, messages...) }()
+	for _, want := range []string{"encoded-first", "encoded-third"} {
+		select {
+		case delivery := <-deliveries:
+			if string(delivery.Body) != want {
+				t.Fatalf("delivered body = %q, want %q", delivery.Body, want)
+			}
+			if err := delivery.Ack(false); err != nil {
+				t.Fatalf("Ack: %v", err)
+			}
+		case <-ctx.Done():
+			t.Fatalf("receiving the encoded neighbours: %v", ctx.Err())
+		}
+	}
+	deadline := time.NewTimer(5 * time.Second) //nolint:forbidigo // bounded live-broker confirm guard
+	defer deadline.Stop()
+	var publishErr *driver.PublishError
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("batch Publish error = nil, want the unencodable message to fail")
+		}
+		if !errors.As(err, &publishErr) {
+			t.Fatalf("batch Publish error = %v, want *driver.PublishError", err)
+		}
+	case <-deadline.C:
+		t.Fatal("Publish did not return in time: it waited for a confirmation for a message that was never published")
+	case <-ctx.Done():
+		t.Fatalf("batch Publish result: %v", ctx.Err())
+	}
+	if len(publishErr.Failed) != 1 {
+		t.Fatalf("failed indexes = %v, want only the unencodable message at index 1", publishErr.Failed)
+	}
+	failure, ok := publishErr.Failed[1]
+	if !ok {
+		t.Fatalf("failed indexes = %v, want index 1", publishErr.Failed)
+	}
+	if kind, classified := driver.Classify(failure); !classified || kind != driver.KindFatal {
+		t.Fatalf("failed[1] classification = (%v, %t), want (fatal, true)", kind, classified)
+	}
+}
+
 func TestProducerPublishesToDeclaredFanoutExchange(t *testing.T) {
 	requireBroker(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
@@ -318,6 +926,29 @@ func TestProducerPublishesToDeclaredFanoutExchange(t *testing.T) {
 	}
 	if err := conn.Close(ctx); err != nil {
 		t.Fatalf("Conn.Close: %v", err)
+	}
+}
+
+// awaitUnconfirmedDeliveries consumes count deliveries from a destination,
+// acking each, and fails the test if the driver did not get them onto the
+// broker in time. It is used where the test withholds confirmations, so it
+// bounds how long it waits for messages the driver published without waiting
+// for one.
+func awaitUnconfirmedDeliveries(t *testing.T, ctx context.Context, deliveries <-chan amqp.Delivery, count int) {
+	t.Helper()
+	deadline := time.NewTimer(5 * time.Second) //nolint:forbidigo // bounded live-broker publish guard
+	defer deadline.Stop()
+	for received := range count {
+		select {
+		case delivery := <-deliveries:
+			if err := delivery.Ack(false); err != nil {
+				t.Fatalf("Ack: %v", err)
+			}
+		case <-deadline.C:
+			t.Fatalf("%d of %d messages reached the broker while no confirmation was available", received, count)
+		case <-ctx.Done():
+			t.Fatalf("receiving published messages: %v", ctx.Err())
+		}
 	}
 }
 

@@ -346,6 +346,13 @@ func consumerClientOpts(connection *conn, cfg driver.ConsumerConfig, group strin
 			return nil, err
 		}
 	}
+	balancer := connection.balancer
+	if balancer == nil {
+		// Directly constructed connection facades predate the stored selection;
+		// preserve franz-go's cooperative default for those paths. Open always
+		// stores the configured balancer before a consumer can be created.
+		balancer = kgo.CooperativeStickyBalancer()
+	}
 
 	opts := append([]kgo.Opt(nil), connection.clientOpts...)
 	opts = append(opts,
@@ -353,6 +360,7 @@ func consumerClientOpts(connection *conn, cfg driver.ConsumerConfig, group strin
 		kgo.ConsumeTopics(cfg.Destinations...),
 		kgo.DisableAutoCommit(),
 		consumerStartOffset(cfg.StartAt),
+		kgo.Balancers(balancer),
 		// Franz-go defaults FetchMaxWait to 5000ms for non-share groups. When a
 		// multi-destination consumer settles a message on a destination whose
 		// broker partition is currently exhausted, franz-go issues a Fetch
@@ -964,6 +972,7 @@ func inboundMessage(record *kgo.Record, settler *settler) driver.InboundMessage 
 		Ref: driver.BrokerRef{
 			Partition: record.Partition,
 			Offset:    record.Offset,
+			Raw:       fmt.Sprintf("%s/%d/%d", record.Topic, record.Partition, record.Offset),
 		},
 		Settle: settler,
 	}
@@ -1370,7 +1379,7 @@ func (c *consumer) sendError(err error) {
 	if c.errorsClosed {
 		return
 	}
-	if classified && kind != driver.KindTransient {
+	if classified && (kind == driver.KindFatal || kind == driver.KindNotFound || kind == driver.KindTooLarge || kind == driver.KindPermission) {
 		select {
 		case c.errors <- err:
 			return
@@ -1402,7 +1411,7 @@ func (c *consumer) sendRebalanceError(event string, partitions map[string][]int3
 	if intentionalClose {
 		return
 	}
-	c.sendError(classify("consumer", driver.KindTransient, fmt.Errorf("kafka partitions %s: %v", event, partitions)))
+	c.sendError(classify("consumer", driver.KindNotification, fmt.Errorf("kafka partitions %s: %v", event, partitions)))
 }
 
 func (c *consumer) signalSettlerDoneLocked() {

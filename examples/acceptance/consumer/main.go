@@ -14,6 +14,7 @@ import (
 
 	f1 "fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk"
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/codec"
+	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/drivers/kafka"
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/drivers/rabbitmq"
 )
 
@@ -36,8 +37,14 @@ func main() {
 	var retried atomic.Int64
 	var deadLettered atomic.Int64
 
-	client, err := f1.New(ctx, serviceConfig(service),
-		f1.WithDriver(rabbitmq.Driver{}),
+	cfg := serviceConfig(service)
+	driverOption, err := configuredDriverOption(cfg)
+	if err != nil {
+		fmt.Printf("CONSUMER_START_ERROR error=%v\n", err)
+		return
+	}
+	client, err := f1.New(ctx, cfg,
+		driverOption,
 		f1.WithCodec(codec.JSON{}),
 		f1.WithTopology(f1.TopologyDeclare),
 		f1.WithLogger(logger),
@@ -46,6 +53,8 @@ func main() {
 		fmt.Printf("CONSUMER_START_ERROR error=%v\n", err)
 		return
 	}
+	limits := client.Limits()
+	logger.Info("consumer limits", "driver", limits.Driver, "broker", limits.Broker, "features", limits.Features)
 
 	runner, err := client.Subscribe(ctx, f1.Subscription{
 		Name:            envString("F1_ACCEPTANCE_SUBSCRIPTION", "acceptance-consumer"),
@@ -103,12 +112,13 @@ func main() {
 }
 
 func serviceConfig(service string) f1.Config {
+	driverName := envString("F1_ACCEPTANCE_DRIVER", "rabbitmq")
 	return f1.Config{
 		Env:     envString("F1_ACCEPTANCE_ENV", "acceptance"),
 		Service: service,
 		Broker: f1.BrokerConfig{
-			Driver:          "rabbitmq",
-			Endpoints:       []string{envString("F1_ACCEPTANCE_ENDPOINT", "amqp://guest:guest@localhost:5672/")},
+			Driver:          driverName,
+			Endpoints:       []string{envString("F1_ACCEPTANCE_ENDPOINT", defaultEndpoint(driverName))},
 			ConnectTimeout:  5 * time.Second,
 			DefaultPrefetch: 16,
 		},
@@ -129,6 +139,24 @@ func serviceConfig(service string) f1.Config {
 			CloseTimeout: 5 * time.Second,
 		},
 	}
+}
+
+func configuredDriverOption(cfg f1.Config) (f1.Option, error) {
+	switch cfg.Broker.Driver {
+	case "kafka":
+		return f1.WithDriver(kafka.Driver{}), nil
+	case "rabbitmq":
+		return f1.WithDriver(rabbitmq.Driver{}), nil
+	default:
+		return nil, fmt.Errorf("unsupported acceptance driver %q", cfg.Broker.Driver)
+	}
+}
+
+func defaultEndpoint(driverName string) string {
+	if driverName == "kafka" {
+		return "localhost:19092"
+	}
+	return "amqp://guest:guest@localhost:5672/"
 }
 
 func envString(key, fallback string) string {

@@ -160,7 +160,7 @@ func LoadConfig(path string) (Config, error) {
 	}
 	applyEnvironment(&cfg)
 	cfg = normalizeConfig(cfg)
-	if err := validateConfig(cfg); err != nil {
+	if err := validateConfig(cfg, cfg.Broker.Driver); err != nil {
 		return Config{}, err
 	}
 	return cfg, nil
@@ -174,6 +174,17 @@ func defaultConfig() Config {
 		Lifecycle:     LifecycleConfig{PreStopDelay: 5 * time.Second, DrainTimeout: time.Minute, HandlerGrace: 5 * time.Second, FlushTimeout: 20 * time.Second, CloseTimeout: 10 * time.Second, RebalanceDrainTimeout: 25 * time.Second},
 		Subscriptions: map[string]SubscriptionConfig{},
 	}
+}
+
+func effectiveHeaderLimit(configured, driver int) int {
+	limit := CoreMaxHeaderBytes
+	if configured > 0 {
+		limit = min(limit, configured)
+	}
+	if driver > 0 {
+		limit = min(limit, driver)
+	}
+	return limit
 }
 
 func resolvePrefetch(prefetch, brokerDefault int) int {
@@ -197,6 +208,10 @@ func normalizeConfig(cfg Config) Config {
 	if cfg.Codec.MaxBodyBytes == 0 {
 		cfg.Codec.MaxBodyBytes = defaults.Codec.MaxBodyBytes
 	}
+	if cfg.Codec.MaxHeaderBytes == 0 {
+		cfg.Codec.MaxHeaderBytes = defaults.Codec.MaxHeaderBytes
+	}
+
 	if len(cfg.Topology.Priorities) == 0 {
 		cfg.Topology.Priorities = append([]Priority(nil), defaults.Topology.Priorities...)
 	}
@@ -293,7 +308,7 @@ var productionEnvironmentAliases = map[string]struct{}{
 	"prd":        {},
 }
 
-func validateConfig(cfg Config) error {
+func validateConfig(cfg Config, driverName string) error {
 	if cfg.Env == "" {
 		return fmt.Errorf("f1: env must not be empty")
 	}
@@ -306,10 +321,10 @@ func validateConfig(cfg Config) error {
 	if cfg.Broker.Driver != "kafka" && cfg.Broker.Driver != "rabbitmq" && cfg.Broker.Driver != "inmem" {
 		return fmt.Errorf("f1: broker.driver %q is unsupported", cfg.Broker.Driver)
 	}
-	if (cfg.Broker.Driver == "kafka" || cfg.Broker.Driver == "rabbitmq") && len(cfg.Broker.Endpoints) == 0 {
+	if (driverName == "kafka" || driverName == "rabbitmq") && len(cfg.Broker.Endpoints) == 0 {
 		return fmt.Errorf("f1: broker.endpoints must not be empty")
 	}
-	if cfg.Broker.Driver == "inmem" && cfg.Env == "prod" {
+	if driverName == "inmem" && cfg.Env == "prod" {
 		return fmt.Errorf("f1: broker.driver inmem is not allowed in prod")
 	}
 	if cfg.Broker.MaxReconnectAttempts < 0 {
@@ -318,7 +333,7 @@ func validateConfig(cfg Config) error {
 	if cfg.Env == "prod" && cfg.Broker.SASL.Mechanism != "" && !cfg.Broker.TLS.Enabled {
 		return fmt.Errorf("f1: broker.sasl.mechanism requires broker.tls.enabled in prod")
 	}
-	if cfg.Broker.Driver == "rabbitmq" && cfg.Broker.TLS.Enabled {
+	if driverName == "rabbitmq" && cfg.Broker.TLS.Enabled {
 		for _, endpoint := range cfg.Broker.Endpoints {
 			parsed, err := url.Parse(endpoint)
 			if err != nil {
@@ -336,7 +351,7 @@ func validateConfig(cfg Config) error {
 	if cfg.Env == "prod" && cfg.Topology.AutoCreate {
 		return fmt.Errorf("f1: topology.autoCreate must be false in prod")
 	}
-	if cfg.Env == "prod" && cfg.Broker.Driver == "rabbitmq" && cfg.Broker.DriverOptions["rabbitmq.queueType"] != "quorum" {
+	if cfg.Env == "prod" && driverName == "rabbitmq" && cfg.Broker.DriverOptions["rabbitmq.queueType"] != "quorum" {
 		return fmt.Errorf("f1: broker.rabbitmq.queueType must be quorum in prod")
 	}
 	if cfg.Codec.ContentMode != "binary" {
@@ -344,6 +359,9 @@ func validateConfig(cfg Config) error {
 	}
 	if cfg.Codec.MaxBodyBytes <= 0 {
 		return fmt.Errorf("f1: codec.maxBodyBytes must be positive")
+	}
+	if cfg.Codec.MaxHeaderBytes <= 0 {
+		return fmt.Errorf("f1: codec.maxHeaderBytes must be positive")
 	}
 	if err := validateLifecycleConfig(cfg.Lifecycle); err != nil {
 		return err
@@ -380,7 +398,7 @@ func validateConfig(cfg Config) error {
 			return fmt.Errorf("f1: lifecycle.drainTimeout must exceed subscriptions.%s.handlerTimeout", name)
 		}
 	}
-	if cfg.Broker.Driver == "kafka" {
+	if driverName == "kafka" {
 		// Keep these fallback values synchronized with the Kafka driver when it lands.
 		sessionTimeout, err := durationOption(cfg.Broker.DriverOptions, "kafka.sessionTimeout", 45*time.Second)
 		if err != nil {
@@ -390,7 +408,7 @@ func validateConfig(cfg Config) error {
 			return fmt.Errorf("f1: lifecycle.rebalanceDrainTimeout must be at most 0.6 x broker.kafka.sessionTimeout")
 		}
 	}
-	if cfg.Broker.Driver == "rabbitmq" {
+	if driverName == "rabbitmq" {
 		// Keep these fallback values synchronized with the RabbitMQ driver when it lands.
 		consumerTimeout, err := durationOption(cfg.Broker.DriverOptions, "rabbitmq.consumerTimeout", 90*time.Second)
 		if err != nil {

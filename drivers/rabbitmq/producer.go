@@ -24,6 +24,24 @@ type producer struct {
 
 var _ driver.Producer = (*producer)(nil)
 
+// publishWindowSize is the number of messages Publish publishes before it
+// reads a confirmation.
+//
+// With a single publish in flight a client's throughput is one message per
+// confirm round trip, because every message waits for the one before it to be
+// durable. Publishing a window first makes W messages cost about one confirm
+// latency instead of W. The window is a fixed constant rather than the size of
+// the batch because Publish accepts any number of messages, so the state left
+// unacknowledged when a channel stops working has to be bounded, and so does
+// the number of confirmations a window that is cancelled is still owed. Both
+// notify channels are buffered to the same size: the client delivers
+// confirmations and returns to a listener with a send made from its own
+// dispatch path, and a basic.return arrives on a different channel from the
+// confirmation for the same message, so a buffer smaller than the outstanding
+// window can stall dispatch. W = 1 is the one-confirm-at-a-time behaviour this
+// replaces, which keeps the constant usable for bisecting a regression.
+const publishWindowSize = 64
+
 func newProducer(conn *conn, cfg driver.ProducerConfig) (*producer, error) {
 	_ = cfg
 	conn.mu.RLock()
@@ -43,8 +61,8 @@ func newProducer(conn *conn, cfg driver.ProducerConfig) (*producer, error) {
 	p := &producer{
 		conn:     conn,
 		channel:  channel,
-		confirms: make(chan amqp.Confirmation, 1),
-		returns:  make(chan amqp.Return, 1),
+		confirms: make(chan amqp.Confirmation, publishWindowSize),
+		returns:  make(chan amqp.Return, publishWindowSize),
 	}
 	channel.NotifyPublish(p.confirms)
 	channel.NotifyReturn(p.returns)
@@ -73,16 +91,20 @@ func (p *producer) Publish(ctx context.Context, msgs ...driver.OutboundMessage) 
 	}
 
 	failed := make(map[int]error)
-	for index, message := range msgs {
-		if err := ctx.Err(); err != nil {
-			for remaining := index; remaining < len(msgs); remaining++ {
-				failed[remaining] = classify("publish", driver.KindTransient, err)
+	for base := 0; base < len(msgs); {
+		consumed, err := p.publishWindow(ctx, msgs, base, failed)
+		if err != nil {
+			// The channel is gone. Every index the window did not decide
+			// failed for that same reason, and no message after it can be
+			// published on the channel either.
+			for index := base; index < len(msgs); index++ {
+				if _, decided := failed[index]; !decided {
+					failed[index] = err
+				}
 			}
 			break
 		}
-		if err := p.publishOne(ctx, message); err != nil {
-			failed[index] = err
-		}
+		base += consumed
 	}
 	if len(failed) != 0 {
 		return &driver.PublishError{Failed: failed}
@@ -90,21 +112,100 @@ func (p *producer) Publish(ctx context.Context, msgs ...driver.OutboundMessage) 
 	return nil
 }
 
-func (p *producer) publishOne(ctx context.Context, message driver.OutboundMessage) error {
-	exchange, routingKey, expiration := p.target(message)
-	publishing, err := amqpPublishing(message)
-	if err != nil {
-		return classify("publish", driver.KindFatal, err)
+// publishWindow publishes the window of messages that starts at base and then
+// reads one confirmation per published message, in order. It reports how many
+// messages it consumed and a non-nil error when the channel must not be
+// published on again.
+//
+// A nil error means every index in the window has a decided outcome: its own
+// entry in failed, or a durable confirmation. An error means the channel is
+// gone, and the caller reports it for every index the window did not decide.
+//
+// Confirmations are read in the order the client delivers them, which is
+// delivery-tag order whatever order the broker acknowledged in, so the i-th
+// confirmation read belongs to the i-th message published here and no
+// tag-to-index map is needed.
+func (p *producer) publishWindow(ctx context.Context, msgs []driver.OutboundMessage, base int, failed map[int]error) (int, error) {
+	type outbound struct {
+		index      int
+		exchange   string
+		routingKey string
+		publishing amqp.Publishing
 	}
-	publishing.Expiration = expiration
-	if err := p.channel.PublishWithContext(ctx, exchange, routingKey, true, false, publishing); err != nil {
-		return classifyAMQP("publish", driver.KindTransient, err)
+	end := min(base+publishWindowSize, len(msgs))
+	window := make([]outbound, 0, end-base)
+	ids := make(map[string]struct{}, end-base)
+	consumed := 0
+	for offset, message := range msgs[base:end] {
+		publishing, err := amqpPublishing(message)
+		if err != nil {
+			failed[base+offset] = classify("publish", driver.KindFatal, err)
+			consumed = offset + 1
+			continue
+		}
+		if _, duplicate := ids[publishing.MessageId]; duplicate {
+			// A basic.return carries no delivery tag, so the MessageId the
+			// broker echoes back is the only thing that identifies which
+			// message it belongs to. Two messages sharing one within the same
+			// window cannot be told apart, and matching a return for the later
+			// one against the earlier would fail the wrong index, so the
+			// window stops before the repeat. The core stamps a unique
+			// envelope id on every message it publishes, which leaves an
+			// id-less window to a driver-level caller.
+			break
+		}
+		ids[publishing.MessageId] = struct{}{}
+		exchange, routingKey, expiration := p.target(message)
+		publishing.Expiration = expiration
+		window = append(window, outbound{
+			index:      base + offset,
+			exchange:   exchange,
+			routingKey: routingKey,
+			publishing: publishing,
+		})
+		consumed = offset + 1
 	}
-	err, abandoned := p.waitConfirm(ctx)
-	if abandoned {
-		p.invalidateLocked()
+	// Every message reaches the wire before the first confirmation is read, and
+	// a message that failed to encode reached it not at all: filtering those
+	// out here is what keeps the confirmations in step with the window, since
+	// an unpublished message consumes no delivery tag.
+	for offset, item := range window {
+		if err := ctx.Err(); err != nil {
+			if offset > 0 {
+				// Messages already published here are unconfirmed, and their
+				// confirmations must not be read against a later publish.
+				p.invalidateLocked()
+			}
+			return 0, classify("publish", driver.KindTransient, err)
+		}
+		if err := p.channel.PublishWithContext(ctx, item.exchange, item.routingKey, true, false, item.publishing); err != nil {
+			// A publish that failed on the wire leaves the channel's delivery
+			// tags out of step with the messages that were not published.
+			p.invalidateLocked()
+			return 0, classifyAMQP("publish", driver.KindTransient, err)
+		}
 	}
-	return err
+	returned := make(map[string]error, len(window))
+	for _, item := range window {
+		confirmation, err := p.waitConfirm(ctx, returned)
+		if err != nil {
+			p.invalidateLocked()
+			return 0, err
+		}
+		if !confirmation.Ack {
+			failed[item.index] = classify("publish", driver.KindTransient, errors.New("rabbitmq: publisher confirm was negative"))
+			continue
+		}
+		// Match a return by MessageId, never by arrival order: with a window
+		// outstanding the return that has arrived next may belong to a later
+		// message, and failing this one for it would blame the wrong index.
+		// The window holds no duplicate id, so a match is this message.
+		if returnedErr, ok := returned[item.publishing.MessageId]; ok {
+			delete(returned, item.publishing.MessageId)
+			failed[item.index] = returnedErr
+		}
+	}
+	return consumed, nil
 }
 
 // target decides AMQP routing for one outbound message. Whether Destination
@@ -160,37 +261,54 @@ func expirationMillis(remaining time.Duration) string {
 	return strconv.FormatInt(int64(millis), 10)
 }
 
-func (p *producer) waitConfirm(ctx context.Context) (error, bool) {
-	var returned *amqp.Return
+// waitConfirm reads the next confirmation for the window, folding into
+// returned every broker return the client has already dispatched. A
+// basic.return is dispatched before the confirmation for the same message, so
+// a return for the message being confirmed is already on the channel when its
+// confirmation is read; it arrives on a channel of its own, though, so it is
+// parked under its MessageId and matched by the caller when that message's
+// confirmation is read.
+//
+// An error means the confirmation was abandoned on ctx.Done, or one of the two
+// streams closed, so the channel must not be reused for a later publish.
+func (p *producer) waitConfirm(ctx context.Context, returned map[string]error) (amqp.Confirmation, error) {
 	for {
 		select {
 		case item, ok := <-p.returns:
 			if !ok {
-				return classify("publish", driver.KindTransient, amqp.ErrClosed), false
+				return amqp.Confirmation{}, classify("publish", driver.KindTransient, amqp.ErrClosed)
 			}
-			returned = &item
+			returned[item.MessageId] = returnedPublishError(item)
 		case confirmation, ok := <-p.confirms:
 			if !ok {
-				return classify("publish", driver.KindTransient, amqp.ErrClosed), false
+				return amqp.Confirmation{}, classify("publish", driver.KindTransient, amqp.ErrClosed)
 			}
-			if !confirmation.Ack {
-				return classify("publish", driver.KindTransient, errors.New("rabbitmq: publisher confirm was negative")), false
+			if !p.drainReturns(returned) {
+				return amqp.Confirmation{}, classify("publish", driver.KindTransient, amqp.ErrClosed)
 			}
-			if returned == nil {
-				select {
-				case item, ok := <-p.returns:
-					if ok {
-						returned = &item
-					}
-				default:
-				}
-			}
-			if returned != nil {
-				return returnedPublishError(*returned), false
-			}
-			return nil, false
+			return confirmation, nil
 		case <-ctx.Done():
-			return classify("publish", driver.KindTransient, ctx.Err()), true
+			return amqp.Confirmation{}, classify("publish", driver.KindTransient, ctx.Err())
+		}
+	}
+}
+
+// drainReturns parks every return the client has already dispatched and
+// reports whether the return stream is still open. It runs before a
+// confirmation is acted on for two reasons: the drain is what keeps a window's
+// worth of returns from filling the buffer the client's dispatch path sends
+// into, and a confirmation can be selected while the return for that same
+// message is still queued.
+func (p *producer) drainReturns(returned map[string]error) bool {
+	for {
+		select {
+		case item, ok := <-p.returns:
+			if !ok {
+				return false
+			}
+			returned[item.MessageId] = returnedPublishError(item)
+		default:
+			return true
 		}
 	}
 }

@@ -185,6 +185,7 @@ func (p *Publisher) PublishBatch(ctx context.Context, messages []Message) (Batch
 	}
 	conn := p.client.conn
 	effective := p.client.effective
+	headerMaxBytes := effectiveHeaderLimit(p.client.config.Codec.MaxHeaderBytes, effective.MaxHeaderBytes)
 	options := p.client.options
 	source := p.client.source
 	producerIdentity := p.client.producer
@@ -196,7 +197,7 @@ func (p *Publisher) PublishBatch(ctx context.Context, messages []Message) (Batch
 	outbound := make([]driver.OutboundMessage, len(messages))
 	ids := make([]string, len(messages))
 	for i, message := range messages {
-		outboundMessage, id, err := buildOutbound(ctx, options, effective, source, producerIdentity, message)
+		outboundMessage, id, err := buildOutbound(ctx, options, effective, headerMaxBytes, source, producerIdentity, message)
 		if err != nil {
 			return result, fmt.Errorf("f1: message %d: %w", i, err)
 		}
@@ -334,7 +335,7 @@ func warnUnclassified(logger *slog.Logger, err error) {
 	}
 }
 
-func buildOutbound(ctx context.Context, options clientOptions, effective driver.Capabilities, source, producerIdentity string, message Message) (driver.OutboundMessage, string, error) {
+func buildOutbound(ctx context.Context, options clientOptions, effective driver.Capabilities, headerMaxBytes int, source, producerIdentity string, message Message) (driver.OutboundMessage, string, error) {
 	if err := ctx.Err(); err != nil {
 		return driver.OutboundMessage{}, "", err
 	}
@@ -411,7 +412,7 @@ func buildOutbound(ctx context.Context, options clientOptions, effective driver.
 		envelope.TraceParent = publish.causedBy.envelope.TraceParent
 		envelope.TraceState = publish.causedBy.envelope.TraceState
 	}
-	headerMap, err := envelope.EncodeHeaders(effective.MaxHeaderBytes)
+	headerMap, err := envelope.EncodeHeaders(headerMaxBytes)
 	if err != nil {
 		return driver.OutboundMessage{}, "", err
 	}

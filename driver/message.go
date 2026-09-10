@@ -51,7 +51,9 @@ type Header struct {
 
 // BrokerRef stores the broker-specific identity of a delivery. The core does
 // not interpret its fields; each driver uses the identity format supported by
-// its broker: partition and offset, delivery tag, or raw string.
+// its broker: partition and offset, delivery tag, or raw string. The zero value
+// means that the driver did not provide a broker reference; a valid delivery
+// must populate at least one field even when its numeric identity is zero.
 type BrokerRef struct {
 	Partition int32
 	Offset    int64

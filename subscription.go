@@ -255,7 +255,7 @@ func (c *Client) Subscribe(ctx context.Context, sub Subscription) (*Runner, erro
 	if err != nil {
 		return nil, err
 	}
-	if err := validateSubscription(c.config, sub.Name, resolved); err != nil {
+	if err := validateSubscription(c.config, c.driverName, sub.Name, resolved); err != nil {
 		return nil, err
 	}
 	c.mu.Lock()
@@ -386,7 +386,7 @@ func overlayExplicitSubscription(dst *SubscriptionConfig, src Subscription) {
 	}
 }
 
-func validateSubscription(cfg Config, name string, sub SubscriptionConfig) error {
+func validateSubscription(cfg Config, driverName, name string, sub SubscriptionConfig) error {
 	if name == "" {
 		return errors.New("f1: subscription name must not be empty")
 	}
@@ -441,7 +441,7 @@ func validateSubscription(cfg Config, name string, sub SubscriptionConfig) error
 			return fmt.Errorf("f1: subscriptions.%s.fairness.budgets.%s must not be negative", name, priority)
 		}
 	}
-	if cfg.Broker.Driver == "rabbitmq" {
+	if driverName == "rabbitmq" {
 		consumerTimeout, err := durationOption(cfg.Broker.DriverOptions, "rabbitmq.consumerTimeout", 90*time.Second)
 		if err != nil {
 			return err

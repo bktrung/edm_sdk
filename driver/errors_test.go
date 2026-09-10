@@ -64,11 +64,12 @@ func TestKind_String(t *testing.T) {
 	t.Parallel()
 
 	tests := map[Kind]string{
-		KindTransient:  "transient",
-		KindFatal:      "fatal",
-		KindNotFound:   "not_found",
-		KindTooLarge:   "too_large",
-		KindPermission: "permission",
+		KindTransient:    "transient",
+		KindFatal:        "fatal",
+		KindNotFound:     "not_found",
+		KindTooLarge:     "too_large",
+		KindPermission:   "permission",
+		KindNotification: "notification",
 	}
 	for input, want := range tests {
 		if got := input.String(); got != want {

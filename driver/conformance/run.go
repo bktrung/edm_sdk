@@ -766,15 +766,21 @@ func receiveFaultErrorProbe(t *testing.T, ctx context.Context, consumer driver.C
 	t.Helper()
 	receiveCtx, cancel := context.WithTimeout(ctx, waitTimeout)
 	defer cancel()
-	select {
-	case err, ok := <-consumer.Errors():
-		if !ok {
-			t.Fatalf("conformance: %s: Errors closed", what)
+	for {
+		select {
+		case err, ok := <-consumer.Errors():
+			if !ok {
+				t.Fatalf("conformance: %s: Errors closed", what)
+			}
+			kind, classified := driver.Classify(err)
+			if classified && kind == driver.KindNotification {
+				continue
+			}
+			return err
+		case <-receiveCtx.Done():
+			t.Fatalf("conformance: %s: %v", what, receiveCtx.Err())
+			return nil
 		}
-		return err
-	case <-receiveCtx.Done():
-		t.Fatalf("conformance: %s: %v", what, receiveCtx.Err())
-		return nil
 	}
 }
 

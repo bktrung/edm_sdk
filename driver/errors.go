@@ -29,6 +29,8 @@ const (
 	KindTooLarge
 	// KindPermission identifies an authorization failure.
 	KindPermission
+	// KindNotification identifies a routine lifecycle notification rather than a failure.
+	KindNotification
 )
 
 // String returns the stable wire name of the error kind.
@@ -42,6 +44,8 @@ func (k Kind) String() string {
 		return "too_large"
 	case KindPermission:
 		return "permission"
+	case KindNotification:
+		return "notification"
 	default:
 		return "transient"
 	}

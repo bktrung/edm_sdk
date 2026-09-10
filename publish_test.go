@@ -474,13 +474,14 @@ type publishDriver struct {
 
 func (*publishDriver) Name() string { return "test" }
 
-func (*publishDriver) Capabilities() driver.Capabilities { return driver.Capabilities{} }
+func (d *publishDriver) Capabilities() driver.Capabilities { return d.conn.caps }
 
 func (d *publishDriver) Open(context.Context, driver.Config) (driver.Conn, error) { return d.conn, nil }
 
 type publishConn struct {
 	mu               sync.Mutex
 	producer         driver.Producer
+	caps             driver.Capabilities
 	info             driver.BrokerInfo
 	producerCalls    int
 	closeCalls       int
@@ -489,7 +490,7 @@ type publishConn struct {
 	closeRelease     chan struct{}
 }
 
-func (*publishConn) Capabilities() driver.Capabilities { return driver.Capabilities{} }
+func (c *publishConn) Capabilities() driver.Capabilities { return c.caps }
 
 func (c *publishConn) BrokerInfo() driver.BrokerInfo { return c.info }
 

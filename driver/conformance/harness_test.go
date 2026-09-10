@@ -898,7 +898,7 @@ func TestWaitForRebalanceAssignmentError(t *testing.T) {
 			name: "assigned notification",
 			setup: func() (context.Context, <-chan error) {
 				errs := make(chan error, 1)
-				errs <- errors.New("partitions assigned")
+				errs <- &driver.Error{Driver: "test", Op: "consume", K: driver.KindNotification, Err: errors.New("assignment notification")}
 				return context.Background(), errs
 			},
 		},

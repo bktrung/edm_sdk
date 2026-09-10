@@ -41,6 +41,7 @@ type Client struct {
 	limits         Limits
 	effective      driver.Capabilities
 	options        clientOptions
+	driverName     string
 	config         Config
 	source         string
 	producer       string
@@ -116,19 +117,25 @@ func New(ctx context.Context, cfg Config, opts ...Option) (*Client, error) {
 	if options.driver == nil {
 		return nil, fmt.Errorf("f1: New requires WithDriver")
 	}
+	driverName := options.driver.Name()
+	configuredDriverName := cfg.Broker.Driver
+	if driverName != configuredDriverName {
+		logDriverIdentityMismatch(options.logger, configuredDriverName, driverName)
+	}
 	cfg = normalizeConfig(cfg)
-	if err := validateConfig(cfg); err != nil {
+	if err := validateConfig(cfg, driverName); err != nil {
 		return nil, err
 	}
+
 	if _, ok := options.codecsByName[cfg.Codec.Default]; !ok {
 		return nil, fmt.Errorf("f1: codec.default %q is not registered", cfg.Codec.Default)
 	}
 	connection, err := options.driver.Open(ctx, driverConfig(cfg))
 	if err != nil {
-		return nil, fmt.Errorf("f1: open %s driver: %w", options.driver.Name(), err)
+		return nil, fmt.Errorf("f1: open %s driver: %w", driverName, err)
 	}
 	if connection == nil {
-		return nil, fmt.Errorf("f1: open %s driver: driver returned a nil connection", options.driver.Name())
+		return nil, fmt.Errorf("f1: open %s driver: driver returned a nil connection", driverName)
 	}
 	capabilities := connection.Capabilities()
 	effective := capabilities
@@ -140,6 +147,7 @@ func New(ctx context.Context, cfg Config, opts ...Option) (*Client, error) {
 		conn:              connection,
 		effective:         effective,
 		options:           options,
+		driverName:        driverName,
 		config:            cfg,
 		source:            fmt.Sprintf("/%s/%s", cfg.Env, cfg.Service),
 		producer:          fmt.Sprintf("%s/unknown/%s", cfg.Service, cfg.InstanceID),
@@ -150,7 +158,7 @@ func New(ctx context.Context, cfg Config, opts ...Option) (*Client, error) {
 		supervisorDone:    make(chan struct{}),
 		runners:           make(map[*Runner]struct{}),
 	}
-	client.limits = limitsFor(options.driver.Name(), connection.BrokerInfo(), effective)
+	client.limits = limitsFor(driverName, connection.BrokerInfo(), effective)
 	logCapabilities(client)
 	if err := client.ensurePublisherTopology(ctx); err != nil {
 		supervisorCancel()
@@ -159,6 +167,16 @@ func New(ctx context.Context, cfg Config, opts ...Option) (*Client, error) {
 	}
 	go client.reconnectSupervisor()
 	return client, nil
+}
+
+func logDriverIdentityMismatch(logger *slog.Logger, configuredName, injectedName string) {
+	if logger == nil {
+		return
+	}
+	logger.Warn("f1 driver identity mismatch",
+		"configured_driver", configuredName,
+		"injected_driver", injectedName,
+	)
 }
 
 func (c *Client) topologyPolicy() driver.TopologyPolicy {

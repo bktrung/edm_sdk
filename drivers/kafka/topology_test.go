@@ -74,6 +74,74 @@ func TestReplicationFactorIsBrokerDefault(t *testing.T) {
 	}
 }
 
+func TestEnsureTopologyWithoutPartitionFloorCreatesRequestedPartitions(t *testing.T) {
+	ctx, connection, kafkaAdmin := openKafkaAdminTest(t)
+	destination := kafkaTestTopic(t, "floor-disabled")
+	cleanupKafkaTopics(t, kafkaAdmin, destination)
+
+	diff, err := connection.Admin().EnsureTopology(ctx, driver.TopologySpec{
+		Destinations: []driver.DestinationSpec{{Name: destination, Partitions: 2}},
+		Effective:    connection.Capabilities(),
+	})
+	if err != nil {
+		t.Fatalf("EnsureTopology without maxExpectedInstances: %v", err)
+	}
+	if !slices.Contains(diff.CreatedDestinations, destination) {
+		t.Fatalf("CreatedDestinations = %v, want %q", diff.CreatedDestinations, destination)
+	}
+
+	details, err := kafkaAdmin.ListTopics(ctx, destination)
+	if err != nil {
+		t.Fatalf("ListTopics(%q): %v", destination, err)
+	}
+	detail, ok := details[destination]
+	if !ok || detail.Err != nil {
+		t.Fatalf("ListTopics(%q) detail = %#v, want an existing topic", destination, detail)
+	}
+	if got := len(detail.Partitions); got != 2 {
+		t.Fatalf("topic %q partition count = %d, want 2", destination, got)
+	}
+}
+
+func TestEnsureTopologyPartitionFloorAppliesToUnsetAndExistingTopics(t *testing.T) {
+	ctx, connection, kafkaAdmin := openKafkaAdminTest(t)
+	created := kafkaTestTopic(t, "floor-default")
+	existing := kafkaTestTopic(t, "floor-existing")
+	cleanupKafkaTopics(t, kafkaAdmin, created, existing)
+	connection.driverOptions = map[string]string{"kafka.maxExpectedInstances": "3"}
+
+	diff, err := connection.Admin().EnsureTopology(ctx, driver.TopologySpec{
+		Destinations: []driver.DestinationSpec{{Name: created}},
+		Effective:    connection.Capabilities(),
+	})
+	if err != nil {
+		t.Fatalf("EnsureTopology unset partitions with floor: %v", err)
+	}
+	if !slices.Contains(diff.CreatedDestinations, created) {
+		t.Fatalf("CreatedDestinations = %v, want %q", diff.CreatedDestinations, created)
+	}
+	details, err := kafkaAdmin.ListTopics(ctx, created)
+	if err != nil {
+		t.Fatalf("ListTopics(%q): %v", created, err)
+	}
+	if got := len(details[created].Partitions); got != 3 {
+		t.Fatalf("topic %q partition count = %d, want floor 3", created, got)
+	}
+
+	createKafkaTopic(t, kafkaAdmin, ctx, existing, 2)
+	_, err = connection.Admin().EnsureTopology(ctx, driver.TopologySpec{
+		Destinations: []driver.DestinationSpec{{Name: existing}},
+		Effective:    connection.Capabilities(),
+	})
+	if err == nil || !strings.Contains(err.Error(), existing) || !strings.Contains(err.Error(), "maxExpectedInstances") {
+		t.Fatalf("EnsureTopology existing underpartitioned topic error = %v, want floor rejection", err)
+	}
+	var classified *driver.Error
+	if !errors.As(err, &classified) || classified.Kind() != driver.KindFatal {
+		t.Fatalf("EnsureTopology existing underpartitioned topic error = %T/%v, want fatal classified error", err, err)
+	}
+}
+
 func TestBindingsAndExchangesAreIgnored(t *testing.T) {
 	plan := translateTopology(driver.TopologySpec{
 		Exchanges:    []driver.ExchangeSpec{{Name: "events", Kind: "fanout", Durable: true}},
