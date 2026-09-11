@@ -55,4 +55,4 @@ atomicity: inspect each result and use `BatchResult.Failed()` when partial
 failure handling matters.
 
 For the full message path, topology timing, and close interaction, see the
-[publish runtime guide](../publish-flow.md).
+[publish runtime guide](../development/publish-flow.md).

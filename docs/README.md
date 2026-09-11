@@ -1,6 +1,6 @@
 # F1 documentation
 
-Open the [offline documentation front door](index.html) for a browser-friendly route through the docs.
+Use this page as the documentation front door and choose the route that matches your role.
 
 Choose the route that matches your role:
 
@@ -17,34 +17,34 @@ Follow these guides to add F1 to an application:
 
 ## For maintainers
 
-The runtime guide below explains implementation boundaries, message flows, and source-reading order.
+The architecture map is the canonical entry point for maintainers. The runtime guides below explain
+implementation boundaries, message flows, and source-reading order.
+
+- [Architecture](development/architecture.md) — package ownership, dependency boundaries, and core invariants.
 
 This is the shortest route from “what is F1?” to “where does this line run?”
 
 ```mermaid
 flowchart LR
     A[README] --> B[Runtime overview]
-    B --> C[Publish flow]
-    B --> D[Consume flow]
-    D --> E[Dispatch and scheduling]
-    D --> F[Settlement and shutdown]
+    B --> C[Development publish flow]
+    B --> D[Development consume flow]
     B --> G[Drivers and capabilities]
     C --> H[Reading guide and tests]
     D --> H
-    E --> H
-    F --> H
     G --> H
 ```
 
 ## Guides
 
 - [Runtime overview](runtime-overview.md) — boundaries, ownership, and the two main flows.
-- [Publish flow](publish-flow.md) — application payload to durable broker acknowledgement.
-- [Consume flow](consume-flow.md) — broker delivery to handler result and settlement.
-- [Dispatch and scheduling](dispatch-and-scheduling.md) — lanes, fairness, backpressure, and ordering.
-- [Settlement and shutdown](settlement-and-shutdown.md) — retry/DLQ safety and drain phases.
-- [Drivers and capabilities](drivers-and-capabilities.md) — the broker port, supported adapters, Kafka scaffold, and conformance.
-- [Reading guide](reading-guide.md) — file-by-file order and which tests to read later.
+- [Publish flow](development/publish-flow.md) — application payload to durable broker acknowledgement.
+- [Consume flow](development/consume-flow.md) — broker delivery to handler result, settlement, drain, and reconnect.
+- [Driver contract](development/driver-contract.md) — port interfaces, capability negotiation, topology, and lifecycle rules.
+- [Driver conformance](development/driver-conformance.md) — shared contract groups, profiles, fixtures, vectors, and run commands.
+- [Testing strategy](development/testing.md) — test-layer selection, deterministic timing, failure paths, and repository gates.
+- [Drivers and provider notes](drivers-and-capabilities.md) — adapter behavior, broker differences, and capability notes.
+- [Source-reading guide](development/source-reading-guide.md) — maintainer reading order, flow tracing, and verification ownership.
 
 ## Source authority
 
@@ -54,21 +54,14 @@ current behavior. Start from the symbol links in each guide when behavior matter
 ## Current implementation
 
 The repository contains the core SDK, the public codec and driver ports, the deterministic in-memory
-driver, the RabbitMQ driver, and a Kafka driver scaffold. Kafka configuration and port compatibility
-surfaces exist, but [`drivers/kafka.Driver.Open`](../drivers/kafka/kafka.go) currently returns
-`driver.ErrUnsupported`, so RabbitMQ is the supported external runtime adapter.
+driver, the RabbitMQ driver, and a connected Kafka driver. Kafka uses classic consumer groups; share
+groups are not implemented. Its transport limits are reported through `Client.Limits()` and the
+core emulates F1 retry, delay, and dead-letter behavior where Kafka has no native equivalent.
 
 Useful commands are owned by the [Makefile](../Makefile):
 
-```text
-make build
-make test-fast
-make test
-make test-rabbitmq
-make lint
-make verify-agnostic
-```
-
-`test-rabbitmq` requires Docker. The broker lifecycle targets use the
-[local compose fixture](../docker/docker-compose.yml); its Kafka service is a development fixture
-until the Kafka driver is implemented.
+The [Makefile](../Makefile) owns the complete build, unit-test, lint, API-surface, and driver
+verification command set. `make test-rabbitmq` and `make test-kafka` require their respective
+local broker fixtures; `make test-kafka-conformance` runs the Kafka conformance profiles and can
+take several minutes. The broker lifecycle targets use the
+[local compose fixture](../docker/docker-compose.yml).

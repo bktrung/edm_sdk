@@ -10,14 +10,14 @@ flowchart TB
     PORT[driver port\ninterfaces · errors · capabilities · topology]
     INMEM[drivers/inmem]
     RMQ[drivers/rabbitmq]
-    KAFKA[drivers/kafka\nscaffold]
+    KAFKA[drivers/kafka\nKafka adapter]
     BROKER[(RabbitMQ or Kafka)]
 
     APP --> API --> CORE --> PORT
     PORT --> INMEM
     PORT --> RMQ --> BROKER
     PORT --> KAFKA
-    KAFKA -. Open unsupported .-> BROKER
+    KAFKA --> BROKER
     INMEM --> MEM[(In-memory broker state)]
 ```
 
@@ -56,7 +56,7 @@ sequenceDiagram
     P-->>App: Event ID or error
 ```
 
-Details: [publish flow](publish-flow.md).
+Details: [publish flow](development/publish-flow.md).
 
 ## Consume path
 
@@ -86,7 +86,7 @@ sequenceDiagram
     end
 ```
 
-Details: [consume flow](consume-flow.md), [settlement and shutdown](settlement-and-shutdown.md).
+Details: [consume flow](development/consume-flow.md), [lifecycle and shutdown](advanced-topics/lifecycle-and-shutdown.md).
 
 ## Non-negotiable boundaries
 

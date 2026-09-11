@@ -11,9 +11,9 @@ deliberately does not do. For the code tour, start with [`docs/`](docs/README.md
 
 ## Guarantees
 
-Each of these is testable. The current CI pipeline runs `make build`, `make test-fast`, `make test`,
-`make lint`, and `make verify-agnostic`; the [Makefile](Makefile) owns the complete local command
-set.
+Each of these is testable. The current CI pipeline runs the build, unit, lint, broker, API-surface,
+API-diff, import-boundary, and self-contained gates listed in [`.gitlab-ci.yml`](.gitlab-ci.yml);
+the [Makefile](Makefile) owns the corresponding local command set.
 
 - **At-least-once delivery, with a stable message identity.** Transport redelivers during failures
   and rolling restarts - that is the guarantee, not a bug. F1 generates an event id, uses it as the
@@ -56,9 +56,9 @@ set.
 - Schema registry integration. v1 uses JSON plus a versioned envelope; the codec port has hooks for
   Avro/Protobuf, but no registry client ships in v1.
 - NATS JetStream / Pulsar drivers. The port is designed to accommodate them; neither is present.
-- Kafka runtime support is not available yet. The repository includes a Kafka driver scaffold and
-  shared configuration and port surfaces; [`drivers/kafka.Driver.Open`](drivers/kafka/kafka.go)
-  currently returns `driver.ErrUnsupported`.
+- Kafka share-group mode is not implemented. The Kafka adapter supports classic consumer groups;
+  its connected capability report exposes partition-bound scaling and the core-emulated paths for
+  delay, delivery count, and dead-letter behavior.
 - Multiple broker versions per broker. The RabbitMQ adapter targets one stable broker family.
 
 ## Install
@@ -79,7 +79,7 @@ cannot see it.
 
 This repository includes two separate services that use the public SDK API against the local
 RabbitMQ fixture. The [compose fixture](docker/docker-compose.yml) also defines Kafka for driver
-development, but the Kafka driver is not operational yet. The services share `examples/config.yaml`;
+tests and acceptance runs. The services share `examples/config.yaml`;
 change the broker endpoint there when using a real broker. The development config sets
 `topology.autoCreate: true` so the publisher can declare its entry point. Production should
 provision topology separately and leave auto-creation disabled.
@@ -142,5 +142,5 @@ Start with these local documents:
 
 - [`docs/README.md`](docs/README.md) - choose between the service-author guides and the maintainer runtime guide.
 - [`docs/user-guide/getting-started.md`](docs/user-guide/getting-started.md) - install and connect the SDK in a Go service.
-- [`ARCHITECTURE.md`](ARCHITECTURE.md) - current package boundaries and invariants.
+- [`docs/development/architecture.md`](docs/development/architecture.md) - current package boundaries and invariants.
 - This README - product guarantees, non-goals, installation, and quickstart.

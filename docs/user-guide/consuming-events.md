@@ -59,5 +59,6 @@ and publish the same logical key with `f1.WithKey`. F1 preserves order per key;
 it does not provide global ordering across partitions or queues. Check
 `client.Limits()` when a deployment must make a capability decision explicit.
 
-For worker, settlement, and dispatch internals, see the [consume flow](../consume-flow.md)
-and [dispatch guide](../dispatch-and-scheduling.md).
+For worker, settlement, dispatch, and scheduling internals, see the
+[consume flow](../development/consume-flow.md) and
+[ordering and scheduling guide](../advanced-topics/ordering-and-scheduling.md).

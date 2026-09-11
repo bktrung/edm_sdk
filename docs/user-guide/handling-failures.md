@@ -45,5 +45,5 @@ handler must be retained. Use `f1.Ignore` only when losing unmatched events is
 an intentional policy.
 
 For the durable successor-before-ack rule and settlement states, see
-[Settlement and shutdown](../settlement-and-shutdown.md). The root README lists
+[Lifecycle and shutdown](../advanced-topics/lifecycle-and-shutdown.md). The root README lists
 the delivery guarantees and non-goals that service behavior must respect.
