@@ -53,9 +53,34 @@ verify-agnostic: $(GOLANGCI_LINT)
 # they do not have, so an unresolvable citation is worse than none. State the
 # rule the citation stands for instead.
 verify-self-contained:
-	@! git grep -nIE '(ADR-[0-9]{4}|F-P[0-9]+|M1-[0-9]+)' -- . ':!Makefile' \
-	  || { echo "verify-self-contained: citation above cannot be resolved from this repository"; exit 1; }
-	@echo "verify-self-contained: 0 issues."
+	@set -o pipefail; \
+	citation_pattern='(^|[^[:alnum:]_-])(ADR-[0-9]{4}|F-[0-9]{4}|A-[0-9]{4}|F-P[0-9]+|M1-[0-9]+)($$|[^[:alnum:]_-])'; \
+	matches=$$(git grep -nIE "$$citation_pattern" -- . ':!Makefile'); \
+	citation_status=$$?; \
+	if [ "$$citation_status" -gt 1 ]; then \
+		exit "$$citation_status"; \
+	fi; \
+	if [ "$$citation_status" -eq 0 ]; then \
+		printf '%s\n' "$$matches"; \
+		echo "verify-self-contained: citation above cannot be resolved from this repository"; \
+		exit 1; \
+	fi; \
+	paths=$$(git ls-files --cached --others --exclude-standard); \
+	path_status=$$?; \
+	if [ "$$path_status" -ne 0 ]; then \
+		exit "$$path_status"; \
+	fi; \
+	path_matches=$$(printf '%s\n' "$$paths" | grep -nE '(^|/)(plans|journals|reports)/'); \
+	path_match_status=$$?; \
+	if [ "$$path_match_status" -gt 1 ]; then \
+		exit "$$path_match_status"; \
+	fi; \
+	if [ "$$path_match_status" -eq 0 ]; then \
+		printf '%s\n' "$$path_matches"; \
+		echo "verify-self-contained: design-artifact path above cannot be resolved from this repository"; \
+		exit 1; \
+	fi; \
+	echo "verify-self-contained: 0 issues."
 
 ## check-fixture: validate the local fixtures used by tests and tooling.
 check-fixture:
