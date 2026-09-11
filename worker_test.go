@@ -7,6 +7,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/clock"
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/sched"
@@ -193,6 +194,47 @@ func TestLaneFullStillAppliesBackpressure(t *testing.T) {
 	}
 	if got := scheduler.Depth(fallbackLane); got != 0 {
 		t.Fatalf("fallback lane depth = %d, want 0", got)
+	}
+}
+
+func TestTruncateErrorBacksToRuneBoundary(t *testing.T) {
+	const prefixBytes = deathErrorCap - 2
+	value := strings.Repeat("a", prefixBytes) + "\u754c" + "suffix"
+	got := truncateError(errors.New(value))
+
+	if !utf8.ValidString(got) {
+		t.Fatalf("truncateError() returned invalid UTF-8")
+	}
+	if len(got) > deathErrorCap {
+		t.Fatalf("truncateError() length = %d, want at most %d", len(got), deathErrorCap)
+	}
+	if len(got) != prefixBytes {
+		t.Fatalf("truncateError() length = %d, want %d", len(got), prefixBytes)
+	}
+}
+
+func TestTruncateErrorKeepsExactByteCap(t *testing.T) {
+	value := strings.Repeat("a", deathErrorCap)
+	got := truncateError(errors.New(value))
+
+	if len(got) != deathErrorCap {
+		t.Fatalf("truncateError() length = %d, want %d", len(got), deathErrorCap)
+	}
+	if got != value {
+		t.Fatalf("truncateError() changed ASCII text at the exact cap")
+	}
+}
+
+func TestTruncateErrorKeepsOverCapAlignedBoundary(t *testing.T) {
+	value := strings.Repeat("a", deathErrorCap) + "\u754c"
+	got := truncateError(errors.New(value))
+	want := value[:deathErrorCap]
+
+	if len(got) != deathErrorCap {
+		t.Fatalf("truncateError() length = %d, want %d", len(got), deathErrorCap)
+	}
+	if got != want {
+		t.Fatalf("truncateError() = %q, want the first %d bytes", got, deathErrorCap)
 	}
 }
 
