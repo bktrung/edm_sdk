@@ -111,6 +111,15 @@ func profileTopologySpec(group *groupContext, spec driver.TopologySpec) driver.T
 	return spec
 }
 
+// warmTopology moves Kafka destination creation and metadata propagation out of timed checks.
+// The first publish or fetch otherwise pays both costs.
+func warmTopology(t *testing.T, group *groupContext, spec driver.TopologySpec) {
+	t.Helper()
+	if _, err := group.conn.Admin().EnsureTopology(group.ctx, profileTopologySpec(group, spec)); err != nil {
+		t.Fatalf("EnsureTopology warm-up: %v", err)
+	}
+}
+
 func profileDestinations(group *groupContext, destinations []string) ([]string, map[string]string) {
 	scoped := make([]string, len(destinations))
 	logical := make(map[string]string, len(destinations))

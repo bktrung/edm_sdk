@@ -17,7 +17,37 @@ const (
 
 func init() { registerGroup("deferred", runDeferred) }
 
+// warmDeferredTopology pays Kafka's creation and metadata propagation cost before deferred timing checks.
+func warmDeferredTopology(group *groupContext) {
+	destinations := []driver.DestinationSpec{
+		{Name: "deferred.never-early", Delay: deferredDelay},
+		{Name: "deferred.never-early.control"},
+		{Name: "deferred.bounded-late", Delay: deferredDelay},
+		{Name: "deferred.band", Delay: deferredDelay},
+		{Name: "deferred.destination-delay", Delay: deferredDelay},
+		{Name: "deferred.destination-delay.control"},
+		{Name: "deferred.zero"},
+		{Name: "deferred.auxiliary", Delay: deferredDelay},
+		{Name: "deferred.auxiliary.control"},
+		{Name: "deferred.ready", Delay: deferredDelay},
+		{Name: "deferred.ready.control"},
+		{Name: "deferred.release", Delay: deferredDelay},
+		{Name: "deferred.release.control"},
+	}
+	if group.deadline != nil {
+		destinations = append(destinations,
+			driver.DestinationSpec{Name: "deferred.deadline", Delay: deferredDelay},
+			driver.DestinationSpec{Name: "deferred.deadline.control"},
+		)
+	}
+	warmTopology(group.t, group, driver.TopologySpec{
+		Destinations: destinations,
+		Effective:    group.effective,
+	})
+}
+
 func runDeferred(group *groupContext) {
+	warmDeferredTopology(group)
 	group.Check("explicit due time is never delivered early", func(t *testing.T) {
 		deferred := "deferred.never-early"
 		control := "deferred.never-early.control"
