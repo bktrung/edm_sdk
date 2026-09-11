@@ -219,7 +219,7 @@ func TestAbortedDrainJoinsTheStopRefusalIntoTheDrainError(t *testing.T) {
 		Topics:         []string{"orders.created"},
 		Concurrency:    1,
 		Prefetch:       1,
-		Priorities:     []Priority{PriorityNormal},
+		Priorities:     []Priority{PriorityMedium},
 		Retry:          RetryConfig{MaxAttempts: 1},
 		HandlerTimeout: time.Millisecond,
 	})

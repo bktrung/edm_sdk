@@ -1022,7 +1022,7 @@ func TestRetryDestinationTierMapMatchesSubscriptionDestinations(t *testing.T) {
 	sub := Subscription{
 		Name:       "orders",
 		Topics:     []string{"orders.created", "payments.created"},
-		Priorities: []Priority{PriorityHigh, PriorityNormal},
+		Priorities: []Priority{PriorityHigh, PriorityMedium},
 		Retry: RetryConfig{
 			Tiers: []time.Duration{time.Second, 2 * time.Second},
 		},

@@ -18,7 +18,7 @@ func TestPublicRunnerConsumesKafkaMessagesAfterAssignmentNotification(t *testing
 	requireBroker(t)
 	adminCtx, _, admin := openKafkaAdminTest(t)
 	topic := kafkaTestTopic(t, "public-runner")
-	physicalTopic := fmt.Sprintf("f1.test.%s.normal", topic)
+	physicalTopic := fmt.Sprintf("f1.test.%s.medium", topic)
 	group := kafkaTestTopic(t, "public-runner-group")
 	deadLetterTopic := fmt.Sprintf("f1.test.%s.dlq.%s", topic, group)
 	unknownDeadLetterTopic := fmt.Sprintf("f1.test.unknown.dlq.%s", group)
@@ -59,7 +59,7 @@ func TestPublicRunnerConsumesKafkaMessagesAfterAssignmentNotification(t *testing
 		Topics:         []string{topic},
 		Concurrency:    1,
 		Prefetch:       1,
-		Priorities:     []f1.Priority{f1.PriorityNormal},
+		Priorities:     []f1.Priority{f1.PriorityMedium},
 		Retry:          f1.RetryConfig{MaxAttempts: 1},
 		HandlerTimeout: 5 * time.Second,
 		Handlers: map[string]f1.Handler{
@@ -140,7 +140,7 @@ func TestPublicRunnerReconnectsAfterTransientConsumerError(t *testing.T) {
 	requireBroker(t)
 	adminCtx, _, admin := openKafkaAdminTest(t)
 	topic := kafkaTestTopic(t, "public-reconnect")
-	physicalTopic := fmt.Sprintf("f1.test.%s.normal", topic)
+	physicalTopic := fmt.Sprintf("f1.test.%s.medium", topic)
 	group := kafkaTestTopic(t, "public-reconnect-group")
 	cleanupKafkaTopics(t, admin, physicalTopic)
 	cleanupKafkaGroups(t, admin, group)
@@ -168,7 +168,7 @@ func TestPublicRunnerReconnectsAfterTransientConsumerError(t *testing.T) {
 		Topics:         []string{topic},
 		Concurrency:    1,
 		Prefetch:       1,
-		Priorities:     []f1.Priority{f1.PriorityNormal},
+		Priorities:     []f1.Priority{f1.PriorityMedium},
 		Retry:          f1.RetryConfig{MaxAttempts: 1},
 		HandlerTimeout: 5 * time.Second,
 		Handlers: map[string]f1.Handler{
@@ -240,7 +240,7 @@ func kafkaPublicTestConfig() f1.Config {
 			DefaultPrefetch: 1,
 		},
 		Topology: f1.TopologyConfig{
-			Priorities: []f1.Priority{f1.PriorityNormal},
+			Priorities: []f1.Priority{f1.PriorityMedium},
 		},
 		Codec: f1.CodecConfig{
 			Default:        "json",

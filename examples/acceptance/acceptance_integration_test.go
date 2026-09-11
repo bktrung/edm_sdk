@@ -31,7 +31,7 @@ func TestAcceptanceAgainstKafka(t *testing.T) {
 	publisherConfig := kafkaAcceptanceConfig(endpoint, "acceptance-kafka-publisher")
 	consumerConfig := kafkaAcceptanceConfig(endpoint, "acceptance-kafka-consumer")
 	destinations := []string{
-		fmt.Sprintf("f1.%s.%s.normal", publisherConfig.Env, topic),
+		fmt.Sprintf("f1.%s.%s.medium", publisherConfig.Env, topic),
 		fmt.Sprintf("f1.%s.%s.dlq.%s", consumerConfig.Env, topic, subscription),
 		fmt.Sprintf("f1.%s.unknown.dlq.%s", consumerConfig.Env, subscription),
 	}
@@ -88,7 +88,7 @@ func TestAcceptanceAgainstKafka(t *testing.T) {
 		Topics:          []string{topic},
 		Concurrency:     1,
 		Prefetch:        2,
-		Priorities:      []f1.Priority{f1.PriorityNormal},
+		Priorities:      []f1.Priority{f1.PriorityMedium},
 		Retry:           f1.RetryConfig{MaxAttempts: 1},
 		HandlerTimeout:  time.Second,
 		UnmatchedPolicy: f1.Ignore,

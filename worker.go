@@ -9,6 +9,7 @@ import (
 	"sort"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"golang.org/x/sync/errgroup"
 
@@ -1719,13 +1720,20 @@ func setDeathHeaders(headers map[string]string, reason DeathReason, err error, a
 	headers["f1originaldest"] = original
 }
 
+// truncateError returns error text capped at deathErrorCap bytes. If the cap falls inside
+// a UTF-8 rune, it backs up to the preceding rune boundary. The result may therefore be
+// shorter than the cap.
 func truncateError(err error) string {
 	if err == nil {
 		return ""
 	}
 	value := err.Error()
 	if len(value) > deathErrorCap {
-		return value[:deathErrorCap]
+		end := deathErrorCap
+		for end > 0 && !utf8.RuneStart(value[end]) {
+			end--
+		}
+		return value[:end]
 	}
 	return value
 }

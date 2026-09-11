@@ -75,7 +75,7 @@
       "setBy": "producer",
       "enum": [
         "high",
-        "normal",
+        "medium",
         "low"
       ]
     },

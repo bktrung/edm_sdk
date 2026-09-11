@@ -247,14 +247,14 @@ func laneRepairMessage(t *testing.T, id, eventType string) driver.InboundMessage
 		ID:          id,
 		Source:      "/test/orders",
 		Type:        eventType,
-		Priority:    PriorityNormal,
+		Priority:    PriorityMedium,
 	}
 	headers, err := envelope.EncodeHeaders(CoreMaxHeaderBytes)
 	if err != nil {
 		t.Fatal(err)
 	}
 	return driver.InboundMessage{
-		Destination: "f1.test." + eventType + ".normal",
+		Destination: "f1.test." + eventType + ".medium",
 		Headers:     headerSlice(headers),
 		Settle:      &reconnectTestSettler{},
 	}

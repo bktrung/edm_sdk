@@ -49,7 +49,7 @@ func TestDeadLetterSuccessorReachesTheDeclaredConsumerFamily(t *testing.T) {
 	runner, err := client.Subscribe(ctx, f1.Subscription{
 		Name:       "orders",
 		Topics:     []string{"orders.created"},
-		Priorities: []f1.Priority{f1.PriorityNormal},
+		Priorities: []f1.Priority{f1.PriorityMedium},
 		Retry:      f1.RetryConfig{MaxAttempts: 1},
 		OnDeadLetter: func(_ context.Context, deadLetter f1.DeadLettered) {
 			deadLettered <- deadLetter
@@ -76,7 +76,7 @@ func TestDeadLetterSuccessorReachesTheDeclaredConsumerFamily(t *testing.T) {
 	for {
 		broker.conn.mu.Lock()
 		var attached bool
-		if dest := broker.conn.destinations["f1.test.orders.created.normal"]; dest != nil {
+		if dest := broker.conn.destinations["f1.test.orders.created.medium"]; dest != nil {
 			attached = len(dest.consumers) > 0
 		}
 		broker.conn.mu.Unlock()
@@ -120,7 +120,7 @@ func successorFamilyConfig() f1.Config {
 		},
 		Topology: f1.TopologyConfig{
 			AutoCreate: true,
-			Priorities: []f1.Priority{f1.PriorityNormal},
+			Priorities: []f1.Priority{f1.PriorityMedium},
 		},
 		Codec: f1.CodecConfig{
 			Default:        "json",

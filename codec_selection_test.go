@@ -60,7 +60,7 @@ func newCodecSelectionRunner(t *testing.T, cfg Config, opts ...Option) (*Client,
 		subscription: Subscription{
 			Name:           "orders",
 			Topics:         []string{"orders.created"},
-			Priorities:     []Priority{PriorityNormal},
+			Priorities:     []Priority{PriorityMedium},
 			Retry:          RetryConfig{MaxAttempts: 3, Tiers: []time.Duration{time.Second}},
 			HandlerTimeout: time.Second,
 		},
@@ -75,7 +75,7 @@ func codecSelectionMessage(t *testing.T, envelope Envelope, body []byte, settler
 		t.Fatal(err)
 	}
 	return driver.InboundMessage{
-		Destination: "f1.test.orders.created.normal",
+		Destination: "f1.test.orders.created.medium",
 		Headers:     headerSlice(headers),
 		Body:        body,
 		Settle:      settler,

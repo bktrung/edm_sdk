@@ -8,7 +8,7 @@ Guidance for anyone changing this repository, human or agent.
 public API and the orchestration around it. `driver/` is the stdlib-only port that every
 broker adapter implements. `drivers/` holds the adapters: `inmem`, `rabbitmq`, `kafka`.
 
-Read `README.md`, then `ARCHITECTURE.md`, then `docs/reading-guide.md` before your first
+Read `README.md`, then `ARCHITECTURE.md`, then `docs/development/source-reading-guide.md` before your first
 change. Do not start in `worker.go` and do not start in the tests.
 
 ## Style
@@ -162,7 +162,7 @@ Say what you did not do. A gap you name is cheap. The same gap found in review i
 | `client.go` | client construction, driver connection, topology setup, shutdown |
 | `publisher.go` | envelope construction, publish, confirm |
 | `subscription.go` | subscription resolution, handler admission, error-handler group |
-| `worker.go` | consume loop, retry, settlement, drain. Largest file; use the function map in `docs/consume-flow.md` |
+| `worker.go` | consume loop, retry, settlement, drain. Largest file; use the function map in `docs/development/consume-flow.md` |
 | `config.go`, `broker_config.go`, `options.go` | configuration and option resolution |
 | `envelope.go` | message identity, headers, body |
 | `reconnect.go` | reconnection and lane repair |

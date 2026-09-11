@@ -27,7 +27,7 @@ func TestConsumeFanoutPerSubscription(t *testing.T) {
 				Topics:      []string{"orders.created"},
 				Concurrency: 1,
 				Prefetch:    1,
-				Priorities:  []f1.Priority{f1.PriorityNormal},
+				Priorities:  []f1.Priority{f1.PriorityMedium},
 				Retry:       f1.RetryConfig{MaxAttempts: 1},
 				Handlers: map[string]f1.Handler{
 					"orders.created.v1": f1.HandlerFunc(func(context.Context, *f1.Event) error {
@@ -42,7 +42,7 @@ func TestConsumeFanoutPerSubscription(t *testing.T) {
 				Topics:      []string{"orders.created"},
 				Concurrency: 1,
 				Prefetch:    1,
-				Priorities:  []f1.Priority{f1.PriorityNormal},
+				Priorities:  []f1.Priority{f1.PriorityMedium},
 				Retry:       f1.RetryConfig{MaxAttempts: 1},
 				Handlers: map[string]f1.Handler{
 					"orders.created.v1": f1.HandlerFunc(func(context.Context, *f1.Event) error {

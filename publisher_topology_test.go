@@ -46,7 +46,7 @@ func TestVersionedPublishTopicUsesCanonicalEntryPoint(t *testing.T) {
 		producer: producer,
 	}
 	cfg := testClientConfig(t)
-	cfg.Topology.Priorities = []Priority{PriorityNormal}
+	cfg.Topology.Priorities = []Priority{PriorityMedium}
 	client, err := New(context.Background(), cfg,
 		WithDriver(&topologyTestDriver{conn: conn}),
 		WithPublishTopics("orders.created.v1"),
@@ -55,18 +55,18 @@ func TestVersionedPublishTopicUsesCanonicalEntryPoint(t *testing.T) {
 	defer func() { require.NoError(t, client.Close(context.Background())) }()
 
 	require.Len(t, admin.specs, 1)
-	require.Equal(t, []string{"f1.test.orders.created.normal"}, destinationNames(admin.specs[0].Destinations))
+	require.Equal(t, []string{"f1.test.orders.created.medium"}, destinationNames(admin.specs[0].Destinations))
 	_, err = client.Publisher().Publish(context.Background(), "orders.created.v1", map[string]string{"id": "o1"})
 	require.NoError(t, err)
 	producer.mu.Lock()
 	require.Len(t, producer.messages, 1)
-	require.Equal(t, "f1.test.orders.created.normal", producer.messages[0].Destination)
+	require.Equal(t, "f1.test.orders.created.medium", producer.messages[0].Destination)
 	producer.mu.Unlock()
 }
 
 func TestPublisherTopologyHasOnlyEntryPoints(t *testing.T) {
-	priorities := []Priority{PriorityHigh, PriorityNormal}
-	wantNames := []string{"f1.test.orders.created.high", "f1.test.orders.created.normal"}
+	priorities := []Priority{PriorityHigh, PriorityMedium}
+	wantNames := []string{"f1.test.orders.created.high", "f1.test.orders.created.medium"}
 
 	for name, caps := range map[string]driver.Capabilities{
 		"publish": {Fanout: driver.FanoutAtPublish, MaxHeaderBytes: CoreMaxHeaderBytes},
@@ -154,7 +154,7 @@ func TestSubscriberTopologyPolicyControlsAdminCalls(t *testing.T) {
 				subscription: Subscription{
 					Name:       "orders-worker",
 					Topics:     []string{"orders.created"},
-					Priorities: []Priority{PriorityNormal},
+					Priorities: []Priority{PriorityMedium},
 					Retry:      RetryConfig{MaxAttempts: 1},
 				},
 				config: SubscriptionConfig{Prefetch: 1},
@@ -237,7 +237,7 @@ func TestPublisherTopologyArgumentDriftWarns(t *testing.T) {
 	var logs logSink
 	admin := &topologyRecordingAdmin{
 		diff: driver.TopologyDiff{Drifted: []driver.ArgumentDrift{{
-			Name:     "f1.test.orders.created.normal",
+			Name:     "f1.test.orders.created.medium",
 			Argument: "x-delivery-limit",
 			Want:     "5",
 			Got:      "3",
@@ -258,7 +258,7 @@ func TestPublisherTopologyArgumentDriftWarns(t *testing.T) {
 
 	output := logs.String()
 	require.Contains(t, output, "f1 topology argument drift")
-	require.Contains(t, output, "destination=f1.test.orders.created.normal")
+	require.Contains(t, output, "destination=f1.test.orders.created.medium")
 	require.Contains(t, output, "argument=x-delivery-limit")
 	require.Contains(t, output, "want=5")
 	require.Contains(t, output, "got=3")
@@ -268,7 +268,7 @@ func TestSubscriberTopologyArgumentDriftWarns(t *testing.T) {
 	var logs logSink
 	admin := &topologyRecordingAdmin{
 		diff: driver.TopologyDiff{Drifted: []driver.ArgumentDrift{{
-			Name:     "f1.test.orders.created.normal",
+			Name:     "f1.test.orders.created.medium",
 			Argument: "x-delivery-limit",
 			Want:     "5",
 			Got:      "3",
@@ -297,7 +297,7 @@ func TestSubscriberTopologyArgumentDriftWarns(t *testing.T) {
 
 	output := logs.String()
 	require.Contains(t, output, "f1 topology argument drift")
-	require.Contains(t, output, "destination=f1.test.orders.created.normal")
+	require.Contains(t, output, "destination=f1.test.orders.created.medium")
 	require.Contains(t, output, "argument=x-delivery-limit")
 	require.Contains(t, output, "want=5")
 	require.Contains(t, output, "got=3")
@@ -349,7 +349,7 @@ func TestExplicitVersionedTopicMatchesDeclaredPublisherDestination(t *testing.T)
 	require.NoError(t, err)
 	require.Len(t, producer.messages, 1)
 
-	spec := publisherTopologySpec(client.effective, client.source, []string{topicFor(topic)}, []Priority{PriorityNormal})
+	spec := publisherTopologySpec(client.effective, client.source, []string{topicFor(topic)}, []Priority{PriorityMedium})
 	require.Contains(t, destinationNames(spec.Destinations), producer.messages[0].Destination)
 }
 
@@ -360,7 +360,7 @@ func TestVersionedConfiguredTopicPublisherSubscriberRoundTrip(t *testing.T) {
 	subscription := Subscription{
 		Name:       "orders-worker",
 		Topics:     []string{topic},
-		Priorities: []Priority{PriorityNormal},
+		Priorities: []Priority{PriorityMedium},
 		Retry:      RetryConfig{MaxAttempts: 1},
 	}
 

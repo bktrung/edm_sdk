@@ -203,7 +203,7 @@ f1:
       retry:
         tiers: [1s, 5s]
       fairness:
-        weights: {high: 8, normal: 4, low: 1}
+        weights: {high: 8, medium: 4, low: 1}
 `)
 	cfg, err := LoadConfig(path)
 	if err != nil {
@@ -812,7 +812,7 @@ func validValidationConfig() Config {
 			Topics:         []string{"orders"},
 			Concurrency:    1,
 			Prefetch:       64,
-			Priorities:     []Priority{PriorityNormal},
+			Priorities:     []Priority{PriorityMedium},
 			Retry:          RetryConfig{MaxAttempts: 2, Tiers: []time.Duration{time.Second}},
 			HandlerTimeout: time.Second,
 		},
@@ -878,7 +878,7 @@ func TestValidateConfigRejectsInvalidPriorityLists(t *testing.T) {
 			cfg.Subscriptions["orders"] = withPriorities(cfg.Subscriptions["orders"], []Priority{Priority(99)})
 		}, want: "subscriptions.orders.priorities"},
 		{name: "duplicate subscription", set: func(cfg *Config) {
-			cfg.Subscriptions["orders"] = withPriorities(cfg.Subscriptions["orders"], []Priority{PriorityNormal, PriorityNormal})
+			cfg.Subscriptions["orders"] = withPriorities(cfg.Subscriptions["orders"], []Priority{PriorityMedium, PriorityMedium})
 		}, want: "subscriptions.orders.priorities"},
 	}
 	for _, test := range tests {

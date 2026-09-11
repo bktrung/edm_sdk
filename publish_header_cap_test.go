@@ -58,7 +58,7 @@ func TestPublishAndRetryUseOneEffectiveHeaderCap(t *testing.T) {
 		subscription: Subscription{
 			Name:       "orders",
 			Topics:     []string{"orders.created"},
-			Priorities: []Priority{PriorityNormal},
+			Priorities: []Priority{PriorityMedium},
 			Retry: RetryConfig{
 				MaxAttempts: 3,
 				Tiers:       []time.Duration{time.Second},

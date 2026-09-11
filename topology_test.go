@@ -14,7 +14,7 @@ func TestSubscriptionTopologyMatchesFanoutModes(t *testing.T) {
 	sub := Subscription{
 		Name:       "order-worker",
 		Topics:     []string{"order.created"},
-		Priorities: []Priority{PriorityHigh, PriorityNormal},
+		Priorities: []Priority{PriorityHigh, PriorityMedium},
 		Retry: RetryConfig{
 			MaxAttempts: 3,
 			Tiers:       []time.Duration{time.Second, 5 * time.Second},
@@ -24,8 +24,8 @@ func TestSubscriptionTopologyMatchesFanoutModes(t *testing.T) {
 	wantRetry := []string{
 		"f1.prod.order.created.order-worker.high.retry.1",
 		"f1.prod.order.created.order-worker.high.retry.2",
-		"f1.prod.order.created.order-worker.normal.retry.1",
-		"f1.prod.order.created.order-worker.normal.retry.2",
+		"f1.prod.order.created.order-worker.medium.retry.1",
+		"f1.prod.order.created.order-worker.medium.retry.2",
 	}
 	wantDLQ := "f1.prod.order.created.dlq.order-worker"
 	wantBackstop := wantDLQ + ".backstop"
@@ -43,7 +43,7 @@ func TestSubscriptionTopologyMatchesFanoutModes(t *testing.T) {
 			mode: driver.FanoutAtConsume,
 			main: []string{
 				"f1.prod.order.created.high",
-				"f1.prod.order.created.normal",
+				"f1.prod.order.created.medium",
 			},
 		},
 		{
@@ -52,7 +52,7 @@ func TestSubscriptionTopologyMatchesFanoutModes(t *testing.T) {
 			nativeDLQ: true,
 			main: []string{
 				"f1.prod.order.created.high",
-				"f1.prod.order.created.normal",
+				"f1.prod.order.created.medium",
 			},
 		},
 		{
@@ -60,7 +60,7 @@ func TestSubscriptionTopologyMatchesFanoutModes(t *testing.T) {
 			mode: driver.FanoutAtPublish,
 			main: []string{
 				"f1.prod.order.created.order-worker.high",
-				"f1.prod.order.created.order-worker.normal",
+				"f1.prod.order.created.order-worker.medium",
 			},
 			wantExchange: true,
 		},
@@ -70,7 +70,7 @@ func TestSubscriptionTopologyMatchesFanoutModes(t *testing.T) {
 			nativeDLQ: true,
 			main: []string{
 				"f1.prod.order.created.order-worker.high",
-				"f1.prod.order.created.order-worker.normal",
+				"f1.prod.order.created.order-worker.medium",
 			},
 			wantExchange: true,
 		},
@@ -119,7 +119,7 @@ func TestSubscriptionTopologyMatchesFanoutModes(t *testing.T) {
 			if test.wantExchange {
 				wantExchanges := []string{
 					"f1.prod.order.created.high",
-					"f1.prod.order.created.normal",
+					"f1.prod.order.created.medium",
 				}
 				if got := exchangeNames(spec.Exchanges); !reflect.DeepEqual(got, wantExchanges) {
 					t.Fatalf("declared exchanges = %v, want %v", got, wantExchanges)

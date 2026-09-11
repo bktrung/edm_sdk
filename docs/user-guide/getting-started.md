@@ -25,14 +25,13 @@ directly.
 
 The repository currently includes:
 
+- `drivers/kafka` for Kafka classic consumer groups and partition-bound scaling.
 - `drivers/rabbitmq` for RabbitMQ.
 - `drivers/inmem` for deterministic tests and local in-process use.
-- `drivers/kafka` as a scaffold for the Kafka adapter; its `Open` method currently returns
-  `driver.ErrUnsupported`.
 
-Kafka is also represented in shared configuration and port types, and a local Kafka fixture is
-defined in [`docker/docker-compose.yml`](../../docker/docker-compose.yml). It is not a usable runtime
-driver yet.
+Kafka share-group mode is not implemented; `kafka.useShareGroups=always` is rejected. The local
+Kafka fixture is defined in [`docker/docker-compose.yml`](../../docker/docker-compose.yml), and
+`make test-kafka` / `make test-kafka-conformance` own its broker-backed verification.
 
 ## Load configuration and connect
 

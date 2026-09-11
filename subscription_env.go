@@ -84,7 +84,7 @@ func applySubscriptionEnvironment(name string, cfg *SubscriptionConfig) error {
 		}
 		cfg.Fairness.AgingEnabled = parsed
 	}
-	for _, priority := range []Priority{PriorityHigh, PriorityNormal, PriorityLow} {
+	for _, priority := range []Priority{PriorityHigh, PriorityMedium, PriorityLow} {
 		if value, ok := lookupSubscriptionEnv(prefix, "fairness.weights."+priority.String()); ok {
 			parsed, err := strconv.Atoi(value)
 			if err != nil {

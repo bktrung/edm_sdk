@@ -13,7 +13,35 @@ func init() {
 	registerGroup("rebalance", runRebalance)
 }
 
+// warmRebalanceTopology pays Kafka's creation and metadata propagation cost before rebalance checks.
+func warmRebalanceTopology(group *groupContext) {
+	destinations := make([]driver.DestinationSpec, 0, 12)
+	for _, name := range []string{
+		"rebalance.scale-up",
+		"rebalance.reassign",
+		"rebalance.in-flight",
+		"rebalance.delivery-count",
+		"rebalance.prefetch",
+		"rebalance.repeat",
+		"rebalance.settle",
+		"rebalance.key-a",
+		"rebalance.key-b",
+		"rebalance.affinity",
+		"rebalance.join-in-flight",
+		"rebalance.idle-join",
+	} {
+		destinations = append(destinations, driver.DestinationSpec{
+			Name: name, Partitions: rebalancePartitionCount,
+		})
+	}
+	warmTopology(group.t, group, driver.TopologySpec{
+		Destinations: destinations,
+		Effective:    group.effective,
+	})
+}
+
 func runRebalance(group *groupContext) {
+	warmRebalanceTopology(group)
 	group.Check("adding a consumer distributes new work to both consumers", func(t *testing.T) {
 		producer := newRebalanceProducer(t, group, "rebalance.scale-up", driver.ProducerConfig{Effective: group.effective})
 		first := newRebalanceConsumer(t, group, "rebalance.scale-up", 1)

@@ -204,7 +204,7 @@ func TestApplySubscriptionEnvironmentAllocatesFairnessMapsLazily(t *testing.T) {
 	name = name + "_budget"
 	clearSubscriptionEnvironment(t, name)
 	prefix = subscriptionEnvPrefix(name)
-	t.Setenv(envKey(prefix, "fairness.budgets.normal"), "2s")
+	t.Setenv(envKey(prefix, "fairness.budgets.medium"), "2s")
 	cfg = SubscriptionConfig{}
 	if err := applySubscriptionEnvironment(name, &cfg); err != nil {
 		t.Fatal(err)
@@ -212,8 +212,8 @@ func TestApplySubscriptionEnvironmentAllocatesFairnessMapsLazily(t *testing.T) {
 	if cfg.Fairness.Weights != nil {
 		t.Fatalf("budget-only weights = %#v, want nil", cfg.Fairness.Weights)
 	}
-	if cfg.Fairness.Budgets == nil || cfg.Fairness.Budgets[PriorityNormal] != 2*time.Second {
-		t.Fatalf("budget-only budgets = %#v, want normal 2s", cfg.Fairness.Budgets)
+	if cfg.Fairness.Budgets == nil || cfg.Fairness.Budgets[PriorityMedium] != 2*time.Second {
+		t.Fatalf("budget-only budgets = %#v, want medium 2s", cfg.Fairness.Budgets)
 	}
 }
 
@@ -223,8 +223,8 @@ func clearSubscriptionEnvironment(t *testing.T, name string) {
 		"topics", "mode", "concurrency", "prefetch", "priorities",
 		"handlerTimeout", "unmatchedPolicy", "fairness.retryWeightDivisor",
 		"fairness.costModel", "fairness.prefetchFactor", "fairness.agingEnabled",
-		"fairness.weights.high", "fairness.weights.normal", "fairness.weights.low",
-		"fairness.budgets.high", "fairness.budgets.normal", "fairness.budgets.low",
+		"fairness.weights.high", "fairness.weights.medium", "fairness.weights.low",
+		"fairness.budgets.high", "fairness.budgets.medium", "fairness.budgets.low",
 		"retry.maxAttempts", "retry.initialInterval", "retry.multiplier",
 		"retry.maxInterval", "retry.jitter", "retry.tiers",
 	}

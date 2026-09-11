@@ -155,7 +155,7 @@ func TestConsumerTopologyErrorsWithoutAdmin(t *testing.T) {
 		subscription: Subscription{
 			Name:       "orders",
 			Topics:     []string{"orders.created"},
-			Priorities: []Priority{PriorityNormal},
+			Priorities: []Priority{PriorityMedium},
 			Retry:      RetryConfig{MaxAttempts: 1},
 		},
 		config: SubscriptionConfig{Prefetch: 1},
@@ -171,7 +171,7 @@ func topologyTestSubscription() Subscription {
 		Topics:         []string{"orders.created"},
 		Concurrency:    1,
 		Prefetch:       1,
-		Priorities:     []Priority{PriorityNormal},
+		Priorities:     []Priority{PriorityMedium},
 		Retry:          RetryConfig{MaxAttempts: 1},
 		HandlerTimeout: time.Second,
 	}
