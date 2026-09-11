@@ -347,7 +347,7 @@ func buildOutbound(ctx context.Context, options clientOptions, effective driver.
 			return driver.OutboundMessage{}, "", errors.New("nil publish option")
 		}
 	}
-	publish := publishOptions{priority: PriorityNormal}
+	publish := publishOptions{priority: PriorityMedium}
 	for _, option := range message.Opts {
 		if err := option.apply(&publish); err != nil {
 			return driver.OutboundMessage{}, "", err

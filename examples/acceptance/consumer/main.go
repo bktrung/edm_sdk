@@ -61,7 +61,7 @@ func main() {
 		Topics:          []string{topic},
 		Concurrency:     1,
 		Prefetch:        16,
-		Priorities:      []f1.Priority{f1.PriorityHigh, f1.PriorityNormal, f1.PriorityLow},
+		Priorities:      []f1.Priority{f1.PriorityHigh, f1.PriorityMedium, f1.PriorityLow},
 		Retry:           f1.RetryConfig{MaxAttempts: 2, Tiers: []time.Duration{500 * time.Millisecond}},
 		HandlerTimeout:  2 * time.Second,
 		UnmatchedPolicy: f1.DeadLetter,
@@ -124,7 +124,7 @@ func serviceConfig(service string) f1.Config {
 		},
 		Topology: f1.TopologyConfig{
 			AutoCreate: true,
-			Priorities: []f1.Priority{f1.PriorityHigh, f1.PriorityNormal, f1.PriorityLow},
+			Priorities: []f1.Priority{f1.PriorityHigh, f1.PriorityMedium, f1.PriorityLow},
 		},
 		Codec: f1.CodecConfig{
 			Default:        "json",

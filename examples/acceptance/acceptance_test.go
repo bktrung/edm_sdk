@@ -57,7 +57,7 @@ func TestAcceptanceFlowReconcilesHandledRetryAndDeadLetteredMessages(t *testing.
 		Topics:          []string{topic},
 		Concurrency:     1,
 		Prefetch:        2,
-		Priorities:      []f1.Priority{f1.PriorityNormal},
+		Priorities:      []f1.Priority{f1.PriorityMedium},
 		Retry:           f1.RetryConfig{MaxAttempts: 2, Tiers: []time.Duration{10 * time.Millisecond}},
 		HandlerTimeout:  time.Second,
 		UnmatchedPolicy: f1.DeadLetter,
@@ -170,7 +170,7 @@ func acceptanceFlowConfig() f1.Config {
 		},
 		Topology: f1.TopologyConfig{
 			AutoCreate: true,
-			Priorities: []f1.Priority{f1.PriorityNormal},
+			Priorities: []f1.Priority{f1.PriorityMedium},
 		},
 		Codec: f1.CodecConfig{
 			Default:        "json",

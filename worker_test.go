@@ -113,7 +113,7 @@ func TestUnknownLaneRoutesToTheFallbackLane(t *testing.T) {
 		ID:          "evt-fallback-lane",
 		Source:      "/test/orders",
 		Type:        "orders.created",
-		Priority:    PriorityNormal,
+		Priority:    PriorityMedium,
 		Attempt:     1,
 	}, settler)
 	id := runner.inflight.Add(message)
@@ -137,7 +137,7 @@ func TestUnknownLaneRoutesToTheFallbackLane(t *testing.T) {
 	if got := strings.Count(output.String(), "f1 unknown delivery lane; routing to fallback lane"); got != 1 {
 		t.Fatalf("unknown-lane warning count = %d, want 1; output=%q", got, output.String())
 	}
-	if !strings.Contains(output.String(), "lane=orders.created.normal.main") {
+	if !strings.Contains(output.String(), "lane=orders.created.medium.main") {
 		t.Fatalf("unknown-lane warning = %q, want rejected lane id", output.String())
 	}
 }
@@ -148,7 +148,7 @@ func TestLaneFullStillAppliesBackpressure(t *testing.T) {
 		client: &Client{options: clientOptions{clock: fake}},
 		subscription: Subscription{
 			Topics:      []string{"orders.created"},
-			Priorities:  []Priority{PriorityHigh, PriorityNormal},
+			Priorities:  []Priority{PriorityHigh, PriorityMedium},
 			Concurrency: 1,
 			Fairness:    FairnessConfig{PrefetchFactor: 1},
 			Retry:       RetryConfig{MaxAttempts: 1},
@@ -248,7 +248,7 @@ func pipelineTestSubscription(handler func(context.Context, *Event) error) Subsc
 		Topics:         []string{"orders.created"},
 		Concurrency:    1,
 		Prefetch:       1,
-		Priorities:     []Priority{PriorityNormal},
+		Priorities:     []Priority{PriorityMedium},
 		Retry:          RetryConfig{MaxAttempts: 1},
 		HandlerTimeout: time.Second,
 		Handlers:       handlers,

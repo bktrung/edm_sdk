@@ -297,7 +297,7 @@ func TestPublishTopicDerivationAndEnvelope(t *testing.T) {
 	if id == "" {
 		t.Fatal("Publish returned an empty event ID")
 	}
-	if got, want := producer.messages[0].Destination, "f1.test.com.za.order.v2.created.normal"; got != want {
+	if got, want := producer.messages[0].Destination, "f1.test.com.za.order.v2.created.medium"; got != want {
 		t.Fatalf("destination = %q, want %q", got, want)
 	}
 	if got, want := string(producer.messages[0].Key), "ORD-42"; got != want {
@@ -318,7 +318,7 @@ func TestPublishTopicDerivationAndEnvelope(t *testing.T) {
 	if _, err := client.Publisher().Publish(context.Background(), "orders.created.v2", nil); err != nil {
 		t.Fatal(err)
 	}
-	if got, want := producer.messages[0].Destination, "f1.test.orders.created.normal"; got != want {
+	if got, want := producer.messages[0].Destination, "f1.test.orders.created.medium"; got != want {
 		t.Fatalf("trailing version destination = %q, want %q", got, want)
 	}
 
@@ -326,7 +326,7 @@ func TestPublishTopicDerivationAndEnvelope(t *testing.T) {
 	if _, err := client.Publisher().Publish(context.Background(), "orders.created.v2", nil, WithTopic("explicit.topic")); err != nil {
 		t.Fatal(err)
 	}
-	if got, want := producer.messages[0].Destination, "f1.test.explicit.topic.normal"; got != want {
+	if got, want := producer.messages[0].Destination, "f1.test.explicit.topic.medium"; got != want {
 		t.Fatalf("overridden destination = %q, want %q", got, want)
 	}
 }

@@ -35,7 +35,7 @@ func TestOrderedByKeyKeepsEqualKeysSerialAndDifferentKeysConcurrent(t *testing.T
 		Mode:           f1.OrderedByKey,
 		Concurrency:    2,
 		Prefetch:       totalMessages,
-		Priorities:     []f1.Priority{f1.PriorityNormal},
+		Priorities:     []f1.Priority{f1.PriorityMedium},
 		Retry:          f1.RetryConfig{MaxAttempts: 1},
 		HandlerTimeout: time.Second,
 		Handlers: map[string]f1.Handler{

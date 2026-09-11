@@ -538,7 +538,7 @@ func TestRabbitMQCoreRebuildsAfterLaneChannelClosure(t *testing.T) {
 		},
 		Topology: f1.TopologyConfig{
 			AutoCreate: true,
-			Priorities: []f1.Priority{f1.PriorityNormal},
+			Priorities: []f1.Priority{f1.PriorityMedium},
 		},
 		Lifecycle: f1.LifecycleConfig{
 			DrainTimeout: 5 * time.Second,
@@ -565,7 +565,7 @@ func TestRabbitMQCoreRebuildsAfterLaneChannelClosure(t *testing.T) {
 	runner, err := client.Subscribe(context.Background(), f1.Subscription{
 		Name:           "lane-close-live",
 		Topics:         []string{topicA, topicB},
-		Priorities:     []f1.Priority{f1.PriorityNormal},
+		Priorities:     []f1.Priority{f1.PriorityMedium},
 		Retry:          f1.RetryConfig{MaxAttempts: 1},
 		Prefetch:       2,
 		HandlerTimeout: 2 * time.Second,

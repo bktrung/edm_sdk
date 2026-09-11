@@ -118,7 +118,7 @@ func TestProcessDeliveryRecoversClassificationPanic(t *testing.T) {
 		producer.mu.Unlock()
 	}}
 	message := driver.InboundMessage{
-		Destination: "f1.test.orders.created.normal",
+		Destination: "f1.test.orders.created.medium",
 		Headers:     headerSlice(headers),
 		Body:        []byte(`{}`),
 		Settle:      settler,

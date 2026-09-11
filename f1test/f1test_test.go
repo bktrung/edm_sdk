@@ -23,7 +23,7 @@ func TestClientDeliverAndCapture(t *testing.T) {
 		Topics:         []string{"orders.created"},
 		Concurrency:    1,
 		Prefetch:       1,
-		Priorities:     []f1.Priority{f1.PriorityNormal},
+		Priorities:     []f1.Priority{f1.PriorityMedium},
 		Retry:          f1.RetryConfig{MaxAttempts: 1},
 		HandlerTimeout: time.Second,
 		Handlers: map[string]f1.Handler{
@@ -65,7 +65,7 @@ func TestClientDeliverWaitsForRunningSubscription(t *testing.T) {
 		Topics:         []string{"orders.created"},
 		Concurrency:    1,
 		Prefetch:       1,
-		Priorities:     []f1.Priority{f1.PriorityNormal},
+		Priorities:     []f1.Priority{f1.PriorityMedium},
 		Retry:          f1.RetryConfig{MaxAttempts: 1},
 		HandlerTimeout: time.Second,
 		Handlers: map[string]f1.Handler{
@@ -106,7 +106,7 @@ func TestClientDeliverWaitsForEachSubscriptionDestination(t *testing.T) {
 		Topics:         []string{"orders.created"},
 		Concurrency:    1,
 		Prefetch:       1,
-		Priorities:     []f1.Priority{f1.PriorityNormal},
+		Priorities:     []f1.Priority{f1.PriorityMedium},
 		Retry:          f1.RetryConfig{MaxAttempts: 1},
 		HandlerTimeout: time.Second,
 		Handlers: map[string]f1.Handler{
@@ -122,7 +122,7 @@ func TestClientDeliverWaitsForEachSubscriptionDestination(t *testing.T) {
 		Topics:         []string{"payments.created"},
 		Concurrency:    1,
 		Prefetch:       1,
-		Priorities:     []f1.Priority{f1.PriorityNormal},
+		Priorities:     []f1.Priority{f1.PriorityMedium},
 		Retry:          f1.RetryConfig{MaxAttempts: 1},
 		HandlerTimeout: time.Second,
 		Handlers: map[string]f1.Handler{
@@ -157,7 +157,7 @@ func TestClientDeliverWaitsForEachSubscriptionDestination(t *testing.T) {
 	go func() {
 		secondDelivered <- deliver(c, deliverCtx, "payments.created.v1", map[string]string{"id": "payment-before-run"})
 	}()
-	waitForDestination(t, c.state.waiting, "f1.test.payments.created.normal", "second destination was not awaited")
+	waitForDestination(t, c.state.waiting, "f1.test.payments.created.medium", "second destination was not awaited")
 
 	secondStarted = true
 	go func() {
@@ -177,7 +177,7 @@ func TestClientCapturesDeadLetterCopies(t *testing.T) {
 		Topics:         []string{"orders.created"},
 		Concurrency:    1,
 		Prefetch:       1,
-		Priorities:     []f1.Priority{f1.PriorityNormal},
+		Priorities:     []f1.Priority{f1.PriorityMedium},
 		Retry:          f1.RetryConfig{MaxAttempts: 1},
 		HandlerTimeout: time.Second,
 		OnDeadLetter:   func(context.Context, f1.DeadLettered) { close(deadLettered) },
@@ -217,7 +217,7 @@ func TestClientAdvanceFiresDriverRetry(t *testing.T) {
 		Topics:         []string{"orders.created"},
 		Concurrency:    1,
 		Prefetch:       2,
-		Priorities:     []f1.Priority{f1.PriorityNormal},
+		Priorities:     []f1.Priority{f1.PriorityMedium},
 		Retry:          f1.RetryConfig{MaxAttempts: 2, Tiers: []time.Duration{time.Second}},
 		HandlerTimeout: time.Second,
 		Handlers: map[string]f1.Handler{

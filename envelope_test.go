@@ -74,7 +74,7 @@ func minimalEnvelope() f1.Envelope {
 		Source:      "s",
 		Type:        "t",
 		Time:        time.Date(2026, 8, 5, 11, 0, 0, 0, time.UTC),
-		Priority:    f1.PriorityNormal,
+		Priority:    f1.PriorityMedium,
 	}
 }
 
@@ -291,7 +291,7 @@ func TestEnvelope_MatchesDoc03Table(t *testing.T) {
 	require.NoError(t, err)
 
 	knownEnums := map[string][]string{
-		"f1priority":    {f1.PriorityHigh.String(), f1.PriorityNormal.String(), f1.PriorityLow.String()},
+		"f1priority":    {f1.PriorityHigh.String(), f1.PriorityMedium.String(), f1.PriorityLow.String()},
 		"f1deathreason": deathReasonWireValues(),
 	}
 
@@ -459,7 +459,7 @@ func TestArchivedDependencyUnavailableReasonSurvivesReplay(t *testing.T) {
 		"id":              "archived-dependency-outage",
 		"source":          "/legacy/orders",
 		"type":            "orders.created.v1",
-		"f1priority":      "normal",
+		"f1priority":      "medium",
 		"f1attempt":       "2",
 		"f1deathreason":   "dependency_unavailable",
 		"f1correlationid": "archived-dependency-outage",
@@ -729,6 +729,16 @@ func TestUnrecognisedValueError_Error(t *testing.T) {
 	require.EqualError(t, err, `f1: unrecognised f1priority value "urgent"`)
 }
 
+func TestParsePriorityRejectsNormal(t *testing.T) {
+	t.Parallel()
+
+	_, err := f1.ParsePriority("normal")
+	var valueErr *f1.UnrecognisedValueError
+	require.ErrorAs(t, err, &valueErr)
+	require.Equal(t, "f1priority", valueErr.Attribute)
+	require.Equal(t, "normal", valueErr.Value)
+}
+
 func TestEnvelope_RejectsExtensionOverwritingCanonicalHeader(t *testing.T) {
 	t.Parallel()
 
@@ -827,7 +837,7 @@ func TestPriority_UndeclaredValueDoesNotBecomeALane(t *testing.T) {
 	require.Equal(t, "invalid", undeclared.String())
 	require.False(t, undeclared.Valid())
 
-	require.True(t, f1.PriorityNormal.Valid())
+	require.True(t, f1.PriorityMedium.Valid())
 	require.True(t, f1.PriorityHigh.Valid())
 	require.True(t, f1.PriorityLow.Valid())
 

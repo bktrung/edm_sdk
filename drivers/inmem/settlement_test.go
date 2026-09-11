@@ -211,7 +211,7 @@ func settlementSubscription(handler func(context.Context, *f1.Event) error) f1.S
 		Topics:         []string{"orders.created"},
 		Concurrency:    1,
 		Prefetch:       1,
-		Priorities:     []f1.Priority{f1.PriorityNormal},
+		Priorities:     []f1.Priority{f1.PriorityMedium},
 		Retry:          f1.RetryConfig{MaxAttempts: 1},
 		HandlerTimeout: 20 * time.Millisecond,
 		Handlers: map[string]f1.Handler{

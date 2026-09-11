@@ -13,13 +13,13 @@ f1:
     # Development creates entry points and queues; production should provision them instead.
     autoCreate: true
     verifyOnStart: false
-    priorities: [normal]
+    priorities: [medium]
   subscriptions:
     quickstart:
       topics: [quickstart.message]
       concurrency: 1
       prefetch: 1
-      priorities: [normal]
+      priorities: [medium]
       retry:
         maxAttempts: 1
       handlerTimeout: 5s

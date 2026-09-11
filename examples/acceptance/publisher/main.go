@@ -102,7 +102,7 @@ func serviceConfig(service string) f1.Config {
 		},
 		Topology: f1.TopologyConfig{
 			AutoCreate: true,
-			Priorities: []f1.Priority{f1.PriorityHigh, f1.PriorityNormal, f1.PriorityLow},
+			Priorities: []f1.Priority{f1.PriorityHigh, f1.PriorityMedium, f1.PriorityLow},
 		},
 		Codec: f1.CodecConfig{
 			Default:        "json",

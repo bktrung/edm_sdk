@@ -8,12 +8,12 @@ import (
 )
 
 func TestDWRRShareMatchesWeights(t *testing.T) {
-	scheduler, err := New([]LaneSpec{{ID: "high", Weight: 8, Capacity: 10001}, {ID: "normal", Weight: 4, Capacity: 10001}, {ID: "low", Weight: 1, Capacity: 10001}}, clock.NewFake(time.Unix(0, 0)), false)
+	scheduler, err := New([]LaneSpec{{ID: "high", Weight: 8, Capacity: 10001}, {ID: "medium", Weight: 4, Capacity: 10001}, {ID: "low", Weight: 1, Capacity: 10001}}, clock.NewFake(time.Unix(0, 0)), false)
 	if err != nil {
 		t.Fatal(err)
 	}
 	for range 10000 {
-		for _, id := range []string{"high", "normal", "low"} {
+		for _, id := range []string{"high", "medium", "low"} {
 			if err := scheduler.Enqueue(id, Item{Value: id}); err != nil {
 				t.Fatal(err)
 			}
@@ -27,8 +27,8 @@ func TestDWRRShareMatchesWeights(t *testing.T) {
 		}
 		counts[item.Value.(string)]++
 	}
-	if counts["high"] != 80 || counts["normal"] != 40 || counts["low"] != 10 {
-		t.Fatalf("weighted prefix = %v, want high=80 normal=40 low=10", counts)
+	if counts["high"] != 80 || counts["medium"] != 40 || counts["low"] != 10 {
+		t.Fatalf("weighted prefix = %v, want high=80 medium=40 low=10", counts)
 	}
 }
 

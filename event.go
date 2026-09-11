@@ -60,7 +60,7 @@ func (e *Event) Time() time.Time {
 // Priority returns the event's scheduling lane.
 func (e *Event) Priority() Priority {
 	if e == nil {
-		return PriorityNormal
+		return PriorityMedium
 	}
 	return e.envelope.Priority
 }

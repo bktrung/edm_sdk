@@ -169,7 +169,7 @@ func LoadConfig(path string) (Config, error) {
 func defaultConfig() Config {
 	return Config{
 		Broker:        BrokerConfig{ConnectTimeout: 30 * time.Second, DefaultPrefetch: 64},
-		Topology:      TopologyConfig{VerifyOnStart: true, Priorities: []Priority{PriorityHigh, PriorityNormal, PriorityLow}},
+		Topology:      TopologyConfig{VerifyOnStart: true, Priorities: []Priority{PriorityHigh, PriorityMedium, PriorityLow}},
 		Codec:         CodecConfig{Default: "json", ContentMode: "binary", MaxHeaderBytes: CoreMaxHeaderBytes, MaxBodyBytes: 1024 * 1024},
 		Lifecycle:     LifecycleConfig{PreStopDelay: 5 * time.Second, DrainTimeout: time.Minute, HandlerGrace: 5 * time.Second, FlushTimeout: 20 * time.Second, CloseTimeout: 10 * time.Second, RebalanceDrainTimeout: 25 * time.Second},
 		Subscriptions: map[string]SubscriptionConfig{},
@@ -667,8 +667,8 @@ type rawSubscription struct {
 
 func defaultSubscription() SubscriptionConfig {
 	return SubscriptionConfig{
-		Concurrency: 16, Priorities: []Priority{PriorityHigh, PriorityNormal, PriorityLow},
-		Fairness: FairnessConfig{Weights: map[Priority]int{PriorityHigh: 8, PriorityNormal: 4, PriorityLow: 1}, Budgets: map[Priority]time.Duration{PriorityHigh: 5 * time.Second, PriorityNormal: 30 * time.Second, PriorityLow: 120 * time.Second}, RetryWeightDivisor: 2, CostModel: "count", PrefetchFactor: 2, AgingEnabled: true},
+		Concurrency: 16, Priorities: []Priority{PriorityHigh, PriorityMedium, PriorityLow},
+		Fairness: FairnessConfig{Weights: map[Priority]int{PriorityHigh: 8, PriorityMedium: 4, PriorityLow: 1}, Budgets: map[Priority]time.Duration{PriorityHigh: 5 * time.Second, PriorityMedium: 30 * time.Second, PriorityLow: 120 * time.Second}, RetryWeightDivisor: 2, CostModel: "count", PrefetchFactor: 2, AgingEnabled: true},
 		Retry:    RetryConfig{MaxAttempts: 4, InitialInterval: time.Second, Multiplier: 5, MaxInterval: 30 * time.Second, Jitter: .2}, HandlerTimeout: 30 * time.Second,
 	}
 }

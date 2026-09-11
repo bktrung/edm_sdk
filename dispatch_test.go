@@ -42,7 +42,7 @@ func TestOversizeBodyDeadLettersBeforeHandlerRuns(t *testing.T) {
 		t.Fatal(err)
 	}
 	settler := &dispatchSettler{}
-	message := driver.InboundMessage{Destination: "f1.test.orders.created.normal", Headers: headerSlice(headers), Body: []byte("oversize"), Settle: settler}
+	message := driver.InboundMessage{Destination: "f1.test.orders.created.medium", Headers: headerSlice(headers), Body: []byte("oversize"), Settle: settler}
 	abandoned := false
 	if !dispatchMessage(runner, context.Background(), message, &Envelope{}, &abandoned) {
 		t.Fatal("oversize message was not settled")
@@ -69,7 +69,7 @@ func TestDispatchSettlesMessagesWithoutDeliveryCount(t *testing.T) {
 	runner := &Runner{client: client, subscription: Subscription{
 		Name:       "orders",
 		Topics:     []string{"orders.created", "payments.created"},
-		Priorities: []Priority{PriorityHigh, PriorityNormal},
+		Priorities: []Priority{PriorityHigh, PriorityMedium},
 		Handlers: map[string]Handler{
 			"orders.created": HandlerFunc(func(context.Context, *Event) error { return nil }),
 		},
@@ -81,7 +81,7 @@ func TestDispatchSettlesMessagesWithoutDeliveryCount(t *testing.T) {
 		t.Fatal(err)
 	}
 	message := driver.InboundMessage{
-		Destination:   "f1.test.orders.created.normal",
+		Destination:   "f1.test.orders.created.medium",
 		Headers:       headerSlice(headers),
 		Body:          []byte(`{}`),
 		DeliveryCount: 1,
@@ -359,7 +359,7 @@ func TestRunnerRunRejectedWhileClientClosing(t *testing.T) {
 	}
 	runner := &Runner{client: client, subscription: Subscription{
 		Name: "orders", Topics: []string{"orders.created"}, Concurrency: 1, Prefetch: 1,
-		Priorities: []Priority{PriorityNormal}, Retry: RetryConfig{MaxAttempts: 1}, HandlerTimeout: time.Second,
+		Priorities: []Priority{PriorityMedium}, Retry: RetryConfig{MaxAttempts: 1}, HandlerTimeout: time.Second,
 	}}
 	client.mu.Lock()
 	client.runners[runner] = struct{}{}
@@ -395,10 +395,10 @@ func TestRunnerDispatchesHandlerAndDrains(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	consumer.messages <- driver.InboundMessage{Destination: "f1.test.orders.created.normal", Headers: headerSlice(headers), Body: []byte(`{}`), Settle: settler}
+	consumer.messages <- driver.InboundMessage{Destination: "f1.test.orders.created.medium", Headers: headerSlice(headers), Body: []byte(`{}`), Settle: settler}
 	runner := &Runner{client: client, subscription: Subscription{
 		Name: "orders", Topics: []string{"orders.created"}, Concurrency: 1, Prefetch: 1,
-		Priorities: []Priority{PriorityNormal}, Retry: RetryConfig{MaxAttempts: 1}, HandlerTimeout: time.Second,
+		Priorities: []Priority{PriorityMedium}, Retry: RetryConfig{MaxAttempts: 1}, HandlerTimeout: time.Second,
 		Handlers: map[string]Handler{"orders.created": HandlerFunc(func(context.Context, *Event) error { return nil })},
 	}}
 	ctx, cancel := context.WithCancel(context.Background())
@@ -667,12 +667,12 @@ func TestRunnerAccountingAxesSumAfterMixedOutcomes(t *testing.T) {
 	}
 	runner.accounting = lifecycle.NewAccounting(runner.inflight.registry)
 	message := func(id string, settler driver.Settler) driver.InboundMessage {
-		envelope := Envelope{SpecVersion: "1.0", ID: id, Source: "/test/orders", Type: "orders.created", Priority: PriorityNormal, Attempt: 1}
+		envelope := Envelope{SpecVersion: "1.0", ID: id, Source: "/test/orders", Type: "orders.created", Priority: PriorityMedium, Attempt: 1}
 		headers, err := envelope.EncodeHeaders(CoreMaxHeaderBytes)
 		if err != nil {
 			t.Fatal(err)
 		}
-		return driver.InboundMessage{Destination: "f1.test.orders.created.normal", Headers: headerSlice(headers), Body: []byte(`{}`), DeliveryCount: 1, Settle: settler}
+		return driver.InboundMessage{Destination: "f1.test.orders.created.medium", Headers: headerSlice(headers), Body: []byte(`{}`), DeliveryCount: 1, Settle: settler}
 	}
 	process := func(id string, handler Handler, ctx context.Context) {
 		runner.subscription.Handlers = map[string]Handler{"orders.created": handler}
@@ -719,7 +719,7 @@ func TestMalformedHeadersDeadLetterAsDecodeBeforeHandlerRuns(t *testing.T) {
 	}}
 	settler := &dispatchSettler{}
 	message := driver.InboundMessage{
-		Destination: "f1.test.orders.created.normal",
+		Destination: "f1.test.orders.created.medium",
 		Headers: headerSlice(map[string]string{
 			"specversion": "1.0",
 			"source":      "/test/orders",

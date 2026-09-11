@@ -830,14 +830,14 @@ func reconnectMessage(t *testing.T, id string, settler driver.Settler) driver.In
 		ID:          id,
 		Source:      "/test/orders",
 		Type:        "orders.created",
-		Priority:    PriorityNormal,
+		Priority:    PriorityMedium,
 	}
 	headers, err := envelope.EncodeHeaders(CoreMaxHeaderBytes)
 	if err != nil {
 		t.Fatal(err)
 	}
 	return driver.InboundMessage{
-		Destination: "f1.test.orders.created.normal",
+		Destination: "f1.test.orders.created.medium",
 		Headers:     headerSlice(headers),
 		Settle:      settler,
 	}
