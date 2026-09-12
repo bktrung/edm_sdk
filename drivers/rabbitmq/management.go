@@ -62,23 +62,12 @@ func newManagementClient(endpoint string, cfg driver.Config) (*managementClient,
 		return nil, fmt.Errorf("rabbitmq: invalid management endpoint %q: %w", redacted.String(), errors.New("missing host"))
 	}
 	scheme := "http"
-	managementPort := 15672
 	if parsed.Scheme == "amqps" || (cfg.TLS != nil && cfg.TLS.Enabled) {
 		scheme = "https"
-		managementPort = 15671
 	}
-	if parsed.Port() == "5671" || parsed.Port() == "15671" {
-		managementPort = 15671
-	}
-	if parsed.Port() == "15672" {
-		managementPort = 15672
-	}
-	if configured := strings.TrimSpace(cfg.DriverOptions[managementPortOption]); configured != "" {
-		port, parseErr := strconv.Atoi(configured)
-		if parseErr != nil || port < 1 || port > 65535 {
-			return nil, fmt.Errorf("rabbitmq: invalid %s %q: want a port from 1 to 65535", managementPortOption, configured)
-		}
-		managementPort = port
+	managementPort, portErr := resolveManagementPort(parsed, cfg)
+	if portErr != nil {
+		return nil, portErr
 	}
 	if parsed.Scheme != "amqps" && !isLoopbackEndpoint(endpoint) {
 		return nil, errors.New("rabbitmq: plaintext connection to non-loopback host requires an amqps:// endpoint")
@@ -132,6 +121,32 @@ func newManagementClient(endpoint string, cfg driver.Config) (*managementClient,
 		vhost:    vhost,
 		client:   client,
 	}, nil
+}
+
+func resolveManagementPort(endpoint *url.URL, cfg driver.Config) (int, error) {
+	if configured := strings.TrimSpace(cfg.DriverOptions[managementPortOption]); configured != "" {
+		port, err := strconv.Atoi(configured)
+		if err != nil || port < 1 || port > 65535 {
+			return 0, fmt.Errorf("rabbitmq: invalid %s %q: want a port from 1 to 65535", managementPortOption, configured)
+		}
+		return port, nil
+	}
+
+	amqpPort := endpoint.Port()
+	if amqpPort == "" {
+		amqpPort = "5672"
+		if endpoint.Scheme == "amqps" {
+			amqpPort = "5671"
+		}
+	}
+	port, err := strconv.Atoi(amqpPort)
+	if err != nil || port < 1 || port > 65535 {
+		return 0, fmt.Errorf("rabbitmq: invalid AMQP endpoint port %q", amqpPort)
+	}
+	if port > 65535-10000 {
+		return 0, fmt.Errorf("rabbitmq: invalid derived management port from AMQP port %q", amqpPort)
+	}
+	return port + 10000, nil
 }
 
 func (m *managementClient) queuePath(name string) string {

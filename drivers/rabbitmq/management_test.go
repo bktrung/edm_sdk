@@ -20,6 +20,33 @@ func TestManagementClientHasExplicitTimeout(t *testing.T) {
 	}
 }
 
+func TestManagementClientDerivesStandardPort(t *testing.T) {
+	client, err := newManagementClient("amqp://localhost:5672/", driver.Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if client.baseURL != "http://localhost:15672" {
+		t.Fatalf("management base URL = %q, want standard management endpoint", client.baseURL)
+	}
+}
+
+func TestManagementClientDerivesAlternatePort(t *testing.T) {
+	client, err := newManagementClient("amqp://localhost:25672/", driver.Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if client.baseURL != "http://localhost:35672" {
+		t.Fatalf("management base URL = %q, want alternate management endpoint", client.baseURL)
+	}
+}
+
+func TestManagementClientRejectsInvalidDerivedPort(t *testing.T) {
+	client, err := newManagementClient("amqp://localhost:55536/", driver.Config{})
+	if err == nil || client != nil {
+		t.Fatalf("newManagementClient() = client %v, error %v; want invalid derived port error", client, err)
+	}
+}
+
 func TestManagementClientRejectsInvalidEndpoint(t *testing.T) {
 	client, err := newManagementClient("://invalid", driver.Config{})
 	if err == nil || client != nil {
