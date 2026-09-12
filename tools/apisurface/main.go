@@ -139,11 +139,27 @@ func extractSurface(moduleDir, pkg string) ([]string, error) {
 	if candidate := filepath.Join(moduleDir, pkg); isDirectory(candidate) {
 		packageDir = candidate
 	}
-	pkgs, err := parser.ParseDir(fset, packageDir, func(fi os.FileInfo) bool {
-		return !isTestFile(fi.Name())
-	}, 0)
+	entries, err := os.ReadDir(packageDir)
 	if err != nil {
 		return nil, err
+	}
+	pkgs := make(map[string]*ast.Package)
+	for _, entry := range entries {
+		if entry.IsDir() || filepath.Ext(entry.Name()) != ".go" || isTestFile(entry.Name()) {
+			continue
+		}
+		filename := filepath.Join(packageDir, entry.Name())
+		file, err := parser.ParseFile(fset, filename, nil, 0)
+		if err != nil {
+			return nil, err
+		}
+		name := file.Name.Name
+		p := pkgs[name]
+		if p == nil {
+			p = &ast.Package{Name: name, Files: make(map[string]*ast.File)}
+			pkgs[name] = p
+		}
+		p.Files[filename] = file
 	}
 
 	p, ok := pkgs[pkg]

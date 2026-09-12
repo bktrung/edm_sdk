@@ -7,8 +7,8 @@ import (
 	"go/token"
 	"go/types"
 	"os"
+	"os/exec"
 	"path/filepath"
-	"runtime"
 	"strings"
 
 	"golang.org/x/tools/go/gcexportdata"
@@ -54,6 +54,11 @@ func normalize(input, output string) error {
 		return closeErr
 	}
 
+	goroot, err := resolveGOROOT()
+	if err != nil {
+		return err
+	}
+
 	out, err := os.Create(output)
 	if err != nil {
 		return err
@@ -62,7 +67,7 @@ func normalize(input, output string) error {
 		out.Close()
 		return err
 	}
-	writeErr := gcexportdata.Write(out, canonicalFileSet(files), pkg)
+	writeErr := gcexportdata.Write(out, canonicalFileSet(files, goroot), pkg)
 	closeErr = out.Close()
 	if writeErr != nil {
 		return writeErr
@@ -70,18 +75,34 @@ func normalize(input, output string) error {
 	return closeErr
 }
 
-func canonicalFileSet(files *token.FileSet) *token.FileSet {
+func canonicalFileSet(files *token.FileSet, goroot string) *token.FileSet {
 	canonical := token.NewFileSet()
 	files.Iterate(func(file *token.File) bool {
-		canonical.AddFile(canonicalFileName(file.Name()), file.Base(), file.Size())
+		canonical.AddFile(canonicalFileName(file.Name(), goroot), file.Base(), file.Size())
 		return true
 	})
 	return canonical
 }
 
-func canonicalFileName(name string) string {
+func resolveGOROOT() (string, error) {
+	goPath, err := exec.LookPath("go")
+	if err != nil {
+		return "", err
+	}
+	output, err := exec.Command(goPath, "env", "GOROOT").Output()
+	if err != nil {
+		return "", err
+	}
+	goroot := strings.TrimSpace(string(output))
+	if goroot == "" {
+		return "", fmt.Errorf("go env GOROOT returned empty root")
+	}
+	return goroot, nil
+}
+
+func canonicalFileName(name, goroot string) string {
 	name = filepath.ToSlash(name)
-	if relative, ok := rootedPathSuffix(name, filepath.ToSlash(runtime.GOROOT())); ok {
+	if relative, ok := rootedPathSuffix(name, filepath.ToSlash(goroot)); ok {
 		return "$GOROOT/" + relative
 	}
 	if index := strings.Index(name, "/pkg/mod/"); index >= 0 {

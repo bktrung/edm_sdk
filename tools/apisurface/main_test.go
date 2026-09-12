@@ -31,12 +31,26 @@ const Exported = 1
 	if err := os.WriteFile(filepath.Join(dir, "sample.go"), []byte(source), 0o644); err != nil {
 		t.Fatal(err)
 	}
+	moreSource := `package sample
+
+func Additional() {}
+`
+	if err := os.WriteFile(filepath.Join(dir, "more.go"), []byte(moreSource), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	testSource := `package sample
+
+func TestOnly() {}
+`
+	if err := os.WriteFile(filepath.Join(dir, "sample_test.go"), []byte(testSource), 0o644); err != nil {
+		t.Fatal(err)
+	}
 
 	got, err := extractSurface(root, "sample")
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := []string{"Exported", "Public", "Public.Exported", "Top"}
+	want := []string{"Additional", "Exported", "Public", "Public.Exported", "Top"}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("surface = %v, want %v", got, want)
 	}
