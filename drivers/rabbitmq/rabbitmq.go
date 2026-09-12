@@ -20,9 +20,6 @@ import (
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/driver"
 )
 
-// Local fixture credentials are intentional and never used for production endpoints.
-const defaultEndpoint = "amqp://guest:guest@localhost:5672/" //nolint:gosec // test fixture endpoint
-
 var errMissingEndpoints = errors.New("rabbitmq: broker endpoints must not be empty")
 
 var _ driver.Driver = Driver{}

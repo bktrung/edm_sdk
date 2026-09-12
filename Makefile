@@ -16,6 +16,10 @@ APIDIFF_NORMALIZE := $(CURDIR)/.tools/bin/apidiff-normalize
 API_DIFF_BASELINE_DIR := $(CURDIR)/testdata/api-diff
 API_DIFF_BREAKING_CHANGE ?= 0
 API_DIFF_ENFORCE ?= 1
+RABBITMQ_PORT ?= 5672
+RABBITMQ_MANAGEMENT_PORT ?= 15672
+RABBITMQ_PROJECT ?= docker
+RABBITMQ_COMPOSE := RABBITMQ_PORT=$(RABBITMQ_PORT) RABBITMQ_MANAGEMENT_PORT=$(RABBITMQ_MANAGEMENT_PORT) docker compose --project-name "$(RABBITMQ_PROJECT)" -f docker/docker-compose.yml
 KAFKA_PORT ?= 19092
 KAFKA_PROJECT ?= docker
 KAFKA_COMPOSE := KAFKA_PORT=$(KAFKA_PORT) docker compose --project-name "$(KAFKA_PROJECT)" -f docker/docker-compose.yml
@@ -172,12 +176,13 @@ $(APIDIFF_NORMALIZE): tools/apidiff/normalize.go tools/apidiff/go.mod tools/apid
 
 .PHONY: broker-up broker-down broker-reset broker-smoke test-rabbitmq test-kafka test-infra test-kafka-conformance kafka-up kafka-down
 
-## test-rabbitmq: run the RabbitMQ driver suite against the fixture, starting it
-## first. F1_REQUIRE_RABBITMQ makes an unreachable broker a failure rather than a
-## skip, so this target never reports success for a suite that did not run. The
-## broker is left running for repeat runs; stop it with broker-down.
+## test-rabbitmq: run the RabbitMQ driver suite against the selected fixture,
+## starting it first. F1_REQUIRE_RABBITMQ makes an unreachable broker a
+## failure rather than a skip, so this target never reports success for a suite
+## that did not run. The broker is left running for repeat runs; stop it with
+## broker-down.
 test-rabbitmq: broker-up broker-smoke
-	F1_REQUIRE_RABBITMQ=1 go test -race -count=1 ./drivers/rabbitmq/...
+	F1_RABBITMQ_ENDPOINT=$${F1_RABBITMQ_ENDPOINT:-amqp://guest:guest@localhost:$(RABBITMQ_PORT)/} F1_REQUIRE_RABBITMQ=1 go test -race -count=1 ./drivers/rabbitmq/...
 
 ## test-kafka: run the Kafka driver suite against the fixture, starting it first.
 ## F1_REQUIRE_KAFKA makes an unreachable broker a failure rather than a skip.
@@ -204,29 +209,32 @@ kafka-up:
 kafka-down:
 	$(KAFKA_COMPOSE) stop kafka
 
-## broker-up: start the pinned local RabbitMQ fixture.
+## broker-up: start only the RabbitMQ service for the selected project.
 broker-up:
-	docker compose -f docker/docker-compose.yml up -d
+	$(RABBITMQ_COMPOSE) up -d rabbitmq
 
-## broker-down: stop the local RabbitMQ fixture and keep its named volume.
+## broker-down: stop only the selected RabbitMQ service and keep its named volume.
 broker-down:
-	docker compose -f docker/docker-compose.yml down
+	$(RABBITMQ_COMPOSE) stop rabbitmq
 
-## broker-reset: stop the fixture and remove its named volume.
+## broker-reset: stop RabbitMQ and remove only its selected project's volume.
 broker-reset:
-	docker compose -f docker/docker-compose.yml down -v
+	@set -e; \
+	$(RABBITMQ_COMPOSE) rm -sfv rabbitmq; \
+	volumes=$$(docker volume ls -q --filter label=com.docker.compose.project=$(RABBITMQ_PROJECT) --filter label=com.docker.compose.volume=rabbitmq_data); \
+	if [ -n "$$volumes" ]; then docker volume rm $$volumes; fi
 
 ## broker-smoke: wait for RabbitMQ health and print its version.
 broker-smoke:
 	@set -e; \
 	for attempt in $$(seq 1 60); do \
-		health=$$(docker compose -f docker/docker-compose.yml ps --format '{{.Health}}' rabbitmq 2>/dev/null || true); \
+		health=$$($(RABBITMQ_COMPOSE) ps --format '{{.Health}}' rabbitmq 2>/dev/null || true); \
 		if [ "$$health" = "healthy" ]; then \
-			docker compose -f docker/docker-compose.yml exec -T rabbitmq rabbitmq-diagnostics -q status | grep 'RabbitMQ version'; \
+			$(RABBITMQ_COMPOSE) exec -T rabbitmq rabbitmq-diagnostics -q status | grep 'RabbitMQ version'; \
 			exit 0; \
 		fi; \
 		sleep 1; \
 	done; \
 	echo "broker-smoke: RabbitMQ did not become healthy" >&2; \
-	docker compose -f docker/docker-compose.yml ps; \
+	$(RABBITMQ_COMPOSE) ps; \
 	exit 1
