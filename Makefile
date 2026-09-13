@@ -20,6 +20,10 @@ RABBITMQ_PORT ?= 5672
 RABBITMQ_MANAGEMENT_PORT ?= 15672
 RABBITMQ_PROJECT ?= docker
 RABBITMQ_COMPOSE := RABBITMQ_PORT=$(RABBITMQ_PORT) RABBITMQ_MANAGEMENT_PORT=$(RABBITMQ_MANAGEMENT_PORT) docker compose --project-name "$(RABBITMQ_PROJECT)" -f docker/docker-compose.yml
+# Every RabbitMQ test target needs the same endpoint and the same guarantee that
+# an unreachable broker fails rather than skips. Sharing the prefix keeps a new
+# target from being added with one of the two and not the other.
+RABBITMQ_TEST_ENV = F1_RABBITMQ_ENDPOINT=$${F1_RABBITMQ_ENDPOINT:-amqp://guest:guest@localhost:$(RABBITMQ_PORT)/} F1_REQUIRE_RABBITMQ=1
 KAFKA_PORT ?= 19092
 KAFKA_PROJECT ?= docker
 KAFKA_COMPOSE := KAFKA_PORT=$(KAFKA_PORT) docker compose --project-name "$(KAFKA_PROJECT)" -f docker/docker-compose.yml
@@ -174,15 +178,28 @@ $(APIDIFF): tools/apidiff/go.mod tools/apidiff/go.sum
 $(APIDIFF_NORMALIZE): tools/apidiff/normalize.go tools/apidiff/go.mod tools/apidiff/go.sum
 	cd tools/apidiff && go build -o ../../.tools/bin/apidiff-normalize .
 
-.PHONY: broker-up broker-down broker-reset broker-smoke test-rabbitmq test-kafka test-infra test-kafka-conformance kafka-up kafka-down
+.PHONY: broker-up broker-down broker-reset broker-smoke test-rabbitmq test-rabbitmq-driver test-rabbitmq-conformance test-kafka test-infra test-kafka-conformance kafka-up kafka-down
 
-## test-rabbitmq: run the RabbitMQ driver suite against the selected fixture,
-## starting it first. F1_REQUIRE_RABBITMQ makes an unreachable broker a
-## failure rather than a skip, so this target never reports success for a suite
-## that did not run. The broker is left running for repeat runs; stop it with
-## broker-down.
+## test-rabbitmq: run the RabbitMQ driver suite and its conformance suite
+## against the selected fixture, starting it first. F1_REQUIRE_RABBITMQ makes an
+## unreachable broker a failure rather than a skip, so this target never reports
+## success for a suite that did not run. The broker is left running for repeat
+## runs; stop it with broker-down.
 test-rabbitmq: broker-up broker-smoke
-	F1_RABBITMQ_ENDPOINT=$${F1_RABBITMQ_ENDPOINT:-amqp://guest:guest@localhost:$(RABBITMQ_PORT)/} F1_REQUIRE_RABBITMQ=1 go test -race -count=1 ./drivers/rabbitmq/...
+	$(RABBITMQ_TEST_ENV) go test -race -count=1 ./drivers/rabbitmq/...
+
+## test-rabbitmq-driver: run the RabbitMQ driver suite without the conformance
+## suite, which test-rabbitmq-conformance runs separately. The conformance suite
+## is not behind its own switch the way the Kafka one is, so CI selects the two
+## halves with -skip and -run rather than with an environment variable.
+test-rabbitmq-driver: broker-up broker-smoke
+	$(RABBITMQ_TEST_ENV) go test -race -count=1 -skip '^TestConformance$$' ./drivers/rabbitmq/...
+
+## test-rabbitmq-conformance: run the RabbitMQ conformance suite against the
+## fixture. It requires a live RabbitMQ broker with the management API enabled,
+## because the subscription path reads bindings and queue arguments through it.
+test-rabbitmq-conformance: broker-up broker-smoke
+	$(RABBITMQ_TEST_ENV) go test -v -count=1 -run TestConformance -timeout 20m ./drivers/rabbitmq/...
 
 ## test-kafka: run the Kafka driver suite against the fixture, starting it first.
 ## F1_REQUIRE_KAFKA makes an unreachable broker a failure rather than a skip.
