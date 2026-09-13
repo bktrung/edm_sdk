@@ -3078,3 +3078,80 @@ func TestConsumerTransferMarkersKeepExactOffsets(t *testing.T) {
 		t.Fatal("exact transfer marker was cleared after one stale record")
 	}
 }
+
+// TestConsumerBudgetRefusedRecordsResumeOnAck pins the stall a deadline-bounded
+// poll creates. That poll returns every record franz-go has buffered in one
+// batch, admission takes only what the prefetch budget allows, and the loop
+// holds the rest in its own pending queue. franz-go has already handed those
+// records over and advanced its cursors past them, so the broker will never
+// offer them again: the settlement that frees the budget is the only event that
+// can bring them back, and without one the loop waits on a broker that has
+// nothing left to send while the records it is holding are ready to deliver.
+func TestConsumerBudgetRefusedRecordsResumeOnAck(t *testing.T) {
+	ctx, connection, admin := openKafkaAdminTest(t)
+	ready := kafkaTestTopic(t, "consumer-pending-ready")
+	parked := kafkaTestTopic(t, "consumer-pending-parked")
+	group := kafkaTestTopic(t, "consumer-pending-group")
+	cleanupKafkaTopics(t, admin, ready, parked)
+	cleanupKafkaGroups(t, admin, group)
+	createKafkaTopic(t, admin, ctx, ready, 1)
+	createKafkaTopic(t, admin, ctx, parked, 1)
+	// A record on parked stays due for an hour, which keeps the poll loop in
+	// its deadline-bounded poll for the whole test. A one-record poll cannot
+	// build the batch this needs: a destination that reaches its budget pauses,
+	// and franz-go strips what is still buffered for a paused topic back to the
+	// broker rather than handing it over.
+	const parkedDelay = time.Hour
+	if _, err := connection.Admin().EnsureTopology(ctx, driver.TopologySpec{
+		Destinations: []driver.DestinationSpec{
+			{Name: parked, Delay: parkedDelay},
+			{Name: ready},
+		},
+		Effective: connection.Capabilities(),
+	}); err != nil {
+		t.Fatalf("EnsureTopology: %v", err)
+	}
+	producer, err := connection.Producer(ctx, driver.ProducerConfig{Effective: connection.Capabilities()})
+	if err != nil {
+		t.Fatalf("Producer: %v", err)
+	}
+	t.Cleanup(func() { _ = producer.Close(context.Background()) })
+	consumerValue, err := connection.Consumer(ctx, driver.ConsumerConfig{
+		Group: group, Destinations: []string{parked, ready}, Prefetch: 2,
+		PerDestination: map[string]int{parked: 1, ready: 1}, Effective: connection.Capabilities(),
+	})
+	if err != nil {
+		t.Fatalf("Consumer: %v", err)
+	}
+	t.Cleanup(func() { closeKafkaConsumer(consumerValue) })
+
+	publishKafkaMessage(t, producer, ctx, parked, "parked")
+	waitForDeferredPause(t, consumerValue, parked)
+
+	// Keep the ready lane paused while its records are published, so franz-go
+	// issues the fetch for that partition only after the resume and returns all
+	// four records in the one batch the bounded poll takes.
+	if err := consumerValue.Pause(ready); err != nil {
+		t.Fatalf("Pause(%q): %v", ready, err)
+	}
+	publishKafkaCount(t, producer, ctx, ready, 4)
+	if err := consumerValue.Resume(ready); err != nil {
+		t.Fatalf("Resume(%q): %v", ready, err)
+	}
+
+	// Settle each delivery as it arrives, the way a worker does. The first ack
+	// frees the only ready slot; the other three were already refused, so only
+	// that ack can start them moving again.
+	for delivered := 1; delivered <= 4; delivered++ {
+		message := receiveKafkaMessageBefore(t, consumerValue, kafkaNow().Add(3*time.Second))
+		if message.Destination != ready {
+			t.Fatalf("delivery %d destination = %q, want %q", delivered, message.Destination, ready)
+		}
+		if err := message.Settle.Ack(ctx); err != nil {
+			t.Fatalf("Ack(delivery %d): %v", delivered, err)
+		}
+	}
+	if err := consumerValue.Stop(ctx); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+}

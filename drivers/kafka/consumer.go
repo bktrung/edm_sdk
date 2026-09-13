@@ -150,16 +150,23 @@ type consumer struct {
 	assignmentMu sync.Mutex
 	// deliveryMu closes the gap between admission and Messages send so revoke
 	// cleanup cannot tombstone a settler before its message is enqueued.
-	deliveryMu     sync.Mutex
-	leaveMu        sync.Mutex
-	mu             sync.Mutex
-	draining       bool
-	stopped        bool
-	leaveRequested bool
-	leaveErr       error
-	leaveCtx       context.Context
-	leaveCancel    context.CancelFunc
-	leaveFn        leaveFunc
+	deliveryMu sync.Mutex
+	leaveMu    sync.Mutex
+	mu         sync.Mutex
+	draining   bool
+	stopped    bool
+	// pollCancel interrupts the poll wait in flight and pollWakePending holds a
+	// wake that arrived while no wait was running. The loop keeps records
+	// admission refused in its own pending queue, and franz-go never offers
+	// those again, so the settlement that frees the slot they are waiting for
+	// has to reach the loop through this pair rather than through the broker.
+	pollCancel      context.CancelFunc
+	pollWakePending bool
+	leaveRequested  bool
+	leaveErr        error
+	leaveCtx        context.Context
+	leaveCancel     context.CancelFunc
+	leaveFn         leaveFunc
 	// leaveStatic leaves a static classic group by InstanceID and leaveDynamic
 	// leaves through the owned franz-go client. Both are installed during
 	// construction so tests execute the production membership selector in
@@ -722,6 +729,43 @@ func (c *consumer) leaveLoop() {
 	}
 }
 
+// claimPollWake registers cancel as the interrupt for the poll wait about to
+// begin and reports whether a wake is already pending. The caller must hold
+// c.mu.
+//
+// The pending flush and this registration are two steps, so a wake that lands
+// between them would otherwise be lost: the loop would block on a broker that
+// has nothing left to send, still holding the records the wake was meant to
+// release.
+func (c *consumer) claimPollWake(cancel context.CancelFunc) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.pollWakePending {
+		c.pollWakePending = false
+		return true
+	}
+	c.pollCancel = cancel
+	return false
+}
+
+// releasePollWake forgets the interrupt registered by claimPollWake. A wake
+// that races this call cancels an already finished wait, which is harmless.
+func (c *consumer) releasePollWake() {
+	c.mu.Lock()
+	c.pollCancel = nil
+	c.mu.Unlock()
+}
+
+// wakePollLocked interrupts the poll wait so the loop admits again over the
+// records it is holding. It never blocks: a wake that finds no wait in progress
+// records itself for the next one. The caller must hold c.mu.
+func (c *consumer) wakePollLocked() {
+	c.pollWakePending = true
+	if c.pollCancel != nil {
+		c.pollCancel()
+	}
+}
+
 func (c *consumer) poll(ctx context.Context) {
 	defer close(c.pollDone)
 	defer c.client.AllowRebalance()
@@ -734,28 +778,35 @@ func (c *consumer) poll(ctx context.Context) {
 
 		fetchCtx := ctx
 		bounded := false
+		var cancelFetch context.CancelFunc
 		if due, ok := c.pendingDeadline(pending); ok {
-			var cancel context.CancelFunc
-			fetchCtx, cancel = context.WithDeadline(ctx, due)
+			fetchCtx, cancelFetch = context.WithDeadline(ctx, due)
 			bounded = true
-			fetches := c.client.PollRecords(fetchCtx, 0)
-			cancel()
-			if ctx.Err() != nil || fetches.IsClientClosed() {
-				c.client.AllowRebalance()
-				return
-			}
-			if !c.handleFetches(&pending, fetches, bounded) {
-				return
-			}
+		} else {
+			fetchCtx, cancelFetch = context.WithCancel(ctx)
+		}
+		if c.claimPollWake(cancelFetch) {
+			cancelFetch()
 			continue
 		}
 
-		fetches := c.client.PollRecords(fetchCtx, 1)
+		var fetches kgo.Fetches
+		if bounded {
+			fetches = c.client.PollRecords(fetchCtx, 0)
+		} else {
+			fetches = c.client.PollRecords(fetchCtx, 1)
+		}
+		// A wake ends the wait with a synthetic cancellation fetch. It reports
+		// no broker fault; it reports that admission has to run over pending
+		// again, which is what a bounded poll's own timeout also asks for.
+		woken := fetchCtx.Err() != nil && ctx.Err() == nil
+		cancelFetch()
+		c.releasePollWake()
 		if ctx.Err() != nil || fetches.IsClientClosed() {
 			c.client.AllowRebalance()
 			return
 		}
-		if !c.handleFetches(&pending, fetches, bounded) {
+		if !c.handleFetches(&pending, fetches, bounded || woken) {
 			return
 		}
 	}
@@ -2143,6 +2194,13 @@ func (c *consumer) setPauseReasonLocked(destination string, reason pauseReason, 
 		}
 		if len(reasons) == 0 && !c.draining && !c.stopped {
 			c.client.ResumeFetchTopics(destination)
+			// Resuming fetch does not reach a record the budget refused: the
+			// poll loop took it out of franz-go and is holding it in its own
+			// pending queue, so a broker with nothing left to send produces no
+			// wake and the record is never admitted. The last pause leaving is
+			// exactly the event that makes those records admissible, so the
+			// wait has to end here.
+			c.wakePollLocked()
 		}
 	}
 }
