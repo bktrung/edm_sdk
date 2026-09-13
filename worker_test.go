@@ -5,10 +5,12 @@ import (
 	"errors"
 	"log/slog"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 	"unicode/utf8"
 
+	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/driver"
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/clock"
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/sched"
 )
@@ -235,6 +237,132 @@ func TestTruncateErrorKeepsOverCapAlignedBoundary(t *testing.T) {
 	}
 	if got != want {
 		t.Fatalf("truncateError() = %q, want the first %d bytes", got, deathErrorCap)
+	}
+}
+
+// levelRecorder is a slog.Handler that keeps every record's level and message
+// so a test can assert on levels rather than parse formatted output. waited
+// receives each record's message, which lets a test block until the specific
+// record under test arrives: the consumer loop only returns once its context
+// is cancelled, so a notification record has no other completion signal.
+type levelRecorder struct {
+	mu      sync.Mutex
+	records []slog.Record
+	waited  chan string
+}
+
+func newLevelRecorder() *levelRecorder {
+	return &levelRecorder{waited: make(chan string, 32)}
+}
+
+func (*levelRecorder) Enabled(context.Context, slog.Level) bool { return true }
+
+func (h *levelRecorder) Handle(_ context.Context, record slog.Record) error {
+	h.mu.Lock()
+	h.records = append(h.records, record.Clone())
+	h.mu.Unlock()
+	h.waited <- record.Message
+	return nil
+}
+
+func (h *levelRecorder) WithAttrs([]slog.Attr) slog.Handler { return h }
+func (h *levelRecorder) WithGroup(string) slog.Handler      { return h }
+
+func (h *levelRecorder) snapshot() []slog.Record {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return append([]slog.Record(nil), h.records...)
+}
+
+// waitFor blocks until a record with message arrives, so a test does not race
+// the goroutine logging it. Client construction logs capability records
+// through the same handler, so messages other than the wanted one are
+// discarded rather than treated as the signal.
+func (h *levelRecorder) waitFor(t *testing.T, message string) {
+	t.Helper()
+	deadline := oneSecondTimer(t).C
+	for {
+		select {
+		case got := <-h.waited:
+			if got == message {
+				return
+			}
+		case <-deadline:
+			t.Fatalf("no %q log record; records = %v", message, h.snapshot())
+		}
+	}
+}
+
+func recordsWithMessage(records []slog.Record, message string) []slog.Record {
+	matches := make([]slog.Record, 0, 1)
+	for _, record := range records {
+		if record.Message == message {
+			matches = append(matches, record)
+		}
+	}
+	return matches
+}
+
+func TestConsumerNotificationLogsAtInfo(t *testing.T) {
+	recorder := newLevelRecorder()
+	client, runner, consumer := newLoggerConsumerRunner(t, slog.New(recorder), nil)
+	t.Cleanup(func() { _ = client.Close(context.Background()) })
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- consumeRunnerErrors(runner, ctx) }()
+
+	consumer.errs <- &driver.Error{Driver: "inmem", Op: "consumer", K: driver.KindNotification, Err: errors.New("kafka partitions assigned")}
+	recorder.waitFor(t, "f1 consumer notification")
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatalf("consumeRunnerErrors() error = %v", err)
+	}
+
+	records := recorder.snapshot()
+	notifications := recordsWithMessage(records, "f1 consumer notification")
+	if len(notifications) != 1 {
+		t.Fatalf("f1 consumer notification log records = %v, want exactly one", notifications)
+	}
+	if got := notifications[0].Level; got != slog.LevelInfo {
+		t.Fatalf("consumer notification level = %v, want INFO", got)
+	}
+	for _, record := range records {
+		if record.Level >= slog.LevelError {
+			t.Fatalf("consumer notification produced an error record: %v", record)
+		}
+	}
+}
+
+func TestConsumerRealErrorStillLogsAtError(t *testing.T) {
+	consumerErrors := map[string]error{
+		"transient":    &driver.Error{Driver: "inmem", Op: "consumer", K: driver.KindTransient, Err: errors.New("connection lost")},
+		"unclassified": errors.New("connection lost"),
+	}
+	for name, consumerErr := range consumerErrors {
+		t.Run(name, func(t *testing.T) {
+			recorder := newLevelRecorder()
+			client, runner, consumer := newLoggerConsumerRunner(t, slog.New(recorder), nil)
+			t.Cleanup(func() { _ = client.Close(context.Background()) })
+
+			consumer.errs <- consumerErr
+			if err := consumeRunnerErrors(runner, context.Background()); err != nil {
+				t.Fatalf("consumeRunnerErrors() error = %v", err)
+			}
+
+			records := recorder.snapshot()
+			failures := recordsWithMessage(records, "f1 consumer error")
+			if len(failures) != 1 {
+				t.Fatalf("f1 consumer error log records = %v, want exactly one", failures)
+			}
+			if got := failures[0].Level; got != slog.LevelError {
+				t.Fatalf("consumer error level = %v, want ERROR", got)
+			}
+			if got := recordsWithMessage(records, "f1 consumer notification"); len(got) != 0 {
+				t.Fatalf("consumer error logged as a notification: %v", got)
+			}
+		})
 	}
 }
 

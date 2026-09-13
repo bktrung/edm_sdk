@@ -1063,13 +1063,21 @@ func consumeRunnerErrors(r *Runner, ctx context.Context) error {
 			if err == nil {
 				continue
 			}
-			if r.client.options.errorHandler == nil {
-				lastResortRunnerLogger(r).Error("f1 consumer error", "subscription", r.subscription.Name, "error", err)
-			}
+			// Classify before logging: a notification is routine lifecycle
+			// traffic, not a failure, and must not reach the error stream. A
+			// Kafka group join reports every partition assignment this way,
+			// and a driver's consumer-cancel notification fires once per
+			// timeout interval for a slow handler.
 			kind, classified := driver.Classify(err)
 			if classified && kind == driver.KindNotification {
+				if r.client.options.errorHandler == nil {
+					lastResortRunnerLogger(r).Info("f1 consumer notification", "subscription", r.subscription.Name, "error", err)
+				}
 				runnerNotifyError(r, context.WithoutCancel(ctx), nil, err)
 				continue
+			}
+			if r.client.options.errorHandler == nil {
+				lastResortRunnerLogger(r).Error("f1 consumer error", "subscription", r.subscription.Name, "error", err)
 			}
 			var cancel context.CancelFunc
 			if !classified || kind == driver.KindTransient {
