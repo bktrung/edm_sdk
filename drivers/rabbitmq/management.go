@@ -13,6 +13,8 @@ import (
 	"strings"
 	"time"
 
+	amqp "github.com/rabbitmq/amqp091-go"
+
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/driver"
 )
 
@@ -48,13 +50,21 @@ type managementBinding struct {
 	RoutingKey      string `json:"routing_key"`
 }
 
+// invalidEndpointError reports an endpoint that cannot be read as an AMQP URI
+// without repeating the endpoint: a malformed one can carry credential-looking
+// text. net/url quotes its input in the error it returns, so drop that layer
+// before wrapping.
+func invalidEndpointError(err error) error {
+	if urlErr, ok := errors.AsType[*url.Error](err); ok {
+		err = urlErr.Err
+	}
+	return fmt.Errorf("rabbitmq: invalid management endpoint: %w", err)
+}
+
 func newManagementClient(endpoint string, cfg driver.Config) (*managementClient, error) {
 	parsed, err := url.Parse(endpoint)
 	if err != nil {
-		if urlErr, ok := errors.AsType[*url.Error](err); ok {
-			err = urlErr.Err
-		}
-		return nil, fmt.Errorf("rabbitmq: invalid management endpoint: %w", err)
+		return nil, invalidEndpointError(err)
 	}
 	if parsed.Hostname() == "" {
 		// Opaque and path fields can retain raw credential-looking input; keep only the scheme.
@@ -84,19 +94,14 @@ func newManagementClient(endpoint string, cfg driver.Config) (*managementClient,
 	}
 	vhost := cfg.DriverOptions["rabbitmq.vhost"]
 	if vhost == "" {
-		vhost = "/"
-		if escaped := strings.TrimPrefix(parsed.EscapedPath(), "/"); escaped != "" {
-			decoded, decodeErr := url.PathUnescape(escaped)
-			if decodeErr != nil {
-				return nil, fmt.Errorf("rabbitmq: invalid management endpoint vhost %q: %w", parsed.EscapedPath(), decodeErr)
-			}
-			if decoded != "" {
-				vhost = "/" + strings.TrimPrefix(decoded, "/")
-			}
+		// The AMQP connection reads its vhost from this same endpoint through
+		// this parse, so re-deriving it here is how the two readers drifted
+		// apart. One parse, one answer.
+		amqpURI, uriErr := amqp.ParseURI(endpoint)
+		if uriErr != nil {
+			return nil, invalidEndpointError(uriErr)
 		}
-	}
-	if vhost == "" {
-		vhost = "/"
+		vhost = amqpURI.Vhost
 	}
 	timeout := cfg.ConnectTimeout
 	if timeout <= 0 {

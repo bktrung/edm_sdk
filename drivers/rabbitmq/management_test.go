@@ -7,6 +7,8 @@ import (
 	"testing"
 	"time"
 
+	amqp "github.com/rabbitmq/amqp091-go"
+
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/driver"
 )
 
@@ -38,6 +40,140 @@ func TestManagementClientDerivesAlternatePort(t *testing.T) {
 	}
 	if client.baseURL != "http://localhost:35672" {
 		t.Fatalf("management base URL = %q, want alternate management endpoint", client.baseURL)
+	}
+}
+
+// managementVhostCase is one endpoint spelling and the vhost the management
+// client has to derive from it.
+type managementVhostCase struct {
+	name     string
+	endpoint string
+	options  map[string]string
+	want     string // derived vhost; empty when the endpoint is refused
+	wantErr  string // substring the refusal names; empty when a vhost is expected
+}
+
+// managementVhostCases is the corpus both vhost tests read. The expectations
+// are written out rather than computed, so a change in the AMQP library's
+// reading fails here and names the spelling that moved.
+//
+// An endpoint with no authority is the one spelling whose vhost the management
+// client never derives: the AMQP library reads "orders" from amqp://///orders
+// through its triple-slash branch and would connect to the default host, but
+// the constructor refuses any endpoint without a host long before that, so the
+// row pins the refusal instead.
+func managementVhostCases() []managementVhostCase {
+	return []managementVhostCase{
+		{
+			name:     "trailing slash is the default vhost",
+			endpoint: "amqp://localhost:5672/",
+			want:     "/",
+		},
+		{
+			name:     "named vhost",
+			endpoint: "amqp://localhost:5672/orders",
+			want:     "orders",
+		},
+		{
+			name:     "percent-encoded leading slash",
+			endpoint: "amqp://localhost:5672/%2Forders",
+			want:     "/orders",
+		},
+		{
+			name:     "empty path is the default vhost",
+			endpoint: "amqp://localhost:5672",
+			want:     "/",
+		},
+		{
+			name:     "percent-encoded inner slash",
+			endpoint: "amqps://localhost:5671/orders%2Fsub",
+			want:     "orders/sub",
+		},
+		{
+			name:     "configured option wins over the endpoint",
+			endpoint: "amqp://localhost:5672/orders",
+			options:  map[string]string{"rabbitmq.vhost": "configured-vhost"},
+			want:     "configured-vhost",
+		},
+		{
+			name:     "authority-less endpoint is refused before any derivation",
+			endpoint: "amqp://///orders",
+			wantErr:  "missing host",
+		},
+	}
+}
+
+// TestManagementClientDerivesVhostFromEndpoint spells out what each endpoint
+// spelling means to the management client. It is the layer a reader consults
+// instead of re-deriving the AMQP library's parse from its source, and it is
+// the layer that goes red if an upgrade changes that parse under us.
+func TestManagementClientDerivesVhostFromEndpoint(t *testing.T) {
+	for _, test := range managementVhostCases() {
+		t.Run(test.name, func(t *testing.T) {
+			client, err := newManagementClient(test.endpoint, driver.Config{DriverOptions: test.options})
+			if test.wantErr != "" {
+				if err == nil || client != nil {
+					t.Fatalf("newManagementClient(%q) = client %v, error %v; want refusal", test.endpoint, client, err)
+				}
+				if !strings.Contains(err.Error(), test.wantErr) {
+					t.Fatalf("newManagementClient(%q) error = %v, want %q", test.endpoint, err, test.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("newManagementClient(%q): %v", test.endpoint, err)
+			}
+			if client.vhost != test.want {
+				t.Fatalf("derived vhost for %q = %q, want %q", test.endpoint, client.vhost, test.want)
+			}
+		})
+	}
+}
+
+// TestManagementClientVhostMatchesAMQPParse is the property the row exists for:
+// with no configured vhost, the management client addresses the vhost the AMQP
+// connection's own parse reads from the same endpoint. It is what makes a
+// hand-written reimplementation of that parse impossible to land quietly.
+func TestManagementClientVhostMatchesAMQPParse(t *testing.T) {
+	for _, test := range managementVhostCases() {
+		if test.wantErr != "" || test.options["rabbitmq.vhost"] != "" {
+			continue // the property holds only where the endpoint decides the vhost
+		}
+		t.Run(test.name, func(t *testing.T) {
+			client, err := newManagementClient(test.endpoint, driver.Config{})
+			if err != nil {
+				t.Fatalf("newManagementClient(%q): %v", test.endpoint, err)
+			}
+			amqpURI, err := amqp.ParseURI(test.endpoint)
+			if err != nil {
+				t.Fatalf("amqp.ParseURI(%q): %v", test.endpoint, err)
+			}
+			if client.vhost != amqpURI.Vhost {
+				t.Fatalf("management vhost for %q = %q, AMQP parse reads %q", test.endpoint, client.vhost, amqpURI.Vhost)
+			}
+		})
+	}
+}
+
+// TestManagementClientRejectsEndpointTheAMQPParserRefuses pins what happens when
+// the two readers disagree: net/url accepts an endpoint that the AMQP library's
+// parse refuses, which is reachable for an endpoint carrying whitespace. The
+// constructor refuses it rather than build a client addressing a vhost the
+// connection never reaches, and the refusal does not repeat the endpoint, which
+// here carries credentials.
+func TestManagementClientRejectsEndpointTheAMQPParserRefuses(t *testing.T) {
+	const username = "fake-whitespace-user"
+	const password = "fake-whitespace-pass"
+
+	client, err := newManagementClient("amqp://"+username+":"+password+"@localhost:5672/order s", driver.Config{})
+	if err == nil || client != nil {
+		t.Fatalf("newManagementClient() = client %v, error %v; want refusal", client, err)
+	}
+	if !strings.Contains(err.Error(), "invalid management endpoint") {
+		t.Fatalf("newManagementClient() error = %v, want invalid endpoint detail", err)
+	}
+	if strings.Contains(err.Error(), username) || strings.Contains(err.Error(), password) {
+		t.Fatalf("newManagementClient() error = %v, contains endpoint credentials", err)
 	}
 }
 
