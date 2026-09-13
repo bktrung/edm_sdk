@@ -740,6 +740,41 @@ func runTopologyPolicyChecks(group *groupContext) {
 
 	group.Check("TopologyVerify reports argument drift or fails verification", func(t *testing.T) {
 		admin := newProfileAdmin(group, group.conn.Admin())
+
+		// A deferred destination must survive verification. Delay is a
+		// port-level marker rather than a broker-side argument, so no broker
+		// value exists for a driver to compare and none may refuse the
+		// destination for carrying one. All three shipped answers pass here: a
+		// clean existence check (Kafka), a verified auxiliary (RabbitMQ's park
+		// queue) or a reported drift (inmem compares the stored delay). Only a
+		// refusal fails the check. This runs before the drift attempt below,
+		// which returns early on a driver that fails verification outright.
+		deferred := "topology.verify.deferred"
+		deferredSpec := driver.DestinationSpec{Name: deferred, Delay: topologyParkDelay}
+		if _, err := admin.EnsureTopology(group.ctx, driver.TopologySpec{
+			Destinations: []driver.DestinationSpec{deferredSpec},
+			Effective:    group.effective,
+		}); err != nil {
+			t.Fatalf("EnsureTopology(seed deferred): %v", err)
+		}
+		if maintenance, ok := group.conn.Admin().(driver.Maintenance); ok {
+			// Not group.maintenance: that skips the whole check for a driver
+			// that omits the optional Maintenance port, and this obligation
+			// must hold for every driver that implements Admin.
+			cleanupTopologyDestinations(t, admin, &profileMaintenance{group: group, maintenance: maintenance}, group.ctx, deferred)
+		}
+		deferredDiff, err := admin.EnsureTopology(group.ctx, driver.TopologySpec{
+			Destinations: []driver.DestinationSpec{deferredSpec},
+			Policy:       driver.TopologyVerify,
+			Effective:    group.effective,
+		})
+		if err != nil {
+			t.Fatalf("TopologyVerify refused a deferred destination: %v", err)
+		}
+		if !containsName(deferredDiff.ExistingDestinations, deferred) {
+			t.Fatalf("TopologyVerify ExistingDestinations = %v, want %q", deferredDiff.ExistingDestinations, deferred)
+		}
+
 		name := "topology.verify.drift"
 		declared := driver.DestinationSpec{Name: name, DeliveryLimit: 7}
 		if _, err := admin.EnsureTopology(group.ctx, driver.TopologySpec{

@@ -278,9 +278,11 @@ func (a *admin) verifyTopology(ctx context.Context, spec driver.TopologySpec) (d
 		if destination.DeadLetter != nil {
 			return driver.TopologyDiff{}, classify("ensure_topology", driver.KindFatal, fmt.Errorf("destination %q dead letter verification unsupported: %w", destination.Name, driver.ErrUnsupported))
 		}
-		if destination.Delay > 0 {
-			return driver.TopologyDiff{}, classify("ensure_topology", driver.KindFatal, fmt.Errorf("destination %q delay verification unsupported: %w", destination.Name, driver.ErrUnsupported))
-		}
+		// Delay is deliberately not refused here. It is a port-level marker,
+		// not a broker-side argument, so Kafka holds no value to compare and
+		// the existence, partition floor and partition count checks above
+		// already verify every fact the broker has about a deferred lane.
+		// Refusing the destination fails a lane the consume path honours.
 	}
 	return diff, nil
 }
