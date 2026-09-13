@@ -2329,22 +2329,25 @@ func (c *consumer) setPauseReasonLocked(destination string, reason pauseReason, 
 	switch {
 	case !paused && reasons.holdsFetches():
 		c.client.PauseFetchTopics(destination)
-	case paused && !reasons.holdsFetches() && !c.draining && !c.stopped:
+	case !add && !reasons.holdsFetches() && !c.draining && !c.stopped:
+		// A removal that leaves the fetches unheld releases them, whether or
+		// not the set ever held them. The deferred reason is the only reason
+		// that does not hold the fetches itself: it is the gate that refuses
+		// a requeued record before its due time, so a record the poll loop
+		// took out of franz-go and could not admit is waiting for exactly
+		// this removal, and resuming fetch does not reach it.
+		//
+		// Ending the wait is part of the release. The poll that follows a
+		// release with nothing waiting has no deadline, so a broker with
+		// nothing left to hand over produces no other wake and the record is
+		// never admitted again.
+		//
+		// The resume is unconditional because fetching can also be paused on
+		// this destination from outside this bookkeeping, which a lane fault
+		// does; resuming a destination that is not paused is a no-op in
+		// franz-go.
 		c.client.ResumeFetchTopics(destination)
-		// Resuming fetch does not reach a record the budget refused: the
-		// poll loop took it out of franz-go and is holding it in its own
-		// pending queue, so a broker with nothing left to send produces no
-		// wake and the record is never admitted. The last pause leaving is
-		// exactly the event that makes those records admissible, so the
-		// wait has to end here.
 		c.wakePollLocked()
-	case !paused && reasons.empty() && !c.draining && !c.stopped:
-		// The set emptied without ever holding the fetches, which is the
-		// deferred reason leaving. Fetching may still be paused on this
-		// destination by something outside this bookkeeping, and a lane fault
-		// is the one that does that, so the resume is unconditional. Resuming
-		// a destination that is not paused is a no-op in franz-go.
-		c.client.ResumeFetchTopics(destination)
 	}
 }
 

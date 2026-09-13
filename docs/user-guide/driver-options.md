@@ -55,6 +55,24 @@ floor is a startup failure rather than a deployment that silently scales less
 than expected, and under `TopologyDeclare` a request for fewer partitions than
 the floor is refused before a topic is created.
 
+A subscription's `Prefetch` is also the deferred hold limit for its
+destinations, so it is the knob behind the ordering guarantee for a delayed
+destination. The subscription's destinations share that budget, and a
+destination's share is its limit: the destination keeps its fetches while it
+holds fewer records waiting for a due time than `max(share, 2)`, which is what
+lets a record behind a waiting one be read and delivered at its own due time.
+Two is the floor, because one waiting record must never be enough to hold the
+fetches: the record behind it can be due sooner, and holding there would make it
+wait for a due time that is not its own.
+
+At that limit the driver holds the destination's fetches, which bounds what it
+spends on records it cannot deliver yet. A record behind the held ones cannot be
+read until they have been delivered, so it arrives at the earliest held record's
+due time rather than at its own, and a later-due record can be delivered before
+a nearer one behind it. Raising a destination's share raises the limit and
+narrows that window, and lowering it cannot narrow the window past two records,
+which is the floor. Bounded memory is what the lateness buys.
+
 ## RabbitMQ options
 
 | Key | What it does | Accepted values | Default | Read at |

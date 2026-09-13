@@ -294,6 +294,164 @@ func TestPendingDeadlineIgnoresUnknownDestinationAlongsideDeferrable(t *testing.
 	}
 }
 
+// newDeferredConsumerClient returns a franz-go client for a consumer a test
+// builds by hand. It seeds a port nothing listens on because nothing on this
+// path dials: the driver's two pause calls only record state on the client, so
+// these tests reach them without a fixture and without touching a broker
+// another worktree is running.
+func newDeferredConsumerClient(t *testing.T) *kgo.Client {
+	t.Helper()
+	client, err := kgo.NewClient(kgo.SeedBrokers("localhost:1"))
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+	t.Cleanup(client.Close)
+	return client
+}
+
+// TestDeferredPausesHoldFetchesOnlyAtTheHoldLimit pins the trade this pause
+// makes: a destination keeps its fetches until it holds its fill of records
+// waiting for a due time, and only then are they held. Holding at the first
+// waiting record hides a record behind it that is due sooner, and never holding
+// them is unbounded pending memory, so both edges are checked.
+func TestDeferredPausesHoldFetchesOnlyAtTheHoldLimit(t *testing.T) {
+	now := time.Unix(100, 0)
+	const (
+		destination = "retry"
+		delay       = 10 * time.Second
+	)
+	newConsumer := func(budget int) *consumer {
+		return &consumer{
+			client:       newDeferredConsumerClient(t),
+			conn:         &conn{delays: map[string]time.Duration{destination: delay}},
+			budgets:      map[string]int{destination: budget},
+			pauseReasons: make(map[string]pauseReasonSet),
+			unsettled:    make(map[string]int),
+			clock:        clock.NewFake(now),
+		}
+	}
+	// A due time inside the destination's declared band, so each record is one
+	// the driver holds for its own due time rather than one it faults on.
+	waiting := func(offsets ...int64) []*kgo.Record {
+		records := make([]*kgo.Record, 0, len(offsets))
+		for _, offset := range offsets {
+			records = append(records, deferredTestTopicRecord(destination, 0, offset, now, now.Add(delay)))
+		}
+		return records
+	}
+	// heldFetches is what the driver tells franz-go about the destination, and
+	// deferred is the gate that refuses a redelivery past it.
+	state := func(c *consumer) (heldFetches, deferred bool) {
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		reasons := c.pauseReasons[destination]
+		_, deferred = reasons[pauseReasonDeferred]
+		return reasons.holdsFetches(), deferred
+	}
+
+	// The floor. One waiting record is the record the loop is waiting for, and
+	// the fetches stay open so any record behind it can be read. A budget of
+	// one is the case the floor exists for: without it the hold limit is one
+	// and this one record holds the fetches.
+	c := newConsumer(1)
+	c.syncDeferredPauses(waiting(0))
+	if heldFetches, deferred := state(c); heldFetches || !deferred {
+		t.Fatalf("fetches held = %t, deferred reason set = %t after one waiting record with a budget of one and a hold limit of %d; want false, true",
+			heldFetches, deferred, c.deferredHoldLimit(destination))
+	}
+
+	// A budget of two is reached by two waiting records, and the fetches are
+	// held there even though the deferred reason itself does not hold them.
+	c = newConsumer(2)
+	c.syncDeferredPauses(waiting(0, 1))
+	if heldFetches, deferred := state(c); !heldFetches || !deferred {
+		t.Fatalf("fetches held = %t, deferred reason set = %t after two waiting records with a budget of two; want true, true", heldFetches, deferred)
+	}
+
+	// One of them coming due releases the hold and leaves the gate: the record
+	// still waiting is refused a redelivery, which is admission's job, and not
+	// the fetching's.
+	c.syncDeferredPauses(waiting(0))
+	if heldFetches, deferred := state(c); heldFetches || !deferred {
+		t.Fatalf("fetches held = %t, deferred reason set = %t after one of two records was delivered; want false, true", heldFetches, deferred)
+	}
+
+	// The budget is the operator's read-ahead knob, so a destination it holds
+	// above the floor holds nothing until the waiting records reach it.
+	c = newConsumer(3)
+	c.syncDeferredPauses(waiting(0, 1))
+	if heldFetches, _ := state(c); heldFetches {
+		t.Fatal("fetches held = true after two waiting records with a budget of three, want false")
+	}
+
+	// Nothing waiting leaves neither the gate nor the hold.
+	c.syncDeferredPauses(nil)
+	if heldFetches, deferred := state(c); heldFetches || deferred {
+		t.Fatalf("fetches held = %t, deferred reason set = %t with nothing waiting; want false, false", heldFetches, deferred)
+	}
+}
+
+// TestDeferredReasonLeavingWakesThePollLoop pins the release that never crossed
+// a fetch pause. A record waiting for its due time puts the deferred reason on
+// its destination without holding the fetches, so that reason can leave a
+// destination whose fetches were never held, and it is still the event that
+// admits what it was refusing. A resume does not reach a record the poll loop
+// took out of franz-go, so the release has to end the wait.
+func TestDeferredReasonLeavingWakesThePollLoop(t *testing.T) {
+	now := time.Unix(100, 0)
+	const (
+		destination = "retry"
+		delay       = 10 * time.Second
+	)
+	woke := make(chan struct{}, 1)
+	c := &consumer{
+		client:       newDeferredConsumerClient(t),
+		conn:         &conn{delays: map[string]time.Duration{destination: delay}},
+		budgets:      map[string]int{destination: 2},
+		pauseReasons: make(map[string]pauseReasonSet),
+		unsettled:    make(map[string]int),
+		clock:        clock.NewFake(now),
+		pollCancel: func() {
+			select {
+			case woke <- struct{}{}:
+			default:
+			}
+		},
+	}
+
+	// One waiting record and a budget of two leaves the fetches unheld, so
+	// nothing in this sequence is a fetch transition and there is no wait to
+	// end yet.
+	c.syncDeferredPauses([]*kgo.Record{deferredTestTopicRecord(destination, 0, 0, now, now.Add(delay))})
+	c.mu.Lock()
+	reasons := c.pauseReasons[destination]
+	_, deferred := reasons[pauseReasonDeferred]
+	gated := deferred && !reasons.holdsFetches()
+	c.mu.Unlock()
+	if !gated {
+		t.Fatalf("deferred reason set = %t, fetches held = %t after one waiting record with a budget of two; want a gate without a hold", deferred, reasons.holdsFetches())
+	}
+	select {
+	case <-woke:
+		t.Fatal("setting the deferred reason ended a wait, want no wake")
+	default:
+	}
+
+	// The waiting record is delivered, and the gate goes with it.
+	c.syncDeferredPauses(nil)
+	c.mu.Lock()
+	empty := c.pauseReasons[destination].empty()
+	c.mu.Unlock()
+	if !empty {
+		t.Fatal("the deferred reason survived the delivery of the record waiting past it")
+	}
+	select {
+	case <-woke:
+	default:
+		t.Fatal("the deferred reason leaving did not end the poll wait")
+	}
+}
+
 // TestConsumerDeferredNearerDueTimeIsNotHeldBehindFartherDueTime holds the
 // driver to a due time of its own. Two delayed records share one destination
 // and one partition, so the nearer record is behind the farther one in the log,
