@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -202,7 +203,7 @@ func (p *producer) publishWindow(ctx context.Context, msgs []driver.OutboundMess
 		// The window holds no duplicate id, so a match is this message.
 		if returnedErr, ok := returned[item.publishing.MessageId]; ok {
 			delete(returned, item.publishing.MessageId)
-			failed[item.index] = returnedErr
+			failed[item.index] = parkingFailure(item.routingKey, returnedErr)
 		}
 	}
 	return consumed, nil
@@ -319,6 +320,43 @@ func returnedPublishError(returned amqp.Return) error {
 		return classify("publish", driver.KindNotFound, errors.Join(driver.ErrDestinationMissing, reason))
 	}
 	return classify("publish", driver.KindFatal, reason)
+}
+
+// parkingSuffix turns a destination name into the name of its parking queue,
+// the queue a delayed or retried message waits in until its TTL expires. The
+// suffix is fixed: both the topology path that declares the queue and the
+// publish path that routes to it derive the name the same way.
+const parkingSuffix = ".park"
+
+// parkingFailure rewrites a not-found publish failure for a message that was
+// routed to a parking queue, so the failure names that queue and the topology
+// it needs. Nothing else routes a publish to a name carrying this suffix, so a
+// not-found there means the parking queue is missing, which is the one failure
+// whose cause an operator cannot recover from the broker's own words: the
+// broker returns 312 NO_ROUTE and never names the queue it could not route to.
+//
+// The queue is declared by the adapter under TopologyDeclare and checked under
+// TopologyVerify, but it is operator-provisioned under TopologyNone, so the
+// message states both and spells out the declare arguments rather than saying
+// only that something does not exist. Classification is deliberately the
+// wrapped error's own: this adds context and changes no kind.
+func parkingFailure(routingKey string, err error) error {
+	if !strings.HasSuffix(routingKey, parkingSuffix) || !errors.Is(err, driver.ErrDestinationMissing) {
+		return err
+	}
+	destination := strings.TrimSuffix(routingKey, parkingSuffix)
+	return fmt.Errorf(
+		"rabbitmq: parking destination %q is missing: a delayed or retried message is parked there"+
+			" until its delay expires, so it is required topology that must exist before that publish,"+
+			" and its name is always the destination plus %q. The adapter declares it under"+
+			" TopologyDeclare and requires it under TopologyVerify; under TopologyNone the operator"+
+			" provisions it: create it durable with x-queue-type %q (or %q for a classic deployment),"+
+			" x-dead-letter-exchange \"\", x-dead-letter-routing-key %q, and on a quorum queue also"+
+			" x-dead-letter-strategy \"at-least-once\" and x-overflow \"reject-publish\"; those three"+
+			" dead-letter arguments belong together for at-least-once delivery, and a classic queue"+
+			" omits the last two and dead-letters at most once: %w",
+		routingKey, parkingSuffix, queueKindQuorum, queueKindClassic, destination, err,
+	)
 }
 
 func amqpPublishing(message driver.OutboundMessage) (amqp.Publishing, error) {

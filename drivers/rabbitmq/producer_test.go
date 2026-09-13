@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -974,6 +975,107 @@ func openProducerFixture(t *testing.T, ctx context.Context, queue string) (drive
 	}
 	t.Cleanup(func() { _ = conn.Close(ctx) })
 	return conn, channel
+}
+
+// TestProducerParkingFailureNamesMissingQueue proves a delayed publish whose
+// parking queue does not exist reports the failure against that queue itself.
+// The broker's own answer is a 312 NO_ROUTE return, which names nothing, and
+// under TopologyNone the parking queue is operator-provisioned topology, so the
+// error is the only thing that can tell an operator what to create. The kind
+// and the sentinel stay what the publish path already produced.
+//
+// The same producer publishes again once the queue exists, which is the
+// operator's other question: creating the queue while the service runs is
+// enough, and no restart is needed.
+func TestProducerParkingFailureNamesMissingQueue(t *testing.T) {
+	requireBroker(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	const destination = "rabbitmq-driver-park-missing"
+	conn, rawChannel := openProducerFixture(t, ctx, destination)
+	parkName := destination + ".park"
+
+	raw, err := amqp.Dial(defaultEndpoint)
+	if err != nil {
+		t.Fatalf("Dial: %v", err)
+	}
+	t.Cleanup(func() { _ = raw.Close() })
+	dropPark := func() {
+		channel, channelErr := raw.Channel()
+		if channelErr != nil {
+			return
+		}
+		defer func() { _ = channel.Close() }()
+		_, _ = channel.QueueDelete(parkName, false, false, false)
+	}
+	t.Cleanup(dropPark)
+	// The parking queue is removed rather than merely assumed absent, so the
+	// test measures the missing queue rather than the state of the fixture.
+	// An undeleted leftover cannot make it pass quietly: the publish below
+	// would then succeed and fail the test.
+	dropPark()
+	if _, err := rawChannel.QueueDeclare(destination, true, false, false, false, nil); err != nil {
+		t.Fatalf("QueueDeclare(%q): %v", destination, err)
+	}
+
+	publisher, err := conn.Producer(ctx, driver.ProducerConfig{RequireDurableAck: true})
+	if err != nil {
+		t.Fatalf("Producer: %v", err)
+	}
+	parked := driver.OutboundMessage{
+		Destination: destination,
+		DelayUntil:  time.Now().Add(time.Hour), //nolint:forbidigo // a live delayed publish needs a future due time
+		Headers:     []driver.Header{{Key: "id", Value: []byte("park-missing-1")}},
+		Body:        []byte("parked"),
+	}
+	err = publisher.Publish(ctx, parked)
+	if err == nil {
+		t.Fatalf("Publish routed to the missing parking queue %q succeeded, want a failure", parkName)
+	}
+	if !errors.Is(err, driver.ErrDestinationMissing) {
+		t.Fatalf("Publish error = %v, want ErrDestinationMissing", err)
+	}
+	if kind, classified := driver.Classify(err); !classified || kind != driver.KindNotFound {
+		t.Fatalf("Publish classification = (%v, %t), want (not_found, true)", kind, classified)
+	}
+	var publishErr *driver.PublishError
+	if !errors.As(err, &publishErr) || len(publishErr.Failed) != 1 {
+		t.Fatalf("Publish error = %v, want exactly one failed message", err)
+	}
+	failure := publishErr.Failed[0]
+	// The token list is the operator's checklist: the queue to create, the
+	// policy split that decides who creates it, and the arguments a hand-made
+	// queue must carry, including the two that only exist to keep a quorum
+	// queue dead-lettering at least once.
+	for _, want := range []string{parkName, "TopologyNone", "TopologyVerify", "x-dead-letter-routing-key", "x-dead-letter-strategy", "at-least-once"} {
+		if !strings.Contains(failure.Error(), want) {
+			t.Fatalf("parking failure %q does not name %q, so an operator cannot act on it", failure, want)
+		}
+	}
+
+	if _, err := rawChannel.QueueDeclare(parkName, true, false, false, false, parkingArguments(destination, queueKindQuorum)); err != nil {
+		t.Fatalf("QueueDeclare(%q): %v", parkName, err)
+	}
+	parked.Headers = []driver.Header{{Key: "id", Value: []byte("park-missing-2")}}
+	if err := publisher.Publish(ctx, parked); err != nil {
+		t.Fatalf("Publish after the parking queue exists: %v", err)
+	}
+
+	// A destination that is not a parking queue keeps the failure it already
+	// produced. Rewriting it too would name a queue this publish never
+	// targeted, which is a worse answer than the broker's own.
+	missing := destination + "-missing"
+	err = publisher.Publish(ctx, driver.OutboundMessage{Destination: missing, Body: []byte("missing")})
+	if err == nil {
+		t.Fatalf("Publish to the missing destination %q succeeded, want a failure", missing)
+	}
+	if !errors.As(err, &publishErr) || len(publishErr.Failed) != 1 {
+		t.Fatalf("Publish error = %v, want exactly one failed message", err)
+	}
+	if failure := publishErr.Failed[0]; strings.Contains(failure.Error(), "parking destination") {
+		t.Fatalf("failure for the missing destination %q claims a parking queue: %v", missing, failure)
+	}
 }
 
 // TestProducerTargetRoutesEntryPointToExchange proves target() routes an
