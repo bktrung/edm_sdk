@@ -210,7 +210,8 @@ func TestInspectorSeparatesDeferredMessages(t *testing.T) {
 func TestConformance(t *testing.T) {
 	var output bytes.Buffer
 	// The whole suite shares this fake clock so deferred checks can advance broker
-	// time deterministically; it starts at real time because receiveBefore waits on wall time.
+	// time deterministically. Its origin is arbitrary now that receiveBefore spends
+	// its own waitTimeout budget instead of time.Until of a fixture instant.
 	fake := clock.NewFake(clock.NewReal().Now())
 	report := runConformance(t, Driver{Clock: fake})
 	if err := report.WriteMarkdown(&output); err != nil {

@@ -99,6 +99,13 @@ func runDeferred(group *groupContext) {
 		producer := newDeferredProducer(t, group, profileDestination(group, name), deferredDelay)
 		consumer := deferredConsumer(t, group, []string{name}, 3)
 		base := deferredNow(group)
+		// The offsets ascend, and that order is load-bearing rather than tidy: a driver
+		// that parks every deferred message of a destination in one queue releases them
+		// in publish order, because a per-message TTL expires only at the head of a queue.
+		// Ascending due times keep the head the earliest one, so each message still leaves
+		// at its own instant and a violation stays invisible here. Reordering these offsets
+		// therefore changes what this check covers: a nearer due time published after a
+		// farther one needs its own check.
 		offsets := []time.Duration{deferredDelay * 4 / 5, deferredDelay, deferredDelay * 6 / 5}
 		dues := make(map[string]time.Time, len(offsets))
 		for i, offset := range offsets {
@@ -174,6 +181,9 @@ func runDeferred(group *groupContext) {
 		if err := producer.Publish(group.ctx, driver.OutboundMessage{Destination: name, Body: []byte("zero")}); err != nil {
 			t.Fatal(err)
 		}
+		// The deadline bounds a broker suite's wait and a fixture suite never reads it:
+		// receiveBefore spends its own waitTimeout on a delivery the fixture clock has
+		// already released, so both suites give this delivery the same 5s.
 		message := receiveBefore(t, group, consumer, realNow().Add(waitTimeout), "zero-value delivery")
 		if string(message.Body) != "zero" {
 			t.Fatalf("body=%q, want zero", message.Body)
