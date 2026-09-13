@@ -10,6 +10,8 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"testing/synctest"
+	"time"
 
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/driver"
 )
@@ -962,4 +964,72 @@ func TestWaitForRebalanceAssignmentError(t *testing.T) {
 			}
 		})
 	}
+}
+
+// stalledDeadlineFixture is a DeadlineFixture whose clock stands still: every Now call
+// returns the instant it was built at, which is what a descheduled check goroutine sees
+// from the fixture's side while wall time keeps moving.
+type stalledDeadlineFixture struct{ now time.Time }
+
+func (*stalledDeadlineFixture) Consumer(context.Context, time.Duration, driver.ConsumerConfig) (driver.Consumer, error) {
+	return nil, errors.New("stalled deadline fixture has no consumers")
+}
+
+func (f *stalledDeadlineFixture) Now() time.Time { return f.now }
+
+func (*stalledDeadlineFixture) Advance(time.Duration) {}
+
+// delayedFixtureConsumer yields one message after a fixed delay, standing in for a driver
+// that hands over a delivery the fixture clock has already released. The release channel
+// lets the test's cleanup end the delivery goroutine when the receive fails, which is what
+// keeps a failing run from leaving the bubble with a goroutine still waiting on its timer.
+type delayedFixtureConsumer struct {
+	messages chan driver.InboundMessage
+	release  chan struct{}
+}
+
+func newDelayedFixtureConsumer(t *testing.T, after time.Duration, message driver.InboundMessage) *delayedFixtureConsumer {
+	consumer := &delayedFixtureConsumer{
+		messages: make(chan driver.InboundMessage, 1),
+		release:  make(chan struct{}),
+	}
+	t.Cleanup(func() { close(consumer.release) })
+	go func() {
+		select {
+		case <-consumer.release:
+		case <-time.After(after): //nolint:forbidigo // the delivery is bubble time, ordered by the bubble clock
+			consumer.messages <- message
+		}
+	}()
+	return consumer
+}
+
+func (c *delayedFixtureConsumer) Messages() <-chan driver.InboundMessage { return c.messages }
+func (*delayedFixtureConsumer) Errors() <-chan error                     { return nil }
+func (*delayedFixtureConsumer) Pause(...string) error                    { return nil }
+func (*delayedFixtureConsumer) Resume(...string) error                   { return nil }
+func (*delayedFixtureConsumer) Drain(context.Context) error              { return nil }
+func (*delayedFixtureConsumer) Stop(context.Context) error               { return nil }
+func (*delayedFixtureConsumer) Release(context.Context) error            { return nil }
+
+func (*delayedFixtureConsumer) Lag(context.Context) (map[string]int64, error) { return nil, nil }
+
+// TestReceiveBeforeWaitsForTheDeliveryAfterAFixtureClockStall reproduces the deferred
+// timing failure where nothing is late: the fixture clock stands still while the wait's
+// clock spends the whole deferred budget, which is what a long deschedule does to a check
+// on a saturated machine. A fixture deadline must then wait on the harness's delivery
+// budget, not on the remainder of an instant the fixture clock never spent.
+func TestReceiveBeforeWaitsForTheDeliveryAfterAFixtureClockStall(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		group := &groupContext{t: t, ctx: context.Background(), deadline: &stalledDeadlineFixture{now: realNow()}}
+		consumer := newDelayedFixtureConsumer(t, deferredLateBound+waitInterval, driver.InboundMessage{Body: []byte("released")})
+		deadline := group.deadline.Now().Add(deferredLateBound)
+		// The deschedule: wall time passes between the deadline being computed and the
+		// wait starting, while the fixture clock that produced the deadline stays put.
+		time.Sleep(deferredLateBound) //nolint:forbidigo // the stall is bubble time; see the consumer above
+		message := receiveBefore(t, group, consumer, deadline, "fixture delivery after a fixture clock stall")
+		if string(message.Body) != "released" {
+			t.Fatalf("body=%q, want released", message.Body)
+		}
+	})
 }
