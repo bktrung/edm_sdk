@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"time"
 
 	amqp "github.com/rabbitmq/amqp091-go"
 
@@ -73,7 +74,7 @@ func (a *adminOperations) ensureTopology(ctx context.Context, spec driver.Topolo
 			delete(a.conn.deferred, destination.Name)
 		}
 		a.conn.mu.Unlock()
-		args := queueArguments(destination, a.conn.queueKind)
+		args := queueArguments(destination, a.conn.queueKind, a.conn.consumerTimeout)
 		exists, err := a.queueExists(ctx, destination.Name, destination.Durable, args)
 		if err != nil {
 			return driver.TopologyDiff{}, err
@@ -165,7 +166,7 @@ func (a *adminOperations) verifyTopology(ctx context.Context, spec driver.Topolo
 		if destination.Name == "" {
 			return driver.TopologyDiff{}, classify("ensure_topology", driver.KindFatal, errors.New("destination name is empty"))
 		}
-		mainArgs := queueArguments(destination, a.conn.queueKind)
+		mainArgs := queueArguments(destination, a.conn.queueKind, a.conn.consumerTimeout)
 		if exists, err := a.queueExists(ctx, destination.Name, destination.Durable, mainArgs); err != nil {
 			return driver.TopologyDiff{}, err
 		} else if !exists {
@@ -447,6 +448,34 @@ func validateExchange(exchange driver.ExchangeSpec) error {
 	}
 }
 
+// consumerTimeoutOption is the DriverOptions key carrying the per-queue
+// consumer timeout.
+const consumerTimeoutOption = "rabbitmq.consumerTimeout"
+
+// resolveConsumerTimeout reads the consumer timeout this driver declares as
+// x-consumer-timeout on every quorum destination queue. An absent option
+// declares nothing, leaving the broker's own timeout in force instead of
+// imposing this driver's choice on a deployment that never made one.
+//
+// A present option must be at least a millisecond. The broker reads the
+// argument as whole milliseconds, and a value that truncates to zero cancels
+// every consumer on the queue on its first delivery, so accepting it would
+// turn a typo into a subscription that never keeps a message.
+func resolveConsumerTimeout(options map[string]string) (time.Duration, error) {
+	configured, present := options[consumerTimeoutOption]
+	if !present {
+		return 0, nil
+	}
+	timeout, err := time.ParseDuration(configured)
+	if err != nil {
+		return 0, fmt.Errorf("rabbitmq: invalid %s %q: %w", consumerTimeoutOption, configured, err)
+	}
+	if timeout < time.Millisecond {
+		return 0, fmt.Errorf("rabbitmq: invalid %s %q: want at least 1ms, because the broker reads x-consumer-timeout in whole milliseconds and zero cancels every consumer immediately", consumerTimeoutOption, configured)
+	}
+	return timeout, nil
+}
+
 // queueArguments builds the declare-time arguments for a destination queue.
 // When the queue is quorum-kind and spec carries a dead-letter route, it adds
 // x-dead-letter-strategy and x-overflow alongside the route so the broker's
@@ -455,9 +484,18 @@ func validateExchange(exchange driver.ExchangeSpec) error {
 // dropping any one of them downgrades dead-lettering to at-most-once with no
 // error from the broker, so a future edit that removes one of the three
 // reintroduces silent message loss and no test outside this file will fail.
-func queueArguments(spec driver.DestinationSpec, kind queueKind) amqp.Table {
+//
+// x-consumer-timeout is quorum-only. RabbitMQ 4.3 answers a classic queue
+// declared with it with a 406 PRECONDITION_FAILED - invalid arg
+// 'x-consumer-timeout' - which closes the channel, so declaring it on a
+// classic-configured connection would fail every declare rather than being
+// quietly ignored.
+func queueArguments(spec driver.DestinationSpec, kind queueKind, consumerTimeout time.Duration) amqp.Table {
 	args := amqp.Table{}
 	args["x-queue-type"] = string(kind)
+	if kind == queueKindQuorum && consumerTimeout > 0 {
+		args["x-consumer-timeout"] = consumerTimeout.Milliseconds()
+	}
 	if spec.DeliveryLimit > 0 {
 		if spec.DeliveryLimit > 2147483647 {
 			spec.DeliveryLimit = 2147483647
