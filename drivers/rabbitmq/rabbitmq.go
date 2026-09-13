@@ -132,21 +132,26 @@ func (Driver) Open(ctx context.Context, cfg driver.Config) (driver.Conn, error) 
 }
 
 type conn struct {
-	mu           sync.RWMutex
-	topologyMu   sync.Mutex
-	amqp         *amqp.Connection
-	caps         driver.Capabilities
-	info         driver.BrokerInfo
-	queueKind    queueKind
-	management   *managementClient
-	closed       bool
-	closing      bool
-	closeAttempt bool
-	active       map[*consumer]struct{}
-	producers    map[*producer]struct{}
-	publishFault atomic.Int32 // 0 = unset; otherwise driver.Kind + 1
-	closeFault   atomic.Bool
-	deferred     map[string]time.Duration
+	mu         sync.RWMutex
+	topologyMu sync.Mutex
+	amqp       *amqp.Connection
+	caps       driver.Capabilities
+	info       driver.BrokerInfo
+	queueKind  queueKind
+	// consumerTimeout is the x-consumer-timeout this connection declares on
+	// quorum destination queues. It is resolved at Open because a queue
+	// argument is fixed at declare time, and the topology and admin paths have
+	// no other way back to DriverOptions.
+	consumerTimeout time.Duration
+	management      *managementClient
+	closed          bool
+	closing         bool
+	closeAttempt    bool
+	active          map[*consumer]struct{}
+	producers       map[*producer]struct{}
+	publishFault    atomic.Int32 // 0 = unset; otherwise driver.Kind + 1
+	closeFault      atomic.Bool
+	deferred        map[string]time.Duration
 }
 
 var _ driver.Conn = (*conn)(nil)
@@ -156,15 +161,20 @@ func newConn(amqpConn *amqp.Connection, caps driver.Capabilities, endpoint strin
 	if err != nil {
 		return nil, err
 	}
+	consumerTimeout, err := resolveConsumerTimeout(cfg.DriverOptions)
+	if err != nil {
+		return nil, err
+	}
 	return &conn{
-		amqp:       amqpConn,
-		caps:       caps,
-		info:       brokerInfo(amqpConn),
-		queueKind:  kind,
-		management: management,
-		active:     make(map[*consumer]struct{}),
-		producers:  make(map[*producer]struct{}),
-		deferred:   make(map[string]time.Duration),
+		amqp:            amqpConn,
+		caps:            caps,
+		info:            brokerInfo(amqpConn),
+		queueKind:       kind,
+		consumerTimeout: consumerTimeout,
+		management:      management,
+		active:          make(map[*consumer]struct{}),
+		producers:       make(map[*producer]struct{}),
+		deferred:        make(map[string]time.Duration),
 	}, nil
 }
 

@@ -107,12 +107,40 @@ type PublishError struct {
 	Failed map[int]error
 }
 
-// Error returns the number of failed messages.
+// Error returns the number of failed messages followed by the cause at the
+// lowest failed index. Entries holding no error are skipped, so an all-nil
+// Failed renders the count alone. Only one cause is named however many
+// messages failed; the count says how many more there are. The text is stable
+// for the same failure because the cause is chosen by index, not by range
+// order over the map.
 func (e *PublishError) Error() string {
 	if e == nil || len(e.Failed) == 0 {
 		return "f1/driver: publish error has no failed messages"
 	}
-	return fmt.Sprintf("f1/driver: %d of the published messages failed", len(e.Failed))
+	summary := fmt.Sprintf("f1/driver: %d of the published messages failed", len(e.Failed))
+	index, cause := e.firstCause()
+	if cause == nil {
+		return summary
+	}
+	return fmt.Sprintf("%s; first at index %d: %v", summary, index, cause)
+}
+
+// firstCause returns the lowest index in Failed holding a non-nil error
+// together with that error, or a nil error when every entry is nil. The lowest
+// index wins rather than the first iteration of the map, so the same failure
+// renders the same text on every run.
+func (e *PublishError) firstCause() (int, error) {
+	lowest := -1
+	var cause error
+	for index, err := range e.Failed {
+		if err == nil {
+			continue
+		}
+		if lowest < 0 || index < lowest {
+			lowest, cause = index, err
+		}
+	}
+	return lowest, cause
 }
 
 // Unwrap returns the per-message causes for errors.Is and errors.As.

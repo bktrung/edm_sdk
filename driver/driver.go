@@ -2,6 +2,7 @@ package driver
 
 import (
 	"context"
+	"log/slog"
 	"time"
 )
 
@@ -182,6 +183,11 @@ type Config struct {
 	ConnectTimeout        time.Duration // timeout for Open retries
 	TLS                   *TLSConfig    // nil disables TLS
 	SASL                  *SASLConfig   // nil disables SASL
+	// Logger receives driver diagnostics: conditions the driver survives and
+	// reports without failing the operation that met them. A nil Logger means
+	// the driver falls back to slog.Default(), so every driver must accept a
+	// nil Logger; inmem opens with a zero Config.
+	Logger *slog.Logger
 	// DriverOptions carries driver-specific knobs untouched by the core.
 	DriverOptions map[string]string
 }

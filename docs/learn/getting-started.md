@@ -14,7 +14,7 @@ This guide walks through the smallest useful F1 flow:
 The examples deliberately do not choose a broker. F1's application-facing code
 should not need to change when the driver changes. Select and configure a
 concrete driver in your application's composition root, then pass it to F1 as
-an implementation of [`driver.Driver`](../../driver/driver.go).
+an implementation of [`driver.Driver`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/driver/driver.go).
 
 ## The mental model
 
@@ -38,23 +38,41 @@ provided one, and otherwise falls back to the event ID.
 
 ## Install F1
 
-The module is hosted on the project's private Go module host. Configure your
-Go toolchain for that host, then add F1 to the application:
+The module is hosted on the project's private Go module host. Set `GOPRIVATE`
+before downloading it so the Go tool does not query the public proxy or
+checksum database, which cannot see that host, then add F1 to the application:
 
 ```sh
 go env -w GOPRIVATE=fgit.zapps.vn
 go get fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk
 ```
 
-Use the Go version declared in [`go.mod`](../../go.mod). Keep connection
+Use the Go version declared in [`go.mod`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/go.mod). Keep connection
 endpoints, credentials, and driver-specific settings in your application's
 configuration; do not put them in handler code.
+
+## Choose a driver
+
+The application selects the concrete driver at the composition boundary. The
+service-facing code uses the root `f1` package; it does not use a broker client
+directly. The repository currently includes:
+
+- `drivers/kafka` for Kafka classic consumer groups and partition-bound scaling.
+- `drivers/rabbitmq` for RabbitMQ.
+- `drivers/inmem` for deterministic tests and local in-process use.
+
+Kafka share-group mode is not implemented; `kafka.useShareGroups=always` is rejected. The local
+Kafka fixture is defined in [`docker/docker-compose.yml`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/docker/docker-compose.yml), and
+`make test-kafka` / `make test-kafka-conformance` own its broker-backed verification.
+
+Start the configuration from [`examples/config.yaml`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/examples/config.yaml), then provide the
+service's broker endpoint, topology policy, and subscription settings.
 
 ## Connect the client
 
 F1 requires two pieces at startup:
 
-- a resolved [`f1.Config`](../../config.go), normally loaded with
+- a resolved [`f1.Config`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/config.go), normally loaded with
   `f1.LoadConfig`; and
 - the concrete `driver.Driver` selected by the application.
 
@@ -94,6 +112,11 @@ therefore returned at the connection boundary, before the application begins
 publishing or consuming. Keep the `broker.driver` value in the loaded config
 aligned with the selected driver's `Name()`; F1 logs a driver-identity mismatch
 so an accidental configuration split is visible.
+
+Pass `f1.WithPublishTopics(...)` as well when F1 should ensure the publisher's
+topology at startup. Production topology should normally be provisioned
+separately and verified rather than auto-created. See [`config.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/config.go) and
+[`options.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/options.go) for the owning definitions.
 
 The exact configuration belongs to the selected driver and deployment. This
 guide leaves that choice open on purpose; the rest of the application can use
@@ -228,6 +251,13 @@ accepted publishes, and releases the driver's producer and connection
 resources. Call `runner.Drain` directly when you need to stop one subscription
 while keeping the client alive for other work.
 
+## Run the local example
+
+The root [README](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/README.md) contains the complete RabbitMQ fixture quickstart. It
+builds separate publisher and consumer services from
+[`examples/`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/tree/main/examples) so you can see the composition boundary in a
+runnable form.
+
 ## Design around these guarantees
 
 Before moving beyond the first example, make these choices explicit in the
@@ -245,16 +275,22 @@ service design:
 - **Driver portability:** application composition chooses the adapter; business
   handlers should depend on F1 events, not driver packages.
 
+## Next steps
+
+- [Publishing events](/user-guide/publishing-events) - routing metadata and batches.
+- [Consuming events](/user-guide/consuming-events) - handlers, metadata, and ordering.
+- [Handling failures](/user-guide/handling-failures) - retry, terminal, drop, and dead-letter.
+
 ## Continue from the source contracts
 
 When you need more detail, read the symbols that own the behavior:
 
-- [`Publisher`](../../publisher.go) — event construction, routing metadata, and
+- [`Publisher`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/publisher.go) - event construction, routing metadata, and
   durable publish behavior;
-- [`Subscription`](../../subscription.go) — topics, handlers, retry, and
+- [`Subscription`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/subscription.go) - topics, handlers, retry, and
   delivery policy;
-- [`Event`](../../event.go) — envelope access, decoding, and idempotency;
-- [`HandlerFunc`](../../handler.go) and [`Terminal`](../../errors.go) — handler
+- [`Event`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/event.go) - envelope access, decoding, and idempotency;
+- [`HandlerFunc`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/handler.go) and [`Terminal`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/errors.go) - handler
   adaptation and failure classification; and
-- [`driver.Driver`](../../driver/driver.go) — the adapter boundary used by the
+- [`driver.Driver`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/driver/driver.go) - the adapter boundary used by the
   application composition layer.

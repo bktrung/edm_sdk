@@ -162,11 +162,13 @@ func TestSubscriberTopologyPolicyControlsAdminCalls(t *testing.T) {
 			_, err = openRunnerConsumer(runner, context.Background())
 			require.NoError(t, err)
 			require.NoError(t, client.Close(context.Background()))
-			if policy == TopologyNone {
-				require.Empty(t, admin.specs)
-			} else {
-				require.Len(t, admin.specs, 1)
-			}
+			// Every policy reaches the admin, TopologyNone included: under that
+			// policy the call is how a retry tier's delay reaches the consumer,
+			// and the driver answers it without touching the broker. Do not
+			// restore the older assertion that None makes no call; that was the
+			// defect, and a retry ladder ran with every delay dropped to zero.
+			require.Len(t, admin.specs, 1)
+			require.Equal(t, policy, admin.specs[0].Policy)
 		})
 	}
 }

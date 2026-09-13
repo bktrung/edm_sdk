@@ -82,6 +82,12 @@ func (c *orderingRecordingConn) Consumer(_ context.Context, cfg driver.ConsumerC
 	return &orderingTestConsumer{}, nil
 }
 
+// Admin gives this fake the admin surface a subscription requires under every
+// policy. Under TopologyNone the call is not a topology call: it is how a retry
+// tier's delay reaches the consumer, so the core makes it rather than skipping
+// the policy, and a nil admin is a missing surface we need.
+func (c *orderingRecordingConn) Admin() driver.Admin { return &dispatchAdmin{} }
+
 type orderingTestConsumer struct{}
 
 func (*orderingTestConsumer) Messages() <-chan driver.InboundMessage { return nil }

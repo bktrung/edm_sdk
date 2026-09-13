@@ -13,7 +13,7 @@ The core owns the logical topology contract and application-visible semantics.
 The driver owns transport syntax and provider-specific administration. This is
 why application handlers should use `f1.Event`, `Publisher`, and
 `Subscription`, while driver implementations work through the interfaces under
-[`driver/`](../../driver).
+[`driver/`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/tree/main/driver).
 
 ## Select topology policy
 
@@ -27,13 +27,13 @@ F1 exposes three policies:
 
 The effective policy is selected in this order:
 
-1. an explicit [`WithTopology`](../../options.go) option;
+1. an explicit [`WithTopology`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/options.go) option;
 2. `topology.autoCreate: true` in configuration;
 3. `topology.verifyOnStart: true` in configuration; or
 4. `TopologyNone` when neither configuration setting is enabled.
 
-The policy selection is implemented by [`topologyPolicy`](../../client.go) and
-validated in [`config.go`](../../config.go). In the current validation,
+The policy selection is implemented by [`topologyPolicy`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/client.go) and
+validated in [`config.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/config.go). In the current validation,
 `topology.autoCreate` is rejected when `Config.Env` is `prod`; production
 provisioning should therefore be explicit rather than an accidental side
 effect of starting a service.
@@ -91,8 +91,8 @@ client, err := f1.New(
 Use this option when startup should fail before the first publish if the
 publisher topology is unavailable. Omit it when publishing topics are managed
 outside this client and the service intentionally relies on an existing
-topology. The option contract is owned by [`WithPublishTopics`](../../options.go)
-and topic validation by [`validatePublishTopic`](../../publisher.go).
+topology. The option contract is owned by [`WithPublishTopics`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/options.go)
+and topic validation by [`validatePublishTopic`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/publisher.go).
 
 ## What F1 generates
 
@@ -117,12 +117,12 @@ was selected.
 Do not construct physical destination names in application code. Use logical
 event types, `WithTopic`, `WithPublishTopics`, and `Subscription.Topics`; the
 core naming functions keep publish, consume, retry, and dead-letter families
-consistent. The topology builders are [`publisherTopologySpec`](../../publisher.go)
-and [`subscriptionTopologySpecs`](../../worker.go).
+consistent. The topology builders are [`publisherTopologySpec`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/publisher.go)
+and [`subscriptionTopologySpecs`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/worker.go).
 
 ## Admin operations are non-destructive by default
 
-The driver's [`Admin`](../../driver/driver.go) interface provides:
+The driver's [`Admin`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/driver/driver.go) interface provides:
 
 - `EnsureTopology`, which is idempotent, creates missing resources according to
   the selected policy, and reports changes, drift, and in-scope orphans; and
@@ -130,14 +130,14 @@ The driver's [`Admin`](../../driver/driver.go) interface provides:
 
 `EnsureTopology` does not delete destinations. An orphan in a topology diff is
 an observation that requires an operational decision, not permission to remove
-data. Destructive operations are an optional [`Maintenance`](../../driver/driver.go)
+data. Destructive operations are an optional [`Maintenance`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/driver/driver.go)
 capability; `Prune` must recheck that a destination and its auxiliary retry or
 dead-letter resources are empty and unused before deleting them.
 
 When a driver cannot scan the requested scope, `TopologyDiff.OrphanScanError`
 must make that limitation visible. Treat an incomplete orphan report as
 incomplete rather than as proof that cleanup is safe. The executable topology
-contract is in [`driver/topology.go`](../../driver/topology.go).
+contract is in [`driver/topology.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/driver/topology.go).
 
 ## Read capabilities after connecting
 
@@ -168,7 +168,7 @@ portable core; and `FeatureUnavailable` means the requested behavior cannot be
 provided for that connection. The report is a decision surface, not a hint to
 cast the connection to a provider-specific type.
 
-The current public feature report is assembled by [`limitsFor`](../../limits.go).
+The current public feature report is assembled by [`limitsFor`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/limits.go).
 Use the symbol and the connected `Detail` field as the authority instead of
 maintaining a hand-written driver support table in service documentation.
 
@@ -183,7 +183,7 @@ the operation is rejected.
 
 `OrderedByKey` is an example of a required capability for a requested
 subscription mode: an ordered subscription is rejected when the effective
-connection does not advertise the feature. See [Ordering and scheduling](ordering-and-scheduling.md).
+connection does not advertise the feature. See [Ordering and scheduling](/advanced-topics/ordering-and-scheduling).
 
 Physical constraints are not optimizations. Message and header size limits,
 consumer scaling limits, and other connection constraints remain relevant even
@@ -208,10 +208,10 @@ has not become an application dependency. It does not remove physical limits,
 make an unavailable semantic available, or authorize a driver to branch on its
 own capability view instead of the effective set passed by F1.
 
-The transformation is defined by [`Capabilities.Strict`](../../driver/capability.go).
+The transformation is defined by [`Capabilities.Strict`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/driver/capability.go).
 The core and driver conformance suite compare full-capability and strict
 profiles for equivalent observable behavior; see
-[`driver/conformance`](../../driver/conformance/).
+[`driver/conformance`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/tree/main/driver/conformance).
 
 ## Driver implementation boundary
 
@@ -228,8 +228,8 @@ When adding or maintaining a driver, keep these ownership rules:
 - driver-specific topology syntax, names, and administration errors stay
   behind the driver interfaces.
 
-The complete interface contract is in [`driver/driver.go`](../../driver/driver.go),
-and the topology data model is in [`driver/topology.go`](../../driver/topology.go).
+The complete interface contract is in [`driver/driver.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/driver/driver.go),
+and the topology data model is in [`driver/topology.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/driver/topology.go).
 Run the conformance package in both normal and strict profiles before treating
 a driver change as portable.
 
@@ -246,10 +246,10 @@ Keep application tests focused on logical behavior:
 - use the in-memory driver for deterministic topology and capability tests
   without importing transport types into handlers.
 
-The policy matrix is covered by [`topology_policy_test.go`](../../topology_policy_test.go),
-publisher and consumer specs by [`publisher_topology_test.go`](../../publisher_topology_test.go)
-and [`topology_test.go`](../../topology_test.go), and capability equivalence by
-the [driver conformance package](../../driver/conformance/).
+The policy matrix is covered by [`topology_policy_test.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/topology_policy_test.go),
+publisher and consumer specs by [`publisher_topology_test.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/publisher_topology_test.go)
+and [`topology_test.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/topology_test.go), and capability equivalence by
+the [driver conformance package](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/tree/main/driver/conformance).
 
 ## Common mistakes
 
@@ -273,13 +273,13 @@ the [driver conformance package](../../driver/conformance/).
 
 ## Continue from here
 
-- [Ordering and scheduling](ordering-and-scheduling.md) — capability-gated
+- [Ordering and scheduling](/advanced-topics/ordering-and-scheduling) - capability-gated
   per-key ordering and fair delivery lanes;
-- [Lifecycle and shutdown](lifecycle-and-shutdown.md) — resource ownership,
+- [Lifecycle and shutdown](/advanced-topics/lifecycle-and-shutdown) - resource ownership,
   reconnect, drain, and close sequencing;
-- [Publisher and subscriber](../basics/pubsub.md) — logical topics and
+- [Publisher and subscriber](/basics/pubsub) - logical topics and
   subscription boundaries;
-- [Driver and capabilities](../drivers-and-capabilities.md) — port structure
+- [Driver and capabilities](/drivers-and-capabilities) - port structure
   and adapter ownership; and
-- [Getting started](../learn/getting-started.md) — generic driver selection at
+- [Getting started](/learn/getting-started) - generic driver selection at
   the application composition root.

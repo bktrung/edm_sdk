@@ -3,7 +3,6 @@ package kafka
 import (
 	"errors"
 	"fmt"
-	"log/slog"
 	"strconv"
 	"time"
 
@@ -173,7 +172,7 @@ func (c *consumer) reportDeferralErrorLocked(record *kgo.Record, cause error) {
 		return
 	}
 	c.reportedDeferrals[destination] = struct{}{}
-	slog.Default().Warn(
+	c.conn.log().Warn(
 		"kafka deferred delivery fault",
 		"destination", destination,
 		"condition", cause.Error(),

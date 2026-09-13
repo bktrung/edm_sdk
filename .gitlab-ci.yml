@@ -138,6 +138,84 @@ test-kafka-conformance:
       done
     - make -o kafka-up test-kafka-conformance
 
+# The management image is required: the subscription path reads bindings and
+# queue arguments over the management API. The endpoint is the job container
+# loopback rather than the service alias because the driver refuses a plaintext
+# endpoint whose host is not loopback. The wait checks the derived management
+# port too, which is the AMQP port plus 10000 and is not overridden here, and it
+# is written for sh as well as bash because nothing in this file pins the shell
+# the runner uses.
+test-rabbitmq:
+  stage: verify
+  extends: .go-cache
+  services:
+    - name: rabbitmq:4.3.4-management
+      alias: rabbitmq
+  variables:
+    F1_RABBITMQ_ENDPOINT: "amqp://guest:guest@localhost:5672/"
+    F1_REQUIRE_RABBITMQ: "1"
+  script:
+    - |
+      ready_timeout=120
+      deadline=$(( $(date +%s) + ready_timeout ))
+      endpoint=${F1_RABBITMQ_ENDPOINT#*//}
+      endpoint=${endpoint#*@}
+      endpoint=${endpoint%/}
+      host=${endpoint%:*}
+      port=${endpoint##*:}
+      management_port=$((port + 10000))
+      while :; do
+        if (/usr/bin/timeout 2 bash -c 'echo >"/dev/tcp/$1/$2"' _ "${host}" "${port}") 2>/dev/null &&
+          (/usr/bin/timeout 2 bash -c 'echo >"/dev/tcp/$1/$2"' _ "${host}" "${management_port}") 2>/dev/null; then
+          echo "RabbitMQ fixture ready at ${host}:${port}"
+          break
+        fi
+        if [ "$(date +%s)" -ge "${deadline}" ]; then
+          echo "RabbitMQ fixture never became ready at ${host}:${port}" >&2
+          echo "The driver refuses a plaintext endpoint whose host is not loopback, so the broker must be reachable on the job container loopback and the job and service containers must share a network namespace." >&2
+          exit 1
+        fi
+        sleep 2
+      done
+    - make -o broker-up -o broker-smoke test-rabbitmq-driver
+
+# Same service and the same wait; only the suite differs. It runs on every
+# pipeline because the suite is about 45 seconds here, which does not need the
+# merge-request and scheduled placement the Kafka conformance job uses.
+test-rabbitmq-conformance:
+  stage: verify
+  extends: .go-cache
+  services:
+    - name: rabbitmq:4.3.4-management
+      alias: rabbitmq
+  variables:
+    F1_RABBITMQ_ENDPOINT: "amqp://guest:guest@localhost:5672/"
+    F1_REQUIRE_RABBITMQ: "1"
+  script:
+    - |
+      ready_timeout=120
+      deadline=$(( $(date +%s) + ready_timeout ))
+      endpoint=${F1_RABBITMQ_ENDPOINT#*//}
+      endpoint=${endpoint#*@}
+      endpoint=${endpoint%/}
+      host=${endpoint%:*}
+      port=${endpoint##*:}
+      management_port=$((port + 10000))
+      while :; do
+        if (/usr/bin/timeout 2 bash -c 'echo >"/dev/tcp/$1/$2"' _ "${host}" "${port}") 2>/dev/null &&
+          (/usr/bin/timeout 2 bash -c 'echo >"/dev/tcp/$1/$2"' _ "${host}" "${management_port}") 2>/dev/null; then
+          echo "RabbitMQ fixture ready at ${host}:${port}"
+          break
+        fi
+        if [ "$(date +%s)" -ge "${deadline}" ]; then
+          echo "RabbitMQ fixture never became ready at ${host}:${port}" >&2
+          echo "The driver refuses a plaintext endpoint whose host is not loopback, so the broker must be reachable on the job container loopback and the job and service containers must share a network namespace." >&2
+          exit 1
+        fi
+        sleep 2
+      done
+    - make -o broker-up -o broker-smoke test-rabbitmq-conformance
+
 check-api-surface:
   stage: verify
   extends: .go-cache

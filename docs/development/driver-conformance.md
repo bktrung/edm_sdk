@@ -1,18 +1,18 @@
 # Driver conformance
 
 The shared conformance suite is the executable compatibility check for the
-[`driver` port](../../driver/driver.go). It runs the same broker-independent
+[`driver` port](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/driver/driver.go). It runs the same broker-independent
 behavior checks against each adapter through `driver.Driver`, `driver.Conn`,
 and the other port interfaces. A driver-specific test supplies only the
 adapter's connection setup, broker-state inspector, and optional fault or
 deadline fixtures.
 
-The suite protects the contract described in [Driver contract](driver-contract.md)
+The suite protects the contract described in [Driver contract](/development/driver-contract)
 without making the core depend on a broker client. The exact group manifest,
 check names, and declared counts remain authoritative in
-[`driver/conformance/manifest.go`](../../driver/conformance/manifest.go) and
+[`driver/conformance/manifest.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/driver/conformance/manifest.go) and
 the group implementations under
-[`driver/conformance/`](../../driver/conformance/).
+[`driver/conformance/`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/tree/main/driver/conformance).
 
 ## What conformance proves
 
@@ -61,7 +61,7 @@ flowchart TB
     VECTOR --> COMPARE[Compare full and strict]
 ```
 
-[`conformance.Run`](../../driver/conformance/run.go) validates the manifest,
+[`conformance.Run`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/driver/conformance/run.go) validates the manifest,
 opens one connection, builds the provider fixtures, and runs the profile
 subtests. Each profile uses isolated destinations derived from the run ID and
 profile name. The tracked connection records resources and touched
@@ -75,7 +75,7 @@ as the driver.
 
 ## Core contract tests and provider tests
 
-The shared package under [`driver/conformance/`](../../driver/conformance/)
+The shared package under [`driver/conformance/`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/tree/main/driver/conformance)
 must remain broker-independent. It imports the port and standard-library test
 support, not RabbitMQ, Kafka, or in-memory implementation packages. Its tests
 state the contract once so every adapter receives the same checks.
@@ -88,7 +88,7 @@ the port alone:
   deadline fixture.
 - `drivers/rabbitmq/conformance_test.go` adapts RabbitMQ queue and parked
   message inspection and uses the RabbitMQ fault injector from
-  [`drivers/rabbitmq/fault_injector_test.go`](../../drivers/rabbitmq/fault_injector_test.go).
+  [`drivers/rabbitmq/fault_injector_test.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/drivers/rabbitmq/fault_injector_test.go).
 - `drivers/kafka/conformance_test.go` adapts Kafka offsets, consumer-group
   state, deferred records, and the Kafka fault injector. Its `TestConformance`
   is gated by `F1_KAFKA_CONFORMANCE` because the live suite is intentionally
@@ -104,7 +104,7 @@ shared contract to accommodate a provider.
 `conformance.Run` runs two profiles on the same connection:
 
 - **Full** uses the capabilities reported by the live `driver.Conn`.
-- **Strict** applies [`Capabilities.Strict`](../../driver/capability.go),
+- **Strict** applies [`Capabilities.Strict`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/driver/capability.go),
   withdrawing native optimizations while preserving physical limits and
   semantic declarations such as ordered-by-key behavior and the broker's
   scaling model.
@@ -119,9 +119,9 @@ the connection cannot widen the driver's static ceiling, declared limits
 match accepted boundaries, unsupported operations return the standard
 classified error, and capability observations do not become behavior-vector
 events. The field-level source is
-[`driver/conformance/capability.go`](../../driver/conformance/capability.go);
+[`driver/conformance/capability.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/driver/conformance/capability.go);
 the capability definitions and strict transformation are in
-[`driver/capability.go`](../../driver/capability.go).
+[`driver/capability.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/driver/capability.go).
 
 A native capability is an optimization, not permission to change F1
 semantics. If the driver cannot provide a capability, the core must take its
@@ -147,12 +147,12 @@ enough for the suite to observe publish, receive, settle, drain, lag, and
 topology transitions.
 
 The topology group then checks the port's administrative behavior through
-[`driver.Admin`](../../driver/driver.go): creation, idempotency, existing and
+[`driver.Admin`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/driver/driver.go): creation, idempotency, existing and
 orphaned objects within scope, drift or verification, `TopologyNone`,
 description, purge, prune, and context cancellation. The group source is
-[`driver/conformance/topology.go`](../../driver/conformance/topology.go),
+[`driver/conformance/topology.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/driver/conformance/topology.go),
 while topology types and policy semantics live in
-[`driver/topology.go`](../../driver/topology.go).
+[`driver/topology.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/driver/topology.go).
 
 Inspection is test support, not a new production port. Do not add a broker
 depth or offset API to `driver.Conn` merely to make a conformance inspector
@@ -177,7 +177,7 @@ covers these port-level conditions:
 The failure group checks classification, recovery, absence of phantom
 messages, redelivery, delivery-count behavior, stale settlement, open
 `Messages` and `Errors` channels, and deterministic repeated fault sequences.
-See [`driver/conformance/failure.go`](../../driver/conformance/failure.go) and
+See [`driver/conformance/failure.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/driver/conformance/failure.go) and
 the provider injectors linked in the provider test section.
 
 The optional `DeadlineFixture` is separate from fault injection. It gives the
@@ -192,32 +192,32 @@ the useful reading guide, not a second test manifest:
 
 | Behavior | What the group protects | Source |
 | --- | --- | --- |
-| Publish | Durable visibility, empty and canceled calls, body/header/key preservation, partial and total failure, limits, concurrency, and flush/close behavior | [`publish.go`](../../driver/conformance/publish.go) |
-| Consume | Identity, delivery count, multi-destination intake, prefetch shares, pause/resume, start position, channel liveness, and cancellation | [`consume.go`](../../driver/conformance/consume.go) |
-| Settlement | Ack, requeue and discard nack, no double settlement, out-of-order accounting, concurrent settlement, and cancellation | [`settle.go`](../../driver/conformance/settle.go) |
-| Retry and redelivery | Transient recovery, delivery faults, redelivery count, stale settlement, and classified fatal errors at the driver boundary | [`failure.go`](../../driver/conformance/failure.go) |
-| Ordering | Equal-key receipt order, independent-key progress, requeued-key precedence, nil keys, and usable exclusive ordering | [`ordering.go`](../../driver/conformance/ordering.go) |
-| Deferred delivery | Due-time behavior, destination delay, auxiliary depth, and delivery-deadline interaction | [`deferred.go`](../../driver/conformance/deferred.go) |
-| Draining | Stop-fetch semantics, settleability after drain, open channels, refusal and timeout, idempotence, stop closure, and release redelivery | [`drain.go`](../../driver/conformance/drain.go) |
-| Rebalance | Work redistribution, per-consumer budgets, in-flight transfer, key ordering across ownership changes, and stable repeated departure | [`rebalance.go`](../../driver/conformance/rebalance.go) |
-| Lag | Per-destination coverage, backlog growth and fall, broker-depth agreement, and classified unsupported behavior | [`lag.go`](../../driver/conformance/lag.go) |
-| Topology | Admin policies, scope, drift, description, purge, prune, and cancellation | [`topology.go`](../../driver/conformance/topology.go) |
-| Capabilities | Declaration honesty, native and portable paths, limits, scaling, fanout, priority, and capability-report isolation | [`capability.go`](../../driver/conformance/capability.go) |
+| Publish | Durable visibility, empty and canceled calls, body/header/key preservation, partial and total failure, limits, concurrency, and flush/close behavior | [`publish.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/driver/conformance/publish.go) |
+| Consume | Identity, delivery count, multi-destination intake, prefetch shares, pause/resume, start position, channel liveness, and cancellation | [`consume.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/driver/conformance/consume.go) |
+| Settlement | Ack, requeue and discard nack, no double settlement, out-of-order accounting, concurrent settlement, and cancellation | [`settle.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/driver/conformance/settle.go) |
+| Retry and redelivery | Transient recovery, delivery faults, redelivery count, stale settlement, and classified fatal errors at the driver boundary | [`failure.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/driver/conformance/failure.go) |
+| Ordering | Equal-key receipt order, independent-key progress, requeued-key precedence, nil keys, and usable exclusive ordering | [`ordering.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/driver/conformance/ordering.go) |
+| Deferred delivery | Due-time behavior, destination delay, auxiliary depth, and delivery-deadline interaction | [`deferred.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/driver/conformance/deferred.go) |
+| Draining | Stop-fetch semantics, settleability after drain, open channels, refusal and timeout, idempotence, stop closure, and release redelivery | [`drain.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/driver/conformance/drain.go) |
+| Rebalance | Work redistribution, per-consumer budgets, in-flight transfer, key ordering across ownership changes, and stable repeated departure | [`rebalance.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/driver/conformance/rebalance.go) |
+| Lag | Per-destination coverage, backlog growth and fall, broker-depth agreement, and classified unsupported behavior | [`lag.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/driver/conformance/lag.go) |
+| Topology | Admin policies, scope, drift, description, purge, prune, and cancellation | [`topology.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/driver/conformance/topology.go) |
+| Capabilities | Declaration honesty, native and portable paths, limits, scaling, fanout, priority, and capability-report isolation | [`capability.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/driver/conformance/capability.go) |
 
 The suite tests driver-level retry and redelivery primitives. It does not
 reproduce the root worker's retry ladder or dead-letter successor publication;
-those semantics belong to [failure handling](../advanced-topics/failure-handling.md)
-and [consume flow](consume-flow.md).
+those semantics belong to [failure handling](/advanced-topics/failure-handling)
+and [consume flow](/development/consume-flow).
 
 ## Behavior vectors and reports
 
 Each check records only stable, observable events in a
-[`BehaviorVector`](../../driver/conformance/types.go). An event has an ID,
+[`BehaviorVector`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/driver/conformance/types.go). An event has an ID,
 outcome, optional attempt count, and final destination. The vector is ordered
 by observation, which makes differences attributable to a specific event
 rather than to broker-specific logs or timing.
 
-After both profiles finish, [`BehaviorVector.Diff`](../../driver/conformance/types.go)
+After both profiles finish, [`BehaviorVector.Diff`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/driver/conformance/types.go)
 compares length and event values position by position. A full-versus-strict
 difference fails the run. This catches a portable path that passes in
 isolation but changes the result when native capabilities are unavailable.
@@ -225,8 +225,8 @@ isolation but changes the result when native capabilities are unavailable.
 The report also records profile group status, declared and observed group
 counts, explicit fixture-gated skips, capability observations, and pending
 groups. `Run` logs a JSON report; the in-memory test additionally exercises the
-Markdown report writer. Use [`Report`](../../driver/conformance/types.go) and
-the report writers in [`run.go`](../../driver/conformance/run.go) when a
+Markdown report writer. Use [`Report`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/driver/conformance/types.go) and
+the report writers in [`run.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/driver/conformance/run.go) when a
 machine-readable or archived result is needed.
 
 ## Pending and unsupported checks
@@ -252,18 +252,18 @@ core must use the portable path. It must not skip a check merely because the
 driver does not implement an optional optimization.
 
 The authoritative pending list and group counts are in
-[`manifest.go`](../../driver/conformance/manifest.go). Do not copy the list or
+[`manifest.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/driver/conformance/manifest.go). Do not copy the list or
 counts into another document.
 
 ## Adding a driver
 
 When a new adapter is ready to implement the port, use this sequence:
 
-1. Implement the interfaces and behavioral rules in [Driver contract](driver-contract.md).
+1. Implement the interfaces and behavioral rules in [Driver contract](/development/driver-contract).
    Keep broker clients and physical destination logic inside the new
    `drivers/<name>/` package.
 2. Add a provider conformance test modeled on
-   [`drivers/inmem/conformance_test.go`](../../drivers/inmem/conformance_test.go)
+   [`drivers/inmem/conformance_test.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/drivers/inmem/conformance_test.go)
    or the connected adapters. Call `conformance.Run` with the driver,
    connection config, and an `InspectorFactory`.
 3. Implement an inspector that reads the broker's ready, unsettled, and
@@ -310,7 +310,7 @@ make broker-smoke
 F1_REQUIRE_RABBITMQ=1 go test -race -count=1 -run '^TestConformance$' ./drivers/rabbitmq/...
 ```
 
-The broader adapter command is [`make test-rabbitmq`](../../Makefile). Stop
+The broader adapter command is [`make test-rabbitmq`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/Makefile). Stop
 the fixture with `make broker-down` when the broker is no longer needed.
 
 For Kafka, use the dedicated Make target. It starts Kafka, sets the explicit
@@ -322,20 +322,20 @@ make test-kafka-conformance
 ```
 
 The target and its environment contract are defined in
-[`Makefile`](../../Makefile). Running `make test-kafka` exercises the regular
+[`Makefile`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/Makefile). Running `make test-kafka` exercises the regular
 Kafka driver suite, but does not opt into the gated conformance run. The
 Kafka test itself also documents why the gate exists in
-[`drivers/kafka/conformance_test.go`](../../drivers/kafka/conformance_test.go).
+[`drivers/kafka/conformance_test.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/drivers/kafka/conformance_test.go).
 
 When changing a port contract or adapter lifecycle, run the shared harness,
 the in-memory conformance, and the affected broker-backed suite. The repository
 CI definition shows the required Kafka conformance job in
-[`.gitlab-ci.yml`](../../.gitlab-ci.yml).
+[`.gitlab-ci.yml`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/.gitlab-ci.yml).
 
 ## Maintainer reading order
 
-Read [Architecture](architecture.md) for package ownership and import
-boundaries, then [Driver contract](driver-contract.md) for the port rules. Use
+Read [Architecture](/development/architecture) for package ownership and import
+boundaries, then [Driver contract](/development/driver-contract) for the port rules. Use
 this page to trace how those rules are tested. After that, read the specific
 group source and the provider's inspector or fault injector before changing a
 driver.

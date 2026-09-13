@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/twmb/franz-go/pkg/kadm"
 	"github.com/twmb/franz-go/pkg/kerr"
@@ -269,6 +270,54 @@ func TestTopologyVerifyRejectsUnsupportedDeliveryLimit(t *testing.T) {
 	}
 	if kind, ok := driver.Classify(err); !ok || kind != driver.KindFatal {
 		t.Fatalf("TopologyVerify classification = (%v,%t), want fatal", kind, ok)
+	}
+}
+
+// A deferred destination must survive TopologyVerify, and the successful call
+// must teach the connection the lane's delay: a consumer that does not learn it
+// delivers the record immediately instead of waiting for its due time.
+func TestTopologyVerifyPopulatesDeferredDestinationDelay(t *testing.T) {
+	ctx, connection, admin := openKafkaAdminTest(t)
+	destination := kafkaTestTopic(t, "verify-deferred")
+	group := kafkaTestTopic(t, "verify-deferred-group")
+	cleanupKafkaTopics(t, admin, destination)
+	cleanupKafkaGroups(t, admin, group)
+	createKafkaTopic(t, admin, ctx, destination, 1)
+
+	const delay = 2 * time.Second
+	if _, err := connection.Admin().EnsureTopology(ctx, driver.TopologySpec{
+		Policy:       driver.TopologyVerify,
+		Destinations: []driver.DestinationSpec{{Name: destination, Delay: delay}},
+		Effective:    connection.Capabilities(),
+	}); err != nil {
+		t.Fatalf("TopologyVerify with a deferred destination returned %v, want no error", err)
+	}
+
+	producer, err := connection.Producer(ctx, driver.ProducerConfig{Effective: connection.Capabilities()})
+	if err != nil {
+		t.Fatalf("Producer: %v", err)
+	}
+	t.Cleanup(func() { _ = producer.Close(context.Background()) })
+	consumer, err := connection.Consumer(ctx, driver.ConsumerConfig{
+		Group: group, Destinations: []string{destination}, Prefetch: 1, Effective: connection.Capabilities(),
+	})
+	if err != nil {
+		t.Fatalf("Consumer: %v", err)
+	}
+	t.Cleanup(func() { closeKafkaConsumer(consumer) })
+
+	due := kafkaNow().Add(delay)
+	if err := producer.Publish(ctx, driver.OutboundMessage{
+		Destination: destination, Body: []byte("deferred"), DelayUntil: due,
+	}); err != nil {
+		t.Fatalf("Publish: %v", err)
+	}
+	message := receiveKafkaMessageBefore(t, consumer, due.Add(2*time.Second))
+	if message.Destination != destination || message.ReceivedAt.Before(due) {
+		t.Fatalf("deferred delivery = %+v, want destination %q received at or after %s", message, destination, due)
+	}
+	if err := message.Settle.Ack(ctx); err != nil {
+		t.Fatalf("Ack: %v", err)
 	}
 }
 

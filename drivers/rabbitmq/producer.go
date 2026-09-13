@@ -4,7 +4,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
+	"slices"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -202,7 +205,7 @@ func (p *producer) publishWindow(ctx context.Context, msgs []driver.OutboundMess
 		// The window holds no duplicate id, so a match is this message.
 		if returnedErr, ok := returned[item.publishing.MessageId]; ok {
 			delete(returned, item.publishing.MessageId)
-			failed[item.index] = returnedErr
+			failed[item.index] = parkingFailure(item.routingKey, p.conn.queueKind, returnedErr)
 		}
 	}
 	return consumed, nil
@@ -319,6 +322,63 @@ func returnedPublishError(returned amqp.Return) error {
 		return classify("publish", driver.KindNotFound, errors.Join(driver.ErrDestinationMissing, reason))
 	}
 	return classify("publish", driver.KindFatal, reason)
+}
+
+// parkingSuffix turns a destination name into the name of its parking queue,
+// the queue a delayed or retried message waits in until its TTL expires. The
+// suffix is fixed: both the topology path that declares the queue and the
+// publish path that routes to it derive the name the same way.
+const parkingSuffix = ".park"
+
+// parkingFailure rewrites a not-found publish failure for a message that was
+// routed to a parking queue, so the failure names that queue and the topology
+// it needs. Nothing else routes a publish to a name carrying this suffix, so a
+// not-found there means the parking queue is missing, which is the one failure
+// whose cause an operator cannot recover from the broker's own words: the
+// broker returns 312 NO_ROUTE and never names the queue it could not route to.
+//
+// The queue is declared by the adapter under TopologyDeclare, checked under
+// TopologyVerify, and operator-provisioned under TopologyNone, so the message
+// states that split. Its declare arguments are rendered from parkingArguments
+// rather than copied into the text: the two had to be edited together before,
+// and an argument added there without a matching edit here would have told an
+// operator to create a queue the adapter would then report as drift. Durability
+// is a declare flag rather than an entry in that table, so the message states
+// it in words instead: the adapter declares the parking queue durable under
+// every queue kind, and an operator provisioning one under TopologyNone has
+// only this text to read. kind is the connection's own queue kind, because the
+// arguments differ by kind and the producer holds no other way back to it.
+// Classification is deliberately the wrapped error's own: this adds context
+// and changes no kind.
+func parkingFailure(routingKey string, kind queueKind, err error) error {
+	if !strings.HasSuffix(routingKey, parkingSuffix) || !errors.Is(err, driver.ErrDestinationMissing) {
+		return err
+	}
+	destination := strings.TrimSuffix(routingKey, parkingSuffix)
+	return fmt.Errorf(
+		"rabbitmq: parking destination %q is missing: a delayed or retried message is parked there"+
+			" until its delay expires, so the adapter declares the queue durable under TopologyDeclare"+
+			" and requires it under TopologyVerify, and under TopologyNone the operator provisions it"+
+			" with the declare arguments %s: %w",
+		routingKey, declareArgumentsText(parkingArguments(destination, kind)), err,
+	)
+}
+
+// declareArgumentsText renders a queue's declare arguments as key=value pairs
+// in sorted key order, so the same queue configuration always produces the
+// same operator-facing text. String values are quoted, which keeps the empty
+// string that x-dead-letter-exchange uses for the default exchange visible.
+func declareArgumentsText(args amqp.Table) string {
+	keys := slices.Sorted(maps.Keys(args))
+	parts := make([]string, 0, len(keys))
+	for _, key := range keys {
+		if text, ok := args[key].(string); ok {
+			parts = append(parts, key+"="+strconv.Quote(text))
+			continue
+		}
+		parts = append(parts, fmt.Sprintf("%s=%v", key, args[key]))
+	}
+	return strings.Join(parts, ", ")
 }
 
 func amqpPublishing(message driver.OutboundMessage) (amqp.Publishing, error) {

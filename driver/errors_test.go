@@ -49,6 +49,66 @@ func TestPublishError_EmptyFailedIsRejected(t *testing.T) {
 	}
 }
 
+func TestPublishError_ErrorNamesTheCauseAtTheLowestIndex(t *testing.T) {
+	t.Parallel()
+
+	tests := map[string]struct {
+		failed map[int]error
+		want   string
+	}{
+		"one failure": {
+			failed: map[int]error{0: errors.New("connection reset")},
+			want:   "f1/driver: 1 of the published messages failed; first at index 0: connection reset",
+		},
+		"first cause at a non-zero index": {
+			failed: map[int]error{
+				2: errors.New("missing destination"),
+				3: errors.New("too large"),
+				4: errors.New("connection reset"),
+				5: errors.New("denied"),
+			},
+			want: "f1/driver: 4 of the published messages failed; first at index 2: missing destination",
+		},
+		"nil entry below the first cause": {
+			failed: map[int]error{0: nil, 1: errors.New("connection reset"), 4: errors.New("too large")},
+			want:   "f1/driver: 3 of the published messages failed; first at index 1: connection reset",
+		},
+		"every entry nil": {
+			failed: map[int]error{0: nil, 3: nil},
+			want:   "f1/driver: 2 of the published messages failed",
+		},
+	}
+	for name, test := range tests {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			err := &PublishError{Failed: test.failed}
+			if got := err.Error(); got != test.want {
+				t.Fatalf("PublishError.Error() = %q, want %q", got, test.want)
+			}
+		})
+	}
+}
+
+func TestPublishError_ErrorNamesTheCauseThroughARetryWrap(t *testing.T) {
+	t.Parallel()
+
+	// A successor publication that fails leaves the retry path wrapping the
+	// partial publish in a driver Error, so this is the text an operator reads
+	// for a refused retry: the wrapper, then the partial failure with its
+	// cause, then the wrapper's kind.
+	pe := &PublishError{Failed: map[int]error{
+		0: errors.New(`rabbitmq: parking destination "orders" is missing`),
+	}}
+	err := &Error{Driver: "rabbitmq", Op: "retry", K: KindNotFound, Err: pe}
+
+	const before = "f1/rabbitmq: retry: f1/driver: 1 of the published messages failed (not_found)"
+	want := `f1/rabbitmq: retry: f1/driver: 1 of the published messages failed; ` +
+		`first at index 0: rabbitmq: parking destination "orders" is missing (not_found)`
+	if got := err.Error(); got != want {
+		t.Fatalf("retry-wrapped PublishError.Error() = %q, want %q; before it was %q", got, want, before)
+	}
+}
+
 func TestPublishError_UnwrapsPerMessageCauses(t *testing.T) {
 	t.Parallel()
 

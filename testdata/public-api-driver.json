@@ -42,6 +42,7 @@
     "Kind.String",
     "KindFatal",
     "KindNotFound",
+    "KindNotification",
     "KindPermission",
     "KindTooLarge",
     "KindTransient",

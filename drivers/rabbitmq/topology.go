@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"time"
 
 	amqp "github.com/rabbitmq/amqp091-go"
 
@@ -73,7 +74,7 @@ func (a *adminOperations) ensureTopology(ctx context.Context, spec driver.Topolo
 			delete(a.conn.deferred, destination.Name)
 		}
 		a.conn.mu.Unlock()
-		args := queueArguments(destination, a.conn.queueKind)
+		args := queueArguments(destination, a.conn.queueKind, a.conn.consumerTimeout)
 		exists, err := a.queueExists(ctx, destination.Name, destination.Durable, args)
 		if err != nil {
 			return driver.TopologyDiff{}, err
@@ -165,7 +166,7 @@ func (a *adminOperations) verifyTopology(ctx context.Context, spec driver.Topolo
 		if destination.Name == "" {
 			return driver.TopologyDiff{}, classify("ensure_topology", driver.KindFatal, errors.New("destination name is empty"))
 		}
-		mainArgs := queueArguments(destination, a.conn.queueKind)
+		mainArgs := queueArguments(destination, a.conn.queueKind, a.conn.consumerTimeout)
 		if exists, err := a.queueExists(ctx, destination.Name, destination.Durable, mainArgs); err != nil {
 			return driver.TopologyDiff{}, err
 		} else if !exists {
@@ -174,7 +175,8 @@ func (a *adminOperations) verifyTopology(ctx context.Context, spec driver.Topolo
 		diff.ExistingDestinations = append(diff.ExistingDestinations, destination.Name)
 		drifted, err := a.argumentDrift(ctx, destination.Name, mainArgs)
 		if err != nil {
-			return driver.TopologyDiff{}, classify("ensure_topology", driver.KindTransient, fmt.Errorf("rabbitmq: argument drift verification unavailable for %q: %w", destination.Name, err))
+			purpose := fmt.Sprintf("argument drift verification for destination %q", destination.Name)
+			return driver.TopologyDiff{}, classify("ensure_topology", driver.KindTransient, a.managementUnavailable(purpose, err))
 		}
 		diff.Drifted = append(diff.Drifted, drifted...)
 		a.conn.mu.Lock()
@@ -195,7 +197,8 @@ func (a *adminOperations) verifyTopology(ctx context.Context, spec driver.Topolo
 			diff.ExistingDestinations = append(diff.ExistingDestinations, parkName)
 			parkDrifted, err := a.argumentDrift(ctx, parkName, parkArgs)
 			if err != nil {
-				return driver.TopologyDiff{}, classify("ensure_topology", driver.KindTransient, fmt.Errorf("rabbitmq: argument drift verification unavailable for %q: %w", parkName, err))
+				purpose := fmt.Sprintf("argument drift verification for parking destination %q", parkName)
+				return driver.TopologyDiff{}, classify("ensure_topology", driver.KindTransient, a.managementUnavailable(purpose, err))
 			}
 			diff.Drifted = append(diff.Drifted, parkDrifted...)
 		}
@@ -230,12 +233,9 @@ func (a *adminOperations) currentBindings(ctx context.Context) (map[bindingKey]s
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	if a.conn.management == nil {
-		return nil, errors.New("rabbitmq: binding verification unsupported: management client is unavailable")
-	}
 	bindings, err := a.conn.management.listBindings(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("rabbitmq: binding verification unavailable: %w", err)
+		return nil, a.managementUnavailable("binding verification", err)
 	}
 	actual := make(map[bindingKey]struct{}, len(bindings))
 	for _, binding := range bindings {
@@ -247,6 +247,22 @@ func (a *adminOperations) currentBindings(ctx context.Context) (map[bindingKey]s
 	return actual, nil
 }
 
+// managementUnavailable wraps a failure to reach the broker's management HTTP
+// API with the deployment action that resolves it. The subscription path
+// cannot do this inspection over AMQP: a passive declare confirms a queue's
+// name but reports none of its arguments, so bindings and argument values are
+// visible only through management, and an unreachable API fails subscription
+// topology under TopologyDeclare and TopologyVerify rather than degrading -
+// the orphan scan is the one inspection that only records the limitation.
+//
+// The message names the endpoint that was tried because it is derived rather
+// than configured - the AMQP host with the AMQP port plus 10000 - so the
+// common failure on a broker whose management plugin is disabled, firewalled,
+// or on another port is otherwise indistinguishable from a broker that is down.
+func (a *adminOperations) managementUnavailable(purpose string, err error) error {
+	return fmt.Errorf("rabbitmq: %s requires the management API at %s (enable the RabbitMQ management plugin, or set rabbitmq.managementPort when management does not listen on the AMQP port plus 10000): %w", purpose, a.conn.management.baseURL, err)
+}
+
 // argumentDrift compares the arguments a destination was declared with
 // against what the broker actually holds, read through the management API
 // because AMQP's QueueDeclarePassive checks the queue's name only and
@@ -254,13 +270,14 @@ func (a *adminOperations) currentBindings(ctx context.Context) (map[bindingKey]s
 // only keys present in want are checked, so broker-added arguments outside
 // want never appear as drift.
 //
-// A nil management client, or any failure reaching it, is returned as an
-// error rather than folded into an empty result: TopologyVerify must be able
-// to say "this was not checked" instead of silently reporting a clean diff.
+// A failure reaching the management client is returned as an error rather
+// than folded into an empty result: TopologyVerify must be able to say "this
+// was not checked" instead of silently reporting a clean diff. The client
+// itself is never absent, because newConn is the only construction of a conn
+// the port hands out, it fails Open when newManagementClient cannot build
+// one, and nothing reassigns the field, so the only failure to report here is
+// reaching the broker rather than a missing client.
 func (a *adminOperations) argumentDrift(ctx context.Context, name string, want amqp.Table) ([]driver.ArgumentDrift, error) {
-	if a.conn.management == nil {
-		return nil, errors.New("rabbitmq: argument drift verification unsupported: management client is unavailable")
-	}
 	if len(want) == 0 {
 		return nil, nil
 	}
@@ -429,6 +446,34 @@ func validateExchange(exchange driver.ExchangeSpec) error {
 	}
 }
 
+// consumerTimeoutOption is the DriverOptions key carrying the per-queue
+// consumer timeout.
+const consumerTimeoutOption = "rabbitmq.consumerTimeout"
+
+// resolveConsumerTimeout reads the consumer timeout this driver declares as
+// x-consumer-timeout on every quorum destination queue. An absent option
+// declares nothing, leaving the broker's own timeout in force instead of
+// imposing this driver's choice on a deployment that never made one.
+//
+// A present option must be at least a millisecond. The broker reads the
+// argument as whole milliseconds, and a value that truncates to zero cancels
+// every consumer on the queue on its first delivery, so accepting it would
+// turn a typo into a subscription that never keeps a message.
+func resolveConsumerTimeout(options map[string]string) (time.Duration, error) {
+	configured, present := options[consumerTimeoutOption]
+	if !present {
+		return 0, nil
+	}
+	timeout, err := time.ParseDuration(configured)
+	if err != nil {
+		return 0, fmt.Errorf("rabbitmq: invalid %s %q: %w", consumerTimeoutOption, configured, err)
+	}
+	if timeout < time.Millisecond {
+		return 0, fmt.Errorf("rabbitmq: invalid %s %q: want at least 1ms, because the broker reads x-consumer-timeout in whole milliseconds and zero cancels every consumer immediately", consumerTimeoutOption, configured)
+	}
+	return timeout, nil
+}
+
 // queueArguments builds the declare-time arguments for a destination queue.
 // When the queue is quorum-kind and spec carries a dead-letter route, it adds
 // x-dead-letter-strategy and x-overflow alongside the route so the broker's
@@ -437,9 +482,18 @@ func validateExchange(exchange driver.ExchangeSpec) error {
 // dropping any one of them downgrades dead-lettering to at-most-once with no
 // error from the broker, so a future edit that removes one of the three
 // reintroduces silent message loss and no test outside this file will fail.
-func queueArguments(spec driver.DestinationSpec, kind queueKind) amqp.Table {
+//
+// x-consumer-timeout is quorum-only. RabbitMQ 4.3 answers a classic queue
+// declared with it with a 406 PRECONDITION_FAILED - invalid arg
+// 'x-consumer-timeout' - which closes the channel, so declaring it on a
+// classic-configured connection would fail every declare rather than being
+// quietly ignored.
+func queueArguments(spec driver.DestinationSpec, kind queueKind, consumerTimeout time.Duration) amqp.Table {
 	args := amqp.Table{}
 	args["x-queue-type"] = string(kind)
+	if kind == queueKindQuorum && consumerTimeout > 0 {
+		args["x-consumer-timeout"] = consumerTimeout.Milliseconds()
+	}
 	if spec.DeliveryLimit > 0 {
 		if spec.DeliveryLimit > 2147483647 {
 			spec.DeliveryLimit = 2147483647

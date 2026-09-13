@@ -7,7 +7,7 @@ priority scheduling, zero-loss shutdown, and observability. The message broker i
 driver, swapped by configuration.
 
 This file states what must be true of F1: the guarantees it owes a service author, and the things it
-deliberately does not do. For the code tour, start with [`docs/`](docs/README.md).
+deliberately does not do. For the code tour, start with [`docs/`](docs/index.md).
 
 ## Guarantees
 
@@ -15,6 +15,7 @@ Each of these is testable. The current CI pipeline runs the build, unit, lint, b
 API-diff, import-boundary, and self-contained gates listed in [`.gitlab-ci.yml`](.gitlab-ci.yml);
 the [Makefile](Makefile) owns the corresponding local command set.
 
+<!-- #region guarantees -->
 - **At-least-once delivery, with a stable message identity.** Transport redelivers during failures
   and rolling restarts - that is the guarantee, not a bug. F1 generates an event id, uses it as the
   idempotency key by default, and preserves that key across every retry, dead-letter and
@@ -40,9 +41,11 @@ the [Makefile](Makefile) owns the corresponding local command set.
   requested feature is unavailable under that driver.
 - **Broker agnostic.** The core depends on the `driver` port, not a broker client. Concrete drivers
   are selected by the application and import-boundary linting is enforced by `make verify-agnostic`.
+<!-- #endregion guarantees -->
 
 ## Non-goals for v1
 
+<!-- #region non-goals -->
 - Exactly-once *transport* (Kafka transactions), and exactly-once *effects*. At-least-once delivery
   is the guarantee.
 - SDK-owned deduplication. F1 supplies a stable idempotency key; the application owns effect
@@ -60,6 +63,7 @@ the [Makefile](Makefile) owns the corresponding local command set.
   its connected capability report exposes partition-bound scaling and the core-emulated paths for
   delay, delivery count, and dead-letter behavior.
 - Multiple broker versions per broker. The RabbitMQ adapter targets one stable broker family.
+<!-- #endregion non-goals -->
 
 ## Install
 
@@ -75,6 +79,18 @@ Set `GOPRIVATE=fgit.zapps.vn` before the first `go get` of this module - it live
 host, and without this the Go toolchain will try the public checksum database and proxy, which
 cannot see it.
 
+## Local documentation site
+
+The Markdown under `docs/` is also available as a local VitePress site. Use Node.js 18 or newer,
+then install the pinned dependencies and choose a command:
+
+```sh
+npm ci
+npm run docs:dev       # live authoring server
+npm run docs:build     # static output under docs/.vitepress/dist
+npm run docs:preview   # preview the last build
+```
+
 ## Quickstart with RabbitMQ
 
 This repository includes two separate services that use the public SDK API against the local
@@ -83,6 +99,14 @@ tests and acceptance runs. The services share `examples/config.yaml`;
 change the broker endpoint there when using a real broker. The development config sets
 `topology.autoCreate: true` so the publisher can declare its entry point. Production should
 provision topology separately and leave auto-creation disabled.
+
+The fixture's RabbitMQ image includes the management plugin. The consumer's subscription path
+requires that plugin's HTTP API: it reads bindings, and under startup verification the broker's
+queue arguments, through it, so a broker whose management plugin is disabled, firewalled, or on a
+non-default port fails at subscription start. The API defaults to the AMQP host with the AMQP port
+plus 10000, which is 15672 for the fixture; set `broker.rabbitmq.managementPort` when it listens
+elsewhere. `TopologyNone` is the only policy that starts a subscription without the management API,
+and it requires the topology to already exist.
 
 From a clean checkout:
 
@@ -140,7 +164,7 @@ and the [Google Go Style Guide](https://google.github.io/styleguide/go/guide.htm
 
 Start with these local documents:
 
-- [`docs/README.md`](docs/README.md) - choose between the service-author guides and the maintainer runtime guide.
-- [`docs/user-guide/getting-started.md`](docs/user-guide/getting-started.md) - install and connect the SDK in a Go service.
+- [`docs/index.md`](docs/index.md) - documentation home: guarantees at a glance and a path for service authors, runtime readers, and driver authors.
+- [`docs/learn/getting-started.md`](docs/learn/getting-started.md) - install and connect the SDK in a Go service.
 - [`docs/development/architecture.md`](docs/development/architecture.md) - current package boundaries and invariants.
 - This README - product guarantees, non-goals, installation, and quickstart.

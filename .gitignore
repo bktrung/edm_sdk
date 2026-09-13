@@ -1,6 +1,9 @@
 # Build output
 /bin/
 /dist/
+docs/.vitepress/cache/
+docs/.vitepress/.temp/
+docs/.vitepress/dist/
 *.exe
 *.test
 
@@ -22,3 +25,4 @@ coverage.html
 .DS_Store
 .idea/
 *.swp
+/node_modules/

@@ -8,6 +8,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -154,7 +156,8 @@ func runProfile(
 	injectFactory func(driver.Conn) (FaultInjector, error),
 ) ProfileReport {
 	effective := effectiveCapabilities(conn.Capabilities(), profile)
-	destination := "conformance.inspect." + runID + "." + profile.String() + ".probe"
+	inspectScope := "conformance.inspect." + runID + "." + profile.String() + "."
+	destination := inspectScope + "probe"
 	var producer driver.Producer
 	var consumer driver.Consumer
 	messages := make([]driver.InboundMessage, 0, 2)
@@ -163,7 +166,7 @@ func runProfile(
 	})
 	_, err := conn.Admin().EnsureTopology(ctx, driver.TopologySpec{
 		Destinations: []driver.DestinationSpec{{Name: destination}},
-		Scope:        []string{"conformance.inspect." + runID + "." + profile.String() + "."},
+		Scope:        []string{inspectScope},
 		Effective:    effective,
 	})
 	if err != nil {
@@ -237,6 +240,14 @@ func runProfile(
 	result := ProfileReport{Profile: profile, Vector: BehaviorVector{}, Groups: []GroupResult{}}
 	profileFailed := false
 	tracked := newTrackedConn(conn)
+	// Registered before the first check can create anything, and on the
+	// profile's own test, so a passing profile, a profile aborted by a fatal
+	// assertion and a panic recovered by the testing package all reach it.
+	t.Cleanup(func() {
+		for _, err := range tracked.reclaimRun(ctx, runID) {
+			t.Errorf("conformance %s profile reclaim: %v", profile, err)
+		}
+	})
 	for _, entry := range groupManifest {
 		runner, runnerExists := groupRunners[entry.name]
 		if !runnerExists {
@@ -312,6 +323,10 @@ type trackedConn struct {
 	producers map[*trackedProducer]struct{}
 	consumers map[*trackedConsumer]struct{}
 	touched   map[string]struct{}
+	// created holds every name touched so far in this profile, where touched
+	// holds only the current group's. touched drives a failed group's cleanup;
+	// created drives the reclaim the whole profile runs on its way out.
+	created map[string]struct{}
 }
 
 func newTrackedConn(conn driver.Conn) *trackedConn {
@@ -320,6 +335,7 @@ func newTrackedConn(conn driver.Conn) *trackedConn {
 		producers: make(map[*trackedProducer]struct{}),
 		consumers: make(map[*trackedConsumer]struct{}),
 		touched:   make(map[string]struct{}),
+		created:   make(map[string]struct{}),
 	}
 }
 
@@ -335,7 +351,22 @@ func (c *trackedConn) rememberDestination(name string) {
 	}
 	c.mu.Lock()
 	c.touched[name] = struct{}{}
+	c.created[name] = struct{}{}
 	c.mu.Unlock()
+}
+
+// touchedDestinations is the names the current group has used so far.
+func (c *trackedConn) touchedDestinations() []string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return slices.Sorted(maps.Keys(c.touched))
+}
+
+// createdDestinations is every name the profile has used, across all groups.
+func (c *trackedConn) createdDestinations() []string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return slices.Sorted(maps.Keys(c.created))
 }
 
 func (c *trackedConn) Admin() driver.Admin {
@@ -378,35 +409,105 @@ func (c *trackedConn) Consumer(ctx context.Context, cfg driver.ConsumerConfig) (
 	return tracked, nil
 }
 
+// cleanup reclaims the destinations the current group created, and is called
+// before the next group starts when a group fails. Purging alone would leave
+// every one of them on the broker, because Purge empties a destination and
+// keeps it and Prune is the port's only deletion operation.
 func (c *trackedConn) cleanup(ctx context.Context) []error {
-	c.mu.Lock()
-	producers := make([]*trackedProducer, 0, len(c.producers))
-	for producer := range c.producers {
-		producers = append(producers, producer)
+	consumers, producers := c.trackedHandles()
+	return c.reclaim(ctx, consumers, producers, c.touchedDestinations())
+}
+
+// reclaimRun reclaims every destination the profile created, whether the checks
+// that created them passed or failed. It runs from a test cleanup registered
+// before the first check, so a fatal assertion, a skipped check and a panic
+// recovered by the testing package all reach it. A process killed outright is
+// the one exit it cannot cover, and no exit inside the process can, because a
+// later run must not delete the destinations of a run still using them.
+func (c *trackedConn) reclaimRun(ctx context.Context, runID string) []error {
+	recorded := c.createdDestinations()
+	orphaned, err := c.discoverRunDestinations(ctx, runID, recorded)
+	var errs []error
+	if err != nil {
+		// The prune set is still usable, just not complete, and saying so is
+		// the difference between a short reclaim and an unexplained one.
+		errs = append(errs, err)
 	}
+	destinations := slices.Compact(slices.Sorted(slices.Values(append(recorded, orphaned...))))
+	consumers, producers := c.trackedHandles()
+	return append(errs, c.reclaim(ctx, consumers, producers, destinations)...)
+}
+
+// discoverRunDestinations reads the run's remaining destinations off the broker
+// under the same first name component as a destination this profile recorded.
+// The tracked set is filled by the port wrappers, which cannot see a
+// destination a check created on a connection it opened for itself, so the
+// prune set is completed from the broker rather than trusted to the
+// bookkeeping. The scope is derived from each head rather than fixed, because
+// the run id sits after a destination's own first component and not at the
+// front of it, so no single prefix covers a run.
+func (c *trackedConn) discoverRunDestinations(ctx context.Context, runID string, recorded []string) ([]string, error) {
+	if runID == "" {
+		return nil, nil
+	}
+	seen := make(map[string]struct{}, len(recorded))
+	scopes := make([]string, 0, len(recorded))
+	for _, destination := range recorded {
+		head, _, ok := strings.Cut(destination, ".")
+		if !ok {
+			continue
+		}
+		scope := head + "." + runID + "."
+		if _, duplicate := seen[scope]; duplicate {
+			continue
+		}
+		seen[scope] = struct{}{}
+		scopes = append(scopes, scope)
+	}
+	if len(scopes) == 0 {
+		return nil, nil
+	}
+	diff, err := c.Conn.Admin().EnsureTopology(ctx, driver.TopologySpec{
+		Scope:     scopes,
+		Effective: c.Capabilities(),
+	})
+	if err != nil {
+		return nil, fmt.Errorf("discover run destinations: %w", err)
+	}
+	orphaned := make([]string, 0, len(diff.Orphaned))
+	for _, orphan := range diff.Orphaned {
+		orphaned = append(orphaned, orphan.Name)
+	}
+	return orphaned, nil
+}
+
+func (c *trackedConn) trackedHandles() ([]*trackedConsumer, []*trackedProducer) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	consumers := make([]*trackedConsumer, 0, len(c.consumers))
 	for consumer := range c.consumers {
 		consumers = append(consumers, consumer)
 	}
-	destinations := make([]string, 0, len(c.touched))
-	for destination := range c.touched {
-		destinations = append(destinations, destination)
+	producers := make([]*trackedProducer, 0, len(c.producers))
+	for producer := range c.producers {
+		producers = append(producers, producer)
 	}
-	c.mu.Unlock()
-	sort.Strings(destinations)
+	return consumers, producers
+}
 
+func (c *trackedConn) reclaim(ctx context.Context, consumers []*trackedConsumer, producers []*trackedProducer, destinations []string) []error {
 	var errs []error
+	// Consumers first: a destination with one still attached is refused by
+	// Prune, and a refused release is the difference between a destination that
+	// comes back later and one that stays on the broker.
 	for _, consumer := range consumers {
 		if err := consumer.Release(ctx); err != nil {
 			errs = append(errs, err)
 		}
 	}
-	maintenance, ok := c.Conn.Admin().(driver.Maintenance)
-	if ok {
-		for _, destination := range destinations {
-			if _, err := maintenance.Purge(ctx, destination); err != nil && !errors.Is(err, driver.ErrDestinationMissing) {
-				errs = append(errs, err)
-			}
+	for _, destination := range destinations {
+		if err := purgeAndPruneIfSupported(ctx, c.Conn, destination); err != nil {
+			errs = append(errs, err)
 		}
 	}
 	for _, producer := range producers {

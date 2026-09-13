@@ -5,19 +5,19 @@ message model. The model separates the application contract, the wire
 metadata, and the driver transport so application code does not need to know
 which messaging system is underneath it.
 
-If you are new to F1, read [Getting started](../learn/getting-started.md) first. This
+If you are new to F1, read [Getting started](/learn/getting-started) first. This
 page explains what the message-related types mean and how to use them safely.
 
 ## Start with the right type
 
-F1 has several types with “message” in their role. They are not interchangeable:
+F1 has several types with "message" in their role. They are not interchangeable:
 
-| You need to… | Use | Owned by |
+| You need to... | Use | Owned by |
 | --- | --- | --- |
-| Handle one delivered event | [`f1.Event`](../../event.go) | Application handler |
-| Describe one item in a publish batch | [`f1.Message`](../../publisher.go) | Publisher API |
-| Carry canonical metadata | [`f1.Envelope`](../../envelope.go) | F1 wire contract |
-| Adapt to a transport | [`driver.InboundMessage`](../../driver/message.go) and [`driver.OutboundMessage`](../../driver/message.go) | Driver implementation |
+| Handle one delivered event | [`f1.Event`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/event.go) | Application handler |
+| Describe one item in a publish batch | [`f1.Message`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/publisher.go) | Publisher API |
+| Carry canonical metadata | [`f1.Envelope`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/envelope.go) | F1 wire contract |
+| Adapt to a transport | [`driver.InboundMessage`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/driver/message.go) and [`driver.OutboundMessage`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/driver/message.go) | Driver implementation |
 
 The usual application path is:
 
@@ -70,17 +70,17 @@ different jobs:
 
 The most common metadata options are:
 
-- `WithKey` — sets the partition/routing key and takes precedence over the
+- `WithKey` - sets the partition/routing key and takes precedence over the
   subject and generated event ID;
-- `WithSubject` — records the business subject and supplies the default key
+- `WithSubject` - records the business subject and supplies the default key
   when no key is provided;
-- `WithIdempotencyKey` — carries the stable application deduplication key;
-- `WithHeader` — adds a user-defined extension header;
-- `WithCorrelationID` and `WithCausedBy` — connect events in one workflow; and
-- `WithExpiry` and `WithMaxAttempts` — constrain delivery lifetime and retry
+- `WithIdempotencyKey` - carries the stable application deduplication key;
+- `WithHeader` - adds a user-defined extension header;
+- `WithCorrelationID` and `WithCausedBy` - connect events in one workflow; and
+- `WithExpiry` and `WithMaxAttempts` - constrain delivery lifetime and retry
   attempts.
 
-See [`PublishOption`](../../publisher.go) for the complete option contract.
+See [`PublishOption`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/publisher.go) for the complete option contract.
 
 ## Publish a batch
 
@@ -164,7 +164,7 @@ different logical topic.
 
 ## Metadata and the envelope
 
-An [`Envelope`](../../envelope.go) is the canonical metadata F1 serializes as
+An [`Envelope`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/envelope.go) is the canonical metadata F1 serializes as
 message headers. It is separate from the payload body. The envelope carries
 several kinds of information:
 
@@ -263,15 +263,15 @@ copy of the envelope and body plus the failure reason and last error.
 
 Read these symbols when the behavior matters:
 
-- [`Event`](../../event.go) — handler-facing identity, metadata, raw body, and
+- [`Event`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/event.go) - handler-facing identity, metadata, raw body, and
   decoding;
-- [`Envelope`](../../envelope.go) — canonical wire metadata and header limits;
-- [`Publisher`](../../publisher.go) — publish, batch results, and message
+- [`Envelope`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/envelope.go) - canonical wire metadata and header limits;
+- [`Publisher`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/publisher.go) - publish, batch results, and message
   options;
-- [`HandlerFunc`](../../handler.go) — function handlers and context delivery;
-- [`Subscription`](../../subscription.go) — routing, retry, and unmatched
+- [`HandlerFunc`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/handler.go) - function handlers and context delivery;
+- [`Subscription`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/subscription.go) - routing, retry, and unmatched
   event policy;
-- [`driver.InboundMessage`](../../driver/message.go) — the lower-level driver
+- [`driver.InboundMessage`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/driver/message.go) - the lower-level driver
   transport contract; and
-- [`codec.Codec`](../../codec/codec.go) — the payload encoding and decoding
+- [`codec.Codec`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/codec/codec.go) - the payload encoding and decoding
   contract.

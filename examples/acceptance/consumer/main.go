@@ -3,6 +3,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -32,6 +33,7 @@ func main() {
 
 	service := envString("F1_ACCEPTANCE_CONSUMER_SERVICE", "acceptance-consumer")
 	topic := envString("F1_ACCEPTANCE_TOPIC", "acceptance.message")
+	subscription := envString("F1_ACCEPTANCE_SUBSCRIPTION", "acceptance-consumer")
 	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
 	var handled atomic.Int64
 	var retried atomic.Int64
@@ -55,9 +57,17 @@ func main() {
 	}
 	limits := client.Limits()
 	logger.Info("consumer limits", "driver", limits.Driver, "broker", limits.Broker, "features", limits.Features)
+	// The slog line is the operator-facing form; the harness reads this one. An
+	// encode failure is not fatal: the app keeps consuming, and the harness
+	// reports the missing line.
+	if encodedLimits, encodeErr := json.Marshal(limitsReportOf(limits)); encodeErr != nil {
+		fmt.Printf("LIMITS_ERROR error=%v\n", encodeErr)
+	} else {
+		fmt.Printf("LIMITS %s\n", encodedLimits)
+	}
 
 	runner, err := client.Subscribe(ctx, f1.Subscription{
-		Name:            envString("F1_ACCEPTANCE_SUBSCRIPTION", "acceptance-consumer"),
+		Name:            subscription,
 		Topics:          []string{topic},
 		Concurrency:     1,
 		Prefetch:        16,
@@ -67,7 +77,10 @@ func main() {
 		UnmatchedPolicy: f1.DeadLetter,
 		OnDeadLetter: func(_ context.Context, dead f1.DeadLettered) {
 			deadLettered.Add(1)
-			fmt.Printf("DEAD_LETTER id=%s reason=%s attempt=%d error=%v\n", dead.Envelope.ID, dead.Reason, dead.Attempt, dead.LastErr)
+			var deadBody message
+			_ = json.Unmarshal(dead.Body, &deadBody)
+			fmt.Printf("DEAD_LETTER id=%s key=%s sequence=%d reason=%s attempt=%d destination=%s error=%v\n",
+				dead.Envelope.ID, dead.Envelope.IdempotencyKey, deadBody.Sequence, dead.Reason, dead.Attempt, dead.Destination, dead.LastErr)
 		},
 		Handlers: map[string]f1.Handler{
 			eventType: f1.HandlerFunc(func(_ context.Context, event *f1.Event) error {
@@ -86,7 +99,8 @@ func main() {
 					return f1.Terminal(errors.New("planned permanent failure"))
 				}
 				handled.Add(1)
-				fmt.Printf("HANDLED id=%s sequence=%d attempt=%d\n", event.ID(), payload.Sequence, event.Attempt())
+				fmt.Printf("HANDLED id=%s key=%s sequence=%d attempt=%d destination=%s\n",
+					event.ID(), event.IdempotencyKey(), payload.Sequence, event.Attempt(), topic)
 				return nil
 			}),
 		},
@@ -96,6 +110,13 @@ func main() {
 		_ = client.Close(context.Background())
 		return
 	}
+
+	// The driver-flip harness reads this line and then waits for the subscription
+	// itself: this prints when Subscribe returns, and the destinations are
+	// created later, at the top of the runner's loop. A publish that arrives in
+	// between is refused with ErrDestinationMissing on a broker that fans out at
+	// publish time rather than held for the subscriber that is about to appear.
+	fmt.Printf("CONSUMER_READY driver=%s topic=%s subscription=%s\n", cfg.Broker.Driver, topic, subscription)
 
 	runErr := make(chan error, 1)
 	go func() { runErr <- runner.Run(ctx) }()
@@ -164,4 +185,44 @@ func envString(key, fallback string) string {
 		return value
 	}
 	return fallback
+}
+
+// limitsReport is the machine-readable form of Client.Limits() that the
+// driver-flip harness compares between two driver runs. The slog line above it
+// stays because it is the operator-facing form.
+type limitsReport struct {
+	Driver   string          `json:"driver"`
+	Broker   string          `json:"broker"`
+	Features []featureReport `json:"features"`
+}
+
+type featureReport struct {
+	Feature string `json:"feature"`
+	Mode    string `json:"mode"`
+	Detail  string `json:"detail,omitempty"`
+}
+
+func limitsReportOf(limits f1.Limits) limitsReport {
+	report := limitsReport{Driver: limits.Driver, Broker: limits.Broker}
+	for _, status := range limits.Features {
+		report.Features = append(report.Features, featureReport{
+			Feature: status.Feature,
+			Mode:    featureModeName(status.Mode),
+			Detail:  status.Detail,
+		})
+	}
+	return report
+}
+
+// featureModeName names a FeatureMode for the machine-readable report. It is
+// local because the core's equivalent is unexported.
+func featureModeName(mode f1.FeatureMode) string {
+	switch mode {
+	case f1.FeatureNative:
+		return "native"
+	case f1.FeatureEmulated:
+		return "emulated"
+	default:
+		return "unavailable"
+	}
 }

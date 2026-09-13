@@ -63,14 +63,29 @@ type lane struct {
 	channel     *amqp.Channel
 	// channelMu serializes channel RPCs because AMQP does not correlate
 	// requests with their replies. Channel.Close deliberately does not take it
-	// because closing releases a stuck RPC.
-	channelMu  sync.Mutex
-	tag        string
-	prefetch   int
-	deliveries <-chan amqp.Delivery
-	pending    chan amqp.Delivery
-	resume     chan struct{}
-	emitting   int
+	// because closing releases a stuck RPC. It also guards tag, which changes
+	// each time a server-initiated cancel is re-established.
+	channelMu sync.Mutex
+	tag       string
+	prefetch  int
+	// deliveriesMu guards deliveries and generation. The broker can cancel this
+	// lane's consumer at any time, which closes the deliveries channel the
+	// library handed out; watchCancel attaches a replacement and bumps the
+	// generation, and the reader picks the replacement up by comparing the
+	// generation it last drained against the current one. Only watchCancel
+	// writes deliveries, so a replacement installed while the reader is still
+	// draining the cancelled channel cannot be overwritten, and a reader that
+	// has not yet noticed the close cannot miss it: the generation moves in the
+	// same critical section that installs the channel.
+	deliveriesMu sync.Mutex
+	deliveries   <-chan amqp.Delivery
+	generation   uint64
+	// replacedC carries one token per attachment, waking a reader waiting on a
+	// deliveries channel that has closed.
+	replacedC chan struct{}
+	pending   chan amqp.Delivery
+	resume    chan struct{}
+	emitting  int
 
 	mu     sync.Mutex
 	paused bool
@@ -126,7 +141,11 @@ func newConsumer(conn *conn, cfg driver.ConsumerConfig) (*consumer, error) {
 			_ = channel.Close()
 			return rollback(classifyAMQP("consumer", driver.KindFatal, err))
 		}
-		tag := "f1-consumer-" + strconv.FormatUint(consumerSequence.Add(1), 10)
+		tag := nextConsumerTag()
+		// Registered before the consume call so a cancel that races the attach,
+		// such as a queue deleted while the consumer is being created, is not
+		// missed by a listener that does not exist yet.
+		cancels := channel.NotifyCancel(make(chan string, 1))
 		deliveries, err := channel.Consume(destination, tag, false, cfg.Exclusive, false, false, nil)
 		if err != nil {
 			_ = channel.Close()
@@ -142,6 +161,8 @@ func newConsumer(conn *conn, cfg driver.ConsumerConfig) (*consumer, error) {
 			tag:         tag,
 			prefetch:    prefetch,
 			deliveries:  deliveries,
+			generation:  1,
+			replacedC:   make(chan struct{}, 1),
 			pending:     make(chan amqp.Delivery, prefetch),
 			resume:      make(chan struct{}),
 		}
@@ -149,10 +170,11 @@ func newConsumer(conn *conn, cfg driver.ConsumerConfig) (*consumer, error) {
 		c.byName[destination] = lane
 		c.readers.Add(1)
 		c.forward.Add(1)
-		c.events.Add(1)
+		c.events.Add(2)
 		go c.readDeliveries(lane)
 		go c.emitMessages(lane)
 		go c.watchClose(lane)
+		go c.watchCancel(lane, cancels)
 		if hook := consumerConstructionHook; hook != nil {
 			hook(c, consumerConstructionLaneReady)
 		}
@@ -203,23 +225,115 @@ func (c *consumer) rollbackConstruction() error {
 func (c *consumer) Messages() <-chan driver.InboundMessage { return c.messages }
 func (c *consumer) Errors() <-chan error                   { return c.errors }
 
+// nextConsumerTag returns a fresh consumer tag for an attach. Every attach
+// needs a new one: RabbitMQ answers a reuse of a cancelled tag with
+// NOT_ALLOWED - attempt to reuse consumer tag and closes the channel, so
+// re-establishing on the cancelled tag would turn one cancel into a dead lane.
+func nextConsumerTag() string {
+	return "f1-consumer-" + strconv.FormatUint(consumerSequence.Add(1), 10)
+}
+
+// deliveriesState returns the deliveries channel the reader should drain and
+// its generation. The two are read together because a caller that compares the
+// generation against the one it last drained must not see them from different
+// attachments.
+func (l *lane) deliveriesState() (<-chan amqp.Delivery, uint64) {
+	l.deliveriesMu.Lock()
+	defer l.deliveriesMu.Unlock()
+	return l.deliveries, l.generation
+}
+
+// attachReplacement installs the deliveries channel for the lane's next
+// consumer, or ends the lane when there is none: nil means no consumer is
+// coming, and the reader stops rather than waiting. It is the only writer of
+// lane.deliveries.
+//
+// The teardown state is decided here under the consumer mutex rather than
+// trusted from the caller, because teardown sets it under that same mutex and
+// may have begun while the re-attach RPC was in flight. A live channel
+// installed after Drain's cancel pass would leave a reader waiting for a
+// consumer Drain has already gone past; an ended lane leaves the reader with
+// nothing to wait for, and Stop or Release closes the channel that the extra
+// consumer sits on.
+func (c *consumer) attachReplacement(lane *lane, deliveries <-chan amqp.Delivery) {
+	c.mu.Lock()
+	if c.stopped || c.draining {
+		deliveries = nil
+	}
+	lane.deliveriesMu.Lock()
+	lane.deliveries = deliveries
+	lane.generation++
+	lane.deliveriesMu.Unlock()
+	c.mu.Unlock()
+	select {
+	case lane.replacedC <- struct{}{}:
+	default:
+	}
+}
+
+// ending reports whether the consumer has begun tearing down: Stop and Release
+// set stopped, Drain sets draining. Either way this lane must not attach
+// another consumer, and the reader has no reason to wait for a replacement.
+func (c *consumer) ending() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.stopped || c.draining
+}
+
+// awaitAttachment blocks until watchCancel attaches a replacement for the
+// deliveries channel the reader has drained, and reports whether the lane
+// should keep reading. False means the lane is finished: the consumer is
+// closing, or the re-establish attempt failed and was already reported.
+func (c *consumer) awaitAttachment(lane *lane, drained uint64) bool {
+	for {
+		if c.ending() {
+			return false
+		}
+		deliveries, generation := lane.deliveriesState()
+		if generation > drained {
+			return deliveries != nil
+		}
+		select {
+		case <-lane.replacedC:
+		case <-c.stoppedC:
+			return false
+		case <-c.forwarderStopC:
+			return false
+		}
+	}
+}
+
+// readDeliveries pumps every delivery the lane's consumers receive into
+// lane.pending. It outlives an individual consumer because the broker can
+// cancel one under it: the deliveries channel closes, the reader waits for
+// watchCancel to attach a replacement, and the forwarder and the pending
+// channel stay exactly as they were, so a recovered lane does not look like a
+// restart to the application.
 func (c *consumer) readDeliveries(lane *lane) {
 	defer c.readers.Done()
 	defer close(lane.pending)
-	for delivery := range lane.deliveries {
-		c.mu.Lock()
-		stopped, draining := c.stopped, c.draining
-		c.mu.Unlock()
-		if stopped || draining {
+	drained := uint64(0)
+	for {
+		deliveries, generation := lane.deliveriesState()
+		if deliveries == nil || generation <= drained {
+			if !c.awaitAttachment(lane, drained) {
+				return
+			}
 			continue
 		}
-		if c.readerSendHook != nil {
-			c.readerSendHook(lane)
-		}
-		select {
-		case lane.pending <- delivery:
-		case <-c.stoppedC:
-			return
+		drained = generation
+		for delivery := range deliveries {
+			if c.ending() {
+				continue
+			}
+			if c.readerSendHook != nil {
+				c.readerSendHook(lane)
+			}
+			select {
+			case lane.pending <- delivery:
+			case <-c.stoppedC:
+				return
+			}
 		}
 	}
 }
@@ -341,6 +455,71 @@ func (c *consumer) watchClose(lane *lane) {
 		}
 	case <-c.stoppedC:
 	}
+}
+
+// watchCancel handles a server-initiated basic.cancel by re-establishing the
+// lane's consumer.
+//
+// RabbitMQ 4.3 cancels a consumer that holds a delivery past the queue's
+// x-consumer-timeout, and the library answers by closing the deliveries channel
+// it handed out while reporting nothing else. Without this, that close is
+// indistinguishable from a normal end of stream: the reader stops, no error is
+// sent, and the subscription silently stops delivering while every other signal
+// the application has still reads healthy.
+//
+// The cancel is also reported. The broker cancels for a reason the application
+// owns, a handler that outran the timeout, so recovering in silence would hide
+// the only evidence of it, and the consumer would be cancelled again and again
+// and always invisibly.
+func (c *consumer) watchCancel(lane *lane, cancels <-chan string) {
+	defer c.events.Done()
+	for {
+		select {
+		case _, ok := <-cancels:
+			if !ok {
+				// The library closes this channel when the channel itself
+				// shuts down, so no replacement is coming. Ending the lane is
+				// the behaviour a death of the deliveries channel always had;
+				// without it the reader would wait for a consumer that can
+				// never attach, and watchClose reports the death separately.
+				c.attachReplacement(lane, nil)
+				return
+			}
+		case <-c.stoppedC:
+			return
+		}
+		c.reestablish(lane)
+	}
+}
+
+// reestablish attaches a fresh consumer to a lane the broker cancelled, and
+// tells the application that the cancel happened. A failure to attach ends the
+// lane and is reported as an error, because a lane that neither delivers nor
+// says why is the defect this whole path exists to remove.
+func (c *consumer) reestablish(lane *lane) {
+	if c.ending() {
+		// Teardown already began; the lane is going away because the
+		// application asked it to, so there is nothing to recover and nothing
+		// the application needs to hear about.
+		c.attachReplacement(lane, nil)
+		return
+	}
+	c.sendError(classify("consumer", driver.KindNotification, fmt.Errorf("rabbitmq: broker cancelled the consumer for destination %q", lane.destination)))
+	lane.channelMu.Lock()
+	tag := nextConsumerTag()
+	deliveries, err := lane.channel.Consume(lane.destination, tag, false, c.cfg.Exclusive, false, false, nil)
+	if err == nil {
+		lane.tag = tag
+	}
+	lane.channelMu.Unlock()
+	if err != nil {
+		if !errors.Is(err, amqp.ErrClosed) {
+			c.sendError(classifyAMQP("consumer", driver.KindNotFound, fmt.Errorf("re-establishing destination %q: %w", lane.destination, err)))
+		}
+		c.attachReplacement(lane, nil)
+		return
+	}
+	c.attachReplacement(lane, deliveries)
 }
 
 func (c *consumer) sendError(err error) {

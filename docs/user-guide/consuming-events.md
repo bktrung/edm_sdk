@@ -43,7 +43,7 @@ func handleOrderCreated(ctx context.Context, event *f1.Event) error {
 ```
 
 Returning `nil` acknowledges the delivery. Failure classification is covered
-in [Handling failures](handling-failures.md).
+in [Handling failures](/user-guide/handling-failures).
 
 ## Read event metadata
 
@@ -60,5 +60,5 @@ it does not provide global ordering across partitions or queues. Check
 `client.Limits()` when a deployment must make a capability decision explicit.
 
 For worker, settlement, dispatch, and scheduling internals, see the
-[consume flow](../development/consume-flow.md) and
-[ordering and scheduling guide](../advanced-topics/ordering-and-scheduling.md).
+[consume flow](/development/consume-flow) and
+[ordering and scheduling guide](/advanced-topics/ordering-and-scheduling).

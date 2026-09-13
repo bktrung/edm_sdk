@@ -26,9 +26,15 @@ func TestConformance(t *testing.T) {
 	conformance.Run(t, conformance.Suite{
 		Driver: Driver{},
 		Config: driver.Config{
-			Endpoints:             []string{kafkaEndpoint},
-			ClientID:              "f1-kafka-conformance",
-			RebalanceDrainTimeout: 250 * time.Millisecond,
+			Endpoints: []string{kafkaEndpoint},
+			ClientID:  "f1-kafka-conformance",
+			// A leave requested just after an assignment can cancel the group
+			// session while the session's own offset fetch is in flight. The
+			// client then closes that broker connection and retries the leave on
+			// a new one after its first retry backoff, measured at 207ms to
+			// 302ms. The budget has to clear that floor, with room for a second
+			// retry.
+			RebalanceDrainTimeout: time.Second,
 		},
 		NewInspector:     kafkaInspector,
 		NewFaultInjector: kafkaFaultInjector,

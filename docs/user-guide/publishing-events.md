@@ -46,7 +46,7 @@ deduplicate application effects.
 
 Other supported options include priority, expiry, custom headers, causation,
 an explicit topic, and a per-event maximum attempt count. Their constructors
-and contracts live in [`publisher.go`](../../publisher.go).
+and contracts live in [`publisher.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/publisher.go).
 
 ## Publish batches
 
@@ -55,4 +55,4 @@ atomicity: inspect each result and use `BatchResult.Failed()` when partial
 failure handling matters.
 
 For the full message path, topology timing, and close interaction, see the
-[publish runtime guide](../development/publish-flow.md).
+[publish runtime guide](/development/publish-flow).

@@ -405,11 +405,20 @@ func assertNoDelivery(t *testing.T, group *groupContext, consumer driver.Consume
 
 func receiveBefore(t *testing.T, group *groupContext, consumer driver.Consumer, deadline time.Time, what string) driver.InboundMessage {
 	t.Helper()
-	// The fixture deadline uses its fake clock while this wait uses wall time. The
-	// in-memory fake starts at real time and only advances, so this conversion is safe.
-	timeout := time.Until(deadline)
-	if timeout <= 0 {
-		timeout = time.Millisecond
+	// A broker deadline is wall-clock time, so its remainder is a real budget. A fixture
+	// deadline is an instant on the fixture's own clock: the deferred checks advance that
+	// clock past the due instant before calling here, so the delivery is already owed and
+	// this wait is for wall time to hand it over. waitTimeout is the budget the rest of the
+	// harness gives a delivery. time.Until on a fixture instant instead spends wall time
+	// the fixture clock never spent, so a deschedule between the caller computing the
+	// deadline and this wait starting shortens the budget by the length of the deschedule,
+	// to nothing on a loaded machine.
+	timeout := waitTimeout
+	if group.deadline == nil {
+		timeout = time.Until(deadline)
+		if timeout <= 0 {
+			timeout = time.Millisecond
+		}
 	}
 	ctx, cancel := context.WithTimeout(group.ctx, timeout)
 	defer cancel()

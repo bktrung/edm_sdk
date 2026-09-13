@@ -178,11 +178,28 @@ func runRebalance(group *groupContext) {
 		if secondOutstanding > secondPrefetch {
 			t.Fatalf("second consumer held %d unsettled messages, prefetch=%d", secondOutstanding, secondPrefetch)
 		}
+		// Every published record must be settled, and a record whose ack meets
+		// the transfer is proved by its redelivery or by the drain: a revoked
+		// acknowledgement is not proof of an unsettled record, because the
+		// offset may have committed for the new owner all the same. The
+		// redelivery cannot arrive while the destination has no free capacity,
+		// since a revoked copy keeps the slot it held until it is settled, so
+		// the acks and the redeliveries proceed in one loop.
+		settled := 0
 		for _, message := range initial {
-			ackMessage(t, group, message)
+			if settleBeforeOwnershipTransfer(t, group, message) {
+				settled++
+			}
 		}
-		last, _, _ := receiveFromEither(t, group, "prefetch delivery", first, second)
-		ackMessage(t, group, last)
+		drained := false
+		for settled < firstPrefetch+secondPrefetch+1 && !drained {
+			message, _, _ := receiveFromEither(t, group, "prefetch delivery or redelivery", first, second)
+			if settleBeforeOwnershipTransfer(t, group, message) {
+				settled++
+			}
+			view := inspectDestination(t, group, "rebalance.prefetch")
+			drained = view.Ready == 0 && view.Unsettled == 0
+		}
 		waitFor(t, group, "prefetch destination to drain after all messages are acknowledged", func() (bool, string) {
 			view := inspectDestination(t, group, "rebalance.prefetch")
 			return view.Ready == 0 && view.Unsettled == 0, fmt.Sprintf("view=%+v", view)
@@ -220,11 +237,32 @@ func runRebalance(group *groupContext) {
 		waitForRebalanceAssignment(t, group, joining)
 
 		if settled := settleBeforeOwnershipTransfer(t, group, old); !settled {
-			redelivered := receiveMessage(t, group, joining)
-			if string(redelivered.Body) != "old" {
-				t.Fatalf("redelivered body = %q, want old", redelivered.Body)
-			}
-			ackMessage(t, group, redelivered)
+			// A revoked acknowledgement is not proof of an unsettled record: the
+			// offset may have committed for the new owner all the same, the key
+			// may have moved and be redelivered, or the key may have come back
+			// with this delivery re-granted. Settle whichever arrives, and let
+			// the destination's own drain decide whether anything was left.
+			waitFor(t, group, "a revoked pre-change delivery to settle or be redelivered", func() (bool, string) {
+				view := inspectDestination(t, group, "rebalance.settle")
+				if view.Ready == 0 && view.Unsettled == 0 {
+					return true, "destination drained"
+				}
+				for _, consumer := range []driver.Consumer{first, joining} {
+					select {
+					case redelivered, ok := <-consumer.Messages():
+						if !ok {
+							return false, "Messages channel closed"
+						}
+						if string(redelivered.Body) != "old" {
+							t.Fatalf("redelivered body = %q, want old", redelivered.Body)
+						}
+						ackMessage(t, group, redelivered)
+						return true, "redelivered to the owner"
+					default:
+					}
+				}
+				return false, "no redelivery and the destination is not drained"
+			})
 		}
 		waitFor(t, group, "pre-change delivery settlement to clear", func() (bool, string) {
 			view := inspectDestination(t, group, "rebalance.settle")
@@ -494,15 +532,35 @@ func publishRebalanceCount(t *testing.T, group *groupContext, producer driver.Pr
 	}
 }
 
-func rebalanceGroupName(group *groupContext) string {
-	return "conformance.rebalance." + group.runID + "." + group.profile.String()
+// rebalanceGroupName returns the consumer group one rebalance check owns. Each
+// check gets its own group, so a member that fails to leave cannot hold a later
+// check behind it; the consumers of a single check pass the same subtest in and
+// share its group.
+func rebalanceGroupName(group *groupContext, t *testing.T) string {
+	return "conformance.rebalance." + group.runID + "." + group.profile.String() + "." + rebalanceCheckScope(t)
+}
+
+// rebalanceCheckScope returns the per-check part of a rebalance group name: the
+// last element of the running subtest's name, which the harness sets to the
+// check name, mapped to the characters a group identifier accepts.
+func rebalanceCheckScope(t *testing.T) string {
+	name := t.Name()
+	if index := strings.LastIndexByte(name, '/'); index >= 0 {
+		name = name[index+1:]
+	}
+	return strings.Map(func(r rune) rune {
+		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '_' {
+			return r
+		}
+		return '_'
+	}, name)
 }
 
 func newRebalanceConsumer(t *testing.T, group *groupContext, destination string, prefetch int) driver.Consumer {
 	t.Helper()
 	cfg := driver.ConsumerConfig{
 		Destinations: []string{destination},
-		Group:        rebalanceGroupName(group),
+		Group:        rebalanceGroupName(group, t),
 		Prefetch:     prefetch,
 		Effective:    group.effective,
 	}
@@ -523,7 +581,7 @@ func newRebalanceConsumer(t *testing.T, group *groupContext, destination string,
 func newRebalanceConsumerFor(t *testing.T, group *groupContext, cfg driver.ConsumerConfig) driver.Consumer {
 	t.Helper()
 	if cfg.Group == "" {
-		cfg.Group = rebalanceGroupName(group)
+		cfg.Group = rebalanceGroupName(group, t)
 	}
 	cfg, logical := profileConsumerConfig(group, cfg)
 	consumer, err := group.conn.Consumer(group.ctx, cfg)

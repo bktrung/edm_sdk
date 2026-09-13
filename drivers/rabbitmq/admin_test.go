@@ -106,7 +106,11 @@ func publishPruneMessage(ctx context.Context, channel *amqp.Channel, confirmatio
 	}
 }
 
-func attachPruneConsumer(t *testing.T, ctx context.Context, destination string) *amqp.Channel {
+// attachPruneConsumer attaches a raw consumer to destination and returns its
+// channel and consumer tag. The tag is returned so a caller can detach with
+// Cancel: the broker acknowledges a consumer cancel only once the queue has
+// processed it, while a channel close returns before that for quorum queues.
+func attachPruneConsumer(t *testing.T, ctx context.Context, destination string) (*amqp.Channel, string) {
 	t.Helper()
 	raw, err := amqp.Dial(defaultEndpoint)
 	if err != nil {
@@ -143,7 +147,7 @@ func attachPruneConsumer(t *testing.T, ctx context.Context, destination string) 
 			t.Fatalf("QueueDeclarePassive(%q): %v", destination, err)
 		}
 		if queue.Consumers > 0 {
-			return channel
+			return channel, tag
 		}
 		select {
 		case <-ctx.Done():
@@ -226,7 +230,7 @@ func TestPruneDoesNotDeleteQueueThatGainedAConsumer(t *testing.T) {
 				if name != destination || attached {
 					return
 				}
-				attachPruneConsumer(t, ctx, destination)
+				_, _ = attachPruneConsumer(t, ctx, destination)
 				attached = true
 			}
 
@@ -254,11 +258,18 @@ func TestPruneDeletesQueueWhoseConsumerJustDetached(t *testing.T) {
 		t.Run(string(kind), func(t *testing.T) {
 			destination := "rabbitmq-driver-prune-detached-consumer-" + string(kind)
 			ctx, _, facade := setupPruneTest(t, kind, driver.DestinationSpec{Name: destination, Durable: true})
-			consumerChannel := attachPruneConsumer(t, ctx, destination)
+			consumerChannel, tag := attachPruneConsumer(t, ctx, destination)
 			waitForPruneManagementConsumer(t, ctx, facade, destination)
 
-			if err := consumerChannel.Close(); err != nil {
-				t.Fatalf("Close consumer channel: %v", err)
+			// Detach by cancelling the consumer, not by closing its channel.
+			// The guard reads the queue's own consumer count, and a quorum
+			// queue keeps counting a consumer whose channel was closed until
+			// the queue process handles the cancellation; closing the channel
+			// raced that window and made prune refuse a queue whose consumer
+			// was gone. Cancel is acknowledged only once the count no longer
+			// includes the consumer, which is the detach this test means.
+			if err := consumerChannel.Cancel(tag, false); err != nil {
+				t.Fatalf("Cancel consumer: %v", err)
 			}
 			queues, err := facade.operations.conn.management.listQueues(ctx)
 			if err != nil {
@@ -286,7 +297,7 @@ func TestPruneRefusesDestinationWithALiveConsumer(t *testing.T) {
 		t.Run(string(kind), func(t *testing.T) {
 			destination := "rabbitmq-driver-prune-live-consumer-" + string(kind)
 			ctx, _, facade := setupPruneTest(t, kind, driver.DestinationSpec{Name: destination, Durable: true})
-			_ = attachPruneConsumer(t, ctx, destination)
+			_, _ = attachPruneConsumer(t, ctx, destination)
 			waitForPruneManagementConsumer(t, ctx, facade, destination)
 
 			results, err := facade.Prune(ctx, []string{destination})

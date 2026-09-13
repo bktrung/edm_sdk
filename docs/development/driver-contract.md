@@ -1,11 +1,11 @@
 # Driver contract
 
 This is the authoritative guide for implementing a driver for F1. The
-interfaces and comments in [`driver/driver.go`](../../driver/driver.go),
-[`driver/message.go`](../../driver/message.go),
-[`driver/capability.go`](../../driver/capability.go),
-[`driver/topology.go`](../../driver/topology.go), and
-[`driver/errors.go`](../../driver/errors.go) are the executable contract. This
+interfaces and comments in [`driver/driver.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/driver/driver.go),
+[`driver/message.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/driver/message.go),
+[`driver/capability.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/driver/capability.go),
+[`driver/topology.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/driver/topology.go), and
+[`driver/errors.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/driver/errors.go) are the executable contract. This
 page explains the boundaries and the behavioral rules behind them.
 
 The driver port is broker-independent. The core owns F1 semantics and logical
@@ -55,20 +55,20 @@ The contract is:
 
 - `Name` returns the stable driver registry key used in configuration and
   diagnostics;
-- `Capabilities` reports the driver’s pessimistic native ceiling without
+- `Capabilities` reports the driver's pessimistic native ceiling without
   reading a live connection;
 - `Open` does not return until the connection is usable or the context expires;
-- transient connection failures during `Open` are handled within the driver’s
+- transient connection failures during `Open` are handled within the driver's
   configured connection budget;
 - concurrent calls to the driver are safe.
 
 If a capability depends on broker version, authentication, cluster topology,
 or negotiated protocol features, `Capabilities` must report the pessimistic
 value and `Conn.Capabilities` may refine it downward for the live connection.
-It must never refine a capability upward beyond the driver’s declared ceiling.
+It must never refine a capability upward beyond the driver's declared ceiling.
 
 The public interface and shared connection configuration are in
-[`driver/driver.go`](../../driver/driver.go).
+[`driver/driver.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/driver/driver.go).
 
 ## `driver.Conn`
 
@@ -93,23 +93,23 @@ The core may create producer and consumer resources concurrently. A driver must
 protect connection state accordingly.
 
 `Conn.Close` must not silently tear down resources that the core still owns. A
-driver should return [`ErrResourcesOutstanding`](../../driver/errors.go) when
+driver should return [`ErrResourcesOutstanding`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/driver/errors.go) when
 the caller violates the close order. The client close sequence is documented in
-[Lifecycle and shutdown](../advanced-topics/lifecycle-and-shutdown.md).
+[Lifecycle and shutdown](/advanced-topics/lifecycle-and-shutdown).
 
 ## Message types and settlement
 
 There is no type named `driver.Message` in the current port. The message
 contract is split deliberately:
 
-- [`driver.OutboundMessage`](../../driver/message.go) is the portable value the
+- [`driver.OutboundMessage`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/driver/message.go) is the portable value the
   core gives to a producer;
-- [`driver.InboundMessage`](../../driver/message.go) is the delivery a consumer
+- [`driver.InboundMessage`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/driver/message.go) is the delivery a consumer
   gives to the core;
-- [`driver.Header`](../../driver/message.go) carries opaque key/value metadata;
-- [`driver.BrokerRef`](../../driver/message.go) carries broker identity without
+- [`driver.Header`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/driver/message.go) carries opaque key/value metadata;
+- [`driver.BrokerRef`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/driver/message.go) carries broker identity without
   exposing its fields to core routing; and
-- [`driver.Settler`](../../driver/message.go) finishes one inbound delivery.
+- [`driver.Settler`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/driver/message.go) finishes one inbound delivery.
 
 ### `OutboundMessage`
 
@@ -138,7 +138,7 @@ before the next delivery can mutate the storage.
 
 `Settler` provides per-delivery `Ack` and `Nack`. A driver must not allow the
 same delivery to be settled twice; subsequent calls should expose
-[`ErrAlreadySettled`](../../driver/errors.go) or the equivalent documented
+[`ErrAlreadySettled`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/driver/errors.go) or the equivalent documented
 portable error.
 
 - `Ack` marks the original delivery successfully handled.
@@ -169,7 +169,7 @@ publish path. A driver must honor that flag rather than downgrade it based on a
 provider default.
 
 `Publish` accepts multiple messages and must be safe for concurrent use. It may
-return a [`PublishError`](../../driver/errors.go) when only some indexes failed.
+return a [`PublishError`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/driver/errors.go) when only some indexes failed.
 The `Failed` map uses input indexes and contains the individual causes for
 messages that were not acknowledged. The core maps that result into per-message
 batch outcomes; it does not treat a batch as atomic.
@@ -186,13 +186,13 @@ before the flush completes, unless the provider has made the resource unusable.
 
 `Close` releases producer resources. It must not discard accepted but
 unacknowledged work silently, and it must coordinate with concurrent `Publish`
-calls according to the provider’s resource guarantees.
+calls according to the provider's resource guarantees.
 
 Concrete producer implementations are the source of provider mechanics:
 
-- [`drivers/inmem/producer.go`](../../drivers/inmem/producer.go)
-- [`drivers/rabbitmq/producer.go`](../../drivers/rabbitmq/producer.go)
-- [`drivers/kafka/producer.go`](../../drivers/kafka/producer.go)
+- [`drivers/inmem/producer.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/drivers/inmem/producer.go)
+- [`drivers/rabbitmq/producer.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/drivers/rabbitmq/producer.go)
+- [`drivers/kafka/producer.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/drivers/kafka/producer.go)
 
 ## `driver.Consumer`
 
@@ -240,11 +240,11 @@ settle or explicitly return it.
 `Stop` is final consumer shutdown after outstanding deliveries have been
 settled. It must flush committed positions or equivalent broker progress before
 returning. If the context expires first, return
-[`ErrDrainTimeout`](../../driver/errors.go), preserving the distinction from a
-caller’s ordinary resource or protocol failure.
+[`ErrDrainTimeout`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/driver/errors.go), preserving the distinction from a
+caller's ordinary resource or protocol failure.
 
 Calling `Stop` while the driver still owns unsettled deliveries is a contract
-violation. A driver should return [`ErrResourcesOutstanding`](../../driver/errors.go)
+violation. A driver should return [`ErrResourcesOutstanding`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/driver/errors.go)
 instead of silently committing past those deliveries.
 
 ### Release
@@ -257,7 +257,7 @@ Release makes no durability promise about committed positions. It is the
 explicit handoff operation for connection loss, reconnect, and shutdown paths
 where the core cannot prove settlement. It must be idempotent and safe after a
 previous release or stop. A broker that cannot return unsettled work must
-return [`ErrUnsupported`](../../driver/errors.go).
+return [`ErrUnsupported`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/driver/errors.go).
 
 ### Lag
 
@@ -266,13 +266,13 @@ without a reliable lag query returns `ErrUnsupported`; it must not invent a
 zero backlog.
 
 The complete consumer interface is in
-[`driver/driver.go`](../../driver/driver.go). The core’s use of these operations
-is traced in [Consume flow](consume-flow.md).
+[`driver/driver.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/driver/driver.go). The core's use of these operations
+is traced in [Consume flow](/development/consume-flow).
 
 ## `driver.Admin` and topology
 
 `Admin` is the required topology administration surface. The core owns the
-logical F1 topology and passes a declarative [`TopologySpec`](../../driver/topology.go).
+logical F1 topology and passes a declarative [`TopologySpec`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/driver/topology.go).
 The driver owns how that spec maps to broker objects.
 
 ### Policies
@@ -309,7 +309,7 @@ return a clean diff it did not actually verify.
 missing destination from an existing empty destination.
 
 The topology structures and their ownership rules are defined in
-[`driver/topology.go`](../../driver/topology.go). Optional destructive
+[`driver/topology.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/driver/topology.go). Optional destructive
 operations are exposed separately through `driver.Maintenance`; they are not
 part of the required `Admin` contract.
 
@@ -339,7 +339,7 @@ different capability view.
 
 ## Capability reporting
 
-[`Capabilities`](../../driver/capability.go) describes native mechanisms and
+[`Capabilities`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/driver/capability.go) describes native mechanisms and
 physical constraints. It does not redefine F1 semantics. The core must produce
 the same observable result when a portable capability is forced off; a driver
 must therefore report an optimization only when it can actually provide it.
@@ -372,7 +372,7 @@ must branch on `TopologySpec.Effective`, `ProducerConfig.Effective`, and
 `ConsumerConfig.Effective`, not on its own raw connection capability cache.
 
 The strict behavior is tested in
-[`driver/capability_test.go`](../../driver/capability_test.go) and compared
+[`driver/capability_test.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/driver/capability_test.go) and compared
 against the full profile by the conformance suite.
 
 ## Errors and classification
@@ -394,16 +394,16 @@ Drivers may wrap these errors so `errors.Is` remains useful.
 
 ### Classified errors
 
-Implement [`ClassifiedError`](../../driver/errors.go), or return the standard
-[`driver.Error`](../../driver/errors.go), for errors where the core needs a
+Implement [`ClassifiedError`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/driver/errors.go), or return the standard
+[`driver.Error`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/driver/errors.go), for errors where the core needs a
 portable class:
 
-- `KindTransient` — retryable network, timeout, or leader-election failure;
-- `KindFatal` — authentication, protocol, or unrecoverable resource failure;
-- `KindNotFound` — missing destination;
-- `KindTooLarge` — physical message or header limit;
-- `KindPermission` — authorization failure; and
-- `KindNotification` — routine lifecycle notification, not a failure.
+- `KindTransient` - retryable network, timeout, or leader-election failure;
+- `KindFatal` - authentication, protocol, or unrecoverable resource failure;
+- `KindNotFound` - missing destination;
+- `KindTooLarge` - physical message or header limit;
+- `KindPermission` - authorization failure; and
+- `KindNotification` - routine lifecycle notification, not a failure.
 
 `driver.Classify` treats an unclassified error as transient and reports that it
 was unclassified. This conservative fallback keeps a transport failure from
@@ -414,7 +414,7 @@ boundary and preserve the broker cause through `Unwrap`.
 classification among the failed indexes, and `Retryable` is true only when all
 failed messages are transient.
 
-The rules are exercised by [`driver/errors_test.go`](../../driver/errors_test.go)
+The rules are exercised by [`driver/errors_test.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/driver/errors_test.go)
 and the provider error tests.
 
 ## Context cancellation
@@ -451,7 +451,7 @@ semantics that make it possible: a successful producer result must mean durable
 acceptance, `Ack` must settle only the named delivery, `Nack` must honor the
 requested requeue policy, and `Release` must not commit past unsettled work.
 The complete core ordering is documented in
-[Consume flow](consume-flow.md).
+[Consume flow](/development/consume-flow).
 
 ## Core independence and implementation boundary
 
@@ -462,7 +462,7 @@ shared support, but not another concrete driver. The conformance package tests
 the port and never imports a concrete adapter.
 
 These rules are enforced by the `depguard` configuration in
-[`.golangci.yml`](../../.golangci.yml) and [`make verify-agnostic`](../../Makefile).
+[`.golangci.yml`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/.golangci.yml) and [`make verify-agnostic`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/Makefile).
 Do not add a broker convenience path to the core to work around an incomplete
 driver; add or correct the port contract when the behavior is genuinely
 portable.
@@ -486,5 +486,5 @@ Use this checklist as a handoff to the conformance page:
 9. All core-selected effective capability profiles are honored.
 10. The driver passes the shared contract suite and provider-specific tests.
 
-Continue with [Driver conformance](driver-conformance.md) for the shared
+Continue with [Driver conformance](/development/driver-conformance) for the shared
 harness, profiles, behavior vectors, provider fixtures, and run commands.

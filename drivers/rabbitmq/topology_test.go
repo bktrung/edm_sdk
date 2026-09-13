@@ -464,6 +464,131 @@ func TestEnsureTopologyParkQueueArgumentsClassicKind(t *testing.T) {
 	}
 }
 
+// TestEnsureTopologyDeclaresConsumerTimeout proves rabbitmq.consumerTimeout
+// reaches the queue as x-consumer-timeout and that the value read back from the
+// broker is the configured one, rather than only having been passed to the
+// declare call. The classic case is a boundary, not a variant: RabbitMQ 4.3
+// refuses the argument on a classic queue with a 406 PRECONDITION_FAILED that
+// closes the channel, so a missing kind gate fails the declare outright. The
+// unset case pins the decision to declare nothing when the operator set
+// nothing, since a driver-chosen default here would cancel consumers that the
+// deployment never asked to bound.
+func TestEnsureTopologyDeclaresConsumerTimeout(t *testing.T) {
+	requireBroker(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	raw, err := amqp.Dial(defaultEndpoint)
+	if err != nil {
+		t.Fatalf("Dial: %v", err)
+	}
+	t.Cleanup(func() { _ = raw.Close() })
+	rawChannel, err := raw.Channel()
+	if err != nil {
+		t.Fatalf("Channel: %v", err)
+	}
+	t.Cleanup(func() { _ = rawChannel.Close() })
+
+	mgmt, err := newManagementClient(defaultEndpoint, driver.Config{})
+	if err != nil {
+		t.Fatalf("newManagementClient: %v", err)
+	}
+
+	cases := []struct {
+		name    string
+		queue   string
+		options map[string]string
+		want    any
+	}{
+		{
+			name:    "quorum declares the configured timeout",
+			queue:   "rabbitmq-driver-consumer-timeout-quorum",
+			options: map[string]string{"rabbitmq.consumerTimeout": "90s"},
+			want:    int64(90000),
+		},
+		{
+			name:    "classic omits the timeout",
+			queue:   "rabbitmq-driver-consumer-timeout-classic",
+			options: map[string]string{"rabbitmq.queueType": "classic", "rabbitmq.consumerTimeout": "90s"},
+		},
+		{
+			name:  "unset declares nothing",
+			queue: "rabbitmq-driver-consumer-timeout-unset",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, _ = rawChannel.QueueDelete(tc.queue, false, false, false)
+			t.Cleanup(func() { _, _ = rawChannel.QueueDelete(tc.queue, false, false, false) })
+
+			conn, err := (Driver{}).Open(ctx, driver.Config{
+				Endpoints:     []string{defaultEndpoint},
+				DriverOptions: tc.options,
+			})
+			if err != nil {
+				t.Fatalf("Open: %v", err)
+			}
+			t.Cleanup(func() { _ = conn.Close(ctx) })
+
+			spec := driver.TopologySpec{Destinations: []driver.DestinationSpec{{Name: tc.queue, Durable: true}}}
+			if _, err := conn.Admin().EnsureTopology(ctx, spec); err != nil {
+				t.Fatalf("EnsureTopology: %v", err)
+			}
+
+			queue, err := mgmt.getQueue(ctx, tc.queue)
+			if err != nil {
+				t.Fatalf("getQueue(%q): %v", tc.queue, err)
+			}
+			got, present := queue.Arguments["x-consumer-timeout"]
+			if tc.want == nil {
+				if present {
+					t.Fatalf("declared queue arguments = %+v, want x-consumer-timeout absent", queue.Arguments)
+				}
+				return
+			}
+			if !present {
+				t.Fatalf("declared queue arguments = %+v, want x-consumer-timeout %v", queue.Arguments, tc.want)
+			}
+			if !argumentValuesEqual(tc.want, got) {
+				t.Fatalf("declared x-consumer-timeout = %v (%T), want %v (%T)", got, got, tc.want, tc.want)
+			}
+		})
+	}
+}
+
+// TestResolveConsumerTimeoutRejectsUnusableValues covers the values that cannot
+// be declared: an unparsable duration, and anything that the broker would read
+// as zero milliseconds, which cancels every consumer on the queue immediately.
+func TestResolveConsumerTimeoutRejectsUnusableValues(t *testing.T) {
+	cases := []struct {
+		name    string
+		options map[string]string
+		want    time.Duration
+		ok      bool
+	}{
+		{name: "absent declares nothing", options: nil, ok: true},
+		{name: "configured", options: map[string]string{"rabbitmq.consumerTimeout": "90s"}, want: 90 * time.Second, ok: true},
+		{name: "sub-millisecond", options: map[string]string{"rabbitmq.consumerTimeout": "500us"}},
+		{name: "zero", options: map[string]string{"rabbitmq.consumerTimeout": "0s"}},
+		{name: "negative", options: map[string]string{"rabbitmq.consumerTimeout": "-1s"}},
+		{name: "unparsable", options: map[string]string{"rabbitmq.consumerTimeout": "garbage"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := resolveConsumerTimeout(tc.options)
+			if !tc.ok {
+				if err == nil || !strings.Contains(err.Error(), "rabbitmq.consumerTimeout") {
+					t.Fatalf("resolveConsumerTimeout(%v) error = %v, want error naming the option", tc.options, err)
+				}
+				return
+			}
+			if err != nil || got != tc.want {
+				t.Fatalf("resolveConsumerTimeout(%v) = %v, %v, want %v", tc.options, got, err, tc.want)
+			}
+		})
+	}
+}
+
 func containsString(values []string, want string) bool {
 	return slices.Contains(values, want)
 }

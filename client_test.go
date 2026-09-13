@@ -468,6 +468,7 @@ func (c *testConn) Ping(context.Context) error {
 func (c *testConn) Close(context.Context) error { c.closeCalls++; return c.closeErr }
 
 func TestDriverConfigForwardingAndFallback(t *testing.T) {
+	logger := slog.New(slog.DiscardHandler)
 	t.Run("explicit instance id and rebalance timeout", func(t *testing.T) {
 		cfg := Config{
 			Service:    "order-service",
@@ -480,9 +481,12 @@ func TestDriverConfigForwardingAndFallback(t *testing.T) {
 				ConnectTimeout: 5 * time.Second,
 			},
 		}
-		driverCfg := driverConfig(cfg)
+		driverCfg := driverConfig(cfg, logger)
 		if driverCfg.ClientID != "order-worker-1" {
 			t.Fatalf("ClientID = %q, want %q", driverCfg.ClientID, "order-worker-1")
+		}
+		if driverCfg.Logger != logger {
+			t.Fatal("Logger was not forwarded to the port configuration")
 		}
 		if driverCfg.InstanceID != "order-worker-1" {
 			t.Fatalf("InstanceID = %q, want %q", driverCfg.InstanceID, "order-worker-1")
@@ -503,9 +507,12 @@ func TestDriverConfigForwardingAndFallback(t *testing.T) {
 				Endpoints: []string{"127.0.0.1:9092"},
 			},
 		}
-		driverCfg := driverConfig(cfg)
+		driverCfg := driverConfig(cfg, logger)
 		if driverCfg.ClientID != "order-service" {
 			t.Fatalf("ClientID = %q, want fallback to service %q", driverCfg.ClientID, "order-service")
+		}
+		if driverCfg.Logger != logger {
+			t.Fatal("Logger was not forwarded to the port configuration")
 		}
 		if driverCfg.InstanceID != "" {
 			t.Fatalf("InstanceID = %q, want empty", driverCfg.InstanceID)

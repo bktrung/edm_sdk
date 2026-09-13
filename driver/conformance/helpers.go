@@ -45,24 +45,27 @@ func profileDestination(group *groupContext, destination string) string {
 		return ""
 	}
 	profile := group.profile.String()
+	runID := group.runID
 	parts := strings.Split(destination, ".")
-	for _, part := range parts {
-		if part == profile {
+	for i := 0; i+1 < len(parts); i++ {
+		if parts[i] == runID && parts[i+1] == profile {
 			return destination
 		}
 	}
 	if len(parts) == 1 {
-		return destination + "." + profile
+		return destination + "." + runID + "." + profile
 	}
-	return parts[0] + "." + profile + "." + strings.Join(parts[1:], ".")
+	return parts[0] + "." + runID + "." + profile + "." + strings.Join(parts[1:], ".")
 }
 
 func unprofileDestination(group *groupContext, destination string) string {
 	parts := strings.Split(destination, ".")
+	runID := group.runID
 	profile := group.profile.String()
-	for i, part := range parts {
-		if part == profile {
-			return strings.Join(append(parts[:i], parts[i+1:]...), ".")
+	for i := 0; i+1 < len(parts); i++ {
+		if parts[i] == runID && parts[i+1] == profile {
+			parts = append(parts[:i], parts[i+2:]...)
+			return strings.Join(parts, ".")
 		}
 	}
 	return destination
@@ -126,7 +129,7 @@ func profileDestinations(group *groupContext, destinations []string) ([]string, 
 	for i, destination := range destinations {
 		scopedDestination := profileDestination(group, destination)
 		scoped[i] = scopedDestination
-		logical[scopedDestination] = destination
+		logical[scopedDestination] = unprofileDestination(group, scopedDestination)
 	}
 	return scoped, logical
 }
@@ -297,12 +300,11 @@ func profileError(group *groupContext, err error) error {
 		return nil
 	}
 	message := err.Error()
+	runID := group.runID
 	profile := group.profile.String()
 	parts := strings.Split(message, " ")
 	for i, part := range parts {
-		if strings.Contains(part, "."+profile) {
-			parts[i] = strings.ReplaceAll(part, "."+profile, "")
-		}
+		parts[i] = strings.ReplaceAll(part, "."+runID+"."+profile, "")
 	}
 	return &profileWrappedError{message: strings.Join(parts, " "), err: err}
 }
@@ -335,14 +337,7 @@ func (a *profileAdmin) DescribeTopology(ctx context.Context, names []string) (dr
 
 func unprofileTopologyDiff(group *groupContext, diff driver.TopologyDiff) driver.TopologyDiff {
 	logical := func(destination string) string {
-		parts := strings.Split(destination, ".")
-		profile := group.profile.String()
-		for i, part := range parts {
-			if part == profile {
-				return strings.Join(append(parts[:i], parts[i+1:]...), ".")
-			}
-		}
-		return destination
+		return unprofileDestination(group, destination)
 	}
 	mapNames := func(names []string) {
 		for i := range names {
@@ -380,24 +375,25 @@ func profileDestinationsForCall(group *groupContext, destinations []string) []st
 
 func newProducer(t *testing.T, group *groupContext, destination string, config driver.ProducerConfig) driver.Producer {
 	t.Helper()
+	logicalDestination := unprofileDestination(group, destination)
 	if _, err := group.conn.Admin().EnsureTopology(group.ctx, driver.TopologySpec{
 		Destinations: []driver.DestinationSpec{{Name: destination}},
 		Effective:    group.effective,
 	}); err != nil {
-		t.Fatalf("EnsureTopology(%q): %v", destination, err)
+		t.Fatalf("EnsureTopology(%q): %v", logicalDestination, err)
 	}
 	producer, err := group.conn.Producer(group.ctx, config)
 	if err != nil {
-		t.Fatalf("Producer(%q): %v", destination, err)
+		t.Fatalf("Producer(%q): %v", logicalDestination, err)
 	}
 	t.Cleanup(func() {
 		if err := producer.Close(group.ctx); err != nil {
-			t.Errorf("close producer %q: %v", destination, err)
+			t.Errorf("close producer %q: %v", logicalDestination, err)
 		}
 	})
 	t.Cleanup(func() {
 		if err := purgeIfSupported(group.ctx, group.conn, destination); err != nil {
-			t.Errorf("purge destination %q: %v", destination, err)
+			t.Errorf("purge destination %q: %v", logicalDestination, err)
 		}
 	})
 	return &profileProducer{group: group, producer: producer, scoped: destination != unprofileDestination(group, destination)}
@@ -405,18 +401,19 @@ func newProducer(t *testing.T, group *groupContext, destination string, config d
 
 func newConsumer(t *testing.T, group *groupContext, destination string, prefetch int) driver.Consumer {
 	t.Helper()
+	logicalDestination := unprofileDestination(group, destination)
 	cfg := driver.ConsumerConfig{
 		Destinations: []string{destination}, Prefetch: prefetch, Effective: group.effective,
 	}
-	logical := map[string]string{destination: unprofileDestination(group, destination)}
+	logical := map[string]string{destination: logicalDestination}
 	consumer, err := group.conn.Consumer(group.ctx, cfg)
 	if err != nil {
-		t.Fatalf("Consumer(%q): %v", destination, err)
+		t.Fatalf("Consumer(%q): %v", logicalDestination, err)
 	}
 	wrapped := newProfileConsumer(group, consumer, logical)
 	t.Cleanup(func() {
 		if err := wrapped.Stop(group.ctx); err != nil {
-			t.Errorf("stop consumer %q: %v", destination, err)
+			t.Errorf("stop consumer %q: %v", logicalDestination, err)
 		}
 	})
 	return wrapped

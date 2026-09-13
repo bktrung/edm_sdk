@@ -3,6 +3,7 @@ package rabbitmq
 import (
 	"context"
 	"errors"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -705,6 +706,141 @@ func TestNewConsumerRejectsDuplicateDestinationWithoutLeaking(t *testing.T) {
 	if err := connection.Ping(context.Background()); err != nil {
 		t.Fatalf("Ping after duplicate rejection: %v", err)
 	}
+}
+
+// TestConsumerReestablishesAfterServerCancel drives the broker into cancelling
+// a consumer and proves the driver recovers instead of going quiet.
+//
+// The queue is declared here with a one-second x-consumer-timeout rather than
+// through the driver, so the cancel is the broker's own decision and not an
+// artifact of this driver's declaration. That also makes the test fail for the
+// right reason when the cancel handling is removed: the deliveries channel
+// closes, nothing is reported, and the lane never delivers again, which is
+// exactly the silent stall this change exists to remove.
+func TestConsumerReestablishesAfterServerCancel(t *testing.T) {
+	requireBroker(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	const queue = "rabbitmq-driver-consumer-server-cancel"
+	raw, err := amqp.Dial(defaultEndpoint)
+	if err != nil {
+		t.Fatalf("raw broker connection: %v", err)
+	}
+	t.Cleanup(func() { _ = raw.Close() })
+	rawChannel, err := raw.Channel()
+	if err != nil {
+		t.Fatalf("raw channel: %v", err)
+	}
+	t.Cleanup(func() { _ = rawChannel.Close() })
+	_, _ = rawChannel.QueueDelete(queue, false, false, false)
+	t.Cleanup(func() { _, _ = rawChannel.QueueDelete(queue, false, false, false) })
+	if _, err := rawChannel.QueueDeclare(queue, true, false, false, false, amqp.Table{
+		"x-queue-type":       "quorum",
+		"x-consumer-timeout": int32(1000),
+	}); err != nil {
+		t.Fatalf("QueueDeclare(%q): %v", queue, err)
+	}
+
+	conn, err := (Driver{}).Open(ctx, driver.Config{Endpoints: []string{defaultEndpoint}})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	t.Cleanup(func() { _ = conn.Close(context.Background()) })
+	sdkConsumer, err := conn.Consumer(ctx, driver.ConsumerConfig{Destinations: []string{queue}, Prefetch: 1})
+	if err != nil {
+		t.Fatalf("Consumer: %v", err)
+	}
+	// Release rather than Stop: the delivery held below is never settled, and
+	// its ack deadline is the setup, not a leak.
+	t.Cleanup(func() { _ = sdkConsumer.Release(context.Background()) })
+
+	publish := func(body string) {
+		t.Helper()
+		if err := rawChannel.PublishWithContext(ctx, "", queue, false, false, amqp.Publishing{
+			DeliveryMode: amqp.Persistent,
+			Body:         []byte(body),
+		}); err != nil {
+			t.Fatalf("Publish(%q): %v", body, err)
+		}
+	}
+
+	// Positive control: the lane delivers before any cancel.
+	publish("held")
+	firstCtx, firstCancel := context.WithTimeout(ctx, 5*time.Second)
+	defer firstCancel()
+	select {
+	case message := <-sdkConsumer.Messages():
+		if message.Destination != queue || string(message.Body) != "held" {
+			t.Fatalf("first delivery = %q/%q, want the held message", message.Destination, message.Body)
+		}
+		// Deliberately unsettled: the broker cancels a consumer that holds a
+		// delivery past x-consumer-timeout.
+	case <-firstCtx.Done():
+		t.Fatal("timed out waiting for the first delivery")
+	}
+
+	// The cancel lands about a second after that delivery. It must be reported
+	// as a notification and must not be reported as a failure: a cancel that
+	// failed the runner would be a worse defect than the stall being fixed.
+	reportCtx, reportCancel := context.WithTimeout(ctx, 15*time.Second)
+	defer reportCancel()
+	select {
+	case err := <-sdkConsumer.Errors():
+		kind, classified := driver.Classify(err)
+		if !classified || kind != driver.KindNotification {
+			t.Fatalf("consumer error after the broker cancel = %v (kind %v, classified %t), want a notification", err, kind, classified)
+		}
+		if !strings.Contains(err.Error(), queue) {
+			t.Fatalf("cancel notification = %q, want it to name destination %q", err, queue)
+		}
+	case <-reportCtx.Done():
+		t.Fatal("timed out waiting for the cancel notification")
+	}
+
+	// The re-established consumer must deliver again. The held message was
+	// requeued when the broker cancelled its consumer, so it can arrive first.
+	publish("after")
+	afterCtx, afterCancel := context.WithTimeout(ctx, 15*time.Second)
+	defer afterCancel()
+	for {
+		select {
+		case message := <-sdkConsumer.Messages():
+			if err := message.Settle.Ack(ctx); err != nil {
+				t.Fatalf("Ack(%q): %v", message.Body, err)
+			}
+			if string(message.Body) == "after" {
+				return
+			}
+		case <-afterCtx.Done():
+			t.Fatal("timed out waiting for a delivery after the broker cancel")
+		}
+	}
+}
+
+// TestConsumerLaneEndsWhenChannelDies proves a lane still finishes when its
+// channel dies outside a server cancel. A cancel is the one close that earns a
+// replacement; a dead channel ends the lane as it always did, and a reader that
+// waited for a replacement instead would park there until the consumer was torn
+// down.
+func TestConsumerLaneEndsWhenChannelDies(t *testing.T) {
+	queue := consumerAdmissionQueue(t)
+	connection := openConsumerAdmissionConn(t, queue)
+	sdkConsumer, err := connection.Consumer(context.Background(), driver.ConsumerConfig{
+		Destinations: []string{queue},
+		Prefetch:     1,
+	})
+	if err != nil {
+		t.Fatalf("Consumer: %v", err)
+	}
+	built := sdkConsumer.(*consumer)
+	t.Cleanup(func() { _ = sdkConsumer.Release(context.Background()) })
+
+	if err := built.lanes[0].channel.Close(); err != nil {
+		t.Fatalf("close lane channel: %v", err)
+	}
+	waitConsumerWaitGroupDone(t, &built.readers, "reader after channel death")
+	waitConsumerWaitGroupDone(t, &built.forward, "forwarder after channel death")
 }
 
 func waitConsumerWaitGroupDone(t *testing.T, group *sync.WaitGroup, what string) {
