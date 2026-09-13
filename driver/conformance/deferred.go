@@ -13,6 +13,14 @@ const (
 	deferredDelay     = 500 * time.Millisecond
 	deferredMargin    = 500 * time.Millisecond
 	deferredLateBound = deferredDelay*2/5 + deferredMargin
+
+	// deferredOrderDelay is the delay the due-order check's destination declares.
+	// A due time has to sit inside the band its destination's own delay sets for
+	// it, because a driver is entitled to refuse one outside that band, so due
+	// times deferredDelay*4 apart from their own publish instants cannot share a
+	// destination declaring deferredDelay. See the check for why they are that
+	// far apart and why they are not further.
+	deferredOrderDelay = deferredDelay * 6
 )
 
 func init() { registerGroup("deferred", runDeferred) }
@@ -24,6 +32,7 @@ func warmDeferredTopology(group *groupContext) {
 		{Name: "deferred.never-early.control"},
 		{Name: "deferred.bounded-late", Delay: deferredDelay},
 		{Name: "deferred.band", Delay: deferredDelay},
+		{Name: "deferred.due-order", Delay: deferredOrderDelay},
 		{Name: "deferred.destination-delay", Delay: deferredDelay},
 		{Name: "deferred.destination-delay.control"},
 		{Name: "deferred.zero"},
@@ -142,6 +151,83 @@ func runDeferred(group *groupContext) {
 			t.Fatalf("undelivered in-band messages: %v", dues)
 		}
 		group.vector.Add(BehaviorEvent{ID: "deferred-band", Outcome: "all-delivered", FinalDestination: name})
+	})
+
+	group.Check("a nearer due time published after a farther one is delivered in due order", func(t *testing.T) {
+		name := "deferred.due-order"
+		producer := newDeferredProducer(t, group, profileDestination(group, name), deferredOrderDelay)
+		consumer := deferredConsumer(t, group, []string{name}, 2)
+		// Publish order here is the opposite of due order, and that inversion is the
+		// whole instrument: a driver that parks every deferred message of one
+		// destination behind a single released head, or that holds a message waiting
+		// for its own due time behind a later-due one it read first, releases the
+		// nearer message only once the farther one is owed. The band check above
+		// publishes its offsets in due order, which leaves an earlier due time at the
+		// head on exactly those drivers, so it cannot see the fault and this check
+		// exists.
+		//
+		// The separation between the two due times, not the assertions, is what makes
+		// the fault visible. Held behind the farther message, the nearer one arrives
+		// at the farther due time, 2s past its own and far outside deferredLateBound,
+		// so the band assertion below cannot pass by accident. Due times closer
+		// together than the band would let a driver release both late and still put
+		// each inside its own band, which reads as green.
+		//
+		// Each due time is deferredDelay*4 or deferredDelay*8 from its own publish
+		// instant, and the destination declares deferredOrderDelay. Both offsets sit
+		// inside the band a destination's own delay sets for a due time, which is what
+		// keeps the check measuring delivery order rather than measuring a driver
+		// correctly refusing a due time it does not owe. Both also sit outside the
+		// narrower window assertDeferredBand enforces, so that helper is not the one
+		// for this check and is not called here: it constrains a due time to within a
+		// fifth of the destination delay, and two due times that close together cannot
+		// be separated by more than the band.
+		fartherDue := deferredNow(group).Add(deferredDelay * 8)
+		if err := producer.Publish(group.ctx, driver.OutboundMessage{Destination: name, Body: []byte("farther"), DelayUntil: fartherDue}); err != nil {
+			t.Fatal(err)
+		}
+		nearerDue := deferredNow(group).Add(deferredDelay * 4)
+		if err := producer.Publish(group.ctx, driver.OutboundMessage{Destination: name, Body: []byte("nearer"), DelayUntil: nearerDue}); err != nil {
+			t.Fatal(err)
+		}
+		owed := []struct {
+			body string
+			due  time.Time
+		}{
+			{body: "nearer", due: nearerDue},
+			{body: "farther", due: fartherDue},
+		}
+		// Each step releases the message that step's due time is owed to, and both due
+		// times fall at or before last, the last instant a delivery can legitimately
+		// arrive by. Waiting against last rather than against each due time's own
+		// bound is what makes a driver that releases the two together report a
+		// delivery at the wrong instant, rather than report a delivery that never
+		// came.
+		last := fartherDue.Add(deferredLateBound)
+		received := make(map[string]driver.InboundMessage, len(owed))
+		for _, step := range owed {
+			advanceDeferredTo(group, step.due.Add(deferredLateBound))
+			message := receiveBefore(t, group, consumer, last, "due-order deferred delivery")
+			received[string(message.Body)] = message
+			ackMessage(t, group, message)
+		}
+		for _, want := range owed {
+			message, ok := received[want.body]
+			if !ok {
+				t.Fatalf("body %q owed at %s was never delivered", want.body, want.due)
+			}
+			if message.ReceivedAt.Before(want.due) {
+				t.Fatalf("body %q arrived at %s before its due time %s", want.body, message.ReceivedAt, want.due)
+			}
+			if message.ReceivedAt.After(want.due.Add(deferredLateBound)) {
+				t.Fatalf("body %q arrived at %s after its bound %s", want.body, message.ReceivedAt, want.due.Add(deferredLateBound))
+			}
+		}
+		if nearer, farther := received["nearer"], received["farther"]; !nearer.ReceivedAt.Before(farther.ReceivedAt) {
+			t.Fatalf("body %q arrived at %s and body %q at %s: deliveries arrived in publish order, not due order",
+				"nearer", nearer.ReceivedAt, "farther", farther.ReceivedAt)
+		}
+		group.vector.Add(BehaviorEvent{ID: "deferred-due-order", Outcome: "due-order", FinalDestination: name})
 	})
 
 	group.Check("destination delay supplies a zero due time", func(t *testing.T) {
