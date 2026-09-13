@@ -1,6 +1,7 @@
 package rabbitmq
 
 import (
+	"errors"
 	"net/http"
 	"strings"
 	"testing"
@@ -225,6 +226,60 @@ func TestManagementClientRejectsInvalidConfiguredPort(t *testing.T) {
 			client, err := newManagementClient(defaultEndpoint, cfg)
 			if err == nil || client != nil {
 				t.Fatalf("newManagementClient() = client %v, error %v; want invalid port error", client, err)
+			}
+		})
+	}
+}
+
+// TestManagementUnavailableNamesPurposeEndpointAndAction pins the message an
+// operator reads when the management API cannot be reached. It is the SDK's
+// only answer to the most likely single cause of a first deployment failing,
+// so every part of it that a reader acts on is asserted: which inspection
+// needed the API, the endpoint that was tried, and the two actions that
+// resolve it. The endpoint is built from an AMQP URL that carries a user and
+// password, which is the case the message must not leak.
+func TestManagementUnavailableNamesPurposeEndpointAndAction(t *testing.T) {
+	const username = "fake-management-user"
+	const password = "fake-management-pass"
+	cause := errors.New("management endpoint is unreachable")
+
+	purposes := []string{
+		"binding verification",
+		`argument drift verification for destination "orders"`,
+		`argument drift verification for parking destination "orders.park"`,
+	}
+	for _, test := range []struct {
+		name string
+		cfg  driver.Config
+	}{
+		{name: "derived port", cfg: driver.Config{}},
+		{
+			name: "configured port",
+			cfg:  driver.Config{DriverOptions: map[string]string{managementPortOption: "18080"}},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			client, err := newManagementClient("amqp://"+username+":"+password+"@localhost:5672/", test.cfg)
+			if err != nil {
+				t.Fatalf("newManagementClient: %v", err)
+			}
+			admin := &adminOperations{conn: &conn{management: client}}
+			for _, purpose := range purposes {
+				t.Run(purpose, func(t *testing.T) {
+					failure := admin.managementUnavailable(purpose, cause)
+					message := failure.Error()
+					for _, want := range []string{purpose, client.baseURL, "RabbitMQ management plugin", managementPortOption} {
+						if !strings.Contains(message, want) {
+							t.Fatalf("management failure %q does not name %q, so an operator cannot act on it", message, want)
+						}
+					}
+					if !errors.Is(failure, cause) {
+						t.Fatalf("management failure %q does not wrap the cause %v", message, cause)
+					}
+					if strings.Contains(message, username) || strings.Contains(message, password) {
+						t.Fatalf("management failure %q contains endpoint credentials", message)
+					}
+				})
 			}
 		})
 	}

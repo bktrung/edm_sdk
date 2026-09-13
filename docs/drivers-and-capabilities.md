@@ -67,6 +67,11 @@ therefore reaches the subscription path:
 The endpoint defaults to the AMQP host with the AMQP port plus 10000, and uses
 the AMQP credentials unless `broker.sasl` overrides them. Set
 `broker.rabbitmq.managementPort` when the management plugin listens elsewhere.
+The endpoint's host is always the AMQP host, and only its port can be
+overridden. A managed offering that serves the management API on a separate
+hostname cannot be configured today: there is no host option, so a port setting
+does not reach it and a deployment of that shape needs the API exposed on the
+AMQP host or a proxy in front of it.
 An unreachable API fails subscription start with an error naming the endpoint,
 rather than skipping the check; a broker with the management plugin disabled,
 firewalled, or on a non-default port is the most likely cause.
@@ -122,6 +127,26 @@ side holds the record until its due time, so a delayed or retried message needs
 no topology beyond the destination topic. RabbitMQ's emulation needs the parking
 queue, so `TopologyNone` obliges an operator to provision the destinations and
 their parking queues here, and only the topics there.
+
+Consumer delivery timeouts are a destination-queue setting rather than a
+parking-queue one, and they follow the same policy split. Setting
+`broker.rabbitmq.consumerTimeout` reaches the broker as the queue argument
+`x-consumer-timeout`, on quorum destination queues only: the broker refuses the
+argument on a classic queue, so a classic deployment never declares it, and when
+the key is absent nothing is declared and the broker's own default stays in
+force. The argument is fixed when the queue is created, which is what decides
+the upgrade path for a deployment whose destination queues already exist.
+
+A default deployment runs `TopologyVerify`. Against an existing queue the drift
+detector names the argument as `x-consumer-timeout Want:90000 Got:<absent>`, and
+startup logs that as a warning under `f1 topology argument drift` rather than
+failing; the queue keeps the broker default. Under `topology.autoCreate`
+(`TopologyDeclare`) there is no drift check at all, so the existing queue is
+found and left as it was, silently. The adapter never makes an active redeclare
+carrying the argument either way, because the broker refuses one with
+`406 PRECONDITION_FAILED`. An existing queue therefore has to be deleted and
+recreated to gain the setting, and the drift warning is the only thing that says
+so.
 
 ## Kafka driver
 

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -1075,6 +1076,49 @@ func TestProducerParkingFailureNamesMissingQueue(t *testing.T) {
 	}
 	if failure := publishErr.Failed[0]; strings.Contains(failure.Error(), "parking destination") {
 		t.Fatalf("failure for the missing destination %q claims a parking queue: %v", missing, failure)
+	}
+}
+
+// TestParkingFailureRendersEveryDeclareArgument proves the message is derived
+// from parkingArguments rather than restating it. The test iterates that
+// function's own output, so an argument added there reaches the message with
+// no second edit, and an argument removed there cannot leave the message
+// telling an operator to create a queue the adapter would then report as
+// drift. The two queue kinds are separate cases because the argument sets
+// differ by kind.
+//
+// Durability is not in that argument table: it is a declare flag, and the
+// adapter sets it for the parking queue under every kind, so the message has to
+// state it in words and this test pins the words. An operator provisioning the
+// queue under TopologyNone has only the message to read, and a non-durable
+// queue there loses every parked message on a broker restart.
+func TestParkingFailureRendersEveryDeclareArgument(t *testing.T) {
+	const destination = "orders.deferred"
+	parking := destination + parkingSuffix
+	cause := classify("publish", driver.KindNotFound,
+		errors.Join(driver.ErrDestinationMissing, errors.New("rabbitmq: publish returned by broker: 312 NO_ROUTE")))
+
+	for _, kind := range []queueKind{queueKindQuorum, queueKindClassic} {
+		t.Run(string(kind), func(t *testing.T) {
+			message := parkingFailure(parking, kind, cause).Error()
+			for key, value := range parkingArguments(destination, kind) {
+				rendered := fmt.Sprint(value)
+				if text, ok := value.(string); ok {
+					rendered = strconv.Quote(text)
+				}
+				if !strings.Contains(message, key+"="+rendered) {
+					t.Fatalf("parking failure %q does not carry the declare argument %s=%s", message, key, rendered)
+				}
+			}
+			for _, want := range []string{parking, "declares the queue durable", "TopologyDeclare", "TopologyVerify", "TopologyNone"} {
+				if !strings.Contains(message, want) {
+					t.Fatalf("parking failure %q does not name %q", message, want)
+				}
+			}
+			if !errors.Is(parkingFailure(parking, kind, cause), driver.ErrDestinationMissing) {
+				t.Fatalf("parking failure %q no longer wraps ErrDestinationMissing", message)
+			}
+		})
 	}
 }
 

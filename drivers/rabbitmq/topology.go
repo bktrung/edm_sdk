@@ -233,9 +233,6 @@ func (a *adminOperations) currentBindings(ctx context.Context) (map[bindingKey]s
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	if a.conn.management == nil {
-		return nil, errors.New("rabbitmq: binding verification unsupported: management client is unavailable")
-	}
 	bindings, err := a.conn.management.listBindings(ctx)
 	if err != nil {
 		return nil, a.managementUnavailable("binding verification", err)
@@ -273,13 +270,14 @@ func (a *adminOperations) managementUnavailable(purpose string, err error) error
 // only keys present in want are checked, so broker-added arguments outside
 // want never appear as drift.
 //
-// A nil management client, or any failure reaching it, is returned as an
-// error rather than folded into an empty result: TopologyVerify must be able
-// to say "this was not checked" instead of silently reporting a clean diff.
+// A failure reaching the management client is returned as an error rather
+// than folded into an empty result: TopologyVerify must be able to say "this
+// was not checked" instead of silently reporting a clean diff. The client
+// itself is never absent, because newConn is the only construction of a conn
+// the port hands out, it fails Open when newManagementClient cannot build
+// one, and nothing reassigns the field, so the only failure to report here is
+// reaching the broker rather than a missing client.
 func (a *adminOperations) argumentDrift(ctx context.Context, name string, want amqp.Table) ([]driver.ArgumentDrift, error) {
-	if a.conn.management == nil {
-		return nil, errors.New("rabbitmq: argument drift verification unsupported: management client is unavailable")
-	}
 	if len(want) == 0 {
 		return nil, nil
 	}
