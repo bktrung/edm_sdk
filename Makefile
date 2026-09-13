@@ -34,12 +34,15 @@ KAFKA_COMPOSE := KAFKA_PORT=$(KAFKA_PORT) docker compose --project-name "$(KAFKA
 build:
 	CGO_ENABLED=0 go build -trimpath -ldflags "-X main.version=$(VERSION)" ./...
 
-## test-fast: run short race-enabled tests and print coverage.
+## test-fast: run the short race-enabled suite and print coverage. This is the
+## broker-free gate: broker-backed tests skip without dialing. See
+## docs/development/testing.md.
 test-fast:
 	go test -race -short -coverprofile=coverage.out ./...
 	go tool cover -func=coverage.out | tail -1
 
-## test: run the full test suite.
+## test: run the full test suite. It contacts a broker whenever one is
+## reachable, so its broker-backed suites run. See docs/development/testing.md.
 test:
 	go test -count=1 ./...
 
@@ -90,7 +93,9 @@ verify-self-contained:
 	fi; \
 	echo "verify-self-contained: 0 issues."
 
-## check-fixture: validate the local fixtures used by tests and tooling.
+## check-fixture: validate the local fixtures used by tests and tooling. It runs
+## the full suite, so it contacts a broker whenever one is reachable. See
+## docs/development/testing.md.
 check-fixture:
 	go test -count=1 ./...
 	$(MAKE) check-api-surface check-api-surface-codec check-api-surface-driver check-api-surface-f1test check-api-diff

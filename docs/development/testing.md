@@ -202,6 +202,27 @@ required gate: a known Kafka consumer stall can red it at any corpus size, so
 run it deliberately and read a red run as evidence about that defect rather than
 about broker agnosticism.
 
+### Which targets contact a broker
+
+`make test` and `make check-fixture` run the suite without `-short`, so they
+contact a broker whenever one is reachable and each driver package's
+broker-backed tests then run for a minute or more. The broker-backed targets
+(`test-kafka`, `test-rabbitmq`, `test-kafka-conformance`, `test-infra`,
+`test-driver-flip`) also contact a broker, and they set `F1_REQUIRE_KAFKA` or
+`F1_REQUIRE_RABBITMQ` so an unreachable fixture fails instead of skipping.
+
+`make test-fast` is the broker-free gate. It passes `-short`, and a driver
+suite decides to skip its broker-backed tests before the reachability probe
+runs, so the command opens no connection even when a broker is listening.
+Setting `F1_REQUIRE_KAFKA` or `F1_REQUIRE_RABBITMQ` together with `-short` is a
+contradiction, and the affected test fails rather than skipping.
+
+Point a run at your own fixture with `F1_KAFKA_ENDPOINT` (for example
+`localhost:19131`) and `F1_RABBITMQ_ENDPOINT` (for example
+`amqp://guest:guest@localhost:15131/`). The broker-backed targets honour both,
+falling back to the port their own `KAFKA_PORT` or `RABBITMQ_PORT` variable
+selects.
+
 Keep provider tests isolated from one another. Use the fixture cleanup helpers,
 remove queues, topics, and groups created by the test, and do not reset a
 shared broker that the test did not start.

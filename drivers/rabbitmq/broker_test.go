@@ -90,9 +90,17 @@ var brokerProbe struct {
 }
 
 // requireBroker skips the calling test when the local fixture is unreachable,
-// or fails it when requireBrokerEnv is set. The probe runs once per package.
+// or fails it when requireBrokerEnv is set. Under -short it decides before the
+// probe, so the short suite excludes broker-backed tests without opening a
+// connection. The probe runs once per package.
 func requireBroker(t *testing.T) {
 	t.Helper()
+	if testing.Short() {
+		if os.Getenv(requireBrokerEnv) != "" {
+			t.Fatalf("-short and %s contradict each other: the short suite excludes broker-backed tests", requireBrokerEnv)
+		}
+		t.Skip("short suite excludes broker-backed tests; run `make test-rabbitmq` to require the RabbitMQ fixture")
+	}
 	brokerProbe.once.Do(func() {
 		conn, err := net.DialTimeout("tcp", brokerAddress(defaultEndpoint), 2*time.Second)
 		if err != nil {
