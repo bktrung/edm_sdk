@@ -990,19 +990,21 @@ func openRunnerConsumer(r *Runner, ctx context.Context) (driver.Consumer, error)
 	r.mu.Lock()
 	r.retryDestinationTiers = retryDestinationTiers
 	r.mu.Unlock()
-	if policy != driver.TopologyNone {
-		admin := conn.Admin()
-		if admin == nil {
-			return nil, errors.New("f1: consumer topology requires driver admin")
-		}
-		topology := subscriptionTopologySpecs(effective, source, r.subscription)
-		topology.Policy = policy
-		diff, err := admin.EnsureTopology(ctx, topology)
-		if err != nil {
-			return nil, fmt.Errorf("f1: ensure subscription topology: %w", err)
-		}
-		logTopologyDrift(lastResortRunnerLogger(r), diff)
+	// Every policy goes through the admin, TopologyNone included: under None the
+	// driver does no broker work but still records what the spec said, and a
+	// consumer's retry delay must not depend on whether the core decided to make
+	// the call.
+	admin := conn.Admin()
+	if admin == nil {
+		return nil, errors.New("f1: consumer topology requires driver admin")
 	}
+	topology := subscriptionTopologySpecs(effective, source, r.subscription)
+	topology.Policy = policy
+	diff, err := admin.EnsureTopology(ctx, topology)
+	if err != nil {
+		return nil, fmt.Errorf("f1: ensure subscription topology: %w", err)
+	}
+	logTopologyDrift(lastResortRunnerLogger(r), diff)
 	perDestination := make(map[string]int, len(destinations))
 	remaining := r.config.Prefetch
 	for i, destination := range destinations {

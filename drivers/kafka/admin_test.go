@@ -7,6 +7,8 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -14,6 +16,8 @@ import (
 	"github.com/twmb/franz-go/pkg/kerr"
 	"github.com/twmb/franz-go/pkg/kgo"
 
+	//nolint:depguard // this test must exercise the public f1 API against Kafka.
+	f1 "fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk"
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/driver"
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/clock"
 )
@@ -418,5 +422,188 @@ func TestPruneRefusesConnectionConsumer(t *testing.T) {
 	result := results[0]
 	if result.Deleted || result.Reason == "" {
 		t.Fatalf("Prune(%q) = %+v, want refused with a reason", topic, result)
+	}
+}
+
+// kafkaBrokerWrites counts every request a franz-go client writes to a broker.
+// A count that does not move is the evidence that a call made no round trip.
+type kafkaBrokerWrites struct{ requests atomic.Int64 }
+
+func (c *kafkaBrokerWrites) OnBrokerWrite(kgo.BrokerMetadata, int16, int, time.Duration, time.Duration, error) {
+	c.requests.Add(1)
+}
+
+func TestEnsureTopologyUnderTopologyNoneRecordsDelaysWithoutContactingTheBroker(t *testing.T) {
+	requireBroker(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	t.Cleanup(cancel)
+
+	counter := &kafkaBrokerWrites{}
+	client, err := kgo.NewClient(
+		kgo.SeedBrokers(kafkaEndpoint),
+		kgo.ClientID("f1-kafka-none-delay-test"),
+		kgo.WithHooks(counter),
+	)
+	if err != nil {
+		t.Fatalf("kgo.NewClient: %v", err)
+	}
+	t.Cleanup(client.Close)
+	connection := &conn{client: client, delays: make(map[string]time.Duration)}
+
+	destination := kafkaTestTopic(t, "none-delay")
+	const delay = 1500 * time.Millisecond
+	before := counter.requests.Load()
+	diff, err := connection.Admin().EnsureTopology(ctx, driver.TopologySpec{
+		Policy:       driver.TopologyNone,
+		Destinations: []driver.DestinationSpec{{Name: destination, Delay: delay}},
+		Effective:    (Driver{}).Capabilities(),
+	})
+	if err != nil {
+		t.Fatalf("EnsureTopology(TopologyNone): %v", err)
+	}
+	if writes := counter.requests.Load() - before; writes != 0 {
+		t.Fatalf("EnsureTopology(TopologyNone) wrote %d broker requests, want 0", writes)
+	}
+	if got, known := connection.destinationDelay(destination); !known || got != delay {
+		t.Fatalf("destinationDelay(%q) = (%s, %t), want (%s, true)", destination, got, known, delay)
+	}
+	if len(diff.CreatedDestinations) != 0 || len(diff.ExistingDestinations) != 0 {
+		t.Fatalf("TopologyNone diff = %#v, want no destinations", diff)
+	}
+
+	// The zero above is only evidence if this counter can see a round trip at
+	// all, so the same client makes a declarative call next.
+	created := kafkaTestTopic(t, "none-delay-control")
+	cleanupKafkaTopics(t, kadm.NewClient(client), created)
+	before = counter.requests.Load()
+	declared, err := connection.Admin().EnsureTopology(ctx, driver.TopologySpec{
+		Destinations: []driver.DestinationSpec{{Name: created, Delay: delay}},
+		Effective:    (Driver{}).Capabilities(),
+	})
+	if err != nil {
+		t.Fatalf("EnsureTopology(TopologyDeclare): %v", err)
+	}
+	if writes := counter.requests.Load() - before; writes == 0 {
+		t.Fatal("positive control: EnsureTopology(TopologyDeclare) wrote no broker requests")
+	}
+	if !namesContainAll(declared.CreatedDestinations, created) {
+		t.Fatalf("CreatedDestinations = %v, want %q", declared.CreatedDestinations, created)
+	}
+}
+
+func TestPublicSubscriptionHonoursRetryDelayUnderTopologyNone(t *testing.T) {
+	requireBroker(t)
+	adminCtx, _, admin := openKafkaAdminTest(t)
+	topic := kafkaTestTopic(t, "topology-none-retry")
+	group := kafkaTestTopic(t, "topology-none-retry-group")
+	main := fmt.Sprintf("f1.test.%s.medium", topic)
+	deadLetter := fmt.Sprintf("f1.test.%s.dlq.%s", topic, group)
+	unknownDeadLetter := fmt.Sprintf("f1.test.unknown.dlq.%s", group)
+	// The default ladder is three tiers (MaxAttempts 4), so a TopologyNone
+	// deployment has to create every retry destination itself. Only tier 1 is
+	// exercised below; the rest exist so the consumer subscribes to topics the
+	// broker knows.
+	topics := []string{main, deadLetter, unknownDeadLetter}
+	for tier := 1; tier <= 3; tier++ {
+		topics = append(topics, fmt.Sprintf("f1.test.%s.%s.medium.retry.%d", topic, group, tier))
+	}
+	cleanupKafkaTopics(t, admin, topics...)
+	cleanupKafkaGroups(t, admin, group)
+	for _, name := range topics {
+		createKafkaTopic(t, admin, adminCtx, name, 1)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	t.Cleanup(cancel)
+	client, err := f1.New(ctx, kafkaPublicTestConfig(),
+		f1.WithDriver(Driver{}),
+		f1.WithTopology(f1.TopologyNone),
+		f1.WithPublishTopics(topic),
+	)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	closed := false
+	t.Cleanup(func() {
+		if !closed {
+			_ = client.Close(context.Background())
+		}
+	})
+
+	const eventType = "topology.none.retry.delay.v1"
+	var (
+		attemptsMu sync.Mutex
+		attempts   []time.Time
+		done       = make(chan struct{})
+		doneOnce   sync.Once
+	)
+	wall := clock.NewReal()
+	runner, err := client.Subscribe(ctx, f1.Subscription{
+		Name:        group,
+		Topics:      []string{topic},
+		Concurrency: 1,
+		// One topic, one priority and the default ladder's four lanes
+		// (main plus three retry tiers), so prefetch must cover all four.
+		Prefetch:       4,
+		Priorities:     []f1.Priority{f1.PriorityMedium},
+		HandlerTimeout: 5 * time.Second,
+		Handlers: map[string]f1.Handler{
+			eventType: f1.HandlerFunc(func(_ context.Context, _ *f1.Event) error {
+				attemptsMu.Lock()
+				attempts = append(attempts, wall.Now())
+				count := len(attempts)
+				attemptsMu.Unlock()
+				if count == 1 {
+					return errors.New("first attempt fails")
+				}
+				doneOnce.Do(func() { close(done) })
+				return nil
+			}),
+		},
+	})
+	if err != nil {
+		t.Fatalf("Subscribe: %v", err)
+	}
+	runDone := make(chan error, 1)
+	go func() { runDone <- runner.Run(ctx) }()
+
+	if _, err := client.Publisher().Publish(ctx, eventType, map[string]string{"id": "retry-delay"}, f1.WithTopic(topic)); err != nil {
+		t.Fatalf("Publish: %v", err)
+	}
+
+	select {
+	case <-done:
+	case <-ctx.Done():
+		t.Fatalf("the retried message was not delivered again: %v", ctx.Err())
+	}
+
+	attemptsMu.Lock()
+	got := append([]time.Time(nil), attempts...)
+	attemptsMu.Unlock()
+	if len(got) != 2 {
+		t.Fatalf("handler attempts = %d, want 2", len(got))
+	}
+	elapsed := got[1].Sub(got[0])
+	t.Logf("second attempt arrived %s after the failed attempt (tier-1 nominal delay 1s)", elapsed)
+	if elapsed < 800*time.Millisecond {
+		t.Fatalf("second attempt arrived %s after the failed attempt, want the tier-1 delay of about 1s", elapsed)
+	}
+	if elapsed > 10*time.Second {
+		t.Fatalf("second attempt arrived %s after the failed attempt, want no longer than 10s", elapsed)
+	}
+
+	if err := client.Close(context.Background()); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	closed = true
+	runWaitCtx, runWaitCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer runWaitCancel()
+	select {
+	case runErr := <-runDone:
+		if runErr != nil && !errors.Is(runErr, context.Canceled) {
+			t.Fatalf("Runner.Run: %v", runErr)
+		}
+	case <-runWaitCtx.Done():
+		t.Fatal("Runner.Run did not stop after Close")
 	}
 }

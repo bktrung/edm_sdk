@@ -276,6 +276,10 @@ func (a *admin) pruneGuard(ctx context.Context, name string) (string, error) {
 // EnsureTopology accepts exchanges, bindings, DeadLetter, and DeliveryLimit
 // fields, but Kafka does not honor them: routing is FanoutAtConsume, native
 // dead lettering is unavailable, and the core retry ladder owns those semantics.
+//
+// Under TopologyNone it creates nothing and makes no broker request; it still
+// records each destination's delay, which is local bookkeeping the consume
+// path needs and not a broker round trip.
 func (a *admin) EnsureTopology(ctx context.Context, spec driver.TopologySpec) (driver.TopologyDiff, error) {
 	release, err := a.admission(ctx, "ensure_topology")
 	if err != nil {
@@ -286,9 +290,7 @@ func (a *admin) EnsureTopology(ctx context.Context, spec driver.TopologySpec) (d
 	if err != nil {
 		return driver.TopologyDiff{}, err
 	}
-	if spec.Policy != driver.TopologyNone {
-		a.recordDestinationDelays(spec.Destinations)
-	}
+	a.recordDestinationDelays(spec.Destinations)
 	return diff, nil
 }
 

@@ -92,7 +92,11 @@ func TestConsumerTopologyPolicyUsesDerivedConfig(t *testing.T) {
 		wantSpecs     int
 		wantPolicy    TopologyPolicy
 	}{
-		{"none", false, false, 0, TopologyNone},
+		// The consumer path ensures topology under every policy. Under
+		// TopologyNone the call still arrives: it does no broker work, but it
+		// is how a retry tier's delay reaches the consumer, which the publisher
+		// table above has no use for and where the row stays at 0.
+		{"none", false, false, 1, TopologyNone},
 		{"verify", false, true, 1, TopologyVerify},
 		{"declare", true, false, 1, TopologyDeclare},
 	}
