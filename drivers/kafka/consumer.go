@@ -730,8 +730,8 @@ func (c *consumer) leaveLoop() {
 }
 
 // claimPollWake registers cancel as the interrupt for the poll wait about to
-// begin and reports whether a wake is already pending. The caller must hold
-// c.mu.
+// begin and reports whether a wake is already pending. It takes c.mu itself, so
+// the caller must not hold it.
 //
 // The pending flush and this registration are two steps, so a wake that lands
 // between them would otherwise be lost: the loop would block on a broker that
