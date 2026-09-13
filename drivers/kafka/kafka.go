@@ -6,6 +6,7 @@ import (
 	"crypto/x509"
 	"errors"
 	"fmt"
+	"log/slog"
 	"maps"
 	"net"
 	"os"
@@ -68,6 +69,7 @@ type conn struct {
 	clientOpts            []kgo.Opt
 	driverOptions         map[string]string
 	instanceID            string
+	logger                *slog.Logger
 	rebalanceDrainTimeout time.Duration
 	staticMembership      bool
 	balancer              kgo.GroupBalancer
@@ -225,11 +227,18 @@ func (Driver) Open(ctx context.Context, cfg driver.Config) (driver.Conn, error) 
 	if rebalanceDrainTimeout == 0 {
 		rebalanceDrainTimeout = 25 * time.Second
 	}
+	// Resolve the fallback once, at construction, so the consume path reads a
+	// non-nil logger without repeating the check.
+	logger := cfg.Logger
+	if logger == nil {
+		logger = slog.Default()
+	}
 	return &conn{
 		client:                client,
 		clientOpts:            append([]kgo.Opt(nil), opts...),
 		driverOptions:         maps.Clone(cfg.DriverOptions),
 		instanceID:            cfg.InstanceID,
+		logger:                logger,
 		rebalanceDrainTimeout: rebalanceDrainTimeout,
 		staticMembership:      staticMembership,
 		balancer:              balancer,
@@ -450,6 +459,17 @@ func (c *conn) Consumer(ctx context.Context, cfg driver.ConsumerConfig) (driver.
 }
 
 func (c *conn) Admin() driver.Admin { return &admin{client: kadm.NewClient(c.client), conn: c} }
+
+// log returns the connection's logger, falling back to the process default.
+// Open resolves a nil Config.Logger when it builds the connection; this keeps
+// the zero conn no worse than a nil Config, so a driver diagnostic never panics
+// on a missing logger.
+func (c *conn) log() *slog.Logger {
+	if c.logger == nil {
+		return slog.Default()
+	}
+	return c.logger
+}
 
 func (c *conn) destinationDelay(destination string) (time.Duration, bool) {
 	c.mu.RLock()

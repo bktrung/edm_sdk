@@ -124,7 +124,7 @@ func (c *Client) reconnectOnce(ctx context.Context, cause error, attempt *reconn
 		if err := c.options.clock.Sleep(ctx, delay); err != nil {
 			return err
 		}
-		connection, err := c.options.driver.Open(ctx, driverConfig(c.config))
+		connection, err := c.options.driver.Open(ctx, driverConfig(c.config, c.options.logger))
 		if err == nil {
 			if connection == nil {
 				err = errors.New("reconnect returned no connection")

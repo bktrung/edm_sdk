@@ -130,7 +130,7 @@ func New(ctx context.Context, cfg Config, opts ...Option) (*Client, error) {
 	if _, ok := options.codecsByName[cfg.Codec.Default]; !ok {
 		return nil, fmt.Errorf("f1: codec.default %q is not registered", cfg.Codec.Default)
 	}
-	connection, err := options.driver.Open(ctx, driverConfig(cfg))
+	connection, err := options.driver.Open(ctx, driverConfig(cfg, options.logger))
 	if err != nil {
 		return nil, fmt.Errorf("f1: open %s driver: %w", driverName, err)
 	}
@@ -710,13 +710,14 @@ func endPublish(c *Client) {
 	}
 }
 
-func driverConfig(cfg Config) driver.Config {
+func driverConfig(cfg Config, logger *slog.Logger) driver.Config {
 	result := driver.Config{
 		Endpoints:             append([]string(nil), cfg.Broker.Endpoints...),
 		ClientID:              cfg.InstanceID,
 		InstanceID:            cfg.InstanceID,
 		RebalanceDrainTimeout: cfg.Lifecycle.RebalanceDrainTimeout,
 		ConnectTimeout:        cfg.Broker.ConnectTimeout,
+		Logger:                logger,
 		DriverOptions:         cloneOptions(cfg.Broker.DriverOptions),
 	}
 	if result.ClientID == "" {

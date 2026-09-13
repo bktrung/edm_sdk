@@ -2,15 +2,19 @@ package kafka
 
 import (
 	"bytes"
+	"context"
 	"io"
 	"log/slog"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/twmb/franz-go/pkg/kgo"
 
+	//nolint:depguard // this test must exercise the public f1 API against Kafka.
+	f1 "fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk"
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/driver"
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/clock"
 )
@@ -289,11 +293,8 @@ func TestPendingDeadlineIgnoresUnknownDestinationAlongsideDeferrable(t *testing.
 }
 
 func TestConsumerDeferralFaultDoesNotSendError(t *testing.T) {
-	previous := slog.Default()
-	slog.SetDefault(slog.New(slog.NewTextHandler(io.Discard, nil)))
-	t.Cleanup(func() { slog.SetDefault(previous) })
-
 	c := &consumer{
+		conn:              &conn{logger: slog.New(slog.NewTextHandler(io.Discard, nil))},
 		errors:            make(chan error, 10),
 		budgets:           map[string]int{"retry": 1},
 		pauseReasons:      make(map[string]pauseReasonSet),
@@ -320,11 +321,8 @@ func TestConsumerDeferralFaultDoesNotSendError(t *testing.T) {
 
 func TestConsumerDeferralFaultLogsOncePerDestination(t *testing.T) {
 	var logs bytes.Buffer
-	previous := slog.Default()
-	slog.SetDefault(slog.New(slog.NewTextHandler(&logs, nil)))
-	t.Cleanup(func() { slog.SetDefault(previous) })
-
 	c := &consumer{
+		conn:              &conn{logger: slog.New(slog.NewTextHandler(&logs, nil))},
 		errors:            make(chan error, 10),
 		budgets:           map[string]int{"retry": 10},
 		pauseReasons:      make(map[string]pauseReasonSet),
@@ -363,4 +361,172 @@ func TestConsumerDeferralFaultLogsOncePerDestination(t *testing.T) {
 	if !strings.Contains(line, "destination delay is unknown") {
 		t.Errorf("log line missing condition: %q", line)
 	}
+}
+
+// deferralLogSink is a concurrency-safe capture buffer. The driver warns from
+// its fetch goroutine while the test reads the capture, so a bare bytes.Buffer
+// would race under -race.
+type deferralLogSink struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (s *deferralLogSink) Write(p []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.buf.Write(p)
+}
+
+func (s *deferralLogSink) String() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.buf.String()
+}
+
+// swapProcessDefault points slog.Default at sink for the rest of the test and
+// restores the previous default afterwards.
+func swapProcessDefault(t *testing.T, sink *deferralLogSink) {
+	t.Helper()
+	previous := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(sink, nil)))
+	t.Cleanup(func() { slog.SetDefault(previous) })
+}
+
+// deferralLoggerDriver captures the port configuration a public client hands to
+// the real Kafka driver, so a test can reach the connection it opened.
+type deferralLoggerDriver struct {
+	Driver
+	opened driver.Config
+	conn   *conn
+}
+
+func (d *deferralLoggerDriver) Open(ctx context.Context, cfg driver.Config) (driver.Conn, error) {
+	opened, err := d.Driver.Open(ctx, cfg)
+	if err != nil {
+		return nil, err
+	}
+	d.opened = cfg
+	d.conn, _ = opened.(*conn)
+	return opened, nil
+}
+
+// openDeferralPublicClient builds an f1 client over the real Kafka driver and
+// returns the connection it opened plus the port configuration it received. A
+// nil logger omits WithLogger.
+func openDeferralPublicClient(t *testing.T, ctx context.Context, logger *slog.Logger) (*conn, driver.Config) {
+	t.Helper()
+	driverUnderTest := &deferralLoggerDriver{}
+	options := []f1.Option{
+		f1.WithDriver(driverUnderTest),
+		f1.WithTopology(f1.TopologyNone),
+	}
+	if logger != nil {
+		options = append(options, f1.WithLogger(logger))
+	}
+	client, err := f1.New(ctx, kafkaPublicTestConfig(), options...)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	t.Cleanup(func() { _ = client.Close(ctx) })
+	if driverUnderTest.conn == nil {
+		t.Fatal("client did not open a Kafka connection")
+	}
+	return driverUnderTest.conn, driverUnderTest.opened
+}
+
+// assertDeferralFaultWarns publishes one record to a destination the connection
+// knows no delay for, consumes it, and requires the deferral fault warning with
+// all four identifying attributes in sink. The connection declares no topology,
+// which is what leaves the destination delay unknown.
+func assertDeferralFaultWarns(t *testing.T, connection *conn, sink *deferralLogSink) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	t.Cleanup(cancel)
+	_, _, admin := openKafkaAdminTest(t)
+
+	topic := kafkaTestTopic(t, "deferral-logger")
+	group := kafkaTestTopic(t, "deferral-logger-group")
+	cleanupKafkaTopics(t, admin, topic)
+	cleanupKafkaGroups(t, admin, group)
+	createKafkaTopic(t, admin, ctx, topic, 1)
+
+	producer, err := connection.Producer(ctx, driver.ProducerConfig{RequireDurableAck: true, Effective: connection.Capabilities()})
+	if err != nil {
+		t.Fatalf("Producer: %v", err)
+	}
+	defer func() { _ = producer.Close(ctx) }()
+	publishKafkaMessage(t, producer, ctx, topic, "deferral")
+
+	consumerValue, err := connection.Consumer(ctx, driver.ConsumerConfig{
+		Group: group, Destinations: []string{topic}, Prefetch: 1, Effective: connection.Capabilities(),
+	})
+	if err != nil {
+		t.Fatalf("Consumer: %v", err)
+	}
+	defer closeKafkaConsumer(consumerValue)
+	message := receiveKafkaMessage(t, consumerValue)
+	if err := message.Settle.Ack(ctx); err != nil {
+		t.Fatalf("Ack: %v", err)
+	}
+
+	output := sink.String()
+	for _, want := range []string{
+		"kafka deferred delivery fault",
+		"destination=" + topic,
+		"destination delay is unknown",
+		"partition=0",
+		"offset=0",
+	} {
+		if !strings.Contains(output, want) {
+			t.Fatalf("logger output = %q, want %q", output, want)
+		}
+	}
+}
+
+func TestDeferralFaultUsesConfiguredClientLogger(t *testing.T) {
+	requireBroker(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	t.Cleanup(cancel)
+
+	var configured deferralLogSink
+	connection, portConfig := openDeferralPublicClient(t, ctx, slog.New(slog.NewTextHandler(&configured, nil)))
+	if portConfig.Logger == nil {
+		t.Fatal("driver.Config.Logger = nil, want the client's logger")
+	}
+	assertDeferralFaultWarns(t, connection, &configured)
+}
+
+func TestDeferralFaultWithoutConfiguredLoggerUsesProcessDefault(t *testing.T) {
+	t.Run("client without WithLogger", func(t *testing.T) {
+		requireBroker(t)
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		t.Cleanup(cancel)
+
+		var processDefault deferralLogSink
+		swapProcessDefault(t, &processDefault)
+		connection, portConfig := openDeferralPublicClient(t, ctx, nil)
+		if portConfig.Logger != nil {
+			t.Fatal("driver.Config.Logger = non-nil, want nil without WithLogger")
+		}
+		assertDeferralFaultWarns(t, connection, &processDefault)
+	})
+
+	t.Run("zero driver config", func(t *testing.T) {
+		requireBroker(t)
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		t.Cleanup(cancel)
+
+		var processDefault deferralLogSink
+		swapProcessDefault(t, &processDefault)
+		opened, err := (Driver{}).Open(ctx, driver.Config{Endpoints: []string{kafkaEndpoint}})
+		if err != nil {
+			t.Fatalf("Open: %v", err)
+		}
+		connection, ok := opened.(*conn)
+		if !ok {
+			t.Fatalf("Open() returned %T, want *conn", opened)
+		}
+		t.Cleanup(func() { _ = connection.Close(context.Background()) })
+		assertDeferralFaultWarns(t, connection, &processDefault)
+	})
 }
