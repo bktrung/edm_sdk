@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
 	"slices"
 	"strconv"
 	"sync"
@@ -592,6 +593,91 @@ func resolveMaxAckGap(options map[string]string) (int64, error) {
 		return 0, fmt.Errorf("kafka: invalid maxAckGap %q; must be a positive integer", value)
 	}
 	return gap, nil
+}
+
+// Consume-path knob defaults. They are franz-go's own defaults, passed
+// explicitly so an unset key still has a value the driver chose and a test can
+// observe.
+//
+// defaultKafkaSessionTimeout matches the fallback that config validation uses
+// to bound lifecycle.rebalanceDrainTimeout. That bound is only meaningful if
+// the session timeout the broker enforces is the one validation measured, so
+// the two values must move together.
+const (
+	defaultKafkaFetchMaxBytes    int32 = 50 << 20
+	defaultKafkaSessionTimeout         = 45 * time.Second
+	defaultKafkaRebalanceTimeout       = 60 * time.Second
+)
+
+// resolveConsumerOptions translates the broker.kafka.* keys that govern the
+// consume path into franz-go options. It returns an option for every knob,
+// including the ones the operator left unset, for the same reason the producer
+// side does: the values in force are the driver's, not a library default.
+func resolveConsumerOptions(options map[string]string) ([]kgo.Opt, error) {
+	fetchMaxBytes, err := resolveFetchMaxBytes(options)
+	if err != nil {
+		return nil, err
+	}
+	sessionTimeout, err := resolveSessionTimeout(options)
+	if err != nil {
+		return nil, err
+	}
+	rebalanceTimeout, err := resolveRebalanceTimeout(options)
+	if err != nil {
+		return nil, err
+	}
+	return []kgo.Opt{
+		kgo.FetchMaxBytes(fetchMaxBytes),
+		kgo.SessionTimeout(sessionTimeout),
+		kgo.RebalanceTimeout(rebalanceTimeout),
+	}, nil
+}
+
+// resolveFetchMaxBytes maps kafka.fetchMaxBytes onto the ceiling a consumer
+// asks each broker for in a fetch. The wire field is an int32, so the parse is
+// bounded at 32 bits and a larger value is refused rather than wrapped into a
+// negative ceiling.
+func resolveFetchMaxBytes(options map[string]string) (int32, error) {
+	value, ok := options["kafka.fetchMaxBytes"]
+	if !ok {
+		return defaultKafkaFetchMaxBytes, nil
+	}
+	bytes, err := strconv.ParseInt(value, 10, 32)
+	if err != nil || bytes <= 0 {
+		return 0, fmt.Errorf("kafka: invalid kafka.fetchMaxBytes %q; must be an integer between 1 and %d", value, math.MaxInt32)
+	}
+	return int32(bytes), nil
+}
+
+// resolveSessionTimeout maps kafka.sessionTimeout onto the group member session
+// timeout. The member carries the value in its join request, so it is the
+// timeout the coordinator expires the member on rather than a local
+// approximation of it.
+func resolveSessionTimeout(options map[string]string) (time.Duration, error) {
+	value, ok := options["kafka.sessionTimeout"]
+	if !ok {
+		return defaultKafkaSessionTimeout, nil
+	}
+	timeout, err := time.ParseDuration(value)
+	if err != nil || timeout <= 0 {
+		return 0, fmt.Errorf("kafka: invalid kafka.sessionTimeout %q; must be a positive duration", value)
+	}
+	return timeout, nil
+}
+
+// resolveRebalanceTimeout maps kafka.rebalanceTimeout onto the group member
+// rebalance timeout: the window the broker allows a member to complete a
+// rebalance before removing it from the group.
+func resolveRebalanceTimeout(options map[string]string) (time.Duration, error) {
+	value, ok := options["kafka.rebalanceTimeout"]
+	if !ok {
+		return defaultKafkaRebalanceTimeout, nil
+	}
+	timeout, err := time.ParseDuration(value)
+	if err != nil || timeout <= 0 {
+		return 0, fmt.Errorf("kafka: invalid kafka.rebalanceTimeout %q; must be a positive duration", value)
+	}
+	return timeout, nil
 }
 
 func newConsumerGroup() (string, error) {

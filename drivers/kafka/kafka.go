@@ -124,6 +124,17 @@ func (Driver) Open(ctx context.Context, cfg driver.Config) (driver.Conn, error) 
 	if err != nil {
 		return nil, classify("open", driver.KindFatal, err)
 	}
+	// Resolve the remaining knobs before anything touches the broker, so a
+	// value the driver cannot translate is refused here, naming its key, rather
+	// than surfacing later as a connection or group failure.
+	producerOpts, err := resolveProducerOptions(cfg.DriverOptions)
+	if err != nil {
+		return nil, classify("open", driver.KindFatal, err)
+	}
+	consumerOpts, err := resolveConsumerOptions(cfg.DriverOptions)
+	if err != nil {
+		return nil, classify("open", driver.KindFatal, err)
+	}
 	if len(cfg.Endpoints) == 0 {
 		return nil, classify("open", driver.KindFatal, errMissingEndpoints)
 	}
@@ -165,8 +176,19 @@ func (Driver) Open(ctx context.Context, cfg driver.Config) (driver.Conn, error) 
 	opts = append(opts, kgo.ProducerBatchMaxBytesFn(func(string) int32 {
 		return producerBatchBytes
 	}))
+	// The consume-path knobs belong in this list rather than on the consumer
+	// alone: the consumer factory clones this slice, and the client that owns
+	// the group is the consumer's, so the group and fetch settings have to be
+	// in what it clones.
+	opts = append(opts, consumerOpts...)
+	// The produce-path knobs stay out of that list, on the client that
+	// produces. franz-go's DefaultCompressor compacts the codec slice it is
+	// handed in place while a client is built, and every consumer client is
+	// built from a clone of this list, so a codec slice shared through it would
+	// be written by each consumer constructed at the same time.
+	producerClientOpts := append(append([]kgo.Opt(nil), opts...), producerOpts...)
 
-	client, err := kgo.NewClient(opts...)
+	client, err := kgo.NewClient(producerClientOpts...)
 	if err != nil {
 		return nil, classify("open", driver.KindFatal, err)
 	}
