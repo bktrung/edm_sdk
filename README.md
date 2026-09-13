@@ -84,6 +84,14 @@ change the broker endpoint there when using a real broker. The development confi
 `topology.autoCreate: true` so the publisher can declare its entry point. Production should
 provision topology separately and leave auto-creation disabled.
 
+The fixture's RabbitMQ image includes the management plugin. The consumer's subscription path
+requires that plugin's HTTP API: it reads bindings, and under startup verification the broker's
+queue arguments, through it, so a broker whose management plugin is disabled, firewalled, or on a
+non-default port fails at subscription start. The API defaults to the AMQP host with the AMQP port
+plus 10000, which is 15672 for the fixture; set `broker.rabbitmq.managementPort` when it listens
+elsewhere. `TopologyNone` is the only policy that starts a subscription without the management API,
+and it requires the topology to already exist.
+
 From a clean checkout:
 
 ```sh

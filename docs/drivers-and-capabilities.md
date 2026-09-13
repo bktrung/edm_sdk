@@ -49,6 +49,32 @@ Use the RabbitMQ suite for queue, exchange, management, confirmation,
 reconnect, TLS, and broker-specific admission behavior. Use conformance when
 the behavior is part of the shared port.
 
+### The management HTTP API is a deployment requirement
+
+The adapter inspects broker-side state through the RabbitMQ management HTTP
+API, not through AMQP. A passive declaration confirms a queue's name and
+nothing else, so a driver that must compare the arguments a queue was declared
+with against what the broker holds has no AMQP channel for that comparison.
+The same applies to bindings, which AMQP cannot enumerate. The requirement
+therefore reaches the subscription path:
+
+| Topology policy | Management API needed to start a subscription |
+| --- | --- |
+| `TopologyDeclare` | Yes. The subscription's bindings are read before the consumer opens. |
+| `TopologyVerify` | Yes. The broker's queue arguments and the bindings are both read. |
+| `TopologyNone` | No. The adapter makes no management call, so the topology must already exist. |
+
+The endpoint defaults to the AMQP host with the AMQP port plus 10000, and uses
+the AMQP credentials unless `broker.sasl` overrides them. Set
+`broker.rabbitmq.managementPort` when the management plugin listens elsewhere.
+An unreachable API fails subscription start with an error naming the endpoint,
+rather than skipping the check; a broker with the management plugin disabled,
+firewalled, or on a non-default port is the most likely cause.
+
+The local fixture (`make broker-up`) runs a `-management` image with the API on
+15672. Managed RabbitMQ offerings differ in whether that API is exposed and on
+which credentials, so check it before deploying.
+
 ## Kafka driver
 
 The Kafka adapter uses classic consumer groups and franz-go. Share-group mode

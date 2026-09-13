@@ -174,7 +174,8 @@ func (a *adminOperations) verifyTopology(ctx context.Context, spec driver.Topolo
 		diff.ExistingDestinations = append(diff.ExistingDestinations, destination.Name)
 		drifted, err := a.argumentDrift(ctx, destination.Name, mainArgs)
 		if err != nil {
-			return driver.TopologyDiff{}, classify("ensure_topology", driver.KindTransient, fmt.Errorf("rabbitmq: argument drift verification unavailable for %q: %w", destination.Name, err))
+			purpose := fmt.Sprintf("argument drift verification for destination %q", destination.Name)
+			return driver.TopologyDiff{}, classify("ensure_topology", driver.KindTransient, a.managementUnavailable(purpose, err))
 		}
 		diff.Drifted = append(diff.Drifted, drifted...)
 		a.conn.mu.Lock()
@@ -195,7 +196,8 @@ func (a *adminOperations) verifyTopology(ctx context.Context, spec driver.Topolo
 			diff.ExistingDestinations = append(diff.ExistingDestinations, parkName)
 			parkDrifted, err := a.argumentDrift(ctx, parkName, parkArgs)
 			if err != nil {
-				return driver.TopologyDiff{}, classify("ensure_topology", driver.KindTransient, fmt.Errorf("rabbitmq: argument drift verification unavailable for %q: %w", parkName, err))
+				purpose := fmt.Sprintf("argument drift verification for parking destination %q", parkName)
+				return driver.TopologyDiff{}, classify("ensure_topology", driver.KindTransient, a.managementUnavailable(purpose, err))
 			}
 			diff.Drifted = append(diff.Drifted, parkDrifted...)
 		}
@@ -235,7 +237,7 @@ func (a *adminOperations) currentBindings(ctx context.Context) (map[bindingKey]s
 	}
 	bindings, err := a.conn.management.listBindings(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("rabbitmq: binding verification unavailable: %w", err)
+		return nil, a.managementUnavailable("binding verification", err)
 	}
 	actual := make(map[bindingKey]struct{}, len(bindings))
 	for _, binding := range bindings {
@@ -245,6 +247,22 @@ func (a *adminOperations) currentBindings(ctx context.Context) (map[bindingKey]s
 		actual[bindingKey{source: binding.Source, destination: binding.Destination}] = struct{}{}
 	}
 	return actual, nil
+}
+
+// managementUnavailable wraps a failure to reach the broker's management HTTP
+// API with the deployment action that resolves it. The subscription path
+// cannot do this inspection over AMQP: a passive declare confirms a queue's
+// name but reports none of its arguments, so bindings and argument values are
+// visible only through management, and an unreachable API fails subscription
+// topology under TopologyDeclare and TopologyVerify rather than degrading -
+// the orphan scan is the one inspection that only records the limitation.
+//
+// The message names the endpoint that was tried because it is derived rather
+// than configured - the AMQP host with the AMQP port plus 10000 - so the
+// common failure on a broker whose management plugin is disabled, firewalled,
+// or on another port is otherwise indistinguishable from a broker that is down.
+func (a *adminOperations) managementUnavailable(purpose string, err error) error {
+	return fmt.Errorf("rabbitmq: %s requires the management API at %s (enable the RabbitMQ management plugin, or set rabbitmq.managementPort when management does not listen on the AMQP port plus 10000): %w", purpose, a.conn.management.baseURL, err)
 }
 
 // argumentDrift compares the arguments a destination was declared with
