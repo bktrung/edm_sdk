@@ -178,7 +178,7 @@ $(APIDIFF): tools/apidiff/go.mod tools/apidiff/go.sum
 $(APIDIFF_NORMALIZE): tools/apidiff/normalize.go tools/apidiff/go.mod tools/apidiff/go.sum
 	cd tools/apidiff && go build -o ../../.tools/bin/apidiff-normalize .
 
-.PHONY: broker-up broker-down broker-reset broker-smoke test-rabbitmq test-rabbitmq-driver test-rabbitmq-conformance test-kafka test-infra test-kafka-conformance kafka-up kafka-down
+.PHONY: broker-up broker-down broker-reset broker-smoke test-rabbitmq test-rabbitmq-driver test-rabbitmq-conformance test-kafka test-infra test-driver-flip test-kafka-conformance kafka-up kafka-down
 
 ## test-rabbitmq: run the RabbitMQ driver suite and its conformance suite
 ## against the selected fixture, starting it first. F1_REQUIRE_RABBITMQ makes an
@@ -209,6 +209,18 @@ test-kafka: kafka-up
 ## test-infra: run the tests that need a broker. Fails, never skips, when one is missing.
 test-infra: kafka-up
 	F1_KAFKA_ENDPOINT=$${F1_KAFKA_ENDPOINT:-localhost:$(KAFKA_PORT)} F1_ACCEPTANCE_ENDPOINT=$${F1_ACCEPTANCE_ENDPOINT:-localhost:$(KAFKA_PORT)} F1_REQUIRE_KAFKA=1 go test -count=1 -tags integration ./...
+
+## test-driver-flip: run the acceptance services against each driver with one
+## corpus and diff the two runs. This is the driver-flip acceptance: the same
+## application, deployed twice, must produce the same behaviour vector. It needs
+## both brokers, and F1_REQUIRE_KAFKA and F1_REQUIRE_RABBITMQ make a missing one a
+## failure rather than a skip. Artifacts land in .cache/driver-flip.
+test-driver-flip: kafka-up broker-up broker-smoke
+	F1_DRIVER_FLIP=1 \
+	F1_KAFKA_ENDPOINT=$${F1_KAFKA_ENDPOINT:-localhost:$(KAFKA_PORT)} \
+	F1_RABBITMQ_ENDPOINT=$${F1_RABBITMQ_ENDPOINT:-amqp://guest:guest@localhost:$(RABBITMQ_PORT)/} \
+	F1_REQUIRE_KAFKA=1 F1_REQUIRE_RABBITMQ=1 \
+	go test -v -count=1 -tags integration -run TestDriverFlipAcceptance -timeout 45m ./examples/acceptance/
 
 ## test-kafka-conformance: run both Kafka conformance profiles against the fixture.
 ## This takes about 250s and requires a live Kafka broker. F1_KAFKA_CONFORMANCE
