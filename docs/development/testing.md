@@ -213,9 +213,17 @@ broker-backed tests then run for a minute or more. The broker-backed targets
 
 `make test-fast` is the broker-free gate. It passes `-short`, and a driver
 suite decides to skip its broker-backed tests before the reachability probe
-runs, so the command opens no connection even when a broker is listening.
+runs, so no test body opens a connection even when a broker is listening.
 Setting `F1_REQUIRE_KAFKA` or `F1_REQUIRE_RABBITMQ` together with `-short` is a
 contradiction, and the affected test fails rather than skipping.
+
+One residual connect survives the guard. `TestConsumerStaticMembershipOptionInspection`
+in `drivers/kafka/consumer_test.go` builds a client from a compiled-in
+`localhost:19092` seed that ignores `F1_KAFKA_ENDPOINT` and never reaches the
+guard, and franz-go's background connect races the process exit, so a short run
+of the whole `drivers/kafka` package dials that port in roughly one run in five.
+Until that literal is gone, keep a fixture off port 19092 or expect the stray
+connect. Removing the hardcoded endpoints from the test files is tracked work.
 
 Point a run at your own fixture with `F1_KAFKA_ENDPOINT` (for example
 `localhost:19131`) and `F1_RABBITMQ_ENDPOINT` (for example
