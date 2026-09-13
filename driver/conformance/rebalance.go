@@ -532,15 +532,35 @@ func publishRebalanceCount(t *testing.T, group *groupContext, producer driver.Pr
 	}
 }
 
-func rebalanceGroupName(group *groupContext) string {
-	return "conformance.rebalance." + group.runID + "." + group.profile.String()
+// rebalanceGroupName returns the consumer group one rebalance check owns. Each
+// check gets its own group, so a member that fails to leave cannot hold a later
+// check behind it; the consumers of a single check pass the same subtest in and
+// share its group.
+func rebalanceGroupName(group *groupContext, t *testing.T) string {
+	return "conformance.rebalance." + group.runID + "." + group.profile.String() + "." + rebalanceCheckScope(t)
+}
+
+// rebalanceCheckScope returns the per-check part of a rebalance group name: the
+// last element of the running subtest's name, which the harness sets to the
+// check name, mapped to the characters a group identifier accepts.
+func rebalanceCheckScope(t *testing.T) string {
+	name := t.Name()
+	if index := strings.LastIndexByte(name, '/'); index >= 0 {
+		name = name[index+1:]
+	}
+	return strings.Map(func(r rune) rune {
+		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '_' {
+			return r
+		}
+		return '_'
+	}, name)
 }
 
 func newRebalanceConsumer(t *testing.T, group *groupContext, destination string, prefetch int) driver.Consumer {
 	t.Helper()
 	cfg := driver.ConsumerConfig{
 		Destinations: []string{destination},
-		Group:        rebalanceGroupName(group),
+		Group:        rebalanceGroupName(group, t),
 		Prefetch:     prefetch,
 		Effective:    group.effective,
 	}
@@ -561,7 +581,7 @@ func newRebalanceConsumer(t *testing.T, group *groupContext, destination string,
 func newRebalanceConsumerFor(t *testing.T, group *groupContext, cfg driver.ConsumerConfig) driver.Consumer {
 	t.Helper()
 	if cfg.Group == "" {
-		cfg.Group = rebalanceGroupName(group)
+		cfg.Group = rebalanceGroupName(group, t)
 	}
 	cfg, logical := profileConsumerConfig(group, cfg)
 	consumer, err := group.conn.Consumer(group.ctx, cfg)
