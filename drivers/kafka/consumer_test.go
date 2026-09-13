@@ -2277,3 +2277,804 @@ func TestConsumerRealRebalanceNoGoroutineOrTimerLeak(t *testing.T) {
 		t.Fatalf("goroutine count grew from %d to %d (delta %d)", baselineGoroutines, finalGoroutines, diff)
 	}
 }
+
+func TestConsumerCallerHeldTransferIsExclusive(t *testing.T) {
+	requireBroker(t)
+	ctx, connection, admin := openKafkaAdminTest(t)
+	topic := kafkaTestTopic(t, "caller-held-transfer")
+	group := kafkaTestTopic(t, "caller-held-transfer-group")
+	cleanupKafkaTopics(t, admin, topic)
+	cleanupKafkaGroups(t, admin, group)
+	createKafkaTopic(t, admin, ctx, topic, 1)
+	t.Cleanup(func() {
+		cleanupKafkaTopics(t, admin, topic)
+		cleanupKafkaGroups(t, admin, group)
+	})
+
+	connection.rebalanceDrainTimeout = 200 * time.Millisecond
+	producer, err := connection.Producer(ctx, driver.ProducerConfig{
+		RequireDurableAck: true,
+		Effective:         connection.Capabilities(),
+	})
+	if err != nil {
+		t.Fatalf("Producer: %v", err)
+	}
+	t.Cleanup(func() { _ = producer.Close(context.Background()) })
+	publishKafkaMessage(t, producer, ctx, topic, "caller-held")
+
+	cfg := driver.ConsumerConfig{
+		Group:        group,
+		Destinations: []string{topic},
+		Prefetch:     1,
+		Effective:    connection.Capabilities(),
+	}
+	source, err := newConsumer(ctx, connection, cfg)
+	if err != nil {
+		t.Fatalf("source Consumer: %v", err)
+	}
+	t.Cleanup(func() { source.client.Close() })
+
+	var held driver.InboundMessage
+	receiveCtx, receiveCancel := context.WithTimeout(ctx, 15*time.Second)
+	defer receiveCancel()
+	for held.Body == nil {
+		select {
+		case held = <-source.Messages():
+		case err := <-source.Errors():
+			if kind, classified := driver.Classify(err); classified && kind != driver.KindNotification {
+				t.Fatalf("source error: %v", err)
+			}
+		case <-receiveCtx.Done():
+			t.Fatalf("source timed out receiving caller-held message: %v", receiveCtx.Err())
+		}
+	}
+	if string(held.Body) != "caller-held" {
+		t.Fatalf("source body = %q, want caller-held", held.Body)
+	}
+
+	target, err := newConsumer(ctx, connection, cfg)
+	if err != nil {
+		t.Fatalf("target Consumer: %v", err)
+	}
+	t.Cleanup(func() { target.client.Close() })
+
+	// Drive the ownership move through the production callbacks. A
+	// single-partition topic leaves the assignor free to hand the partition
+	// to either member, so waiting for its choice would make this test depend
+	// on which member wins rather than on the transfer.
+	source.onPartitionsRevoked(ctx, nil, map[string][]int32{topic: {0}})
+	target.onPartitionsAssigned(ctx, nil, map[string][]int32{topic: {0}})
+
+	targetCtx, targetCancel := context.WithTimeout(ctx, 15*time.Second)
+	defer targetCancel()
+	var replacement driver.InboundMessage
+	for replacement.Body == nil {
+		select {
+		case replacement = <-target.Messages():
+		case err := <-target.Errors():
+			if kind, classified := driver.Classify(err); classified && kind != driver.KindNotification {
+				t.Fatalf("target error: %v", err)
+			}
+		case <-targetCtx.Done():
+			t.Fatalf("target timed out receiving transferred message: %v", targetCtx.Err())
+		}
+	}
+	if string(replacement.Body) != "caller-held" || replacement.Ref.Offset != held.Ref.Offset {
+		t.Fatalf("target replacement = body %q offset %d, want body %q offset %d",
+			replacement.Body, replacement.Ref.Offset, held.Body, held.Ref.Offset)
+	}
+
+	// The transfer detaches the settler's settlement authority but keeps its
+	// destination slot charged: the caller still holds the delivery, and a
+	// delivery occupies a slot from admission until terminal settlement. The
+	// slot is released exactly once, by the settlement below.
+	waitForKafkaConsumerState(t, source, "source settler detached with slot held", func() bool {
+		source.mu.Lock()
+		defer source.mu.Unlock()
+		return len(source.settlers) == 0 && source.unsettled[topic] == 1
+	})
+	target.mu.Lock()
+	targetUnsettled := target.unsettled[topic]
+	targetSettlers := len(target.settlers)
+	target.mu.Unlock()
+	if targetUnsettled != 1 || targetSettlers != 1 {
+		t.Fatalf("target ownership = unsettled %d settlers %d, want 1 and 1", targetUnsettled, targetSettlers)
+	}
+	if err := held.Settle.Ack(ctx); err == nil || !errors.Is(err, ErrRevoked) {
+		t.Fatalf("source Ack = %v, want ErrRevoked", err)
+	}
+	waitForKafkaConsumerState(t, source, "revoked settlement released the slot once", func() bool {
+		source.mu.Lock()
+		defer source.mu.Unlock()
+		return source.unsettled[topic] == 0 && len(source.settlers) == 0
+	})
+	if err := replacement.Settle.Ack(ctx); err != nil {
+		t.Fatalf("target Ack: %v", err)
+	}
+	waitForKafkaConsumerState(t, target, "target prefetch released", func() bool {
+		target.mu.Lock()
+		defer target.mu.Unlock()
+		return target.unsettled[topic] == 0 && len(target.settlers) == 0
+	})
+
+	noDuplicateCtx, noDuplicateCancel := context.WithTimeout(ctx, 500*time.Millisecond)
+	defer noDuplicateCancel()
+	select {
+	case duplicate := <-target.Messages():
+		t.Fatalf("target received duplicate offset %d body %q", duplicate.Ref.Offset, duplicate.Body)
+	case <-noDuplicateCtx.Done():
+	}
+}
+
+// TestConsumerHandoffStaysQueuedUntilAnEligibleOwnerAppears covers requeuing
+// directly. A delivery the caller still holds is transferred while the only
+// candidates are a fenced member and a draining one, so the handoff stays in
+// the source's queue instead of reaching either, and the next assigned owner
+// receives it.
+func TestConsumerHandoffStaysQueuedUntilAnEligibleOwnerAppears(t *testing.T) {
+	requireBroker(t)
+	ctx, connection, admin := openKafkaAdminTest(t)
+	topic := kafkaTestTopic(t, "fenced-handoff")
+	group := kafkaTestTopic(t, "fenced-handoff-group")
+	cleanupKafkaTopics(t, admin, topic)
+	cleanupKafkaGroups(t, admin, group)
+	createKafkaTopic(t, admin, ctx, topic, 1)
+	t.Cleanup(func() {
+		cleanupKafkaTopics(t, admin, topic)
+		cleanupKafkaGroups(t, admin, group)
+	})
+
+	connection.rebalanceDrainTimeout = 200 * time.Millisecond
+	producer, err := connection.Producer(ctx, driver.ProducerConfig{
+		RequireDurableAck: true,
+		Effective:         connection.Capabilities(),
+	})
+	if err != nil {
+		t.Fatalf("Producer: %v", err)
+	}
+	t.Cleanup(func() { _ = producer.Close(context.Background()) })
+	publishKafkaMessage(t, producer, ctx, topic, "fenced-handoff")
+
+	cfg := driver.ConsumerConfig{
+		Group:        group,
+		Destinations: []string{topic},
+		Prefetch:     1,
+		Effective:    connection.Capabilities(),
+	}
+	source, err := newConsumer(ctx, connection, cfg)
+	if err != nil {
+		t.Fatalf("source Consumer: %v", err)
+	}
+	t.Cleanup(func() { source.client.Close() })
+
+	var held driver.InboundMessage
+	receiveCtx, receiveCancel := context.WithTimeout(ctx, 15*time.Second)
+	defer receiveCancel()
+	for held.Body == nil {
+		select {
+		case held = <-source.Messages():
+		case err := <-source.Errors():
+			if kind, classified := driver.Classify(err); classified && kind != driver.KindNotification {
+				t.Fatalf("source error: %v", err)
+			}
+		case <-receiveCtx.Done():
+			t.Fatalf("source timed out receiving the delivery: %v", receiveCtx.Err())
+		}
+	}
+	if string(held.Body) != "fenced-handoff" {
+		t.Fatalf("source body = %q, want fenced-handoff", held.Body)
+	}
+
+	// The first candidate is fenced after an assignment, so the dispatch guard skips it,
+	// and it would refuse the record inside emit anyway: the fenced half of that guard is
+	// defence in depth behind isRecordStaleLocked, and the handoff requeues either way.
+	// The second is assigned and reachable but draining, so the handoff is offered to it,
+	// refused by emit, and returned to the queue. What this test pins is that observable
+	// contract: neither candidate receives it, the source keeps it queued, and the next
+	// assigned owner gets it.
+	key := partitionKey{destination: topic, partition: 0}
+	fenced := &consumer{
+		conn:              connection,
+		messages:          make(chan driver.InboundMessage, 4),
+		fenced:            map[partitionKey]bool{key: true},
+		activeGenerations: map[partitionKey]uint64{key: 1},
+	}
+	draining := &consumer{
+		conn:              connection,
+		messages:          make(chan driver.InboundMessage, 4),
+		draining:          true,
+		activeGenerations: map[partitionKey]uint64{key: 1},
+	}
+	connection.mu.Lock()
+	connection.consumers[fenced] = struct{}{}
+	connection.consumers[draining] = struct{}{}
+	connection.mu.Unlock()
+	t.Cleanup(func() {
+		connection.mu.Lock()
+		delete(connection.consumers, fenced)
+		delete(connection.consumers, draining)
+		connection.mu.Unlock()
+	})
+
+	// The caller holds the delivery, so the transfer queues the handoff for the
+	// key's next owner rather than delivering it.
+	source.onPartitionsRevoked(ctx, nil, map[string][]int32{topic: {0}})
+	source.redriveHandoffs(key)
+
+	waitForKafkaConsumerState(t, source, "handoff queued while no candidate can own it", func() bool {
+		source.mu.Lock()
+		defer source.mu.Unlock()
+		return len(source.handoffs[key]) == 1
+	})
+	if len(fenced.messages) != 0 {
+		t.Fatalf("fenced target received %d handoff messages, want none", len(fenced.messages))
+	}
+	if len(draining.messages) != 0 {
+		t.Fatalf("draining target received %d handoff messages, want none", len(draining.messages))
+	}
+
+	second, err := newConsumer(ctx, connection, cfg)
+	if err != nil {
+		t.Fatalf("second Consumer: %v", err)
+	}
+	t.Cleanup(func() { second.client.Close() })
+	second.onPartitionsAssigned(ctx, nil, map[string][]int32{topic: {0}})
+
+	secondCtx, secondCancel := context.WithTimeout(ctx, 15*time.Second)
+	defer secondCancel()
+	var replacement driver.InboundMessage
+	for replacement.Body == nil {
+		select {
+		case replacement = <-second.Messages():
+		case err := <-second.Errors():
+			if kind, classified := driver.Classify(err); classified && kind != driver.KindNotification {
+				t.Fatalf("second consumer error: %v", err)
+			}
+		case <-secondCtx.Done():
+			t.Fatalf("second consumer timed out receiving the queued handoff: %v", secondCtx.Err())
+		}
+	}
+	if replacement.Ref.Offset != held.Ref.Offset {
+		t.Fatalf("second consumer offset = %d, want %d", replacement.Ref.Offset, held.Ref.Offset)
+	}
+	waitForKafkaConsumerState(t, source, "queued handoff drained to the assigned owner", func() bool {
+		source.mu.Lock()
+		defer source.mu.Unlock()
+		return len(source.handoffs[key]) == 0
+	})
+	if len(fenced.messages) != 0 || len(draining.messages) != 0 {
+		t.Fatalf("ineligible targets received %d and %d handoff messages, want none",
+			len(fenced.messages), len(draining.messages))
+	}
+}
+
+// queuedHandoffOffsets counts the handoff offsets a consumer still has queued for one
+// destination.
+func queuedHandoffOffsets(consumer *consumer, destination string) int {
+	consumer.mu.Lock()
+	defer consumer.mu.Unlock()
+	queued := 0
+	for key, offsets := range consumer.handoffs {
+		if key.destination == destination {
+			queued += len(offsets)
+		}
+	}
+	return queued
+}
+
+// TestConsumerQueuedHandoffDispatchesWhenCapacityFrees covers the capacity trigger directly: two
+// caller-held deliveries are transferred while the only eligible target is at its prefetch
+// budget, so exactly one handoff is taken and the other stays queued. Freeing one slot on that
+// target is enough to have the queued one taken. Without the trigger the record has no path back
+// at all, because its offset reservation keeps the broker's own redelivery filtered.
+func TestConsumerQueuedHandoffDispatchesWhenCapacityFrees(t *testing.T) {
+	requireBroker(t)
+	ctx, connection, admin := openKafkaAdminTest(t)
+	topic := kafkaTestTopic(t, "capacity-trigger")
+	group := kafkaTestTopic(t, "capacity-trigger-group")
+	cleanupKafkaTopics(t, admin, topic)
+	cleanupKafkaGroups(t, admin, group)
+	createKafkaTopic(t, admin, ctx, topic, 2)
+	t.Cleanup(func() {
+		cleanupKafkaTopics(t, admin, topic)
+		cleanupKafkaGroups(t, admin, group)
+	})
+
+	connection.rebalanceDrainTimeout = 200 * time.Millisecond
+	producer, err := connection.Producer(ctx, driver.ProducerConfig{
+		RequireDurableAck: true,
+		Effective:         connection.Capabilities(),
+	})
+	if err != nil {
+		t.Fatalf("Producer: %v", err)
+	}
+	t.Cleanup(func() { _ = producer.Close(context.Background()) })
+	publishKafkaMessage(t, producer, ctx, topic, "trigger-a")
+	publishKafkaMessage(t, producer, ctx, topic, "trigger-b")
+
+	cfg := driver.ConsumerConfig{
+		Group:        group,
+		Destinations: []string{topic},
+		Prefetch:     2,
+		Effective:    connection.Capabilities(),
+	}
+	source, err := newConsumer(ctx, connection, cfg)
+	if err != nil {
+		t.Fatalf("source Consumer: %v", err)
+	}
+	t.Cleanup(func() { source.client.Close() })
+
+	held := make([]driver.InboundMessage, 0, 2)
+	receiveCtx, receiveCancel := context.WithTimeout(ctx, 15*time.Second)
+	defer receiveCancel()
+	for len(held) < 2 {
+		select {
+		case message := <-source.Messages():
+			held = append(held, message)
+		case err := <-source.Errors():
+			if kind, classified := driver.Classify(err); classified && kind != driver.KindNotification {
+				t.Fatalf("source error: %v", err)
+			}
+		case <-receiveCtx.Done():
+			t.Fatalf("source timed out after %d deliveries: %v", len(held), receiveCtx.Err())
+		}
+	}
+
+	targetCfg := cfg
+	targetCfg.Prefetch = 1
+	target, err := newConsumer(ctx, connection, targetCfg)
+	if err != nil {
+		t.Fatalf("target Consumer: %v", err)
+	}
+	t.Cleanup(func() { target.client.Close() })
+	target.onPartitionsAssigned(ctx, nil, map[string][]int32{topic: {0, 1}})
+
+	// Both caller-held copies are transferred, so both offsets queue as handoffs while the
+	// target holds its single slot.
+	source.onPartitionsRevoked(ctx, nil, map[string][]int32{topic: {0, 1}})
+
+	firstCtx, firstCancel := context.WithTimeout(ctx, 15*time.Second)
+	defer firstCancel()
+	var first driver.InboundMessage
+	for first.Body == nil {
+		select {
+		case first = <-target.Messages():
+		case err := <-target.Errors():
+			if kind, classified := driver.Classify(err); classified && kind != driver.KindNotification {
+				t.Fatalf("target error: %v", err)
+			}
+		case <-firstCtx.Done():
+			t.Fatalf("target timed out taking the first handoff: %v", firstCtx.Err())
+		}
+	}
+	waitForKafkaConsumerState(t, source, "one handoff stays queued while the target is full", func() bool {
+		return queuedHandoffOffsets(source, topic) == 1
+	})
+
+	// Freeing the target's single slot is the crossing the trigger exists for. Every
+	// production release holds c.mu while it writes the destination's charge, so the test
+	// takes the same lock, and the dispatch the release spawns blocks on it exactly as it
+	// does on every production release path.
+	target.mu.Lock()
+	target.releaseSlotsLocked(topic, 1)
+	target.mu.Unlock()
+
+	secondCtx, secondCancel := context.WithTimeout(ctx, 15*time.Second)
+	defer secondCancel()
+	var second driver.InboundMessage
+	for second.Body == nil {
+		select {
+		case second = <-target.Messages():
+		case err := <-target.Errors():
+			if kind, classified := driver.Classify(err); classified && kind != driver.KindNotification {
+				t.Fatalf("target error: %v", err)
+			}
+		case <-secondCtx.Done():
+			t.Fatalf("queued handoff was not dispatched after capacity freed: %v", secondCtx.Err())
+		}
+	}
+	if first.Ref.Offset == second.Ref.Offset {
+		t.Fatalf("both handoffs delivered offset %d, want one each", first.Ref.Offset)
+	}
+	delivered := map[int64]bool{first.Ref.Offset: true, second.Ref.Offset: true}
+	for _, message := range held {
+		if !delivered[message.Ref.Offset] {
+			t.Fatalf("held offset %d was never redelivered to the target", message.Ref.Offset)
+		}
+	}
+	waitForKafkaConsumerState(t, source, "no handoff is left queued", func() bool {
+		return queuedHandoffOffsets(source, topic) == 0
+	})
+}
+
+// TestConsumerSelfTransferRegrantsSettlement covers a cooperative generation
+// bump that hands a revoked partition back to the member that transferred it:
+// the delivery the caller still holds keeps its one live settlement path, the
+// queued handoff is cleared instead of delivered twice, and the destination
+// slot is released exactly once, by that settlement.
+func TestConsumerSelfTransferRegrantsSettlement(t *testing.T) {
+	requireBroker(t)
+	ctx, connection, admin := openKafkaAdminTest(t)
+	topic := kafkaTestTopic(t, "self-transfer")
+	group := kafkaTestTopic(t, "self-transfer-group")
+	cleanupKafkaTopics(t, admin, topic)
+	cleanupKafkaGroups(t, admin, group)
+	createKafkaTopic(t, admin, ctx, topic, 2)
+	t.Cleanup(func() {
+		cleanupKafkaTopics(t, admin, topic)
+		cleanupKafkaGroups(t, admin, group)
+	})
+
+	connection.rebalanceDrainTimeout = 200 * time.Millisecond
+	// One record per partition, so the delivery held on partition 0 and the
+	// untouched delivery on partition 1 are both real.
+	manualClient, err := kgo.NewClient(append([]kgo.Opt(nil), append(connection.clientOpts, kgo.RecordPartitioner(kgo.ManualPartitioner()))...)...)
+	if err != nil {
+		t.Fatalf("ManualPartitioner client: %v", err)
+	}
+	t.Cleanup(manualClient.Close)
+	for partition, body := range map[int32]string{0: "lower", 1: "higher"} {
+		record := &kgo.Record{Topic: topic, Partition: partition, Value: []byte(body)}
+		if err := manualClient.ProduceSync(ctx, record).FirstErr(); err != nil {
+			t.Fatalf("ProduceSync partition %d: %v", partition, err)
+		}
+	}
+
+	cfg := driver.ConsumerConfig{
+		Group:        group,
+		Destinations: []string{topic},
+		Prefetch:     2,
+		Effective:    connection.Capabilities(),
+	}
+	source, err := newConsumer(ctx, connection, cfg)
+	if err != nil {
+		t.Fatalf("source Consumer: %v", err)
+	}
+	t.Cleanup(func() { source.client.Close() })
+
+	held := make(map[int32]driver.InboundMessage)
+	receiveCtx, receiveCancel := context.WithTimeout(ctx, 20*time.Second)
+	defer receiveCancel()
+	for len(held) < 2 {
+		select {
+		case message := <-source.Messages():
+			held[message.Ref.Partition] = message
+		case err := <-source.Errors():
+			if kind, classified := driver.Classify(err); classified && kind != driver.KindNotification {
+				t.Fatalf("source error: %v", err)
+			}
+		case <-receiveCtx.Done():
+			t.Fatalf("source timed out holding both deliveries: %v", receiveCtx.Err())
+		}
+	}
+	lower := held[0]
+
+	// Revoke only partition 0, then hand it straight back: the production
+	// callbacks of a cooperative bump that keeps the partition on this member.
+	source.onPartitionsRevoked(ctx, nil, map[string][]int32{topic: {0}})
+	source.onPartitionsAssigned(ctx, nil, map[string][]int32{topic: {0}})
+
+	returned, ok := lower.Settle.(*settler)
+	if !ok {
+		t.Fatalf("settler type = %T, want *settler", lower.Settle)
+	}
+	source.mu.Lock()
+	live := len(source.settlers)
+	_, attached := source.settlers[returned]
+	queued := len(source.handoffs[partitionKey{destination: topic, partition: 0}])
+	charged := source.unsettled[topic]
+	tracker := returned.tracker
+	source.mu.Unlock()
+	if live != 2 {
+		t.Fatalf("source settlers after self-transfer = %d, want the returned and the kept delivery", live)
+	}
+	if !attached || returned.tombstoned || tracker == nil {
+		t.Fatalf("returned delivery not re-granted: attached=%v tombstoned=%v tracker=%v",
+			attached, returned.tombstoned, tracker)
+	}
+	if queued != 0 {
+		t.Fatalf("queued handoffs after self-transfer = %d, want the copy cleared", queued)
+	}
+	if charged != 2 {
+		t.Fatalf("source slot accounting = %d charged, want 2 until terminal settlement", charged)
+	}
+	if err := lower.Settle.Ack(ctx); err != nil {
+		t.Fatalf("Ack of the returned partition: %v", err)
+	}
+	source.mu.Lock()
+	afterAck := source.unsettled[topic]
+	source.mu.Unlock()
+	if afterAck != 1 {
+		t.Fatalf("slot accounting after one settlement = %d, want 1 (one release per delivery)", afterAck)
+	}
+	if err := held[1].Settle.Ack(ctx); err != nil {
+		t.Fatalf("Ack of the kept partition: %v", err)
+	}
+	waitForKafkaConsumerState(t, source, "both slots released", func() bool {
+		source.mu.Lock()
+		defer source.mu.Unlock()
+		return source.unsettled[topic] == 0 && len(source.settlers) == 0
+	})
+
+	noDuplicateCtx, noDuplicateCancel := context.WithTimeout(ctx, 500*time.Millisecond)
+	defer noDuplicateCancel()
+	select {
+	case duplicate := <-source.Messages():
+		t.Fatalf("source received duplicate offset %d body %q", duplicate.Ref.Offset, duplicate.Body)
+	case <-noDuplicateCtx.Done():
+	}
+}
+
+// TestConsumerTransferredDeliveryReleasesOneSlot covers the detached case: a
+// delivery transferred to another consumer keeps its destination slot until the
+// caller's revoked settlement completes, and that settlement releases exactly
+// one slot. The delta is asserted rather than the absolute count, so a
+// concurrent rebalance cannot mask a double release.
+func TestConsumerTransferredDeliveryReleasesOneSlot(t *testing.T) {
+	requireBroker(t)
+	ctx, connection, admin := openKafkaAdminTest(t)
+	topic := kafkaTestTopic(t, "detached-slot")
+	group := kafkaTestTopic(t, "detached-slot-group")
+	cleanupKafkaTopics(t, admin, topic)
+	cleanupKafkaGroups(t, admin, group)
+	createKafkaTopic(t, admin, ctx, topic, 2)
+	t.Cleanup(func() {
+		cleanupKafkaTopics(t, admin, topic)
+		cleanupKafkaGroups(t, admin, group)
+	})
+
+	connection.rebalanceDrainTimeout = 200 * time.Millisecond
+	manualClient, err := kgo.NewClient(append([]kgo.Opt(nil), append(connection.clientOpts, kgo.RecordPartitioner(kgo.ManualPartitioner()))...)...)
+	if err != nil {
+		t.Fatalf("ManualPartitioner client: %v", err)
+	}
+	t.Cleanup(manualClient.Close)
+	for partition, body := range map[int32]string{0: "moved", 1: "kept"} {
+		record := &kgo.Record{Topic: topic, Partition: partition, Value: []byte(body)}
+		if err := manualClient.ProduceSync(ctx, record).FirstErr(); err != nil {
+			t.Fatalf("ProduceSync partition %d: %v", partition, err)
+		}
+	}
+
+	cfg := driver.ConsumerConfig{
+		Group:        group,
+		Destinations: []string{topic},
+		Prefetch:     2,
+		Effective:    connection.Capabilities(),
+	}
+	source, err := newConsumer(ctx, connection, cfg)
+	if err != nil {
+		t.Fatalf("source Consumer: %v", err)
+	}
+	t.Cleanup(func() { source.client.Close() })
+
+	held := make(map[int32]driver.InboundMessage)
+	receiveCtx, receiveCancel := context.WithTimeout(ctx, 20*time.Second)
+	defer receiveCancel()
+	for len(held) < 2 {
+		select {
+		case message := <-source.Messages():
+			held[message.Ref.Partition] = message
+		case err := <-source.Errors():
+			if kind, classified := driver.Classify(err); classified && kind != driver.KindNotification {
+				t.Fatalf("source error: %v", err)
+			}
+		case <-receiveCtx.Done():
+			t.Fatalf("source timed out holding both deliveries: %v", receiveCtx.Err())
+		}
+	}
+
+	target, err := newConsumer(ctx, connection, cfg)
+	if err != nil {
+		t.Fatalf("target Consumer: %v", err)
+	}
+	t.Cleanup(func() { target.client.Close() })
+
+	// Transfer partition 0 to the other consumer through the production
+	// callbacks and settle the source's copy afterwards.
+	source.onPartitionsRevoked(ctx, nil, map[string][]int32{topic: {0}})
+	target.onPartitionsAssigned(ctx, nil, map[string][]int32{topic: {0}})
+
+	moved := held[0]
+	source.mu.Lock()
+	settler, ok := moved.Settle.(*settler)
+	detached := ok && settler.tombstoned
+	before := source.unsettled[topic]
+	source.mu.Unlock()
+	if !detached {
+		t.Fatalf("source settler for the moved partition is not detached")
+	}
+	if before < 1 {
+		t.Fatalf("source slot accounting = %d charged after the transfer, want the moved delivery still charged", before)
+	}
+	if err := moved.Settle.Ack(ctx); err == nil || !errors.Is(err, ErrRevoked) {
+		t.Fatalf("source Ack = %v, want ErrRevoked", err)
+	}
+	source.mu.Lock()
+	after := source.unsettled[topic]
+	source.mu.Unlock()
+	if before-after != 1 {
+		t.Fatalf("revoked settlement released %d slots, want exactly 1", before-after)
+	}
+	if err := held[1].Settle.Ack(ctx); err != nil {
+		t.Fatalf("Ack of the kept partition: %v", err)
+	}
+}
+
+func TestConsumerLeaveSelectsMembershipPath(t *testing.T) {
+	tests := []struct {
+		name       string
+		static     bool
+		instanceID string
+	}{
+		{name: "static instance", static: true, instanceID: "worker-1"},
+		{name: "dynamic member", instanceID: ""},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			wantErr := errors.New("leave failed")
+			var (
+				staticCalls  int
+				dynamicCalls int
+				gotGroup     string
+				gotInstance  string
+			)
+			c := &consumer{
+				group:            "group",
+				staticMembership: tc.static,
+				instanceID:       tc.instanceID,
+				errors:           make(chan error, 1),
+				leaveRequestC:    make(chan struct{}, 1),
+				leaveStopC:       make(chan struct{}),
+				leaveFinished:    make(chan struct{}),
+				leaveLoopDone:    make(chan struct{}),
+			}
+			c.leaveStatic = func(_ context.Context, group, instanceID string) error {
+				staticCalls++
+				gotGroup = group
+				gotInstance = instanceID
+				return wantErr
+			}
+			c.leaveDynamic = func(_ context.Context) error {
+				dynamicCalls++
+				return wantErr
+			}
+			c.leaveFn = c.leaveGroup
+
+			if err := c.requestLeaveAndWait(context.Background()); !errors.Is(err, wantErr) {
+				t.Fatalf("requestLeaveAndWait error = %v, want %v", err, wantErr)
+			}
+			<-c.leaveLoopDone
+			wantStatic := tc.static && tc.instanceID != ""
+			expectedStatic := 0
+			expectedDynamic := 1
+			if wantStatic {
+				expectedStatic = 1
+				expectedDynamic = 0
+			}
+			if staticCalls != expectedStatic {
+				t.Fatalf("static operation calls = %d, want %d", staticCalls, expectedStatic)
+			}
+			if dynamicCalls != expectedDynamic {
+				t.Fatalf("dynamic operation calls = %d, want %d", dynamicCalls, expectedDynamic)
+			}
+			if wantStatic && (gotGroup != c.group || gotInstance != tc.instanceID) {
+				t.Fatalf("static operation arguments = group %q instance %q, want group %q instance %q",
+					gotGroup, gotInstance, c.group, tc.instanceID)
+			}
+			select {
+			case err := <-c.errors:
+				if !errors.Is(err, wantErr) {
+					t.Fatalf("Errors() = %v, want %v", err, wantErr)
+				}
+			default:
+				t.Fatal("leave error was not reported")
+			}
+		})
+	}
+}
+
+func TestConsumerLeaveTeardownCancelsBoundedOperation(t *testing.T) {
+	client, err := kgo.NewClient(kgo.SeedBrokers("localhost:19092"))
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+	defer client.Close()
+
+	started := make(chan struct{})
+	canceled := make(chan struct{})
+	connection := &conn{
+		consumers: make(map[*consumer]struct{}),
+	}
+	c := &consumer{
+		conn:                  connection,
+		client:                client,
+		group:                 "group",
+		destinations:          []string{"topic"},
+		budgets:               map[string]int{"topic": 1},
+		errors:                make(chan error, 1),
+		messages:              make(chan driver.InboundMessage, 1),
+		pollDone:              make(chan struct{}),
+		stopDone:              make(chan struct{}),
+		forwarderStopC:        make(chan struct{}),
+		leaveRequestC:         make(chan struct{}, 1),
+		leaveStopC:            make(chan struct{}),
+		leaveFinished:         make(chan struct{}),
+		leaveLoopDone:         make(chan struct{}),
+		rebalanceDrainTimeout: time.Hour,
+		leaveFn: func(ctx context.Context, _ leaveRequest) error {
+			close(started)
+			<-ctx.Done()
+			close(canceled)
+			return ctx.Err()
+		},
+		cancelPoll: func() {},
+	}
+
+	drainCtx, cancelDrain := context.WithCancel(context.Background())
+	drainDone := make(chan error, 1)
+	go func() {
+		drainDone <- c.Drain(drainCtx)
+	}()
+	waitForKafkaConsumerState(t, c, "Drain to enter draining state", func() bool {
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		return c.draining
+	})
+	cancelDrain()
+	if err := <-drainDone; !errors.Is(err, context.Canceled) {
+		t.Fatalf("Drain() error = %v, want context cancellation", err)
+	}
+
+	c.requestLeave()
+	select {
+	case <-started:
+	case <-clock.NewReal().Timer(time.Second).C:
+		t.Fatal("leave operation did not start")
+	}
+
+	teardownCtx, cancelTeardown := context.WithTimeout(context.Background(), time.Second)
+	defer cancelTeardown()
+	teardownDone := make(chan struct{})
+	go func() {
+		c.closeTeardown(teardownCtx)
+		close(teardownDone)
+	}()
+	select {
+	case <-canceled:
+	case <-teardownCtx.Done():
+		t.Fatal("leave context was not canceled by teardown")
+	}
+	select {
+	case <-teardownDone:
+	case <-teardownCtx.Done():
+		t.Fatal("teardown exceeded its context bound")
+	}
+}
+
+func TestConsumerTransferMarkersKeepExactOffsets(t *testing.T) {
+	key := partitionKey{destination: "topic", partition: 0}
+	target := &consumer{
+		messages:          make(chan driver.InboundMessage, 1),
+		activeGenerations: map[partitionKey]uint64{key: 1},
+		fenced:            make(map[partitionKey]bool),
+		recordGenerations: make(map[*kgo.Record]uint64),
+	}
+	lower := &kgo.Record{Topic: key.destination, Partition: key.partition, Offset: 4}
+	exact := &kgo.Record{Topic: key.destination, Partition: key.partition, Offset: 5}
+	target.recordGenerations[lower] = 1
+	target.recordGenerations[exact] = 1
+
+	target.suppressSettledTransfer(key, exact.Offset)
+
+	if target.isRecordStale(lower) {
+		t.Fatal("lower offset was suppressed by a higher settled offset")
+	}
+	if !target.isRecordStale(exact) {
+		t.Fatal("exact settled offset was not suppressed")
+	}
+	target.discardStaleRecord(exact)
+	if !target.isRecordStale(exact) {
+		t.Fatal("exact transfer marker was cleared after one stale record")
+	}
+}

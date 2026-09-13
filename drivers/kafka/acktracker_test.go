@@ -313,7 +313,12 @@ func TestConsumerTrackerGenerationAndCounter(t *testing.T) {
 	if got := first.Unacked(); got != consumer.unsettled[destination] {
 		t.Fatalf("tracker unacked = %d, consumer unsettled = %d", got, consumer.unsettled[destination])
 	}
-	racingSettler := &settler{tracker: first, record: &kgo.Record{Topic: destination, Partition: 0, Offset: 10}}
+	racingSettler := &settler{
+		owner:   consumer,
+		tracker: first,
+		record:  &kgo.Record{Topic: destination, Partition: 0, Offset: 10},
+		key:     partitionKey{destination: destination, partition: 0},
+	}
 	consumer.mu.Lock()
 	consumer.settlers[racingSettler] = struct{}{}
 	consumer.mu.Unlock()
@@ -322,8 +327,14 @@ func TestConsumerTrackerGenerationAndCounter(t *testing.T) {
 	}
 
 	consumer.dropTracker(destination, 0)
+	if got := consumer.unsettled[destination]; got != 1 {
+		t.Fatalf("unsettled after tracker drop = %d, want 1 for retained settler", got)
+	}
+	if err := racingSettler.Ack(context.Background()); !errors.Is(err, ErrRevoked) {
+		t.Fatalf("retained settler Ack after drop = %v, want ErrRevoked", err)
+	}
 	if got := consumer.unsettled[destination]; got != 0 {
-		t.Fatalf("unsettled after tracker drop = %d, want 0", got)
+		t.Fatalf("unsettled after revoked settlement = %d, want 0", got)
 	}
 	consumer.onPartitionsAssigned(context.Background(), nil, map[string][]int32{destination: {0}})
 	consumer.mu.Lock()
@@ -401,9 +412,46 @@ func TestAckTrackerDropDoesNotWaitOnCommit(t *testing.T) {
 	select {
 	case err := <-ackDone:
 		if err != nil {
-			t.Fatalf("Ack: %v", err)
+			t.Fatalf("Ack = %v, want nil after committed offset crosses drop", err)
 		}
 	case <-doneCtx.Done():
+		t.Fatal("timed out waiting for Ack to complete")
+	}
+}
+
+func TestAckTrackerRevocationWinsFailedCommit(t *testing.T) {
+	tracker := newAckTracker(0, 1)
+	if err := tracker.Track(0); err != nil {
+		t.Fatalf("Track(0): %v", err)
+	}
+
+	commitEntered := make(chan struct{})
+	commitRelease := make(chan struct{})
+	ackDone := make(chan error, 1)
+	go func() {
+		ackDone <- tracker.Ack(0, func(int64) error {
+			close(commitEntered)
+			<-commitRelease
+			return errors.New("commit failed")
+		})
+	}()
+	waitCtx, waitCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer waitCancel()
+
+	select {
+	case <-commitEntered:
+	case <-waitCtx.Done():
+		t.Fatal("timed out waiting for commit callback to be entered")
+	}
+	tracker.Drop()
+	close(commitRelease)
+
+	select {
+	case err := <-ackDone:
+		if !errors.Is(err, ErrRevoked) {
+			t.Fatalf("Ack after revoked commit failure = %v, want ErrRevoked", err)
+		}
+	case <-waitCtx.Done():
 		t.Fatal("timed out waiting for Ack to complete")
 	}
 }

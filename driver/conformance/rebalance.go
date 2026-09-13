@@ -178,11 +178,28 @@ func runRebalance(group *groupContext) {
 		if secondOutstanding > secondPrefetch {
 			t.Fatalf("second consumer held %d unsettled messages, prefetch=%d", secondOutstanding, secondPrefetch)
 		}
+		// Every published record must be settled, and a record whose ack meets
+		// the transfer is proved by its redelivery or by the drain: a revoked
+		// acknowledgement is not proof of an unsettled record, because the
+		// offset may have committed for the new owner all the same. The
+		// redelivery cannot arrive while the destination has no free capacity,
+		// since a revoked copy keeps the slot it held until it is settled, so
+		// the acks and the redeliveries proceed in one loop.
+		settled := 0
 		for _, message := range initial {
-			ackMessage(t, group, message)
+			if settleBeforeOwnershipTransfer(t, group, message) {
+				settled++
+			}
 		}
-		last, _, _ := receiveFromEither(t, group, "prefetch delivery", first, second)
-		ackMessage(t, group, last)
+		drained := false
+		for settled < firstPrefetch+secondPrefetch+1 && !drained {
+			message, _, _ := receiveFromEither(t, group, "prefetch delivery or redelivery", first, second)
+			if settleBeforeOwnershipTransfer(t, group, message) {
+				settled++
+			}
+			view := inspectDestination(t, group, "rebalance.prefetch")
+			drained = view.Ready == 0 && view.Unsettled == 0
+		}
 		waitFor(t, group, "prefetch destination to drain after all messages are acknowledged", func() (bool, string) {
 			view := inspectDestination(t, group, "rebalance.prefetch")
 			return view.Ready == 0 && view.Unsettled == 0, fmt.Sprintf("view=%+v", view)
@@ -220,11 +237,32 @@ func runRebalance(group *groupContext) {
 		waitForRebalanceAssignment(t, group, joining)
 
 		if settled := settleBeforeOwnershipTransfer(t, group, old); !settled {
-			redelivered := receiveMessage(t, group, joining)
-			if string(redelivered.Body) != "old" {
-				t.Fatalf("redelivered body = %q, want old", redelivered.Body)
-			}
-			ackMessage(t, group, redelivered)
+			// A revoked acknowledgement is not proof of an unsettled record: the
+			// offset may have committed for the new owner all the same, the key
+			// may have moved and be redelivered, or the key may have come back
+			// with this delivery re-granted. Settle whichever arrives, and let
+			// the destination's own drain decide whether anything was left.
+			waitFor(t, group, "a revoked pre-change delivery to settle or be redelivered", func() (bool, string) {
+				view := inspectDestination(t, group, "rebalance.settle")
+				if view.Ready == 0 && view.Unsettled == 0 {
+					return true, "destination drained"
+				}
+				for _, consumer := range []driver.Consumer{first, joining} {
+					select {
+					case redelivered, ok := <-consumer.Messages():
+						if !ok {
+							return false, "Messages channel closed"
+						}
+						if string(redelivered.Body) != "old" {
+							t.Fatalf("redelivered body = %q, want old", redelivered.Body)
+						}
+						ackMessage(t, group, redelivered)
+						return true, "redelivered to the owner"
+					default:
+					}
+				}
+				return false, "no redelivery and the destination is not drained"
+			})
 		}
 		waitFor(t, group, "pre-change delivery settlement to clear", func() (bool, string) {
 			view := inspectDestination(t, group, "rebalance.settle")

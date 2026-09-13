@@ -112,21 +112,24 @@ func (t *ackTracker) Ack(offset int64, commit func(int64) error) error {
 	commitPoint := t.base
 	t.mu.Unlock()
 
-	if len(advanced) == 0 || commit == nil {
-		return nil
-	}
-	if err := commit(commitPoint); err != nil {
-		t.mu.Lock()
-		t.base = oldBase
-		for _, advancedOffset := range advanced {
-			t.acked[advancedOffset] = struct{}{}
+	if len(advanced) > 0 && commit != nil {
+		if err := commit(commitPoint); err != nil {
+			t.mu.Lock()
+			revoked := t.revoked
+			t.base = oldBase
+			for _, advancedOffset := range advanced {
+				t.acked[advancedOffset] = struct{}{}
+			}
+			delete(t.acked, offset)
+			if hadOutstanding {
+				t.outstanding[offset]++
+			}
+			t.mu.Unlock()
+			if revoked {
+				return ErrRevoked
+			}
+			return err
 		}
-		delete(t.acked, offset)
-		if hadOutstanding {
-			t.outstanding[offset]++
-		}
-		t.mu.Unlock()
-		return err
 	}
 	return nil
 }
