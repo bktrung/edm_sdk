@@ -188,10 +188,19 @@ client library. Examples include:
   conformance suite.
 
 The [Makefile](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/Makefile) owns the broker lifecycle and suite targets.
-Use its `test-rabbitmq`, `test-kafka`, `test-kafka-conformance`, and
-`test-infra` targets instead of copying fixture setup into documentation or
-test scripts. The targets make unreachable required fixtures fail rather than
-silently turning a broker test into a skip.
+Use its `test-rabbitmq`, `test-kafka`, `test-kafka-conformance`,
+`test-infra`, and `test-driver-flip` targets instead of copying fixture setup
+into documentation or test scripts. The targets make unreachable required
+fixtures fail rather than silently turning a broker test into a skip.
+
+`test-driver-flip` is the driver-flip acceptance: it builds the two
+`examples/acceptance` services once, runs the identical binaries against Kafka
+and RabbitMQ with one corpus, and diffs the behaviour vectors. It needs both
+brokers, takes a few minutes, and writes its artifacts to `.cache/driver-flip`.
+Size the corpus with `F1_DRIVER_FLIP_CORPUS` (default 10 000). It is not a
+required gate: a known Kafka consumer stall can red it at any corpus size, so
+run it deliberately and read a red run as evidence about that defect rather than
+about broker agnosticism.
 
 Keep provider tests isolated from one another. Use the fixture cleanup helpers,
 remove queues, topics, and groups created by the test, and do not reset a
