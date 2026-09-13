@@ -1,6 +1,6 @@
 # Middleware
 
-F1 middleware wraps an [`f1.Handler`](../../handler.go) with behavior that is
+F1 middleware wraps an [`f1.Handler`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/handler.go) with behavior that is
 useful across handlers but should not be part of one handler's business logic.
 Typical examples are structured logging, timing, tracing, and application-level
 metrics.
@@ -19,8 +19,8 @@ The middleware boundary is part of the handler path:
 4. F1 classifies the returned error and settles the delivery outside the
    middleware chain.
 
-The owning implementation is [`buildHandlerChain`](../../handler.go), and
-subscription registration is wired by [`wrapHandlers`](../../subscription.go).
+The owning implementation is [`buildHandlerChain`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/handler.go), and
+subscription registration is wired by [`wrapHandlers`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/subscription.go).
 Middleware does not see driver messages or broker settlement references.
 
 ## Define middleware
@@ -135,7 +135,7 @@ for in-flight delivery settlement within the configured lifecycle budgets.
 
 `Event` is the handler-facing view of a delivery. Middleware may inspect its
 accessors and call `Decode`, but it should not make the handler depend on a
-driver-specific message or settlement object. See [Message](message.md) for
+driver-specific message or settlement object. See [Message](/basics/message) for
 payload, envelope, header, and identity guidance.
 
 ## Error propagation and settlement
@@ -152,7 +152,7 @@ The final error returned by the chain is interpreted by the F1 runtime:
 | `f1.Drop(err)` | F1 acknowledges the event without applying its effect or retaining a copy. |
 
 The dispatch implementation keeps this classification and settlement outside
-the middleware chain; see [`dispatchMessage`](../../worker.go). A middleware
+the middleware chain; see [`dispatchMessage`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/worker.go). A middleware
 that logs an error must still return it. Swallowing the error by returning `nil`
 changes the delivery outcome to success.
 
@@ -163,8 +163,8 @@ return fmt.Errorf("record handler metrics: %w", err)
 ```
 
 Do not implement a second retry or dead-letter loop by calling the handler
-again from middleware. Configure retry on the [`Subscription`](../../subscription.go)
-and use the classification helpers in [`errors.go`](../../errors.go).
+again from middleware. Configure retry on the [`Subscription`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/subscription.go)
+and use the classification helpers in [`errors.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/errors.go).
 
 ## Middleware is not an error callback
 
@@ -182,11 +182,11 @@ F1 has callback surfaces for events that are not part of the handler pipeline:
 those errors already flow through retry and dead-letter classification. Its
 callback may receive a nil event for a connection-level error, and it must not
 block delivery or shutdown. The option's contract is documented in
-[`options.go`](../../options.go).
+[`options.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/options.go).
 
 Keep dead-letter and discarded callbacks short. They are notification surfaces,
 not replacement handler pipelines. Use the subscription's
-[`DeadLettered`](../../subscription.go) and [`Discarded`](../../subscription.go)
+[`DeadLettered`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/subscription.go) and [`Discarded`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/subscription.go)
 payloads to inspect the event and failure reason.
 
 ## Testing middleware
@@ -195,7 +195,7 @@ Test middleware at two levels:
 
 1. Unit-test the wrapper with a small fake handler to prove ordering, context
    propagation, and error preservation.
-2. Use [`f1test`](../../f1test/f1test.go) to verify the wrapped handler's
+2. Use [`f1test`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/f1test/f1test.go) to verify the wrapped handler's
    observable behavior through a real `Client`, `Subscription`, and `Runner`.
 
 Include cases for success, a wrapped retryable error, a wrapped terminal error,
@@ -205,11 +205,11 @@ implementation.
 
 ## Continue from here
 
-- [Message](message.md) — event data, metadata, context, and identity;
-- [Publisher and subscriber](pubsub.md) — publish, subscribe, runner, and
+- [Message](/basics/message) - event data, metadata, context, and identity;
+- [Publisher and subscriber](/basics/pubsub) - publish, subscribe, runner, and
   lifecycle boundaries;
-- [`Terminal`, `Drop`, and `RetryAfter`](../../errors.go) — failure
+- [`Terminal`, `Drop`, and `RetryAfter`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/errors.go) - failure
   classification helpers;
-- [Consume flow](../development/consume-flow.md) — dispatch, classification, and
+- [Consume flow](/development/consume-flow) - dispatch, classification, and
   settlement internals; and
-- [`Middleware`](../../handler.go) — the executable type and composition owner.
+- [`Middleware`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/handler.go) - the executable type and composition owner.

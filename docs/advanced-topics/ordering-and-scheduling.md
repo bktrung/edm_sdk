@@ -10,8 +10,8 @@ F1 has two separate delivery decisions:
 Do not use one setting to solve the other. `OrderedByKey` protects a per-key
 business invariant; `FairnessConfig` protects service capacity across work
 classes. Both operate within F1's at-least-once delivery model, so ordering
-does not remove the need for idempotent effects. See [Message](../basics/message.md)
-and [Publisher and subscriber](../basics/pubsub.md) for the application-facing
+does not remove the need for idempotent effects. See [Message](/basics/message)
+and [Publisher and subscriber](/basics/pubsub) for the application-facing
 message and subscription model.
 
 ## Choose the ordering guarantee
@@ -46,8 +46,8 @@ The connected driver must advertise the `ordered_by_key` capability. F1
 rejects an ordered subscription when that capability is unavailable. Check
 `client.Limits()` during startup when deployment portability matters; the
 capability report is the authority for the connected driver. The capability
-contract is defined by [`driver.Capabilities`](../../driver/capability.go) and
-the subscription check is in [`Subscribe`](../../subscription.go).
+contract is defined by [`driver.Capabilities`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/driver/capability.go) and
+the subscription check is in [`Subscribe`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/subscription.go).
 
 ### Make the key stable
 
@@ -66,8 +66,8 @@ _, err := client.Publisher().Publish(
 the transport key from the subject and then the generated event ID. That is
 safe as a default, but generated IDs do not create a useful per-order
 ordering relationship. `WithSubject` can provide a stable default when the
-subject is the business entity. See [`WithKey`](../../publisher.go) and
-[Message metadata](../basics/message.md#metadata-and-the-envelope).
+subject is the business entity. See [`WithKey`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/publisher.go) and
+[Message metadata](/basics/message#metadata-and-the-envelope).
 
 Ordering follows the message key. `WithKey` sets it explicitly; `WithSubject`
 supplies it when no explicit key is present; and when neither is provided F1
@@ -101,8 +101,8 @@ driver's prefetch budget, the fetch-to-dispatch boundary, bounded scheduler
 lanes, and the dispatch pool before the handler runs. When a downstream stage
 is full, the pipeline waits for capacity instead of growing an unbounded
 in-memory queue. The executable pipeline is owned by
-[`runDispatchPipeline`](../../worker.go); the internal rationale is in
-[Consume flow](../development/consume-flow.md).
+[`runDispatchPipeline`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/worker.go); the internal rationale is in
+[Consume flow](/development/consume-flow).
 
 Start with `Concurrency` matched to the safe parallelism of the handler and
 its dependencies. Set `Prefetch` high enough to keep those workers supplied,
@@ -138,7 +138,7 @@ This is intentional: strict priority could starve medium work during a
 sustained high-priority load.
 
 The default fairness policy is defined by `defaultSubscription` in
-[`config.go`](../../config.go). Override it when the service has a measured
+[`config.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/config.go). Override it when the service has a measured
 capacity policy rather than copying defaults into application code:
 
 ```go
@@ -172,8 +172,8 @@ The scheduler uses weighted round-robin when no lane has exceeded its aging
 budget. When aging is enabled, the lane with the greatest budget overrun may
 be selected first. This gives latency-sensitive work a way to recover from
 temporary contention without turning the whole policy into strict priority.
-The implementation is [`internal/sched`](../../internal/sched), and its lane
-construction is [`newRunnerScheduler`](../../worker.go).
+The implementation is [`internal/sched`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/tree/main/internal/sched), and its lane
+construction is [`newRunnerScheduler`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/worker.go).
 
 ## Keep retry work from taking all capacity
 
@@ -191,7 +191,7 @@ lane that has waited beyond its configured budget.
 
 Returning `f1.RetryAfter` changes the event's next eligible time; it does not
 give that retry priority over fresh work once it is ready. Configure retry
-classification and delay in [Failure handling](failure-handling.md), then use
+classification and delay in [Failure handling](/advanced-topics/failure-handling), then use
 fairness settings for the service-level capacity decision.
 
 ## A practical tuning sequence
@@ -220,7 +220,7 @@ and duplicate effects that were already possible under at-least-once delivery.
 
 ## Test ordering and fairness
 
-Use [`f1test`](../../f1test/f1test.go) for deterministic service-policy tests:
+Use [`f1test`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/f1test/f1test.go) for deterministic service-policy tests:
 
 - configure `Mode: f1.OrderedByKey` and verify equal keys never overlap;
 - publish different keys and verify the subscription can use its configured
@@ -231,13 +231,13 @@ Use [`f1test`](../../f1test/f1test.go) for deterministic service-policy tests:
 - advance the fake clock when testing retry eligibility or aging instead of
   sleeping in the test.
 
-The repository's [`ordered_test.go`](../../f1test/ordered_test.go) covers equal
+The repository's [`ordered_test.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/f1test/ordered_test.go) covers equal
 key serialization and different-key concurrency. The scheduler unit tests in
-[`internal/sched/scheduler_test.go`](../../internal/sched/scheduler_test.go)
+[`internal/sched/scheduler_test.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/internal/sched/scheduler_test.go)
 cover weighted selection, bounded lanes, and aging; the retry-storm test in
-[`retry_storm_test.go`](../../retry_storm_test.go) guards fresh-work share under
+[`retry_storm_test.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/retry_storm_test.go) guards fresh-work share under
 retry pressure. A driver implementation must also preserve the capability
-contract validated by the [driver conformance package](../../driver/conformance/).
+contract validated by the [driver conformance package](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/tree/main/driver/conformance).
 
 ## Common mistakes
 
@@ -257,13 +257,13 @@ contract validated by the [driver conformance package](../../driver/conformance/
 
 ## Continue from here
 
-- [Failure handling](failure-handling.md) — retry classification, dead letters,
+- [Failure handling](/advanced-topics/failure-handling) - retry classification, dead letters,
   and idempotent effects;
-- [Message](../basics/message.md) — keys, priority metadata, and delivery
+- [Message](/basics/message) - keys, priority metadata, and delivery
   identity;
-- [Publisher and subscriber](../basics/pubsub.md) — publish and subscription
+- [Publisher and subscriber](/basics/pubsub) - publish and subscription
   boundaries;
-- [Driver and capabilities](../drivers-and-capabilities.md) — capability
+- [Driver and capabilities](/drivers-and-capabilities) - capability
   discovery and portability; and
-- [Consume flow](../development/consume-flow.md) — implementation details for
+- [Consume flow](/development/consume-flow) - implementation details for
   lanes, pool routing, and backpressure.

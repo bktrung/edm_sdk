@@ -8,8 +8,8 @@ not acknowledge, reject, or requeue a driver message directly.
 F1 provides at-least-once delivery. A successful handler run and its business
 side effects can still be followed by a process or connection failure before
 the original delivery is settled, so handlers that change external state
-should use a stable idempotency key. See [Message](../basics/message.md) and
-[Publisher and subscriber](../basics/pubsub.md) for the delivery model.
+should use a stable idempotency key. See [Message](/basics/message) and
+[Publisher and subscriber](/basics/pubsub) for the delivery model.
 
 ## Choose the outcome
 
@@ -64,12 +64,12 @@ if err := validateOrder(order); err != nil {
 dead-letter copy. Details do not affect routing, retries, settlement, or
 ordering. Keys must be lowercase alphanumeric; F1 accepts at most 16 keys and
 1 KiB of encoded detail data. Invalid or excess details are discarded and
-reported when the message is dead-lettered. See [`WithDetails`](../../errors.go)
+reported when the message is dead-lettered. See [`WithDetails`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/errors.go)
 for the exact contract.
 
 ## Retry policy
 
-The subscription's [`RetryConfig`](../../config.go) defines the retry ladder:
+The subscription's [`RetryConfig`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/config.go) defines the retry ladder:
 
 ```go
 runner, err := client.Subscribe(ctx, f1.Subscription{
@@ -89,7 +89,7 @@ runner, err := client.Subscribe(ctx, f1.Subscription{
 ```
 
 The effective attempt limit is the smaller of the event's
-[`WithMaxAttempts`](../../publisher.go) value and the subscription policy.
+[`WithMaxAttempts`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/publisher.go) value and the subscription policy.
 An event can lower the policy ceiling, but cannot raise it. `MaxAttempts` is
 the total delivery-attempt cap, including the first delivery; the event's
 `Attempt()` value is one-based. Once the current attempt reaches that cap, an
@@ -100,7 +100,7 @@ When no explicit retry tiers are configured, F1 derives them from
 `InitialInterval`, `Multiplier`, `MaxInterval`, and `Jitter`. Explicit
 `Tiers` can define the delays directly. `RetryAfter` selects the delay for the
 current retry but does not bypass the configured attempt cap. The validation
-and delay calculation live in [`config.go`](../../config.go); keep service
+and delay calculation live in [`config.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/config.go); keep service
 policy in configuration rather than implementing a second retry loop in a
 handler or middleware.
 
@@ -110,17 +110,17 @@ F1 publishes a dead-letter successor when a message cannot or should not be
 retried. The dead-letter copy carries the original body and envelope metadata,
 plus a death reason and the last error. Current automatic reasons include:
 
-- `terminal` — the handler returned `f1.Terminal`;
-- `max_attempts` — the retry ladder was exhausted;
-- `panic` — the handler or middleware panicked;
-- `decode` — the envelope, codec, or body could not be decoded;
-- `expired` — the event expired before handling;
-- `unmatched` — no handler matched and the subscription selected
+- `terminal` - the handler returned `f1.Terminal`;
+- `max_attempts` - the retry ladder was exhausted;
+- `panic` - the handler or middleware panicked;
+- `decode` - the envelope, codec, or body could not be decoded;
+- `expired` - the event expired before handling;
+- `unmatched` - no handler matched and the subscription selected
   `f1.DeadLetter`; and
-- `poison` — the retry metadata exceeded the runtime's sanity limit.
+- `poison` - the retry metadata exceeded the runtime's sanity limit.
 
 The reason is available in the dead-letter envelope and in the
-[`DeadLettered`](../../subscription.go) callback payload:
+[`DeadLettered`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/subscription.go) callback payload:
 
 ```go
 subscription := f1.Subscription{
@@ -151,7 +151,7 @@ handoff budget, F1 reports the runtime error and releases the consumer without
 acknowledging the original delivery, allowing the driver to redeliver it. This
 settle-last ordering prevents a failed dead-letter handoff from becoming
 silent loss. The full settlement sequence is described in
-[Lifecycle and shutdown](lifecycle-and-shutdown.md).
+[Lifecycle and shutdown](/advanced-topics/lifecycle-and-shutdown).
 
 ## Drop and unmatched events
 
@@ -180,10 +180,10 @@ successor first and acknowledges the current delivery second, but a process can
 still stop after the handler's side effect and before either settlement step
 completes. The original or successor may therefore be observed more than once.
 
-Use [`Event.IdempotencyKey()`](../basics/message.md#delivery-identity-and-redelivery)
+Use [`Event.IdempotencyKey()`](/basics/message#delivery-identity-and-redelivery)
 as the input to application-owned deduplication when an effect must be safe to
 repeat. A producer can set the key with
-[`WithIdempotencyKey`](../../publisher.go); otherwise F1 falls back to the
+[`WithIdempotencyKey`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/publisher.go); otherwise F1 falls back to the
 event ID. The key is an input to the application's idempotency store, not a
 deduplication database managed by F1.
 
@@ -200,7 +200,7 @@ There are two different kinds of failure notification:
 | `Subscription.OnDiscarded` | An unmatched or explicitly dropped event | Retried or dead-lettered handler errors |
 | `f1.WithErrorHandler` | Driver-level asynchronous errors and retry/dead-letter successor-publish failures | Ordinary errors returned by a handler |
 
-Configure [`WithErrorHandler`](../../options.go) for runtime failures that the
+Configure [`WithErrorHandler`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/options.go) for runtime failures that the
 handler result cannot represent. The event argument identifies the affected
 delivery when there is one; it is `nil` for a connection-level error. The
 callback runs asynchronously with a bounded context and must remain safe to
@@ -209,7 +209,7 @@ or dead-letter policy and are not sent to this callback a second time.
 
 ## Test the policy, not a driver
 
-Failure behavior is easiest to verify with [`f1test`](../../f1test/f1test.go),
+Failure behavior is easiest to verify with [`f1test`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/f1test/f1test.go),
 which uses the in-memory driver and a manually advanced clock:
 
 ```go
@@ -242,7 +242,7 @@ Cover at least:
 
 The in-memory driver and test helper are useful for policy tests, but driver
 compatibility still belongs to the driver's conformance suite. See
-[`f1test`](../../f1test/f1test.go) and the [driver conformance package](../../driver/conformance/)
+[`f1test`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/f1test/f1test.go) and the [driver conformance package](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/tree/main/driver/conformance)
 for the two boundaries.
 
 ## Common mistakes
@@ -262,13 +262,13 @@ for the two boundaries.
 
 ## Continue from here
 
-- [Message](../basics/message.md) — envelope metadata, identity, and
+- [Message](/basics/message) - envelope metadata, identity, and
   at-least-once handler design;
-- [Publisher and subscriber](../basics/pubsub.md) — the publish/consume
+- [Publisher and subscriber](/basics/pubsub) - the publish/consume
   boundary and handler lifecycle;
-- [Middleware](../basics/middleware.md) — where cross-cutting handler logic
+- [Middleware](/basics/middleware) - where cross-cutting handler logic
   runs and where classification remains outside the chain;
-- [Lifecycle and shutdown](lifecycle-and-shutdown.md) — successor
+- [Lifecycle and shutdown](/advanced-topics/lifecycle-and-shutdown) - successor
   handoff, acknowledgement, release, and drain behavior; and
-- [`errors.go`](../../errors.go), [`worker.go`](../../worker.go), and
-  [`subscription.go`](../../subscription.go) — executable failure contracts.
+- [`errors.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/errors.go), [`worker.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/worker.go), and
+  [`subscription.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/subscription.go) - executable failure contracts.

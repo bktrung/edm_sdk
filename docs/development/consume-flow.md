@@ -1,6 +1,6 @@
 # Consume flow
 
-This page is the canonical maintainer trace for one subscription’s delivery
+This page is the canonical maintainer trace for one subscription's delivery
 lifecycle. It follows the path from `Client.Subscribe` through runner startup,
 broker intake, scheduling, middleware and handler execution, disposition,
 settlement, drain, and reconnect.
@@ -12,44 +12,56 @@ primitives, and the driver port.
 ## End-to-end path
 
 ```mermaid
+%%{init: {"flowchart": {"nodeSpacing": 24, "rankSpacing": 32, "padding": 10}}}%%
 flowchart TB
-    SUB[Client.Subscribe] --> RES[Resolve and validate subscription]
-    RES --> RUNNER[Create and register Runner]
-    RUNNER --> RUN[Runner.Run]
-    RUN --> TOPO[Prepare subscription topology]
-    TOPO --> CONSUMER[Create driver.Consumer]
-    CONSUMER --> FETCH[Read Consumer.Messages]
-    FETCH --> REGISTER[Register in-flight delivery]
-    REGISTER --> CHANNEL[Bounded dispatch channel]
-    CHANNEL --> SCHED[Select dispatch lane]
-    SCHED --> POOL[Dispatch pool]
-    POOL --> PROCESS[processDelivery]
-    PROCESS --> DECODE[Decode and validate envelope]
-    DECODE --> MIDDLEWARE[Middleware chain]
-    MIDDLEWARE --> HANDLER[Invoke handler]
-    HANDLER --> OUTCOME{Disposition}
-    OUTCOME --> ACK[Ack original]
-    OUTCOME --> SUCCESSOR[Publish retry or DLQ successor]
-    SUCCESSOR --> ACK
-    OUTCOME --> REQUEUE[Nack or release for redelivery]
-    ACK --> ACCOUNT[Record settlement and disposition]
-    REQUEUE --> ACCOUNT
+    subgraph S1[Subscribe]
+        direction LR
+        SUB[Client.Subscribe] --> RES[Resolve and validate<br/>subscription] --> RUNNER[Create and<br/>register Runner]
+    end
+    subgraph S2[Start a generation]
+        direction LR
+        RUN[Runner.Run] --> TOPO[Prepare subscription<br/>topology] --> CONSUMER[Create<br/>driver.Consumer]
+    end
+    subgraph S3[Intake]
+        direction LR
+        FETCH[Read<br/>Consumer.Messages] --> REGISTER[Register in-flight<br/>delivery] --> CHANNEL[Bounded dispatch<br/>channel]
+    end
+    subgraph S4[Dispatch]
+        direction LR
+        SCHED[Select dispatch<br/>lane] --> POOL[Dispatch pool] --> PROCESS[processDelivery]
+    end
+    subgraph S5[Handle]
+        direction LR
+        DECODE[Decode and validate<br/>envelope] --> MIDDLEWARE[Middleware chain] --> HANDLER[Invoke handler]
+    end
+    subgraph S6[Settle]
+        direction LR
+        OUTCOME{Disposition} --> ACK[Ack original]
+        OUTCOME --> SUCCESSOR[Publish retry or<br/>DLQ successor] --> ACK
+        OUTCOME --> REQUEUE[Nack or release<br/>for redelivery]
+        ACK --> ACCOUNT[Record settlement<br/>and disposition]
+        REQUEUE --> ACCOUNT
+    end
+    S1 --> S2 --> S3 --> S4 --> S5 --> S6
 ```
+
+Each row is one stage, read left to right; the stages run top to bottom. The last node of a stage
+feeds the first node of the next.
 
 The main owners are:
 
-- [`Client.Subscribe`](../../subscription.go) for configuration resolution,
+- [`Client.Subscribe`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/subscription.go) for configuration resolution,
   validation, middleware wrapping, and runner registration;
-- [`Runner.Run`](../../worker.go) for generation lifecycle, consumer startup,
+- [`Runner.Run`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/worker.go) for generation lifecycle, consumer startup,
   fetch, dispatch, and reconnect decisions;
-- [`openRunnerConsumer`](../../worker.go) for destinations, topology, and
+- [`openRunnerConsumer`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/worker.go) for destinations, topology, and
   `driver.Consumer` construction;
-- [`runDispatchPipeline`](../../worker.go) for scheduler and pool coordination;
-- [`processDelivery`](../../worker.go) and [`dispatchMessage`](../../worker.go)
+- [`runDispatchPipeline`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/worker.go) for scheduler and pool coordination;
+- [`processDelivery`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/worker.go) and [`dispatchMessage`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/worker.go)
   for handler outcomes and settlement;
-- [`internal/dispatch`](../../internal/dispatch/registry.go) for accepted-work
+- [`internal/dispatch`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/internal/dispatch/registry.go) for accepted-work
   and settlement accounting;
-- [`internal/lifecycle`](../../internal/lifecycle/state.go) for runner state
+- [`internal/lifecycle`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/internal/lifecycle/state.go) for runner state
   transitions and shutdown phases.
 
 ## Subscription creation is not runner startup
@@ -68,7 +80,7 @@ The main owners are:
 
 The runner is ready to start, but no subscription topology or driver consumer
 exists yet. The precedence and validation path is in
-[`subscription.go`](../../subscription.go).
+[`subscription.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/subscription.go).
 
 `Runner.Run` performs the runtime work. It can only start once, initializes the
 generation contexts, lifecycle machine, in-flight registry, accounting view,
@@ -110,11 +122,11 @@ The runner then creates one `driver.Consumer` with:
 - the effective capability profile; and
 - the current core-selected starting position for a new group (`StartEarliest`).
 
-The executable owner is [`openRunnerConsumer`](../../worker.go). The shared
-consumer and topology contracts are [`driver.Consumer`](../../driver/driver.go),
-[`driver.Admin`](../../driver/driver.go), and
-[`driver/topology.go`](../../driver/topology.go). User-visible capability
-behavior is explained in [Topology and capabilities](../advanced-topics/topology-and-capabilities.md).
+The executable owner is [`openRunnerConsumer`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/worker.go). The shared
+consumer and topology contracts are [`driver.Consumer`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/driver/driver.go),
+[`driver.Admin`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/driver/driver.go), and
+[`driver/topology.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/driver/topology.go). User-visible capability
+behavior is explained in [Topology and capabilities](/advanced-topics/topology-and-capabilities).
 
 ## Fetching deliveries
 
@@ -127,7 +139,7 @@ After a consumer is ready, `Runner.Run` starts three coordinated activities:
 The driver owns transport delivery. Each `driver.InboundMessage` carries the
 physical destination, key, headers, body, broker reference, delivery count,
 and a per-delivery `driver.Settler`. The port definition is in
-[`driver/message.go`](../../driver/message.go).
+[`driver/message.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/driver/message.go).
 
 `fetchRunner` registers a delivery before placing it on the bounded dispatch
 channel. Registration is important: once the driver has handed the message to
@@ -164,8 +176,8 @@ keeps a retry storm from consuming all handler capacity while still preventing
 an eligible lane from starving indefinitely.
 
 The scheduler implementation is in
-[`internal/sched/scheduler.go`](../../internal/sched/scheduler.go) and the
-runner’s lane construction is in [`newRunnerScheduler`](../../worker.go).
+[`internal/sched/scheduler.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/internal/sched/scheduler.go) and the
+runner's lane construction is in [`newRunnerScheduler`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/worker.go).
 
 When a lane is full, `runDispatchPipeline` keeps one pending delivery and waits
 for worker capacity. It does not grow an unbounded in-memory queue. This is the
@@ -191,15 +203,15 @@ is set for the ordered consumer path. The pool still performs key-affine
 dispatch so the handler-side ordering invariant is visible in the core.
 
 The pool implementation is in
-[`internal/dispatch/pool.go`](../../internal/dispatch/pool.go). Behavioral
-coverage includes [`f1test/ordered_test.go`](../../f1test/ordered_test.go),
-[`worker_ordering_test.go`](../../worker_ordering_test.go), and the scheduler
-tests in [`internal/sched/scheduler_test.go`](../../internal/sched/scheduler_test.go).
+[`internal/dispatch/pool.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/internal/dispatch/pool.go). Behavioral
+coverage includes [`f1test/ordered_test.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/f1test/ordered_test.go),
+[`worker_ordering_test.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/worker_ordering_test.go), and the scheduler
+tests in [`internal/sched/scheduler_test.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/internal/sched/scheduler_test.go).
 
 ## Middleware and handler execution
 
 Subscription creation wraps each registered handler with the client middleware
-chain. [`buildHandlerChain`](../../handler.go) applies user middleware in
+chain. [`buildHandlerChain`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/handler.go) applies user middleware in
 submission order and places panic recovery around the resulting chain.
 Classification and settlement intentionally stay outside middleware in
 `dispatchMessage`, so middleware cannot accidentally acknowledge or requeue a
@@ -220,9 +232,9 @@ recognizes a non-cooperative handler as stuck after its bounded thresholds. A
 stuck handler is not allowed to hold the runner indefinitely; the surrounding
 `processDelivery` cleanup decides how the unsettled delivery is returned.
 
-The handler and middleware contracts are in [`handler.go`](../../handler.go).
+The handler and middleware contracts are in [`handler.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/handler.go).
 The user-facing message and middleware model is documented in
-[Message](../basics/message.md) and [Middleware](../basics/middleware.md).
+[Message](/basics/message) and [Middleware](/basics/middleware).
 
 ## Delivery decisions
 
@@ -243,9 +255,9 @@ original delivery:
 | Handler or settlement remains incomplete during shutdown | Preserve broker ownership where possible | Requeue, release, unknown, or abandoned outcome |
 
 The decision tree is implemented by
-[`dispatchMessage`](../../worker.go), with error categories in
-[`errors.go`](../../errors.go) and retry mechanics in
-[`internal/retry`](../../internal/retry/classify.go).
+[`dispatchMessage`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/worker.go), with error categories in
+[`errors.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/errors.go) and retry mechanics in
+[`internal/retry`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/internal/retry/classify.go).
 
 ### Retry, delay, and successor destinations
 
@@ -268,7 +280,7 @@ delivery. This deliberately chooses broker redelivery over losing a message or
 pretending that the successor exists.
 
 User-facing retry and dead-letter policy is documented in
-[Failure handling](../advanced-topics/failure-handling.md).
+[Failure handling](/advanced-topics/failure-handling).
 
 ## Settle-last ordering
 
@@ -296,10 +308,10 @@ eligible for redelivery. A crash after successor confirmation and before the
 ack can duplicate the successor; at-least-once delivery means handlers must
 remain idempotent.
 
-The implementation is in [`retryAndSettle`](../../worker.go),
-[`deadLetterAndSettle`](../../worker.go), and
-[`publishSuccessor`](../../worker.go). The settlement port is
-[`driver.Settler`](../../driver/message.go), whose `Ack` and `Nack` operations
+The implementation is in [`retryAndSettle`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/worker.go),
+[`deadLetterAndSettle`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/worker.go), and
+[`publishSuccessor`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/worker.go). The settlement port is
+[`driver.Settler`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/driver/message.go), whose `Ack` and `Nack` operations
 must not be applied more than once by a driver.
 
 ## In-flight accounting and settlement cleanup
@@ -312,7 +324,7 @@ The runtime tracks two related but different facts for each accepted delivery:
 
 `internal/dispatch.Registry` registers a delivery before dispatch and removes
 it only after the settlement result is known or the bounded cleanup budget is
-exhausted. `WaitZero` is the runner’s proof that accepted work has left the
+exhausted. `WaitZero` is the runner's proof that accepted work has left the
 in-flight set.
 
 `processDelivery` owns the final cleanup defer. It:
@@ -326,10 +338,10 @@ in-flight set.
 This distinction matters when a driver call returns an error: the intended
 disposition may be known while the broker-side settlement remains unknown.
 The registry and accounting types are in
-[`internal/dispatch/registry.go`](../../internal/dispatch/registry.go) and
-[`internal/lifecycle/accounting.go`](../../internal/lifecycle/accounting.go).
-Settlement behavior is covered by [`settlement_state_test.go`](../../settlement_state_test.go),
-[`worker_settlement_test.go`](../../worker_settlement_test.go), and the driver
+[`internal/dispatch/registry.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/internal/dispatch/registry.go) and
+[`internal/lifecycle/accounting.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/internal/lifecycle/accounting.go).
+Settlement behavior is covered by [`settlement_state_test.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/settlement_state_test.go),
+[`worker_settlement_test.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/worker_settlement_test.go), and the driver
 settlement suites.
 
 ## Drain and shutdown
@@ -371,11 +383,11 @@ broker-owned work without claiming that the message was handled.
 
 `Client.Close` drains all registered runners before waiting for active publishes
 and closing shared producer/connection resources. The lifecycle implementation
-is in [`internal/lifecycle/drain.go`](../../internal/lifecycle/drain.go), with
-runner integration in [`Runner.Drain`](../../worker.go),
-[`drainAfterRun`](../../reconnect.go), and [`Client.Close`](../../client.go).
+is in [`internal/lifecycle/drain.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/internal/lifecycle/drain.go), with
+runner integration in [`Runner.Drain`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/worker.go),
+[`drainAfterRun`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/reconnect.go), and [`Client.Close`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/client.go).
 User-visible shutdown behavior is documented in
-[Lifecycle and shutdown](../advanced-topics/lifecycle-and-shutdown.md).
+[Lifecycle and shutdown](/advanced-topics/lifecycle-and-shutdown).
 
 ## Reconnect behavior
 
@@ -390,7 +402,7 @@ User-visible shutdown behavior is documented in
 
 The runner may first repair a consumer generation. If the connection itself
 must be rebuilt, it transitions to reconnecting and asks the client supervisor
-to coordinate the handoff. [`Runner.abandonForReconnect`](../../reconnect.go)
+to coordinate the handoff. [`Runner.abandonForReconnect`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/reconnect.go)
 cancels the generation and calls `Consumer.Release`, deliberately leaving
 unsettled deliveries for broker redelivery rather than classifying them as
 application retries.
@@ -398,7 +410,7 @@ application retries.
 The client reconnect path then waits for publish quiescence, opens a replacement
 connection, derives its effective capabilities, re-establishes topology, swaps
 the live connection, and lets the runner create a fresh consumer generation.
-The complete connection path is in [`reconnect.go`](../../reconnect.go).
+The complete connection path is in [`reconnect.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/reconnect.go).
 
 After a successful repair, lifecycle state returns to ready. If reconnect
 attempts are exhausted or a fatal consumer condition remains, the runner records
@@ -409,21 +421,21 @@ the failure and stops rather than silently losing the subscription.
 When changing consume behavior, follow this order:
 
 1. Subscription resolution and middleware wrapping in
-   [`subscription.go`](../../subscription.go).
+   [`subscription.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/subscription.go).
 2. Runner generation, topology, fetching, and lifecycle transitions in
-   [`worker.go`](../../worker.go).
+   [`worker.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/worker.go).
 3. Ordered dispatch and in-flight registry behavior in
-   [`internal/dispatch/pool.go`](../../internal/dispatch/pool.go) and
-   [`internal/dispatch/registry.go`](../../internal/dispatch/registry.go).
+   [`internal/dispatch/pool.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/internal/dispatch/pool.go) and
+   [`internal/dispatch/registry.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/internal/dispatch/registry.go).
 4. Fairness, retry-lane weighting, and aging in
-   [`internal/sched/scheduler.go`](../../internal/sched/scheduler.go).
+   [`internal/sched/scheduler.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/internal/sched/scheduler.go).
 5. Retry classification and destination construction in
-   [`internal/retry/classify.go`](../../internal/retry/classify.go) and
-   [`worker.go`](../../worker.go).
+   [`internal/retry/classify.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/internal/retry/classify.go) and
+   [`worker.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/worker.go).
 6. Driver delivery and settlement semantics in
-   [`driver/driver.go`](../../driver/driver.go) and
-   [`driver/message.go`](../../driver/message.go).
-7. Reconnect and shutdown handoff in [`reconnect.go`](../../reconnect.go).
+   [`driver/driver.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/driver/driver.go) and
+   [`driver/message.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/driver/message.go).
+7. Reconnect and shutdown handoff in [`reconnect.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/reconnect.go).
 8. Root, `f1test`, conformance, and provider tests before changing a port or
    lifecycle contract.
 

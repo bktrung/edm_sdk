@@ -5,7 +5,7 @@ application publishes typed events and registers handlers; the selected driver
 connects those operations to the messaging system used by the deployment.
 
 This page explains the boundary between the two sides. For the event envelope,
-payload, headers, and message types themselves, see [Message](message.md).
+payload, headers, and message types themselves, see [Message](/basics/message).
 
 ## The F1 boundary
 
@@ -14,11 +14,11 @@ surface is split into a client, a publisher, a subscription, and a runner:
 
 | Responsibility | F1 entry point | What it owns |
 | --- | --- | --- |
-| Connect to the selected transport | [`f1.New`](../../client.go) with [`f1.WithDriver`](../../options.go) | Driver connection and client resources |
-| Publish events | [`Client.Publisher`](../../client.go) | Encoding, envelope construction, and durable publish acknowledgement |
-| Declare consumption | [`Client.Subscribe`](../../subscription.go) | Subscription validation, topics, handlers, and delivery policy |
-| Run consumption | [`Runner.Run`](../../worker.go) | Fetching, dispatch, retries, settlement, and reconnect behavior |
-| Stop consumption | [`Runner.Drain`](../../worker.go) or [`Client.Close`](../../client.go) | Stop fetching, settle in-flight work, and release resources |
+| Connect to the selected transport | [`f1.New`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/client.go) with [`f1.WithDriver`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/options.go) | Driver connection and client resources |
+| Publish events | [`Client.Publisher`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/client.go) | Encoding, envelope construction, and durable publish acknowledgement |
+| Declare consumption | [`Client.Subscribe`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/subscription.go) | Subscription validation, topics, handlers, and delivery policy |
+| Run consumption | [`Runner.Run`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/worker.go) | Fetching, dispatch, retries, settlement, and reconnect behavior |
+| Stop consumption | [`Runner.Drain`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/worker.go) or [`Client.Close`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/client.go) | Stop fetching, settle in-flight work, and release resources |
 
 The application-facing code stays on the F1 side of this boundary. A concrete
 driver is selected in composition code and passed through `WithDriver`; handler
@@ -52,7 +52,7 @@ removing a trailing version segment such as `.v1`; use `WithTopic` only when an
 explicit topic is part of the application contract. Routing and workflow
 metadata are added with `PublishOption` constructors such as `WithKey`,
 `WithSubject`, `WithIdempotencyKey`, and `WithCorrelationID`. The complete
-option contract lives in [`publisher.go`](../../publisher.go).
+option contract lives in [`publisher.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/publisher.go).
 
 ### Batch publishing
 
@@ -81,7 +81,7 @@ if err != nil {
 Batch publishing preserves input order in `BatchResult.Results` and makes no
 atomicity claim. Inspect each `MessageResult`; a transport-wide error is the
 method error, while an individual item failure is attached to that item. See
-the [publish flow](../development/publish-flow.md) for topology timing, partial failure,
+the [publish flow](/development/publish-flow) for topology timing, partial failure,
 and close interaction.
 
 ## Declare and run a subscription
@@ -112,9 +112,9 @@ ownership scope. Topics select the logical destinations to consume. The
 handler map selects a handler by the exact event type emitted by the publisher.
 Retry, concurrency, prefetch, ordering, and unmatched-event behavior are
 subscription policy; their owning fields are documented in
-[`Subscription`](../../subscription.go).
+[`Subscription`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/subscription.go).
 
-The handler receives an [`f1.Event`](../../event.go), not a driver message. It
+The handler receives an [`f1.Event`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/event.go), not a driver message. It
 can decode the payload and inspect F1 metadata while remaining independent of
 transport-specific delivery references.
 
@@ -137,8 +137,8 @@ Transient downstream failures should return their ordinary error so the retry
 policy can decide when to try again. Return `nil` only after the application
 effect has completed.
 
-The classification helpers are defined in [`errors.go`](../../errors.go), and
-the dispatch path that applies them is owned by [`worker.go`](../../worker.go).
+The classification helpers are defined in [`errors.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/errors.go), and
+the dispatch path that applies them is owned by [`worker.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/worker.go).
 
 ## At-least-once delivery
 
@@ -155,7 +155,7 @@ effect idempotent:
 
 F1 does not maintain a universal deduplication store for application effects.
 The service that owns the side effect owns its idempotency decision. The
-[message guide](message.md) covers the envelope and identity fields in detail.
+[message guide](/basics/message) covers the envelope and identity fields in detail.
 
 ## Lifecycle and shutdown
 
@@ -176,31 +176,31 @@ if err := client.Close(shutdownCtx); err != nil {
 }
 ```
 
-For a complete signal-driven shutdown sequence, see [Getting started](../learn/getting-started.md)
-and the [graceful shutdown guide](../user-guide/graceful-shutdown.md). The
-client lifecycle contract is implemented in [`client.go`](../../client.go) and
-the runner drain contract in [`worker.go`](../../worker.go).
+For a complete signal-driven shutdown sequence, see [Getting started](/learn/getting-started)
+and the [graceful shutdown guide](/user-guide/graceful-shutdown). The
+client lifecycle contract is implemented in [`client.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/client.go) and
+the runner drain contract in [`worker.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/worker.go).
 
 ## Driver portability
 
-The [`driver.Driver`](../../driver/driver.go) interface is the transport
+The [`driver.Driver`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/driver/driver.go) interface is the transport
 boundary. F1 opens the selected driver, creates producer and consumer resources,
 and keeps envelope, routing, retry, and handler semantics in the core.
 
 This separation lets the same publisher and subscription code run with a
 different adapter when deployment requirements change. Driver-specific
 capabilities are exposed through `Client.Limits()` and must be treated as
-capabilities, not assumptions. The [driver and capabilities guide](../drivers-and-capabilities.md)
+capabilities, not assumptions. The [driver and capabilities guide](/drivers-and-capabilities)
 explains that boundary and its portability rules.
 
 When implementing a new driver, use the public driver interfaces and the
-[conformance package](../../driver/conformance/) as the executable contract.
+[conformance package](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/tree/main/driver/conformance) as the executable contract.
 Do not make application handlers depend on driver transport types merely to
 access broker-specific behavior.
 
 ## Testing the pub/sub boundary
 
-Use [`f1test`](../../f1test/f1test.go) for deterministic handler tests. It
+Use [`f1test`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/f1test/f1test.go) for deterministic handler tests. It
 provides the normal client and runner APIs backed by an in-memory driver, plus
 helpers for delivering events, observing accepted messages, advancing deferred
 delivery time, and inspecting dead-letter output.
@@ -211,13 +211,13 @@ idempotency, and shutdown rather than on broker-specific delivery references.
 
 ## Continue from here
 
-- [Message](message.md) — event payloads, envelopes, headers, metadata, and
+- [Message](/basics/message) - event payloads, envelopes, headers, metadata, and
   delivery identity;
-- [Publishing events](../user-guide/publishing-events.md) — publish options,
+- [Publishing events](/user-guide/publishing-events) - publish options,
   routing metadata, and batches;
-- [Consuming events](../user-guide/consuming-events.md) — handler registration,
+- [Consuming events](/user-guide/consuming-events) - handler registration,
   event decoding, ordering, and capabilities;
-- [Publish flow](../development/publish-flow.md) — publisher internals and acknowledgement
+- [Publish flow](/development/publish-flow) - publisher internals and acknowledgement
   timing; and
-- [Consume flow](../development/consume-flow.md) — runner startup, dispatch, settlement,
+- [Consume flow](/development/consume-flow) - runner startup, dispatch, settlement,
   and reconnect behavior.

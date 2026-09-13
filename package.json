@@ -1,0 +1,17 @@
+{
+  "name": "f1-documentation-site",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "scripts": {
+    "docs:dev": "vitepress dev docs",
+    "docs:build": "vitepress build docs",
+    "docs:preview": "vitepress preview docs"
+  },
+  "devDependencies": {
+    "mermaid": "11.4.1",
+    "vitepress": "1.6.4"
+  }
+}

@@ -41,8 +41,8 @@ func TestOrderHandler(t *testing.T) {
 }
 ```
 
-The complete runnable patterns live in [`f1test/f1test_test.go`](../../f1test/f1test_test.go)
-and [`f1test/fanout_test.go`](../../f1test/fanout_test.go). Import the normal Go
+The complete runnable patterns live in [`f1test/f1test_test.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/f1test/f1test_test.go)
+and [`f1test/fanout_test.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/f1test/fanout_test.go). Import the normal Go
 testing and assertion packages used by the repository.
 
 ## Test retries and dead letters
@@ -50,7 +50,7 @@ testing and assertion packages used by the repository.
 Use `f1.RetryAfter`, `f1.Terminal`, or `f1.Drop` in the handler, then inspect
 `client.Published()` and `client.DLQ()`. Advance retry time with
 `client.Advance(duration)` instead of sleeping. See the retry and dead-letter
-cases in [`f1test/f1test_test.go`](../../f1test/f1test_test.go).
+cases in [`f1test/f1test_test.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/f1test/f1test_test.go).
 
 ## Test the public contract
 

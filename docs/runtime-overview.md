@@ -5,12 +5,12 @@ F1 separates application-facing behavior from broker mechanics.
 ```mermaid
 flowchart TB
     APP[Application service]
-    API[package f1\nClient · Publisher · Subscription · Runner · Event]
-    CORE[Core runtime\nconfig · envelope · worker · retry · dispatch · lifecycle]
-    PORT[driver port\ninterfaces · errors · capabilities · topology]
+    API[package f1<br/>Client, Publisher, Subscription, Runner, Event]
+    CORE[Core runtime<br/>config, envelope, worker, retry, dispatch, lifecycle]
+    PORT[driver port<br/>interfaces, errors, capabilities, topology]
     INMEM[drivers/inmem]
     RMQ[drivers/rabbitmq]
-    KAFKA[drivers/kafka\nKafka adapter]
+    KAFKA[drivers/kafka<br/>Kafka adapter]
     BROKER[(RabbitMQ or Kafka)]
 
     APP --> API --> CORE --> PORT
@@ -28,7 +28,7 @@ flowchart TB
 | `Client` | one live connection, shared producer, runners, lifecycle admission |
 | `Publisher` | application publish calls; delegates state to `Client` |
 | `Subscription` | handler-facing policy and callbacks |
-| `Runner` | one subscription’s consumer, fetcher, scheduler, workers, and drain |
+| `Runner` | one subscription's consumer, fetcher, scheduler, workers, and drain |
 | `driver.Conn` | live broker resources |
 | `driver.Producer` | durable publish acknowledgement |
 | `driver.Consumer` | broker delivery and transport lifecycle |
@@ -56,7 +56,7 @@ sequenceDiagram
     P-->>App: Event ID or error
 ```
 
-Details: [publish flow](development/publish-flow.md).
+Details: [publish flow](/development/publish-flow).
 
 ## Consume path
 
@@ -86,7 +86,7 @@ sequenceDiagram
     end
 ```
 
-Details: [consume flow](development/consume-flow.md), [lifecycle and shutdown](advanced-topics/lifecycle-and-shutdown.md).
+Details: [consume flow](/development/consume-flow), [lifecycle and shutdown](/advanced-topics/lifecycle-and-shutdown).
 
 ## Non-negotiable boundaries
 
@@ -97,4 +97,4 @@ Details: [consume flow](development/consume-flow.md), [lifecycle and shutdown](a
 - At-least-once delivery means duplicate handler effects are possible.
 - The application owns idempotency using `Event.IdempotencyKey()`.
 
-The import rules are enforced by [`make verify-agnostic`](../Makefile) and `.golangci.yml`.
+The import rules are enforced by [`make verify-agnostic`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/Makefile) and `.golangci.yml`.

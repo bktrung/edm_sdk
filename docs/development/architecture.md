@@ -13,17 +13,14 @@ or decide whether a behavior belongs in the core SDK or in a driver.
 ```mermaid
 flowchart TB
     APP[Application]
-    CORE[Root package f1\npublic API and orchestration]
-    CODEC[codec/\npayload codecs]
-    INTERNAL[internal/*\nportable runtime primitives]
-    PORT[driver/\nbroker-independent port]
-    CONFORMANCE[driver/conformance/\nport contract suite]
-    F1TEST[f1test/\ndeterministic test client]
-    INMEM[drivers/inmem/\nreference driver]
-    RABBIT[drivers/rabbitmq/\nRabbitMQ adapter]
-    KAFKA[drivers/kafka/\nKafka adapter]
+    CORE[Root package f1<br/>public API and orchestration]
+    CODEC[codec/<br/>payload codecs]
+    INTERNAL[internal/*<br/>portable runtime primitives]
+    PORT[driver/<br/>broker-independent port]
+    INMEM[drivers/inmem/<br/>reference driver]
+    RABBIT[drivers/rabbitmq/<br/>RabbitMQ adapter]
+    KAFKA[drivers/kafka/<br/>Kafka adapter]
     BROKER[(External broker)]
-    TOOLS[tools/\nAPI and compatibility checks]
 
     APP --> CORE
     CORE --> CODEC
@@ -32,11 +29,24 @@ flowchart TB
     PORT --> INMEM
     PORT --> RABBIT
     PORT --> KAFKA
+    RABBIT --> BROKER
+    KAFKA --> BROKER
+```
+
+The verification packages sit beside the runtime and point at what they exercise:
+
+```mermaid
+flowchart LR
+    CONFORMANCE[driver/conformance/<br/>port contract suite]
+    F1TEST[f1test/<br/>deterministic test client]
+    TOOLS[tools/<br/>API and compatibility checks]
+    CORE[Root package f1]
+    PORT[driver/ port]
+    INMEM[drivers/inmem/]
+
     CONFORMANCE --> PORT
     F1TEST --> CORE
     F1TEST --> INMEM
-    RABBIT --> BROKER
-    KAFKA --> BROKER
     TOOLS -. verifies .-> CORE
     TOOLS -. verifies .-> PORT
 ```
@@ -58,20 +68,20 @@ own the details.
 
 | Package | Responsibility | Start here |
 | --- | --- | --- |
-| `.` (`package f1`) | Public API, configuration, client lifecycle, publishing, subscriptions, runners, event/envelope types, routing, errors, and capability limits | [`client.go`](../../client.go), [`publisher.go`](../../publisher.go), [`subscription.go`](../../subscription.go), [`worker.go`](../../worker.go) |
-| `codec/` | Broker-independent payload codec interface and JSON implementation | [`codec/codec.go`](../../codec/codec.go) |
-| `driver/` | Broker port: connection, producer, consumer, settlement, administration, topology, capabilities, messages, and driver errors | [`driver/driver.go`](../../driver/driver.go), [`driver/capability.go`](../../driver/capability.go), [`driver/topology.go`](../../driver/topology.go) |
-| `driver/conformance/` | Broker-independent contract suite that exercises a candidate driver through the port | [`driver/conformance/run.go`](../../driver/conformance/run.go), [`driver/conformance/manifest.go`](../../driver/conformance/manifest.go) |
-| `internal/clock/` | Real and manually advanced clocks used to keep timing behavior testable | [`internal/clock/clock.go`](../../internal/clock/clock.go) |
-| `internal/retry/` | Error classification, retry outcomes, backoff tiers, and retry sanity checks | [`internal/retry/classify.go`](../../internal/retry/classify.go), [`internal/retry/ladder.go`](../../internal/retry/ladder.go) |
-| `internal/sched/` | Bounded weighted lanes, aging, and scheduling fairness | [`internal/sched/scheduler.go`](../../internal/sched/scheduler.go) |
-| `internal/dispatch/` | Worker pool, ordered-key routing, and in-flight delivery accounting | [`internal/dispatch/pool.go`](../../internal/dispatch/pool.go), [`internal/dispatch/registry.go`](../../internal/dispatch/registry.go) |
-| `internal/lifecycle/` | Runner drain state and disposition accounting used by shutdown and settlement | [`internal/lifecycle/state.go`](../../internal/lifecycle/state.go), [`internal/lifecycle/drain.go`](../../internal/lifecycle/drain.go) |
-| `drivers/inmem/` | Deterministic in-memory broker, including topology, delivery, settlement, and fault behavior for tests | [`drivers/inmem/inmem.go`](../../drivers/inmem/inmem.go) |
-| `drivers/rabbitmq/` | RabbitMQ transport, topology, management, settlement, reconnect, and broker-specific tests | [`drivers/rabbitmq/rabbitmq.go`](../../drivers/rabbitmq/rabbitmq.go) |
-| `drivers/kafka/` | Kafka transport, classic consumer groups, topology, offsets, rebalancing, and broker-specific tests | [`drivers/kafka/kafka.go`](../../drivers/kafka/kafka.go) |
-| `f1test/` | Black-box handler-test client backed by the in-memory driver and a fake clock | [`f1test/f1test.go`](../../f1test/f1test.go) |
-| `tools/` | API-surface and API-diff checks for public packages | [`tools/apisurface/main.go`](../../tools/apisurface/main.go), [`tools/apidiff/normalize.go`](../../tools/apidiff/normalize.go) |
+| `.` (`package f1`) | Public API, configuration, client lifecycle, publishing, subscriptions, runners, event/envelope types, routing, errors, and capability limits | [`client.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/client.go), [`publisher.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/publisher.go), [`subscription.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/subscription.go), [`worker.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/worker.go) |
+| `codec/` | Broker-independent payload codec interface and JSON implementation | [`codec/codec.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/codec/codec.go) |
+| `driver/` | Broker port: connection, producer, consumer, settlement, administration, topology, capabilities, messages, and driver errors | [`driver/driver.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/driver/driver.go), [`driver/capability.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/driver/capability.go), [`driver/topology.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/driver/topology.go) |
+| `driver/conformance/` | Broker-independent contract suite that exercises a candidate driver through the port | [`driver/conformance/run.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/driver/conformance/run.go), [`driver/conformance/manifest.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/driver/conformance/manifest.go) |
+| `internal/clock/` | Real and manually advanced clocks used to keep timing behavior testable | [`internal/clock/clock.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/internal/clock/clock.go) |
+| `internal/retry/` | Error classification, retry outcomes, backoff tiers, and retry sanity checks | [`internal/retry/classify.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/internal/retry/classify.go), [`internal/retry/ladder.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/internal/retry/ladder.go) |
+| `internal/sched/` | Bounded weighted lanes, aging, and scheduling fairness | [`internal/sched/scheduler.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/internal/sched/scheduler.go) |
+| `internal/dispatch/` | Worker pool, ordered-key routing, and in-flight delivery accounting | [`internal/dispatch/pool.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/internal/dispatch/pool.go), [`internal/dispatch/registry.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/internal/dispatch/registry.go) |
+| `internal/lifecycle/` | Runner drain state and disposition accounting used by shutdown and settlement | [`internal/lifecycle/state.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/internal/lifecycle/state.go), [`internal/lifecycle/drain.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/internal/lifecycle/drain.go) |
+| `drivers/inmem/` | Deterministic in-memory broker, including topology, delivery, settlement, and fault behavior for tests | [`drivers/inmem/inmem.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/drivers/inmem/inmem.go) |
+| `drivers/rabbitmq/` | RabbitMQ transport, topology, management, settlement, reconnect, and broker-specific tests | [`drivers/rabbitmq/rabbitmq.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/drivers/rabbitmq/rabbitmq.go) |
+| `drivers/kafka/` | Kafka transport, classic consumer groups, topology, offsets, rebalancing, and broker-specific tests | [`drivers/kafka/kafka.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/drivers/kafka/kafka.go) |
+| `f1test/` | Black-box handler-test client backed by the in-memory driver and a fake clock | [`f1test/f1test.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/f1test/f1test.go) |
+| `tools/` | API-surface and API-diff checks for public packages | [`tools/apisurface/main.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/tools/apisurface/main.go), [`tools/apidiff/normalize.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/tools/apidiff/normalize.go) |
 
 ## Ownership of the runtime
 
@@ -82,12 +92,12 @@ primary owner:
   producer, runner registry, reconnect supervision, publish admission, and
   client close phases. `reconnect.go` owns connection replacement and runner
   re-entry. The shutdown semantics are explained in
-  [Lifecycle and shutdown](../advanced-topics/lifecycle-and-shutdown.md).
+  [Lifecycle and shutdown](/advanced-topics/lifecycle-and-shutdown).
 - **Publishing:** `publisher.go` builds outbound messages from application
   events, codec output, envelope headers, and logical routing options.
   `client.go` owns producer admission and delegates durable publication to
-  `driver.Producer`. See [Message](../basics/message.md) for the public
-  envelope model and [Pub/sub](../basics/pubsub.md) for application-level use.
+  `driver.Producer`. See [Message](/basics/message) for the public
+  envelope model and [Pub/sub](/basics/pubsub) for application-level use.
 - **Consuming:** `subscription.go` resolves and validates subscription policy;
   `worker.go` owns runner generations, fetching, dispatch, handler decisions,
   successor publication, and settlement. The driver owns transport delivery
@@ -95,26 +105,26 @@ primary owner:
 - **Scheduling and ordering:** `internal/sched` selects work from bounded
   lanes; `internal/dispatch` owns worker execution, ordered-key routing, and
   in-flight accounting. User-visible behavior is described in
-  [Ordering and scheduling](../advanced-topics/ordering-and-scheduling.md).
+  [Ordering and scheduling](/advanced-topics/ordering-and-scheduling).
 - **Settlement and failure routing:** `internal/retry` classifies outcomes;
   `worker.go` publishes retry or dead-letter successors and settles the source
-  delivery. The [Failure handling](../advanced-topics/failure-handling.md)
+  delivery. The [Failure handling](/advanced-topics/failure-handling)
   guide describes the application-facing policy.
 - **Topology:** the core resolves logical F1 topics, retry lanes, dead-letter
   lanes, and subscription destinations into `driver.TopologySpec`. The driver
   translates that specification into broker objects through `driver.Admin`.
-  See [Topology and capabilities](../advanced-topics/topology-and-capabilities.md).
+  See [Topology and capabilities](/advanced-topics/topology-and-capabilities).
 
-The canonical implementation walkthroughs are [publish flow](publish-flow.md)
-and [consume flow](consume-flow.md). The [runtime overview](../runtime-overview.md)
+The canonical implementation walkthroughs are [publish flow](/development/publish-flow)
+and [consume flow](/development/consume-flow). The [runtime overview](/runtime-overview)
 and provider guide remain useful companion pages: the runtime overview explains
 the system at a glance, while the provider guide retains adapter-specific notes.
 
 ## Dependency and import boundaries
 
 These boundaries keep the SDK broker-agnostic and are enforced by the
-`depguard` configuration in [`.golangci.yml`](../../.golangci.yml) through
-[`make verify-agnostic`](../../Makefile):
+`depguard` configuration in [`.golangci.yml`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/.golangci.yml) through
+[`make verify-agnostic`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/Makefile):
 
 - The root package and `internal/**` may depend on the port and portable
   standard-library code, but must not import `drivers/**` or a broker client.
@@ -144,7 +154,7 @@ APIs remain inside `drivers/*`. This keeps the application-facing API generic
 and lets the same runtime use in-memory, RabbitMQ, or Kafka transports.
 
 The import boundary is checked by `make verify-agnostic`; the port itself is
-defined in [`driver/driver.go`](../../driver/driver.go).
+defined in [`driver/driver.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/driver/driver.go).
 
 ### Successors are published before the source is acknowledged
 
@@ -154,10 +164,10 @@ This prevents the source from being lost when the replacement was not durably
 accepted, while still allowing duplicates if acknowledgement or connection
 state is uncertain.
 
-The implementation path is in [`worker.go`](../../worker.go), especially the
+The implementation path is in [`worker.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/worker.go), especially the
 successor publication and settlement helpers. The ordering is protected by
-[`worker_settlement_test.go`](../../worker_settlement_test.go) and the retry
-bridge tests in [`worker_retry_bridge_test.go`](../../worker_retry_bridge_test.go).
+[`worker_settlement_test.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/worker_settlement_test.go) and the retry
+bridge tests in [`worker_retry_bridge_test.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/worker_retry_bridge_test.go).
 
 ### Delivery is at least once
 
@@ -168,14 +178,14 @@ effects idempotent, normally using the event idempotency key exposed by the
 public event model.
 
 The user-facing trade-off is documented in
-[Failure handling](../advanced-topics/failure-handling.md); the settlement
+[Failure handling](/advanced-topics/failure-handling); the settlement
 state and redelivery behavior are covered by the root settlement and driver
 tests.
 
 ### Handlers must be idempotent
 
 The SDK can provide stable identity and safe retry routing, but it does not own
-the application’s effect store or deduplication policy. A handler that charges a
+the application's effect store or deduplication policy. A handler that charges a
 card, updates a database, or emits an external side effect must tolerate the
 same event being observed more than once.
 
@@ -191,9 +201,9 @@ must be treated as optimizations rather than new semantics.
 
 The core must preserve required behavior when a native capability is absent and
 must expose physical limitations instead of silently claiming support. See
-[`driver/capability.go`](../../driver/capability.go),
-[`limits.go`](../../limits.go), and
-[Topology and capabilities](../advanced-topics/topology-and-capabilities.md).
+[`driver/capability.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/driver/capability.go),
+[`limits.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/limits.go), and
+[Topology and capabilities](/advanced-topics/topology-and-capabilities).
 
 ### F1 owns logical routing; drivers own physical destinations
 
@@ -204,27 +214,27 @@ consumer groups, offsets, or equivalent broker objects.
 
 Drivers must not reconstruct F1 routing names or infer application policy from
 broker-specific defaults. Topology ownership is split deliberately between
-the core’s logical model and the driver’s physical model; the port types are
-defined in [`driver/topology.go`](../../driver/topology.go).
+the core's logical model and the driver's physical model; the port types are
+defined in [`driver/topology.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/driver/topology.go).
 
 ## How to use this map
 
-For a user-facing behavior, start with the relevant page in
-[`docs/README.md`](../README.md), then follow its source links. For a runtime
+For a user-facing behavior, start with the relevant Guides or Concepts page
+in the sidebar, then follow its source links. For a runtime
 change, read this page first, trace the owning package, and read the nearest
 behavioral tests before modifying a boundary.
 
 The maintainer route is:
 
-1. [Runtime overview](../runtime-overview.md) for object ownership and flow.
-2. [Publish flow](publish-flow.md) or [Consume flow](consume-flow.md)
+1. [Runtime overview](/runtime-overview) for object ownership and flow.
+2. [Publish flow](/development/publish-flow) or [Consume flow](/development/consume-flow)
    for the message path.
-3. [Driver contract](driver-contract.md) for port behavior and extension rules.
-4. [Driver conformance](driver-conformance.md) for shared contract tests,
+3. [Driver contract](/development/driver-contract) for port behavior and extension rules.
+4. [Driver conformance](/development/driver-conformance) for shared contract tests,
    profiles, and provider fixtures.
-5. [Drivers and capabilities](../drivers-and-capabilities.md) for provider
+5. [Drivers and capabilities](/drivers-and-capabilities) for provider
    differences and the current adapter notes.
-6. [Source-reading guide](source-reading-guide.md) for a staged source and test tour.
+6. [Source-reading guide](/development/source-reading-guide) for a staged source and test tour.
 
 The development documentation is the canonical maintainer route. The root
 `ARCHITECTURE.md` remains a stable entrypoint that points here.

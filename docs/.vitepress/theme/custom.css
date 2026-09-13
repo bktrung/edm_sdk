@@ -1,0 +1,157 @@
+:root {
+  --vp-c-brand-1: #b42318;
+  --vp-c-brand-2: #d92d20;
+  --vp-c-brand-3: #f04438;
+  --vp-c-brand-soft: rgba(240, 68, 56, 0.14);
+  --vp-home-hero-name-color: transparent;
+  --vp-home-hero-name-background: linear-gradient(120deg, #b42318 30%, #f04438);
+}
+
+.dark {
+  --vp-c-brand-1: #ff9b8f;
+  --vp-c-brand-2: #ffb4aa;
+  --vp-c-brand-3: #ffcec8;
+  --vp-c-brand-soft: rgba(255, 155, 143, 0.16);
+}
+
+/* The default theme paints the brand button with brand-3 and white text. The
+   dark palette's brand-3 is a pale pink, which made the primary action nearly
+   unreadable, and the light brand-3 is below 4.5:1 as well. Pin the button to
+   deep reds that keep white text above 4.5:1 in both appearances. */
+:root,
+.dark {
+  --vp-button-brand-text: #ffffff;
+  --vp-button-brand-hover-text: #ffffff;
+  --vp-button-brand-active-text: #ffffff;
+  --vp-button-brand-bg: #b42318;
+  --vp-button-brand-hover-bg: #d92d20;
+  --vp-button-brand-active-bg: #912018;
+}
+
+.VPHome .VPHero .name {
+  letter-spacing: -0.04em;
+}
+
+.VPHome .VPHero .tagline {
+  max-width: 44rem;
+}
+
+/* Without a hero image the title wraps at a narrow measure and breaks into
+   three short lines; give it enough room to read as one statement. */
+.VPHome .VPHero .text {
+  max-width: 48rem;
+}
+
+/* Reader-path cards on the home page. Each card is one link so the whole
+   surface is the target, and the grid stacks to one column on phones. */
+.f1-paths {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 16px;
+  margin: 24px 0 8px;
+}
+
+@media (max-width: 768px) {
+  .f1-paths {
+    grid-template-columns: 1fr;
+  }
+}
+
+.vp-doc a.f1-path {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 20px 22px;
+  border: 1px solid var(--vp-c-divider);
+  border-radius: 12px;
+  background: var(--vp-c-bg-soft);
+  color: var(--vp-c-text-1);
+  text-decoration: none;
+  transition: border-color 0.2s, background-color 0.2s;
+}
+
+.vp-doc a.f1-path:hover {
+  border-color: var(--vp-c-brand-1);
+  background: var(--vp-c-brand-soft);
+}
+
+.f1-path__eyebrow {
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--vp-c-brand-1);
+}
+
+.f1-path__title {
+  font-size: 17px;
+  line-height: 1.4;
+}
+
+.f1-path__body {
+  font-size: 14px;
+  line-height: 1.6;
+  color: var(--vp-c-text-2);
+}
+
+.f1-path__cta {
+  margin-top: auto;
+  padding-top: 4px;
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--vp-c-brand-1);
+}
+
+.vp-doc div[class*='language-'] {
+  overflow-x: auto;
+}
+
+.f1-mermaid {
+  display: flex;
+  justify-content: center;
+  margin: 1.5rem 0;
+  max-width: 100%;
+  overflow-x: auto;
+}
+
+.f1-mermaid svg {
+  max-width: 100%;
+  height: auto;
+}
+
+/* Mermaid sizes each HTML label box for its own line-height of 1.5. The
+   .vp-doc paragraph rule reaches into the label and sets a 28px line-height
+   plus margins, so a three-line label outgrows its 72px box and the last line
+   is cut off. Give labels back the metrics Mermaid measured with. */
+.vp-doc .f1-mermaid foreignObject p {
+  margin: 0;
+  line-height: 1.5;
+}
+
+@media (max-width: 640px) {
+  .f1-mermaid {
+    justify-content: flex-start;
+  }
+}
+
+.f1-mermaid--error {
+  color: var(--vp-c-danger-1);
+  font-family: var(--vp-font-family-mono);
+  font-size: 0.875rem;
+}
+
+:focus-visible {
+  outline: 2px solid var(--vp-c-brand-1);
+  outline-offset: 3px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    scroll-behavior: auto !important;
+    transition-duration: 0.01ms !important;
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+  }
+}

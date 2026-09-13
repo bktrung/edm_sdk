@@ -43,6 +43,6 @@ when a service owns multiple subscriptions. Flush and connection-close errors
 are returned; keep and report them rather than discarding them. A successful
 close is safe to call again.
 
-See [`examples/consumer/main.go`](../../examples/consumer/main.go) for the full
-signal and cleanup flow, and [Lifecycle and shutdown](../advanced-topics/lifecycle-and-shutdown.md)
+See [`examples/consumer/main.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/examples/consumer/main.go) for the full
+signal and cleanup flow, and [Lifecycle and shutdown](/advanced-topics/lifecycle-and-shutdown)
 for the runtime state machine.

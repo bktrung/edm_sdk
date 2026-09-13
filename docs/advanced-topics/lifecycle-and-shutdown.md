@@ -30,9 +30,9 @@ stateDiagram-v2
     Ready --> Failed: terminal consumer error
 ```
 
-The public runner lifecycle is implemented by [`Runner.Run`](../../worker.go)
-and [`Runner.Drain`](../../worker.go). The state machine and phase transitions
-are owned by [`internal/lifecycle`](../../internal/lifecycle). A runner that
+The public runner lifecycle is implemented by [`Runner.Run`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/worker.go)
+and [`Runner.Drain`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/worker.go). The state machine and phase transitions
+are owned by [`internal/lifecycle`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/tree/main/internal/lifecycle). A runner that
 has not started is already drained; `Drain` returns without starting it.
 
 ## Run a subscription
@@ -97,7 +97,7 @@ Drain performs the following contract:
 `Drain` does not acknowledge an unfinished handler as successful. If a handler
 does not cooperate with cancellation or a settlement operation cannot finish,
 F1 returns an error or requeues/releases the delivery according to the final
-settlement path. See [Consume flow](../development/consume-flow.md)
+settlement path. See [Consume flow](/development/consume-flow)
 for the settle-last rule and in-flight accounting.
 
 Calling `Drain` is idempotent for an already draining or closed runner. The
@@ -137,8 +137,8 @@ Core-generated retry and dead-letter successors are allowed to complete during
 runner drain so an accepted failed delivery is not lost merely because
 shutdown has begun. Application code should stop publishing once shutdown
 starts. The publish-side ownership is described in
-[Publish flow](../development/publish-flow.md), and the executable orchestration is in
-[`Client.Close`](../../client.go).
+[Publish flow](/development/publish-flow), and the executable orchestration is in
+[`Client.Close`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/client.go).
 
 `Client.Close` is safe to call again after it has completed. A concurrent close
 attempt is rejected while the first attempt is active. If shutdown cannot
@@ -189,7 +189,7 @@ remain usable between those operations.
 
 ## Configure shutdown budgets
 
-Lifecycle budgets live in [`LifecycleConfig`](../../config.go). Configure them
+Lifecycle budgets live in [`LifecycleConfig`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/config.go). Configure them
 from the service's work and dependency behavior rather than selecting values
 only to make a shutdown test pass:
 
@@ -208,7 +208,7 @@ the collection of runner drains. The caller's `Close` context can end the
 current wait earlier; a producer or connection phase that was started for
 rejoining may continue in the background.
 
-The config defaults and validation are executable in [`config.go`](../../config.go).
+The config defaults and validation are executable in [`config.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/config.go).
 Do not duplicate the numeric defaults in service documentation; link to the
 config owner and set explicit values when the deployment needs a documented
 policy.
@@ -256,11 +256,11 @@ Once `Client.Close` begins, shutdown wins over reconnect: new reconnect work is
 not admitted and the supervisor is canceled. A reconnect failure should be
 reported as a runtime or runner error; it is not a reason for the service to
 skip the close path. The reconnect ownership lives in
-[`reconnect.go`](../../reconnect.go).
+[`reconnect.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/reconnect.go).
 
 ## Test lifecycle behavior
 
-Use [`f1test`](../../f1test/f1test.go) for handler and settlement tests, then
+Use [`f1test`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/f1test/f1test.go) for handler and settlement tests, then
 use driver conformance tests for driver-specific lifecycle behavior. Cover the
 decisions that matter to the service:
 
@@ -275,13 +275,13 @@ decisions that matter to the service:
   caller deadline.
 
 The lifecycle state machine is tested in
-[`internal/lifecycle/drain_test.go`](../../internal/lifecycle/drain_test.go).
+[`internal/lifecycle/drain_test.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/internal/lifecycle/drain_test.go).
 Client-level timeout and retry behavior is covered by
-[`client_drain_budget_test.go`](../../client_drain_budget_test.go) and
-[`client_close_sequencing_test.go`](../../client_close_sequencing_test.go).
+[`client_drain_budget_test.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/client_drain_budget_test.go) and
+[`client_close_sequencing_test.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/client_close_sequencing_test.go).
 The runnable consumer example demonstrates signal handling, but the service
 code should still keep the driver selection outside its business handlers; see
-[`examples/consumer/main.go`](../../examples/consumer/main.go) for the complete
+[`examples/consumer/main.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/examples/consumer/main.go) for the complete
 composition pattern.
 
 ## Common mistakes
@@ -303,12 +303,12 @@ composition pattern.
 
 ## Continue from here
 
-- [Publisher and subscriber](../basics/pubsub.md) — runner ownership and the
+- [Publisher and subscriber](/basics/pubsub) - runner ownership and the
   publish/consume lifecycle boundary;
-- [Failure handling](failure-handling.md) — settlement outcomes during drain
+- [Failure handling](/advanced-topics/failure-handling) - settlement outcomes during drain
   and successor handoff;
-- [Message](../basics/message.md) — context, identity, and idempotent effects;
-- [Consume flow](../development/consume-flow.md) — settle-last
+- [Message](/basics/message) - context, identity, and idempotent effects;
+- [Consume flow](/development/consume-flow) - settle-last
   ordering and in-flight accounting; and
-- [Runtime overview](../runtime-overview.md) — client, runner, and driver
+- [Runtime overview](/runtime-overview) - client, runner, and driver
   boundaries.
