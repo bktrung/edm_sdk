@@ -239,7 +239,17 @@ func (p *producer) target(message driver.OutboundMessage) (exchange, routingKey,
 			due = now.Add(delay)
 		}
 		if remaining := due.Sub(now); remaining > 0 {
-			return "", destination + ".park", expirationMillis(remaining)
+			// On the ladder, the rung queue's own x-message-ttl does the
+			// delaying and the message carries no expiration: that is what
+			// makes expiry order FIFO order and keeps a message from waiting
+			// for one parked ahead of it. Above the ladder the per-message
+			// path stays exactly as it was, per-message expiration included,
+			// because a due time up to maxExpirationMillis is still owed and
+			// clamping it into the top rung would release it early.
+			if rung := parkRung(remaining); rung > 0 {
+				return "", parkQueueName(destination, rung), ""
+			}
+			return "", destination + parkingSuffix, expirationMillis(remaining)
 		}
 	}
 	if message.EntryPoint {
@@ -324,10 +334,11 @@ func returnedPublishError(returned amqp.Return) error {
 	return classify("publish", driver.KindFatal, reason)
 }
 
-// parkingSuffix turns a destination name into the name of its parking queue,
-// the queue a delayed or retried message waits in until its TTL expires. The
-// suffix is fixed: both the topology path that declares the queue and the
-// publish path that routes to it derive the name the same way.
+// parkingSuffix turns a destination name into the name of the parking queue a
+// delay above the ladder waits in. A rung queue carries the same suffix
+// followed by the rung's tag, and both the topology path that declares a queue
+// and the publish path that routes to it derive the name from the same
+// helpers, so the two shapes cannot drift apart.
 const parkingSuffix = ".park"
 
 // parkingFailure rewrites a not-found publish failure for a message that was
@@ -339,28 +350,28 @@ const parkingSuffix = ".park"
 //
 // The queue is declared by the adapter under TopologyDeclare, checked under
 // TopologyVerify, and operator-provisioned under TopologyNone, so the message
-// states that split. Its declare arguments are rendered from parkingArguments
-// rather than copied into the text: the two had to be edited together before,
-// and an argument added there without a matching edit here would have told an
-// operator to create a queue the adapter would then report as drift. Durability
-// is a declare flag rather than an entry in that table, so the message states
-// it in words instead: the adapter declares the parking queue durable under
-// every queue kind, and an operator provisioning one under TopologyNone has
-// only this text to read. kind is the connection's own queue kind, because the
-// arguments differ by kind and the producer holds no other way back to it.
-// Classification is deliberately the wrapped error's own: this adds context
-// and changes no kind.
+// states that split. Its declare arguments are rendered from the argument
+// builder for that queue rather than copied into the text: the two had to be
+// edited together before, and an argument added there without a matching edit
+// here would have told an operator to create a queue the adapter would then
+// report as drift. Durability is a declare flag rather than an entry in that
+// table, so the message states it in words instead: the adapter declares the
+// parking queue durable under every queue kind, and an operator provisioning
+// one under TopologyNone has only this text to read. kind is the connection's
+// own queue kind, because the arguments differ by kind and the producer holds
+// no other way back to it. Classification is deliberately the wrapped error's
+// own: this adds context and changes no kind.
 func parkingFailure(routingKey string, kind queueKind, err error) error {
-	if !strings.HasSuffix(routingKey, parkingSuffix) || !errors.Is(err, driver.ErrDestinationMissing) {
+	destination, _, isParking := parkQueueParts(routingKey)
+	if !isParking || !errors.Is(err, driver.ErrDestinationMissing) {
 		return err
 	}
-	destination := strings.TrimSuffix(routingKey, parkingSuffix)
 	return fmt.Errorf(
 		"rabbitmq: parking destination %q is missing: a delayed or retried message is parked there"+
 			" until its delay expires, so the adapter declares the queue durable under TopologyDeclare"+
 			" and requires it under TopologyVerify, and under TopologyNone the operator provisions it"+
 			" with the declare arguments %s: %w",
-		routingKey, declareArgumentsText(parkingArguments(destination, kind)), err,
+		routingKey, declareArgumentsText(parkArguments(destination, kind, routingKey)), err,
 	)
 }
 

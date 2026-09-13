@@ -80,25 +80,52 @@ The local fixture (`make broker-up`) runs a `-management` image with the API on
 15672. Managed RabbitMQ offerings differ in whether that API is exposed and on
 which credentials, so check it before deploying.
 
-### Delayed and retried messages need a per-destination parking queue
+### Delayed and retried messages need per-destination parking queues
 
-RabbitMQ has no native delayed delivery, so the adapter emulates it with one
-parking queue per destination. A delayed or retried message is published with a
-per-message TTL to `<destination>.park`, and the broker dead-letters it back to
-the destination when the TTL expires. The name is always the destination name
-with `.park` appended, so a destination name ending in `.park` is reserved.
+RabbitMQ has no native delayed delivery, so the adapter emulates it with
+queue-level TTLs and a dead-letter route back to the destination.
 
-The parking queue is declared from the destination's delay, and which policy
-makes it exist is the same split as any other destination:
+A delay of at most 64s is parked in the queue of the smallest rung of a fixed
+ladder that is at least the delay:
 
-| Topology policy | Parking queue |
+| Rung | 500ms | 1s | 2s | 4s | 8s | 16s | 32s | 64s |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+
+That queue is named `<destination>.park.<rung>`, for example `orders.park.2s`,
+and it is declared with `x-message-ttl` set to its rung. The message carries no
+expiration of its own: RabbitMQ expires a per-message TTL only when the message
+reaches the head of its queue, so a message parked behind a later one waits for
+it and the delay can overrun by the distance between the two due times. With the
+TTL on the queue, every message in it expires in FIFO order, and a rung queue
+cannot construct that case at all. Rounding the delay up is what keeps a message
+from being released before its due time; the cost is lateness below one rung, so
+a 5s delay is released at about 8s.
+
+A delay above 64s parks in `<destination>.park`, the queue that carries a
+per-message expiration, exactly as it always has. The deferral ceiling stays
+where it was (about 24.8 days), and the limitation of that path is unchanged: a
+due time beyond the top rung can still be released late by a message parked
+ahead of it. It is not reachable from the SDK's retry path, whose delays are
+bounded by configuration, and it is reachable by an application passing
+`DelayUntil` more than a minute out.
+
+The names are reserved: a destination name may not end in `.park`, and it may
+not end in `.park.` followed by one of the rung tags above. Both shapes belong
+to parking queues, and the adapter reads a queue name back to find the
+destination it parks for.
+
+The rung queues and the queue above the ladder are declared from the
+destination's delay, and which policy makes them exist is the same split as any
+other destination:
+
+| Topology policy | Parking queues |
 | --- | --- |
 | `TopologyDeclare` | Declared by the adapter at subscription start. |
-| `TopologyVerify` | Must exist and match its declared arguments, checked at subscription start. |
+| `TopologyVerify` | Must exist and match their declared arguments, checked at subscription start. |
 | `TopologyNone` | Provisioned by the operator. The adapter declares and checks nothing. |
 
-The queue is durable, and its declare arguments follow the deployment's queue
-type (`broker.rabbitmq.queueType`, `quorum` by default):
+The queues are durable, and their declare arguments follow the deployment's
+queue type (`broker.rabbitmq.queueType`, `quorum` by default):
 
 | Argument | Value |
 | --- | --- |
@@ -107,12 +134,20 @@ type (`broker.rabbitmq.queueType`, `quorum` by default):
 | `x-dead-letter-routing-key` | the destination name |
 | `x-dead-letter-strategy` | `at-least-once`, on quorum only |
 | `x-overflow` | `reject-publish`, on quorum only |
+| `x-message-ttl` | the rung, in milliseconds, on the rung queues only |
 
-On quorum the last two arguments are added because all three dead-letter
+On quorum the two strategy arguments are added because all three dead-letter
 arguments are required together for RabbitMQ's at-least-once dead-letter
-guarantee; the parking queue is the delay mechanism itself, not a failure path,
-so a message lost there is a dropped retry with no error. A classic deployment
-omits them, and its delay path is at-most-once.
+guarantee; the parking queues are the delay mechanism itself, not a failure
+path, so a message lost there is a dropped retry with no error. A classic
+deployment omits them, and its delay path is at-most-once.
+
+Upgrading from a release without the ladder needs no drain. The existing
+`<destination>.park` queue keeps dead-lettering to its destination and the
+messages parked in it leave on their own schedule, and the rung queues are
+declared by the topology pass. An application that empties a destination
+(`Purge`) empties every parking queue of it, and one that deletes a destination
+(`Prune`) is refused while any of them still holds a message.
 
 Under `TopologyNone` a missing parking queue is discovered by the publish that
 needed it. The broker returns the message (`312 NO_ROUTE`) rather than closing

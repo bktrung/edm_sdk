@@ -22,11 +22,11 @@ func setupPruneTest(t *testing.T, kind queueKind, specs ...driver.DestinationSpe
 		cancel()
 		t.Fatalf("newManagementClient: %v", err)
 	}
-	names := make([]string, 0, len(specs)*2)
+	names := make([]string, 0, len(specs)*(len(parkRungs)+2))
 	for _, spec := range specs {
 		names = append(names, spec.Name)
 		if spec.Delay > 0 {
-			names = append(names, spec.Name+".park")
+			names = append(names, parkQueueNames(spec.Name)...)
 		}
 	}
 	for _, name := range names {
@@ -393,6 +393,69 @@ func TestPruneDoesNotDeleteParkingQueueThatGainedAMessage(t *testing.T) {
 			}
 			assertPruneQueuePresent(t, ctx, facade, destination, true)
 			assertPruneQueuePresent(t, ctx, facade, parking, true)
+		})
+	}
+}
+
+// TestPruneRefusesEveryParkingRung proves the prune guard reads the whole
+// ladder: a message parked in a rung queue, with the destination's own queue
+// empty, refuses the deletion and the refusal names the queue holding it.
+// Before the ladder there was one parking queue, so a guard that reads only the
+// beyond-the-ladder queue would delete a destination whose deferred work is
+// sitting in a rung, and those messages would dead-letter into a destination
+// that no longer exists.
+func TestPruneRefusesEveryParkingRung(t *testing.T) {
+	for _, rung := range parkRungs {
+		t.Run(parkRungTags[rung], func(t *testing.T) {
+			destination := "rabbitmq-driver-prune-rung-" + parkRungTags[rung]
+			ctx, rabbitConn, facade := setupPruneTest(t, queueKindQuorum, driver.DestinationSpec{
+				Name:    destination,
+				Durable: true,
+				Delay:   rung,
+			})
+			producer, err := rabbitConn.Producer(ctx, driver.ProducerConfig{RequireDurableAck: true})
+			if err != nil {
+				t.Fatalf("Producer: %v", err)
+			}
+			defer func() { _ = producer.Close(context.Background()) }()
+			due := time.Now().Add(rung) //nolint:forbidigo // a live delayed publish needs a future due time
+			if err := producer.Publish(ctx, driver.OutboundMessage{
+				Destination: destination,
+				DelayUntil:  due,
+				Body:        []byte("parked"),
+			}); err != nil {
+				t.Fatalf("Publish: %v", err)
+			}
+
+			// Which queue holds it is read from the broker rather than assumed:
+			// the rung is a function of the delay left when the publish lands,
+			// and a mis-routed message has to fail here rather than pass by
+			// refusing for the wrong queue.
+			held := make([]string, 0, 1)
+			for _, parkName := range parkQueueNames(destination) {
+				ready, err := facade.operations.inspectQueue(ctx, parkName)
+				if err != nil {
+					t.Fatalf("inspectQueue(%q): %v", parkName, err)
+				}
+				if ready > 0 {
+					held = append(held, parkName)
+				}
+			}
+			want := parkQueueName(destination, rung)
+			if len(held) != 1 || held[0] != want {
+				t.Fatalf("parking queues holding a message = %v, want exactly [%q]", held, want)
+			}
+
+			results, err := facade.Prune(ctx, []string{destination})
+			if err != nil {
+				t.Fatalf("Prune: %v", err)
+			}
+			wantReason := fmt.Sprintf("auxiliary %q holds 1 ready message(s)", want)
+			if len(results) != 1 || results[0].Deleted || results[0].Reason != wantReason {
+				t.Fatalf("Prune result = %+v, want a refusal with reason %q", results, wantReason)
+			}
+			assertPruneQueuePresent(t, ctx, facade, destination, true)
+			assertPruneQueuePresent(t, ctx, facade, want, true)
 		})
 	}
 }

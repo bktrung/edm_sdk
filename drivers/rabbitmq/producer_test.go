@@ -1094,31 +1094,45 @@ func TestProducerParkingFailureNamesMissingQueue(t *testing.T) {
 // queue there loses every parked message on a broker restart.
 func TestParkingFailureRendersEveryDeclareArgument(t *testing.T) {
 	const destination = "orders.deferred"
-	parking := destination + parkingSuffix
 	cause := classify("publish", driver.KindNotFound,
 		errors.Join(driver.ErrDestinationMissing, errors.New("rabbitmq: publish returned by broker: 312 NO_ROUTE")))
 
-	for _, kind := range []queueKind{queueKindQuorum, queueKindClassic} {
-		t.Run(string(kind), func(t *testing.T) {
-			message := parkingFailure(parking, kind, cause).Error()
-			for key, value := range parkingArguments(destination, kind) {
-				rendered := fmt.Sprint(value)
-				if text, ok := value.(string); ok {
-					rendered = strconv.Quote(text)
+	// Both parking queue shapes are covered, because their argument sets
+	// differ by more than the kind: a rung queue carries x-message-ttl and the
+	// queue above the ladder does not.
+	parkingQueues := map[string]string{
+		"above the ladder": destination + parkingSuffix,
+		"rung":             parkQueueName(destination, 2*time.Second),
+	}
+	for shape, parking := range parkingQueues {
+		for _, kind := range []queueKind{queueKindQuorum, queueKindClassic} {
+			t.Run(shape+"/"+string(kind), func(t *testing.T) {
+				message := parkingFailure(parking, kind, cause).Error()
+				args := parkArguments(destination, kind, parking)
+				if _, isRung, ok := parkQueueParts(parking); ok && isRung > 0 {
+					if _, present := args["x-message-ttl"]; !present {
+						t.Fatalf("parking failure for the rung queue %q is rendered from an argument set without x-message-ttl", parking)
+					}
 				}
-				if !strings.Contains(message, key+"="+rendered) {
-					t.Fatalf("parking failure %q does not carry the declare argument %s=%s", message, key, rendered)
+				for key, value := range args {
+					rendered := fmt.Sprint(value)
+					if text, ok := value.(string); ok {
+						rendered = strconv.Quote(text)
+					}
+					if !strings.Contains(message, key+"="+rendered) {
+						t.Fatalf("parking failure %q does not carry the declare argument %s=%s", message, key, rendered)
+					}
 				}
-			}
-			for _, want := range []string{parking, "declares the queue durable", "TopologyDeclare", "TopologyVerify", "TopologyNone"} {
-				if !strings.Contains(message, want) {
-					t.Fatalf("parking failure %q does not name %q", message, want)
+				for _, want := range []string{parking, "declares the queue durable", "TopologyDeclare", "TopologyVerify", "TopologyNone"} {
+					if !strings.Contains(message, want) {
+						t.Fatalf("parking failure %q does not name %q", message, want)
+					}
 				}
-			}
-			if !errors.Is(parkingFailure(parking, kind, cause), driver.ErrDestinationMissing) {
-				t.Fatalf("parking failure %q no longer wraps ErrDestinationMissing", message)
-			}
-		})
+				if !errors.Is(parkingFailure(parking, kind, cause), driver.ErrDestinationMissing) {
+					t.Fatalf("parking failure %q no longer wraps ErrDestinationMissing", message)
+				}
+			})
+		}
 	}
 }
 
@@ -1178,6 +1192,85 @@ func TestProducerTargetRetryAndDLQStayConcreteDestinations(t *testing.T) {
 			}
 			if expiration != "" {
 				t.Fatalf("target() expiration = %q, want empty for a non-deferred publish", expiration)
+			}
+		})
+	}
+}
+
+// TestProducerTargetRungsAndFallThrough pins the routing decision the ladder
+// adds: a remaining delay on the ladder parks in that rung's queue and the
+// message carries no expiration, because the rung queue's own TTL does the
+// delaying. Above the ladder the per-message path is unchanged, which is what
+// keeps a due time up to maxExpirationMillis owed instead of clamped early.
+//
+// The declared-delay path is used so the remaining delay is the table's own
+// value: target reads one clock and derives the due time from it, so no wall
+// time passes between the two.
+func TestProducerTargetRungsAndFallThrough(t *testing.T) {
+	cases := []struct {
+		delay  time.Duration
+		want   string
+		onRung bool
+	}{
+		{delay: 500 * time.Millisecond, want: "orders.deferred.park.500ms", onRung: true},
+		{delay: 501 * time.Millisecond, want: "orders.deferred.park.1s", onRung: true},
+		{delay: time.Second, want: "orders.deferred.park.1s", onRung: true},
+		{delay: 1500 * time.Millisecond, want: "orders.deferred.park.2s", onRung: true},
+		{delay: 3 * time.Second, want: "orders.deferred.park.4s", onRung: true},
+		{delay: 10 * time.Second, want: "orders.deferred.park.16s", onRung: true},
+		{delay: 64 * time.Second, want: "orders.deferred.park.64s", onRung: true},
+		{delay: 64*time.Second + time.Millisecond, want: "orders.deferred.park"},
+		{delay: 24 * time.Hour, want: "orders.deferred.park"},
+	}
+	for _, test := range cases {
+		t.Run(test.delay.String(), func(t *testing.T) {
+			p := &producer{conn: &conn{deferred: map[string]time.Duration{"orders.deferred": test.delay}}}
+			exchange, routingKey, expiration := p.target(driver.OutboundMessage{Destination: "orders.deferred"})
+			if exchange != "" {
+				t.Fatalf("target() exchange = %q, want empty for a parked publish", exchange)
+			}
+			if routingKey != test.want {
+				t.Fatalf("target() routingKey = %q, want %q", routingKey, test.want)
+			}
+			if test.onRung && expiration != "" {
+				t.Fatalf("target() expiration = %q, want empty on the ladder so the rung queue's TTL decides", expiration)
+			}
+			if !test.onRung && expiration == "" {
+				t.Fatalf("target() expiration is empty above the ladder, want a per-message TTL for %s", test.delay)
+			}
+		})
+	}
+}
+
+// TestParkingSuffixParsingIsStrict pins the parse that keeps a rung suffix
+// from being a wildcard tail. The conformance suite declares a destination
+// named topology.prune.park.eligible, and reading that name as a rung queue of
+// topology.prune would both hide a queue from the orphan scan and take a rung
+// queue out of the prune guard.
+func TestParkingSuffixParsingIsStrict(t *testing.T) {
+	cases := []struct {
+		name        string
+		destination string
+		rung        time.Duration
+		ok          bool
+	}{
+		{name: "orders.park", destination: "orders", ok: true},
+		{name: "orders.park.1s", destination: "orders", rung: time.Second, ok: true},
+		{name: "orders.park.500ms", destination: "orders", rung: 500 * time.Millisecond, ok: true},
+		{name: "orders.park.64s", destination: "orders", rung: 64 * time.Second, ok: true},
+		{name: "topology.prune.park.eligible"},
+		{name: "orders.park.65s"},
+		{name: "orders.park.1000"},
+		{name: "orders.park."},
+		{name: "orders.parked"},
+		{name: "orders.deferred.park.1s.park.2s", destination: "orders.deferred.park.1s", rung: 2 * time.Second, ok: true},
+	}
+	for _, test := range cases {
+		t.Run(test.name, func(t *testing.T) {
+			destination, rung, ok := parkQueueParts(test.name)
+			if ok != test.ok || destination != test.destination || rung != test.rung {
+				t.Fatalf("parkQueueParts(%q) = (%q, %s, %t), want (%q, %s, %t)",
+					test.name, destination, rung, ok, test.destination, test.rung, test.ok)
 			}
 		})
 	}

@@ -263,12 +263,8 @@ func TestEnsureTopologyParkQueueArgumentsReachBroker(t *testing.T) {
 		t.Fatalf("Channel: %v", err)
 	}
 	t.Cleanup(func() { _ = rawChannel.Close() })
-	_, _ = rawChannel.QueueDelete(destination, false, false, false)
-	_, _ = rawChannel.QueueDelete(park, false, false, false)
-	t.Cleanup(func() {
-		_, _ = rawChannel.QueueDelete(destination, false, false, false)
-		_, _ = rawChannel.QueueDelete(park, false, false, false)
-	})
+	deleteParkQueues(rawChannel, destination)
+	t.Cleanup(func() { deleteParkQueues(rawChannel, destination) })
 
 	conn, err := (Driver{}).Open(ctx, driver.Config{Endpoints: []string{defaultEndpoint}})
 	if err != nil {
@@ -309,6 +305,80 @@ func TestEnsureTopologyParkQueueArgumentsReachBroker(t *testing.T) {
 	}
 }
 
+// TestEnsureTopologyRungQueueArgumentsReachBroker pins the queue-level TTL that
+// makes expiry order FIFO order, read back through the management API rather
+// than from the Go map, because AMQP passive declare checks a name and not its
+// arguments. The queue above the ladder is read in the same run and must not
+// carry that TTL: it keeps the per-message expiration a due time beyond the
+// ladder needs, and a TTL there would release such a message early.
+func TestEnsureTopologyRungQueueArgumentsReachBroker(t *testing.T) {
+	requireBroker(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	const destination = "rabbitmq-driver-park-rung-args-queue"
+	const rung = 2 * time.Second
+	rungQueue := parkQueueName(destination, rung)
+	const aboveLadder = destination + ".park"
+	raw, err := amqp.Dial(defaultEndpoint)
+	if err != nil {
+		t.Fatalf("Dial: %v", err)
+	}
+	t.Cleanup(func() { _ = raw.Close() })
+	rawChannel, err := raw.Channel()
+	if err != nil {
+		t.Fatalf("Channel: %v", err)
+	}
+	t.Cleanup(func() { _ = rawChannel.Close() })
+	deleteParkQueues(rawChannel, destination)
+	t.Cleanup(func() { deleteParkQueues(rawChannel, destination) })
+
+	conn, err := (Driver{}).Open(ctx, driver.Config{Endpoints: []string{defaultEndpoint}})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	t.Cleanup(func() { _ = conn.Close(ctx) })
+
+	if _, err := conn.Admin().EnsureTopology(ctx, driver.TopologySpec{
+		Destinations: []driver.DestinationSpec{{Name: destination, Durable: true, Delay: rung}},
+	}); err != nil {
+		t.Fatalf("EnsureTopology: %v", err)
+	}
+
+	mgmt, err := newManagementClient(defaultEndpoint, driver.Config{})
+	if err != nil {
+		t.Fatalf("newManagementClient: %v", err)
+	}
+	queue, err := mgmt.getQueue(ctx, rungQueue)
+	if err != nil {
+		t.Fatalf("getQueue(%q): %v", rungQueue, err)
+	}
+	want := map[string]string{
+		"x-queue-type":              "quorum",
+		"x-dead-letter-exchange":    "",
+		"x-dead-letter-routing-key": destination,
+		"x-dead-letter-strategy":    "at-least-once",
+		"x-overflow":                "reject-publish",
+		"x-message-ttl":             "2000",
+	}
+	for key, wantValue := range want {
+		got, present := queue.Arguments[key]
+		if !present {
+			t.Fatalf("rung queue arguments %+v missing %q", queue.Arguments, key)
+		}
+		if fmt.Sprint(got) != wantValue {
+			t.Fatalf("rung queue argument %q = %v, want %q", key, got, wantValue)
+		}
+	}
+	above, err := mgmt.getQueue(ctx, aboveLadder)
+	if err != nil {
+		t.Fatalf("getQueue(%q): %v", aboveLadder, err)
+	}
+	if value, present := above.Arguments["x-message-ttl"]; present {
+		t.Fatalf("the queue above the ladder carries x-message-ttl=%v, which would release a beyond-the-ladder due time early", value)
+	}
+}
+
 // TestVerifyTopologyReportsDriftOnStaleParkQueue is the deployability
 // control: it hand-declares a park queue with the pre-fix argument set (no
 // x-dead-letter-strategy, no x-overflow) so an upgraded driver's
@@ -332,12 +402,8 @@ func TestVerifyTopologyReportsDriftOnStaleParkQueue(t *testing.T) {
 		t.Fatalf("Channel: %v", err)
 	}
 	t.Cleanup(func() { _ = rawChannel.Close() })
-	_, _ = rawChannel.QueueDelete(destination, false, false, false)
-	_, _ = rawChannel.QueueDelete(park, false, false, false)
-	t.Cleanup(func() {
-		_, _ = rawChannel.QueueDelete(destination, false, false, false)
-		_, _ = rawChannel.QueueDelete(park, false, false, false)
-	})
+	deleteParkQueues(rawChannel, destination)
+	t.Cleanup(func() { deleteParkQueues(rawChannel, destination) })
 
 	conn, err := (Driver{}).Open(ctx, driver.Config{Endpoints: []string{defaultEndpoint}})
 	if err != nil {
@@ -361,6 +427,16 @@ func TestVerifyTopologyReportsDriftOnStaleParkQueue(t *testing.T) {
 		"x-dead-letter-routing-key": destination,
 	}); err != nil {
 		t.Fatalf("out-of-band QueueDeclare(%q): %v", park, err)
+	}
+
+	// Declare the rung queues through the driver. The declare path checks a
+	// parking queue by name and never rewrites its arguments, so the hand-made
+	// queue above the ladder is left exactly as it is, while the ladder the
+	// verify pass below requires now exists.
+	if _, err := conn.Admin().EnsureTopology(ctx, driver.TopologySpec{
+		Destinations: []driver.DestinationSpec{{Name: destination, Durable: true, Delay: time.Second}},
+	}); err != nil {
+		t.Fatalf("EnsureTopology(declare ladder): %v", err)
 	}
 
 	// Confirm through the management API that the hand-declared queue really
@@ -423,12 +499,8 @@ func TestEnsureTopologyParkQueueArgumentsClassicKind(t *testing.T) {
 		t.Fatalf("Channel: %v", err)
 	}
 	t.Cleanup(func() { _ = rawChannel.Close() })
-	_, _ = rawChannel.QueueDelete(destination, false, false, false)
-	_, _ = rawChannel.QueueDelete(park, false, false, false)
-	t.Cleanup(func() {
-		_, _ = rawChannel.QueueDelete(destination, false, false, false)
-		_, _ = rawChannel.QueueDelete(park, false, false, false)
-	})
+	deleteParkQueues(rawChannel, destination)
+	t.Cleanup(func() { deleteParkQueues(rawChannel, destination) })
 
 	conn, err := (Driver{}).Open(ctx, driver.Config{
 		Endpoints:     []string{defaultEndpoint},
