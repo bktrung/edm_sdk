@@ -783,6 +783,12 @@ func runTopologyPolicyChecks(group *groupContext) {
 		}); err != nil {
 			t.Fatalf("EnsureTopology(seed): %v", err)
 		}
+		if maintenance, ok := group.conn.Admin().(driver.Maintenance); ok {
+			// Registered rather than called at the end of the body: the verify
+			// below returns early on a driver that refuses the drift outright,
+			// and the destination has to be reclaimed on that path too.
+			cleanupTopologyDestinations(t, admin, &profileMaintenance{group: group, maintenance: maintenance}, group.ctx, name)
+		}
 		requested := declared
 		requested.DeliveryLimit = 9
 		diff, err := admin.EnsureTopology(group.ctx, driver.TopologySpec{
