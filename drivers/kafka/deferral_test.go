@@ -5,6 +5,8 @@ import (
 	"context"
 	"io"
 	"log/slog"
+	"maps"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -289,6 +291,128 @@ func TestPendingDeadlineIgnoresUnknownDestinationAlongsideDeferrable(t *testing.
 	deadline, ok := c.pendingDeadline([]*kgo.Record{rUnknown, rKnown})
 	if !ok || !deadline.Equal(wantDue) {
 		t.Fatalf("pendingDeadline(unknown + known) = %s, %t; want %s, true", deadline, ok, wantDue)
+	}
+}
+
+// TestConsumerDeferredNearerDueTimeIsNotHeldBehindFartherDueTime holds the
+// driver to a due time of its own. Two delayed records share one destination
+// and one partition, so the nearer record is behind the farther one in the log,
+// and the nearer one is owed at its own due time whatever was published before
+// it. Both orders are run: publishing the farther one first is the order that
+// leaves a reader waiting for a due time that is not its own.
+//
+// One partition is deliberate. A pause coarser than a record cannot deliver the
+// nearer record on time, because reaching it means reading past a record that
+// is not due yet.
+func TestConsumerDeferredNearerDueTimeIsNotHeldBehindFartherDueTime(t *testing.T) {
+	const (
+		declaredDelay = 3 * time.Second
+		nearOffset    = 2 * time.Second
+		farOffset     = 4 * time.Second
+		lateBound     = 700 * time.Millisecond
+	)
+	for _, order := range []struct {
+		name         string
+		fartherFirst bool
+	}{
+		{name: "farther due time published first", fartherFirst: true},
+		{name: "nearer due time published first"},
+	} {
+		t.Run(order.name, func(t *testing.T) {
+			// The connection built here falls back to the process default
+			// logger, so a deferral fault on the path under test is captured
+			// rather than printed and forgotten.
+			var logged deferralLogSink
+			swapProcessDefault(t, &logged)
+
+			ctx, connection, admin := openKafkaAdminTest(t)
+			topic := kafkaTestTopic(t, "deferred-due-order")
+			group := kafkaTestTopic(t, "deferred-due-order-group")
+			cleanupKafkaTopics(t, admin, topic)
+			cleanupKafkaGroups(t, admin, group)
+			createKafkaTopic(t, admin, ctx, topic, 1)
+			if _, err := connection.Admin().EnsureTopology(ctx, driver.TopologySpec{
+				Destinations: []driver.DestinationSpec{{Name: topic, Delay: declaredDelay}},
+				Effective:    connection.Capabilities(),
+			}); err != nil {
+				t.Fatalf("EnsureTopology: %v", err)
+			}
+			producer, err := connection.Producer(ctx, driver.ProducerConfig{Effective: connection.Capabilities()})
+			if err != nil {
+				t.Fatalf("Producer: %v", err)
+			}
+			t.Cleanup(func() { _ = producer.Close(context.Background()) })
+			consumerValue, err := connection.Consumer(ctx, driver.ConsumerConfig{
+				Group: group, Destinations: []string{topic}, Prefetch: 2, Effective: connection.Capabilities(),
+			})
+			if err != nil {
+				t.Fatalf("Consumer: %v", err)
+			}
+			t.Cleanup(func() { closeKafkaConsumer(consumerValue) })
+
+			// Each due time is measured from its own publish instant, because a
+			// driver bounds a due time against the record's own timestamp.
+			publish := func(body string, offset time.Duration) time.Time {
+				t.Helper()
+				due := kafkaNow().Add(offset)
+				if err := producer.Publish(ctx, driver.OutboundMessage{
+					Destination: topic, Body: []byte(body), DelayUntil: due,
+				}); err != nil {
+					t.Fatalf("Publish(%s): %v", body, err)
+				}
+				return due
+			}
+			start := kafkaNow()
+			var nearDue, farDue time.Time
+			if order.fartherFirst {
+				farDue = publish("due-order-far", farOffset)
+				nearDue = publish("due-order-near", nearOffset)
+			} else {
+				nearDue = publish("due-order-near", nearOffset)
+				farDue = publish("due-order-far", farOffset)
+			}
+			if farDue.Sub(nearDue) <= lateBound {
+				t.Fatalf("due times %s and %s are only %s apart, which cannot show a release in the wrong order",
+					nearDue, farDue, farDue.Sub(nearDue))
+			}
+
+			received := make(map[string]driver.InboundMessage, 2)
+			for range 2 {
+				message := receiveKafkaMessageBefore(t, consumerValue, farDue.Add(2*lateBound))
+				received[string(message.Body)] = message
+				if err := message.Settle.Ack(ctx); err != nil {
+					t.Fatalf("Ack(%q): %v", message.Body, err)
+				}
+			}
+			for _, want := range []struct {
+				body string
+				due  time.Time
+			}{
+				{body: "due-order-near", due: nearDue},
+				{body: "due-order-far", due: farDue},
+			} {
+				message, ok := received[want.body]
+				if !ok {
+					t.Fatalf("bodies delivered = %v, want %q", slices.Sorted(maps.Keys(received)), want.body)
+				}
+				late := message.ReceivedAt.Sub(want.due)
+				t.Logf("body=%q arrived=%dms due=%dms late=%dms",
+					want.body,
+					message.ReceivedAt.Sub(start)/time.Millisecond,
+					want.due.Sub(start)/time.Millisecond,
+					late/time.Millisecond,
+				)
+				if late < 0 {
+					t.Fatalf("body %q arrived at %s, before its due time %s", want.body, message.ReceivedAt, want.due)
+				}
+				if late > lateBound {
+					t.Fatalf("body %q arrived at %s, %s after its due time %s", want.body, message.ReceivedAt, late, want.due)
+				}
+			}
+			if faults := logged.String(); strings.Contains(faults, "kafka deferred delivery fault") {
+				t.Fatalf("in-band due times logged a deferral fault: %s", faults)
+			}
+		})
 	}
 }
 

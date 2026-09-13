@@ -26,6 +26,7 @@ type pauseReason string
 
 const (
 	pauseReasonDeferred   pauseReason = "deferred"
+	pauseReasonHold       pauseReason = "hold-full"
 	pauseReasonPrefetch   pauseReason = "prefetch-full"
 	pauseReasonAckGap     pauseReason = "ack-gap"
 	pauseReasonUserPaused pauseReason = "user-paused"
@@ -56,6 +57,33 @@ func (s pauseReasonSet) remove(reason pauseReason) bool {
 }
 
 func (s pauseReasonSet) empty() bool { return len(s) == 0 }
+
+// holding reports whether reason is about records the driver is already holding
+// rather than a condition of the destination that has to clear. A holding
+// reason never keeps a record whose due time has arrived from being delivered:
+// the records it names are the ones that become deliverable.
+func (r pauseReason) holding() bool {
+	return r == pauseReasonDeferred || r == pauseReasonHold
+}
+
+// holdsFetches reports whether reason keeps franz-go from fetching the
+// destination. A deferred reason does not: the records behind the one that is
+// waiting for its due time still have to be reachable, so the fetches are held
+// by pauseReasonHold instead, at the count that bounds them.
+func (r pauseReason) holdsFetches() bool {
+	return r != pauseReasonDeferred
+}
+
+// holdsFetches reports whether any reason in the set keeps franz-go from
+// fetching the destination.
+func (s pauseReasonSet) holdsFetches() bool {
+	for reason := range s {
+		if reason.holdsFetches() {
+			return true
+		}
+	}
+	return false
+}
 
 func (s pauseReasonSet) permitsRedelivery() bool {
 	// A deferred reason remains a correctness gate for a requeued record:
@@ -860,7 +888,7 @@ func (c *consumer) poll(ctx context.Context) {
 		if !c.flushPending(&pending) {
 			return
 		}
-		c.clearDeferredReasons(pending)
+		c.syncDeferredPauses(pending)
 
 		fetchCtx := ctx
 		bounded := false
@@ -1433,11 +1461,33 @@ func (c *consumer) trackerForLocked(record *kgo.Record) *ackTracker {
 }
 
 // trackerBaseLocked returns the offset a fresh tracker for key must start at.
-// A reserved offset below the first broker record still has no live path on
-// this consumer: its handoff is queued, or taken and not yet emitted. Starting
-// the tracker past it would make TrackRedelivery report the handoff as already
-// settled, dropping the offset's only live settlement path.
+// Offsets below the base count as settled, so the base is the lowest offset on
+// the partition this consumer still owes a delivery for.
+//
+// The first record delivered is not that offset, because delivery follows due
+// times rather than log order: a record published ahead of a nearer due time is
+// delivered after it, so the lowest offset the consumer holds can be the last
+// one delivered. Starting the tracker at the delivered record's own offset
+// would then report the held record as already settled and drop it, losing the
+// offset. The records fetched for this partition and not delivered yet, which
+// is every record whose delivery is still owed, are what the base is taken from
+// instead. A record the loop is about to discard does not count, so an offset
+// that will never be delivered cannot hold the base down.
+//
+// A reserved offset below them still has no live path on this consumer: its
+// handoff is queued, or taken and not yet emitted. Starting the tracker past it
+// would make TrackRedelivery report the handoff as already settled, dropping
+// the offset's only live settlement path.
 func (c *consumer) trackerBaseLocked(key partitionKey, base int64) int64 {
+	for record := range c.recordGenerations {
+		if record.Topic != key.destination || record.Partition != key.partition || record.Offset >= base {
+			continue
+		}
+		if c.isRecordStaleLocked(record) {
+			continue
+		}
+		base = record.Offset
+	}
 	settled := c.settledTransfers[key]
 	for offset := range c.transferReservations[key] {
 		if _, done := settled[offset]; done || offset >= base {
@@ -2267,27 +2317,34 @@ func (c *consumer) setPauseReasonLocked(destination string, reason pauseReason, 
 		reasons = make(pauseReasonSet)
 		c.pauseReasons[destination] = reasons
 	}
+	if _, present := reasons[reason]; present == add {
+		return
+	}
+	paused := reasons.holdsFetches()
 	if add {
-		if !reasons.add(reason) {
-			return
-		}
-		if len(reasons) == 1 {
-			c.client.PauseFetchTopics(destination)
-		}
+		reasons.add(reason)
 	} else {
-		if !reasons.remove(reason) {
-			return
-		}
-		if len(reasons) == 0 && !c.draining && !c.stopped {
-			c.client.ResumeFetchTopics(destination)
-			// Resuming fetch does not reach a record the budget refused: the
-			// poll loop took it out of franz-go and is holding it in its own
-			// pending queue, so a broker with nothing left to send produces no
-			// wake and the record is never admitted. The last pause leaving is
-			// exactly the event that makes those records admissible, so the
-			// wait has to end here.
-			c.wakePollLocked()
-		}
+		reasons.remove(reason)
+	}
+	switch {
+	case !paused && reasons.holdsFetches():
+		c.client.PauseFetchTopics(destination)
+	case paused && !reasons.holdsFetches() && !c.draining && !c.stopped:
+		c.client.ResumeFetchTopics(destination)
+		// Resuming fetch does not reach a record the budget refused: the
+		// poll loop took it out of franz-go and is holding it in its own
+		// pending queue, so a broker with nothing left to send produces no
+		// wake and the record is never admitted. The last pause leaving is
+		// exactly the event that makes those records admissible, so the
+		// wait has to end here.
+		c.wakePollLocked()
+	case !paused && reasons.empty() && !c.draining && !c.stopped:
+		// The set emptied without ever holding the fetches, which is the
+		// deferred reason leaving. Fetching may still be paused on this
+		// destination by something outside this bookkeeping, and a lane fault
+		// is the one that does that, so the resume is unconditional. Resuming
+		// a destination that is not paused is a no-op in franz-go.
+		c.client.ResumeFetchTopics(destination)
 	}
 }
 
