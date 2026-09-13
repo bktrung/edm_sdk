@@ -71,6 +71,8 @@ func (r *Runner) Run(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+	var preRunReconnect *reconnectAttempt
+	var preRunReconnectErr error
 	r.client.mu.Lock()
 	if r.client.closed || r.client.shutdownStarted || r.client.conn == nil {
 		r.client.mu.Unlock()
@@ -81,6 +83,23 @@ func (r *Runner) Run(ctx context.Context) error {
 		r.mu.Unlock()
 		r.client.mu.Unlock()
 		return errors.New("f1: runner is already running")
+	}
+	if r.reconnectCause == errClientReconnecting && r.reconnectCauseAttempt != nil { //nolint:errorlint // exact sentinel identifies supervisor ownership
+		ownedAttempt := r.reconnectCauseAttempt
+		currentAttempt := r.client.reconnect
+		switch {
+		case currentAttempt != nil && currentAttempt != ownedAttempt:
+			r.reconnectCauseAttempt = currentAttempt
+			preRunReconnect = currentAttempt
+		case currentAttempt == ownedAttempt:
+			preRunReconnect = ownedAttempt
+		default:
+			preRunReconnectErr = ownedAttempt.err
+			if preRunReconnectErr == nil {
+				r.reconnectCause = nil
+				r.reconnectCauseAttempt = nil
+			}
+		}
 	}
 	r.started = true
 	r.done = make(chan struct{})
@@ -98,6 +117,17 @@ func (r *Runner) Run(ctx context.Context) error {
 	r.client.mu.Unlock()
 
 	defer finishRunner(r)
+	if preRunReconnectErr != nil {
+		return preRunReconnectErr
+	}
+	if preRunReconnect != nil {
+		if err := r.waitPreRunReconnect(ctx, preRunReconnect); err != nil {
+			if errors.Is(err, errRunnerDraining) {
+				return nil
+			}
+			return err
+		}
+	}
 	var runErr error
 	var runCtx context.Context
 	var cancel context.CancelFunc
@@ -106,27 +136,64 @@ func (r *Runner) Run(ctx context.Context) error {
 	for {
 		r.mu.Lock()
 		failed := r.lifecycle != nil && r.lifecycle.State() == lifecycle.Failed
+		draining := r.draining
 		r.mu.Unlock()
 		if failed {
 			break
 		}
+		if draining {
+			return nil
+		}
 		runCtx, cancel = context.WithCancel(ctx)
 		group := beginRunnerGeneration(r, runCtx, cancel)
+		r.mu.Lock()
+		draining = r.draining
+		r.mu.Unlock()
+		if draining {
+			cancel()
+			return nil
+		}
 
 		consumer, err := openRunnerConsumer(r, runCtx)
+		r.mu.Lock()
+		draining = r.draining
+		r.mu.Unlock()
+		if draining {
+			if consumer != nil {
+				if closeErr := runWithClockTimeout(context.WithoutCancel(runCtx), r.client.options.clock, r.client.config.Lifecycle.CloseTimeout, "consumer release", func(closeCtx context.Context) error {
+					return consumer.Release(closeCtx)
+				}); closeErr != nil {
+					return closeErr
+				}
+			}
+			return nil
+		}
 		if err != nil {
 			repairCause = nil
+			kind, classified := driver.Classify(err)
+			var ownedAttempt *reconnectAttempt
+			r.mu.Lock()
+			if r.reconnectCause == errClientReconnecting && r.reconnectCauseAttempt != nil { //nolint:errorlint // exact sentinel identifies supervisor ownership
+				ownedAttempt = r.reconnectCauseAttempt
+			} else if generation > 0 && (!classified || kind == driver.KindTransient) {
+				r.reconnectCause = err
+				r.reconnectCauseAttempt = nil
+			}
+			r.mu.Unlock()
+			if ownedAttempt != nil {
+				if reconnectErr := r.waitOwnedReconnect(ctx, ownedAttempt); reconnectErr != nil {
+					runErr = reconnectErr
+					break
+				}
+				continue
+			}
 			if generation == 0 {
 				return err
 			}
-			kind, classified := driver.Classify(err)
 			if classified && kind != driver.KindTransient {
 				runErr = err
 				break
 			}
-			r.mu.Lock()
-			r.reconnectCause = err
-			r.mu.Unlock()
 			r.transitionToReconnecting()
 			if reconnectErr := r.requestAndWaitReconnect(ctx, err); reconnectErr != nil {
 				runErr = reconnectErr
@@ -186,21 +253,33 @@ func (r *Runner) Run(ctx context.Context) error {
 		// generation result. The later repair write-back remains a separate lock.
 		r.mu.Lock()
 		reconnectCause := r.reconnectCause
+		reconnectCauseAttempt := r.reconnectCauseAttempt
 		consumerError := r.consumerError
 		successfulDelivery := r.successfulDelivery
 		repairCycleActive := r.repairCycleActive
 		failedRepairCycles := r.failedRepairCycles
-		draining := r.draining
+		draining = r.draining
 		failedLifecycle := r.lifecycle != nil && r.lifecycle.State() == lifecycle.Failed
+		decisionHook := r.reconnectDecisionHook
 		r.mu.Unlock()
 		if failedLifecycle {
 			runErr = generationErr
 			break
 		}
+		if decisionHook != nil {
+			decisionHook()
+		}
 		clientReconnecting := r.client.isReconnecting()
 		if ctx.Err() != nil || draining || (!clientReconnecting && reconnectCause == nil) {
 			runErr = generationErr
 			break
+		}
+		if reconnectCauseAttempt != nil && reconnectCause == errClientReconnecting { //nolint:errorlint // exact sentinel identifies supervisor ownership
+			if reconnectErr := r.waitOwnedReconnect(ctx, reconnectCauseAttempt); reconnectErr != nil {
+				runErr = reconnectErr
+				break
+			}
+			continue
 		}
 		if consumerError && !clientReconnecting {
 			if successfulDelivery {
@@ -254,6 +333,89 @@ func (r *Runner) requestAndWaitReconnect(ctx context.Context, cause error) error
 	return r.client.waitReconnect(ctx, attempt)
 }
 
+var errRunnerDraining = errors.New("f1: runner is draining")
+
+func (r *Runner) waitOwnedReconnect(ctx context.Context, attempt *reconnectAttempt) error {
+	return r.waitOwnedReconnectUntil(ctx, attempt, nil)
+}
+
+func (r *Runner) waitPreRunReconnect(ctx context.Context, attempt *reconnectAttempt) error {
+	return r.waitOwnedReconnectUntil(ctx, attempt, r.drainStarted)
+}
+
+func (r *Runner) waitOwnedReconnectUntil(ctx context.Context, attempt *reconnectAttempt, drain <-chan struct{}) error {
+	for {
+		r.mu.Lock()
+		decisionHook := r.reconnectDecisionHook
+		r.mu.Unlock()
+		if decisionHook != nil {
+			decisionHook()
+		}
+		if attempt != nil {
+			select {
+			case <-attempt.done:
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-drain:
+				return errRunnerDraining
+			}
+		}
+		r.client.mu.Lock()
+		var reconnectErr error
+		var currentAttempt *reconnectAttempt
+		if attempt != nil {
+			reconnectErr = attempt.err
+			currentAttempt = r.client.reconnect
+		}
+		// Keep Client.mu while taking Runner.mu. Ownership can move while this
+		// attempt is in flight: the supervisor records the newest attempt on the
+		// runner when it abandons it, and registers that same attempt on the
+		// client. Either record is newer than this attempt, so adopt it before
+		// reading any result, otherwise a superseded attempt's error would fail a
+		// runner the client is already recovering.
+		r.mu.Lock()
+		if attempt != nil &&
+			r.reconnectCause == errClientReconnecting { //nolint:errorlint // exact sentinel identifies supervisor ownership
+			nextAttempt := r.reconnectCauseAttempt
+			if nextAttempt == attempt && currentAttempt != nil && currentAttempt != attempt {
+				nextAttempt = currentAttempt
+			}
+			if nextAttempt != nil && nextAttempt != attempt {
+				r.reconnectCauseAttempt = nextAttempt
+				r.mu.Unlock()
+				r.client.mu.Unlock()
+				attempt = nextAttempt
+				continue
+			}
+		}
+		if reconnectErr != nil {
+			r.mu.Unlock()
+			r.client.mu.Unlock()
+			return reconnectErr
+		}
+		if r.reconnectCause == errClientReconnecting { //nolint:errorlint // exact sentinel identifies supervisor ownership
+			if r.reconnectCauseAttempt == attempt {
+				r.reconnectCause = nil
+				r.reconnectCauseAttempt = nil
+				r.mu.Unlock()
+				r.client.mu.Unlock()
+				return nil
+			}
+			nextAttempt := r.reconnectCauseAttempt
+			r.mu.Unlock()
+			r.client.mu.Unlock()
+			if nextAttempt != nil {
+				attempt = nextAttempt
+				continue
+			}
+			return nil
+		}
+		r.mu.Unlock()
+		r.client.mu.Unlock()
+		return nil
+	}
+}
+
 // beginRunnerGeneration resets the per-generation runner state at the top of
 // Run's loop, where the generation's run context is created. The settlement
 // context belongs to this reset: first-wins installation is correct within
@@ -277,7 +439,9 @@ func beginRunnerGeneration(r *Runner, runCtx context.Context, cancel context.Can
 	r.cancel = cancel
 	r.settleCtx = nil
 	r.settleCancel = nil
-	r.reconnectCause = nil
+	if r.reconnectCauseAttempt == nil {
+		r.reconnectCause = nil
+	}
 	r.consumerError = false
 	r.successfulDelivery = false
 	group := new(errgroup.Group)
@@ -913,6 +1077,7 @@ func consumeRunnerErrors(r *Runner, ctx context.Context) error {
 				}
 				if r.reconnectCause == nil {
 					r.reconnectCause = err
+					r.reconnectCauseAttempt = nil
 				}
 				cancel = r.cancel
 				r.mu.Unlock()

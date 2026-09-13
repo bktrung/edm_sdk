@@ -30,7 +30,7 @@ func (c *Client) reconnectSupervisor() {
 				continue
 			}
 			lastResortClientLogger(c).Warn("f1 reconnect started", "error", request.cause)
-			err := c.reconnectOnce(c.supervisorCtx, request.cause)
+			err := c.reconnectOnce(c.supervisorCtx, request.cause, attempt)
 			c.finishReconnect(attempt, err)
 		case <-c.supervisorCtx.Done():
 			err := c.supervisorCtx.Err()
@@ -106,8 +106,8 @@ func (c *Client) waitReconnect(ctx context.Context, attempt *reconnectAttempt) e
 	return err
 }
 
-func (c *Client) reconnectOnce(ctx context.Context, cause error) error {
-	if err := c.abandonRunners(ctx); err != nil {
+func (c *Client) reconnectOnce(ctx context.Context, cause error, attempt *reconnectAttempt) error {
+	if err := c.abandonRunners(ctx, attempt); err != nil {
 		return err
 	}
 	if err := c.waitPublishIdle(ctx); err != nil {
@@ -188,7 +188,7 @@ func (c *Client) reconnectSample() float64 {
 	return rand.Float64() //nolint:gosec // jitter needs a fast non-cryptographic sample
 }
 
-func (c *Client) abandonRunners(ctx context.Context) error {
+func (c *Client) abandonRunners(ctx context.Context, attempt *reconnectAttempt) error {
 	c.mu.Lock()
 	runners := make([]*Runner, 0, len(c.runners))
 	for runner := range c.runners {
@@ -196,7 +196,7 @@ func (c *Client) abandonRunners(ctx context.Context) error {
 	}
 	c.mu.Unlock()
 	for _, runner := range runners {
-		if err := runner.abandonForReconnect(ctx); err != nil {
+		if err := runner.abandonForReconnect(ctx, attempt); err != nil {
 			return err
 		}
 	}
@@ -233,7 +233,7 @@ func sameConnection(left, right driver.Conn) bool {
 	return leftValue.Interface() == rightValue.Interface()
 }
 
-func (r *Runner) abandonForReconnect(ctx context.Context) error {
+func (r *Runner) abandonForReconnect(ctx context.Context, attempt *reconnectAttempt) error {
 	r.mu.Lock()
 	if r.lifecycle != nil && r.lifecycle.State() == lifecycle.Failed {
 		consumer := r.consumer
@@ -248,6 +248,9 @@ func (r *Runner) abandonForReconnect(ctx context.Context) error {
 	}
 	if r.reconnectCause == nil {
 		r.reconnectCause = errClientReconnecting
+		r.reconnectCauseAttempt = attempt
+	} else if r.reconnectCause == errClientReconnecting && r.reconnectCauseAttempt != nil && attempt != nil && r.reconnectCauseAttempt != attempt { //nolint:errorlint // exact sentinel identifies supervisor ownership
+		r.reconnectCauseAttempt = attempt
 	}
 	cancel := r.cancel
 	consumer := r.consumer

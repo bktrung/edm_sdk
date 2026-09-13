@@ -106,6 +106,11 @@ type Runner struct {
 	finished              bool
 	runErr                error
 	reconnectCause        error
+	// reconnectCauseAttempt is set only when the supervisor injects the generic
+	// reconnect cause, so a runner can wait for that exact client attempt.
+	reconnectCauseAttempt *reconnectAttempt
+	// reconnectDecisionHook is a test-only seam for pausing generation decisions.
+	reconnectDecisionHook func()
 	// consumerError identifies a transient failure from Consumer.Errors in this generation.
 	consumerError bool
 	// successfulDelivery means this generation completed at least one handled delivery.
