@@ -229,6 +229,116 @@ func cleanupRabbitTestQueues(t *testing.T, capture *captureRabbitDriver, prefixe
 	}
 }
 
+// rabbitManagementPort derives the fixture's management port from the AMQP
+// endpoint the suite is pointed at, the way the driver does when no
+// rabbitmq.managementPort option is set. A test that hides the AMQP port
+// behind a proxy has to pass this value back to the driver.
+func rabbitManagementPort(t *testing.T) int {
+	t.Helper()
+	parsed, err := url.Parse(defaultEndpoint)
+	if err != nil {
+		t.Fatalf("parse %s: %v", rabbitMQEndpointEnv, err)
+	}
+	port, err := strconv.Atoi(parsed.Port())
+	if err != nil {
+		t.Fatalf("%s must carry an explicit port, got %q", rabbitMQEndpointEnv, parsed.Port())
+	}
+	return port + 10000
+}
+
+// rabbitResetProxy forwards AMQP connections to the fixture and keeps every
+// socket pair it opens, so a test can break the transport under the driver
+// without asking the broker to close anything.
+type rabbitResetProxy struct {
+	listener net.Listener
+	target   string
+	mu       sync.Mutex
+	pairs    []*rabbitResetPair
+}
+
+type rabbitResetPair struct {
+	client   net.Conn
+	upstream net.Conn
+}
+
+func newRabbitResetProxy(t *testing.T, target string) *rabbitResetProxy {
+	t.Helper()
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen for the AMQP proxy: %v", err)
+	}
+	proxy := &rabbitResetProxy{listener: listener, target: target}
+	t.Cleanup(proxy.stop)
+	go proxy.serve()
+	return proxy
+}
+
+// endpoint rewrites the fixture endpoint onto the proxy and keeps its
+// credentials, so the driver still reads a loopback plaintext endpoint.
+func (p *rabbitResetProxy) endpoint(t *testing.T) string {
+	t.Helper()
+	parsed, err := url.Parse(defaultEndpoint)
+	if err != nil {
+		t.Fatalf("parse %s: %v", rabbitMQEndpointEnv, err)
+	}
+	parsed.Host = p.listener.Addr().String()
+	return parsed.String()
+}
+
+func (p *rabbitResetProxy) serve() {
+	for {
+		client, err := p.listener.Accept()
+		if err != nil {
+			return
+		}
+		upstream, err := net.Dial("tcp", p.target)
+		if err != nil {
+			_ = client.Close()
+			continue
+		}
+		p.mu.Lock()
+		p.pairs = append(p.pairs, &rabbitResetPair{client: client, upstream: upstream})
+		p.mu.Unlock()
+		go func() { _, _ = io.Copy(upstream, client) }()
+		go func() { _, _ = io.Copy(client, upstream) }()
+	}
+}
+
+// reset drops every socket pair opened so far with an RST instead of a FIN, so
+// the driver reads a failed socket rather than the broker's close frame. The
+// listener stays open, which is what lets the driver reconnect through it.
+func (p *rabbitResetProxy) reset() {
+	p.mu.Lock()
+	pairs := append([]*rabbitResetPair(nil), p.pairs...)
+	p.mu.Unlock()
+	for _, pair := range pairs {
+		resetRabbitSocket(pair.client)
+		resetRabbitSocket(pair.upstream)
+	}
+}
+
+// resetRabbitSocket sets SO_LINGER to zero before closing, which makes the
+// kernel send an RST and discard whatever was buffered. A plain Close would
+// send a FIN, which the driver reads as a clean shutdown and the broker as a
+// client disconnect.
+func resetRabbitSocket(socket net.Conn) {
+	if tcp, ok := socket.(*net.TCPConn); ok {
+		_ = tcp.SetLinger(0)
+	}
+	_ = socket.Close()
+}
+
+func (p *rabbitResetProxy) stop() {
+	_ = p.listener.Close()
+	p.mu.Lock()
+	pairs := append([]*rabbitResetPair(nil), p.pairs...)
+	p.mu.Unlock()
+	for _, pair := range pairs {
+		_ = pair.client.Close()
+		_ = pair.upstream.Close()
+	}
+}
+
 func TestRabbitMQCoreRepairsAfterSyntheticTransientFault(t *testing.T) {
 	requireBroker(t)
 	sequence := rabbitReconnectSequence.Add(1)
@@ -422,6 +532,146 @@ func TestRabbitMQCoreReconnectsAfterRealConnectionDeath(t *testing.T) {
 	}
 	if err := <-runDone; err != nil {
 		t.Fatalf("runner Run() = %v", err)
+	}
+}
+
+// TestRabbitMQCoreReconnectsAfterSocketReset resets the TCP socket under a live
+// subscription, which is how a consumer meets a lost transport: the driver
+// fails to read and reports a client-side close, and the core has to reconnect.
+// The tests above close the connection through the broker's management API,
+// which arrives as a server-sent frame and takes the other path.
+func TestRabbitMQCoreReconnectsAfterSocketReset(t *testing.T) {
+	requireBroker(t)
+	sequence := rabbitReconnectSequence.Add(1)
+	topic := fmt.Sprintf("socket-reset.live.%d.%d", os.Getpid(), sequence)
+	proxy := newRabbitResetProxy(t, brokerAddress(defaultEndpoint))
+	cfg := f1.Config{
+		Env:        "test",
+		Service:    "socket-reset",
+		InstanceID: fmt.Sprintf("%d", sequence),
+		Broker: f1.BrokerConfig{
+			Driver:               "rabbitmq",
+			Endpoints:            []string{proxy.endpoint(t)},
+			ConnectTimeout:       5 * time.Second,
+			MaxReconnectAttempts: 3,
+			DefaultPrefetch:      1,
+			// The proxy port hides the fixture's AMQP port, and the driver
+			// derives the management port from the endpoint it was handed.
+			DriverOptions: map[string]string{
+				"rabbitmq.managementPort": strconv.Itoa(rabbitManagementPort(t)),
+			},
+		},
+		Topology: f1.TopologyConfig{AutoCreate: true},
+		Lifecycle: f1.LifecycleConfig{
+			DrainTimeout: 5 * time.Second,
+			HandlerGrace: 500 * time.Millisecond,
+			FlushTimeout: 5 * time.Second,
+			CloseTimeout: 5 * time.Second,
+		},
+	}
+	driverCapture := &captureRabbitDriver{base: Driver{}}
+	consumerErrors := make(chan error, 8)
+	client, err := f1.New(context.Background(), cfg,
+		f1.WithDriver(driverCapture),
+		f1.WithErrorHandler(func(_ context.Context, _ *f1.Event, err error) {
+			select {
+			case consumerErrors <- err:
+			default:
+			}
+		}),
+		f1.WithLogger(slog.New(slog.NewTextHandler(io.Discard, nil))),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cleanupPrefix := fmt.Sprintf("f1.test.%s", topic)
+	t.Cleanup(func() {
+		_ = client.Close(context.Background())
+		cleanupRabbitTestQueues(t, driverCapture, cleanupPrefix, "f1.test.unknown.dlq.socket-reset-live")
+	})
+
+	var handled atomic.Int32
+	runner, err := client.Subscribe(context.Background(), f1.Subscription{
+		Name:           "socket-reset-live",
+		Topics:         []string{topic},
+		Prefetch:       12,
+		HandlerTimeout: 2 * time.Second,
+		Handlers: map[string]f1.Handler{
+			topic: f1.HandlerFunc(func(context.Context, *f1.Event) error {
+				handled.Add(1)
+				return nil
+			}),
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	runDone := make(chan error, 1)
+	go func() { runDone <- runner.Run(context.Background()) }()
+	waitRabbit(t, func() bool {
+		connections := driverCapture.connections()
+		if len(connections) != 1 {
+			return false
+		}
+		connection, ok := connections[0].(*conn)
+		return ok && activeRabbitConsumer(connection) != nil
+	})
+	if _, err := client.Publisher().Publish(context.Background(), topic, map[string]string{"phase": "before"}); err != nil {
+		t.Fatal(err)
+	}
+	waitRabbit(t, func() bool { return handled.Load() == 1 })
+
+	proxy.reset()
+
+	// The reset must reach the core as a transient consumer error. A fatal one
+	// cancels the runner, so the replacement wait below would fail as an
+	// unattributed timeout; this names the cause instead.
+	var resetErr error
+	timer := time.NewTimer(15 * time.Second) //nolint:forbidigo // live broker reconnect wait is intentionally wall-clock based
+	defer timer.Stop()
+	select {
+	case resetErr = <-consumerErrors:
+	case <-timer.C:
+		t.Fatal("the core reported no consumer error after the socket reset")
+	}
+	if kind, classified := driver.Classify(resetErr); !classified || kind != driver.KindTransient {
+		t.Fatalf("consumer error after the socket reset = %v, kind %v, classified %t; want a classified transient error", resetErr, kind, classified)
+	}
+
+	waitRabbit(t, func() bool {
+		connections := driverCapture.connections()
+		if len(connections) != 2 {
+			return false
+		}
+		replacement, ok := connections[1].(*conn)
+		return ok && activeRabbitConsumer(replacement) != nil
+	})
+	if _, err := client.Publisher().Publish(context.Background(), topic, map[string]string{"phase": "after"}); err != nil {
+		t.Fatal(err)
+	}
+	waitRabbit(t, func() bool { return handled.Load() == 2 })
+
+	if err := client.Close(context.Background()); err != nil {
+		t.Fatalf("client.Close() = %v, want nil", err)
+	}
+	runTimer := time.NewTimer(15 * time.Second) //nolint:forbidigo // live broker shutdown is intentionally wall-clock based
+	defer runTimer.Stop()
+	select {
+	case runErr := <-runDone:
+		if runErr != nil {
+			t.Fatalf("runner Run() = %v, want nil", runErr)
+		}
+	case <-runTimer.C:
+		t.Fatal("runner Run() did not return after Close")
+	}
+	if got := len(driverCapture.connections()); got != 2 {
+		t.Fatalf("driver connections after Close = %d, want 2: a reconnect must not start once Close begins", got)
+	}
+	// A reconnect the shutdown cancelled before its dial finished raises the
+	// attempt count without ever appending to the connection list, so the
+	// count is what catches one the list cannot show.
+	if got := driverCapture.openAttempts(); got != 2 {
+		t.Fatalf("driver Open attempts after Close = %d, want 2: a reconnect must not start once Close begins", got)
 	}
 }
 

@@ -603,7 +603,20 @@ func classifyAMQP(op string, fallback driver.Kind, err error) error {
 			kind = driver.KindNotFound
 			err = errors.Join(driver.ErrDestinationMissing, err)
 		case 501, 502, 503, 504:
-			kind = driver.KindFatal
+			// A client-side 501-504 is how amqp091-go reports a lost
+			// transport: a failed socket read shuts the connection down with
+			// FrameError (501), and ErrClosed is ChannelError (504). The core
+			// must reconnect rather than stop, so the caller's fallback cannot
+			// decide the kind: the Qos, Confirm and topology call sites pass
+			// fatal, and a connection lost while a consumer reopens would
+			// otherwise end the subscription. The broker sends these codes for
+			// protocol misuse instead, and a forced close arrives as 320, so a
+			// server-sent one stays fatal.
+			if amqpErr.Server {
+				kind = driver.KindFatal
+			} else {
+				kind = driver.KindTransient
+			}
 		}
 	}
 	return classify(op, kind, err)

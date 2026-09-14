@@ -201,3 +201,98 @@ func TestClassifyAMQPNotFound(t *testing.T) {
 		t.Fatalf("Classify(%v) = %v, %t, want not_found, true", err, kind, ok)
 	}
 }
+
+// TestClassifyAMQPTransportLoss covers the close codes amqp091-go raises on the
+// client when the transport dies. The library marks those with Server false,
+// and the caller's fallback cannot decide them: the Qos, Confirm and topology
+// paths pass fatal, so a connection lost while a consumer reopens would end the
+// subscription. A code in the same range that the broker sent stays fatal,
+// because the broker sends those for protocol misuse by the client.
+func TestClassifyAMQPTransportLoss(t *testing.T) {
+	for _, test := range []struct {
+		name        string
+		err         error
+		fallback    driver.Kind
+		want        driver.Kind
+		wantMissing bool
+	}{
+		{
+			name:     "client frame error with a fatal fallback",
+			err:      &amqp.Error{Code: 501, Reason: "connection reset by peer"},
+			fallback: driver.KindFatal,
+			want:     driver.KindTransient,
+		},
+		{
+			name:     "client channel error with a fatal fallback",
+			err:      amqp.ErrClosed,
+			fallback: driver.KindFatal,
+			want:     driver.KindTransient,
+		},
+		{
+			name:     "client channel error with a not found fallback",
+			err:      amqp.ErrClosed,
+			fallback: driver.KindNotFound,
+			want:     driver.KindTransient,
+		},
+		{
+			name:     "wrapped client channel error",
+			err:      fmt.Errorf("publish: %w", amqp.ErrClosed),
+			fallback: driver.KindFatal,
+			want:     driver.KindTransient,
+		},
+		{
+			name:     "client syntax error with a fatal fallback",
+			err:      amqp.ErrSyntax,
+			fallback: driver.KindFatal,
+			want:     driver.KindTransient,
+		},
+		{
+			name:     "client command invalid with a fatal fallback",
+			err:      amqp.ErrCommandInvalid,
+			fallback: driver.KindFatal,
+			want:     driver.KindTransient,
+		},
+		{
+			name:     "server frame error with a transient fallback",
+			err:      &amqp.Error{Code: 501, Reason: "frame could not be parsed", Server: true},
+			fallback: driver.KindTransient,
+			want:     driver.KindFatal,
+		},
+		{
+			name:     "server channel error with a transient fallback",
+			err:      &amqp.Error{Code: 504, Reason: "channel error", Server: true},
+			fallback: driver.KindTransient,
+			want:     driver.KindFatal,
+		},
+		{
+			name:     "server connection forced",
+			err:      &amqp.Error{Code: 320, Reason: "CONNECTION_FORCED", Server: true},
+			fallback: driver.KindTransient,
+			want:     driver.KindTransient,
+		},
+		{
+			name:        "destination missing",
+			err:         &amqp.Error{Code: 404, Reason: "NOT_FOUND"},
+			fallback:    driver.KindTransient,
+			want:        driver.KindNotFound,
+			wantMissing: true,
+		},
+		{
+			name:     "client credentials refusal",
+			err:      amqp.ErrCredentials,
+			fallback: driver.KindTransient,
+			want:     driver.KindPermission,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			err := classifyAMQP("consume", test.fallback, test.err)
+			kind, ok := driver.Classify(err)
+			if !ok || kind != test.want {
+				t.Fatalf("Classify(%v) = %v, %t, want %v, true", err, kind, ok, test.want)
+			}
+			if got := errors.Is(err, driver.ErrDestinationMissing); got != test.wantMissing {
+				t.Fatalf("errors.Is(%v, ErrDestinationMissing) = %t, want %t", err, got, test.wantMissing)
+			}
+		})
+	}
+}
