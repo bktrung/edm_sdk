@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"math"
+	"slices"
 	"sort"
 	"sync"
 	"sync/atomic"
@@ -202,13 +203,29 @@ type destination struct {
 	spec      driver.DestinationSpec
 	messages  []*queuedMessage
 	consumers map[*consumer]struct{}
-	affinity  map[string]*consumer
+	affinity  map[affinityKey]*consumer
 	order     []*consumer
-	next      int
+	// next holds one round-robin cursor per group, created with the
+	// destination.
+	next map[string]int
+}
+
+// affinityKey identifies one group's key affinity on one destination. Holding
+// affinity per group is what lets two groups on a destination each keep their
+// own consumer for a key: a single holder would duplicate the message into the
+// group that already has it and withhold it from the other.
+type affinityKey struct {
+	group string
+	key   string
 }
 
 type groupState struct {
 	positions map[string]uint64
+	// members holds every destination this group has attached to, for the
+	// life of the connection. Membership outlives the consumers that created
+	// it, so a message the group has not been given is not retired by the
+	// groups that are still attached.
+	members map[string]bool
 }
 
 type queuedMessage struct {
@@ -271,7 +288,10 @@ func (c *conn) newConsumer(ctx context.Context, cfg driver.ConsumerConfig, ackDe
 		group = c.groups[cfg.Group]
 		if group == nil {
 			createdGroup = true
-			group = &groupState{positions: make(map[string]uint64, len(cfg.Destinations))}
+			group = &groupState{
+				positions: make(map[string]uint64, len(cfg.Destinations)),
+				members:   make(map[string]bool, len(cfg.Destinations)),
+			}
 			c.groups[cfg.Group] = group
 			if cfg.StartAt == driver.StartLatest {
 				for _, name := range cfg.Destinations {
@@ -281,6 +301,7 @@ func (c *conn) newConsumer(ctx context.Context, cfg driver.ConsumerConfig, ackDe
 		}
 		for _, name := range cfg.Destinations {
 			startAfter[name] = group.positions[name]
+			group.members[name] = true
 		}
 		if createdGroup && cfg.StartAt != driver.StartLatest {
 			c.replayHistoryLocked(cfg.Group, cfg.Destinations, startAfter)
@@ -300,7 +321,6 @@ func (c *conn) newConsumer(ctx context.Context, cfg driver.ConsumerConfig, ackDe
 		paused:       make(map[string]bool),
 		unsettled:    make(map[string]int),
 		unsettledKey: make(map[deliveryKey]int),
-		group:        group,
 		startAfter:   startAfter,
 		ackDeadline:  ackDeadline,
 		inflight:     make(map[*settler]struct{}),
@@ -330,7 +350,13 @@ func (c *conn) replayHistoryLocked(group string, destinations []string, startAft
 				continue
 			}
 			deliveredGroups := make(map[string]bool, len(c.groups))
-			for existing := range c.groups {
+			for existing, state := range c.groups {
+				// A group that never attached to this destination is not a
+				// member of it, so the replayed copy must not wait on a group
+				// that will never be given the message.
+				if !state.members[name] {
+					continue
+				}
 				deliveredGroups[existing] = existing != group
 			}
 			dest.messages = append(dest.messages, &queuedMessage{
@@ -523,8 +549,9 @@ func (c *conn) requeueDeliveryLocked(delivery *settler, now time.Time) {
 			consumer.unsettledKey[keyID]--
 		} else {
 			delete(consumer.unsettledKey, keyID)
-			if dest, ok := c.destinations[name]; ok && dest.affinity[key] == consumer {
-				delete(dest.affinity, key)
+			affinity := affinityKey{group: consumer.cfg.Group, key: key}
+			if dest, ok := c.destinations[name]; ok && dest.affinity[affinity] == consumer {
+				delete(dest.affinity, affinity)
 			}
 		}
 	}
@@ -534,8 +561,21 @@ func (c *conn) requeueDeliveryLocked(delivery *settler, now time.Time) {
 		delete(delivery.message.deliveredGroups, consumer.cfg.Group)
 	}
 	if dest, ok := c.destinations[name]; ok {
-		dest.messages = append([]*queuedMessage{delivery.message}, dest.messages...)
+		dest.requeueLocked(delivery.message)
 	}
+}
+
+// requeueLocked returns message to the head of the destination's queue unless
+// it is already there. A message stays queued while any member group has not
+// been given it, so a requeue from a group that already holds it must not add a
+// second entry: the duplicate would outlive the delivery that created it,
+// because every group would already hold the message and no consumer would
+// ever be eligible for the extra copy.
+func (d *destination) requeueLocked(message *queuedMessage) {
+	if slices.Contains(d.messages, message) {
+		return
+	}
+	d.messages = append([]*queuedMessage{message}, d.messages...)
 }
 
 func (c *conn) dropInFlightLocked(op string) {
@@ -580,10 +620,10 @@ destinationLoop:
 					msg.deliveredGroups[cs.cfg.Group] = true
 					key := string(msg.message.Key)
 					if key != "" {
-						dest.affinity[key] = cs
+						dest.affinity[affinityKey{group: cs.cfg.Group, key: key}] = cs
 						cs.unsettledKey[deliveryKey{destination: dest.spec.Name, key: key}]++
 					}
-					if dest.messageComplete(msg) {
+					if c.messageComplete(dest, msg) {
 						dest.messages = append(dest.messages[:i], dest.messages[i+1:]...)
 					}
 					delivered = true
@@ -608,46 +648,103 @@ func (c *conn) destinationNamesLocked() []string {
 	return names
 }
 
+// pickConsumer selects the consumer that takes message next, or nil when no
+// group can take it now. Groups are considered one at a time, in the order
+// their consumers attached, and each group is considered once per selection,
+// at the first consumer that still represents it. A group that already holds
+// the message has nothing to take. A group with an affinity consumer for the
+// key uses it, and is skipped for now when that consumer cannot take the
+// message, so one group's holder never withholds the message from the groups
+// behind it. A group with no affinity for the key round-robins among its own
+// eligible consumers, so one group's keys never select another group's
+// consumer.
 func (d *destination) pickConsumer(message *queuedMessage) *consumer {
-	eligible := make([]*consumer, 0, len(d.order))
-	for _, cs := range d.order {
-		if message.deliveredGroups != nil && message.deliveredGroups[cs.cfg.Group] {
+	key := string(message.message.Key)
+	for index, cs := range d.order {
+		group := cs.cfg.Group
+		if message.deliveredGroups[group] {
 			continue
 		}
-		if !cs.stopped && !cs.draining && !cs.paused[d.spec.Name] &&
-			cs.canReceive(d.spec.Name) && cs.visible(message, d.spec.Name) {
-			eligible = append(eligible, cs)
+		// The first attached consumer of a group has no earlier consumer that
+		// could have represented it, and this runs once per queued message per
+		// dispatch pass, so that case skips the scan.
+		if index > 0 && representedEarlier(d.order[:index], group) {
+			continue
 		}
-	}
-	if len(eligible) == 0 {
-		return nil
-	}
-	if len(message.message.Key) != 0 {
-		if cs := d.affinity[string(message.message.Key)]; cs != nil {
-			if !cs.stopped && !cs.draining && !cs.paused[d.spec.Name] &&
-				cs.canReceive(d.spec.Name) && cs.visible(message, d.spec.Name) {
-				return cs
+		if key != "" {
+			if holder := d.affinity[affinityKey{group: group, key: key}]; holder != nil {
+				if holder.eligibleFor(message, d.spec.Name) {
+					return holder
+				}
+				continue
 			}
-			return nil
+		}
+		count := 0
+		for _, candidate := range d.order {
+			if candidate.cfg.Group == group && candidate.eligibleFor(message, d.spec.Name) {
+				count++
+			}
+		}
+		if count == 0 {
+			continue
+		}
+		next := d.next[group] % count
+		d.next[group] = next + 1
+		for _, candidate := range d.order {
+			if candidate.cfg.Group != group || !candidate.eligibleFor(message, d.spec.Name) {
+				continue
+			}
+			if next == 0 {
+				return candidate
+			}
+			next--
 		}
 	}
-	cs := eligible[d.next%len(eligible)]
-	d.next++
-	return cs
+	return nil
 }
 
-func (d *destination) messageComplete(message *queuedMessage) bool {
-	groups := make(map[string]struct{})
-	for _, cs := range d.order {
-		if cs.stopped || cs.draining {
+// representedEarlier reports whether a consumer attached before the one being
+// considered already stands for group, so each group is considered once.
+func representedEarlier(earlier []*consumer, group string) bool {
+	for _, cs := range earlier {
+		if cs.cfg.Group == group {
+			return true
+		}
+	}
+	return false
+}
+
+// messageComplete reports whether every group with a claim on the destination
+// has been given message. A named group keeps its claim after its consumers
+// leave, so a message that group has not been given keeps waiting for it. A
+// group created after the message was published has no claim on it: its floor
+// on the destination is at or above the message's sequence, and visible can
+// never offer it the message, so waiting for it would strand the message for
+// the life of the connection. The anonymous group has no claim of its own and
+// counts only while an ungrouped consumer is attached, which is what keeps
+// ungrouped delivery stateless. A destination with no group at all retires
+// nothing.
+func (c *conn) messageComplete(dest *destination, message *queuedMessage) bool {
+	groups := 0
+	for name, group := range c.groups {
+		if !group.members[dest.spec.Name] || message.sequence <= group.positions[dest.spec.Name] {
 			continue
 		}
-		groups[cs.cfg.Group] = struct{}{}
-		if message.deliveredGroups == nil || !message.deliveredGroups[cs.cfg.Group] {
+		groups++
+		if !message.deliveredGroups[name] {
 			return false
 		}
 	}
-	return len(groups) > 0
+	for _, cs := range dest.order {
+		if cs.stopped || cs.draining || cs.cfg.Group != "" {
+			continue
+		}
+		groups++
+		if !message.deliveredGroups[""] {
+			return false
+		}
+	}
+	return groups > 0
 }
 
 func (c *consumer) canReceive(destination string) bool {
@@ -666,6 +763,15 @@ func (c *consumer) canReceive(destination string) bool {
 
 func (c *consumer) visible(message *queuedMessage, destination string) bool {
 	return message.sequence > c.startAfter[destination]
+}
+
+// eligibleFor reports whether c can be given message from destination now:
+// still attached, not paused there, inside its prefetch budget, and past the
+// floor its group was created at. One selection asks this question at several
+// points, so the decision is stated once.
+func (c *consumer) eligibleFor(message *queuedMessage, destination string) bool {
+	return !c.stopped && !c.draining && !c.paused[destination] &&
+		c.canReceive(destination) && c.visible(message, destination)
 }
 
 func (c *conn) inboundLocked(cs *consumer, destination string, msg *queuedMessage) (driver.InboundMessage, *settler) {

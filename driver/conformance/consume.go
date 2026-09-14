@@ -379,6 +379,82 @@ func runConsume(group *groupContext) {
 		group.vector.Add(BehaviorEvent{ID: "start-existing", Outcome: "ok", FinalDestination: "consume.existing-group"})
 	})
 
+	group.Check("two groups on one destination each receive every message", func(t *testing.T) {
+		if group.effective.Fanout != driver.FanoutAtConsume {
+			group.Skip(t, "two groups on one destination each receive every message", "groups on one destination compete under publish fanout; independent groups are a consume-fanout obligation")
+			return
+		}
+		destination := "consume.two-groups"
+		groupName := "consume-two-groups-" + group.runID + "-" + group.profile.String()
+		purgeAndCleanupTopologyDestinations(t, group.maintenance(t), group.ctx, destination)
+		producer := newProducer(t, group, profileDestination(group, destination), driver.ProducerConfig{Effective: group.effective})
+		consumers := []driver.Consumer{
+			newConsumerFor(t, group, driver.ConsumerConfig{
+				Group: groupName + "-a", Destinations: []string{destination}, Prefetch: 2,
+				StartAt: driver.StartEarliest, Effective: group.effective,
+			}),
+			newConsumerFor(t, group, driver.ConsumerConfig{
+				Group: groupName + "-b", Destinations: []string{destination}, Prefetch: 2,
+				StartAt: driver.StartEarliest, Effective: group.effective,
+			}),
+		}
+		if err := producer.Publish(group.ctx,
+			driver.OutboundMessage{Destination: destination, Body: []byte("shared")},
+			driver.OutboundMessage{Destination: destination, Key: []byte("order-1"), Body: []byte("keyed")},
+		); err != nil {
+			t.Fatalf("Publish() error = %v", err)
+		}
+		var held []driver.InboundMessage
+		for _, consumer := range consumers {
+			held = append(held, receiveEveryBody(t, group, consumer, []string{"shared", "keyed"})...)
+		}
+		// Nothing is settled until every group has received every body. Settling
+		// in one group releases that group's claim on the key, and a driver that
+		// keeps one claim per key instead of one per group hands the keyed
+		// message to the other group only after that release, which is the
+		// defect this check exists for.
+		for _, message := range held {
+			ackMessage(t, group, message)
+		}
+		group.vector.Add(BehaviorEvent{ID: "two-groups", Outcome: "ok", FinalDestination: destination})
+	})
+
+	group.Check("a detached group receives a message acked while it was away", func(t *testing.T) {
+		if group.effective.Fanout != driver.FanoutAtConsume {
+			group.Skip(t, "a detached group receives a message acked while it was away", "groups on one destination compete under publish fanout; independent groups are a consume-fanout obligation")
+			return
+		}
+		destination := "consume.detached-group"
+		groupName := "consume-detached-group-" + group.runID + "-" + group.profile.String()
+		purgeAndCleanupTopologyDestinations(t, group.maintenance(t), group.ctx, destination)
+		producer := newProducer(t, group, profileDestination(group, destination), driver.ProducerConfig{Effective: group.effective})
+		attached := newConsumerFor(t, group, driver.ConsumerConfig{
+			Group: groupName + "-a", Destinations: []string{destination}, Prefetch: 1,
+			StartAt: driver.StartEarliest, Effective: group.effective,
+		})
+		away := newConsumerFor(t, group, driver.ConsumerConfig{
+			Group: groupName + "-b", Destinations: []string{destination}, Prefetch: 1,
+			StartAt: driver.StartEarliest, Effective: group.effective,
+		})
+		if err := away.Stop(group.ctx); err != nil {
+			t.Fatalf("Stop(away consumer) error = %v", err)
+		}
+		if err := producer.Publish(group.ctx, driver.OutboundMessage{Destination: destination, Body: []byte("while-away")}); err != nil {
+			t.Fatalf("Publish() error = %v", err)
+		}
+		ackMessage(t, group, receiveMessage(t, group, attached))
+		returned := newConsumerFor(t, group, driver.ConsumerConfig{
+			Group: groupName + "-b", Destinations: []string{destination}, Prefetch: 1,
+			StartAt: driver.StartEarliest, Effective: group.effective,
+		})
+		message := receiveMessage(t, group, returned)
+		if string(message.Body) != "while-away" {
+			t.Fatalf("rejoined consumer body = %q, want while-away", message.Body)
+		}
+		ackMessage(t, group, message)
+		group.vector.Add(BehaviorEvent{ID: "detached-group", Outcome: "ok", FinalDestination: destination})
+	})
+
 	group.Check("zero-value consumer configuration delivers", func(t *testing.T) {
 		producer := newProducer(t, group, profileDestination(group, "consume.zero"), driver.ProducerConfig{Effective: group.effective})
 		if err := producer.Publish(group.ctx, driver.OutboundMessage{Destination: "consume.zero", Body: []byte("default")}); err != nil {
@@ -487,6 +563,27 @@ func newConsumerFor(t *testing.T, group *groupContext, cfg driver.ConsumerConfig
 		}
 	})
 	return wrapped
+}
+
+// receiveEveryBody receives from consumer until every body in wanted has
+// arrived and returns each delivery unsettled. Delivery is at-least-once, so
+// the two-group checks assert that a body arrived rather than that it arrived
+// once, and the caller settles what it holds. Settling happens outside this
+// helper because a group that settles mid-check releases the claim it holds on
+// a key, which the second group's delivery must not depend on.
+func receiveEveryBody(t *testing.T, group *groupContext, consumer driver.Consumer, wanted []string) []driver.InboundMessage {
+	t.Helper()
+	remaining := make(map[string]bool, len(wanted))
+	for _, body := range wanted {
+		remaining[body] = true
+	}
+	var received []driver.InboundMessage
+	for len(remaining) > 0 {
+		message := receiveMessage(t, group, consumer)
+		received = append(received, message)
+		delete(remaining, string(message.Body))
+	}
+	return received
 }
 
 func publishCount(t *testing.T, group *groupContext, producer driver.Producer, destination string, count int) {
