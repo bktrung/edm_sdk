@@ -62,8 +62,11 @@ go func() {
 driver error ends the current runner generation. A transient driver failure may
 put the runner into `Reconnecting`; the runner can rebuild its consumer and
 return to `Ready` without the service creating a second runner. A terminal
-runner error is returned and recorded in the client's health state; inspect and
-report it rather than silently restarting the same runner in a loop.
+runner error is returned and recorded in the client's health state, whether it
+came from a fatal consumer error or from any other way the runner stopped. That
+record stays until a runner with the same subscription name starts and reaches
+`Ready`; inspect and report it rather than silently restarting the same runner
+in a loop.
 
 The context passed to `Run` controls normal intake and handler work. Use a
 separate shutdown context for cleanup so an already-canceled run context does

@@ -106,6 +106,12 @@ type Runner struct {
 	finished              bool
 	runErr                error
 	reconnectCause        error
+	// recordedFailure reports whether this runner has already recorded a
+	// failure against its subscription name. It is guarded by client.mu, not
+	// by mu: every record site and the clear already hold that lock, and the
+	// exit record reads it in the same critical section that decides whether
+	// the entry it would replace is still this runner's.
+	recordedFailure bool
 	// reconnectCauseAttempt is set only when the supervisor injects the generic
 	// reconnect cause, so a runner can wait for that exact client attempt.
 	reconnectCauseAttempt *reconnectAttempt

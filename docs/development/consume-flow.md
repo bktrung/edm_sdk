@@ -396,7 +396,10 @@ User-visible shutdown behavior is documented in
 - notification errors are reported without ending the generation;
 - transient or unclassified errors record a reconnect cause and cancel the
   generation;
-- fatal errors mark the runner failed and surface through client health;
+- fatal errors mark the runner failed, and any error that ends a started
+  runner is recorded in client health, except after the caller's cancel, a
+  drain, or the start of client shutdown; the record stays until a runner
+  with the same subscription name reaches ready again;
 - a canceled generation drains or releases its consumer according to the
   outstanding-delivery state.
 

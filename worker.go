@@ -64,7 +64,10 @@ type poisonDropReport struct {
 
 // Run starts the consumer, owns its fetcher and workers, and returns when the
 // consumer stops, the caller cancels ctx, or a driver error requests shutdown.
-func (r *Runner) Run(ctx context.Context) error {
+// A non-nil result after the runner started is recorded against its
+// subscription name for Client.Health, except when the caller cancelled, the
+// runner was drained, or the client is shutting down.
+func (r *Runner) Run(ctx context.Context) (runErr error) {
 	if r == nil {
 		return errors.New("f1: runner is nil")
 	}
@@ -117,6 +120,11 @@ func (r *Runner) Run(ctx context.Context) error {
 	r.client.mu.Unlock()
 
 	defer finishRunner(r)
+	// Registered after the pre-start refusals, so a refused Run never records
+	// anything, and before the first return that follows a start. Deferred
+	// after finishRunner so it runs first and reads the result Run is about to
+	// hand back, including an error joined in by drainAfterRun.
+	defer func() { r.recordRunExit(ctx, runErr) }()
 	if preRunReconnectErr != nil {
 		return preRunReconnectErr
 	}
@@ -128,7 +136,6 @@ func (r *Runner) Run(ctx context.Context) error {
 			return err
 		}
 	}
-	var runErr error
 	var runCtx context.Context
 	var cancel context.CancelFunc
 	generation := 0
@@ -215,7 +222,8 @@ func (r *Runner) Run(ctx context.Context) error {
 		r.consumer = consumer
 		r.mu.Unlock()
 
-		switch r.lifecycle.State() {
+		state := r.lifecycle.State()
+		switch state {
 		case lifecycle.Starting, lifecycle.Reconnecting:
 			r.mu.Lock()
 			r.repairCycleActive = false
@@ -223,6 +231,11 @@ func (r *Runner) Run(ctx context.Context) error {
 			r.mu.Unlock()
 			if err := r.lifecycle.Transition(lifecycle.Ready); err != nil {
 				runErr = err
+			} else if state == lifecycle.Starting {
+				// A runner that started afresh under this name has replaced the
+				// one whose failure is recorded. A runner returning to ready
+				// from reconnecting has replaced nothing.
+				r.client.clearFailedSubscription(r.subscription.Name)
 			}
 		case lifecycle.Ready:
 		default:
@@ -328,6 +341,40 @@ func (r *Runner) Run(ctx context.Context) error {
 		runErr = errors.Join(runErr, shutdownErr)
 	}
 	return runErr
+}
+
+// recordRunExit records a stopped runner against its subscription name, so a
+// subscription that ended on its own is visible through Client.Health rather
+// than only as a drained client with no consumer. It runs as Run returns, so
+// it sees the value the caller receives.
+//
+// Three exits are not subscription failures and stay unrecorded: the caller's
+// cancel, a drain, and a client that has begun shutting down. The caller's
+// cancel is read from ctx rather than from the result, because a cancel can
+// surface as nil or as a context error depending on which branch observed it
+// first.
+//
+// Record ownership decides the rest, and it is compared by owner rather than
+// by error: the error here can be joined with a drain error, so it is not the
+// value the runner recorded early. A runner that recorded early keeps only the
+// entry it still owns, and a runner that never recorded writes one.
+func (r *Runner) recordRunExit(ctx context.Context, err error) {
+	if err == nil || ctx.Err() != nil {
+		return
+	}
+	r.mu.Lock()
+	draining := r.draining
+	r.mu.Unlock()
+	if draining {
+		return
+	}
+	c := r.client
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.shutdownStarted {
+		return
+	}
+	c.recordRunnerExitLocked(r, err)
 }
 
 func (r *Runner) requestAndWaitReconnect(ctx context.Context, cause error) error {
@@ -1227,7 +1274,7 @@ func recordFatalConsumerError(r *Runner, err error) {
 			setRunnerError(r, errors.Join(err, transitionErr))
 		}
 	}
-	r.client.recordFailedRunner(r, err)
+	r.client.recordFailedSubscription(r.subscription.Name, err, r)
 }
 
 // --- Intake and cancellation ---

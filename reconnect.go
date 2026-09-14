@@ -107,9 +107,7 @@ func (c *Client) waitReconnect(ctx context.Context, attempt *reconnectAttempt) e
 }
 
 func (c *Client) reconnectOnce(ctx context.Context, cause error, attempt *reconnectAttempt) error {
-	if err := c.abandonRunners(ctx, attempt); err != nil {
-		return err
-	}
+	c.abandonRunners(ctx, attempt)
 	if err := c.waitPublishIdle(ctx); err != nil {
 		return err
 	}
@@ -188,7 +186,15 @@ func (c *Client) reconnectSample() float64 {
 	return rand.Float64() //nolint:gosec // jitter needs a fast non-cryptographic sample
 }
 
-func (c *Client) abandonRunners(ctx context.Context, attempt *reconnectAttempt) error {
+// abandonRunners hands every runner to attempt and gives back the deliveries
+// they hold unsettled. A failed Release is logged and the abandon continues:
+// the connection is being replaced because it may be broken, so its teardown
+// calls can fail for the same reason, and every other step that retires that
+// connection is already logged and continued. Aborting instead would strand
+// the runners already cancelled on a client that stays healthy and leave the
+// rest un-abandoned. A consumer left open by its failed Release is the same
+// leak the retiring connection already logs, not a second defect.
+func (c *Client) abandonRunners(ctx context.Context, attempt *reconnectAttempt) {
 	c.mu.Lock()
 	runners := make([]*Runner, 0, len(c.runners))
 	for runner := range c.runners {
@@ -197,10 +203,9 @@ func (c *Client) abandonRunners(ctx context.Context, attempt *reconnectAttempt) 
 	c.mu.Unlock()
 	for _, runner := range runners {
 		if err := runner.abandonForReconnect(ctx, attempt); err != nil {
-			return err
+			lastResortClientLogger(c).Warn("f1 subscription release failed during reconnect", "subscription", runner.subscription.Name, "error", err)
 		}
 	}
-	return nil
 }
 
 func (c *Client) waitPublishIdle(ctx context.Context) error {

@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"maps"
 	"math/rand/v2"
+	"slices"
 	"sync"
 	"time"
 
@@ -30,9 +31,14 @@ type reconnectRequest struct {
 	cause error
 }
 
+// A failedSubscription records one stopped subscription by name. owner is the
+// runner that wrote the entry. An exit record replaces an entry only while it
+// is still that runner's, so a runner that a newer runner of the same name has
+// superseded cannot put its failure back into Health.
 type failedSubscription struct {
-	name string
-	err  error
+	name  string
+	err   error
+	owner *Runner
 }
 
 // Client is an eagerly connected messaging client.
@@ -339,13 +345,76 @@ func failedRunnerHealthLocked(c *Client) error {
 	return errors.Join(errs...)
 }
 
-func (c *Client) recordFailedRunner(runner *Runner, err error) {
-	if c == nil || runner == nil || err == nil {
+// recordFailedSubscription records err against the subscription name, owned by
+// the runner that observed it. A name that is already recorded has its error
+// and owner replaced in place, so the early record taken at a fatal consumer
+// error and the record taken when a runner stops collapse into one entry, a
+// newer runner of that name takes the entry over from the runner it replaced,
+// and the list is bounded by the number of distinct subscription names.
+// Entries are kept ordered by name so Health's text does not depend on the
+// order in which runners stopped.
+func (c *Client) recordFailedSubscription(name string, err error, owner *Runner) {
+	if c == nil || err == nil || owner == nil {
 		return
 	}
 	c.mu.Lock()
-	c.failedSubscriptions = append(c.failedSubscriptions, failedSubscription{name: runner.subscription.Name, err: err})
-	c.mu.Unlock()
+	defer c.mu.Unlock()
+	c.recordFailedSubscriptionLocked(name, err, owner)
+}
+
+// recordFailedSubscriptionLocked writes an entry a runner has not written
+// before, and marks that runner as having recorded. The caller holds c.mu.
+func (c *Client) recordFailedSubscriptionLocked(name string, err error, owner *Runner) {
+	owner.recordedFailure = true
+	for i := range c.failedSubscriptions {
+		switch {
+		case c.failedSubscriptions[i].name == name:
+			c.failedSubscriptions[i].err = err
+			c.failedSubscriptions[i].owner = owner
+			return
+		case c.failedSubscriptions[i].name > name:
+			c.failedSubscriptions = slices.Insert(c.failedSubscriptions, i, failedSubscription{name: name, err: err, owner: owner})
+			return
+		}
+	}
+	c.failedSubscriptions = append(c.failedSubscriptions, failedSubscription{name: name, err: err, owner: owner})
+}
+
+// recordRunnerExitLocked writes the failure that stopped runner. A runner that
+// has not recorded before writes an entry as it always did. A runner that
+// already recorded has already told Health about this name, and may update
+// that entry only while the entry is still its own: it never inserts one, and
+// it never overwrites another runner's. So a runner whose name a newer runner
+// has cleared, or a newer runner whose failure has taken the entry over, keeps
+// the old exit from re-marking a subscription that is no longer it. The caller
+// holds c.mu.
+func (c *Client) recordRunnerExitLocked(runner *Runner, err error) {
+	if !runner.recordedFailure {
+		c.recordFailedSubscriptionLocked(runner.subscription.Name, err, runner)
+		return
+	}
+	for i := range c.failedSubscriptions {
+		if c.failedSubscriptions[i].name != runner.subscription.Name || c.failedSubscriptions[i].owner != runner {
+			continue
+		}
+		c.failedSubscriptions[i].err = err
+		return
+	}
+}
+
+// clearFailedSubscription removes the recorded failure for name. A runner that
+// starts afresh under that name has replaced whatever stopped its predecessor,
+// so the record no longer describes the client. A runner rebuilding its
+// consumer through a reconnect has replaced nothing and does not clear.
+func (c *Client) clearFailedSubscription(name string) {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.failedSubscriptions = slices.DeleteFunc(c.failedSubscriptions, func(failed failedSubscription) bool {
+		return failed.name == name
+	})
 }
 
 // Close drains active work and releases the driver resources. It keeps the
