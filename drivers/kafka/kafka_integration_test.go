@@ -1,3 +1,5 @@
+//go:build integration
+
 package kafka
 
 import (
@@ -453,26 +455,6 @@ func TestCapabilitiesReadBrokerLimits(t *testing.T) {
 	}
 	if depth != 1 {
 		t.Fatalf("topicDepth(%q) = %d, want exactly one retained boundary message", topic, depth)
-	}
-}
-
-func assertFatalOpenError(t *testing.T, err error, wantText string) {
-	t.Helper()
-	if err == nil {
-		t.Fatal("Open() error = nil, want classified fatal error")
-	}
-	if !strings.Contains(err.Error(), wantText) {
-		t.Fatalf("Open() error = %v, want text %q", err, wantText)
-	}
-	var classified *driver.Error
-	if !errors.As(err, &classified) {
-		t.Fatalf("Open() error = %T, want *driver.Error", err)
-	}
-	if classified.Op != "open" {
-		t.Errorf("Open() error Op = %q, want open", classified.Op)
-	}
-	if classified.Kind() != driver.KindFatal {
-		t.Errorf("Open() error Kind = %v, want fatal", classified.Kind())
 	}
 }
 

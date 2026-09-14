@@ -20,10 +20,10 @@ RABBITMQ_PORT ?= 5672
 RABBITMQ_MANAGEMENT_PORT ?= 15672
 RABBITMQ_PROJECT ?= docker
 RABBITMQ_COMPOSE := RABBITMQ_PORT=$(RABBITMQ_PORT) RABBITMQ_MANAGEMENT_PORT=$(RABBITMQ_MANAGEMENT_PORT) docker compose --project-name "$(RABBITMQ_PROJECT)" -f docker/docker-compose.yml
-# Every RabbitMQ test target needs the same endpoint and the same guarantee that
-# an unreachable broker fails rather than skips. Sharing the prefix keeps a new
-# target from being added with one of the two and not the other.
-RABBITMQ_TEST_ENV = F1_RABBITMQ_ENDPOINT=$${F1_RABBITMQ_ENDPOINT:-amqp://guest:guest@localhost:$(RABBITMQ_PORT)/} F1_REQUIRE_RABBITMQ=1
+# Every RabbitMQ test target needs the same endpoint. Sharing the prefix keeps a
+# new target from being added with a different one. Whether a test needs a broker
+# is decided by the integration build tag now, not by an environment variable.
+RABBITMQ_TEST_ENV = F1_RABBITMQ_ENDPOINT=$${F1_RABBITMQ_ENDPOINT:-amqp://guest:guest@localhost:$(RABBITMQ_PORT)/}
 KAFKA_PORT ?= 19092
 KAFKA_PROJECT ?= docker
 KAFKA_COMPOSE := KAFKA_PORT=$(KAFKA_PORT) docker compose --project-name "$(KAFKA_PROJECT)" -f docker/docker-compose.yml
@@ -34,15 +34,15 @@ KAFKA_COMPOSE := KAFKA_PORT=$(KAFKA_PORT) docker compose --project-name "$(KAFKA
 build:
 	CGO_ENABLED=0 go build -trimpath -ldflags "-X main.version=$(VERSION)" ./...
 
-## test-fast: run the short race-enabled suite and print coverage. This is the
-## broker-free gate: broker-backed tests skip without dialing. See
-## docs/development/testing.md.
+## test-fast: run the race-enabled suite and print coverage. This is the
+## broker-free gate: every test that needs a broker lives behind the integration
+## build tag, so none of them is compiled here. See docs/development/testing.md.
 test-fast:
-	go test -race -short -coverprofile=coverage.out ./...
+	go test -race -coverprofile=coverage.out ./...
 	go tool cover -func=coverage.out | tail -1
 
-## test: run the full test suite. It contacts a broker whenever one is
-## reachable, so its broker-backed suites run. See docs/development/testing.md.
+## test: run the same broker-free suite without the race detector and without
+## coverage. Nothing here reads a broker. See docs/development/testing.md.
 test:
 	go test -count=1 ./...
 
@@ -93,8 +93,8 @@ verify-self-contained:
 	fi; \
 	echo "verify-self-contained: 0 issues."
 
-## check-fixture: validate the local fixtures used by tests and tooling. It runs
-## the full suite, so it contacts a broker whenever one is reachable. See
+## check-fixture: validate the local fixtures used by tests and tooling. The test
+## run is the broker-free one; test-infra is the target that needs brokers. See
 ## docs/development/testing.md.
 check-fixture:
 	go test -count=1 ./...
@@ -186,52 +186,59 @@ $(APIDIFF_NORMALIZE): tools/apidiff/normalize.go tools/apidiff/go.mod tools/apid
 .PHONY: broker-up broker-down broker-reset broker-smoke test-rabbitmq test-rabbitmq-driver test-rabbitmq-conformance test-kafka test-infra test-driver-flip test-kafka-conformance kafka-up kafka-down
 
 ## test-rabbitmq: run the RabbitMQ driver suite and its conformance suite
-## against the selected fixture, starting it first. F1_REQUIRE_RABBITMQ makes an
-## unreachable broker a failure rather than a skip, so this target never reports
-## success for a suite that did not run. The broker is left running for repeat
-## runs; stop it with broker-down.
+## against the selected fixture, starting it first. The integration tag selects
+## the broker-backed files and there is no skip branch left, so an unreachable
+## broker fails this target instead of quietly reporting success. The broker is
+## left running for repeat runs; stop it with broker-down.
 test-rabbitmq: broker-up broker-smoke
-	$(RABBITMQ_TEST_ENV) go test -race -count=1 ./drivers/rabbitmq/...
+	$(RABBITMQ_TEST_ENV) go test -race -count=1 -tags integration ./drivers/rabbitmq/...
 
 ## test-rabbitmq-driver: run the RabbitMQ driver suite without the conformance
 ## suite, which test-rabbitmq-conformance runs separately. The conformance suite
 ## is not behind its own switch the way the Kafka one is, so CI selects the two
 ## halves with -skip and -run rather than with an environment variable.
 test-rabbitmq-driver: broker-up broker-smoke
-	$(RABBITMQ_TEST_ENV) go test -race -count=1 -skip '^TestConformance$$' ./drivers/rabbitmq/...
+	$(RABBITMQ_TEST_ENV) go test -race -count=1 -tags integration -skip '^TestConformance$$' ./drivers/rabbitmq/...
 
 ## test-rabbitmq-conformance: run the RabbitMQ conformance suite against the
 ## fixture. It requires a live RabbitMQ broker with the management API enabled,
 ## because the subscription path reads bindings and queue arguments through it.
 test-rabbitmq-conformance: broker-up broker-smoke
-	$(RABBITMQ_TEST_ENV) go test -v -count=1 -run TestConformance -timeout 20m ./drivers/rabbitmq/...
+	$(RABBITMQ_TEST_ENV) go test -v -count=1 -tags integration -run TestConformance -timeout 20m ./drivers/rabbitmq/...
 
 ## test-kafka: run the Kafka driver suite against the fixture, starting it first.
-## F1_REQUIRE_KAFKA makes an unreachable broker a failure rather than a skip.
+## The integration tag selects the broker-backed files; an unreachable broker
+## fails the run. Kafka conformance stays behind F1_KAFKA_CONFORMANCE, which is a
+## feature-completeness switch, not an infrastructure one.
 test-kafka: kafka-up
-	F1_KAFKA_ENDPOINT=$${F1_KAFKA_ENDPOINT:-localhost:$(KAFKA_PORT)} F1_REQUIRE_KAFKA=1 go test -race -count=1 ./drivers/kafka/...
+	F1_KAFKA_ENDPOINT=$${F1_KAFKA_ENDPOINT:-localhost:$(KAFKA_PORT)} go test -race -count=1 -tags integration ./drivers/kafka/...
 
-## test-infra: run the tests that need a broker. Fails, never skips, when one is missing.
-test-infra: kafka-up
-	F1_KAFKA_ENDPOINT=$${F1_KAFKA_ENDPOINT:-localhost:$(KAFKA_PORT)} F1_ACCEPTANCE_ENDPOINT=$${F1_ACCEPTANCE_ENDPOINT:-localhost:$(KAFKA_PORT)} F1_REQUIRE_KAFKA=1 go test -count=1 -tags integration ./...
+## test-infra: run every test that needs a broker, across both drivers, with the
+## fixtures started first. A missing fixture fails the run rather than skipping.
+## Packages run one at a time (-p 1): the broker-backed suites share the fixtures
+## and the CPU, and a parallel run of this target used to contend with itself.
+test-infra: kafka-up broker-up broker-smoke
+	F1_KAFKA_ENDPOINT=$${F1_KAFKA_ENDPOINT:-localhost:$(KAFKA_PORT)} \
+	F1_ACCEPTANCE_ENDPOINT=$${F1_ACCEPTANCE_ENDPOINT:-localhost:$(KAFKA_PORT)} \
+	$(RABBITMQ_TEST_ENV) \
+	go test -count=1 -p 1 -tags integration ./...
 
 ## test-driver-flip: run the acceptance services against each driver with one
 ## corpus and diff the two runs. This is the driver-flip acceptance: the same
 ## application, deployed twice, must produce the same behaviour vector. It needs
-## both brokers, and F1_REQUIRE_KAFKA and F1_REQUIRE_RABBITMQ make a missing one a
-## failure rather than a skip. Artifacts land in .cache/driver-flip.
+## both brokers, and an unreachable one fails the run. Artifacts land in
+## .cache/driver-flip.
 test-driver-flip: kafka-up broker-up broker-smoke
 	F1_DRIVER_FLIP=1 \
 	F1_KAFKA_ENDPOINT=$${F1_KAFKA_ENDPOINT:-localhost:$(KAFKA_PORT)} \
 	F1_RABBITMQ_ENDPOINT=$${F1_RABBITMQ_ENDPOINT:-amqp://guest:guest@localhost:$(RABBITMQ_PORT)/} \
-	F1_REQUIRE_KAFKA=1 F1_REQUIRE_RABBITMQ=1 \
 	go test -v -count=1 -tags integration -run TestDriverFlipAcceptance -timeout 45m ./examples/acceptance/
 
 ## test-kafka-conformance: run both Kafka conformance profiles against the fixture.
 ## This takes about 250s and requires a live Kafka broker. F1_KAFKA_CONFORMANCE
-## and F1_REQUIRE_KAFKA make the conformance run explicit and required.
+## keeps the run explicit; the integration tag makes it required.
 test-kafka-conformance: kafka-up
-	F1_KAFKA_ENDPOINT=$${F1_KAFKA_ENDPOINT:-localhost:$(KAFKA_PORT)} F1_KAFKA_CONFORMANCE=1 F1_REQUIRE_KAFKA=1 go test -v -count=1 -run TestConformance -timeout 20m ./drivers/kafka/...
+	F1_KAFKA_ENDPOINT=$${F1_KAFKA_ENDPOINT:-localhost:$(KAFKA_PORT)} F1_KAFKA_CONFORMANCE=1 go test -v -count=1 -tags integration -run TestConformance -timeout 20m ./drivers/kafka/...
 
 ## kafka-up: start the Kafka fixture without starting RabbitMQ. KAFKA_PORT
 ## defaults to the historical port and KAFKA_PROJECT to the existing compose

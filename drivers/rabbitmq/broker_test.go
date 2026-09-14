@@ -13,7 +13,6 @@ const (
 	// Local fixture credentials are intentional and never used for production endpoints.
 	defaultRabbitMQEndpoint = "amqp://guest:guest@localhost:5672/" //nolint:gosec // test fixture endpoint
 	rabbitMQEndpointEnv     = "F1_RABBITMQ_ENDPOINT"
-	requireBrokerEnv        = "F1_REQUIRE_RABBITMQ"
 )
 
 var defaultEndpoint = resolveRabbitMQEndpoint()
@@ -89,18 +88,13 @@ var brokerProbe struct {
 	reason string
 }
 
-// requireBroker skips the calling test when the local fixture is unreachable,
-// or fails it when requireBrokerEnv is set. Under -short it decides before the
-// probe, so the short suite excludes broker-backed tests without opening a
-// connection. The probe runs once per package.
+// requireBroker probes the RabbitMQ fixture once per package and fails the
+// calling test when it is unreachable. There is no skip branch: a test that needs
+// this fixture lives in an _integration_test.go file, so the only honest outcomes
+// for it are a pass and a failure that names the missing fixture. The probe runs
+// once per package, so one dial decides the whole suite.
 func requireBroker(t *testing.T) {
 	t.Helper()
-	if testing.Short() {
-		if os.Getenv(requireBrokerEnv) != "" {
-			t.Fatalf("-short and %s contradict each other: the short suite excludes broker-backed tests", requireBrokerEnv)
-		}
-		t.Skip("short suite excludes broker-backed tests; run `make test-rabbitmq` to require the RabbitMQ fixture")
-	}
 	brokerProbe.once.Do(func() {
 		conn, err := net.DialTimeout("tcp", brokerAddress(defaultEndpoint), 2*time.Second)
 		if err != nil {
@@ -109,11 +103,7 @@ func requireBroker(t *testing.T) {
 		}
 		_ = conn.Close()
 	})
-	if brokerProbe.reason == "" {
-		return
+	if brokerProbe.reason != "" {
+		t.Fatalf("RabbitMQ fixture unreachable (%s); start it with `make broker-up`", brokerProbe.reason)
 	}
-	if os.Getenv(requireBrokerEnv) != "" {
-		t.Fatalf("%s is set and the RabbitMQ fixture is unreachable: %s", requireBrokerEnv, brokerProbe.reason)
-	}
-	t.Skipf("RabbitMQ fixture unreachable (%s); run `make test-rabbitmq` to require it", brokerProbe.reason)
 }

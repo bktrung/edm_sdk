@@ -1,17 +1,23 @@
 package kafka
 
 import (
+	"context"
+	"errors"
 	"net"
 	"os"
+	"strings"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/twmb/franz-go/pkg/kgo"
+
+	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/driver"
 )
 
 const (
 	defaultKafkaEndpoint = "localhost:19092"
 	kafkaEndpointEnv     = "F1_KAFKA_ENDPOINT"
-	requireBrokerEnv     = "F1_REQUIRE_KAFKA"
 )
 
 var kafkaEndpoint = resolveKafkaEndpoint()
@@ -47,18 +53,13 @@ var brokerProbe struct {
 	reason string
 }
 
-// requireBroker skips the calling test when the local fixture is unreachable,
-// or fails it when requireBrokerEnv is set. Under -short it decides before the
-// probe, so the short suite excludes broker-backed tests without opening a
-// connection. The probe runs once per package.
+// requireBroker probes the Kafka fixture once per package and fails the calling
+// test when it is unreachable. There is no skip branch: a test that needs this
+// fixture lives in an _integration_test.go file, so the only honest outcomes for
+// it are a pass and a failure that names the missing fixture. The probe runs once
+// per package, so one dial decides the whole suite.
 func requireBroker(t *testing.T) {
 	t.Helper()
-	if testing.Short() {
-		if os.Getenv(requireBrokerEnv) != "" {
-			t.Fatalf("-short and %s contradict each other: the short suite excludes broker-backed tests", requireBrokerEnv)
-		}
-		t.Skip("short suite excludes broker-backed tests; run `make test-kafka` to require the Kafka fixture")
-	}
 	brokerProbe.once.Do(func() {
 		conn, err := net.DialTimeout("tcp", kafkaEndpoint, 2*time.Second)
 		if err != nil {
@@ -67,11 +68,45 @@ func requireBroker(t *testing.T) {
 		}
 		_ = conn.Close()
 	})
-	if brokerProbe.reason == "" {
-		return
+	if brokerProbe.reason != "" {
+		t.Fatalf("Kafka fixture unreachable (%s); start it with `make kafka-up`", brokerProbe.reason)
 	}
-	if os.Getenv(requireBrokerEnv) != "" {
-		t.Fatalf("%s is set and the Kafka fixture is unreachable: %s", requireBrokerEnv, brokerProbe.reason)
+}
+
+// assertFatalOpenError checks the shape of an Open refusal: a classified fatal
+// error, tagged with the open operation, carrying the expected text. It lives in
+// this file rather than beside the tests that use it because tls_test.go needs it
+// and tls_test.go is not an integration file, so a definition in an integration
+// file would leave the broker-free build unable to compile.
+func assertFatalOpenError(t *testing.T, err error, wantText string) {
+	t.Helper()
+	if err == nil {
+		t.Fatal("Open() error = nil, want classified fatal error")
 	}
-	t.Skipf("Kafka fixture unreachable (%s); run `make test-kafka` to require it", brokerProbe.reason)
+	if !strings.Contains(err.Error(), wantText) {
+		t.Fatalf("Open() error = %v, want text %q", err, wantText)
+	}
+	var classified *driver.Error
+	if !errors.As(err, &classified) {
+		t.Fatalf("Open() error = %T, want *driver.Error", err)
+	}
+	if classified.Op != "open" {
+		t.Errorf("Open() error Op = %q, want open", classified.Op)
+	}
+	if classified.Kind() != driver.KindFatal {
+		t.Errorf("Open() error Kind = %v, want fatal", classified.Kind())
+	}
+}
+
+// noDialKafkaOption returns the option a test hands to kgo.NewClient when it
+// builds a client to inspect its resolved options or to drive a teardown path
+// whose network calls are stubbed out. franz-go dials a seed broker from a
+// background metadata fetch, so a client built from a compiled-in seed reaches
+// whatever another lane happens to be running on the default port, from a test
+// that never needs a broker. Every such site shares this one option so the
+// decision cannot be right at three call sites and wrong at a fourth.
+func noDialKafkaOption() kgo.Opt {
+	return kgo.Dialer(func(context.Context, string, string) (net.Conn, error) {
+		return nil, errors.New("test client never dials")
+	})
 }

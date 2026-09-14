@@ -175,6 +175,12 @@ pending groups, fixture registration, and provider run paths.
 
 ## Broker-backed RabbitMQ and Kafka tests
 
+These tests live in `_integration_test.go` files behind the `//go:build
+integration` tag. A test file is an integration file, and is named
+`_integration_test.go`, if and only if it requires a process this repository did
+not start; the commands for both sides of that line are under "Which targets
+contact a broker" below.
+
 Use live broker tests only when the behavior depends on the provider or its
 client library. Examples include:
 
@@ -190,8 +196,9 @@ client library. Examples include:
 The [Makefile](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/Makefile) owns the broker lifecycle and suite targets.
 Use its `test-rabbitmq`, `test-kafka`, `test-kafka-conformance`,
 `test-infra`, and `test-driver-flip` targets instead of copying fixture setup
-into documentation or test scripts. The targets make unreachable required
-fixtures fail rather than silently turning a broker test into a skip.
+into documentation or test scripts. Each passes `-tags integration` and an
+explicit endpoint, so an unreachable fixture fails the run rather than turning
+that suite into a skip.
 
 `test-driver-flip` is the driver-flip acceptance: it builds the two
 `examples/acceptance` services once, runs the identical binaries against Kafka
@@ -204,32 +211,43 @@ about broker agnosticism.
 
 ### Which targets contact a broker
 
-`make test` and `make check-fixture` run the suite without `-short`, so they
-contact a broker whenever one is reachable and each driver package's
-broker-backed tests then run for a minute or more. The broker-backed targets
-(`test-kafka`, `test-rabbitmq`, `test-kafka-conformance`, `test-infra`,
-`test-driver-flip`) also contact a broker, and they set `F1_REQUIRE_KAFKA` or
-`F1_REQUIRE_RABBITMQ` so an unreachable fixture fails instead of skipping.
+A test file is an integration file, and is named `_integration_test.go`, if and
+only if it requires a process this repository did not start. Scope is irrelevant:
+a single-unit test that needs a broker is an integration file, and an untagged
+file may cross three packages. The file carries `//go:build integration` for the
+same reason, and the guard in `internal/testlayout` fails when the tag and the
+name disagree in either direction.
 
-`make test-fast` is the broker-free gate. It passes `-short`, and a driver
-suite decides to skip its broker-backed tests before the reachability probe
-runs, so no test body opens a connection even when a broker is listening.
-Setting `F1_REQUIRE_KAFKA` or `F1_REQUIRE_RABBITMQ` together with `-short` is a
-contradiction, and the affected test fails rather than skipping.
+That makes the split a compile-time one, so a run never decides at run time
+whether infrastructure is reachable. `make test-fast` and `make test` run every
+test that needs no broker; the integration files are not compiled into them at
+all, so no test in either run connects to a broker. Those two targets are the
+default gate and they stay runnable with nothing listening.
 
-One residual connect survives the guard. `TestConsumerStaticMembershipOptionInspection`
-in `drivers/kafka/consumer_test.go` builds a client from a compiled-in
-`localhost:19092` seed that ignores `F1_KAFKA_ENDPOINT` and never reaches the
-guard, and franz-go's background connect races the process exit, so a short run
-of the whole `drivers/kafka` package dials that port in roughly one run in five.
-Until that literal is gone, keep a fixture off port 19092 or expect the stray
-connect. Removing the hardcoded endpoints from the test files is tracked work.
+`make test-infra` runs the other half, `go test -count=1 -p 1 -tags integration
+./...`, with Kafka and RabbitMQ started first. An unreachable fixture fails the
+run; nothing behind the tag skips. Packages run one at a time there because the
+broker-backed suites share both fixtures and the machine.
 
-Point a run at your own fixture with `F1_KAFKA_ENDPOINT` (for example
-`localhost:19131`) and `F1_RABBITMQ_ENDPOINT` (for example
-`amqp://guest:guest@localhost:15131/`). The broker-backed targets honour both,
+The per-driver targets are the same tag with a narrower package list:
+`test-kafka`, `test-rabbitmq`, `test-rabbitmq-driver`,
+`test-rabbitmq-conformance`, `test-kafka-conformance`, and `test-driver-flip`.
+Each starts the fixtures it needs and passes `-tags integration`, so each one
+keeps running the tests it names.
+
+`F1_KAFKA_ENDPOINT` and `F1_RABBITMQ_ENDPOINT` say *where* a fixture is. Unset
+means the documented default address, and a test pointed at nothing fails rather
+than skipping. Point a run at your own fixture with `F1_KAFKA_ENDPOINT` (for
+example `localhost:19131`) and `F1_RABBITMQ_ENDPOINT` (for example
+`amqp://guest:guest@localhost:15131/`); the broker-backed targets honour both,
 falling back to the port their own `KAFKA_PORT` or `RABBITMQ_PORT` variable
 selects.
+
+Tests that build a `kgo` client only to inspect its resolved options, or to drive
+a path whose network calls are stubbed out, pass `noDialKafkaOption`. franz-go
+dials a seed broker from a background metadata fetch, so a client built from a
+compiled-in endpoint reaches whatever happens to be listening on that port, from
+a test that never needs a broker.
 
 Keep provider tests isolated from one another. Use the fixture cleanup helpers,
 remove queues, topics, and groups created by the test, and do not reset a
@@ -253,7 +271,7 @@ The shared fault contract is implemented in
 reconnect and lane-repair behavior is covered by
 [`reconnection_test.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/reconnection_test.go) and
 [`lane_repair_test.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/lane_repair_test.go). Provider-specific recovery
-belongs in [`drivers/rabbitmq/reconnect_test.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/drivers/rabbitmq/reconnect_test.go),
+belongs in [`drivers/rabbitmq/reconnect_integration_test.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/drivers/rabbitmq/reconnect_integration_test.go),
 the RabbitMQ fault injector, and the corresponding Kafka or in-memory tests.
 
 Delivery is at least once. Duplicate delivery, uncertain acknowledgement, and

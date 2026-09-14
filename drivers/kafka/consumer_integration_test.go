@@ -1,3 +1,5 @@
+//go:build integration
+
 package kafka
 
 import (
@@ -1456,7 +1458,7 @@ func waitForKafkaConsumerState(t *testing.T, consumer *consumer, description str
 
 func TestConsumerStaticMembershipOptionInspection(t *testing.T) {
 	conn := &conn{
-		clientOpts: []kgo.Opt{kgo.SeedBrokers("localhost:19092")},
+		clientOpts: []kgo.Opt{noDialKafkaOption()},
 	}
 	cfg := driver.ConsumerConfig{Group: "group", Destinations: []string{"topic"}}
 
@@ -2975,7 +2977,7 @@ func TestConsumerLeaveSelectsMembershipPath(t *testing.T) {
 }
 
 func TestConsumerLeaveTeardownCancelsBoundedOperation(t *testing.T) {
-	client, err := kgo.NewClient(kgo.SeedBrokers("localhost:19092"))
+	client, err := kgo.NewClient(noDialKafkaOption())
 	if err != nil {
 		t.Fatalf("NewClient: %v", err)
 	}
