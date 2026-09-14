@@ -113,6 +113,11 @@ type consumerHandoff struct {
 	message driver.InboundMessage
 }
 
+type transferReservation struct {
+	key    partitionKey
+	offset int64
+}
+
 type consumer struct {
 	conn             *conn
 	client           *kgo.Client
@@ -184,6 +189,13 @@ type consumer struct {
 	mu         sync.Mutex
 	draining   bool
 	stopped    bool
+	// leftConnection marks a consumer that has left the connection and holds no
+	// queued copies, so requeueHandoff forwards a copy to a registered consumer
+	// instead of storing it. moveQueuedHandoffsOnLeave sets it in the same hold
+	// that takes the queue, so a copy is either carried by that snapshot or sees
+	// the flag. Deliberately not c.stopped, whose meaning is "accepts no new
+	// work" and which is set while the consumer is still registered.
+	leftConnection bool
 	// pollCancel interrupts the poll wait in flight and pollWakePending holds a
 	// wake that arrived while no wait was running. The loop keeps records
 	// admission refused in its own pending queue, and franz-go never offers
@@ -2474,6 +2486,10 @@ func (c *consumer) closeTeardown(ctx context.Context) {
 		c.client.Close()
 	}
 	c.conn.removeConsumer(c)
+	// The move runs after the client is closed, so no rebalance callback can
+	// queue another handoff here, and after the consumer is unregistered, so no
+	// peer can take one from this queue. The snapshot is then complete.
+	c.moveQueuedHandoffsOnLeave()
 	if c.synthesizedGroup {
 		if err := c.deleteGroup(ctx); err != nil {
 			c.sendError(err)
@@ -2542,10 +2558,28 @@ func (c *consumer) Release(ctx context.Context) error {
 	}
 	c.assignmentMu.Lock()
 	c.mu.Lock()
+	// Every settler still here is a live settlement path this Release is about
+	// to abandon without settling, its offset uncommitted, so the peer
+	// reservation that filtered the broker's copy has to go while this member
+	// still owns the partition: a peer assigned the partition after the leave
+	// fetches from the committed offset and moves past a record the reservation
+	// hid. An offset with a queued handoff is left out, because that copy still
+	// needs the reservation until it is delivered or settled. Stop cannot reach
+	// any of this: it refuses while a settler is outstanding.
+	reservations := make([]transferReservation, 0)
+	for settler := range c.settlers {
+		if _, queued := c.handoffs[settler.key][settler.record.Offset]; queued {
+			continue
+		}
+		reservations = append(reservations, transferReservation{key: settler.key, offset: settler.record.Offset})
+	}
 	trackers := c.detachAllTrackersLocked()
 	c.mu.Unlock()
 	c.assignmentMu.Unlock()
 
+	for _, reservation := range reservations {
+		c.clearTransferReservation(reservation.key, reservation.offset)
+	}
 	for _, tracker := range trackers {
 		tracker.Drop()
 	}
@@ -2868,7 +2902,14 @@ func (c *consumer) takeHandoffs(partitions map[string][]int32) []consumerHandoff
 func (c *consumer) requeueHandoff(message driver.InboundMessage) {
 	key := partitionKey{destination: message.Destination, partition: message.Ref.Partition}
 	c.mu.Lock()
-	defer c.mu.Unlock()
+	if c.leftConnection {
+		// This consumer has left the connection, so a copy stored here would sit
+		// in a queue no dispatch scans. Forward it instead; forwardHandoffs takes
+		// its own locks, so c.mu is released first.
+		c.mu.Unlock()
+		c.forwardHandoffs(message)
+		return
+	}
 	if c.handoffs == nil {
 		c.handoffs = make(map[partitionKey]map[int64]driver.InboundMessage)
 	}
@@ -2878,6 +2919,78 @@ func (c *consumer) requeueHandoff(message driver.InboundMessage) {
 		c.handoffs[key] = offsets
 	}
 	offsets[message.Ref.Offset] = message
+	c.mu.Unlock()
+}
+
+// forwardHandoffs places copies this consumer can no longer queue on a
+// registered consumer, which offers each one to whichever consumer is eligible,
+// now or at that consumer's next capacity release.
+//
+// It takes its own locks: the caller must hold none. The peer snapshot is taken
+// under conn.mu.RLock and released before any consumer lock is taken, and each
+// requeue and dispatch takes one consumer's mutex at a time.
+func (c *consumer) forwardHandoffs(handoffs ...driver.InboundMessage) {
+	if c.conn == nil || len(handoffs) == 0 {
+		return
+	}
+	keys := make(map[partitionKey]struct{}, len(handoffs))
+	for _, message := range handoffs {
+		keys[partitionKey{destination: message.Destination, partition: message.Ref.Partition}] = struct{}{}
+	}
+	c.conn.mu.RLock()
+	var peer *consumer
+	for candidate := range c.conn.consumers {
+		if candidate != c {
+			peer = candidate
+			break
+		}
+	}
+	c.conn.mu.RUnlock()
+	if peer == nil {
+		// Nothing is left to filter these offsets, so dropping the copies loses
+		// nothing. Every reservation for them lived on a consumer that has since
+		// left the connection, and a reservation stops filtering the moment its
+		// holder stops fetching; the broker's own redelivery of each uncommitted
+		// offset is therefore visible again and arrives at the next start. A copy
+		// kept here instead would sit in a queue no dispatch scans.
+		return
+	}
+	for _, message := range handoffs {
+		peer.requeueHandoff(message)
+	}
+	for key := range keys {
+		go peer.dispatchHandoffs(key)
+	}
+}
+
+// moveQueuedHandoffsOnLeave hands the queued copies held by c to a registered
+// consumer before c leaves the connection, so each offset keeps a live
+// settlement path. It marks c as left in the same hold that takes the queue, so
+// no copy can be stored here after the snapshot: a concurrent requeue either
+// takes c.mu before that hold, and its copy travels in the snapshot, or takes it
+// after, and its copy is forwarded.
+func (c *consumer) moveQueuedHandoffsOnLeave() {
+	if c.conn == nil {
+		return
+	}
+	c.mu.Lock()
+	handoffs := make([]driver.InboundMessage, 0)
+	keys := make(map[partitionKey]struct{})
+	for key, offsets := range c.handoffs {
+		for _, message := range offsets {
+			handoffs = append(handoffs, message)
+		}
+		keys[key] = struct{}{}
+	}
+	clear(c.handoffs)
+	for key := range keys {
+		// This consumer never commits again, so its commit coverage cannot
+		// suppress a moved copy and means nothing to a peer.
+		delete(c.pendingTransfers, key)
+	}
+	c.leftConnection = true
+	c.mu.Unlock()
+	c.forwardHandoffs(handoffs...)
 }
 
 func (c *consumer) emitHandoff(source *consumer, message driver.InboundMessage) {
