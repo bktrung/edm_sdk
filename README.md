@@ -11,9 +11,10 @@ deliberately does not do. For the code tour, start with [`docs/`](docs/index.md)
 
 ## Guarantees
 
-Each of these is testable. The current CI pipeline runs the build, unit, lint, broker, API-surface,
-API-diff, import-boundary, and self-contained gates listed in [`.gitlab-ci.yml`](.gitlab-ci.yml);
-the [Makefile](Makefile) owns the corresponding local command set.
+Each of these is testable. The default CI pipeline runs the build, unit, lint, API-surface,
+API-diff, import-boundary, and self-contained gates listed in [`.gitlab-ci.yml`](.gitlab-ci.yml).
+Broker-backed jobs remain available there and run when `RUN_BROKER_TESTS=1` is set; the
+[Makefile](Makefile) owns the corresponding local command set.
 
 <!-- #region guarantees -->
 - **At-least-once delivery, with a stable message identity.** Transport redelivers during failures
