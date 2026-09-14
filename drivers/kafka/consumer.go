@@ -1370,6 +1370,7 @@ func (c *consumer) emit(record *kgo.Record) (delivered, active, created bool) {
 				}
 			}
 		}
+		delete(c.recordGenerations, record)
 		c.mu.Unlock()
 		return true, true, false
 	}
