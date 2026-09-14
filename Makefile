@@ -16,6 +16,7 @@ APIDIFF_NORMALIZE := $(CURDIR)/.tools/bin/apidiff-normalize
 API_DIFF_BASELINE_DIR := $(CURDIR)/testdata/api-diff
 API_DIFF_BREAKING_CHANGE ?= 0
 API_DIFF_ENFORCE ?= 1
+API_DIFF_ADDITIONS_ENFORCE ?= 1
 RABBITMQ_PORT ?= 5672
 RABBITMQ_MANAGEMENT_PORT ?= 15672
 RABBITMQ_PROJECT ?= docker
@@ -116,11 +117,16 @@ check-api-surface-driver: $(APISURFACE)
 check-api-surface-f1test: $(APISURFACE)
 	$(APISURFACE) -package f1test -fixture testdata/public-api-f1test.json
 
-## check-api-diff: report API changes; fails on incompatible ones only when API_DIFF_ENFORCE=1.
+## check-api-diff: report API changes; fail on incompatible changes unless
+## API_DIFF_ENFORCE=0, and on unrecorded compatible changes unless
+## API_DIFF_ADDITIONS_ENFORCE=0. Both are enforced by default.
 ##
 ## Enforcement is on. Intentional breaking changes require an explicit maintainer
 ## approval when recording a new baseline: API_DIFF_BREAKING_CHANGE=1 make
 ## record-api-diff-baseline
+##
+## An addition is recorded by running make record-api-diff-baseline in the commit
+## that adds the symbol, which puts it in the diff a reviewer reads.
 check-api-diff: $(APIDIFF) $(APIDIFF_NORMALIZE)
 	@set -e; \
 	for spec in \
@@ -141,19 +147,30 @@ check-api-diff: $(APIDIFF) $(APIDIFF_NORMALIZE)
 				exit 1; \
 			fi; \
 			echo "api-diff: $$package has incompatible changes (not enforced; set API_DIFF_ENFORCE=1)" >&2; \
-		elif [ ! -s "$$report" ]; then \
+		fi; \
+		if grep -q '^Compatible changes:' "$$report"; then \
+			if [ "$(API_DIFF_ADDITIONS_ENFORCE)" = "1" ]; then \
+				echo "api-diff: $$package has unrecorded compatible changes; run make record-api-diff-baseline in the commit that adds them" >&2; \
+				exit 1; \
+			fi; \
+			echo "api-diff: $$package has unrecorded compatible changes (not enforced; set API_DIFF_ADDITIONS_ENFORCE=1)" >&2; \
+		fi; \
+		if [ ! -s "$$report" ]; then \
 			echo "api-diff: $$package unchanged"; \
 		fi; \
 		rm -f "$$report" "$$current" "$$normalized_old" "$$normalized_new"; \
 	done
 
 ## record-api-diff-baseline: refresh committed snapshots; breaking changes require explicit approval.
+##
+## The pre-refresh check runs with API_DIFF_ADDITIONS_ENFORCE=0, because recording
+## the additions is what this target is for. Its incompatible guard is unchanged.
 record-api-diff-baseline: $(APIDIFF) $(APIDIFF_NORMALIZE)
 	@if [ -f "$(API_DIFF_BASELINE_DIR)/f1.export" ] && \
 		[ -f "$(API_DIFF_BASELINE_DIR)/driver.export" ] && \
 		[ -f "$(API_DIFF_BASELINE_DIR)/codec.export" ] && \
 		[ "$(API_DIFF_BREAKING_CHANGE)" != "1" ]; then \
-		$(MAKE) check-api-diff; \
+		$(MAKE) check-api-diff API_DIFF_ADDITIONS_ENFORCE=0; \
 	elif [ "$(API_DIFF_BREAKING_CHANGE)" = "1" ]; then \
 		echo "api-diff: refreshing baseline with breaking-change approval"; \
 	else \

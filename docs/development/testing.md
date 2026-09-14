@@ -359,9 +359,14 @@ make those tests meaningful:
   [`tools/apisurface`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/tree/main/tools/apisurface), and the owning Makefile
   targets are `check-api-surface` and its package-specific variants.
 - API-diff checks compare the current root, driver, and codec surfaces with
-  [`testdata/api-diff/`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/tree/main/testdata/api-diff). An incompatible change is
-  a release decision, not a baseline-maintenance detail; use the Makefile's
-  `check-api-diff` and explicitly approved baseline workflow.
+  [`testdata/api-diff/`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/tree/main/testdata/api-diff). An incompatible change fails the
+  check and is a release decision, not a baseline-maintenance detail; record it
+  only through the Makefile's explicitly approved baseline workflow. An
+  addition fails too, until the same commit records it in the baseline with
+  `make record-api-diff-baseline`, which puts the addition in the diff a
+  reviewer reads. Either half can be turned off for one local run:
+  `API_DIFF_ENFORCE=0` for incompatible changes and `API_DIFF_ADDITIONS_ENFORCE=0`
+  for additions.
 - `verify-agnostic` runs the `depguard` rules in
   [`.golangci.yml`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/.golangci.yml). It prevents core code from importing
   concrete drivers or broker clients and prevents the conformance package from
