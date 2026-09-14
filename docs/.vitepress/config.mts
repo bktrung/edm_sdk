@@ -55,6 +55,7 @@ export default defineConfig({
           { text: 'Handling failures', link: '/user-guide/handling-failures' },
           { text: 'Graceful shutdown', link: '/user-guide/graceful-shutdown' },
           { text: 'Testing handlers', link: '/user-guide/testing' },
+          { text: 'Driver options', link: '/user-guide/driver-options' },
         ],
       },
       {

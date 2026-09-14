@@ -124,7 +124,9 @@ func TestUnknownLaneRoutesToTheFallbackLane(t *testing.T) {
 	close(deliveries)
 
 	pipelineDone := make(chan error, 1)
-	go func() { pipelineDone <- runDispatchPipeline(runner, context.Background(), deliveries) }()
+	go func() {
+		pipelineDone <- runDispatchPipeline(runner, context.Background(), deliveries, runner.config.Prefetch)
+	}()
 	select {
 	case err := <-pipelineDone:
 		if err != nil {
@@ -380,6 +382,79 @@ func pipelineTestSubscription(handler func(context.Context, *Event) error) Subsc
 		Retry:          RetryConfig{MaxAttempts: 1},
 		HandlerTimeout: time.Second,
 		Handlers:       handlers,
+	}
+}
+
+// TestFetchRunnerDrainsWhenCancelledDuringHandOver pins the cancel path where
+// the fetch loop is already inside enqueueDelivery: the lane gate holds
+// deliveries back, so the hand-over can be blocked when the context fires, and
+// a return that skips the drain leaves the driver's handed-over messages
+// unsettled and fails Stop. It mirrors the running loop's ctx.Done case, which
+// drains before returning.
+func TestFetchRunnerDrainsWhenCancelledDuringHandOver(t *testing.T) {
+	_, runner, consumer := newSettlementOrderingRunner(t)
+	settler := &scriptedNackSettler{}
+	envelope := Envelope{
+		SpecVersion: "1.0",
+		ID:          "refused-hand-over",
+		Source:      "/test/orders",
+		Type:        "orders.created",
+		Attempt:     1,
+	}
+	headers, err := envelope.EncodeHeaders(CoreMaxHeaderBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	consumer.messages <- driver.InboundMessage{
+		Destination: "f1.test.orders.created.medium",
+		Headers:     headerSlice(headers),
+		Body:        []byte(`{}`),
+		Settle:      settler,
+	}
+	// Unbuffered and never read: the hand-over cannot complete, so the loop
+	// blocks in enqueueDelivery's select until the cancellation reaches it.
+	dispatch := make(chan delivery)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- fetchRunner(runner, ctx, dispatch) }()
+	// The in-flight count is the only signal that the loop is inside the
+	// hand-over: enqueueDelivery adds the entry before its select, so a count
+	// of one means the send is blocked. Cancelling earlier would exercise the
+	// ctx.Done case above the read instead, not the refusal.
+	timer := oneSecondTimer(t)
+	for runner.inflight.Len() != 1 {
+		select {
+		case <-timer.C:
+			t.Fatalf("inflight length = %d, want 1 with a hand-over in progress", runner.inflight.Len())
+		default:
+		}
+		if err := clock.NewReal().Sleep(ctx, time.Millisecond); err != nil {
+			t.Fatal(err)
+		}
+	}
+	cancel()
+	timer = oneSecondTimer(t)
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("fetchRunner() = %v, want nil after the cancellation", err)
+		}
+	case <-timer.C:
+		t.Fatal("fetchRunner did not return after the cancellation")
+	}
+	consumer.mu.Lock()
+	drained := consumer.drained
+	consumer.mu.Unlock()
+	if !drained {
+		t.Fatal("fetchRunner returned without draining the consumer after a refused hand-over")
+	}
+	nacks, acks, outstanding := settler.state()
+	if nacks != 1 || acks != 0 || outstanding {
+		t.Fatalf("settlement calls = nacks %d, acks %d, outstanding %v, want one nack and nothing outstanding", nacks, acks, outstanding)
+	}
+	if runner.inflight.Len() != 0 {
+		t.Fatalf("inflight after the refused hand-over = %d, want 0", runner.inflight.Len())
 	}
 }
 

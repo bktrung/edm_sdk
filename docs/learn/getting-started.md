@@ -61,7 +61,8 @@ directly. The repository currently includes:
 - `drivers/rabbitmq` for RabbitMQ.
 - `drivers/inmem` for deterministic tests and local in-process use.
 
-Kafka share-group mode is not implemented; `kafka.useShareGroups=always` is rejected. The local
+Every broker-specific setting a driver accepts, what it does, and what it
+defaults to is listed in [Driver options](/user-guide/driver-options). The local
 Kafka fixture is defined in [`docker/docker-compose.yml`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/docker/docker-compose.yml), and
 `make test-kafka` / `make test-kafka-conformance` own its broker-backed verification.
 

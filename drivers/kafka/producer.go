@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -193,6 +194,75 @@ func (p *producer) Flush(ctx context.Context) error {
 		return classify("flush", kafkaErrorKind(err), err)
 	}
 	return nil
+}
+
+// defaultKafkaBatchLinger is franz-go's own producer linger default. It is
+// passed explicitly rather than left unset so that the value in force is the
+// driver's, and so a reader can see it without reading the client library.
+const defaultKafkaBatchLinger = 10 * time.Millisecond
+
+// resolveProducerOptions translates the broker.kafka.* keys that govern the
+// produce path into franz-go options. It returns an option for every knob,
+// including the ones the operator left unset, so the produce settings in force
+// never depend on a client library default the driver did not choose.
+func resolveProducerOptions(options map[string]string) ([]kgo.Opt, error) {
+	codecs, err := resolveCompression(options)
+	if err != nil {
+		return nil, err
+	}
+	linger, err := resolveBatchLinger(options)
+	if err != nil {
+		return nil, err
+	}
+	return []kgo.Opt{
+		kgo.ProducerBatchCompression(codecs...),
+		kgo.ProducerLinger(linger),
+	}, nil
+}
+
+// resolveCompression maps kafka.compression onto a franz-go codec preference.
+// A named codec stands alone: adding a fallback would let the producer publish
+// an encoding the configuration does not describe, and a batch encoded with a
+// codec the operator did not choose is a surprise the operator cannot see.
+//
+// The unset default is franz-go's own preference, snappy with an uncompressed
+// fallback, so an operator who sets nothing keeps the behaviour they had.
+func resolveCompression(options map[string]string) ([]kgo.CompressionCodec, error) {
+	value, ok := options["kafka.compression"]
+	if !ok {
+		return []kgo.CompressionCodec{kgo.SnappyCompression(), kgo.NoCompression()}, nil
+	}
+	switch strings.ToLower(value) {
+	case "none":
+		return []kgo.CompressionCodec{kgo.NoCompression()}, nil
+	case "gzip":
+		return []kgo.CompressionCodec{kgo.GzipCompression()}, nil
+	case "snappy":
+		return []kgo.CompressionCodec{kgo.SnappyCompression()}, nil
+	case "lz4":
+		return []kgo.CompressionCodec{kgo.Lz4Compression()}, nil
+	case "zstd":
+		return []kgo.CompressionCodec{kgo.ZstdCompression()}, nil
+	default:
+		return nil, fmt.Errorf("kafka: invalid kafka.compression %q; supported codecs are none, gzip, snappy, lz4, zstd", value)
+	}
+}
+
+// resolveBatchLinger maps kafka.batchLinger onto the producer's linger. Zero is
+// valid and disables lingering, which franz-go expresses as a zero duration. A
+// negative duration is refused rather than clamped to zero: an operator who
+// mistypes the key gets the key named back, not a producer that silently never
+// lingers.
+func resolveBatchLinger(options map[string]string) (time.Duration, error) {
+	value, ok := options["kafka.batchLinger"]
+	if !ok {
+		return defaultKafkaBatchLinger, nil
+	}
+	linger, err := time.ParseDuration(value)
+	if err != nil || linger < 0 {
+		return 0, fmt.Errorf("kafka: invalid kafka.batchLinger %q; must be a non-negative duration", value)
+	}
+	return linger, nil
 }
 
 func (p *producer) Close(ctx context.Context) error {

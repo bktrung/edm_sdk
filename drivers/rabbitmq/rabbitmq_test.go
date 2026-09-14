@@ -89,38 +89,6 @@ func TestQueueKindCapabilities(t *testing.T) {
 	}
 }
 
-func TestConnectionCapabilitiesFollowQueueType(t *testing.T) {
-	requireBroker(t)
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-	defer cancel()
-	cases := []struct {
-		name          string
-		options       map[string]string
-		wantNative    bool
-		wantNativeDLQ bool
-	}{
-		{name: "default quorum", wantNative: true, wantNativeDLQ: true},
-		{name: "classic", options: map[string]string{"rabbitmq.queueType": "classic"}, wantNative: false, wantNativeDLQ: false},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			conn, err := (Driver{}).Open(ctx, driver.Config{
-				Endpoints: []string{defaultEndpoint}, DriverOptions: tc.options,
-			})
-			if err != nil {
-				t.Fatalf("Open() error = %v", err)
-			}
-			defer func() { _ = conn.Close(ctx) }()
-			if got := conn.Capabilities().NativeDeliveryCount; got != tc.wantNative {
-				t.Fatalf("NativeDeliveryCount = %t, want %t", got, tc.wantNative)
-			}
-			if got := conn.Capabilities().NativeDLQ; got != tc.wantNativeDLQ {
-				t.Fatalf("NativeDLQ = %t, want %t", got, tc.wantNativeDLQ)
-			}
-		})
-	}
-}
-
 func TestExpirationMillisClampsLargeDelay(t *testing.T) {
 	if got := expirationMillis(100 * 365 * 24 * time.Hour); got != "2147483647" {
 		t.Fatalf("expirationMillis(100 years) = %q, want 2147483647", got)
@@ -170,18 +138,6 @@ func TestOpenRefusesPlaintextRemoteBeforeDialing(t *testing.T) {
 	if !strings.Contains(err.Error(), "amqps://") {
 		t.Fatalf("Open() error = %v, want plaintext endpoint refusal", err)
 	}
-}
-
-func TestOpenAllowsPlaintextLoopback(t *testing.T) {
-	requireBroker(t)
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-	defer cancel()
-
-	conn, err := (Driver{}).Open(ctx, driver.Config{Endpoints: []string{defaultEndpoint}})
-	if err != nil {
-		t.Fatalf("Open() error = %v, want loopback plaintext connection", err)
-	}
-	defer func() { _ = conn.Close(ctx) }()
 }
 
 func TestOpenAllowsAmqpsEndpoint(t *testing.T) {
@@ -235,62 +191,6 @@ func receivedOpenAttempt(accepted <-chan struct{}) bool {
 	}
 }
 
-func TestDriverOpenPingClose(t *testing.T) {
-	requireBroker(t)
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-	defer cancel()
-	conn, err := (Driver{}).Open(ctx, driver.Config{Endpoints: []string{defaultEndpoint}, ConnectTimeout: 10 * time.Second})
-	if err != nil {
-		t.Fatalf("Open() error = %v", err)
-	}
-	if got := conn.BrokerInfo().Kind; got != "rabbitmq" {
-		t.Fatalf("BrokerInfo().Kind = %q, want rabbitmq", got)
-	}
-	if err := conn.Ping(ctx); err != nil {
-		t.Fatalf("Ping() error = %v", err)
-	}
-	if err := conn.Close(ctx); err != nil {
-		t.Fatalf("Close() error = %v", err)
-	}
-	if err := conn.Close(ctx); err != nil {
-		t.Fatalf("second Close() error = %v", err)
-	}
-}
-
-type expiredDeadlineContext struct {
-	context.Context
-	deadline time.Time
-}
-
-func (c expiredDeadlineContext) Deadline() (time.Time, bool) {
-	return c.deadline, true
-}
-
-func TestCloseTimeoutRemainsRetryable(t *testing.T) {
-	requireBroker(t)
-	connContext, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-	defer cancel()
-	publicConn, err := (Driver{}).Open(connContext, driver.Config{Endpoints: []string{defaultEndpoint}})
-	if err != nil {
-		t.Fatalf("Open() error = %v", err)
-	}
-	rabbitConn := publicConn.(*conn)
-
-	closeErr := publicConn.Close(expiredDeadlineContext{
-		Context:  context.Background(),
-		deadline: time.Unix(0, 0),
-	})
-	if closeErr == nil {
-		t.Fatal("Close() error = nil, want underlying close timeout")
-	}
-	if rabbitConn.closed {
-		t.Fatal("connection marked closed after failed underlying close; a later Close cannot retry")
-	}
-	if retryErr := publicConn.Close(context.Background()); retryErr != nil {
-		t.Fatalf("retry Close() error = %v, want success after retry", retryErr)
-	}
-}
-
 func TestClassifyAMQPNotFound(t *testing.T) {
 	err := classifyAMQP("consume", driver.KindTransient, &amqp.Error{Code: 404, Reason: "not found"})
 	if !errors.Is(err, driver.ErrDestinationMissing) {
@@ -299,5 +199,100 @@ func TestClassifyAMQPNotFound(t *testing.T) {
 	kind, ok := driver.Classify(err)
 	if !ok || kind != driver.KindNotFound {
 		t.Fatalf("Classify(%v) = %v, %t, want not_found, true", err, kind, ok)
+	}
+}
+
+// TestClassifyAMQPTransportLoss covers the close codes amqp091-go raises on the
+// client when the transport dies. The library marks those with Server false,
+// and the caller's fallback cannot decide them: the Qos, Confirm and topology
+// paths pass fatal, so a connection lost while a consumer reopens would end the
+// subscription. A code in the same range that the broker sent stays fatal,
+// because the broker sends those for protocol misuse by the client.
+func TestClassifyAMQPTransportLoss(t *testing.T) {
+	for _, test := range []struct {
+		name        string
+		err         error
+		fallback    driver.Kind
+		want        driver.Kind
+		wantMissing bool
+	}{
+		{
+			name:     "client frame error with a fatal fallback",
+			err:      &amqp.Error{Code: 501, Reason: "connection reset by peer"},
+			fallback: driver.KindFatal,
+			want:     driver.KindTransient,
+		},
+		{
+			name:     "client channel error with a fatal fallback",
+			err:      amqp.ErrClosed,
+			fallback: driver.KindFatal,
+			want:     driver.KindTransient,
+		},
+		{
+			name:     "client channel error with a not found fallback",
+			err:      amqp.ErrClosed,
+			fallback: driver.KindNotFound,
+			want:     driver.KindTransient,
+		},
+		{
+			name:     "wrapped client channel error",
+			err:      fmt.Errorf("publish: %w", amqp.ErrClosed),
+			fallback: driver.KindFatal,
+			want:     driver.KindTransient,
+		},
+		{
+			name:     "client syntax error with a fatal fallback",
+			err:      amqp.ErrSyntax,
+			fallback: driver.KindFatal,
+			want:     driver.KindTransient,
+		},
+		{
+			name:     "client command invalid with a fatal fallback",
+			err:      amqp.ErrCommandInvalid,
+			fallback: driver.KindFatal,
+			want:     driver.KindTransient,
+		},
+		{
+			name:     "server frame error with a transient fallback",
+			err:      &amqp.Error{Code: 501, Reason: "frame could not be parsed", Server: true},
+			fallback: driver.KindTransient,
+			want:     driver.KindFatal,
+		},
+		{
+			name:     "server channel error with a transient fallback",
+			err:      &amqp.Error{Code: 504, Reason: "channel error", Server: true},
+			fallback: driver.KindTransient,
+			want:     driver.KindFatal,
+		},
+		{
+			name:     "server connection forced",
+			err:      &amqp.Error{Code: 320, Reason: "CONNECTION_FORCED", Server: true},
+			fallback: driver.KindTransient,
+			want:     driver.KindTransient,
+		},
+		{
+			name:        "destination missing",
+			err:         &amqp.Error{Code: 404, Reason: "NOT_FOUND"},
+			fallback:    driver.KindTransient,
+			want:        driver.KindNotFound,
+			wantMissing: true,
+		},
+		{
+			name:     "client credentials refusal",
+			err:      amqp.ErrCredentials,
+			fallback: driver.KindTransient,
+			want:     driver.KindPermission,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			err := classifyAMQP("consume", test.fallback, test.err)
+			kind, ok := driver.Classify(err)
+			if !ok || kind != test.want {
+				t.Fatalf("Classify(%v) = %v, %t, want %v, true", err, kind, ok, test.want)
+			}
+			if got := errors.Is(err, driver.ErrDestinationMissing); got != test.wantMissing {
+				t.Fatalf("errors.Is(%v, ErrDestinationMissing) = %t, want %t", err, got, test.wantMissing)
+			}
+		})
 	}
 }

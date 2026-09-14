@@ -244,7 +244,7 @@ func TestLaneBalancerPartitionFloor(t *testing.T) {
 
 func TestConsumerClientOptsUsesConfiguredBalancer(t *testing.T) {
 	connection := &conn{
-		clientOpts: []kgo.Opt{kgo.SeedBrokers("localhost:19092")},
+		clientOpts: []kgo.Opt{noDialKafkaOption()},
 		balancer:   kgo.RangeBalancer(),
 	}
 	options, err := consumerClientOpts(connection, driver.ConsumerConfig{Destinations: []string{"topic"}}, "group", nil)

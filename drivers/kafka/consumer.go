@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
 	"slices"
 	"strconv"
 	"sync"
@@ -25,6 +26,7 @@ type pauseReason string
 
 const (
 	pauseReasonDeferred   pauseReason = "deferred"
+	pauseReasonHold       pauseReason = "hold-full"
 	pauseReasonPrefetch   pauseReason = "prefetch-full"
 	pauseReasonAckGap     pauseReason = "ack-gap"
 	pauseReasonUserPaused pauseReason = "user-paused"
@@ -56,6 +58,33 @@ func (s pauseReasonSet) remove(reason pauseReason) bool {
 
 func (s pauseReasonSet) empty() bool { return len(s) == 0 }
 
+// holding reports whether reason is about records the driver is already holding
+// rather than a condition of the destination that has to clear. A holding
+// reason never keeps a record whose due time has arrived from being delivered:
+// the records it names are the ones that become deliverable.
+func (r pauseReason) holding() bool {
+	return r == pauseReasonDeferred || r == pauseReasonHold
+}
+
+// holdsFetches reports whether reason keeps franz-go from fetching the
+// destination. A deferred reason does not: the records behind the one that is
+// waiting for its due time still have to be reachable, so the fetches are held
+// by pauseReasonHold instead, at the count that bounds them.
+func (r pauseReason) holdsFetches() bool {
+	return r != pauseReasonDeferred
+}
+
+// holdsFetches reports whether any reason in the set keeps franz-go from
+// fetching the destination.
+func (s pauseReasonSet) holdsFetches() bool {
+	for reason := range s {
+		if reason.holdsFetches() {
+			return true
+		}
+	}
+	return false
+}
+
 func (s pauseReasonSet) permitsRedelivery() bool {
 	// A deferred reason remains a correctness gate for a requeued record:
 	// allowing that record through would deliver it before its due time.
@@ -82,6 +111,11 @@ type leaveFunc func(context.Context, leaveRequest) error
 type consumerHandoff struct {
 	source  *consumer
 	message driver.InboundMessage
+}
+
+type transferReservation struct {
+	key    partitionKey
+	offset int64
 }
 
 type consumer struct {
@@ -150,16 +184,30 @@ type consumer struct {
 	assignmentMu sync.Mutex
 	// deliveryMu closes the gap between admission and Messages send so revoke
 	// cleanup cannot tombstone a settler before its message is enqueued.
-	deliveryMu     sync.Mutex
-	leaveMu        sync.Mutex
-	mu             sync.Mutex
-	draining       bool
-	stopped        bool
-	leaveRequested bool
-	leaveErr       error
-	leaveCtx       context.Context
-	leaveCancel    context.CancelFunc
-	leaveFn        leaveFunc
+	deliveryMu sync.Mutex
+	leaveMu    sync.Mutex
+	mu         sync.Mutex
+	draining   bool
+	stopped    bool
+	// leftConnection marks a consumer that has left the connection and holds no
+	// queued copies, so requeueHandoff forwards a copy to a registered consumer
+	// instead of storing it. moveQueuedHandoffsOnLeave sets it in the same hold
+	// that takes the queue, so a copy is either carried by that snapshot or sees
+	// the flag. Deliberately not c.stopped, whose meaning is "accepts no new
+	// work" and which is set while the consumer is still registered.
+	leftConnection bool
+	// pollCancel interrupts the poll wait in flight and pollWakePending holds a
+	// wake that arrived while no wait was running. The loop keeps records
+	// admission refused in its own pending queue, and franz-go never offers
+	// those again, so the settlement that frees the slot they are waiting for
+	// has to reach the loop through this pair rather than through the broker.
+	pollCancel      context.CancelFunc
+	pollWakePending bool
+	leaveRequested  bool
+	leaveErr        error
+	leaveCtx        context.Context
+	leaveCancel     context.CancelFunc
+	leaveFn         leaveFunc
 	// leaveStatic leaves a static classic group by InstanceID and leaveDynamic
 	// leaves through the owned franz-go client. Both are installed during
 	// construction so tests execute the production membership selector in
@@ -179,8 +227,11 @@ type consumer struct {
 }
 
 type settler struct {
-	owner            *consumer
-	record           *kgo.Record
+	owner  *consumer
+	record *kgo.Record
+	// handoffDelivered marks a delivery this consumer emitted as a handoff, so
+	// a later emission of the same offset recognizes it as the copy already
+	// delivered. Guarded by owner.mu, like tracker.
 	handoffDelivered bool
 	tracker          *ackTracker
 	handoff          driver.InboundMessage
@@ -204,10 +255,21 @@ type settler struct {
 	settled         bool
 }
 
+// clearHandoffDelivered reports whether this delivery had been emitted as a
+// handoff, and clears the flag under owner.mu, which guards it. The marker the
+// flag stands for is cleared separately, through owner.clearHandoffMarker,
+// which takes owner.mu itself and so cannot be called from under it.
+func (s *settler) clearHandoffDelivered() bool {
+	s.owner.mu.Lock()
+	defer s.owner.mu.Unlock()
+	delivered := s.handoffDelivered
+	s.handoffDelivered = false
+	return delivered
+}
+
 func (s *settler) completeRevocation() {
-	if s.handoffDelivered {
+	if s.clearHandoffDelivered() {
 		s.owner.clearHandoffMarker(s.key, s.record.Offset)
-		s.handoffDelivered = false
 	}
 	// A tombstoned source is detached from c.settlers immediately so the
 	// destination slot can be reused. Its public settlement still completes
@@ -300,9 +362,8 @@ func (s *settler) Nack(ctx context.Context, options driver.NackOptions) error {
 
 	if options.Requeue {
 		s.requeued = true
-		if s.handoffDelivered {
+		if s.clearHandoffDelivered() {
 			s.owner.clearHandoffMarker(s.key, s.record.Offset)
-			s.handoffDelivered = false
 		}
 		s.owner.mu.Lock()
 		if err := tracker.Release(s.record.Offset); err != nil {
@@ -587,6 +648,91 @@ func resolveMaxAckGap(options map[string]string) (int64, error) {
 	return gap, nil
 }
 
+// Consume-path knob defaults. They are franz-go's own defaults, passed
+// explicitly so an unset key still has a value the driver chose and a test can
+// observe.
+//
+// defaultKafkaSessionTimeout matches the fallback that config validation uses
+// to bound lifecycle.rebalanceDrainTimeout. That bound is only meaningful if
+// the session timeout the broker enforces is the one validation measured, so
+// the two values must move together.
+const (
+	defaultKafkaFetchMaxBytes    int32 = 50 << 20
+	defaultKafkaSessionTimeout         = 45 * time.Second
+	defaultKafkaRebalanceTimeout       = 60 * time.Second
+)
+
+// resolveConsumerOptions translates the broker.kafka.* keys that govern the
+// consume path into franz-go options. It returns an option for every knob,
+// including the ones the operator left unset, for the same reason the producer
+// side does: the values in force are the driver's, not a library default.
+func resolveConsumerOptions(options map[string]string) ([]kgo.Opt, error) {
+	fetchMaxBytes, err := resolveFetchMaxBytes(options)
+	if err != nil {
+		return nil, err
+	}
+	sessionTimeout, err := resolveSessionTimeout(options)
+	if err != nil {
+		return nil, err
+	}
+	rebalanceTimeout, err := resolveRebalanceTimeout(options)
+	if err != nil {
+		return nil, err
+	}
+	return []kgo.Opt{
+		kgo.FetchMaxBytes(fetchMaxBytes),
+		kgo.SessionTimeout(sessionTimeout),
+		kgo.RebalanceTimeout(rebalanceTimeout),
+	}, nil
+}
+
+// resolveFetchMaxBytes maps kafka.fetchMaxBytes onto the ceiling a consumer
+// asks each broker for in a fetch. The wire field is an int32, so the parse is
+// bounded at 32 bits and a larger value is refused rather than wrapped into a
+// negative ceiling.
+func resolveFetchMaxBytes(options map[string]string) (int32, error) {
+	value, ok := options["kafka.fetchMaxBytes"]
+	if !ok {
+		return defaultKafkaFetchMaxBytes, nil
+	}
+	bytes, err := strconv.ParseInt(value, 10, 32)
+	if err != nil || bytes <= 0 {
+		return 0, fmt.Errorf("kafka: invalid kafka.fetchMaxBytes %q; must be an integer between 1 and %d", value, math.MaxInt32)
+	}
+	return int32(bytes), nil
+}
+
+// resolveSessionTimeout maps kafka.sessionTimeout onto the group member session
+// timeout. The member carries the value in its join request, so it is the
+// timeout the coordinator expires the member on rather than a local
+// approximation of it.
+func resolveSessionTimeout(options map[string]string) (time.Duration, error) {
+	value, ok := options["kafka.sessionTimeout"]
+	if !ok {
+		return defaultKafkaSessionTimeout, nil
+	}
+	timeout, err := time.ParseDuration(value)
+	if err != nil || timeout <= 0 {
+		return 0, fmt.Errorf("kafka: invalid kafka.sessionTimeout %q; must be a positive duration", value)
+	}
+	return timeout, nil
+}
+
+// resolveRebalanceTimeout maps kafka.rebalanceTimeout onto the group member
+// rebalance timeout: the window the broker allows a member to complete a
+// rebalance before removing it from the group.
+func resolveRebalanceTimeout(options map[string]string) (time.Duration, error) {
+	value, ok := options["kafka.rebalanceTimeout"]
+	if !ok {
+		return defaultKafkaRebalanceTimeout, nil
+	}
+	timeout, err := time.ParseDuration(value)
+	if err != nil || timeout <= 0 {
+		return 0, fmt.Errorf("kafka: invalid kafka.rebalanceTimeout %q; must be a positive duration", value)
+	}
+	return timeout, nil
+}
+
 func newConsumerGroup() (string, error) {
 	var raw [16]byte
 	if _, err := rand.Read(raw[:]); err != nil {
@@ -722,6 +868,43 @@ func (c *consumer) leaveLoop() {
 	}
 }
 
+// claimPollWake registers cancel as the interrupt for the poll wait about to
+// begin and reports whether a wake is already pending. It takes c.mu itself, so
+// the caller must not hold it.
+//
+// The pending flush and this registration are two steps, so a wake that lands
+// between them would otherwise be lost: the loop would block on a broker that
+// has nothing left to send, still holding the records the wake was meant to
+// release.
+func (c *consumer) claimPollWake(cancel context.CancelFunc) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.pollWakePending {
+		c.pollWakePending = false
+		return true
+	}
+	c.pollCancel = cancel
+	return false
+}
+
+// releasePollWake forgets the interrupt registered by claimPollWake. A wake
+// that races this call cancels an already finished wait, which is harmless.
+func (c *consumer) releasePollWake() {
+	c.mu.Lock()
+	c.pollCancel = nil
+	c.mu.Unlock()
+}
+
+// wakePollLocked interrupts the poll wait so the loop admits again over the
+// records it is holding. It never blocks: a wake that finds no wait in progress
+// records itself for the next one. The caller must hold c.mu.
+func (c *consumer) wakePollLocked() {
+	c.pollWakePending = true
+	if c.pollCancel != nil {
+		c.pollCancel()
+	}
+}
+
 func (c *consumer) poll(ctx context.Context) {
 	defer close(c.pollDone)
 	defer c.client.AllowRebalance()
@@ -730,32 +913,39 @@ func (c *consumer) poll(ctx context.Context) {
 		if !c.flushPending(&pending) {
 			return
 		}
-		c.clearDeferredReasons(pending)
+		c.syncDeferredPauses(pending)
 
 		fetchCtx := ctx
 		bounded := false
+		var cancelFetch context.CancelFunc
 		if due, ok := c.pendingDeadline(pending); ok {
-			var cancel context.CancelFunc
-			fetchCtx, cancel = context.WithDeadline(ctx, due)
+			fetchCtx, cancelFetch = context.WithDeadline(ctx, due)
 			bounded = true
-			fetches := c.client.PollRecords(fetchCtx, 0)
-			cancel()
-			if ctx.Err() != nil || fetches.IsClientClosed() {
-				c.client.AllowRebalance()
-				return
-			}
-			if !c.handleFetches(&pending, fetches, bounded) {
-				return
-			}
+		} else {
+			fetchCtx, cancelFetch = context.WithCancel(ctx)
+		}
+		if c.claimPollWake(cancelFetch) {
+			cancelFetch()
 			continue
 		}
 
-		fetches := c.client.PollRecords(fetchCtx, 1)
+		var fetches kgo.Fetches
+		if bounded {
+			fetches = c.client.PollRecords(fetchCtx, 0)
+		} else {
+			fetches = c.client.PollRecords(fetchCtx, 1)
+		}
+		// A wake ends the wait with a synthetic cancellation fetch. It reports
+		// no broker fault; it reports that admission has to run over pending
+		// again, which is what a bounded poll's own timeout also asks for.
+		woken := fetchCtx.Err() != nil && ctx.Err() == nil
+		cancelFetch()
+		c.releasePollWake()
 		if ctx.Err() != nil || fetches.IsClientClosed() {
 			c.client.AllowRebalance()
 			return
 		}
-		if !c.handleFetches(&pending, fetches, bounded) {
+		if !c.handleFetches(&pending, fetches, bounded || woken) {
 			return
 		}
 	}
@@ -1296,11 +1486,33 @@ func (c *consumer) trackerForLocked(record *kgo.Record) *ackTracker {
 }
 
 // trackerBaseLocked returns the offset a fresh tracker for key must start at.
-// A reserved offset below the first broker record still has no live path on
-// this consumer: its handoff is queued, or taken and not yet emitted. Starting
-// the tracker past it would make TrackRedelivery report the handoff as already
-// settled, dropping the offset's only live settlement path.
+// Offsets below the base count as settled, so the base is the lowest offset on
+// the partition this consumer still owes a delivery for.
+//
+// The first record delivered is not that offset, because delivery follows due
+// times rather than log order: a record published ahead of a nearer due time is
+// delivered after it, so the lowest offset the consumer holds can be the last
+// one delivered. Starting the tracker at the delivered record's own offset
+// would then report the held record as already settled and drop it, losing the
+// offset. The records fetched for this partition and not delivered yet, which
+// is every record whose delivery is still owed, are what the base is taken from
+// instead. A record the loop is about to discard does not count, so an offset
+// that will never be delivered cannot hold the base down.
+//
+// A reserved offset below them still has no live path on this consumer: its
+// handoff is queued, or taken and not yet emitted. Starting the tracker past it
+// would make TrackRedelivery report the handoff as already settled, dropping
+// the offset's only live settlement path.
 func (c *consumer) trackerBaseLocked(key partitionKey, base int64) int64 {
+	for record := range c.recordGenerations {
+		if record.Topic != key.destination || record.Partition != key.partition || record.Offset >= base {
+			continue
+		}
+		if c.isRecordStaleLocked(record) {
+			continue
+		}
+		base = record.Offset
+	}
 	settled := c.settledTransfers[key]
 	for offset := range c.transferReservations[key] {
 		if _, done := settled[offset]; done || offset >= base {
@@ -2130,20 +2342,37 @@ func (c *consumer) setPauseReasonLocked(destination string, reason pauseReason, 
 		reasons = make(pauseReasonSet)
 		c.pauseReasons[destination] = reasons
 	}
+	if _, present := reasons[reason]; present == add {
+		return
+	}
+	paused := reasons.holdsFetches()
 	if add {
-		if !reasons.add(reason) {
-			return
-		}
-		if len(reasons) == 1 {
-			c.client.PauseFetchTopics(destination)
-		}
+		reasons.add(reason)
 	} else {
-		if !reasons.remove(reason) {
-			return
-		}
-		if len(reasons) == 0 && !c.draining && !c.stopped {
-			c.client.ResumeFetchTopics(destination)
-		}
+		reasons.remove(reason)
+	}
+	switch {
+	case !paused && reasons.holdsFetches():
+		c.client.PauseFetchTopics(destination)
+	case !add && !reasons.holdsFetches() && !c.draining && !c.stopped:
+		// A removal that leaves the fetches unheld releases them, whether or
+		// not the set ever held them. The deferred reason is the only reason
+		// that does not hold the fetches itself: it is the gate that refuses
+		// a requeued record before its due time, so a record the poll loop
+		// took out of franz-go and could not admit is waiting for exactly
+		// this removal, and resuming fetch does not reach it.
+		//
+		// Ending the wait is part of the release. The poll that follows a
+		// release with nothing waiting has no deadline, so a broker with
+		// nothing left to hand over produces no other wake and the record is
+		// never admitted again.
+		//
+		// The resume is unconditional because fetching can also be paused on
+		// this destination from outside this bookkeeping, which a lane fault
+		// does; resuming a destination that is not paused is a no-op in
+		// franz-go.
+		c.client.ResumeFetchTopics(destination)
+		c.wakePollLocked()
 	}
 }
 
@@ -2270,6 +2499,10 @@ func (c *consumer) closeTeardown(ctx context.Context) {
 		c.client.Close()
 	}
 	c.conn.removeConsumer(c)
+	// The move runs after the client is closed, so no rebalance callback can
+	// queue another handoff here, and after the consumer is unregistered, so no
+	// peer can take one from this queue. The snapshot is then complete.
+	c.moveQueuedHandoffsOnLeave()
 	if c.synthesizedGroup {
 		if err := c.deleteGroup(ctx); err != nil {
 			c.sendError(err)
@@ -2338,10 +2571,28 @@ func (c *consumer) Release(ctx context.Context) error {
 	}
 	c.assignmentMu.Lock()
 	c.mu.Lock()
+	// Every settler still here is a live settlement path this Release is about
+	// to abandon without settling, its offset uncommitted, so the peer
+	// reservation that filtered the broker's copy has to go while this member
+	// still owns the partition: a peer assigned the partition after the leave
+	// fetches from the committed offset and moves past a record the reservation
+	// hid. An offset with a queued handoff is left out, because that copy still
+	// needs the reservation until it is delivered or settled. Stop cannot reach
+	// any of this: it refuses while a settler is outstanding.
+	reservations := make([]transferReservation, 0)
+	for settler := range c.settlers {
+		if _, queued := c.handoffs[settler.key][settler.record.Offset]; queued {
+			continue
+		}
+		reservations = append(reservations, transferReservation{key: settler.key, offset: settler.record.Offset})
+	}
 	trackers := c.detachAllTrackersLocked()
 	c.mu.Unlock()
 	c.assignmentMu.Unlock()
 
+	for _, reservation := range reservations {
+		c.clearTransferReservation(reservation.key, reservation.offset)
+	}
 	for _, tracker := range trackers {
 		tracker.Drop()
 	}
@@ -2664,7 +2915,14 @@ func (c *consumer) takeHandoffs(partitions map[string][]int32) []consumerHandoff
 func (c *consumer) requeueHandoff(message driver.InboundMessage) {
 	key := partitionKey{destination: message.Destination, partition: message.Ref.Partition}
 	c.mu.Lock()
-	defer c.mu.Unlock()
+	if c.leftConnection {
+		// This consumer has left the connection, so a copy stored here would sit
+		// in a queue no dispatch scans. Forward it instead; forwardHandoffs takes
+		// its own locks, so c.mu is released first.
+		c.mu.Unlock()
+		c.forwardHandoffs(message)
+		return
+	}
 	if c.handoffs == nil {
 		c.handoffs = make(map[partitionKey]map[int64]driver.InboundMessage)
 	}
@@ -2674,10 +2932,100 @@ func (c *consumer) requeueHandoff(message driver.InboundMessage) {
 		c.handoffs[key] = offsets
 	}
 	offsets[message.Ref.Offset] = message
+	c.mu.Unlock()
+}
+
+// forwardHandoffs places copies this consumer can no longer queue on a
+// registered consumer, which offers each one to whichever consumer is eligible,
+// now or at that consumer's next capacity release.
+//
+// It takes its own locks: the caller must hold none. The peer snapshot is taken
+// under conn.mu.RLock and released before any consumer lock is taken, and each
+// requeue and dispatch takes one consumer's mutex at a time.
+func (c *consumer) forwardHandoffs(handoffs ...driver.InboundMessage) {
+	if c.conn == nil || len(handoffs) == 0 {
+		return
+	}
+	keys := make(map[partitionKey]struct{}, len(handoffs))
+	for _, message := range handoffs {
+		keys[partitionKey{destination: message.Destination, partition: message.Ref.Partition}] = struct{}{}
+	}
+	c.conn.mu.RLock()
+	var peer *consumer
+	for candidate := range c.conn.consumers {
+		if candidate != c {
+			peer = candidate
+			break
+		}
+	}
+	c.conn.mu.RUnlock()
+	if peer == nil {
+		// Nothing is left to filter these offsets, so dropping the copies loses
+		// nothing. Every reservation for them lived on a consumer that has since
+		// left the connection, and a reservation stops filtering the moment its
+		// holder stops fetching; the broker's own redelivery of each uncommitted
+		// offset is therefore visible again and arrives at the next start. A copy
+		// kept here instead would sit in a queue no dispatch scans.
+		return
+	}
+	for _, message := range handoffs {
+		peer.requeueHandoff(message)
+	}
+	for key := range keys {
+		go peer.dispatchHandoffs(key)
+	}
+}
+
+// moveQueuedHandoffsOnLeave hands the queued copies held by c to a registered
+// consumer before c leaves the connection, so each offset keeps a live
+// settlement path. It marks c as left in the same hold that takes the queue, so
+// no copy can be stored here after the snapshot: a concurrent requeue either
+// takes c.mu before that hold, and its copy travels in the snapshot, or takes it
+// after, and its copy is forwarded.
+func (c *consumer) moveQueuedHandoffsOnLeave() {
+	if c.conn == nil {
+		return
+	}
+	c.mu.Lock()
+	handoffs := make([]driver.InboundMessage, 0)
+	keys := make(map[partitionKey]struct{})
+	for key, offsets := range c.handoffs {
+		for _, message := range offsets {
+			handoffs = append(handoffs, message)
+		}
+		keys[key] = struct{}{}
+	}
+	clear(c.handoffs)
+	for key := range keys {
+		// This consumer never commits again, so its commit coverage cannot
+		// suppress a moved copy and means nothing to a peer.
+		delete(c.pendingTransfers, key)
+	}
+	c.leftConnection = true
+	c.mu.Unlock()
+	c.forwardHandoffs(handoffs...)
 }
 
 func (c *consumer) emitHandoff(source *consumer, message driver.InboundMessage) {
 	key := partitionKey{destination: message.Destination, partition: message.Ref.Partition}
+	// The source is checked before the target's lock is taken: no consumer's mu
+	// is held while another consumer's mu is acquired. Two emissions in
+	// opposite directions would otherwise take the same two locks in opposite
+	// orders, and nothing is lost by checking first, because the source
+	// snapshot is already stale the moment its lock is released: the decision
+	// below acts on a snapshot taken earlier either way.
+	sourceHolds := false
+	if source != nil && source != c {
+		source.mu.Lock()
+		for settler := range source.settlers {
+			if settler.key == key && settler.record.Offset == message.Ref.Offset &&
+				!settler.tombstoned && settler.tracker != nil {
+				sourceHolds = true
+				break
+			}
+		}
+		source.mu.Unlock()
+	}
 	c.mu.Lock()
 	if offsets := c.settledTransfers[key]; offsets != nil {
 		if _, marked := offsets[message.Ref.Offset]; marked {
@@ -2719,18 +3067,6 @@ func (c *consumer) emitHandoff(source *consumer, message driver.InboundMessage) 
 			handoffLive = settler.handoffDelivered
 			break
 		}
-	}
-	sourceHolds := false
-	if source != nil && source != c {
-		source.mu.Lock()
-		for settler := range source.settlers {
-			if settler.key == key && settler.record.Offset == message.Ref.Offset &&
-				!settler.tombstoned && settler.tracker != nil {
-				sourceHolds = true
-				break
-			}
-		}
-		source.mu.Unlock()
 	}
 	if (liveSettler && !handoffLive) || sourceHolds {
 		c.mu.Unlock()

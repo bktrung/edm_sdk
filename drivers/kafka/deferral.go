@@ -14,6 +14,11 @@ const (
 	kafkaDeferralUpperNumerator  = 3
 	kafkaDeferralBandDenominator = 2
 	kafkaMaxDuration             = time.Duration(1<<63 - 1)
+	// kafkaDeferredHoldMinimum is the floor under a destination's hold limit.
+	// One waiting record must never be enough to hold a destination's fetches:
+	// the record behind it can be due sooner, and holding there is what makes
+	// it wait for a due time that is not its own.
+	kafkaDeferredHoldMinimum = 2
 )
 
 type deferralDecision struct {
@@ -124,8 +129,12 @@ func (c *consumer) admissionLocked(record *kgo.Record) bool {
 		c.reportDeferralErrorLocked(record, decision.err)
 	}
 	if decision.wait {
-		// Topic-granular pausing also stalls other partitions on this topic;
-		// the bounded delay is the accepted cost of keeping pending memory bounded.
+		// The record waits for its due time, and this destination holds it.
+		// The reason gates redelivery of a record this destination already
+		// delivered; it deliberately does not hold the fetches, because a
+		// record behind this one may be due sooner and is only reachable by
+		// reading past it. syncDeferredPauses bounds how many records may wait
+		// and holds the fetches at that bound.
 		c.setPauseReasonLocked(destination, pauseReasonDeferred, true)
 	}
 
@@ -156,7 +165,7 @@ func (c *consumer) admissionLocked(record *kgo.Record) bool {
 
 func (s pauseReasonSet) blocksDelivery() bool {
 	for reason := range s {
-		if reason != pauseReasonDeferred {
+		if !reason.holding() {
 			return true
 		}
 	}
@@ -199,29 +208,65 @@ func (c *consumer) pendingDeadline(pending []*kgo.Record) (time.Time, bool) {
 	return earliest, found
 }
 
-func (c *consumer) clearDeferredReasons(pending []*kgo.Record) {
-	var future map[string]struct{}
-	if len(pending) > 0 {
-		future = make(map[string]struct{}, len(pending))
-		now := c.currentTime()
-		for _, record := range pending {
-			delay, known := c.destinationDelay(record.Topic)
-			if evaluateDeferral(record, delay, known, now).wait {
-				future[record.Topic] = struct{}{}
-			}
-		}
-	}
+// syncDeferredPauses reconciles the deferred pauses with the records the poll
+// loop is holding. The loop runs it before every poll, so both pauses follow
+// the records in hand rather than the last admission.
+//
+// The two pauses are deliberately different. The deferred reason marks a
+// destination that holds a record waiting for its due time and gates
+// redelivery only. The hold reason is what keeps franz-go from fetching a
+// destination that already holds its fill of records waiting for a due time,
+// and that bound is the only thing the driver spends on records it cannot
+// deliver yet. Pausing the fetches at the first waiting record instead, as the
+// marker used to, holds the destination at a due time that is not the next one
+// owed: every record behind that one waits for it, however much sooner its own
+// due time is.
+func (c *consumer) syncDeferredPauses(pending []*kgo.Record) {
+	held := c.heldByDestination(pending)
 
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	// Releases run first, so no destination enters the map while it is ranged.
 	for destination, reasons := range c.pauseReasons {
-		if _, deferred := reasons[pauseReasonDeferred]; !deferred {
-			continue
-		}
-		if _, remains := future[destination]; !remains {
-			// This is the only removal site for deferred: a re-check found
-			// no pending record for this destination that is still not due.
+		if _, deferred := reasons[pauseReasonDeferred]; deferred && held[destination] == 0 {
 			c.setPauseReasonLocked(destination, pauseReasonDeferred, false)
 		}
+		if _, full := reasons[pauseReasonHold]; full && held[destination] < c.deferredHoldLimit(destination) {
+			c.setPauseReasonLocked(destination, pauseReasonHold, false)
+		}
 	}
+	for destination, count := range held {
+		c.setPauseReasonLocked(destination, pauseReasonDeferred, true)
+		if count >= c.deferredHoldLimit(destination) {
+			c.setPauseReasonLocked(destination, pauseReasonHold, true)
+		}
+	}
+}
+
+// heldByDestination counts, per destination, the records pending is holding
+// that are not yet due. A record that is due is not one of them: the next
+// flushPending delivers it.
+func (c *consumer) heldByDestination(pending []*kgo.Record) map[string]int {
+	if len(pending) == 0 {
+		return nil
+	}
+	held := make(map[string]int, len(c.destinations))
+	now := c.currentTime()
+	for _, record := range pending {
+		delay, known := c.destinationDelay(record.Topic)
+		if evaluateDeferral(record, delay, known, now).wait {
+			held[record.Topic]++
+		}
+	}
+	return held
+}
+
+// deferredHoldLimit is how many records waiting for a due time a destination
+// may hold before its fetches are held. The admission budget is the operator's
+// read-ahead knob and bounds how much work one destination keeps in flight, and
+// the floor keeps the guarantee this pause must not spend: one waiting record
+// is the record the poll loop is waiting for, and holding the fetches at that
+// first record is what hides everything behind it.
+func (c *consumer) deferredHoldLimit(destination string) int {
+	return max(c.budgets[destination], kafkaDeferredHoldMinimum)
 }

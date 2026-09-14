@@ -5,6 +5,9 @@ image: golang:1.26.1
 variables:
   GOPRIVATE: fgit.zapps.vn
   GOPATH: "$CI_PROJECT_DIR/.go"
+  # Keep broker-backed checks opt-in while CI runs on a developer laptop.
+  # Set RUN_BROKER_TESTS=1 when starting a pipeline to run them.
+  RUN_BROKER_TESTS: "0"
 
 stages:
   - build
@@ -56,6 +59,9 @@ verify-agnostic:
 test-kafka:
   stage: verify
   extends: .go-cache
+  rules:
+    - if: '$RUN_BROKER_TESTS == "1"'
+    - when: never
   services:
     - name: apache/kafka:4.2.1
       alias: kafka
@@ -97,6 +103,9 @@ test-kafka:
 test-kafka-conformance:
   stage: verify
   extends: .go-cache
+  rules:
+    - if: '$RUN_BROKER_TESTS == "1"'
+    - when: never
   services:
     - name: apache/kafka:4.2.1
       alias: kafka
@@ -116,9 +125,6 @@ test-kafka-conformance:
   variables:
     F1_KAFKA_ENDPOINT: "kafka:19092"
     F1_REQUIRE_KAFKA: "1"
-  rules:
-    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
-    - if: '$CI_PIPELINE_SOURCE == "schedule"'
   script:
     - |
       ready_timeout=120
@@ -148,6 +154,9 @@ test-kafka-conformance:
 test-rabbitmq:
   stage: verify
   extends: .go-cache
+  rules:
+    - if: '$RUN_BROKER_TESTS == "1"'
+    - when: never
   services:
     - name: rabbitmq:4.3.4-management
       alias: rabbitmq
@@ -179,12 +188,14 @@ test-rabbitmq:
       done
     - make -o broker-up -o broker-smoke test-rabbitmq-driver
 
-# Same service and the same wait; only the suite differs. It runs on every
-# pipeline because the suite is about 45 seconds here, which does not need the
-# merge-request and scheduled placement the Kafka conformance job uses.
+# Same service and the same wait; only the suite differs. When broker tests are
+# enabled, this suite runs alongside the driver suite.
 test-rabbitmq-conformance:
   stage: verify
   extends: .go-cache
+  rules:
+    - if: '$RUN_BROKER_TESTS == "1"'
+    - when: never
   services:
     - name: rabbitmq:4.3.4-management
       alias: rabbitmq

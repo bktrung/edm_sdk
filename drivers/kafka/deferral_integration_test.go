@@ -1,3 +1,5 @@
+//go:build integration
+
 package kafka
 
 import (
@@ -5,6 +7,8 @@ import (
 	"context"
 	"io"
 	"log/slog"
+	"maps"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -289,6 +293,286 @@ func TestPendingDeadlineIgnoresUnknownDestinationAlongsideDeferrable(t *testing.
 	deadline, ok := c.pendingDeadline([]*kgo.Record{rUnknown, rKnown})
 	if !ok || !deadline.Equal(wantDue) {
 		t.Fatalf("pendingDeadline(unknown + known) = %s, %t; want %s, true", deadline, ok, wantDue)
+	}
+}
+
+// newDeferredConsumerClient returns a franz-go client for a consumer a test
+// builds by hand. It seeds a port nothing listens on because nothing on this
+// path dials: the driver's two pause calls only record state on the client, so
+// these tests reach them without a fixture and without touching a broker
+// another worktree is running.
+func newDeferredConsumerClient(t *testing.T) *kgo.Client {
+	t.Helper()
+	client, err := kgo.NewClient(kgo.SeedBrokers("localhost:1"))
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+	t.Cleanup(client.Close)
+	return client
+}
+
+// TestDeferredPausesHoldFetchesOnlyAtTheHoldLimit pins the trade this pause
+// makes: a destination keeps its fetches until it holds its fill of records
+// waiting for a due time, and only then are they held. Holding at the first
+// waiting record hides a record behind it that is due sooner, and never holding
+// them is unbounded pending memory, so both edges are checked.
+func TestDeferredPausesHoldFetchesOnlyAtTheHoldLimit(t *testing.T) {
+	now := time.Unix(100, 0)
+	const (
+		destination = "retry"
+		delay       = 10 * time.Second
+	)
+	newConsumer := func(budget int) *consumer {
+		return &consumer{
+			client:       newDeferredConsumerClient(t),
+			conn:         &conn{delays: map[string]time.Duration{destination: delay}},
+			budgets:      map[string]int{destination: budget},
+			pauseReasons: make(map[string]pauseReasonSet),
+			unsettled:    make(map[string]int),
+			clock:        clock.NewFake(now),
+		}
+	}
+	// A due time inside the destination's declared band, so each record is one
+	// the driver holds for its own due time rather than one it faults on.
+	waiting := func(offsets ...int64) []*kgo.Record {
+		records := make([]*kgo.Record, 0, len(offsets))
+		for _, offset := range offsets {
+			records = append(records, deferredTestTopicRecord(destination, 0, offset, now, now.Add(delay)))
+		}
+		return records
+	}
+	// heldFetches is what the driver tells franz-go about the destination, and
+	// deferred is the gate that refuses a redelivery past it.
+	state := func(c *consumer) (heldFetches, deferred bool) {
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		reasons := c.pauseReasons[destination]
+		_, deferred = reasons[pauseReasonDeferred]
+		return reasons.holdsFetches(), deferred
+	}
+
+	// The floor. One waiting record is the record the loop is waiting for, and
+	// the fetches stay open so any record behind it can be read. A budget of
+	// one is the case the floor exists for: without it the hold limit is one
+	// and this one record holds the fetches.
+	c := newConsumer(1)
+	c.syncDeferredPauses(waiting(0))
+	if heldFetches, deferred := state(c); heldFetches || !deferred {
+		t.Fatalf("fetches held = %t, deferred reason set = %t after one waiting record with a budget of one and a hold limit of %d; want false, true",
+			heldFetches, deferred, c.deferredHoldLimit(destination))
+	}
+
+	// A budget of two is reached by two waiting records, and the fetches are
+	// held there even though the deferred reason itself does not hold them.
+	c = newConsumer(2)
+	c.syncDeferredPauses(waiting(0, 1))
+	if heldFetches, deferred := state(c); !heldFetches || !deferred {
+		t.Fatalf("fetches held = %t, deferred reason set = %t after two waiting records with a budget of two; want true, true", heldFetches, deferred)
+	}
+
+	// One of them coming due releases the hold and leaves the gate: the record
+	// still waiting is refused a redelivery, which is admission's job, and not
+	// the fetching's.
+	c.syncDeferredPauses(waiting(0))
+	if heldFetches, deferred := state(c); heldFetches || !deferred {
+		t.Fatalf("fetches held = %t, deferred reason set = %t after one of two records was delivered; want false, true", heldFetches, deferred)
+	}
+
+	// The budget is the operator's read-ahead knob, so a destination it holds
+	// above the floor holds nothing until the waiting records reach it.
+	c = newConsumer(3)
+	c.syncDeferredPauses(waiting(0, 1))
+	if heldFetches, _ := state(c); heldFetches {
+		t.Fatal("fetches held = true after two waiting records with a budget of three, want false")
+	}
+
+	// Nothing waiting leaves neither the gate nor the hold.
+	c.syncDeferredPauses(nil)
+	if heldFetches, deferred := state(c); heldFetches || deferred {
+		t.Fatalf("fetches held = %t, deferred reason set = %t with nothing waiting; want false, false", heldFetches, deferred)
+	}
+}
+
+// TestDeferredReasonLeavingWakesThePollLoop pins the release that never crossed
+// a fetch pause. A record waiting for its due time puts the deferred reason on
+// its destination without holding the fetches, so that reason can leave a
+// destination whose fetches were never held, and it is still the event that
+// admits what it was refusing. A resume does not reach a record the poll loop
+// took out of franz-go, so the release has to end the wait.
+func TestDeferredReasonLeavingWakesThePollLoop(t *testing.T) {
+	now := time.Unix(100, 0)
+	const (
+		destination = "retry"
+		delay       = 10 * time.Second
+	)
+	woke := make(chan struct{}, 1)
+	c := &consumer{
+		client:       newDeferredConsumerClient(t),
+		conn:         &conn{delays: map[string]time.Duration{destination: delay}},
+		budgets:      map[string]int{destination: 2},
+		pauseReasons: make(map[string]pauseReasonSet),
+		unsettled:    make(map[string]int),
+		clock:        clock.NewFake(now),
+		pollCancel: func() {
+			select {
+			case woke <- struct{}{}:
+			default:
+			}
+		},
+	}
+
+	// One waiting record and a budget of two leaves the fetches unheld, so
+	// nothing in this sequence is a fetch transition and there is no wait to
+	// end yet.
+	c.syncDeferredPauses([]*kgo.Record{deferredTestTopicRecord(destination, 0, 0, now, now.Add(delay))})
+	c.mu.Lock()
+	reasons := c.pauseReasons[destination]
+	_, deferred := reasons[pauseReasonDeferred]
+	gated := deferred && !reasons.holdsFetches()
+	c.mu.Unlock()
+	if !gated {
+		t.Fatalf("deferred reason set = %t, fetches held = %t after one waiting record with a budget of two; want a gate without a hold", deferred, reasons.holdsFetches())
+	}
+	select {
+	case <-woke:
+		t.Fatal("setting the deferred reason ended a wait, want no wake")
+	default:
+	}
+
+	// The waiting record is delivered, and the gate goes with it.
+	c.syncDeferredPauses(nil)
+	c.mu.Lock()
+	empty := c.pauseReasons[destination].empty()
+	c.mu.Unlock()
+	if !empty {
+		t.Fatal("the deferred reason survived the delivery of the record waiting past it")
+	}
+	select {
+	case <-woke:
+	default:
+		t.Fatal("the deferred reason leaving did not end the poll wait")
+	}
+}
+
+// TestConsumerDeferredNearerDueTimeIsNotHeldBehindFartherDueTime holds the
+// driver to a due time of its own. Two delayed records share one destination
+// and one partition, so the nearer record is behind the farther one in the log,
+// and the nearer one is owed at its own due time whatever was published before
+// it. Both orders are run: publishing the farther one first is the order that
+// leaves a reader waiting for a due time that is not its own.
+//
+// One partition is deliberate. A pause coarser than a record cannot deliver the
+// nearer record on time, because reaching it means reading past a record that
+// is not due yet.
+func TestConsumerDeferredNearerDueTimeIsNotHeldBehindFartherDueTime(t *testing.T) {
+	const (
+		declaredDelay = 3 * time.Second
+		nearOffset    = 2 * time.Second
+		farOffset     = 4 * time.Second
+		lateBound     = 700 * time.Millisecond
+	)
+	for _, order := range []struct {
+		name         string
+		fartherFirst bool
+	}{
+		{name: "farther due time published first", fartherFirst: true},
+		{name: "nearer due time published first"},
+	} {
+		t.Run(order.name, func(t *testing.T) {
+			// The connection built here falls back to the process default
+			// logger, so a deferral fault on the path under test is captured
+			// rather than printed and forgotten.
+			var logged deferralLogSink
+			swapProcessDefault(t, &logged)
+
+			ctx, connection, admin := openKafkaAdminTest(t)
+			topic := kafkaTestTopic(t, "deferred-due-order")
+			group := kafkaTestTopic(t, "deferred-due-order-group")
+			cleanupKafkaTopics(t, admin, topic)
+			cleanupKafkaGroups(t, admin, group)
+			createKafkaTopic(t, admin, ctx, topic, 1)
+			if _, err := connection.Admin().EnsureTopology(ctx, driver.TopologySpec{
+				Destinations: []driver.DestinationSpec{{Name: topic, Delay: declaredDelay}},
+				Effective:    connection.Capabilities(),
+			}); err != nil {
+				t.Fatalf("EnsureTopology: %v", err)
+			}
+			producer, err := connection.Producer(ctx, driver.ProducerConfig{Effective: connection.Capabilities()})
+			if err != nil {
+				t.Fatalf("Producer: %v", err)
+			}
+			t.Cleanup(func() { _ = producer.Close(context.Background()) })
+			consumerValue, err := connection.Consumer(ctx, driver.ConsumerConfig{
+				Group: group, Destinations: []string{topic}, Prefetch: 2, Effective: connection.Capabilities(),
+			})
+			if err != nil {
+				t.Fatalf("Consumer: %v", err)
+			}
+			t.Cleanup(func() { closeKafkaConsumer(consumerValue) })
+
+			// Each due time is measured from its own publish instant, because a
+			// driver bounds a due time against the record's own timestamp.
+			publish := func(body string, offset time.Duration) time.Time {
+				t.Helper()
+				due := kafkaNow().Add(offset)
+				if err := producer.Publish(ctx, driver.OutboundMessage{
+					Destination: topic, Body: []byte(body), DelayUntil: due,
+				}); err != nil {
+					t.Fatalf("Publish(%s): %v", body, err)
+				}
+				return due
+			}
+			start := kafkaNow()
+			var nearDue, farDue time.Time
+			if order.fartherFirst {
+				farDue = publish("due-order-far", farOffset)
+				nearDue = publish("due-order-near", nearOffset)
+			} else {
+				nearDue = publish("due-order-near", nearOffset)
+				farDue = publish("due-order-far", farOffset)
+			}
+			if farDue.Sub(nearDue) <= lateBound {
+				t.Fatalf("due times %s and %s are only %s apart, which cannot show a release in the wrong order",
+					nearDue, farDue, farDue.Sub(nearDue))
+			}
+
+			received := make(map[string]driver.InboundMessage, 2)
+			for range 2 {
+				message := receiveKafkaMessageBefore(t, consumerValue, farDue.Add(2*lateBound))
+				received[string(message.Body)] = message
+				if err := message.Settle.Ack(ctx); err != nil {
+					t.Fatalf("Ack(%q): %v", message.Body, err)
+				}
+			}
+			for _, want := range []struct {
+				body string
+				due  time.Time
+			}{
+				{body: "due-order-near", due: nearDue},
+				{body: "due-order-far", due: farDue},
+			} {
+				message, ok := received[want.body]
+				if !ok {
+					t.Fatalf("bodies delivered = %v, want %q", slices.Sorted(maps.Keys(received)), want.body)
+				}
+				late := message.ReceivedAt.Sub(want.due)
+				t.Logf("body=%q arrived=%dms due=%dms late=%dms",
+					want.body,
+					message.ReceivedAt.Sub(start)/time.Millisecond,
+					want.due.Sub(start)/time.Millisecond,
+					late/time.Millisecond,
+				)
+				if late < 0 {
+					t.Fatalf("body %q arrived at %s, before its due time %s", want.body, message.ReceivedAt, want.due)
+				}
+				if late > lateBound {
+					t.Fatalf("body %q arrived at %s, %s after its due time %s", want.body, message.ReceivedAt, late, want.due)
+				}
+			}
+			if faults := logged.String(); strings.Contains(faults, "kafka deferred delivery fault") {
+				t.Fatalf("in-band due times logged a deferral fault: %s", faults)
+			}
+		})
 	}
 }
 

@@ -15,6 +15,7 @@
     "Conn",
     "Consumer",
     "ConsumerConfig",
+    "DelayAccuracy",
     "DestBackstopDLQ",
     "DestDLQ",
     "DestKind",

@@ -93,11 +93,14 @@ func (a *adminOperations) DescribeTopology(ctx context.Context, names []string) 
 		}
 		depth[name] = int64(ready)
 		if _, ok := deferred[name]; ok {
-			parked, parkErr := a.inspectQueue(ctx, name+".park")
-			if parkErr != nil && !isNotFound(parkErr) {
-				return driver.TopologyState{}, classifyAMQP("describe_topology", driver.KindTransient, parkErr)
-			}
-			if parkErr == nil {
+			for _, parkName := range parkQueueNames(name) {
+				parked, parkErr := a.inspectQueue(ctx, parkName)
+				if parkErr != nil {
+					if isNotFound(parkErr) {
+						continue
+					}
+					return driver.TopologyState{}, classifyAMQP("describe_topology", driver.KindTransient, parkErr)
+				}
 				depth[name] += int64(parked)
 			}
 		}
@@ -127,11 +130,22 @@ func (a *adminOperations) Purge(ctx context.Context, destination string) (int64,
 	if !hasParking {
 		return int64(count), nil
 	}
-	parked, err := channel.QueuePurge(destination+".park", false)
-	if err != nil {
-		return int64(count), classifyAMQP("purge", driver.KindTransient, err)
+	total := int64(count)
+	for _, parkName := range parkQueueNames(destination) {
+		purged, err := channel.QueuePurge(parkName, false)
+		if err != nil {
+			// A parking queue that is not there holds nothing, which is the
+			// state an upgraded deployment starts in: the rung queues are
+			// created by the topology pass, and Purge of the destination is
+			// still the operation an application calls to empty it.
+			if isNotFound(err) {
+				continue
+			}
+			return total, classifyAMQP("purge", driver.KindTransient, err)
+		}
+		total += int64(purged)
 	}
-	return int64(count + parked), nil
+	return total, nil
 }
 
 func (a *adminOperations) Prune(ctx context.Context, names []string) ([]driver.PruneResult, error) {
@@ -151,36 +165,37 @@ func (a *adminOperations) Prune(ctx context.Context, names []string) ([]driver.P
 			results = append(results, result)
 			continue
 		}
-		parkName := name + ".park"
-		_, hasPark := findQueue(queues, parkName)
+		parking := existingParkQueues(queues, name)
 		mainReady, mainConsumers, inspectErr := a.inspectQueueWithConsumers(ctx, name)
 		if inspectErr != nil {
 			result.Reason = "destination disappeared before deletion"
 			results = append(results, result)
 			continue
 		}
-		parkReady := int64(0)
-		if hasPark {
-			parkReady, inspectErr = a.inspectQueue(ctx, parkName)
-			if inspectErr != nil {
+		refused := false
+		for _, parkName := range parking {
+			parkReady, parkErr := a.inspectQueue(ctx, parkName)
+			if parkErr != nil {
 				result.Reason = "parking destination disappeared before deletion"
-				results = append(results, result)
-				continue
+				refused = true
+				break
+			}
+			if reason := a.pruneReason(name, mainConsumers, mainReady, parkName, parkReady); reason != "" {
+				result.Reason = reason
+				refused = true
+				break
 			}
 		}
-		if reason := a.pruneReason(name, mainConsumers, mainReady, hasPark, parkReady); reason != "" {
-			result.Reason = reason
+		if refused {
 			results = append(results, result)
 			continue
 		}
-		if hasPark {
+		if len(parking) > 0 {
 			queues, err = a.conn.management.listQueues(ctx)
 			if err != nil {
 				return nil, classify("prune", driver.KindTransient, err)
 			}
-			_, exists = findQueue(queues, name)
-			_, hasPark = findQueue(queues, parkName)
-			if !exists {
+			if _, exists = findQueue(queues, name); !exists {
 				result.Reason = "destination disappeared before deletion"
 				results = append(results, result)
 				continue
@@ -191,31 +206,46 @@ func (a *adminOperations) Prune(ctx context.Context, names []string) ([]driver.P
 				results = append(results, result)
 				continue
 			}
-			parkReady, inspectErr = a.inspectQueue(ctx, parkName)
-			if inspectErr != nil {
-				result.Reason = "parking destination disappeared before deletion"
+			survivors := make([]string, 0, len(parking))
+			for _, parkName := range parking {
+				parkReady, parkErr := a.inspectQueue(ctx, parkName)
+				if parkErr != nil {
+					result.Reason = "parking destination disappeared before deletion"
+					refused = true
+					break
+				}
+				if reason := a.pruneReason(name, mainConsumers, mainReady, parkName, parkReady); reason != "" {
+					result.Reason = reason
+					refused = true
+					break
+				}
+				survivors = append(survivors, parkName)
+			}
+			if refused {
 				results = append(results, result)
 				continue
 			}
-			if reason := a.pruneReason(name, mainConsumers, mainReady, hasPark, parkReady); reason != "" {
-				result.Reason = reason
-				results = append(results, result)
-				continue
+			deletedAll := true
+			for _, parkName := range survivors {
+				if a.pruneBeforeDeleteHook != nil {
+					a.pruneBeforeDeleteHook(parkName)
+				}
+				deleted, deleteErr := a.deleteQueue(ctx, parkName, true)
+				if errors.Is(deleteErr, errQueueNotPrunable) {
+					result.Reason = pruneDeleteReason(deleteErr, "parking destination is no longer prunable")
+					deletedAll = false
+					break
+				}
+				if deleteErr != nil {
+					return nil, classify("prune", driver.KindTransient, deleteErr)
+				}
+				if !deleted {
+					result.Reason = "parking destination disappeared before deletion"
+					deletedAll = false
+					break
+				}
 			}
-			if a.pruneBeforeDeleteHook != nil {
-				a.pruneBeforeDeleteHook(parkName)
-			}
-			deleted, deleteErr := a.deleteQueue(ctx, parkName, true)
-			if errors.Is(deleteErr, errQueueNotPrunable) {
-				result.Reason = pruneDeleteReason(deleteErr, "parking destination is no longer prunable")
-				results = append(results, result)
-				continue
-			}
-			if deleteErr != nil {
-				return nil, classify("prune", driver.KindTransient, deleteErr)
-			}
-			if !deleted {
-				result.Reason = "parking destination disappeared before deletion"
+			if !deletedAll {
 				results = append(results, result)
 				continue
 			}
@@ -236,7 +266,7 @@ func (a *adminOperations) Prune(ctx context.Context, names []string) ([]driver.P
 			results = append(results, result)
 			continue
 		}
-		if reason := a.pruneReason(name, mainConsumers, mainReady, false, 0); reason != "" {
+		if reason := a.pruneReason(name, mainConsumers, mainReady, "", 0); reason != "" {
 			result.Reason = reason
 			results = append(results, result)
 			continue
@@ -273,17 +303,36 @@ func findQueue(queues []managementQueue, name string) (managementQueue, bool) {
 	return managementQueue{}, false
 }
 
-func (a *adminOperations) pruneReason(name string, mainConsumers, mainReady int64, hasPark bool, parkReady int64) string {
+// pruneReason reports why a destination may not be deleted yet, or an empty
+// string when it may. auxiliary names the one parking queue whose ready count
+// was just read, and is empty for the check that runs after the parking queues
+// are gone.
+func (a *adminOperations) pruneReason(name string, mainConsumers, mainReady int64, auxiliary string, auxiliaryReady int64) string {
 	if mainConsumers > 0 || a.consumerCount(name) > 0 {
 		return fmt.Sprintf("destination %q has consumers attached", name)
 	}
 	if mainReady > 0 {
 		return fmt.Sprintf("destination %q holds %d ready message(s)", name, mainReady)
 	}
-	if hasPark && parkReady > 0 {
-		return fmt.Sprintf("auxiliary %q holds %d ready message(s)", name+".park", parkReady)
+	if auxiliary != "" && auxiliaryReady > 0 {
+		return fmt.Sprintf("auxiliary %q holds %d ready message(s)", auxiliary, auxiliaryReady)
 	}
 	return ""
+}
+
+// existingParkQueues lists the parking queues of a destination that the broker
+// has right now, in the order parkQueueNames declares them. A parking queue
+// that is not there holds nothing and needs no guard; a deployment that
+// predates the ladder simply has fewer of them, and one whose rung queue an
+// application drained by hand needs no refusal either.
+func existingParkQueues(queues []managementQueue, destination string) []string {
+	present := make([]string, 0, len(parkRungs)+1)
+	for _, parkName := range parkQueueNames(destination) {
+		if _, found := findQueue(queues, parkName); found {
+			present = append(present, parkName)
+		}
+	}
+	return present
 }
 
 func (a *adminOperations) consumerCount(destination string) int64 {

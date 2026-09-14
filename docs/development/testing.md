@@ -175,6 +175,12 @@ pending groups, fixture registration, and provider run paths.
 
 ## Broker-backed RabbitMQ and Kafka tests
 
+These tests live in `_integration_test.go` files behind the `//go:build
+integration` tag. A test file is an integration file, and is named
+`_integration_test.go`, if and only if it requires a process this repository did
+not start; the commands for both sides of that line are under "Which targets
+contact a broker" below.
+
 Use live broker tests only when the behavior depends on the provider or its
 client library. Examples include:
 
@@ -190,8 +196,9 @@ client library. Examples include:
 The [Makefile](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/Makefile) owns the broker lifecycle and suite targets.
 Use its `test-rabbitmq`, `test-kafka`, `test-kafka-conformance`,
 `test-infra`, and `test-driver-flip` targets instead of copying fixture setup
-into documentation or test scripts. The targets make unreachable required
-fixtures fail rather than silently turning a broker test into a skip.
+into documentation or test scripts. Each passes `-tags integration` and an
+explicit endpoint, so an unreachable fixture fails the run rather than turning
+that suite into a skip.
 
 `test-driver-flip` is the driver-flip acceptance: it builds the two
 `examples/acceptance` services once, runs the identical binaries against Kafka
@@ -201,6 +208,46 @@ Size the corpus with `F1_DRIVER_FLIP_CORPUS` (default 10 000). It is not a
 required gate: a known Kafka consumer stall can red it at any corpus size, so
 run it deliberately and read a red run as evidence about that defect rather than
 about broker agnosticism.
+
+### Which targets contact a broker
+
+A test file is an integration file, and is named `_integration_test.go`, if and
+only if it requires a process this repository did not start. Scope is irrelevant:
+a single-unit test that needs a broker is an integration file, and an untagged
+file may cross three packages. The file carries `//go:build integration` for the
+same reason, and the guard in `internal/testlayout` fails when the tag and the
+name disagree in either direction.
+
+That makes the split a compile-time one, so a run never decides at run time
+whether infrastructure is reachable. `make test-fast` and `make test` run every
+test that needs no broker; the integration files are not compiled into them at
+all, so no test in either run connects to a broker. Those two targets are the
+default gate and they stay runnable with nothing listening.
+
+`make test-infra` runs the other half, `go test -count=1 -p 1 -tags integration
+./...`, with Kafka and RabbitMQ started first. An unreachable fixture fails the
+run; nothing behind the tag skips. Packages run one at a time there because the
+broker-backed suites share both fixtures and the machine.
+
+The per-driver targets are the same tag with a narrower package list:
+`test-kafka`, `test-rabbitmq`, `test-rabbitmq-driver`,
+`test-rabbitmq-conformance`, `test-kafka-conformance`, and `test-driver-flip`.
+Each starts the fixtures it needs and passes `-tags integration`, so each one
+keeps running the tests it names.
+
+`F1_KAFKA_ENDPOINT` and `F1_RABBITMQ_ENDPOINT` say *where* a fixture is. Unset
+means the documented default address, and a test pointed at nothing fails rather
+than skipping. Point a run at your own fixture with `F1_KAFKA_ENDPOINT` (for
+example `localhost:19131`) and `F1_RABBITMQ_ENDPOINT` (for example
+`amqp://guest:guest@localhost:15131/`); the broker-backed targets honour both,
+falling back to the port their own `KAFKA_PORT` or `RABBITMQ_PORT` variable
+selects.
+
+Tests that build a `kgo` client only to inspect its resolved options, or to drive
+a path whose network calls are stubbed out, pass `noDialKafkaOption`. franz-go
+dials a seed broker from a background metadata fetch, so a client built from a
+compiled-in endpoint reaches whatever happens to be listening on that port, from
+a test that never needs a broker.
 
 Keep provider tests isolated from one another. Use the fixture cleanup helpers,
 remove queues, topics, and groups created by the test, and do not reset a
@@ -224,7 +271,7 @@ The shared fault contract is implemented in
 reconnect and lane-repair behavior is covered by
 [`reconnection_test.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/reconnection_test.go) and
 [`lane_repair_test.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/lane_repair_test.go). Provider-specific recovery
-belongs in [`drivers/rabbitmq/reconnect_test.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/drivers/rabbitmq/reconnect_test.go),
+belongs in [`drivers/rabbitmq/reconnect_integration_test.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/drivers/rabbitmq/reconnect_integration_test.go),
 the RabbitMQ fault injector, and the corresponding Kafka or in-memory tests.
 
 Delivery is at least once. Duplicate delivery, uncertain acknowledgement, and
@@ -312,9 +359,14 @@ make those tests meaningful:
   [`tools/apisurface`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/tree/main/tools/apisurface), and the owning Makefile
   targets are `check-api-surface` and its package-specific variants.
 - API-diff checks compare the current root, driver, and codec surfaces with
-  [`testdata/api-diff/`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/tree/main/testdata/api-diff). An incompatible change is
-  a release decision, not a baseline-maintenance detail; use the Makefile's
-  `check-api-diff` and explicitly approved baseline workflow.
+  [`testdata/api-diff/`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/tree/main/testdata/api-diff). An incompatible change fails the
+  check and is a release decision, not a baseline-maintenance detail; record it
+  only through the Makefile's explicitly approved baseline workflow. An
+  addition fails too, until the same commit records it in the baseline with
+  `make record-api-diff-baseline`, which puts the addition in the diff a
+  reviewer reads. Either half can be turned off for one local run:
+  `API_DIFF_ENFORCE=0` for incompatible changes and `API_DIFF_ADDITIONS_ENFORCE=0`
+  for additions.
 - `verify-agnostic` runs the `depguard` rules in
   [`.golangci.yml`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/.golangci.yml). It prevents core code from importing
   concrete drivers or broker clients and prevents the conformance package from

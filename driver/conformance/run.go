@@ -247,6 +247,19 @@ func runProfile(
 		for _, err := range tracked.reclaimRun(ctx, runID) {
 			t.Errorf("conformance %s profile reclaim: %v", profile, err)
 		}
+		// The measurement runs inside this cleanup, after the reclaim above,
+		// and not in a second one registered beside it. t.Cleanup is LIFO, so
+		// a cleanup registered after this one runs before the reclaim and
+		// reports every destination the reclaim is about to delete; one
+		// cleanup also keeps the order from depending on where a later
+		// registration happens to land.
+		survivors, err := tracked.unreclaimedDestinations(ctx, runID)
+		if err != nil {
+			t.Errorf("conformance %s profile reclaim verification: %v", profile, err)
+		}
+		if len(survivors) != 0 {
+			t.Errorf("conformance %s profile left destinations behind: %s", profile, strings.Join(survivors, ", "))
+		}
 	})
 	for _, entry := range groupManifest {
 		runner, runnerExists := groupRunners[entry.name]
@@ -436,6 +449,46 @@ func (c *trackedConn) reclaimRun(ctx context.Context, runID string) []error {
 	destinations := slices.Compact(slices.Sorted(slices.Values(append(recorded, orphaned...))))
 	consumers, producers := c.trackedHandles()
 	return append(errs, c.reclaim(ctx, consumers, producers, destinations)...)
+}
+
+// unreclaimedDestinations reports the destinations this profile created that the
+// broker still holds. reclaimRun attempts the deletes and cannot tell a driver
+// that deleted a destination from one that only said so; a read taken after the
+// reclaim is the only thing that separates the two, and this is that read.
+//
+// The candidates are the names the profile recorded plus the run's orphans under
+// their scopes, which is the set reclaimRun prunes. Every one of them carries
+// this run's id, so a destination that was on the fixture before the run can be
+// neither reclaimed nor reported here: a shared fixture with history is normal,
+// and this measurement does not clean up after anyone else.
+//
+// A driver without driver.Maintenance has no delete operation at all, so no run
+// on one can leave the fixture clean. The reclaim prunes nothing there and this
+// reports nothing, rather than failing a run for a capability the port makes
+// optional.
+func (c *trackedConn) unreclaimedDestinations(ctx context.Context, runID string) ([]string, error) {
+	if _, ok := c.Conn.Admin().(driver.Maintenance); !ok {
+		return nil, nil
+	}
+	recorded := c.createdDestinations()
+	orphaned, err := c.discoverRunDestinations(ctx, runID, recorded)
+	candidates := slices.Compact(slices.Sorted(slices.Values(append(recorded, orphaned...))))
+	admin := c.Conn.Admin()
+	survivors := make([]string, 0, len(candidates))
+	for _, destination := range candidates {
+		_, describeErr := admin.DescribeTopology(ctx, []string{destination})
+		if errors.Is(describeErr, driver.ErrDestinationMissing) {
+			continue
+		}
+		if describeErr != nil {
+			// A destination whose existence the broker cannot answer for is
+			// not a destination this run can claim to have removed.
+			err = errors.Join(err, fmt.Errorf("describe %q after reclaim: %w", destination, describeErr))
+			continue
+		}
+		survivors = append(survivors, destination)
+	}
+	return survivors, err
 }
 
 // discoverRunDestinations reads the run's remaining destinations off the broker

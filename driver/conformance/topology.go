@@ -398,10 +398,15 @@ func runTopology(group *groupContext) {
 		admin := newProfileAdmin(group, group.conn.Admin())
 		nonEmpty := "topology.prune.ready"
 		eligible := "topology.prune.ready.eligible"
-		if _, err := admin.EnsureTopology(group.ctx, driver.TopologySpec{
+		_, err := admin.EnsureTopology(group.ctx, driver.TopologySpec{
 			Destinations: []driver.DestinationSpec{{Name: eligible}},
 			Effective:    group.effective,
-		}); err != nil {
+		})
+		// Registered before the error check: a driver can create the
+		// destination and still fail, and the Prune below is the only step that
+		// reclaims it on the passing path.
+		cleanupTopologyDestinationsIfPresent(t, admin, maintenance, group.ctx, eligible)
+		if err != nil {
 			t.Fatalf("EnsureTopology(eligible): %v", err)
 		}
 		producer := newProducer(t, group, profileDestination(group, nonEmpty), driver.ProducerConfig{Effective: group.effective})
@@ -435,10 +440,15 @@ func runTopology(group *groupContext) {
 		admin := newProfileAdmin(group, group.conn.Admin())
 		parked := "topology.prune.park"
 		eligible := "topology.prune.park.eligible"
-		if _, err := admin.EnsureTopology(group.ctx, driver.TopologySpec{
+		_, err := admin.EnsureTopology(group.ctx, driver.TopologySpec{
 			Destinations: []driver.DestinationSpec{{Name: eligible}},
 			Effective:    group.effective,
-		}); err != nil {
+		})
+		// Registered before the error check: a driver can create the
+		// destination and still fail, and the Prune below is the only step that
+		// reclaims it on the passing path.
+		cleanupTopologyDestinationsIfPresent(t, admin, maintenance, group.ctx, eligible)
+		if err != nil {
 			t.Fatalf("EnsureTopology(eligible): %v", err)
 		}
 		producer := newDeferredProducer(t, group, profileDestination(group, parked), topologyParkDelay)
@@ -472,10 +482,16 @@ func runTopology(group *groupContext) {
 		admin := newProfileAdmin(group, group.conn.Admin())
 		attached := "topology.prune.consumer"
 		eligible := "topology.prune.consumer.eligible"
-		if _, err := admin.EnsureTopology(group.ctx, driver.TopologySpec{
+		_, err := admin.EnsureTopology(group.ctx, driver.TopologySpec{
 			Destinations: []driver.DestinationSpec{{Name: attached}, {Name: eligible}},
 			Effective:    group.effective,
-		}); err != nil {
+		})
+		// Registered before the consumer exists, so that this cleanup runs
+		// after the consumer's own Stop cleanup: that Stop is the detach Prune
+		// needs, and a registration that ran first would be refused with the
+		// consumer still attached.
+		cleanupTopologyDestinationsIfPresent(t, admin, maintenance, group.ctx, attached, eligible)
+		if err != nil {
 			t.Fatalf("EnsureTopology(seed): %v", err)
 		}
 		_ = newConsumer(t, group, profileDestination(group, attached), 1)
@@ -652,6 +668,44 @@ func cleanupTopologyDestinations(t *testing.T, admin driver.Admin, maintenance d
 			}
 			if !errors.Is(describeErr, driver.ErrDestinationMissing) {
 				t.Errorf("DescribeTopology(%q) after cleanup: %v", name, describeErr)
+			}
+		}
+	})
+}
+
+// cleanupTopologyDestinationsIfPresent registers a cleanup that reclaims
+// destinations the check may already have deleted. Each prune guard deletes its
+// eligible destination as the step its own assertion is corroborated by, so on a
+// passing path nothing is left for this cleanup to reclaim, and only an
+// assertion that ends the check earlier leaves the destination behind. Absence
+// is a pass here, where cleanupTopologyDestinations reports it as a reclaim that
+// did not happen.
+func cleanupTopologyDestinationsIfPresent(t *testing.T, admin driver.Admin, maintenance driver.Maintenance, ctx context.Context, names ...string) {
+	t.Helper()
+	t.Cleanup(func() {
+		present := make([]string, 0, len(names))
+		for _, name := range names {
+			_, err := admin.DescribeTopology(ctx, []string{name})
+			if errors.Is(err, driver.ErrDestinationMissing) {
+				continue
+			}
+			if err != nil {
+				t.Errorf("DescribeTopology(%q) before cleanup: %v", name, err)
+				continue
+			}
+			present = append(present, name)
+		}
+		if len(present) == 0 {
+			return
+		}
+		results, err := maintenance.Prune(ctx, present)
+		if err != nil {
+			t.Errorf("prune destinations %v: %v", present, err)
+			return
+		}
+		for _, name := range present {
+			if result := findPruneResult(results, name); !result.Deleted {
+				t.Errorf("Prune(%q)=%+v, want deleted", name, result)
 			}
 		}
 	})

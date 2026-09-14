@@ -94,6 +94,14 @@ func (Driver) Name() string {
 }
 
 // Capabilities reports the ceiling across classic and share-group modes.
+//
+// No delay accuracy is declared. The driver does hold a deferred record and
+// release it from the poll loop once its due time arrives, but a record that is
+// not in hand at that moment waits on a fetch that no bound covers: the
+// per-destination hold pause and the unsettled budget both stop fetching with
+// no time limit, and a broker that is slow or unavailable stops it longer
+// still. Any number declared here would be a measured hope rather than a bound
+// the code holds to.
 func (Driver) Capabilities() driver.Capabilities {
 	return driver.Capabilities{
 		PerMessageAck:       true,
@@ -121,6 +129,17 @@ func (Driver) Open(ctx context.Context, cfg driver.Config) (driver.Conn, error) 
 		return nil, classify("open", driver.KindFatal, err)
 	}
 	balancer, err := resolveBalancer(cfg.DriverOptions)
+	if err != nil {
+		return nil, classify("open", driver.KindFatal, err)
+	}
+	// Resolve the remaining knobs before anything touches the broker, so a
+	// value the driver cannot translate is refused here, naming its key, rather
+	// than surfacing later as a connection or group failure.
+	producerOpts, err := resolveProducerOptions(cfg.DriverOptions)
+	if err != nil {
+		return nil, classify("open", driver.KindFatal, err)
+	}
+	consumerOpts, err := resolveConsumerOptions(cfg.DriverOptions)
 	if err != nil {
 		return nil, classify("open", driver.KindFatal, err)
 	}
@@ -165,8 +184,19 @@ func (Driver) Open(ctx context.Context, cfg driver.Config) (driver.Conn, error) 
 	opts = append(opts, kgo.ProducerBatchMaxBytesFn(func(string) int32 {
 		return producerBatchBytes
 	}))
+	// The consume-path knobs belong in this list rather than on the consumer
+	// alone: the consumer factory clones this slice, and the client that owns
+	// the group is the consumer's, so the group and fetch settings have to be
+	// in what it clones.
+	opts = append(opts, consumerOpts...)
+	// The produce-path knobs stay out of that list, on the client that
+	// produces. franz-go's DefaultCompressor compacts the codec slice it is
+	// handed in place while a client is built, and every consumer client is
+	// built from a clone of this list, so a codec slice shared through it would
+	// be written by each consumer constructed at the same time.
+	producerClientOpts := append(append([]kgo.Opt(nil), opts...), producerOpts...)
 
-	client, err := kgo.NewClient(opts...)
+	client, err := kgo.NewClient(producerClientOpts...)
 	if err != nil {
 		return nil, classify("open", driver.KindFatal, err)
 	}
