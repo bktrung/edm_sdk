@@ -239,10 +239,7 @@ func TestOrderedPoolFreeTracksIdleWorkers(t *testing.T) {
 		t.Fatal("ordered pool reported free while every worker had work")
 	}
 	unblock()
-	waitForFreeSignal(t, pool)
-	if !pool.Free() {
-		t.Fatal("ordered pool did not report free after both keys finished")
-	}
+	waitUntilFree(t, pool)
 }
 
 // distinctQueueKeys returns one key per worker, at index i for worker i.
@@ -272,6 +269,27 @@ func waitForFreeSignal(t *testing.T, p *Pool) {
 	case <-p.FreeSignal():
 	case <-clock.NewReal().Timer(5 * time.Second).C:
 		t.Fatal("no free signal after an item finished")
+	}
+}
+
+// waitUntilFree blocks until the pool reports free, re-checking Free after
+// every hint.
+//
+// A hint is sent after every finished item and is never a count of idle
+// workers, so the first hint after unblock can come from the first of one
+// key's items while other items of that key are still queued and the other
+// worker is still running. One deadline covers the whole loop: a timer
+// re-created per pass could never fire while hints keep arriving.
+func waitUntilFree(t *testing.T, p *Pool) {
+	t.Helper()
+	deadline := clock.NewReal().Timer(5 * time.Second)
+	defer deadline.Stop()
+	for !p.Free() {
+		select {
+		case <-p.FreeSignal():
+		case <-deadline.C:
+			t.Fatal("ordered pool did not report free after both keys finished")
+		}
 	}
 }
 
