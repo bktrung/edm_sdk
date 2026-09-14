@@ -5,9 +5,13 @@ import (
 	"errors"
 	"hash/fnv"
 	"runtime"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
+
+	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/clock"
 )
 
 func TestPoolRunsAllWork(t *testing.T) {
@@ -116,12 +120,15 @@ func TestPoolValidationFreeSignalAndClosedSubmit(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := p.Submit(context.Background(), Work{Run: func(context.Context) {}}); err != nil {
+	release := make(chan struct{})
+	if err := p.Submit(context.Background(), Work{Run: func(context.Context) { <-release }}); err != nil {
 		t.Fatal(err)
 	}
-	if err := p.WaitFree(context.Background()); err != nil {
-		t.Fatal(err)
+	if p.Free() {
+		t.Fatal("pool reported free while an accepted item was unfinished")
 	}
+	close(release)
+	waitForFreeSignal(t, p)
 	p.Close()
 	if err := p.Submit(context.Background(), Work{Run: func(context.Context) {}}); err == nil {
 		t.Fatal("submit after close must fail")
@@ -131,16 +138,140 @@ func TestPoolValidationFreeSignalAndClosedSubmit(t *testing.T) {
 	}
 }
 
-func TestPoolWaitFreeHonorsCancellation(t *testing.T) {
+func TestPoolFreeTracksAcceptedWorkAndNeverBlocksSubmit(t *testing.T) {
 	p, err := NewPool(context.Background(), 1, false, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer p.Close()
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-	if err := p.WaitFree(ctx); err == nil {
-		t.Fatal("WaitFree must respect cancellation")
+	if !p.Free() {
+		t.Fatal("new pool must report free")
+	}
+	started := make(chan struct{})
+	release := make(chan struct{})
+	if err := p.Submit(context.Background(), Work{Run: func(context.Context) {
+		close(started)
+		<-release
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	<-started
+	if p.Free() {
+		t.Fatal("pool reported free with one accepted item unfinished")
+	}
+
+	// A submit made while Free reports true must not block: the count it is
+	// derived from is what bounds the queue, not the workers' progress.
+	close(release)
+	waitForFreeSignal(t, p)
+	if !p.Free() {
+		t.Fatal("pool did not report free after its only item finished")
+	}
+	done := make(chan error, 1)
+	go func() {
+		done <- p.Submit(context.Background(), Work{Run: func(context.Context) {}})
+	}()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-clock.NewReal().Timer(5 * time.Second).C:
+		t.Fatal("Submit blocked while Free reported true")
+	}
+}
+
+// TestOrderedPoolFreeTracksIdleWorkers covers the ordered rule: the pool can
+// take more work while some worker has nothing queued and nothing running, even
+// though another worker already has this key's next item behind the running
+// one. Reporting on the total instead would stall the idle worker.
+func TestOrderedPoolFreeTracksIdleWorkers(t *testing.T) {
+	const workers = 2
+	pool, err := NewPool(context.Background(), workers, true, 4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
+	keys := distinctQueueKeys(t, workers)
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	unblock := func() { releaseOnce.Do(func() { close(release) }) }
+	// Deferred after pool.Close, so it runs before it: a failure below must
+	// unblock the handlers, or Close would wait on them until the test binary
+	// times out.
+	defer unblock()
+	started := make(chan string, workers+1)
+	submit := func(key string) {
+		t.Helper()
+		if err := pool.Submit(context.Background(), Work{Key: []byte(key), Run: func(context.Context) {
+			started <- key
+			<-release
+		}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	submit(keys[0])
+	select {
+	case <-started:
+	case <-clock.NewReal().Timer(5 * time.Second).C:
+		t.Fatal("first worker did not start")
+	}
+	// Three more of the same key: the worker runs one and queues the rest, so
+	// the accepted count reaches the queue depth while the other worker is
+	// still idle. Ordered mode must keep reporting free there; the depth is the
+	// caller's bound, not this check's.
+	submit(keys[0])
+	submit(keys[0])
+	submit(keys[0])
+	if !pool.Free() {
+		t.Fatal("ordered pool reported busy at the queue depth while one worker was idle")
+	}
+	submit(keys[1])
+	select {
+	case key := <-started:
+		if key != keys[1] {
+			t.Fatalf("second worker started key %q, want %q", key, keys[1])
+		}
+	case <-clock.NewReal().Timer(5 * time.Second).C:
+		t.Fatal("idle worker did not start the other key")
+	}
+	if pool.Free() {
+		t.Fatal("ordered pool reported free while every worker had work")
+	}
+	unblock()
+	waitForFreeSignal(t, pool)
+	if !pool.Free() {
+		t.Fatal("ordered pool did not report free after both keys finished")
+	}
+}
+
+// distinctQueueKeys returns one key per worker, at index i for worker i.
+func distinctQueueKeys(t *testing.T, workers int) []string {
+	t.Helper()
+	byWorker := make([]string, workers)
+	found := 0
+	for i := 0; found < workers; i++ {
+		if i == 10000 {
+			t.Fatalf("found keys for %d of %d workers", found, workers)
+		}
+		key := "ordered-key-" + strconv.Itoa(i)
+		hash := fnv.New32a()
+		_, _ = hash.Write([]byte(key))
+		worker := queueIndex(hash.Sum32(), uint32(workers)) //nolint:gosec // worker count is the test's own, far below MaxUint32.
+		if byWorker[worker] == "" {
+			byWorker[worker] = key
+			found++
+		}
+	}
+	return byWorker
+}
+
+func waitForFreeSignal(t *testing.T, p *Pool) {
+	t.Helper()
+	select {
+	case <-p.FreeSignal():
+	case <-clock.NewReal().Timer(5 * time.Second).C:
+		t.Fatal("no free signal after an item finished")
 	}
 }
 
@@ -230,12 +361,15 @@ func TestPoolNilOperations(t *testing.T) {
 	if err := pool.Submit(context.Background(), Work{}); err == nil {
 		t.Fatal("nil pool submit must fail")
 	}
-	if err := pool.WaitFree(context.Background()); err == nil {
-		t.Fatal("nil pool WaitFree must fail")
+	if pool.Free() {
+		t.Fatal("nil pool must not report free")
+	}
+	if pool.FreeSignal() != nil {
+		t.Fatal("nil pool must not expose a wake-up channel")
 	}
 }
 
-func TestPoolSubmitAndWaitCancellationPaths(t *testing.T) {
+func TestPoolSubmitCancellationPaths(t *testing.T) {
 	parent, cancelParent := context.WithCancel(context.Background())
 	pool, err := NewPool(parent, 1, false, 1)
 	if err != nil {
@@ -257,8 +391,8 @@ func TestPoolSubmitAndWaitCancellationPaths(t *testing.T) {
 	if err := pool.Submit(context.Background(), Work{Run: func(context.Context) {}}); !errors.Is(err, context.Canceled) {
 		t.Fatalf("Submit() after parent cancellation = %v, want context canceled", err)
 	}
-	if err := pool.WaitFree(context.Background()); !errors.Is(err, context.Canceled) {
-		t.Fatalf("WaitFree after parent cancellation = %v, want context canceled", err)
+	if pool.Free() {
+		t.Fatal("pool reported free while two accepted items were unfinished")
 	}
 	close(release)
 	pool.Close()

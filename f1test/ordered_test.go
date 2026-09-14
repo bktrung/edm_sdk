@@ -13,11 +13,15 @@ import (
 	f1 "fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk"
 )
 
-func TestOrderedByKeyKeepsEqualKeysSerialAndDifferentKeysConcurrent(t *testing.T) {
+// orderedSaturation publishes messagesPerKey copies of each of two keys, key-0
+// first, and waits for handlers of both keys to be running at once. fairness is
+// the subscription's fairness block, whose PrefetchFactor sets the lane buffer
+// the published run has to fit inside.
+func orderedSaturation(t *testing.T, messagesPerKey int, fairness f1.FairnessConfig) {
+	t.Helper()
 	c := NewClient(t, quietLogger())
 	ctx, cancel := context.WithCancel(context.Background())
 	keys := distinctOrderedKeys()
-	const messagesPerKey = 4
 	totalMessages := len(keys) * messagesPerKey
 
 	var mu sync.Mutex
@@ -36,6 +40,7 @@ func TestOrderedByKeyKeepsEqualKeysSerialAndDifferentKeysConcurrent(t *testing.T
 		Concurrency:    2,
 		Prefetch:       totalMessages,
 		Priorities:     []f1.Priority{f1.PriorityMedium},
+		Fairness:       fairness,
 		Retry:          f1.RetryConfig{MaxAttempts: 1},
 		HandlerTimeout: time.Second,
 		Handlers: map[string]f1.Handler{
@@ -132,6 +137,25 @@ func TestOrderedByKeyKeepsEqualKeysSerialAndDifferentKeysConcurrent(t *testing.T
 	defer mu.Unlock()
 	require.Empty(t, overlap, "equal keys overlapped in the handler")
 	require.Zero(t, activeTotal)
+}
+
+// TestOrderedByKeyKeepsEqualKeysSerialAndDifferentKeysConcurrent covers a run of
+// one key longer than the default lane buffer. Five messages have to be in
+// flight for the first key-1 to start behind four key-0, so the factor is 3:
+// the buffer is max(2, ceil(concurrency*weight/totalWeight)) * factor, which is
+// max(2, ceil(2*1/1)) * 3 = 6. A run of one key longer than the lane buffer
+// serializes the subscription, by design: the buffers stay small, so an ordered
+// subscription looks ahead by its lane buffer and no further.
+func TestOrderedByKeyKeepsEqualKeysSerialAndDifferentKeysConcurrent(t *testing.T) {
+	orderedSaturation(t, 4, f1.FairnessConfig{PrefetchFactor: 3})
+}
+
+// TestOrderedByKeyRunsDifferentKeysWithinTheLaneBuffer covers the window the
+// buffers are sized for: two keys of two, four messages in total, which is
+// exactly the default lane buffer of max(2, ceil(2*1/1)) * 2 = 4. Different keys
+// run concurrently inside that window; per-key order still holds on each key.
+func TestOrderedByKeyRunsDifferentKeysWithinTheLaneBuffer(t *testing.T) {
+	orderedSaturation(t, 2, f1.FairnessConfig{})
 }
 
 func distinctOrderedKeys() [2]string {

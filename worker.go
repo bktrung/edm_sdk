@@ -154,7 +154,12 @@ func (r *Runner) Run(ctx context.Context) error {
 			return nil
 		}
 
-		consumer, err := openRunnerConsumer(r, runCtx)
+		// The consumer's total in-flight budget, derived once per generation.
+		// The driver enforces it as its outstanding limit, and the pipeline
+		// sizes the ordered worker queues from it, so both read the same number
+		// instead of deriving it again from a formula that could drift.
+		prefetch := runnerConsumerPrefetch(r.config.Prefetch, runnerLanePlan(r))
+		consumer, err := openRunnerConsumerWith(r, runCtx, prefetch)
 		r.mu.Lock()
 		draining = r.draining
 		r.mu.Unlock()
@@ -239,7 +244,7 @@ func (r *Runner) Run(ctx context.Context) error {
 			return runPipeline(func() error { return fetchRunner(r, runCtx, deliveries) })
 		})
 		group.Go(func() error {
-			return runPipeline(func() error { return runDispatchPipeline(r, runCtx, deliveries) })
+			return runPipeline(func() error { return runDispatchPipeline(r, runCtx, deliveries, prefetch) })
 		})
 		group.Go(func() error {
 			return runPipeline(func() error { return consumeRunnerErrors(r, runCtx) })
@@ -452,13 +457,35 @@ func beginRunnerGeneration(r *Runner, runCtx context.Context, cancel context.Can
 
 // --- Dispatch and scheduling ---
 
-func runDispatchPipeline(r *Runner, ctx context.Context, deliveries <-chan delivery) error {
+// runDispatchPipeline chooses work from the scheduler and hands it to the pool.
+// prefetch is the consumer's total in-flight budget for this generation, the
+// value the driver was given, and it is the ordered worker queue depth.
+func runDispatchPipeline(r *Runner, ctx context.Context, deliveries <-chan delivery, prefetch int) error {
 	scheduler, err := newRunnerScheduler(r)
 	if err != nil {
 		return err
 	}
 	pipelineCtx := context.WithoutCancel(ctx)
-	pool, err := dispatch.NewPool(pipelineCtx, r.subscription.Concurrency, r.subscription.Mode == OrderedByKey, r.subscription.Prefetch)
+	// Unordered mode queues at concurrency depth. The loop submits only while
+	// the pool reports it can accept work, so a deeper queue would not hold
+	// more: it would only let the loop read a prefetch's worth of the
+	// scheduler's earlier picks into a first-in, first-out buffer in front of
+	// the workers, where the next choice cannot correct them.
+	//
+	// Ordered mode queues at that same budget. This is not the first-in,
+	// first-out buffer the paragraph above refuses, and the difference is
+	// where the bound sits. Free in ordered mode reports idle workers, so it
+	// stops the loop choosing when every worker has work, not when a count is
+	// reached; the queue then holds only items the scheduler already committed
+	// to a busy key's worker, in the order it committed them, which is exactly
+	// the per-key order the mode promises. It cannot hold more than the pool
+	// can be given, and the pool cannot be given more than the driver has
+	// handed over, so Submit does not block.
+	queueDepth := r.subscription.Concurrency
+	if r.subscription.Mode == OrderedByKey {
+		queueDepth = prefetch
+	}
+	pool, err := dispatch.NewPool(pipelineCtx, r.subscription.Concurrency, r.subscription.Mode == OrderedByKey, queueDepth)
 	if err != nil {
 		return err
 	}
@@ -475,7 +502,27 @@ func runDispatchPipeline(r *Runner, ctx context.Context, deliveries <-chan deliv
 	var pending *delivery
 	pendingLane := ""
 	open := true
-	for open || pending != nil || schedulerHasItems(scheduler) {
+	for {
+		// Choose only what the pool can start now. The scheduler is asked for
+		// an item after the pool reports room, so its answer stays current
+		// instead of being queued behind earlier picks.
+		for pool.Free() {
+			item, ok := scheduler.Next()
+			if !ok {
+				break
+			}
+			work := item.Value.(delivery)
+			if err := pool.Submit(pipelineCtx, dispatch.Work{
+				Key: append([]byte(nil), work.message.Key...),
+				Run: func(context.Context) { processDelivery(r, ctx, work) },
+			}); err != nil {
+				return err
+			}
+		}
+		// A delivery whose lane is full stays here, and is retried after the
+		// dispatches above have made room. It is the only reachable
+		// ErrLaneFull: the fallback lane can take deliveries several
+		// destinations overflow into.
 		if pending != nil {
 			laneID, queued, err := enqueuePendingDelivery(r, scheduler, pending, pendingLane)
 			if err != nil {
@@ -484,38 +531,38 @@ func runDispatchPipeline(r *Runner, ctx context.Context, deliveries <-chan deliv
 			if queued {
 				pending = nil
 				pendingLane = ""
-			} else {
-				pendingLane = laneID
+				// The dispatch pass above ran before this lane took the item,
+				// so a free worker has not been offered it yet. Parking here
+				// would wait for a completion that cannot arrive: the item is
+				// in a lane, not with a worker, and the only other wake-up is
+				// another delivery. One delivery read while the pool is free
+				// and no further traffic is a reachable quiescent state (the
+				// runner is idle with work in hand), so offer it now.
+				continue
 			}
+			pendingLane = laneID
 		}
-		if item, ok := scheduler.Next(); ok {
-			work := item.Value.(delivery)
-			if err := pool.Submit(pipelineCtx, dispatch.Work{
-				Key: append([]byte(nil), work.message.Key...),
-				Run: func(context.Context) { processDelivery(r, ctx, work) },
-			}); err != nil {
-				return err
+		if !open && pending == nil && !schedulerHasItems(scheduler) {
+			return nil
+		}
+		// Read more deliveries only while the channel is open and nothing is
+		// held back: a held delivery must reach its lane before later ones,
+		// and reading past it could wedge a full lane behind its own refill.
+		var incoming <-chan delivery
+		if open && pending == nil {
+			incoming = deliveries
+		}
+		select {
+		case <-pool.FreeSignal():
+		case item, ok := <-incoming:
+			if !ok {
+				open = false
+				continue
 			}
-			continue
+			pending = &item
+			pendingLane = ""
 		}
-		if pending != nil {
-			if err := pool.WaitFree(pipelineCtx); err != nil {
-				return err
-			}
-			continue
-		}
-		if !open {
-			break
-		}
-		item, ok := <-deliveries
-		if !ok {
-			open = false
-			continue
-		}
-		pending = &item
-		pendingLane = ""
 	}
-	return nil
 }
 
 func enqueuePendingDelivery(r *Runner, scheduler *sched.Scheduler, pending *delivery, pendingLane string) (string, bool, error) {
@@ -551,9 +598,31 @@ func schedulerHasItems(scheduler *sched.Scheduler) bool {
 	return scheduler != nil && scheduler.Pending() > 0
 }
 
-// newRunnerScheduler converts fairness weights into lane capacity and applies
-// the retry divisor and prefetch factor without changing the scheduling graph.
-func newRunnerScheduler(r *Runner) (*sched.Scheduler, error) {
+// runnerLane is one delivery lane: the scheduler's ID for it, the broker
+// destination that feeds it, and the spec the scheduler is built from.
+type runnerLane struct {
+	id          string
+	group       string
+	destination string
+	weight      int
+	budget      time.Duration
+	capacity    int
+}
+
+// runnerLanePlan derives every lane of a subscription from its fairness
+// configuration. It is the single computation behind both the scheduler's
+// lane capacities and the driver's per-destination caps, so a lane can never
+// be asked to hold more than the destination feeding it may have outstanding.
+//
+// Lane IDs and destination names are different strings: a lane ID is
+// topic.priority.main or topic.priority.retry.N, while the destination comes
+// from the naming helpers that declare topology. The two are resolved here,
+// in one place, so neither caller has to re-derive the other.
+func runnerLanePlan(r *Runner) []runnerLane {
+	r.client.mu.Lock()
+	effective := r.client.effective
+	source := r.client.source
+	r.client.mu.Unlock()
 	weights := r.subscription.Fairness.Weights
 	budgets := r.subscription.Fairness.Budgets
 	divisor := r.subscription.Fairness.RetryWeightDivisor
@@ -564,33 +633,29 @@ func newRunnerScheduler(r *Runner) (*sched.Scheduler, error) {
 	if factor < 1 {
 		factor = defaultPrefetchFactor
 	}
-	type laneMeta struct {
-		group  string
-		weight int
-		budget time.Duration
-	}
-	meta := make(map[string]laneMeta, len(r.subscription.Topics)*len(r.subscription.Priorities)*(1+retryTiers(r.subscription.Retry)))
+	meta := make(map[string]runnerLane, len(r.subscription.Topics)*len(r.subscription.Priorities)*(1+retryTiers(r.subscription.Retry)))
 	groups := make(map[string]struct{})
 	totalWeight := 0
 	for _, topic := range r.subscription.Topics {
+		logical := topicFor(topic)
 		for _, priority := range r.subscription.Priorities {
 			weight := max(weights[priority], 1)
 			budget := budgets[priority]
 			for tier := 0; tier <= retryTiers(r.subscription.Retry); tier++ {
-				laneID := schedulerLaneID(topicFor(topic), priority, tier)
+				laneID := schedulerLaneID(logical, priority, tier)
 				group := laneID
-				if tier > 0 {
-					group = schedulerRetryGroupID(topicFor(topic), priority)
-				}
 				laneWeight, laneBudget := weight, budget
+				destination := consumeDestination(effective, source, logical, priority, r.subscription.Name)
 				if tier > 0 {
-					laneWeight /= divisor
-					if laneWeight < 1 {
-						laneWeight = 1
-					}
+					group = schedulerRetryGroupID(logical, priority)
+					laneWeight = max(laneWeight/divisor, 1)
 					laneBudget *= retryBudgetMultiplier
+					destination = retryDestinationFor(source, logical, priority, tier, r.subscription.Name)
 				}
-				meta[laneID] = laneMeta{group: group, weight: laneWeight, budget: laneBudget}
+				meta[laneID] = runnerLane{
+					id: laneID, group: group, destination: destination,
+					weight: laneWeight, budget: laneBudget,
+				}
 				if _, exists := groups[group]; !exists {
 					groups[group] = struct{}{}
 					totalWeight += laneWeight
@@ -601,17 +666,46 @@ func newRunnerScheduler(r *Runner) (*sched.Scheduler, error) {
 	if totalWeight < 1 {
 		totalWeight = 1
 	}
-	specs := make([]sched.LaneSpec, 0, len(meta))
 	ids := make([]string, 0, len(meta))
 	for id := range meta {
 		ids = append(ids, id)
 	}
 	sort.Strings(ids)
+	plan := make([]runnerLane, 0, len(ids))
 	for _, id := range ids {
 		lane := meta[id]
-		capacity := max((r.subscription.Concurrency*lane.weight+totalWeight-1)/totalWeight, minimumLaneCapacity)
-		capacity *= factor
-		specs = append(specs, sched.LaneSpec{ID: id, Group: lane.group, Weight: lane.weight, Budget: lane.budget, Capacity: capacity})
+		lane.capacity = max((r.subscription.Concurrency*lane.weight+totalWeight-1)/totalWeight, minimumLaneCapacity) * factor
+		plan = append(plan, lane)
+	}
+	return plan
+}
+
+// runnerConsumerPrefetch returns the consumer's total in-flight budget: the
+// configured prefetch, capped by the sum of the lane capacities. A larger
+// total would let the driver fetch work ahead of the lanes that can hold it,
+// which is the buffering the lane bound exists to keep out: fetch must pause
+// on a full destination rather than queue behind it.
+func runnerConsumerPrefetch(configured int, lanes []runnerLane) int {
+	total := 0
+	for _, lane := range lanes {
+		total += lane.capacity
+	}
+	if total < 1 {
+		return configured
+	}
+	return min(configured, total)
+}
+
+// newRunnerScheduler converts fairness weights into lane capacity and applies
+// the retry divisor and prefetch factor without changing the scheduling graph.
+func newRunnerScheduler(r *Runner) (*sched.Scheduler, error) {
+	lanes := runnerLanePlan(r)
+	specs := make([]sched.LaneSpec, 0, len(lanes))
+	for _, lane := range lanes {
+		specs = append(specs, sched.LaneSpec{
+			ID: lane.id, Group: lane.group, Weight: lane.weight,
+			Budget: lane.budget, Capacity: lane.capacity,
+		})
 	}
 	return sched.New(specs, r.client.options.clock, r.subscription.Fairness.AgingEnabled)
 }
@@ -975,7 +1069,18 @@ func lastResortRunnerLogger(r *Runner) *slog.Logger {
 	return slog.Default()
 }
 
+// openRunnerConsumer opens the consumer with the budget derived from the
+// runner's own configuration. Run derives that budget once per generation and
+// calls openRunnerConsumerWith, so the driver's limit and the pipeline's
+// ordered queue depth are the same number even when they are not both derived
+// from the configuration at the same point in time.
 func openRunnerConsumer(r *Runner, ctx context.Context) (driver.Consumer, error) {
+	return openRunnerConsumerWith(r, ctx, runnerConsumerPrefetch(r.config.Prefetch, runnerLanePlan(r)))
+}
+
+// openRunnerConsumerWith opens the consumer for a generation whose total
+// in-flight budget is prefetch, as derived by Run.
+func openRunnerConsumerWith(r *Runner, ctx context.Context, prefetch int) (driver.Consumer, error) {
 	r.client.mu.Lock()
 	conn := r.client.conn
 	effective := r.client.effective
@@ -1005,20 +1110,22 @@ func openRunnerConsumer(r *Runner, ctx context.Context) (driver.Consumer, error)
 		return nil, fmt.Errorf("f1: ensure subscription topology: %w", err)
 	}
 	logTopologyDrift(lastResortRunnerLogger(r), diff)
-	perDestination := make(map[string]int, len(destinations))
-	remaining := r.config.Prefetch
-	for i, destination := range destinations {
-		share := 1
-		if remaining > len(destinations)-i {
-			share = max(remaining/(len(destinations)-i), 1)
-		}
-		perDestination[destination] = share
-		remaining -= share
+	// Each destination's cap is its lane's capacity, so a lane can never hold
+	// more than the driver lets that destination have outstanding. Reading the
+	// shared delivery channel into lanes then cannot jam behind one full lane
+	// while another lane's work waits in the channel. prefetch, the total the
+	// caller derived, is capped by the sum of those caps, so the driver pauses
+	// a full destination instead of fetching ahead of the lanes that hold the
+	// work.
+	lanes := runnerLanePlan(r)
+	perDestination := make(map[string]int, len(lanes))
+	for _, lane := range lanes {
+		perDestination[lane.destination] = lane.capacity
 	}
 	consumer, err := conn.Consumer(ctx, driver.ConsumerConfig{
 		Group:          r.subscription.Name,
 		Destinations:   destinations,
-		Prefetch:       r.config.Prefetch,
+		Prefetch:       prefetch,
 		PerDestination: perDestination,
 		Exclusive:      r.subscription.Mode == OrderedByKey,
 		Effective:      effective,
@@ -1145,8 +1252,7 @@ func fetchRunner(r *Runner, ctx context.Context, dispatch chan<- delivery) error
 				return nil
 			}
 			if !enqueueDelivery(r, ctx, dispatch, message) {
-				close(dispatch)
-				return nil
+				return fetchRunnerAfterCancel(r, ctx, messages, dispatch)
 			}
 		}
 	}
