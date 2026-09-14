@@ -405,8 +405,49 @@ func TestPublishBatchReportsPartialFailuresAndWarnsPerMessage(t *testing.T) {
 	if got, want := result.Failed(), []int{0, 1}; len(got) != len(want) || got[0] != want[0] || got[1] != want[1] {
 		t.Fatalf("failed indexes = %v, want %v", got, want)
 	}
+	quiescePublishClient(t, client)
 	if got := strings.Count(logs.String(), "f1 unclassified publish error"); got != 2 {
 		t.Fatalf("unclassified warning count = %d, want 2; logs=%s", got, logs.String())
+	}
+}
+
+func TestPublishBatchUnclassifiedFailuresDoNotReconnect(t *testing.T) {
+	t.Parallel()
+	var logs logSink
+	producer := &recordingProducer{publishErr: &driver.PublishError{Failed: map[int]error{
+		0: errors.New("untranslated one"),
+		1: errors.New("untranslated two"),
+	}}}
+	client := newPublishClient(t, producer, WithLogger(slog.New(slog.NewTextHandler(&logs, nil))))
+	if _, err := client.Publisher().PublishBatch(context.Background(), []Message{
+		{EventType: "orders.created", Payload: "one"},
+		{EventType: "orders.created", Payload: "two"},
+	}); err != nil {
+		t.Fatalf("PublishBatch() error = %v, want nil for partial failure", err)
+	}
+	quiescePublishClient(t, client)
+	if reconnectRequested(client, logs.String()) {
+		t.Fatalf("a batch whose causes are all untranslated reconnected the client; logs=%s", logs.String())
+	}
+}
+
+func TestPublishBatchTransientCauseStillReconnects(t *testing.T) {
+	t.Parallel()
+	var logs logSink
+	producer := &recordingProducer{publishErr: &driver.PublishError{Failed: map[int]error{
+		0: &driver.Error{Driver: "test", Op: "publish", K: driver.KindTransient, Err: errors.New("broker reset the connection")},
+		1: errors.New("untranslated"),
+	}}}
+	client := newPublishClient(t, producer, WithLogger(slog.New(slog.NewTextHandler(&logs, nil))))
+	if _, err := client.Publisher().PublishBatch(context.Background(), []Message{
+		{EventType: "orders.created", Payload: "one"},
+		{EventType: "orders.created", Payload: "two"},
+	}); err != nil {
+		t.Fatalf("PublishBatch() error = %v, want nil for partial failure", err)
+	}
+	quiescePublishClient(t, client)
+	if !reconnectRequested(client, logs.String()) {
+		t.Fatalf("a batch carrying a cause its driver classified transient did not reconnect the client; logs=%s", logs.String())
 	}
 }
 
@@ -458,6 +499,33 @@ func newPublishClient(t *testing.T, producer *recordingProducer, opts ...Option)
 	}
 	t.Cleanup(func() { _ = client.Close(context.Background()) })
 	return client
+}
+
+// quiescePublishClient closes client and waits for its reconnect supervisor to
+// exit, so a test can read a logger this client writes to without racing it.
+// Close alone is not enough: it cancels the supervisor but does not join it,
+// and the supervisor logs through this client's logger when it starts a
+// reconnect.
+func quiescePublishClient(t *testing.T, client *Client) {
+	t.Helper()
+	if err := client.Close(context.Background()); err != nil {
+		t.Fatalf("Close() = %v, want nil", err)
+	}
+	<-client.supervisorDone
+}
+
+// reconnectRequested reports whether client asked its reconnect supervisor to
+// rebuild the connection. Read it only after quiescePublishClient: a request
+// the supervisor never took is still in its one-slot queue, and one it took has
+// already been logged through the client's logger, so the two checks together
+// cover every order the supervisor can run in.
+func reconnectRequested(client *Client, logs string) bool {
+	select {
+	case <-client.reconnectRequests:
+		return true
+	default:
+	}
+	return strings.Contains(logs, "f1 reconnect started")
 }
 
 func messageHeaders(message driver.OutboundMessage) map[string]string {

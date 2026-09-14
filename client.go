@@ -683,6 +683,17 @@ func closeDiscardedProducer(c *Client, producer driver.Producer, ctx context.Con
 	}
 }
 
+// requestReconnectOnTransient requests a reconnect when err is evidence that
+// the connection is unhealthy.
+//
+// A *driver.PublishError is that evidence only when a failed message carries an
+// error the driver itself classified transient; a driver that said transient
+// for a message observed something about the connection. PublishError.Kind, by
+// contrast, reports the worst classification among the failed messages and
+// counts an untranslated cause as transient, so a batch whose causes are all
+// untranslated reports KindTransient and reports it as classified. That default
+// is a retry hint for the caller and says nothing about the socket, so it must
+// not bring the connection down.
 func requestReconnectOnTransient(c *Client, err error) {
 	if c == nil || err == nil {
 		return
@@ -690,7 +701,21 @@ func requestReconnectOnTransient(c *Client, err error) {
 	if kind, classified := driver.Classify(err); !classified || kind != driver.KindTransient {
 		return
 	}
+	if partial, ok := errors.AsType[*driver.PublishError](err); ok && !carriesTransientCause(partial) {
+		return
+	}
 	_, _ = c.requestReconnect(err)
+}
+
+// carriesTransientCause reports whether any failed message in a batch carries
+// an error its driver classified transient.
+func carriesTransientCause(partial *driver.PublishError) bool {
+	for _, cause := range partial.Failed {
+		if kind, classified := driver.Classify(cause); classified && kind == driver.KindTransient {
+			return true
+		}
+	}
+	return false
 }
 
 func beginPublish(c *Client) {

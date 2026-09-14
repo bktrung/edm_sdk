@@ -157,7 +157,12 @@ func (e *PublishError) Unwrap() []error {
 	return causes
 }
 
-// Kind returns the most severe classification among failed messages.
+// Kind returns the most severe classification among failed messages. A cause a
+// driver did not classify is counted as KindTransient, so a batch whose causes
+// are all untranslated reports KindTransient. That worst-of default is a retry
+// hint for the caller - an application the driver told nothing is better served
+// publishing again than being told the failure is fatal - and not a signal that
+// the connection is unhealthy.
 func (e *PublishError) Kind() Kind {
 	if e == nil || len(e.Failed) == 0 {
 		return KindFatal
