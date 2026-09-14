@@ -57,6 +57,27 @@ func capabilitiesForQueueKind(kind queueKind) driver.Capabilities {
 	return caps
 }
 
+// delayAccuracyForLadder derives the delay accuracy the parking ladder
+// delivers, from the ladder itself rather than from a restatement of it: an
+// edited rung, or a ladder that stops doubling, then changes the reported
+// number instead of leaving a stale literal behind.
+//
+// A delay at or below the first rung parks in that rung, so its lateness is at
+// most the rung. A delay in (previous, rung] parks in rung, so its lateness is
+// at most rung - previous, and the relative bound is the largest such gap as a
+// fraction of the rung below it. The top rung is the last delay with a
+// declared bound: above it a message takes the per-message expiration path,
+// where one parked ahead of it holds it back for as long as that one's due
+// time is later, so no bound is declared there.
+func delayAccuracyForLadder(rungs []time.Duration) driver.DelayAccuracy {
+	accuracy := driver.DelayAccuracy{Floor: rungs[0], MaxDelay: rungs[len(rungs)-1]}
+	for i := 1; i < len(rungs); i++ {
+		previous := rungs[i-1]
+		accuracy.Relative = max(accuracy.Relative, float64(rungs[i]-previous)/float64(previous))
+	}
+	return accuracy
+}
+
 // Capabilities reports the RabbitMQ behavior used by this driver.
 func (Driver) Capabilities() driver.Capabilities {
 	return driver.Capabilities{
@@ -65,6 +86,7 @@ func (Driver) Capabilities() driver.Capabilities {
 		NativePriority:       driver.PriorityStrict,
 		NativePriorityLevels: 32,
 		NativeDelay:          false,
+		DelayAccuracy:        delayAccuracyForLadder(parkRungs[:]),
 		NativeDeliveryCount:  true,
 		NativeDLQ:            true,
 		ConsumerScaling:      driver.ScalingFree,

@@ -94,6 +94,14 @@ func (Driver) Name() string {
 }
 
 // Capabilities reports the ceiling across classic and share-group modes.
+//
+// No delay accuracy is declared. The driver does hold a deferred record and
+// release it from the poll loop once its due time arrives, but a record that is
+// not in hand at that moment waits on a fetch that no bound covers: the
+// per-destination hold pause and the unsettled budget both stop fetching with
+// no time limit, and a broker that is slow or unavailable stops it longer
+// still. Any number declared here would be a measured hope rather than a bound
+// the code holds to.
 func (Driver) Capabilities() driver.Capabilities {
 	return driver.Capabilities{
 		PerMessageAck:       true,

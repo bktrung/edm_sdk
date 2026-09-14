@@ -101,6 +101,15 @@ cannot construct that case at all. Rounding the delay up is what keeps a message
 from being released before its due time; the cost is lateness below one rung, so
 a 5s delay is released at about 8s.
 
+That cost is reported rather than left to folklore. `Limits()` renders
+`native_delay` for this driver as `late by at most the requested delay, or
+500ms, whichever is larger, for a delay of at most 1m4s; no bound above that`.
+Both numbers are read from the rung table rather than written down beside it:
+the floor is its first rung, where every shorter delay lands, and the ceiling is
+its last, above which the per-message path below takes over. Editing a rung
+changes what the report says, so the declaration cannot drift from the
+mechanism.
+
 A delay above 64s parks in `<destination>.park`, the queue that carries a
 per-message expiration, exactly as it always has. The deferral ceiling stays
 where it was (about 24.8 days), and the limitation of that path is unchanged: a

@@ -3,6 +3,7 @@ package inmem
 import (
 	"context"
 	"errors"
+	"math"
 	"sort"
 	"sync"
 	"sync/atomic"
@@ -56,11 +57,18 @@ func (Driver) Name() string { return "inmem" }
 
 // Capabilities reports the behavior implemented by the in-memory driver. Native DLQ,
 // priority, transactions, and server-side filtering are intentionally false.
+//
+// DelayAccuracy is zero lateness with no delay excluded: the pump holds every
+// message it has accepted and releases one in the pass that the connection's
+// clock reaches its due time, so nothing between the due time and the release
+// can put the message late. MaxDelay at the largest duration is how the
+// declaration says no requested delay is above the bound.
 func (d Driver) Capabilities() driver.Capabilities {
 	caps := driver.Capabilities{
 		PerMessageAck:       true,
 		OrderedByKey:        true,
 		NativeDelay:         true,
+		DelayAccuracy:       driver.DelayAccuracy{MaxDelay: time.Duration(math.MaxInt64)},
 		NativeDeliveryCount: true,
 		ConsumerScaling:     driver.ScalingFree,
 		LagQueryable:        true,
