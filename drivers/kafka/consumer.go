@@ -227,8 +227,11 @@ type consumer struct {
 }
 
 type settler struct {
-	owner            *consumer
-	record           *kgo.Record
+	owner  *consumer
+	record *kgo.Record
+	// handoffDelivered marks a delivery this consumer emitted as a handoff, so
+	// a later emission of the same offset recognizes it as the copy already
+	// delivered. Guarded by owner.mu, like tracker.
 	handoffDelivered bool
 	tracker          *ackTracker
 	handoff          driver.InboundMessage
@@ -252,10 +255,21 @@ type settler struct {
 	settled         bool
 }
 
+// clearHandoffDelivered reports whether this delivery had been emitted as a
+// handoff, and clears the flag under owner.mu, which guards it. The marker the
+// flag stands for is cleared separately, through owner.clearHandoffMarker,
+// which takes owner.mu itself and so cannot be called from under it.
+func (s *settler) clearHandoffDelivered() bool {
+	s.owner.mu.Lock()
+	defer s.owner.mu.Unlock()
+	delivered := s.handoffDelivered
+	s.handoffDelivered = false
+	return delivered
+}
+
 func (s *settler) completeRevocation() {
-	if s.handoffDelivered {
+	if s.clearHandoffDelivered() {
 		s.owner.clearHandoffMarker(s.key, s.record.Offset)
-		s.handoffDelivered = false
 	}
 	// A tombstoned source is detached from c.settlers immediately so the
 	// destination slot can be reused. Its public settlement still completes
@@ -348,9 +362,8 @@ func (s *settler) Nack(ctx context.Context, options driver.NackOptions) error {
 
 	if options.Requeue {
 		s.requeued = true
-		if s.handoffDelivered {
+		if s.clearHandoffDelivered() {
 			s.owner.clearHandoffMarker(s.key, s.record.Offset)
-			s.handoffDelivered = false
 		}
 		s.owner.mu.Lock()
 		if err := tracker.Release(s.record.Offset); err != nil {
@@ -2995,6 +3008,24 @@ func (c *consumer) moveQueuedHandoffsOnLeave() {
 
 func (c *consumer) emitHandoff(source *consumer, message driver.InboundMessage) {
 	key := partitionKey{destination: message.Destination, partition: message.Ref.Partition}
+	// The source is checked before the target's lock is taken: no consumer's mu
+	// is held while another consumer's mu is acquired. Two emissions in
+	// opposite directions would otherwise take the same two locks in opposite
+	// orders, and nothing is lost by checking first, because the source
+	// snapshot is already stale the moment its lock is released: the decision
+	// below acts on a snapshot taken earlier either way.
+	sourceHolds := false
+	if source != nil && source != c {
+		source.mu.Lock()
+		for settler := range source.settlers {
+			if settler.key == key && settler.record.Offset == message.Ref.Offset &&
+				!settler.tombstoned && settler.tracker != nil {
+				sourceHolds = true
+				break
+			}
+		}
+		source.mu.Unlock()
+	}
 	c.mu.Lock()
 	if offsets := c.settledTransfers[key]; offsets != nil {
 		if _, marked := offsets[message.Ref.Offset]; marked {
@@ -3036,18 +3067,6 @@ func (c *consumer) emitHandoff(source *consumer, message driver.InboundMessage) 
 			handoffLive = settler.handoffDelivered
 			break
 		}
-	}
-	sourceHolds := false
-	if source != nil && source != c {
-		source.mu.Lock()
-		for settler := range source.settlers {
-			if settler.key == key && settler.record.Offset == message.Ref.Offset &&
-				!settler.tombstoned && settler.tracker != nil {
-				sourceHolds = true
-				break
-			}
-		}
-		source.mu.Unlock()
 	}
 	if (liveSettler && !handoffLive) || sourceHolds {
 		c.mu.Unlock()
