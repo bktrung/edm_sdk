@@ -414,6 +414,10 @@ The client reconnect path then waits for publish quiescence, opens a replacement
 connection, derives its effective capabilities, re-establishes topology, swaps
 the live connection, and lets the runner create a fresh consumer generation.
 The complete connection path is in [`reconnect.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/reconnect.go).
+A runner that starts, or opens a new generation, while a reconnect is in
+progress waits for it and opens on the replacement connection. A consumer
+that was opened on the old connection as the reconnect began is released
+before its generation starts.
 
 After a successful repair, lifecycle state returns to ready. If reconnect
 attempts are exhausted or a fatal consumer condition remains, the runner records

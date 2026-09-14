@@ -100,6 +100,12 @@ type reconnectTestConn struct {
 	admin    *reconnectTestAdmin
 	closed   atomic.Bool
 	producer atomic.Int32
+	// openConsumers is the number of consumers this connection still carries,
+	// counted by the same close that releases each one. openAtClose is what
+	// Close found, so a test can tell whether a connection was retired with a
+	// consumer still on it, which the real drivers refuse to do.
+	openConsumers atomic.Int32
+	openAtClose   atomic.Int32
 }
 
 func (c *reconnectTestConn) Capabilities() driver.Capabilities { return c.driver.Capabilities() }
@@ -137,10 +143,14 @@ func (c *reconnectTestConn) Consumer(ctx context.Context, cfg driver.ConsumerCon
 		return nil, &driver.Error{Driver: c.driver.Name(), Op: "consumer", K: driver.KindTransient, Err: errors.New("connection closed")}
 	}
 	consumer := &reconnectTestConsumer{
+		conn:     c,
 		group:    cfg.Group,
 		messages: make(chan driver.InboundMessage, 8),
 		errors:   make(chan error, 8),
 	}
+	// Counted before the consumer is handed to anyone, so a test that receives
+	// it from created never sees the connection without its consumer.
+	c.openConsumers.Add(1)
 	select {
 	case c.driver.created <- consumer:
 	default:
@@ -151,6 +161,7 @@ func (c *reconnectTestConn) Admin() driver.Admin      { return c.admin }
 func (*reconnectTestConn) Ping(context.Context) error { return nil }
 func (c *reconnectTestConn) Close(context.Context) error {
 	c.closed.Store(true)
+	c.openAtClose.Store(c.openConsumers.Load())
 	return nil
 }
 
@@ -189,6 +200,9 @@ func (p *reconnectTestProducer) Close(context.Context) error {
 }
 
 type reconnectTestConsumer struct {
+	// conn is the connection this consumer was opened on, which a test reads to
+	// tell which connection a runner's consumer landed on.
+	conn         *reconnectTestConn
 	group        string
 	messages     chan driver.InboundMessage
 	errors       chan error
@@ -279,6 +293,9 @@ func (c *reconnectTestConsumer) setFailRelease(n int, err error) {
 	c.mu.Unlock()
 }
 
+// close releases the consumer from its connection. Both Release and Stop end
+// here, and a consumer that Release leaves open never reaches it, so the
+// connection's count follows the consumers that are really gone.
 func (c *reconnectTestConsumer) close() {
 	c.once.Do(func() {
 		c.mu.Lock()
@@ -286,6 +303,9 @@ func (c *reconnectTestConsumer) close() {
 		close(c.messages)
 		close(c.errors)
 		c.mu.Unlock()
+		if c.conn != nil {
+			c.conn.openConsumers.Add(-1)
+		}
 	})
 }
 
@@ -2617,6 +2637,203 @@ func TestRunnerPreservesOwnerThroughConsumerOpenCancellation(t *testing.T) {
 	default:
 	}
 	stopService()
+}
+
+// TestRunnerStartedDuringReconnectOpensOnTheReplacementConnection proves that a
+// runner which starts while a reconnect is in progress opens its consumer on
+// the connection the reconnect leaves live, instead of on the connection that
+// reconnect is about to retire.
+func TestRunnerStartedDuringReconnectOpensOnTheReplacementConnection(t *testing.T) {
+	fake := clock.NewFake(time.Unix(400, 0))
+	recorded := &recordingClock{Fake: fake, sleepStarted: make(chan chan struct{}, 4)}
+	d := &reconnectTestDriver{created: make(chan *reconnectTestConsumer, 4)}
+	client := newReconnectTestClient(t, d, recorded, 0)
+	client.reconnectRandom = func() float64 { return 0 }
+
+	if _, err := client.requestReconnect(errors.New("supervisor reconnect")); err != nil {
+		t.Fatalf("requestReconnect = %v, want nil", err)
+	}
+	select {
+	case token := <-recorded.sleepStarted:
+		<-token
+	case <-clock.NewReal().Timer(2 * time.Second).C:
+		t.Fatal("supervisor reconnect sleep did not start")
+	}
+	// The supervisor is parked in its backoff. It has abandoned the runners it
+	// knew about and has not opened the replacement, so c.conn is still the
+	// connection it is going to retire.
+
+	runner, err := client.Subscribe(context.Background(), Subscription{
+		Name:           "orders",
+		Topics:         []string{"orders.created"},
+		Prefetch:       12,
+		HandlerTimeout: 10 * time.Millisecond,
+		Handlers: map[string]Handler{
+			"orders.created": HandlerFunc(func(context.Context, *Event) error { return nil }),
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	runCtx, cancelRun := context.WithCancel(context.Background())
+	t.Cleanup(cancelRun)
+	runDone := make(chan error, 1)
+	waiting := make(chan struct{}, 1)
+	runner.reconnectWaitHook = func() {
+		select {
+		case waiting <- struct{}{}:
+		default:
+		}
+	}
+	go func() { runDone <- runner.Run(runCtx) }()
+
+	select {
+	case <-waiting:
+		fake.Advance(0)
+		waitReconnectCondition(t, func() bool { return !client.isReconnecting() })
+	case consumer := <-d.created:
+		t.Fatalf("runner consumer connection = %p, opened while the reconnect was in progress, want the replacement connection", consumer.conn)
+	case <-clock.NewReal().Timer(2 * time.Second).C:
+		t.Fatal("runner neither waited for the reconnect nor opened a consumer")
+	}
+
+	d.mu.Lock()
+	connections := append([]*reconnectTestConn(nil), d.connections...)
+	d.mu.Unlock()
+	if len(connections) != 2 {
+		t.Fatalf("driver connections after the reconnect = %d, want 2", len(connections))
+	}
+	oldConn, replacement := connections[0], connections[1]
+
+	var consumer *reconnectTestConsumer
+	select {
+	case consumer = <-d.created:
+	case <-clock.NewReal().Timer(2 * time.Second).C:
+		t.Fatal("runner opened no consumer")
+	}
+	if consumer.conn != replacement {
+		t.Fatalf("runner consumer connection = %p, want the replacement connection %p", consumer.conn, replacement)
+	}
+	if got := oldConn.openAtClose.Load(); got != 0 {
+		t.Fatalf("consumers open when the retired connection closed = %d, want 0", got)
+	}
+	select {
+	case err := <-runDone:
+		t.Fatalf("runner Run returned during the reconnect: %v", err)
+	default:
+	}
+}
+
+// TestConsumerOpenedAsAReconnectBeginsIsReleased proves that a consumer whose
+// open straddles the start of a reconnect is released rather than adopted: the
+// reconnect's abandon ran before that consumer existed, so nothing else would
+// ever close it, and the connection it was opened on would be retired with a
+// consumer still on it.
+func TestConsumerOpenedAsAReconnectBeginsIsReleased(t *testing.T) {
+	fake := clock.NewFake(time.Unix(400, 0))
+	recorded := &recordingClock{Fake: fake, sleepStarted: make(chan chan struct{}, 4)}
+	d := &reconnectTestDriver{created: make(chan *reconnectTestConsumer, 4)}
+	client := newReconnectTestClient(t, d, recorded, 0)
+	client.reconnectRandom = func() float64 { return 0 }
+
+	runner, err := client.Subscribe(context.Background(), Subscription{
+		Name:           "orders",
+		Topics:         []string{"orders.created"},
+		Prefetch:       12,
+		HandlerTimeout: 10 * time.Millisecond,
+		Handlers: map[string]Handler{
+			"orders.created": HandlerFunc(func(context.Context, *Event) error { return nil }),
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	runCtx, cancelRun := context.WithCancel(context.Background())
+	t.Cleanup(cancelRun)
+	runDone := make(chan error, 1)
+	go func() { runDone <- runner.Run(runCtx) }()
+
+	failing := <-d.created
+	d.mu.Lock()
+	retiring := d.connections[0]
+	d.mu.Unlock()
+	waitReconnectCondition(t, func() bool { return runner.lifecycle.Ready() })
+
+	// The next open is the one that straddles the reconnect: it asks for a
+	// reconnect and waits until the supervisor has abandoned the runners (the
+	// backoff it parks in is after the abandon), so its consumer is created
+	// after that abandon and lands on the connection now being retired.
+	var gateOnce sync.Once
+	var gateFailed atomic.Bool
+	d.mu.Lock()
+	d.consumerOpenHook = func(context.Context, string) error {
+		gateOnce.Do(func() {
+			if _, err := client.requestReconnect(errors.New("consumer open requested reconnect")); err != nil {
+				gateFailed.Store(true)
+				return
+			}
+			select {
+			case token := <-recorded.sleepStarted:
+				<-token
+			case <-clock.NewReal().Timer(time.Second).C:
+				gateFailed.Store(true)
+			}
+		})
+		return nil
+	}
+	d.mu.Unlock()
+
+	failing.sendError(&driver.Error{Driver: d.Name(), Op: "consumer", K: driver.KindTransient, Err: errors.New("consumer disconnected")})
+	var replacement *reconnectTestConsumer
+	select {
+	case replacement = <-d.created:
+	case <-clock.NewReal().Timer(2 * time.Second).C:
+		t.Fatal("runner opened no replacement consumer")
+	}
+	if replacement.conn != retiring {
+		t.Fatalf("replacement consumer connection = %p, want the retiring connection %p", replacement.conn, retiring)
+	}
+
+	// The runner either releases the consumer it opened here or adopts it as
+	// its generation's consumer. Waiting for that decision makes the count the
+	// retiring connection records the runner's decision, not the order two
+	// goroutines reached the connection in.
+	waitReconnectCondition(t, func() bool {
+		if retiring.openConsumers.Load() == 0 {
+			return true
+		}
+		runner.mu.Lock()
+		defer runner.mu.Unlock()
+		return runner.consumer == replacement
+	})
+
+	fake.Advance(0)
+	waitReconnectCondition(t, func() bool { return !client.isReconnecting() })
+
+	if got := retiring.openAtClose.Load(); got != 0 {
+		t.Fatalf("consumers open when the retired connection closed = %d, want 0", got)
+	}
+	d.mu.Lock()
+	connections := append([]*reconnectTestConn(nil), d.connections...)
+	d.mu.Unlock()
+	if len(connections) != 2 {
+		t.Fatalf("driver connections after the reconnect = %d, want 2", len(connections))
+	}
+	liveOn := connections[1]
+	waitReconnectCondition(t, func() bool {
+		runner.mu.Lock()
+		defer runner.mu.Unlock()
+		consumer, ok := runner.consumer.(*reconnectTestConsumer)
+		return ok && consumer.conn == liveOn
+	})
+	if gateFailed.Load() {
+		t.Fatal("consumer open gate did not reach the running abandon")
+	}
+	select {
+	case err := <-runDone:
+		t.Fatalf("runner Run returned during the reconnect: %v", err)
+	default:
+	}
 }
 
 // TestAbandonForReconnectPreservesRunnerOwnCause proves that a runner which

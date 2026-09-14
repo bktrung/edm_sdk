@@ -117,6 +117,9 @@ type Runner struct {
 	reconnectCauseAttempt *reconnectAttempt
 	// reconnectDecisionHook is a test-only seam for pausing generation decisions.
 	reconnectDecisionHook func()
+	// reconnectWaitHook is a test-only seam, called when a runner is about to wait for a
+	// reconnect in progress before it opens its consumer.
+	reconnectWaitHook func()
 	// consumerError identifies a transient failure from Consumer.Errors in this generation.
 	consumerError bool
 	// successfulDelivery means this generation completed at least one handled delivery.
