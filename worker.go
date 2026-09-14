@@ -1912,7 +1912,9 @@ func failSuccessorHandoff(r *Runner, ctx context.Context, op string, event *Even
 // retryAndSettle republishes message to its retry destination, carrying the
 // already-received body forward unchanged. Like deadLetter, it deliberately
 // does not apply codec.maxBodyBytes: that limit only guards a publish the
-// application originated, and this body was already accepted once.
+// application originated, and this body was already accepted once. A retry
+// copy whose headers cannot be encoded is handed to the dead-letter path
+// rather than settled.
 func retryAndSettle(r *Runner, ctx context.Context, message driver.InboundMessage, envelope Envelope, lastErr error, states ...*deliveryState) bool {
 	state := stateFor(states)
 	copyEnvelope := envelope
@@ -1948,8 +1950,8 @@ func retryAndSettle(r *Runner, ctx context.Context, message driver.InboundMessag
 	copyEnvelope.DueTime = &due
 	encoded, err := copyEnvelope.EncodeHeaders(state.headerMaxBytes)
 	if err != nil {
-		_ = nackDelivery(r, runnerSettlementContext(r, ctx), message, driver.NackOptions{CountAsFailure: true}, state)
-		return false
+		return deadLetterAndSettle(r, ctx, message, envelope, ReasonTerminal,
+			errors.Join(lastErr, fmt.Errorf("f1: retry copy cannot be encoded: %w", err)), state)
 	}
 	destination := retryDestination(r, copyEnvelope, message, tier)
 	out := driver.OutboundMessage{Destination: destination, Key: append([]byte(nil), message.Key...), Body: append([]byte(nil), message.Body...), DelayUntil: due}

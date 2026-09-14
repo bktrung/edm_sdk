@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -463,4 +464,105 @@ func oneSecondTimer(t *testing.T) clock.Timer {
 	timer := clock.NewReal().Timer(time.Second)
 	t.Cleanup(func() { timer.Stop() })
 	return timer
+}
+
+// TestRetryCopyThatCannotEncodeGoesToTheDeadLetterPath proves a delivery
+// whose retry copy will not fit the header cap is handed to the dead-letter
+// path instead of being settled: the original stays unsettled for the broker
+// to redeliver, the consumer is released, and the error handler is told the
+// hand-off failed. The dead-letter copy cannot fit either, but for a
+// different reason than the retry copy's: it is built from the original
+// envelope, so it carries no due time, and it adds the never-shed
+// f1deathreason and f1deathtime on top of the cap the original already needs.
+// The hand-off failure is therefore the ruled outcome and no dead-letter
+// notification happens.
+func TestRetryCopyThatCannotEncodeGoesToTheDeadLetterPath(t *testing.T) {
+	recorder := newErrorHandlerRecorder()
+	consumer := newDispatchConsumer()
+	producer := &dispatchProducer{}
+	client, runner := newErrorHandlerRunner(t, producer, consumer, recorder.handle)
+	defer func() { _ = client.Close(context.Background()) }()
+
+	settler := &retryBridgeSettler{}
+	envelope := Envelope{
+		SpecVersion: "1.0",
+		ID:          "retry-copy-too-large",
+		Source:      "/test/orders",
+		Type:        "orders.created.v1",
+		Priority:    PriorityHigh,
+		Attempt:     1,
+		// f1partitionkey is never shed, so it pins the envelope's floor.
+		PartitionKey: strings.Repeat("k", 2000),
+	}
+	message := retryBridgeMessage(t, envelope, settler)
+
+	// The cap is sized from this envelope rather than from a constant: the
+	// encoded size moves with the timestamp format and the header names, and a
+	// hard-coded cap would let the test pass or fail for the wrong reason.
+	// EncodeHeaders coerces a non-positive cap up to CoreMaxHeaderBytes, so the
+	// smallest cap the envelope fits is searched from 1, and "an envelope fits
+	// at cap n" is monotone in n.
+	limit := sort.Search(CoreMaxHeaderBytes, func(n int) bool {
+		_, err := envelope.EncodeHeaders(n + 1)
+		return err == nil
+	}) + 1
+
+	// Guard the premise: the original fits at limit by construction, and the
+	// retry copy has to not fit, or the call below would exercise the publish
+	// path instead of the one under test.
+	retryCopy := envelope
+	retryCopy.OriginalDest = message.Destination
+	retryCopy.Attempt = envelope.Attempt + 1
+	retryCopy.MaxAttempts = effectiveMaxAttempts(envelope.MaxAttempts, runner.subscription.Retry.MaxAttempts)
+	due := runner.client.options.clock.Now().UTC().Add(time.Second)
+	retryCopy.DueTime = &due
+	if _, err := retryCopy.EncodeHeaders(limit); !errors.Is(err, ErrEnvelopeTooLarge) {
+		t.Fatalf("retry copy EncodeHeaders(%d) error = %v, want %v: the premise that the copy cannot be built does not hold", limit, err, ErrEnvelopeTooLarge)
+	}
+
+	if retryAndSettle(runner, context.Background(), message, envelope, errors.New("temporary"), &deliveryState{headerMaxBytes: limit}) {
+		t.Fatal("retryAndSettle reported success for a retry copy it could not encode")
+	}
+	if settler.acks != 0 {
+		t.Fatalf("Ack calls = %d, want 0: the original must stay unsettled", settler.acks)
+	}
+	if len(settler.nacks) != 0 {
+		t.Fatalf("Nack calls = %+v, want none: the original must stay unsettled", settler.nacks)
+	}
+	producer.mu.Lock()
+	published := len(producer.messages)
+	producer.mu.Unlock()
+	if published != 0 {
+		t.Fatalf("published messages = %d, want 0: an unencodable retry copy must not be published", published)
+	}
+	consumer.mu.Lock()
+	released := consumer.released
+	consumer.mu.Unlock()
+	if !released {
+		t.Fatal("consumer was not released: nothing would redeliver the still-unsettled original")
+	}
+
+	recorder.waitForCall(t, time.Second)
+	if got := recorder.count(); got != 1 {
+		t.Fatalf("error handler calls = %d, want 1", got)
+	}
+	recorder.mu.Lock()
+	call := recorder.calls[0]
+	recorder.mu.Unlock()
+	classified, ok := errors.AsType[*driver.Error](call.err)
+	if !ok {
+		t.Fatalf("error = %v, want a classified *driver.Error", call.err)
+	}
+	if classified.Op != "dead_letter" {
+		t.Fatalf("driver error op = %q, want %q", classified.Op, "dead_letter")
+	}
+	if !errors.Is(call.err, ErrEnvelopeTooLarge) {
+		t.Fatalf("error = %v, want it to wrap %v", call.err, ErrEnvelopeTooLarge)
+	}
+	if call.event == nil {
+		t.Fatal("event = nil, want the failed delivery's Event")
+	}
+	if got := call.event.ID(); got != envelope.ID {
+		t.Fatalf("event ID = %q, want %q", got, envelope.ID)
+	}
 }
