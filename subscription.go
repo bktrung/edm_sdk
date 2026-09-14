@@ -356,11 +356,24 @@ func overlayLoadedSubscription(dst *SubscriptionConfig, src SubscriptionConfig) 
 	if p.Priorities || len(src.Priorities) > 0 {
 		dst.Priorities = append([]Priority(nil), src.Priorities...)
 	}
+	// A YAML-named fairness or retry block is decoded over the full defaults,
+	// so the struct is complete and replaces the default wholesale, which is
+	// what preserves an explicit YAML zero. A Go-built config sets no presence
+	// and its struct is partial, so it merges field by field, the rule the
+	// explicit subscription overlay already uses.
 	if p.Fairness || !fairnessZero(src.Fairness) {
-		dst.Fairness = cloneFairness(src.Fairness)
+		if p.Fairness {
+			dst.Fairness = cloneFairness(src.Fairness)
+		} else {
+			dst.Fairness = mergeFairness(dst.Fairness, src.Fairness)
+		}
 	}
 	if p.Retry || !retryZero(src.Retry) {
-		dst.Retry = cloneRetry(src.Retry)
+		if p.Retry {
+			dst.Retry = cloneRetry(src.Retry)
+		} else {
+			dst.Retry = mergeRetry(dst.Retry, src.Retry)
+		}
 	}
 	if p.HandlerTimeout || src.HandlerTimeout != 0 {
 		dst.HandlerTimeout = src.HandlerTimeout

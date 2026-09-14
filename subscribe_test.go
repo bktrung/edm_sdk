@@ -304,6 +304,59 @@ f1:
 	}
 }
 
+func TestSubscribeMergesGoBuiltRetryOverDefaults(t *testing.T) {
+	t.Parallel()
+	cfg := Config{
+		Env:     "test",
+		Service: "orders",
+		Broker:  BrokerConfig{Driver: "inmem"},
+		Subscriptions: map[string]SubscriptionConfig{
+			"orders": {Topics: []string{"orders.created"}, Retry: RetryConfig{MaxAttempts: 7}},
+		},
+	}
+	client, err := New(context.Background(), cfg, WithDriver(&testDriver{conn: &testConn{info: testBrokerInfo()}}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = client.Close(context.Background()) })
+	runner, err := client.Subscribe(context.Background(), Subscription{Name: "orders"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := defaultSubscription().Retry
+	want.MaxAttempts = 7
+	if got := runner.config.Retry; !reflect.DeepEqual(got, want) {
+		t.Fatalf("resolved retry = %+v, want %+v", got, want)
+	}
+}
+
+func TestSubscribeMergesGoBuiltFairnessOverDefaults(t *testing.T) {
+	t.Parallel()
+	weights := map[Priority]int{PriorityHigh: 5, PriorityMedium: 2}
+	cfg := Config{
+		Env:     "test",
+		Service: "orders",
+		Broker:  BrokerConfig{Driver: "inmem"},
+		Subscriptions: map[string]SubscriptionConfig{
+			"orders": {Topics: []string{"orders.created"}, Fairness: FairnessConfig{Weights: weights}},
+		},
+	}
+	client, err := New(context.Background(), cfg, WithDriver(&testDriver{conn: &testConn{info: testBrokerInfo()}}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = client.Close(context.Background()) })
+	runner, err := client.Subscribe(context.Background(), Subscription{Name: "orders"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := defaultSubscription().Fairness
+	want.Weights = weights
+	if got := runner.config.Fairness; !reflect.DeepEqual(got, want) {
+		t.Fatalf("resolved fairness = %+v, want %+v", got, want)
+	}
+}
+
 func TestUnmatchedDiscardReasonIsNotDeathReason(t *testing.T) {
 	discarded := discardUnmatched(Envelope{}, nil)
 	if discarded.Reason != DiscardUnmatched {
