@@ -2,7 +2,7 @@
 
 This page is the canonical maintainer trace for one subscription's delivery
 lifecycle. It follows the path from `Client.Subscribe` through runner startup,
-broker intake, scheduling, middleware and handler execution, disposition,
+broker intake, scheduling, middleware and handler execution, delivery decisions,
 settlement, drain, and reconnect.
 
 The source and tests own exact behavior. This page records responsibility,
@@ -36,11 +36,11 @@ flowchart TB
     end
     subgraph S6[Settle]
         direction LR
-        OUTCOME{Disposition} --> ACK[Ack original]
+        OUTCOME{Settlement decision} --> ACK[Ack original]
         OUTCOME --> SUCCESSOR[Publish retry or<br/>DLQ successor] --> ACK
         OUTCOME --> REQUEUE[Nack or release<br/>for redelivery]
-        ACK --> ACCOUNT[Record settlement<br/>and disposition]
-        REQUEUE --> ACCOUNT
+        ACK --> LEFT[Delivery leaves the<br/>in-flight registry]
+        REQUEUE --> LEFT
     end
     S1 --> S2 --> S3 --> S4 --> S5 --> S6
 ```
@@ -59,8 +59,8 @@ The main owners are:
 - [`runDispatchPipeline`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/worker.go) for scheduler and pool coordination;
 - [`processDelivery`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/worker.go) and [`dispatchMessage`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/worker.go)
   for handler outcomes and settlement;
-- [`internal/dispatch`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/internal/dispatch/registry.go) for accepted-work
-  and settlement accounting;
+- [`internal/dispatch`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/internal/dispatch/pool.go) for the dispatch pool,
+  ordered-key routing, and the in-flight registry;
 - [`internal/lifecycle`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/internal/lifecycle/state.go) for runner state
   transitions and shutdown phases.
 
@@ -83,7 +83,7 @@ exists yet. The precedence and validation path is in
 [`subscription.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/subscription.go).
 
 `Runner.Run` performs the runtime work. It can only start once, initializes the
-generation contexts, lifecycle machine, in-flight registry, accounting view,
+generation contexts, lifecycle machine, in-flight registry,
 and notification groups, then enters its generation loop. A generation owns
 one consumer, fetcher, dispatch pipeline, and consumer-error watcher.
 
@@ -238,12 +238,12 @@ The user-facing message and middleware model is documented in
 
 ## Delivery decisions
 
-The result of handler processing determines the intended disposition of the
-original delivery:
+The result of handler processing determines how the original delivery is
+settled:
 
 | Condition | Core action | Original delivery |
 | --- | --- | --- |
-| Handler succeeds | Record handled disposition | Ack |
+| Handler succeeds | Mark the generation handled | Ack |
 | Handler explicitly drops | Notify `OnDiscarded` | Ack without successor |
 | No handler, unmatched policy `Ignore` | Notify discarded | Ack without successor |
 | No handler, unmatched policy `DeadLetter` | Build DLQ successor | Ack after successor publication |
@@ -256,8 +256,9 @@ original delivery:
 
 The decision tree is implemented by
 [`dispatchMessage`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/worker.go), with error categories in
-[`errors.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/errors.go) and retry mechanics in
-[`internal/retry`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/internal/retry/classify.go).
+[`errors.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/errors.go), classification in
+[`worker.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/worker.go), and retry mechanics in
+[`internal/retry`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/internal/retry/ladder.go).
 
 ### Retry, delay, and successor destinations
 
@@ -314,17 +315,12 @@ The implementation is in [`retryAndSettle`](https://fgit.zapps.vn/zatf2026-be-t3
 [`driver.Settler`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/driver/message.go), whose `Ack` and `Nack` operations
 must not be applied more than once by a driver.
 
-## In-flight accounting and settlement cleanup
+## In-flight registry and settlement cleanup
 
-The runtime tracks two related but different facts for each accepted delivery:
-
-1. **Intended message disposition:** handled, requeued, retried, or
-   dead-lettered.
-2. **Settlement outcome:** settled, requeued, unknown, or abandoned.
-
-`internal/dispatch.Registry` registers a delivery before dispatch and removes
-it only after the settlement result is known or the bounded cleanup budget is
-exhausted. `WaitZero` is the runner's proof that accepted work has left the
+The runtime tracks one fact for each accepted delivery: whether it is still in
+flight. `internal/dispatch.Registry` registers a delivery before dispatch and
+removes it once its settlement path finished, or when the bounded cleanup
+budget runs out. `WaitZero` is the runner's proof that accepted work has left the
 in-flight set.
 
 `processDelivery` owns the final cleanup defer. It:
@@ -333,13 +329,13 @@ in-flight set.
 - requeues an abandoned delivery when no settlement was attempted;
 - retries the last ack or nack operation for a bounded number of rounds;
 - falls back from a failed ack to a requeue nack during cleanup; and
-- records the final accounting outcome in the registry.
+- removes the delivery from the in-flight registry once its settlement path
+  finished.
 
-This distinction matters when a driver call returns an error: the intended
-disposition may be known while the broker-side settlement remains unknown.
-The registry and accounting types are in
-[`internal/dispatch/registry.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/internal/dispatch/registry.go) and
-[`internal/lifecycle/accounting.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/internal/lifecycle/accounting.go).
+When a driver call returns an error the broker-side settlement is unknown, so
+the entry stays in the registry until the delivery settles or the bounded
+cleanup budget runs out. The registry is in
+[`internal/dispatch/registry.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/internal/dispatch/registry.go).
 Settlement behavior is covered by [`settlement_state_test.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/settlement_state_test.go),
 [`worker_settlement_test.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/worker_settlement_test.go), and the driver
 settlement suites.

@@ -133,7 +133,6 @@ type Runner struct {
 	inflight              *inflightRegistry
 	retryDestinationTiers map[string]int
 	lifecycle             *lifecycle.Machine
-	accounting            *lifecycle.Accounting
 	dispatchPool          *dispatch.Pool
 }
 

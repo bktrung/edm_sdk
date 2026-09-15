@@ -3,13 +3,13 @@ package f1
 import (
 	"context"
 	"errors"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/driver"
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/clock"
-	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/lifecycle"
 )
 
 // scriptedNackSettler models the port contract for a failed negative
@@ -22,6 +22,7 @@ type scriptedNackSettler struct {
 	ackCalls    int
 	outstanding bool
 	onAck       func()
+	onNack      func()
 }
 
 func (s *scriptedNackSettler) Ack(context.Context) error {
@@ -36,8 +37,14 @@ func (s *scriptedNackSettler) Ack(context.Context) error {
 
 func (s *scriptedNackSettler) Nack(context.Context, driver.NackOptions) error {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	s.nackCalls++
+	hook := s.onNack
+	s.mu.Unlock()
+	if hook != nil {
+		hook()
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if s.nackCalls <= s.failFirst {
 		s.outstanding = true
 		return &driver.Error{Driver: "test", Op: "nack", K: driver.KindTransient, Err: errors.New("injected transient nack failure")}
@@ -51,12 +58,6 @@ func (s *scriptedNackSettler) state() (nacks, acks int, outstanding bool) {
 	defer s.mu.Unlock()
 	return s.nackCalls, s.ackCalls, s.outstanding
 }
-
-type classificationPanicError struct{}
-
-func (classificationPanicError) Error() string { return "classification panic" }
-
-func (classificationPanicError) Is(error) bool { panic("classification panic") }
 
 func newSettlementOrderingRunner(t *testing.T) (*Client, *Runner, *dispatchConsumer) {
 	t.Helper()
@@ -77,69 +78,81 @@ func newSettlementOrderingRunner(t *testing.T) (*Client, *Runner, *dispatchConsu
 		inflight: newInflightRegistry(),
 	}
 	runner.consumer = consumer
-	runner.accounting = lifecycle.NewAccounting(runner.inflight.registry)
 	return client, runner, consumer
 }
 
-func TestProcessDeliveryRecoversClassificationPanic(t *testing.T) {
-	producer := &dispatchProducer{}
-	client, err := New(context.Background(), testClientConfig(t),
-		WithDriver(&dispatchDriver{conn: &dispatchConn{producer: producer}}),
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = client.Close(context.Background()) })
-
-	runner := &Runner{
-		client: client,
-		subscription: Subscription{
-			Name:           "orders",
-			Retry:          RetryConfig{MaxAttempts: 2},
-			HandlerTimeout: time.Second,
-			Handlers: map[string]Handler{
-				"orders.created": HandlerFunc(func(context.Context, *Event) error {
-					return classificationPanicError{}
-				}),
+// TestRetriedDeliveryDoesNotCountAsHandled pins the flag the reconnect
+// decision reads: only a delivery the handler completed counts the
+// generation as having one, so a delivery that settles by publishing a retry
+// copy must leave it false.
+func TestRetriedDeliveryDoesNotCountAsHandled(t *testing.T) {
+	newRunner := func(t *testing.T, handler Handler) (*dispatchProducer, *Runner) {
+		t.Helper()
+		producer := &dispatchProducer{}
+		client, err := New(context.Background(), testClientConfig(t), WithDriver(&dispatchDriver{conn: &dispatchConn{producer: producer}}))
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = client.Close(context.Background()) })
+		return producer, &Runner{
+			client: client,
+			subscription: Subscription{
+				Name:           "orders",
+				Topics:         []string{"orders.created"},
+				Priorities:     []Priority{PriorityHigh},
+				Retry:          RetryConfig{MaxAttempts: 2, InitialInterval: time.Second},
+				HandlerTimeout: time.Second,
+				Handlers:       map[string]Handler{"orders.created.v1": handler},
 			},
-		},
-		inflight: newInflightRegistry(),
+			inflight: newInflightRegistry(),
+		}
 	}
-	runner.accounting = lifecycle.NewAccounting(runner.inflight.registry)
-	envelope := Envelope{SpecVersion: "1.0", ID: "classification-panic", Source: "/test/orders", Type: "orders.created", Attempt: 1}
-	headers, err := envelope.EncodeHeaders(CoreMaxHeaderBytes)
-	if err != nil {
-		t.Fatal(err)
+	envelope := func(id string) Envelope {
+		return Envelope{SpecVersion: "1.0", ID: id, Source: "/test/orders", Type: "orders.created.v1", Priority: PriorityHigh, Attempt: 1}
 	}
-	seenPublishBeforeAck := false
-	settler := &scriptedNackSettler{onAck: func() {
-		producer.mu.Lock()
-		seenPublishBeforeAck = len(producer.messages) == 1
-		producer.mu.Unlock()
-	}}
-	message := driver.InboundMessage{
-		Destination: "f1.test.orders.created.medium",
-		Headers:     headerSlice(headers),
-		Body:        []byte(`{}`),
-		Settle:      settler,
-	}
-	id := runner.inflight.Add(message)
-	processDelivery(runner, context.Background(), delivery{id: id, message: message})
 
-	nacks, acks, outstanding := settler.state()
-	if nacks != 0 || acks != 1 || outstanding {
-		t.Fatalf("settlement calls = nacks %d, acks %d, outstanding %v; want one ack and no nack", nacks, acks, outstanding)
-	}
-	if !seenPublishBeforeAck {
-		t.Fatal("panic DLQ copy was not published before the original was acked")
-	}
-	if len(producer.messages) != 1 || headerValue(producer.messages[0].Headers, "f1deathreason") != ReasonPanic.String() {
-		t.Fatalf("DLQ messages = %#v, want one panic message", producer.messages)
-	}
-	counts := runner.inflight.Counts()
-	if runner.inflight.Len() != 0 || counts.settled != 1 {
-		t.Fatalf("inflight after classification panic = len %d counts %#v, want one settled delivery", runner.inflight.Len(), counts)
-	}
+	t.Run("retried delivery", func(t *testing.T) {
+		producer, runner := newRunner(t, HandlerFunc(func(context.Context, *Event) error {
+			return errors.New("handler failed")
+		}))
+		settler := &dispatchSettler{}
+		message := retryBridgeMessage(t, envelope("retried"), settler)
+		id := runner.inflight.Add(message)
+		processDelivery(runner, context.Background(), delivery{id: id, message: message})
+
+		if got := len(producer.messages); got != 1 {
+			t.Fatalf("publishes after an ordinary handler error = %d, want one retry copy", got)
+		}
+		if destination := producer.messages[0].Destination; !strings.Contains(destination, "."+retryDestinationSegment+".") {
+			t.Fatalf("retry successor destination = %q, want the retry destination", destination)
+		}
+		if !settler.acked || settler.nacked {
+			t.Fatalf("retry settlement = acked %t nacked %t, want the original acked once its retry copy was published", settler.acked, settler.nacked)
+		}
+		if runner.successfulDelivery {
+			t.Fatal("a generation whose only delivery was retried counted it as handled")
+		}
+	})
+
+	t.Run("handled delivery", func(t *testing.T) {
+		producer, runner := newRunner(t, HandlerFunc(func(context.Context, *Event) error {
+			return nil
+		}))
+		settler := &dispatchSettler{}
+		message := retryBridgeMessage(t, envelope("handled"), settler)
+		id := runner.inflight.Add(message)
+		processDelivery(runner, context.Background(), delivery{id: id, message: message})
+
+		if got := len(producer.messages); got != 0 {
+			t.Fatalf("publishes after a handled delivery = %d, want none", got)
+		}
+		if !settler.acked || settler.nacked {
+			t.Fatalf("handled settlement = acked %t nacked %t, want one ack", settler.acked, settler.nacked)
+		}
+		if !runner.successfulDelivery {
+			t.Fatal("a handled delivery did not count the generation as having one")
+		}
+	})
 }
 
 // TestDrainSetupKeepsInstalledSettlementContextLive pins the context
@@ -266,7 +279,25 @@ func TestGenerationStartDoesNotCancelCapturedSettlementContext(t *testing.T) {
 func TestCleanupKeepsUnsettledDeliveryAccountedUntilSettled(t *testing.T) {
 	_, runner, _ := newSettlementOrderingRunner(t)
 
+	// The first nack runs while the driver still owns the delivery, which is
+	// the moment a drain must not read zero. Record what the registry says
+	// there: the entry is present, and WaitZero reports the cancelled context
+	// instead of completing.
+	var lenDuringFirstNack int
+	var waitErrDuringFirstNack error
 	settler := &scriptedNackSettler{failFirst: 2}
+	settler.onNack = func() {
+		settler.mu.Lock()
+		first := settler.nackCalls == 1
+		settler.mu.Unlock()
+		if !first {
+			return
+		}
+		lenDuringFirstNack = runner.inflight.Len()
+		waitCtx, cancelWait := context.WithCancel(context.Background())
+		cancelWait()
+		waitErrDuringFirstNack = runner.inflight.WaitZero(waitCtx)
+	}
 	envelope := Envelope{
 		SpecVersion: "1.0",
 		ID:          "unsettled-cleanup",
@@ -302,22 +333,37 @@ func TestCleanupKeepsUnsettledDeliveryAccountedUntilSettled(t *testing.T) {
 		}
 		t.Fatal("delivery was never settled despite remaining cleanup budget")
 	}
-	counts := runner.inflight.Counts()
-	if counts.requeued != 1 {
-		t.Fatalf("requeued settlement outcome = %d, want 1: the successful retry was a nack", counts.requeued)
+	if lenDuringFirstNack != 1 {
+		t.Fatalf("inflight length during the first failed nack = %d, want 1: the registry entry must stay while the driver still owns the delivery", lenDuringFirstNack)
+	}
+	if !errors.Is(waitErrDuringFirstNack, context.Canceled) {
+		t.Fatalf("WaitZero during the failed settlement = %v, want context canceled: a wait must not report zero while a delivery is unsettled", waitErrDuringFirstNack)
+	}
+	if got := runner.inflight.Len(); got != 0 {
+		t.Fatalf("inflight length after the delivery settled = %d, want 0", got)
+	}
+	if err := runner.inflight.WaitZero(context.Background()); err != nil {
+		t.Fatalf("WaitZero() after the delivery settled = %v, want nil", err)
 	}
 }
 
 // TestCleanupRemovesDeliveryOnlyWhenSettlementBudgetExhausts pins the other
 // side of the cleanup bound: when every settlement attempt within the
-// bounded budget fails transiently, the delivery is removed and recorded as
-// abandoned rather than retried forever, because a drain must terminate. The
-// registry entry stays for the whole retry budget and goes only when the
-// budget does.
+// bounded budget fails transiently, the delivery is removed rather than
+// retried forever, because a drain must terminate. The registry entry stays
+// for the whole retry budget and goes only when the budget does, so the test
+// reads the registry inside the budget as well as at the end.
 func TestCleanupRemovesDeliveryOnlyWhenSettlementBudgetExhausts(t *testing.T) {
 	_, runner, _ := newSettlementOrderingRunner(t)
 
 	settler := &scriptedNackSettler{failFirst: 99}
+	// Every attempt inside the budget must still see the delivery: an entry
+	// removed early would let a drain read zero while the broker still owns
+	// the message.
+	var lenDuringBudget []int
+	settler.onNack = func() {
+		lenDuringBudget = append(lenDuringBudget, runner.inflight.Len())
+	}
 	envelope := Envelope{
 		SpecVersion: "1.0",
 		ID:          "budget-exhausted",
@@ -347,10 +393,18 @@ func TestCleanupRemovesDeliveryOnlyWhenSettlementBudgetExhausts(t *testing.T) {
 	if !outstanding {
 		t.Fatal("settler reported the delivery settled, want retained")
 	}
+	if len(lenDuringBudget) != 1+settlementRetryAttempts {
+		t.Fatalf("registry reads inside the budget = %d, want %d: one per settlement attempt", len(lenDuringBudget), 1+settlementRetryAttempts)
+	}
+	for attempt, length := range lenDuringBudget {
+		if length != 1 {
+			t.Fatalf("inflight length during settlement attempt %d = %d, want 1: the entry stays for the whole retry budget", attempt+1, length)
+		}
+	}
 	if got := runner.inflight.Len(); got != 0 {
 		t.Fatalf("inflight length = %d, want 0 once the settlement budget is exhausted", got)
 	}
-	if counts := runner.inflight.Counts(); counts.abandoned != 1 {
-		t.Fatalf("abandoned settlement outcome = %d, want 1", counts.abandoned)
+	if err := runner.inflight.WaitZero(context.Background()); err != nil {
+		t.Fatalf("WaitZero() after the budget was exhausted = %v, want nil: a drain must terminate", err)
 	}
 }

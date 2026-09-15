@@ -73,10 +73,10 @@ own the details.
 | `driver/` | Broker port: connection, producer, consumer, settlement, administration, topology, capabilities, messages, and driver errors | [`driver/driver.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/driver/driver.go), [`driver/capability.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/driver/capability.go), [`driver/topology.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/driver/topology.go) |
 | `driver/conformance/` | Broker-independent contract suite that exercises a candidate driver through the port | [`driver/conformance/run.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/driver/conformance/run.go), [`driver/conformance/manifest.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/driver/conformance/manifest.go) |
 | `internal/clock/` | Real and manually advanced clocks used to keep timing behavior testable | [`internal/clock/clock.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/internal/clock/clock.go) |
-| `internal/retry/` | Error classification, retry outcomes, backoff tiers, and retry sanity checks | [`internal/retry/classify.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/internal/retry/classify.go), [`internal/retry/ladder.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/internal/retry/ladder.go) |
+| `internal/retry/` | Backoff tiers, delay resolution, and retry sanity checks | [`internal/retry/ladder.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/internal/retry/ladder.go) |
 | `internal/sched/` | Bounded weighted lanes, aging, and scheduling fairness | [`internal/sched/scheduler.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/internal/sched/scheduler.go) |
 | `internal/dispatch/` | Worker pool, ordered-key routing, and in-flight delivery accounting | [`internal/dispatch/pool.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/internal/dispatch/pool.go), [`internal/dispatch/registry.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/internal/dispatch/registry.go) |
-| `internal/lifecycle/` | Runner drain state and disposition accounting used by shutdown and settlement | [`internal/lifecycle/state.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/internal/lifecycle/state.go), [`internal/lifecycle/drain.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/internal/lifecycle/drain.go) |
+| `internal/lifecycle/` | Runner drain state and shutdown phases | [`internal/lifecycle/state.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/internal/lifecycle/state.go), [`internal/lifecycle/drain.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/internal/lifecycle/drain.go) |
 | `drivers/inmem/` | Deterministic in-memory broker, including topology, delivery, settlement, and fault behavior for tests | [`drivers/inmem/inmem.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/drivers/inmem/inmem.go) |
 | `drivers/rabbitmq/` | RabbitMQ transport, topology, management, settlement, reconnect, and broker-specific tests | [`drivers/rabbitmq/rabbitmq.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/drivers/rabbitmq/rabbitmq.go) |
 | `drivers/kafka/` | Kafka transport, classic consumer groups, topology, offsets, rebalancing, and broker-specific tests | [`drivers/kafka/kafka.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/drivers/kafka/kafka.go) |
@@ -106,7 +106,8 @@ primary owner:
   lanes; `internal/dispatch` owns worker execution, ordered-key routing, and
   in-flight accounting. User-visible behavior is described in
   [Ordering and scheduling](/advanced-topics/ordering-and-scheduling).
-- **Settlement and failure routing:** `internal/retry` classifies outcomes;
+- **Settlement and failure routing:** `worker.go` classifies handler errors and
+  `internal/retry` resolves tiers and delays;
   `worker.go` publishes retry or dead-letter successors and settles the source
   delivery. The [Failure handling](/advanced-topics/failure-handling)
   guide describes the application-facing policy.

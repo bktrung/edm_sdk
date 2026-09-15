@@ -41,6 +41,20 @@ type delivery struct {
 	message driver.InboundMessage
 }
 
+// settlementOperation identifies the kind of settlement call made for a
+// delivery, so a failed one can be retried in kind rather than guessed at.
+type settlementOperation uint8
+
+const (
+	// settlementOperationNone means no settlement call has been made.
+	settlementOperationNone settlementOperation = iota
+	// settlementOperationAck means the delivery was asked to be acknowledged.
+	settlementOperationAck
+	// settlementOperationNack means the delivery was asked to be negatively
+	// acknowledged.
+	settlementOperationNack
+)
+
 // deliveryState records attempted versus settled ownership. operation and
 // nackOptions preserve the exact settlement operation for deferred retries.
 type deliveryState struct {
@@ -112,7 +126,6 @@ func (r *Runner) Run(ctx context.Context) (runErr error) {
 	r.drainStarted = make(chan struct{})
 	r.inflight = newInflightRegistry()
 	r.lifecycle = lifecycle.New()
-	r.accounting = lifecycle.NewAccounting(r.inflight.registry)
 	handlerCtx, handlerCancel := context.WithCancel(ctx)
 	r.handlerCtx, r.handlerCancel = handlerCtx, handlerCancel
 	handlerShutdownCtx, handlerShutdownCancel := context.WithCancel(context.Background())
@@ -1400,12 +1413,8 @@ func enqueueDelivery(r *Runner, ctx context.Context, dispatch chan<- delivery, m
 		// A cancellation path may still have a delivery in the channel. Put it
 		// back through the broker rather than losing it locally.
 		state := &deliveryState{id: id}
-		err := nackDelivery(r, runnerSettlementContext(r, ctx), message, driver.NackOptions{Requeue: true}, state)
-		outcome := settlementOutcomeRequeued
-		if err != nil {
-			outcome = settlementOutcomeUnknown
-		}
-		r.inflight.RemoveAs(id, outcome)
+		_ = nackDelivery(r, runnerSettlementContext(r, ctx), message, driver.NackOptions{Requeue: true}, state)
+		r.inflight.Remove(id)
 		return false
 	}
 }
@@ -1425,20 +1434,12 @@ func processDelivery(r *Runner, ctx context.Context, item delivery) {
 			_ = nackDelivery(r, runnerSettlementContext(r, ctx), item.message, driver.NackOptions{Requeue: true}, state)
 		}
 		retryDeliverySettlement(r, ctx, item.message, state)
-		// The outcome names the delivery's terminal result: a delivery whose
-		// delayed cleanup eventually settled reports that settlement, and
-		// abandoned is reserved for one that never settled at all.
-		operation := state.operation
-		outcome := settlementOutcomeUnknown
-		switch {
-		case state.settled && operation == settlementOperationNack:
-			outcome = settlementOutcomeRequeued
-		case state.settled:
-			outcome = settlementOutcomeSettled
-		case abandoned:
-			outcome = settlementOutcomeAbandoned
-		}
-		r.inflight.RemoveAs(item.id, outcome)
+		// The registry entry leaves only after the delivery's settlement
+		// path finished, so a drain neither reads zero while the broker
+		// still owns the message nor waits on an entry nothing will
+		// remove. An abandoned delivery leaves at the end of the bounded
+		// budget.
+		r.inflight.Remove(item.id)
 	}()
 	dispatchMessage(r, ctx, item.message, &envelope, &abandoned, state)
 }
@@ -1554,11 +1555,11 @@ func dispatchMessage(r *Runner, ctx context.Context, message driver.InboundMessa
 		return ackDelivery(r, runnerSettlementContext(r, ctx), message, state)
 	}
 	outcome := classifyRetryError(result.err)
-	switch outcome.Kind {
-	case retry.Drop:
+	switch outcome {
+	case retryOutcomeDrop:
 		runnerNotifyDiscarded(r, runnerSettlementContext(r, ctx), Discarded{Envelope: envelope, Body: append([]byte(nil), message.Body...), Reason: DiscardDropped, Err: result.err})
 		return ackDelivery(r, runnerSettlementContext(r, ctx), message, state)
-	case retry.Terminal:
+	case retryOutcomeTerminal:
 		return deadLetterAndSettle(r, ctx, message, envelope, ReasonTerminal, result.err, state)
 	}
 	if envelope.Attempt >= maxAttempts {
@@ -1567,20 +1568,33 @@ func dispatchMessage(r *Runner, ctx context.Context, message driver.InboundMessa
 	return retryAndSettle(r, ctx, message, envelope, result.err, state)
 }
 
-func classifyRetryError(err error) retry.Outcome {
+// retryOutcome names the settlement path a handler error takes: retried
+// within the attempt budget, acknowledged without a successor copy, or
+// dead-lettered without another attempt.
+type retryOutcome uint8
+
+const (
+	// retryOutcomeRetry publishes a successor copy so the delivery is
+	// attempted again.
+	retryOutcomeRetry retryOutcome = iota
+	// retryOutcomeDrop acknowledges the delivery without a successor copy.
+	retryOutcomeDrop
+	// retryOutcomeTerminal dead-letters the delivery without another attempt.
+	retryOutcomeTerminal
+)
+
+// classifyRetryError maps a handler error to the settlement path it asks
+// for: a terminal error is dead-lettered without another attempt, a dropped
+// error is acknowledged without a successor copy, and anything else is
+// retried.
+func classifyRetryError(err error) retryOutcome {
 	switch {
 	case IsTerminal(err):
-		return retry.Outcome{Kind: retry.Terminal, Err: err}
+		return retryOutcomeTerminal
 	case IsDropped(err):
-		return retry.Outcome{Kind: retry.Drop, Err: err}
+		return retryOutcomeDrop
 	}
-	if delay, ok := RetryDelay(err); ok {
-		if delay < 0 {
-			delay = 0
-		}
-		return retry.Outcome{Kind: retry.RetryAfter, Delay: delay, Err: err}
-	}
-	return retry.Classify(err)
+	return retryOutcomeRetry
 }
 
 func stateFor(states []*deliveryState) *deliveryState {
@@ -1714,22 +1728,23 @@ func runnerIsDraining(r *Runner) bool {
 // --- Settlement primitives ---
 
 func ackDelivery(r *Runner, ctx context.Context, message driver.InboundMessage, states ...*deliveryState) bool {
-	return ackDeliveryAs(r, ctx, message, lifecycle.Handled, states...)
+	return ackDeliveryAs(r, ctx, message, true, states...)
 }
 
-func ackDeliveryAs(r *Runner, ctx context.Context, message driver.InboundMessage, disposition lifecycle.Disposition, states ...*deliveryState) bool {
+// ackDeliveryAs acknowledges the delivery. handled records whether the ack
+// ends a handled delivery rather than a dead-lettered or retried one; only a
+// handled ack counts the generation's successfulDelivery, which the
+// reconnect decision reads.
+func ackDeliveryAs(r *Runner, ctx context.Context, message driver.InboundMessage, handled bool, states ...*deliveryState) bool {
 	state := stateFor(states)
 	if message.Settle == nil {
 		return false
 	}
 	state.operation = settlementOperationAck
-	if r != nil && r.inflight != nil {
-		r.inflight.SetDisposition(state.id, dispatch.Disposition(disposition))
-	}
 	err := message.Settle.Ack(ctx)
 	state.attempted = true
 	state.settled = err == nil
-	if r != nil && state.settled && disposition == lifecycle.Handled {
+	if r != nil && state.settled && handled {
 		r.mu.Lock()
 		r.successfulDelivery = true
 		r.mu.Unlock()
@@ -1744,9 +1759,6 @@ func nackDelivery(r *Runner, ctx context.Context, message driver.InboundMessage,
 	}
 	state.operation = settlementOperationNack
 	state.nackOptions = options
-	if r != nil && r.inflight != nil {
-		r.inflight.SetDisposition(state.id, dispatch.DispositionRequeued)
-	}
 	err := message.Settle.Nack(ctx, options)
 	state.attempted = true
 	state.settled = err == nil
@@ -1759,7 +1771,7 @@ func deadLetterAndSettle(r *Runner, ctx context.Context, message driver.InboundM
 		if reason == ReasonPoison && isMissingDeadLetterRoute(err) {
 			state.poisonDrop = &poisonDropReport{envelope: envelope, cause: err}
 			sctx := runnerSettlementContext(r, ctx)
-			settled := ackDeliveryAs(r, sctx, message, lifecycle.Handled, state)
+			settled := ackDeliveryAs(r, sctx, message, true, state)
 			if settled {
 				reportPendingPoisonDrop(r, sctx, message, state)
 			}
@@ -1768,7 +1780,7 @@ func deadLetterAndSettle(r *Runner, ctx context.Context, message driver.InboundM
 		failSuccessorHandoff(r, runnerSettlementContext(r, ctx), "dead_letter", eventFromDelivery(r, message, envelope, state.headerMaxBytes), err)
 		return false
 	}
-	return ackDeliveryAs(r, runnerSettlementContext(r, ctx), message, lifecycle.DeadLettered, state)
+	return ackDeliveryAs(r, runnerSettlementContext(r, ctx), message, false, state)
 }
 
 func isMissingDeadLetterRoute(err error) bool {
@@ -2006,7 +2018,7 @@ func retryAndSettle(r *Runner, ctx context.Context, message driver.InboundMessag
 		failSuccessorHandoff(r, runnerSettlementContext(r, ctx), "retry", eventFromDelivery(r, message, envelope, state.headerMaxBytes), err)
 		return false
 	}
-	return ackDeliveryAs(r, runnerSettlementContext(r, ctx), message, lifecycle.Retried, state)
+	return ackDeliveryAs(r, runnerSettlementContext(r, ctx), message, false, state)
 }
 
 // A Stop refusal for outstanding messages is a redelivery case, not a retry

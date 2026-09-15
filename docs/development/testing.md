@@ -48,22 +48,22 @@ The main pure areas are:
 
 - [`codec/`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/tree/main/codec) for payload and codec behavior;
 - [`internal/clock/`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/tree/main/internal/clock) for real and fake time;
-- [`internal/retry/`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/tree/main/internal/retry) for classification, retry
-  outcomes, and backoff ladders;
+- [`internal/retry/`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/tree/main/internal/retry) for backoff ladders and
+  retry sanity checks;
 - [`internal/sched/`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/tree/main/internal/sched) for weighted lanes, aging, and
   fairness;
 - [`internal/dispatch/`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/tree/main/internal/dispatch) for worker routing,
-  ordered keys, and in-flight accounting; and
+  ordered keys, and the in-flight registry; and
 - [`internal/lifecycle/`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/tree/main/internal/lifecycle) for drain state and
-  disposition accounting.
+  shutdown phases.
 
 An internal test should name the invariant it protects and use the smallest
 public surface of that package. It should not reproduce the entire client or
-broker setup just to exercise a queue, clock, retry decision, or accounting
+broker setup just to exercise a queue, clock, retry decision, or drain
 transition.
 
 These tests are the first place to look when a failure is isolated to timing,
-scheduling, dispatch admission, retry classification, or lifecycle accounting.
+scheduling, dispatch admission, retry decisions, or drain state.
 The package-local `*_test.go` files are the authority for the exact fixtures and
 invariants.
 
@@ -86,10 +86,9 @@ Useful entry points include:
 - [`worker_retry_bridge_test.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/worker_retry_bridge_test.go) and
   [`worker_successor_family_test.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/worker_successor_family_test.go)
   for retry and dead-letter successor boundaries;
-- [`settlement_state_test.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/settlement_state_test.go),
-  [`worker_settlement_test.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/worker_settlement_test.go), and
-  [`registry_settlement_test.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/registry_settlement_test.go) for
-  settlement accounting and settle-last ordering; and
+- [`settlement_state_test.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/settlement_state_test.go) and
+  [`worker_settlement_test.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/worker_settlement_test.go) for
+  settlement and settle-last ordering; and
 - [`topology_test.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/topology_test.go),
   [`topology_policy_test.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/topology_policy_test.go), and
   [`worker_ordering_test.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/worker_ordering_test.go) for topology and
@@ -336,7 +335,7 @@ lane names, helper functions, and broker client choice.
 Use a lower-level or fake boundary only when it makes a real invariant
 deterministic:
 
-- test a scheduler, retry ladder, clock, or accounting transition directly in
+- test a scheduler, retry ladder, clock, or drain transition directly in
   its package;
 - use the in-memory driver or `f1test` for F1 behavior instead of mocking the
   worker's internal queues;
@@ -387,7 +386,7 @@ Ask where the claimed behavior lives:
 | --- | --- | --- |
 | Handler result, retry policy, dead letter, event payload | `f1test` | Root or in-memory integration for orchestration boundaries |
 | Root publish, subscribe, dispatch, settlement, topology, lifecycle | Root-package behavior tests | In-memory integration and failure/reconnect cases |
-| Clock, retry ladder, scheduler, dispatch, lifecycle accounting | Pure package tests | Root behavior test if the public contract is also at risk |
+| Clock, retry ladder, scheduler, dispatch, lifecycle state | Pure package tests | Root behavior test if the public contract is also at risk |
 | Port behavior or driver capability | Shared conformance | Provider-specific broker tests |
 | RabbitMQ or Kafka client/broker behavior | Provider suite | Conformance if the port contract changed |
 | Exported API or import boundary | Makefile API/boundary gates | Runtime tests when behavior also changed |

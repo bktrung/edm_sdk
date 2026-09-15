@@ -11,7 +11,6 @@ import (
 
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/driver"
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/clock"
-	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/lifecycle"
 
 	"golang.org/x/sync/errgroup"
 )
@@ -648,57 +647,88 @@ func (*dispatchConsumer) Lag(context.Context) (map[string]int64, error) {
 	return nil, driver.ErrUnsupported
 }
 
-func TestRunnerAccountingAxesSumAfterMixedOutcomes(t *testing.T) {
-	producer := &dispatchProducer{}
-	conn := &dispatchConn{producer: producer}
-	cfg := testClientConfig(t)
-	client, err := New(context.Background(), cfg, WithDriver(&dispatchDriver{conn: conn}))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() { _ = client.Close(context.Background()) }()
-	runner := &Runner{
-		client: client,
-		subscription: Subscription{
-			Name: "orders", Retry: RetryConfig{MaxAttempts: 2, InitialInterval: time.Second},
-			HandlerTimeout: time.Second,
-		},
-		inflight: newInflightRegistry(),
-	}
-	runner.accounting = lifecycle.NewAccounting(runner.inflight.registry)
-	message := func(id string, settler driver.Settler) driver.InboundMessage {
-		envelope := Envelope{SpecVersion: "1.0", ID: id, Source: "/test/orders", Type: "orders.created", Priority: PriorityMedium, Attempt: 1}
-		headers, err := envelope.EncodeHeaders(CoreMaxHeaderBytes)
+// TestHandlerDeadlineIsRetriedAndPanicIsDeadLettered pins the two handler
+// results that reach settlement without a classification of their own. A
+// handler error that is not terminal, dropped, or delay-carrying takes the
+// retry path, so a handler deadline publishes a retry copy and settles the
+// original without dead-lettering it. A handler panic never reaches
+// classification: it is dead-lettered first, and it must stay that way.
+func TestHandlerDeadlineIsRetriedAndPanicIsDeadLettered(t *testing.T) {
+	// Each case builds its own runner and producer, so a case run alone sees
+	// only its own publishes.
+	newRunner := func(t *testing.T) (*dispatchProducer, *Runner) {
+		t.Helper()
+		producer := &dispatchProducer{}
+		client, err := New(context.Background(), testClientConfig(t), WithDriver(&dispatchDriver{conn: &dispatchConn{producer: producer}}))
 		if err != nil {
 			t.Fatal(err)
 		}
-		return driver.InboundMessage{Destination: "f1.test.orders.created.medium", Headers: headerSlice(headers), Body: []byte(`{}`), DeliveryCount: 1, Settle: settler}
+		t.Cleanup(func() { _ = client.Close(context.Background()) })
+		return producer, &Runner{
+			client: client,
+			subscription: Subscription{
+				Name:           "orders",
+				Topics:         []string{"orders.created"},
+				Priorities:     []Priority{PriorityHigh},
+				Retry:          RetryConfig{MaxAttempts: 2, InitialInterval: time.Second},
+				HandlerTimeout: time.Second,
+			},
+			inflight: newInflightRegistry(),
+		}
 	}
-	process := func(id string, handler Handler, ctx context.Context) {
-		runner.subscription.Handlers = map[string]Handler{"orders.created": handler}
-		item := message(id, &dispatchSettler{})
-		itemID := runner.inflight.Add(item)
-		processDelivery(runner, ctx, delivery{id: itemID, message: item})
+	envelope := func(id string) Envelope {
+		return Envelope{SpecVersion: "1.0", ID: id, Source: "/test/orders", Type: "orders.created.v1", Priority: PriorityHigh, Attempt: 1}
 	}
-	process("retry", HandlerFunc(func(context.Context, *Event) error { return errors.New("temporary") }), context.Background())
-	process("dead-letter", HandlerFunc(func(context.Context, *Event) error { return Terminal(errors.New("invalid")) }), context.Background())
-	requeueCtx, cancel := context.WithCancel(context.Background())
-	cancel()
-	process("requeue", HandlerFunc(func(ctx context.Context, _ *Event) error {
-		<-ctx.Done()
-		return ctx.Err()
-	}), requeueCtx)
-	settlement := runner.inflight.Counts()
-	disposition := runner.inflight.DispositionCounts()
-	if settlement.received != 3 || settlement.settled+settlement.requeued+settlement.unknown+settlement.abandoned != 3 {
-		t.Fatalf("settlement counts = %#v, want three received and terminal outcomes", settlement)
-	}
-	if disposition.Total() != 3 || disposition.Retried != 1 || disposition.DeadLettered != 1 || disposition.Requeued != 1 {
-		t.Fatalf("disposition counts = %#v, want one retry, dead-letter, and requeue", disposition)
-	}
-	if got := runner.accounting.Snapshot(); got != disposition {
-		t.Fatalf("read-only accounting = %#v, registry dispositions = %#v", got, disposition)
-	}
+
+	t.Run("deadline is retried", func(t *testing.T) {
+		producer, runner := newRunner(t)
+		deadlineSettler := &dispatchSettler{}
+		deadlineMessage := retryBridgeMessage(t, envelope("handler-deadline"), deadlineSettler)
+		runner.subscription.Handlers = map[string]Handler{
+			"orders.created.v1": HandlerFunc(func(context.Context, *Event) error {
+				return context.DeadlineExceeded
+			}),
+		}
+		deadlineID := runner.inflight.Add(deadlineMessage)
+		processDelivery(runner, context.Background(), delivery{id: deadlineID, message: deadlineMessage})
+
+		if got := len(producer.messages); got != 1 {
+			t.Fatalf("publishes after a handler deadline = %d, want one retry copy and no dead letter", got)
+		}
+		if destination := producer.messages[0].Destination; !strings.Contains(destination, "."+retryDestinationSegment+".") || strings.Contains(destination, ".dlq.") {
+			t.Fatalf("deadline successor destination = %q, want the retry destination and no dead letter", destination)
+		}
+		if !deadlineSettler.acked || deadlineSettler.nacked {
+			t.Fatalf("deadline settlement = acked %t nacked %t, want the original acked once its retry copy was published", deadlineSettler.acked, deadlineSettler.nacked)
+		}
+	})
+
+	t.Run("panic is dead-lettered", func(t *testing.T) {
+		producer, runner := newRunner(t)
+		panicSettler := &dispatchSettler{}
+		panicMessage := retryBridgeMessage(t, envelope("handler-panic"), panicSettler)
+		runner.subscription.Handlers = map[string]Handler{
+			"orders.created.v1": HandlerFunc(func(context.Context, *Event) error {
+				panic("handler exploded")
+			}),
+		}
+		panicID := runner.inflight.Add(panicMessage)
+		processDelivery(runner, context.Background(), delivery{id: panicID, message: panicMessage})
+
+		if got := len(producer.messages); got != 1 {
+			t.Fatalf("publishes after a handler panic = %d, want one dead letter and no retry copy", got)
+		}
+		deadLettered := producer.messages[0]
+		if !strings.Contains(deadLettered.Destination, ".dlq.") {
+			t.Fatalf("panic successor destination = %q, want the dead-letter destination", deadLettered.Destination)
+		}
+		if reason := headerValue(deadLettered.Headers, "f1deathreason"); reason != ReasonPanic.String() {
+			t.Fatalf("panic death reason = %q, want %q", reason, ReasonPanic.String())
+		}
+		if !panicSettler.acked {
+			t.Fatal("panic delivery was not acked after its dead letter was published")
+		}
+	})
 }
 
 func TestMalformedHeadersDeadLetterAsDecodeBeforeHandlerRuns(t *testing.T) {

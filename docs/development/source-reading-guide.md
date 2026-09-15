@@ -104,14 +104,14 @@ Read the small, portable mechanisms before the worker that composes them:
 
 1. [`internal/clock/`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/tree/main/internal/clock) - real and manually advanced
    clocks used by retries, delays, deadlines, and tests.
-2. [`internal/retry/`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/tree/main/internal/retry) - classification, retry
-   outcomes, tiers, and delay resolution.
+2. [`internal/retry/`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/tree/main/internal/retry) - backoff tiers and delay
+   resolution.
 3. [`internal/sched/`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/tree/main/internal/sched) - bounded weighted lanes,
    priority, aging, and fairness.
 4. [`internal/dispatch/`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/tree/main/internal/dispatch) - worker pool,
    ordered-key routing, and in-flight registry behavior.
-5. [`internal/lifecycle/`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/tree/main/internal/lifecycle) - runner state,
-   drain transitions, and disposition accounting.
+5. [`internal/lifecycle/`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/tree/main/internal/lifecycle) - runner state and
+   drain transitions.
 
 The goal is to recognize an algorithmic invariant when it appears in a higher
 level flow. Read the package-local tests with each primitive; they are faster
@@ -135,7 +135,7 @@ linearly.
 
 The goal is to preserve the ownership boundaries: the driver owns delivery and
 settlement, the core owns logical routing and handler policy, and the internal
-packages own scheduling, dispatch, accounting, and lifecycle state.
+packages own scheduling, dispatch, and lifecycle state.
 
 ## Pass 6: concrete behavior
 
