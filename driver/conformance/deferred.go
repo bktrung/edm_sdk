@@ -206,7 +206,17 @@ func runDeferred(group *groupContext) {
 		last := fartherDue.Add(deferredLateBound)
 		received := make(map[string]driver.InboundMessage, len(owed))
 		for _, step := range owed {
-			advanceDeferredTo(group, step.due.Add(deferredLateBound))
+			// Advance to half the bound past the due time, not onto it. A fixture stamps
+			// ReceivedAt with the instant its clock was advanced to, so advancing to
+			// step.due.Add(deferredLateBound) left the late assertion below comparing that
+			// instant with itself: equality passed, so the assertion held whatever the driver
+			// did, and it moved with any later edit to the advance target or to how a fixture
+			// stamps ReceivedAt. Half keeps the release triggered by a clock strictly past the
+			// due time and lands ReceivedAt deferredLateBound/2 inside the bound, which gives
+			// the assertion margin to fail on rather than an equality to pass by. Any fraction
+			// below one still leaves the farther message unreleased at this step: its due time
+			// is deferredDelay*4 later and deferredLateBound is far short of that separation.
+			advanceDeferredTo(group, step.due.Add(deferredLateBound/2))
 			message := receiveBefore(t, group, consumer, last, "due-order deferred delivery")
 			received[string(message.Body)] = message
 			ackMessage(t, group, message)
