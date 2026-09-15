@@ -214,20 +214,25 @@ the policy explicitly when that distinction matters to the application.
 
 `Subscribe` validates the subscription and returns a runner. `Run` owns the
 delivery loop; it blocks until the context is canceled or the runner stops with
-an error. On shutdown, cancel delivery first, let in-flight handlers settle,
-then close the client:
+an error. Shutdown is `client.Close`: it stops delivery, lets in-flight handlers
+finish within the drain budget, and then releases the client. In the example
+below, `ctx` is only the shutdown trigger, and the runner gets a context that
+the trigger's cancel cannot reach:
 
 ```go
 func runOrders(ctx context.Context, client *f1.Client, runner *f1.Runner) error {
 	runDone := make(chan error, 1)
 	go func() {
-		runDone <- runner.Run(ctx)
+		// Run keeps the values ctx carries, but not its cancellation: the
+		// shutdown trigger must not cut in-flight handlers off.
+		runDone <- runner.Run(context.WithoutCancel(ctx))
 	}()
 
 	var runErr error
+	runReturned := false
 	select {
-	case err := <-runDone:
-		runErr = err
+	case runErr = <-runDone:
+		runReturned = true
 	case <-ctx.Done():
 	}
 
@@ -237,6 +242,12 @@ func runOrders(ctx context.Context, client *f1.Client, runner *f1.Runner) error 
 	if err := client.Close(shutdownCtx); err != nil {
 		return fmt.Errorf("close F1 client: %w", err)
 	}
+
+	// Close drains the runner, so Run returns even though its context was
+	// never cancelled.
+	if !runReturned {
+		runErr = <-runDone
+	}
 	if runErr != nil && !errors.Is(runErr, context.Canceled) {
 		return fmt.Errorf("order subscription stopped: %w", runErr)
 	}
@@ -244,11 +255,15 @@ func runOrders(ctx context.Context, client *f1.Client, runner *f1.Runner) error 
 }
 ```
 
-In a real service, use `signal.NotifyContext` to cancel the run context from
-the process's termination signals. Give shutdown a separate timeout so a
-stalled handler or driver cannot keep the process alive forever. For a
-whole-process shutdown, `client.Close` drains every registered runner, flushes
-accepted publishes, and releases the driver's producer and connection
+In a real service, watch the process's termination signals and shut down by
+calling `client.Close` with a fresh timeout context, or `runner.Drain` for a
+single subscription, instead of cancelling `Run`'s context: cancelling `Run`
+skips the grace period and abandons the handler that is already in flight. The
+[independent shutdown contexts](/advanced-topics/lifecycle-and-shutdown#use-independent-shutdown-contexts)
+section shows the pattern and the budgets it uses. Give shutdown a separate
+timeout so a stalled handler or driver cannot keep the process alive forever.
+For a whole-process shutdown, `client.Close` drains every registered runner,
+flushes accepted publishes, and releases the driver's producer and connection
 resources. Call `runner.Drain` directly when you need to stop one subscription
 while keeping the client alive for other work.
 

@@ -68,9 +68,40 @@ record stays until a runner with the same subscription name starts and reaches
 `Ready`; inspect and report it rather than silently restarting the same runner
 in a loop.
 
-The context passed to `Run` controls normal intake and handler work. Use a
+The context passed to `Run` controls normal intake and handler work. Canceling
+it is a hard stop: in-flight handlers see their context canceled at once and
+`HandlerGrace` does not apply, so a signal wired straight into `Run` abandons
+the handler that is already in flight. `Runner.Drain` is the graceful stop; it
+ends intake and lets accepted work finish within the lifecycle budgets. Use a
 separate shutdown context for cleanup so an already-canceled run context does
 not immediately cancel the cleanup operation.
+
+When a signal should stop the subscription without abandoning in-flight work,
+drain first and cancel the run context afterwards:
+
+```go
+// Run on its own context, so a signal can drain instead of canceling.
+runCtx, cancelRun := context.WithCancel(context.Background())
+defer cancelRun()
+
+runDone := make(chan error, 1)
+go func() { runDone <- runner.Run(runCtx) }()
+
+signalCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+defer stop()
+
+<-signalCtx.Done()
+
+drainCtx, cancelDrain := context.WithTimeout(context.Background(), 20*time.Second)
+defer cancelDrain()
+if err := runner.Drain(drainCtx); err != nil {
+	return fmt.Errorf("drain orders worker: %w", err)
+}
+cancelRun()
+if err := <-runDone; err != nil {
+	return fmt.Errorf("orders worker stopped: %w", err)
+}
+```
 
 ## Drain one runner
 
@@ -157,16 +188,23 @@ logged and returned to the process supervisor.
 The normal run context and shutdown context have different jobs:
 
 ```go
-ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-defer stop()
+runCtx, cancelRun := context.WithCancel(context.Background())
+defer cancelRun()
 
 runDone := make(chan error, 1)
-go func() { runDone <- runner.Run(ctx) }()
+go func() { runDone <- runner.Run(runCtx) }()
 
+signalCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+defer stop()
+
+// The signal context never cancels runCtx, so a signal leaves in-flight
+// handlers to Close.
 var runErr error
+runReturned := false
 select {
 case runErr = <-runDone:
-case <-ctx.Done():
+	runReturned = true
+case <-signalCtx.Done():
 }
 
 shutdownCtx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
@@ -174,6 +212,13 @@ defer cancel()
 if err := client.Close(shutdownCtx); err != nil {
 	return fmt.Errorf("shutdown: %w", err)
 }
+
+// Close drains every runner, so Run returns even though runCtx was never
+// cancelled.
+if !runReturned {
+	runErr = <-runDone
+}
+cancelRun()
 if runErr != nil && !errors.Is(runErr, context.Canceled) {
 	return fmt.Errorf("subscription stopped: %w", runErr)
 }

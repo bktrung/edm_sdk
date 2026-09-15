@@ -42,6 +42,13 @@ In ordered mode:
 - F1 does not provide one global order across all topics, priorities, keys, or
   consumer instances.
 
+This guarantee ends at a retry. A delivery that fails and is retried is
+acknowledged as soon as its retry copy is stored, which releases the key, so
+the next message with that key is handled before the retry comes back. When a
+key must not be handled out of order at all, either set
+`RetryConfig{MaxAttempts: 1}` for the subscription so a failure goes straight
+to the dead-letter destination, or make the handler tolerate the reorder.
+
 The connected driver must advertise the `ordered_by_key` capability. F1
 rejects an ordered subscription when that capability is unavailable. Check
 `client.Limits()` during startup when deployment portability matters; the

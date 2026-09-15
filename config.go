@@ -74,7 +74,11 @@ type Mode int
 const (
 	// Unordered is the default delivery mode.
 	Unordered Mode = iota
-	// OrderedByKey requests per-key delivery order.
+	// OrderedByKey requests per-key delivery order: deliveries that share a key
+	// are handled one at a time. The guarantee ends at a retry: a delivery that
+	// fails is acknowledged as soon as its retry copy is stored, which releases
+	// the key, so a later delivery with that key is handled before the retry
+	// comes back.
 	OrderedByKey
 )
 

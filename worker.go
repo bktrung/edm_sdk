@@ -64,6 +64,9 @@ type poisonDropReport struct {
 
 // Run starts the consumer, owns its fetcher and workers, and returns when the
 // consumer stops, the caller cancels ctx, or a driver error requests shutdown.
+// Cancelling ctx stops the runner immediately: in-flight handlers see their
+// context cancelled at once, and HandlerGrace does not apply. Drain is the
+// graceful stop.
 // A non-nil result after the runner started is recorded against its
 // subscription name for Client.Health, except when the caller cancelled, the
 // runner was drained, or the client is shutting down.
