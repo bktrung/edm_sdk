@@ -3,6 +3,7 @@ package kafka
 import (
 	"context"
 	"errors"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -11,6 +12,7 @@ import (
 	"github.com/twmb/franz-go/pkg/kgo"
 
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/driver"
+	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/clock"
 )
 
 func TestAckTrackerInOrderAcks(t *testing.T) {
@@ -344,6 +346,116 @@ func TestConsumerTrackerGenerationAndCounter(t *testing.T) {
 	}
 	if second == first {
 		t.Fatal("tracker was reused after drop")
+	}
+}
+
+func TestAlreadySettledRedeliveryReleasesItsRecord(t *testing.T) {
+	const destination = "topic"
+	key := partitionKey{destination: destination, partition: 0}
+	c := &consumer{
+		trackers:              make(map[partitionKey]*ackTracker),
+		trackerGenerations:    make(map[partitionKey]uint64),
+		assignmentGenerations: make(map[partitionKey]uint64),
+		activeGenerations:     make(map[partitionKey]uint64),
+		fenced:                make(map[partitionKey]bool),
+		recordGenerations:     make(map[*kgo.Record]uint64),
+		tenures:               make(map[partitionKey]uint64),
+		settlers:              make(map[*settler]struct{}),
+		messages:              make(chan driver.InboundMessage, 32),
+		budgets:               map[string]int{destination: 100},
+		unsettled:             map[string]int{destination: 0},
+		pauseReasons:          make(map[string]pauseReasonSet),
+		discarded:             make(map[partitionKey]map[int64]struct{}),
+		reportedDeferrals:     map[string]struct{}{destination: {}},
+		requeued:              make(map[partitionKey]int),
+		maxAckGap:             10000,
+		clock:                 clock.NewFake(time.Unix(0, 0)),
+	}
+	ctx := context.Background()
+	c.onPartitionsAssigned(ctx, nil, map[string][]int32{destination: {0}})
+
+	initial := make(map[int64]*settler)
+	for offset := int64(10); offset < 15; offset++ {
+		record := &kgo.Record{
+			Topic:     destination,
+			Partition: 0,
+			Offset:    offset,
+			Key:       []byte("key"),
+			Value:     []byte("value"),
+		}
+		c.tagRecord(record)
+		delivered, active, created := c.emit(record)
+		if !delivered || !active || !created {
+			t.Fatalf("initial emit(%d) = delivered %t, active %t, created %t", offset, delivered, active, created)
+		}
+		initial[offset] = (<-c.messages).Settle.(*settler)
+	}
+
+	tracker := c.trackers[key]
+	if tracker == nil {
+		t.Fatal("initial emit did not create tracker")
+	}
+	for _, offset := range []int64{10, 12, 13, 14} {
+		if err := tracker.Ack(offset, nil); err != nil {
+			t.Fatalf("Ack(%d): %v", offset, err)
+		}
+		c.completeSettlement(initial[offset], false)
+	}
+
+	requeued := initial[11]
+	requeued.requeued = true
+	if err := tracker.Release(11); err != nil {
+		t.Fatalf("Release(11): %v", err)
+	}
+	c.mu.Lock()
+	c.requeued[key]++
+	c.mu.Unlock()
+	c.completeSettlement(requeued, true)
+
+	for offset := int64(11); offset < 15; offset++ {
+		record := &kgo.Record{
+			Topic:     destination,
+			Partition: 0,
+			Offset:    offset,
+			Key:       []byte("key"),
+			Value:     []byte("value"),
+		}
+		c.tagRecord(record)
+		delivered, active, created := c.emit(record)
+		if !delivered || !active {
+			t.Fatalf("rewound emit(%d) = delivered %t, active %t, created %t", offset, delivered, active, created)
+		}
+		if offset == 11 {
+			if !created {
+				t.Fatal("requeued offset 11 was not emitted")
+			}
+			redelivery := (<-c.messages).Settle.(*settler)
+			if err := tracker.Ack(11, nil); err != nil {
+				t.Fatalf("Ack(redelivery 11): %v", err)
+			}
+			c.completeSettlement(redelivery, false)
+			continue
+		}
+		if created {
+			t.Fatalf("already-settled offset %d was emitted", offset)
+		}
+	}
+
+	leaked := make([]int64, 0)
+	c.mu.Lock()
+	for record := range c.recordGenerations {
+		if record.Topic == key.destination && record.Partition == key.partition {
+			leaked = append(leaked, record.Offset)
+		}
+	}
+	commitPoint := tracker.CommitPoint()
+	c.mu.Unlock()
+	slices.Sort(leaked)
+	if len(leaked) != 0 {
+		t.Fatalf("record generations for offsets %v = %d, want 0", leaked, len(leaked))
+	}
+	if commitPoint != 15 {
+		t.Fatalf("commit point after requeued redelivery = %d, want 15", commitPoint)
 	}
 }
 

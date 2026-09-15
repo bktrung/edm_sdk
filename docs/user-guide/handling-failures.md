@@ -11,7 +11,7 @@ failure. Make externally visible effects idempotent with the stable value from
 | --- | --- |
 | `nil` | Acknowledge the delivery. |
 | Ordinary error | Retry according to the subscription retry ladder. |
-| `f1.RetryAfter(err, delay)` | Retry with an explicit delay, subject to configured limits. |
+| `f1.RetryAfter(err, delay)` | Retry at the ladder tier nearest the requested delay, subject to configured limits. |
 | `f1.Terminal(err)` | Skip retries and route the event to the F1 dead-letter destination. |
 | `f1.Drop(err)` | Acknowledge without applying the effect or retaining a copy. |
 

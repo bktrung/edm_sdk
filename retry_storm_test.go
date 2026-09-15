@@ -87,7 +87,7 @@ func retryStormSubscription() Subscription {
 	defaults := defaultSubscription()
 	fairness := cloneFairness(defaults.Fairness)
 	fairness.RetryWeightDivisor = 0
-	fairness.AgingEnabled = false
+	fairness.DisableAging = true
 	retry := cloneRetry(defaults.Retry)
 	retry.Tiers = make([]time.Duration, retryStormTierCount)
 	return Subscription{

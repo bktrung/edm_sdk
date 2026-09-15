@@ -26,7 +26,7 @@ func newRetryBridgeRunner(t *testing.T, producer *dispatchProducer, topic string
 			Name:           "orders",
 			Topics:         []string{topic},
 			Priorities:     []Priority{PriorityHigh},
-			Retry:          RetryConfig{MaxAttempts: 3, Tiers: []time.Duration{time.Second, 2 * time.Second}, Jitter: 0.2},
+			Retry:          RetryConfig{MaxAttempts: 3, Tiers: []time.Duration{time.Second, 2 * time.Second}},
 			HandlerTimeout: time.Second,
 		},
 	}
@@ -65,7 +65,6 @@ func (p *missingRouteProducer) Publish(_ context.Context, messages ...driver.Out
 	return &driver.PublishError{Failed: failed}
 }
 
-func (*missingRouteProducer) Flush(context.Context) error { return nil }
 func (*missingRouteProducer) Close(context.Context) error { return nil }
 
 func noRoutePoisonRunner(t *testing.T, producer driver.Producer, options ...Option) (*Client, *Runner) {
@@ -1065,8 +1064,6 @@ type retryBridgeFailingProducer struct{}
 func (*retryBridgeFailingProducer) Publish(context.Context, ...driver.OutboundMessage) error {
 	return errors.New("successor publish failed")
 }
-
-func (*retryBridgeFailingProducer) Flush(context.Context) error { return nil }
 
 func (*retryBridgeFailingProducer) Close(context.Context) error { return nil }
 

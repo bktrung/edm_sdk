@@ -5,93 +5,24 @@ import (
 	"sync"
 )
 
-// SettlementOperation identifies the kind of settlement call made for a delivery.
-type SettlementOperation uint8
-
-const (
-	// SettlementOperationNone means no settlement call has been made.
-	SettlementOperationNone SettlementOperation = iota
-	// SettlementOperationAck means the delivery was asked to be acknowledged.
-	SettlementOperationAck
-	// SettlementOperationNack means the delivery was asked to be negatively acknowledged.
-	SettlementOperationNack
-)
-
-// SettlementOutcome identifies the terminal result recorded for a delivery.
-type SettlementOutcome uint8
-
-const (
-	// SettlementOutcomeSettled means the delivery was acknowledged successfully.
-	SettlementOutcomeSettled SettlementOutcome = iota
-	// SettlementOutcomeRequeued means the delivery was negatively acknowledged for redelivery.
-	SettlementOutcomeRequeued
-	// SettlementOutcomeUnknown means the settlement call did not return success.
-	SettlementOutcomeUnknown
-	// SettlementOutcomeAbandoned means the handler did not complete before shutdown.
-	SettlementOutcomeAbandoned
-)
-
-// Disposition identifies the terminal message outcome recorded by the dispatch registry.
-type Disposition uint8
-
-const (
-	// DispositionHandled means the original message was acknowledged successfully.
-	DispositionHandled Disposition = iota
-	// DispositionRequeued means the original message is left for broker redelivery.
-	DispositionRequeued
-	// DispositionRetried means a successor retry copy was published.
-	DispositionRetried
-	// DispositionDeadLettered means a successor dead-letter copy was published.
-	DispositionDeadLettered
-)
-
-// DispositionCounts is a snapshot of terminal message dispositions.
-type DispositionCounts struct {
-	Handled      uint64
-	Requeued     uint64
-	Retried      uint64
-	DeadLettered uint64
-}
-
-// Total returns the number of recorded message dispositions.
-func (c DispositionCounts) Total() uint64 {
-	return c.Handled + c.Requeued + c.Retried + c.DeadLettered
-}
-
-// SettlementCounts is a snapshot of settlement call outcomes.
-type SettlementCounts struct {
-	Settled   uint64
-	Requeued  uint64
-	Unknown   uint64
-	Abandoned uint64
-}
-
-// Total returns the number of recorded settlement outcomes.
-func (c SettlementCounts) Total() uint64 {
-	return c.Settled + c.Requeued + c.Unknown + c.Abandoned
-}
-
-// Counts is a snapshot of received deliveries and both accounting axes.
-type Counts struct {
-	Received     uint64
-	Settlements  SettlementCounts
-	Dispositions DispositionCounts
-}
-
-// Registry tracks accepted work until its settlement result is recorded.
+// Registry tracks accepted work until the worker removes it.
+// The zero value is not usable; build one with NewRegistry. Every method is
+// safe for concurrent use, and a nil registry is empty and already drained.
 type Registry struct {
 	mu    sync.Mutex
-	items map[uint64]Disposition
+	items map[uint64]struct{}
 	next  uint64
-	zero  chan struct{}
-	count Counts
+	// zero is closed whenever items becomes empty. It is replaced whenever
+	// Add grows the set back from empty, so a waiter that captured a closed
+	// channel has already observed a genuinely empty set at capture time.
+	zero chan struct{}
 }
 
-// NewRegistry returns an empty settlement-aware registry.
+// NewRegistry returns an empty registry.
 func NewRegistry() *Registry {
 	zero := make(chan struct{})
 	close(zero)
-	return &Registry{items: make(map[uint64]Disposition), zero: zero}
+	return &Registry{items: make(map[uint64]struct{}), zero: zero}
 }
 
 // Add registers work and returns its identity.
@@ -105,17 +36,15 @@ func (r *Registry) Add() uint64 {
 	if len(r.items) == 0 {
 		r.zero = make(chan struct{})
 	}
-	r.count.Received++
-	r.items[r.next] = DispositionHandled
+	r.items[r.next] = struct{}{}
 	return r.next
 }
 
-// SetDisposition records the message outcome to use if the delivery settles successfully.
-func (r *Registry) SetDisposition(id uint64, disposition Disposition) {
+// Remove drops a delivery from the registry. Removing an unknown or already
+// removed identity does nothing, so a duplicate removal never closes the
+// channel twice.
+func (r *Registry) Remove(id uint64) {
 	if r == nil {
-		return
-	}
-	if disposition < DispositionHandled || disposition > DispositionDeadLettered {
 		return
 	}
 	r.mu.Lock()
@@ -123,68 +52,13 @@ func (r *Registry) SetDisposition(id uint64, disposition Disposition) {
 	if _, ok := r.items[id]; !ok {
 		return
 	}
-	r.items[id] = disposition
-}
-
-// Remove records the default successful settlement for a delivery.
-func (r *Registry) Remove(id uint64) {
-	r.RemoveAs(id, SettlementOutcomeSettled)
-}
-
-// RemoveAs removes a delivery and records both accounting outcomes.
-func (r *Registry) RemoveAs(id uint64, outcome SettlementOutcome) {
-	if r == nil {
-		return
-	}
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	disposition, ok := r.items[id]
-	if !ok {
-		return
-	}
 	delete(r.items, id)
-	switch outcome {
-	case SettlementOutcomeSettled:
-		switch disposition {
-		case DispositionHandled:
-			r.count.Dispositions.Handled++
-		case DispositionRequeued:
-			r.count.Dispositions.Requeued++
-		case DispositionRetried:
-			r.count.Dispositions.Retried++
-		case DispositionDeadLettered:
-			r.count.Dispositions.DeadLettered++
-		}
-		r.count.Settlements.Settled++
-	case SettlementOutcomeRequeued:
-		r.count.Dispositions.Requeued++
-		r.count.Settlements.Requeued++
-	case SettlementOutcomeUnknown:
-		r.count.Dispositions.Requeued++
-		r.count.Settlements.Unknown++
-	case SettlementOutcomeAbandoned:
-		r.count.Dispositions.Requeued++
-		r.count.Settlements.Abandoned++
-	default:
-		r.count.Dispositions.Requeued++
-		r.count.Settlements.Unknown++
-	}
 	if len(r.items) == 0 {
 		close(r.zero)
 	}
 }
 
-// Counts returns a snapshot of received deliveries and both accounting axes.
-func (r *Registry) Counts() Counts {
-	if r == nil {
-		return Counts{}
-	}
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	return r.count
-}
-
-// Len returns the number of deliveries without a recorded settlement result.
+// Len returns the number of deliveries still registered.
 func (r *Registry) Len() int {
 	if r == nil {
 		return 0
@@ -194,7 +68,7 @@ func (r *Registry) Len() int {
 	return len(r.items)
 }
 
-// WaitZero waits until every registered delivery has a settlement result.
+// WaitZero waits until the registry is empty.
 //
 //nolint:contextcheck // the caller context intentionally controls this wait.
 func (r *Registry) WaitZero(ctx context.Context) error {

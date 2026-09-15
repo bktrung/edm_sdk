@@ -281,6 +281,49 @@ func runDrain(group *groupContext) {
 		}
 		ackMessage(t, group, redelivered)
 		group.vector.Add(BehaviorEvent{ID: "drain-release-redelivery", Outcome: "redelivered", FinalDestination: "drain.release"})
+
+		// An acknowledged message must not carry an outstanding earlier one
+		// away with it. Release hands back every delivery it did not settle,
+		// so the group has to be able to receive the earlier body again after
+		// rejoining. The acknowledged body is allowed to arrive a second time:
+		// a driver that commits contiguously cannot commit past the hole the
+		// earlier body leaves, and at-least-once delivery permits the repeat.
+		ordered := "drain.release-after-ack"
+		orderedProducer := newProducer(t, group, profileDestination(group, ordered), driver.ProducerConfig{Effective: group.effective})
+		orderedGroup := "drain-release-after-ack-" + group.runID + "-" + group.profile.String()
+		holder := newConsumerFor(t, group, driver.ConsumerConfig{
+			Group: orderedGroup, Destinations: []string{ordered}, Prefetch: 2,
+			StartAt: driver.StartEarliest, Effective: group.effective,
+		})
+		if err := orderedProducer.Publish(group.ctx,
+			driver.OutboundMessage{Destination: ordered, Body: []byte("release-unsettled")},
+			driver.OutboundMessage{Destination: ordered, Body: []byte("release-acknowledged")},
+		); err != nil {
+			t.Fatalf("Publish(release after a later ack) error = %v", err)
+		}
+		outstanding := receiveMessage(t, group, holder)
+		later := receiveMessage(t, group, holder)
+		ackMessage(t, group, later)
+		if err := holder.Release(group.ctx); err != nil {
+			t.Fatalf("Release() after a later ack error = %v", err)
+		}
+		rejoiner := newConsumerFor(t, group, driver.ConsumerConfig{
+			Group: orderedGroup, Destinations: []string{ordered}, Prefetch: 1,
+			StartAt: driver.StartEarliest, Effective: group.effective,
+		})
+		returned := false
+		for range 2 {
+			candidate := receiveMessage(t, group, rejoiner)
+			ackMessage(t, group, candidate)
+			if string(candidate.Body) == string(outstanding.Body) {
+				returned = true
+				break
+			}
+		}
+		if !returned {
+			t.Fatalf("release did not return the unsettled body %q to the group", outstanding.Body)
+		}
+		group.vector.Add(BehaviorEvent{ID: "drain-release-after-ack", Outcome: "redelivered", FinalDestination: ordered})
 	})
 
 	group.Check("release with no outstanding work closes Messages", func(t *testing.T) {

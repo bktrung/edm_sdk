@@ -11,6 +11,7 @@ import (
 
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/driver"
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/clock"
+	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/lifecycle"
 )
 
 type laneRepairDriver struct {
@@ -148,8 +149,6 @@ func (p *laneRepairProducer) Publish(context.Context, ...driver.OutboundMessage)
 	}
 	return nil
 }
-
-func (p *laneRepairProducer) Flush(context.Context) error { return nil }
 
 func (p *laneRepairProducer) Close(context.Context) error {
 	p.conn.producer.Add(-1)
@@ -385,7 +384,7 @@ func TestCloseDrainsRunnerBeforeWaitingForPublishIdle(t *testing.T) {
 		}
 	})
 	consumer := waitLaneConsumer(t, d, "orders")
-	waitReconnectCondition(t, runner.lifecycle.Ready)
+	waitReconnectCondition(t, func() bool { return runner.lifecycle.State() == lifecycle.Ready })
 
 	publishDone := make(chan error, 1)
 	go func() {
@@ -459,11 +458,15 @@ func TestRunnerRepairsConsumerWithoutReplacingConnection(t *testing.T) {
 	billing, _ := startLaneRunner(t, client, laneRepairSubscription("billing", &billingHandled))
 	firstOrders := waitLaneConsumer(t, d, "orders")
 	firstBilling := waitLaneConsumer(t, d, "billing")
-	waitReconnectCondition(t, func() bool { return orders.lifecycle.Ready() && billing.lifecycle.Ready() })
+	waitReconnectCondition(t, func() bool {
+		return orders.lifecycle.State() == lifecycle.Ready && billing.lifecycle.State() == lifecycle.Ready
+	})
 
 	firstOrders.sendError(transientLaneError(d))
 	repairedOrders := waitLaneConsumer(t, d, "orders")
-	waitReconnectCondition(t, func() bool { return orders.lifecycle.Ready() && billing.lifecycle.Ready() })
+	waitReconnectCondition(t, func() bool {
+		return orders.lifecycle.State() == lifecycle.Ready && billing.lifecycle.State() == lifecycle.Ready
+	})
 	if d.openCount() != 1 {
 		t.Fatalf("driver Open count = %d, want 1 during lane repair", d.openCount())
 	}
@@ -498,7 +501,7 @@ func TestRunnerKeepsAdmissionDuringConsumerRepair(t *testing.T) {
 	var handled atomic.Int32
 	runner, _ := startLaneRunner(t, client, laneRepairSubscription("orders", &handled))
 	first := waitLaneConsumer(t, d, "orders")
-	waitReconnectCondition(t, runner.lifecycle.Ready)
+	waitReconnectCondition(t, func() bool { return runner.lifecycle.State() == lifecycle.Ready })
 	started, release := d.blockNextConsumer()
 	defer release()
 	first.sendError(transientLaneError(d))
@@ -509,7 +512,7 @@ func TestRunnerKeepsAdmissionDuringConsumerRepair(t *testing.T) {
 	case <-timer.C:
 		t.Fatal("replacement consumer did not block")
 	}
-	if !runner.lifecycle.Ready() {
+	if runner.lifecycle.State() != lifecycle.Ready {
 		t.Fatalf("runner lifecycle = %s during consumer repair, want Ready", runner.lifecycle.State())
 	}
 	if client.isReconnecting() {
@@ -523,7 +526,7 @@ func TestRunnerKeepsAdmissionDuringConsumerRepair(t *testing.T) {
 	if repaired == first {
 		t.Fatal("repair reused the failed consumer")
 	}
-	waitReconnectCondition(t, runner.lifecycle.Ready)
+	waitReconnectCondition(t, func() bool { return runner.lifecycle.State() == lifecycle.Ready })
 }
 
 func TestRunnerEscalatesWhenConsumerRepairCannotOpen(t *testing.T) {
@@ -532,7 +535,7 @@ func TestRunnerEscalatesWhenConsumerRepairCannotOpen(t *testing.T) {
 	var handled atomic.Int32
 	runner, _ := startLaneRunner(t, client, laneRepairSubscription("orders", &handled))
 	first := waitLaneConsumer(t, d, "orders")
-	waitReconnectCondition(t, runner.lifecycle.Ready)
+	waitReconnectCondition(t, func() bool { return runner.lifecycle.State() == lifecycle.Ready })
 	d.failNextConsumer()
 	first.sendError(transientLaneError(d))
 	second := waitLaneConsumer(t, d, "orders")
@@ -551,7 +554,7 @@ func TestRunnerRebuildsTwiceBeforeEscalating(t *testing.T) {
 	var handled atomic.Int32
 	runner, _ := startLaneRunner(t, client, laneRepairSubscription("orders", &handled))
 	first := waitLaneConsumer(t, d, "orders")
-	waitReconnectCondition(t, runner.lifecycle.Ready)
+	waitReconnectCondition(t, func() bool { return runner.lifecycle.State() == lifecycle.Ready })
 	first.sendError(transientLaneError(d))
 	second := waitLaneConsumer(t, d, "orders")
 	second.sendError(transientLaneError(d))
@@ -562,7 +565,7 @@ func TestRunnerRebuildsTwiceBeforeEscalating(t *testing.T) {
 	if d.openCount() != 1 {
 		t.Fatalf("driver Open count = %d, want 1 after two consumer rebuilds", d.openCount())
 	}
-	waitReconnectCondition(t, runner.lifecycle.Ready)
+	waitReconnectCondition(t, func() bool { return runner.lifecycle.State() == lifecycle.Ready })
 }
 
 func TestRunnerEscalatesAfterThreeConsumerErrors(t *testing.T) {
@@ -571,7 +574,7 @@ func TestRunnerEscalatesAfterThreeConsumerErrors(t *testing.T) {
 	var handled atomic.Int32
 	runner, _ := startLaneRunner(t, client, laneRepairSubscription("orders", &handled))
 	first := waitLaneConsumer(t, d, "orders")
-	waitReconnectCondition(t, runner.lifecycle.Ready)
+	waitReconnectCondition(t, func() bool { return runner.lifecycle.State() == lifecycle.Ready })
 	first.sendError(transientLaneError(d))
 	second := waitLaneConsumer(t, d, "orders")
 	second.sendError(transientLaneError(d))
@@ -589,7 +592,7 @@ func TestRunnerUsefulDeliveryRestoresTwoCycleRepairBudget(t *testing.T) {
 	var handled atomic.Int32
 	runner, _ := startLaneRunner(t, client, laneRepairSubscription("orders", &handled))
 	first := waitLaneConsumer(t, d, "orders")
-	waitReconnectCondition(t, runner.lifecycle.Ready)
+	waitReconnectCondition(t, func() bool { return runner.lifecycle.State() == lifecycle.Ready })
 	first.sendError(transientLaneError(d))
 	second := waitLaneConsumer(t, d, "orders")
 	second.sendError(transientLaneError(d))

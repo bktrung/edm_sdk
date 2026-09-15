@@ -2,21 +2,18 @@ package lifecycle
 
 import "testing"
 
-func TestMachineTransitionsAndProbes(t *testing.T) {
+func TestMachineTransitionsStartingToClosed(t *testing.T) {
 	machine := New()
-	if !machine.Live() || machine.Ready() || machine.State() != Starting {
-		t.Fatal("new machine must be live, not ready, and starting")
+	if got := machine.State(); got != Starting {
+		t.Fatalf("new machine state = %s, want starting", got)
 	}
-	for _, state := range []State{Ready, Draining, Settling, Flushing, Closed} {
+	for _, state := range []State{Ready, Draining, Closed} {
 		if err := machine.Transition(state); err != nil {
 			t.Fatalf("Transition(%s): %v", state, err)
 		}
-		if state == Ready && !machine.Ready() {
-			t.Fatal("ready probe rejected Ready")
+		if got := machine.State(); got != state {
+			t.Fatalf("State() after Transition(%s) = %s", state, got)
 		}
-	}
-	if machine.Live() != true || machine.Ready() {
-		t.Fatal("closed machine probes are incorrect")
 	}
 }
 
@@ -36,7 +33,32 @@ func TestMachineRejectsIllegalTransitions(t *testing.T) {
 	}
 }
 
-func TestMachineReconnectingProbesAndTransitions(t *testing.T) {
+// TestMachineDrainingOnlyClosesOrAborts pins the post-drain fan-out: once a
+// runner is Draining the only forward move is Closed, and Closed is the one
+// live state Aborted is no longer reachable from.
+func TestMachineDrainingOnlyClosesOrAborts(t *testing.T) {
+	machine := New()
+	if err := machine.Transition(Ready); err != nil {
+		t.Fatal(err)
+	}
+	if err := machine.Transition(Draining); err != nil {
+		t.Fatal(err)
+	}
+	if err := machine.Transition(Ready); err == nil {
+		t.Fatal("Draining -> Ready must be rejected")
+	}
+	if err := machine.Transition(Reconnecting); err == nil {
+		t.Fatal("Draining -> Reconnecting must be rejected")
+	}
+	if err := machine.Transition(Closed); err != nil {
+		t.Fatal(err)
+	}
+	if err := machine.Transition(Aborted); err == nil {
+		t.Fatal("Closed -> Aborted must be rejected")
+	}
+}
+
+func TestMachineReconnectingTransitions(t *testing.T) {
 	machine := New()
 	if err := machine.Transition(Ready); err != nil {
 		t.Fatal(err)
@@ -44,14 +66,14 @@ func TestMachineReconnectingProbesAndTransitions(t *testing.T) {
 	if err := machine.Transition(Reconnecting); err != nil {
 		t.Fatal(err)
 	}
-	if machine.Ready() || !machine.Live() {
-		t.Fatalf("reconnecting probes = ready %t live %t", machine.Ready(), machine.Live())
+	if got := machine.State(); got != Reconnecting {
+		t.Fatalf("state after reconnect = %s, want reconnecting", got)
 	}
 	if err := machine.Transition(Ready); err != nil {
 		t.Fatal(err)
 	}
-	if !machine.Ready() {
-		t.Fatal("reconnected machine must become ready")
+	if got := machine.State(); got != Ready {
+		t.Fatalf("state after reconnect finished = %s, want ready", got)
 	}
 }
 
@@ -60,15 +82,15 @@ func TestMachineAbortIsTerminal(t *testing.T) {
 	if err := machine.Transition(Aborted); err != nil {
 		t.Fatal(err)
 	}
-	if machine.Live() || machine.Ready() {
-		t.Fatal("aborted machine must not be live or ready")
+	if got := machine.State(); got != Aborted {
+		t.Fatalf("state = %s, want aborted", got)
 	}
 	if err := machine.Transition(Ready); err == nil {
 		t.Fatal("Aborted -> Ready must be rejected")
 	}
 }
 
-func TestMachineFailedIsTerminalAndLive(t *testing.T) {
+func TestMachineFailedIsTerminal(t *testing.T) {
 	machine := New()
 	if err := machine.Transition(Ready); err != nil {
 		t.Fatal(err)
@@ -76,8 +98,8 @@ func TestMachineFailedIsTerminalAndLive(t *testing.T) {
 	if err := machine.Transition(Failed); err != nil {
 		t.Fatal(err)
 	}
-	if machine.Ready() || !machine.Live() || machine.State().String() != "failed" {
-		t.Fatalf("failed probes = ready %t live %t state %s", machine.Ready(), machine.Live(), machine.State())
+	if got := machine.State(); got != Failed || got.String() != "failed" {
+		t.Fatalf("state = %s, want failed", got)
 	}
 	if err := machine.Transition(Ready); err == nil {
 		t.Fatal("Failed -> Ready must be rejected")
@@ -102,8 +124,8 @@ func TestStateStringsAndNilMachine(t *testing.T) {
 		t.Fatalf("unknown state string = %q", got)
 	}
 	var machine *Machine
-	if machine.State() != Aborted || machine.Ready() || machine.Live() {
-		t.Fatal("nil machine probes must be closed and unhealthy")
+	if machine.State() != Aborted {
+		t.Fatal("nil machine must report aborted")
 	}
 	if err := machine.Transition(Ready); err == nil {
 		t.Fatal("nil transition must fail")
@@ -112,8 +134,8 @@ func TestStateStringsAndNilMachine(t *testing.T) {
 
 func TestAllStateStrings(t *testing.T) {
 	for state, want := range map[State]string{
-		Starting: "starting", Ready: "ready", Reconnecting: "reconnecting", Draining: "draining", Settling: "settling",
-		Flushing: "flushing", Closed: "closed", Aborted: "aborted", Failed: "failed",
+		Starting: "starting", Ready: "ready", Reconnecting: "reconnecting", Draining: "draining",
+		Closed: "closed", Aborted: "aborted", Failed: "failed",
 	} {
 		if got := state.String(); got != want {
 			t.Errorf("State(%d).String() = %q, want %q", state, got, want)

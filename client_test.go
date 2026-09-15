@@ -27,6 +27,10 @@ func TestNewValidatesOptionsEagerly(t *testing.T) {
 	if _, err := New(context.Background(), cfg, WithDriver(fakeDriver), WithLogger(nil)); err == nil || fakeDriver.opened {
 		t.Fatalf("New() error = %v, opened = %v; want option error before open", err, fakeDriver.opened)
 	}
+	nilClockDriver := &testDriver{}
+	if _, err := New(context.Background(), cfg, WithDriver(nilClockDriver), withClock(nil)); err == nil || !strings.Contains(err.Error(), "withClock") || nilClockDriver.opened {
+		t.Fatalf("New() error = %v, opened = %v; want nil clock refused before open", err, nilClockDriver.opened)
+	}
 }
 
 func TestNewRejectsNilConnection(t *testing.T) {
@@ -329,7 +333,7 @@ func TestCloseDrainsAllRunnersAfterOneFails(t *testing.T) {
 func TestCloseDoesNotWaitForHealthProbe(t *testing.T) {
 	t.Parallel()
 	conn := &testConn{pingStarted: make(chan struct{}), pingRelease: make(chan struct{})}
-	client, err := New(context.Background(), testClientConfig(t), WithDriver(&testDriver{conn: conn}), WithClock(clock.NewReal()))
+	client, err := New(context.Background(), testClientConfig(t), WithDriver(&testDriver{conn: conn}), withClock(clock.NewReal()))
 	if err != nil {
 		t.Fatal(err)
 	}

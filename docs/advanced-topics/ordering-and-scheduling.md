@@ -42,6 +42,13 @@ In ordered mode:
 - F1 does not provide one global order across all topics, priorities, keys, or
   consumer instances.
 
+This guarantee ends at a retry. A delivery that fails and is retried is
+acknowledged as soon as its retry copy is stored, which releases the key, so
+the next message with that key is handled before the retry comes back. When a
+key must not be handled out of order at all, either set
+`RetryConfig{MaxAttempts: 1}` for the subscription so a failure goes straight
+to the dead-letter destination, or make the handler tolerate the reorder.
+
 The connected driver must advertise the `ordered_by_key` capability. F1
 rejects an ordered subscription when that capability is unavailable. Check
 `client.Limits()` during startup when deployment portability matters; the
@@ -94,7 +101,7 @@ slots do not help when most work hashes to one key.
 | Setting | Controls | Main trade-off |
 | --- | --- | --- |
 | `Concurrency` | Number of handler workers available to a subscription | More parallelism requires thread-safe, idempotent handler effects and more downstream capacity. |
-| `Prefetch` | How many deliveries the consumer may hold ahead of settlement, and the dispatch queue budget | More buffering can improve utilization but increases in-flight work, memory, and shutdown backlog. |
+| `Prefetch` | How many deliveries the consumer may hold ahead of settlement; in ordered mode it is also the dispatch queue budget | More buffering can improve utilization but increases in-flight work, memory, and shutdown backlog. |
 
 F1 keeps admission and scheduling bounded. A delivery passes through the
 driver's prefetch budget, the fetch-to-dispatch boundary, bounded scheduler
@@ -155,7 +162,6 @@ capacity policy rather than copying defaults into application code:
 	},
 	RetryWeightDivisor: 2,
 	PrefetchFactor:     2,
-	AgingEnabled:       true,
 }
 ```
 
@@ -165,8 +171,8 @@ The fields have distinct jobs:
 - `Budgets` defines how long a lane may wait before aging can promote it;
 - `RetryWeightDivisor` reduces retry pressure relative to fresh work;
 - `PrefetchFactor` scales each scheduler lane's bounded capacity; and
-- `AgingEnabled` enables age-based promotion for lanes that exceed their
-  budget.
+- `DisableAging` turns off age-based promotion for lanes that exceed their
+  budget. Its zero value leaves promotion on, which is the default.
 
 The scheduler uses weighted round-robin when no lane has exceeded its aging
 budget. When aging is enabled, the lane with the greatest budget overrun may

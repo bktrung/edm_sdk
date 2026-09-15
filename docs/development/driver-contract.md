@@ -178,15 +178,15 @@ If the transport result is ambiguous, the driver must return a classified
 error rather than claiming success. The caller may observe a duplicate if the
 broker accepted a message before the connection failure became visible.
 
-### Flush and close
-
-`Flush` waits for buffered messages to reach their acknowledgment boundary. It
-must honor the context and leave the producer usable when cancellation returns
-before the flush completes, unless the provider has made the resource unusable.
+### Close
 
 `Close` releases producer resources. It must not discard accepted but
 unacknowledged work silently, and it must coordinate with concurrent `Publish`
-calls according to the provider's resource guarantees.
+calls according to the provider's resource guarantees. There is no separate
+teardown call before it: the core closes the producer once application
+publishes reach quiescence. A canceled `Close` must still leave the producer
+and the connection in a state the caller can reason about, unless the provider
+has made the resource unusable.
 
 Concrete producer implementations are the source of provider mechanics:
 
@@ -425,8 +425,8 @@ Every operation that can block accepts a context. A driver must:
 - return a context-aware or port-classified error rather than reporting a
   successful operation that did not complete;
 - leave resources in a state the caller can reason about after cancellation;
-- keep a canceled `Flush` or `Close` from corrupting the producer/connection
-  state when the provider allows the resource to remain usable; and
+- keep a canceled `Close` from corrupting the producer/connection state when
+  the provider allows the resource to remain usable; and
 - preserve the distinction between caller cancellation, drain timeout, and a
   broker failure.
 
@@ -475,7 +475,7 @@ Use this checklist as a handoff to the conformance page:
    capability ceiling.
 2. `Open` honors context and returns only a usable `Conn`.
 3. Live capabilities never exceed the static declaration.
-4. Producer publication, flush, and close honor durable acknowledgment and
+4. Producer publication and close honor durable acknowledgment and
    cancellation rules.
 5. Consumer messages/errors channels, drain, stop, release, pause/resume, and
    lag follow the port distinctions.

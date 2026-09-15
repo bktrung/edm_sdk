@@ -106,11 +106,20 @@ type Runner struct {
 	finished              bool
 	runErr                error
 	reconnectCause        error
+	// recordedFailure reports whether this runner has already recorded a
+	// failure against its subscription name. It is guarded by client.mu, not
+	// by mu: every record site and the clear already hold that lock, and the
+	// exit record reads it in the same critical section that decides whether
+	// the entry it would replace is still this runner's.
+	recordedFailure bool
 	// reconnectCauseAttempt is set only when the supervisor injects the generic
 	// reconnect cause, so a runner can wait for that exact client attempt.
 	reconnectCauseAttempt *reconnectAttempt
 	// reconnectDecisionHook is a test-only seam for pausing generation decisions.
 	reconnectDecisionHook func()
+	// reconnectWaitHook is a test-only seam, called when a runner is about to wait for a
+	// reconnect in progress before it opens its consumer.
+	reconnectWaitHook func()
 	// consumerError identifies a transient failure from Consumer.Errors in this generation.
 	consumerError bool
 	// successfulDelivery means this generation completed at least one handled delivery.
@@ -124,7 +133,6 @@ type Runner struct {
 	inflight              *inflightRegistry
 	retryDestinationTiers map[string]int
 	lifecycle             *lifecycle.Machine
-	accounting            *lifecycle.Accounting
 	dispatchPool          *dispatch.Pool
 }
 
@@ -347,11 +355,24 @@ func overlayLoadedSubscription(dst *SubscriptionConfig, src SubscriptionConfig) 
 	if p.Priorities || len(src.Priorities) > 0 {
 		dst.Priorities = append([]Priority(nil), src.Priorities...)
 	}
+	// A YAML-named fairness or retry block is decoded over the full defaults,
+	// so the struct is complete and replaces the default wholesale, which is
+	// what preserves an explicit YAML zero. A Go-built config sets no presence
+	// and its struct is partial, so it merges field by field, the rule the
+	// explicit subscription overlay already uses.
 	if p.Fairness || !fairnessZero(src.Fairness) {
-		dst.Fairness = cloneFairness(src.Fairness)
+		if p.Fairness {
+			dst.Fairness = cloneFairness(src.Fairness)
+		} else {
+			dst.Fairness = mergeFairness(dst.Fairness, src.Fairness)
+		}
 	}
 	if p.Retry || !retryZero(src.Retry) {
-		dst.Retry = cloneRetry(src.Retry)
+		if p.Retry {
+			dst.Retry = cloneRetry(src.Retry)
+		} else {
+			dst.Retry = mergeRetry(dst.Retry, src.Retry)
+		}
 	}
 	if p.HandlerTimeout || src.HandlerTimeout != 0 {
 		dst.HandlerTimeout = src.HandlerTimeout
@@ -489,14 +510,11 @@ func mergeFairness(base, override FairnessConfig) FairnessConfig {
 	if override.RetryWeightDivisor != 0 {
 		base.RetryWeightDivisor = override.RetryWeightDivisor
 	}
-	if override.CostModel != "" {
-		base.CostModel = override.CostModel
-	}
 	if override.PrefetchFactor != 0 {
 		base.PrefetchFactor = override.PrefetchFactor
 	}
-	if override.AgingEnabled {
-		base.AgingEnabled = true
+	if override.DisableAging {
+		base.DisableAging = true
 	}
 	return base
 }
@@ -514,9 +532,6 @@ func mergeRetry(base, override RetryConfig) RetryConfig {
 	if override.MaxInterval != 0 {
 		base.MaxInterval = override.MaxInterval
 	}
-	if override.Jitter != 0 {
-		base.Jitter = override.Jitter
-	}
 	if override.Tiers != nil {
 		base.Tiers = append([]time.Duration(nil), override.Tiers...)
 	}
@@ -524,11 +539,11 @@ func mergeRetry(base, override RetryConfig) RetryConfig {
 }
 
 func fairnessZero(value FairnessConfig) bool {
-	return value.Weights == nil && value.Budgets == nil && value.RetryWeightDivisor == 0 && value.CostModel == "" && value.PrefetchFactor == 0 && !value.AgingEnabled
+	return value.Weights == nil && value.Budgets == nil && value.RetryWeightDivisor == 0 && value.PrefetchFactor == 0 && !value.DisableAging
 }
 
 func retryZero(value RetryConfig) bool {
-	return value.MaxAttempts == 0 && value.InitialInterval == 0 && value.Multiplier == 0 && value.MaxInterval == 0 && value.Jitter == 0 && value.Tiers == nil
+	return value.MaxAttempts == 0 && value.InitialInterval == 0 && value.Multiplier == 0 && value.MaxInterval == 0 && value.Tiers == nil
 }
 
 func clonePriorityWeights(value map[Priority]int) map[Priority]int {

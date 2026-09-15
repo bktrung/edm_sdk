@@ -15,27 +15,27 @@ import (
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/clock"
 )
 
-func TestClientCloseBoundsProducerFlush(t *testing.T) {
+func TestClientCloseBoundsProducerClose(t *testing.T) {
 	fake := clock.NewFake(time.Unix(0, 0))
 	producer := &recordingProducer{
-		flushStarted: make(chan struct{}),
-		flushRelease: make(chan struct{}),
+		closeStarted: make(chan struct{}),
+		closeRelease: make(chan struct{}),
 	}
-	client := newPublishClient(t, producer, WithClock(fake))
-	client.config.Lifecycle.FlushTimeout = 5 * time.Second
-	defer close(producer.flushRelease)
+	client := newPublishClient(t, producer, withClock(fake))
+	client.config.Lifecycle.CloseTimeout = 5 * time.Second
+	defer close(producer.closeRelease)
 	if _, err := client.Publisher().Publish(context.Background(), "orders.created", "payload"); err != nil {
 		t.Fatal(err)
 	}
 
 	closeDone := make(chan error, 1)
 	go func() { closeDone <- client.Close(context.Background()) }()
-	<-producer.flushStarted
+	<-producer.closeStarted
 	waitForFakeTimer(t, fake)
 	fake.Advance(5 * time.Second)
 	err := <-closeDone
-	if !errors.Is(err, context.DeadlineExceeded) || !strings.Contains(err.Error(), "flush phase") {
-		t.Fatalf("Close() error = %v, want flush phase deadline", err)
+	if !errors.Is(err, context.DeadlineExceeded) || !strings.Contains(err.Error(), "close phase") {
+		t.Fatalf("Close() error = %v, want close phase deadline", err)
 	}
 }
 
@@ -46,7 +46,7 @@ func TestClientCloseBoundsConnectionClose(t *testing.T) {
 		closeStarted: make(chan struct{}),
 		closeRelease: make(chan struct{}),
 	}
-	client, err := New(context.Background(), testClientConfig(t), WithDriver(&publishDriver{conn: conn}), WithClock(fake))
+	client, err := New(context.Background(), testClientConfig(t), WithDriver(&publishDriver{conn: conn}), withClock(fake))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -148,8 +148,8 @@ func TestPublishReusesProducerUntilClientClose(t *testing.T) {
 	if err := client.Close(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if got := producer.flushCalls; got != 1 {
-		t.Fatalf("producer flush calls = %d, want 1", got)
+	if got := producer.closeCalls; got != 1 {
+		t.Fatalf("producer close calls after Client.Close = %d, want 1", got)
 	}
 }
 
@@ -180,9 +180,6 @@ func TestCloseWaitsForInFlightPublish(t *testing.T) {
 	if err := <-closeDone; err != nil {
 		t.Fatalf("Close() = %v", err)
 	}
-	if got := producer.flushCalls; got != 1 {
-		t.Fatalf("producer flush calls = %d, want 1", got)
-	}
 	if got := producer.closeCalls; got != 1 {
 		t.Fatalf("producer close calls = %d, want 1", got)
 	}
@@ -211,20 +208,20 @@ func TestPublishRejectedWhenClientIsClosing(t *testing.T) {
 func TestPublishAttemptDuringCloseIsRefused(t *testing.T) {
 	t.Parallel()
 	producer := &recordingProducer{
-		flushStarted: make(chan struct{}),
-		flushRelease: make(chan struct{}),
+		closeStarted: make(chan struct{}),
+		closeRelease: make(chan struct{}),
 	}
 	client := newPublishClient(t, producer)
 	var release sync.Once
-	releaseFlush := func() { release.Do(func() { close(producer.flushRelease) }) }
-	t.Cleanup(releaseFlush)
+	releaseClose := func() { release.Do(func() { close(producer.closeRelease) }) }
+	t.Cleanup(releaseClose)
 	if _, err := client.Publisher().Publish(context.Background(), "orders.created", "first"); err != nil {
 		t.Fatal(err)
 	}
 
 	closeDone := make(chan error, 1)
 	go func() { closeDone <- client.Close(context.Background()) }()
-	<-producer.flushStarted
+	<-producer.closeStarted
 	publishDone := make(chan error, 1)
 	publishReturned := make(chan struct{})
 	go func() {
@@ -237,9 +234,9 @@ func TestPublishAttemptDuringCloseIsRefused(t *testing.T) {
 	select {
 	case <-publishReturned:
 	case <-waitTimer.C:
-		t.Fatal("Publish did not refuse admission while Close was flushing")
+		t.Fatal("Publish did not refuse admission while Close was closing the producer")
 	}
-	releaseFlush()
+	releaseClose()
 	if err := <-closeDone; err != nil {
 		t.Fatalf("Close() = %v", err)
 	}
@@ -451,6 +448,55 @@ func TestPublishBatchTransientCauseStillReconnects(t *testing.T) {
 	}
 }
 
+func TestSinglePublishTransientFailureRequestsReconnect(t *testing.T) {
+	t.Parallel()
+	var logs logSink
+	cause := &driver.Error{Driver: "test", Op: "publish", K: driver.KindTransient, Err: errors.New("broker reset the connection")}
+	producer := &recordingProducer{publishErr: cause}
+	client := newPublishClient(t, producer, WithLogger(slog.New(slog.NewTextHandler(&logs, nil))))
+	if _, err := client.Publisher().Publish(context.Background(), "orders.created", "payload"); !errors.Is(err, cause) {
+		t.Fatalf("Publish() error = %v, want it to wrap %v", err, cause)
+	}
+	quiescePublishClient(t, client)
+	if !reconnectRequested(client, logs.String()) {
+		t.Fatalf("a single publish its driver classified transient did not reconnect the client; logs=%s", logs.String())
+	}
+}
+
+func TestSinglePublishFatalFailureDoesNotRequestReconnect(t *testing.T) {
+	t.Parallel()
+	var logs logSink
+	cause := &driver.Error{Driver: "test", Op: "publish", K: driver.KindFatal, Err: errors.New("broker rejected the publish")}
+	producer := &recordingProducer{publishErr: cause}
+	client := newPublishClient(t, producer, WithLogger(slog.New(slog.NewTextHandler(&logs, nil))))
+	if _, err := client.Publisher().Publish(context.Background(), "orders.created", "payload"); !errors.Is(err, cause) {
+		t.Fatalf("Publish() error = %v, want it to wrap %v", err, cause)
+	}
+	quiescePublishClient(t, client)
+	if reconnectRequested(client, logs.String()) {
+		t.Fatalf("a single publish its driver classified fatal reconnected the client; logs=%s", logs.String())
+	}
+}
+
+func TestProducerCreationTransientFailureRequestsReconnect(t *testing.T) {
+	t.Parallel()
+	var logs logSink
+	cause := &driver.Error{Driver: "test", Op: "producer", K: driver.KindTransient, Err: errors.New("broker closed the channel")}
+	conn := &publishConn{
+		producer:    &recordingProducer{},
+		producerErr: cause,
+		info:        driver.BrokerInfo{Kind: "test", Version: "1"},
+	}
+	client := newPublishClientWithConn(t, conn, WithLogger(slog.New(slog.NewTextHandler(&logs, nil))))
+	if _, err := client.Publisher().Publish(context.Background(), "orders.created", "payload"); !errors.Is(err, cause) {
+		t.Fatalf("Publish() error = %v, want it to wrap %v", err, cause)
+	}
+	quiescePublishClient(t, client)
+	if !reconnectRequested(client, logs.String()) {
+		t.Fatalf("a producer creation its driver classified transient did not reconnect the client; logs=%s", logs.String())
+	}
+}
+
 func TestNewLogsNonNativeCapabilities(t *testing.T) {
 	t.Parallel()
 	var logs logSink
@@ -491,6 +537,13 @@ func TestTopicForOnlyStripsTrailingVersion(t *testing.T) {
 func newPublishClient(t *testing.T, producer *recordingProducer, opts ...Option) *Client {
 	t.Helper()
 	conn := &publishConn{producer: producer, info: driver.BrokerInfo{Kind: "test", Version: "1"}}
+	return newPublishClientWithConn(t, conn, opts...)
+}
+
+// newPublishClientWithConn builds a client over conn, for a test that needs a
+// connection shape the producer-only helper cannot express.
+func newPublishClientWithConn(t *testing.T, conn *publishConn, opts ...Option) *Client {
+	t.Helper()
 	options := []Option{WithDriver(&publishDriver{conn: conn})}
 	options = append(options, opts...)
 	client, err := New(context.Background(), testClientConfig(t), options...)
@@ -549,6 +602,7 @@ func (d *publishDriver) Open(context.Context, driver.Config) (driver.Conn, error
 type publishConn struct {
 	mu               sync.Mutex
 	producer         driver.Producer
+	producerErr      error
 	caps             driver.Capabilities
 	info             driver.BrokerInfo
 	producerCalls    int
@@ -565,8 +619,13 @@ func (c *publishConn) BrokerInfo() driver.BrokerInfo { return c.info }
 func (c *publishConn) Producer(context.Context, driver.ProducerConfig) (driver.Producer, error) {
 	c.mu.Lock()
 	c.producerCalls++
+	producer := c.producer
+	err := c.producerErr
 	c.mu.Unlock()
-	return c.producer, nil
+	if err != nil {
+		return nil, err
+	}
+	return producer, nil
 }
 
 func (*publishConn) Consumer(context.Context, driver.ConsumerConfig) (driver.Consumer, error) {
@@ -599,11 +658,7 @@ type recordingProducer struct {
 	publishStarted   chan struct{}
 	publishRelease   chan struct{}
 	closeCalls       int
-	flushCalls       int
 	closeErr         error
-	flushStarted     chan struct{}
-	flushStartedOnce sync.Once
-	flushRelease     chan struct{}
 	closeStarted     chan struct{}
 	closeStartedOnce sync.Once
 	closeRelease     chan struct{}
@@ -622,21 +677,6 @@ func (p *recordingProducer) Publish(_ context.Context, messages ...driver.Outbou
 		<-release
 	}
 	return err
-}
-
-func (p *recordingProducer) Flush(context.Context) error {
-	p.mu.Lock()
-	p.flushCalls++
-	started := p.flushStarted
-	release := p.flushRelease
-	if started != nil {
-		p.flushStartedOnce.Do(func() { close(started) })
-	}
-	p.mu.Unlock()
-	if release != nil {
-		<-release
-	}
-	return nil
 }
 
 func (p *recordingProducer) Close(context.Context) error {

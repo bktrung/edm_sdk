@@ -7,33 +7,9 @@ import (
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/dispatch"
 )
 
-type settlementOperation = dispatch.SettlementOperation
-
-const (
-	settlementOperationNone = dispatch.SettlementOperationNone
-	settlementOperationAck  = dispatch.SettlementOperationAck
-	settlementOperationNack = dispatch.SettlementOperationNack
-)
-
-type settlementOutcome = dispatch.SettlementOutcome
-
-const (
-	settlementOutcomeSettled   = dispatch.SettlementOutcomeSettled
-	settlementOutcomeRequeued  = dispatch.SettlementOutcomeRequeued
-	settlementOutcomeUnknown   = dispatch.SettlementOutcomeUnknown
-	settlementOutcomeAbandoned = dispatch.SettlementOutcomeAbandoned
-)
-
-type settlementCounts struct {
-	received  uint64
-	settled   uint64
-	requeued  uint64
-	unknown   uint64
-	abandoned uint64
-}
-
-// inflightRegistry preserves the root worker's settlement call shape while
-// delegating storage and accounting to the internal dispatch registry.
+// inflightRegistry tracks the runner's accepted deliveries until they
+// settle, delegating storage to the internal dispatch registry. Drain waits
+// on it; nothing else reads from it.
 type inflightRegistry struct {
 	registry *dispatch.Registry
 }
@@ -51,50 +27,15 @@ func (r *inflightRegistry) Add(_ driver.InboundMessage) uint64 {
 	return r.registry.Add()
 }
 
-// SetDisposition records the message outcome to use if the delivery settles successfully.
-func (r *inflightRegistry) SetDisposition(id uint64, disposition dispatch.Disposition) {
-	if r != nil {
-		r.registry.SetDisposition(id, disposition)
-	}
-}
-
-// Remove records the default successful settlement for a delivery.
+// Remove drops the delivery once its settlement path finished, whether it
+// settled by ack, by requeue, or at the end of the bounded cleanup budget.
 func (r *inflightRegistry) Remove(id uint64) {
 	if r != nil {
 		r.registry.Remove(id)
 	}
 }
 
-// RemoveAs removes a delivery and records its settlement outcome.
-func (r *inflightRegistry) RemoveAs(id uint64, outcome settlementOutcome) {
-	if r != nil {
-		r.registry.RemoveAs(id, outcome)
-	}
-}
-
-func (r *inflightRegistry) Counts() settlementCounts {
-	if r == nil {
-		return settlementCounts{}
-	}
-	counts := r.registry.Counts()
-	return settlementCounts{
-		received:  counts.Received,
-		settled:   counts.Settlements.Settled,
-		requeued:  counts.Settlements.Requeued,
-		unknown:   counts.Settlements.Unknown,
-		abandoned: counts.Settlements.Abandoned,
-	}
-}
-
-// DispositionCounts returns a snapshot of terminal message dispositions.
-func (r *inflightRegistry) DispositionCounts() dispatch.DispositionCounts {
-	if r == nil {
-		return dispatch.DispositionCounts{}
-	}
-	return r.registry.Counts().Dispositions
-}
-
-// Len returns the number of deliveries without a recorded settlement result.
+// Len returns the number of deliveries still in flight.
 func (r *inflightRegistry) Len() int {
 	if r == nil {
 		return 0
@@ -102,7 +43,7 @@ func (r *inflightRegistry) Len() int {
 	return r.registry.Len()
 }
 
-// WaitZero waits until every registered delivery has a settlement result.
+// WaitZero waits until every accepted delivery has left the registry.
 func (r *inflightRegistry) WaitZero(ctx context.Context) error {
 	if r == nil {
 		return nil

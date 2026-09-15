@@ -73,7 +73,12 @@ func (a *adminOperations) EnsureTopology(ctx context.Context, spec driver.Topolo
 			diff.ExistingDestinations = append(diff.ExistingDestinations, item.Name)
 			continue
 		}
-		a.conn.destinations[item.Name] = &destination{spec: item, consumers: make(map[*consumer]struct{}), affinity: make(map[string]*consumer)}
+		a.conn.destinations[item.Name] = &destination{
+			spec:      item,
+			consumers: make(map[*consumer]struct{}),
+			affinity:  make(map[affinityKey]*consumer),
+			next:      make(map[string]int),
+		}
 		diff.CreatedDestinations = append(diff.CreatedDestinations, item.Name)
 	}
 	if len(spec.Scope) == 0 {
@@ -164,6 +169,9 @@ func (a *adminOperations) Purge(ctx context.Context, name string) (int64, error)
 	}
 	n := int64(len(item.messages))
 	item.messages = nil
+	// Replay history is what a later group attaching from earliest is served
+	// from, so purging the queue without it would resurrect every purged body.
+	delete(a.conn.history, name)
 	return n, nil
 }
 
@@ -194,6 +202,14 @@ func (a *adminOperations) Prune(ctx context.Context, names []string) ([]driver.P
 		}
 		// This driver has no auxiliary destinations to delete.
 		delete(a.conn.destinations, name)
+		delete(a.conn.history, name)
+		// A group is a member of a destination only while that destination
+		// exists. Leaving the name in a group's membership would make the
+		// membership demand a delivery from a group that is no longer attached
+		// to anything the recreated destination can serve.
+		for _, group := range a.conn.groups {
+			delete(group.members, name)
+		}
 		results = append(results, driver.PruneResult{Name: name, Deleted: true})
 	}
 	return results, nil

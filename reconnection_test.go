@@ -21,8 +21,10 @@ type reconnectTestDriver struct {
 	mu               sync.Mutex
 	opens            int
 	failOpens        int
+	openErr          error
 	failConsumers    int
 	consumerErr      error
+	publishErr       error
 	consumerOpenHook func(context.Context, string) error
 	connections      []*reconnectTestConn
 	created          chan *reconnectTestConsumer
@@ -40,6 +42,9 @@ func (d *reconnectTestDriver) Open(context.Context, driver.Config) (driver.Conn,
 	d.opens++
 	if d.opens > 1 && d.failOpens > 0 {
 		d.failOpens--
+		if d.openErr != nil {
+			return nil, d.openErr
+		}
 		return nil, &driver.Error{Driver: d.Name(), Op: "open", K: driver.KindTransient, Err: errors.New("open failed")}
 	}
 	conn := &reconnectTestConn{driver: d, admin: &reconnectTestAdmin{}}
@@ -56,7 +61,27 @@ func (d *reconnectTestDriver) OpenCount() int {
 func (d *reconnectTestDriver) setFailOpens(n int) {
 	d.mu.Lock()
 	d.failOpens = n
+	d.openErr = nil
 	d.mu.Unlock()
+}
+
+func (d *reconnectTestDriver) setFailOpensWithError(n int, err error) {
+	d.mu.Lock()
+	d.failOpens = n
+	d.openErr = err
+	d.mu.Unlock()
+}
+
+func (d *reconnectTestDriver) setPublishError(err error) {
+	d.mu.Lock()
+	d.publishErr = err
+	d.mu.Unlock()
+}
+
+func (d *reconnectTestDriver) publishError() error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.publishErr
 }
 
 func (d *reconnectTestDriver) setFailConsumers(n int) {
@@ -75,6 +100,12 @@ type reconnectTestConn struct {
 	admin    *reconnectTestAdmin
 	closed   atomic.Bool
 	producer atomic.Int32
+	// openConsumers is the number of consumers this connection still carries,
+	// counted by the same close that releases each one. openAtClose is what
+	// Close found, so a test can tell whether a connection was retired with a
+	// consumer still on it, which the real drivers refuse to do.
+	openConsumers atomic.Int32
+	openAtClose   atomic.Int32
 }
 
 func (c *reconnectTestConn) Capabilities() driver.Capabilities { return c.driver.Capabilities() }
@@ -112,10 +143,14 @@ func (c *reconnectTestConn) Consumer(ctx context.Context, cfg driver.ConsumerCon
 		return nil, &driver.Error{Driver: c.driver.Name(), Op: "consumer", K: driver.KindTransient, Err: errors.New("connection closed")}
 	}
 	consumer := &reconnectTestConsumer{
+		conn:     c,
 		group:    cfg.Group,
 		messages: make(chan driver.InboundMessage, 8),
 		errors:   make(chan error, 8),
 	}
+	// Counted before the consumer is handed to anyone, so a test that receives
+	// it from created never sees the connection without its consumer.
+	c.openConsumers.Add(1)
 	select {
 	case c.driver.created <- consumer:
 	default:
@@ -126,6 +161,7 @@ func (c *reconnectTestConn) Admin() driver.Admin      { return c.admin }
 func (*reconnectTestConn) Ping(context.Context) error { return nil }
 func (c *reconnectTestConn) Close(context.Context) error {
 	c.closed.Store(true)
+	c.openAtClose.Store(c.openConsumers.Load())
 	return nil
 }
 
@@ -154,14 +190,19 @@ type reconnectTestProducer struct {
 	conn *reconnectTestConn
 }
 
-func (*reconnectTestProducer) Publish(context.Context, ...driver.OutboundMessage) error { return nil }
-func (*reconnectTestProducer) Flush(context.Context) error                              { return nil }
+func (p *reconnectTestProducer) Publish(context.Context, ...driver.OutboundMessage) error {
+	return p.conn.driver.publishError()
+}
+
 func (p *reconnectTestProducer) Close(context.Context) error {
 	p.conn.producer.Add(-1)
 	return nil
 }
 
 type reconnectTestConsumer struct {
+	// conn is the connection this consumer was opened on, which a test reads to
+	// tell which connection a runner's consumer landed on.
+	conn         *reconnectTestConn
 	group        string
 	messages     chan driver.InboundMessage
 	errors       chan error
@@ -171,6 +212,17 @@ type reconnectTestConsumer struct {
 	once         sync.Once
 	mu           sync.RWMutex
 	closed       atomic.Bool
+	// releaseFailures is armed by a test through setFailRelease. While it is
+	// positive, Release returns releaseErr and leaves the consumer open, the
+	// way a driver whose teardown call fails on a broken connection behaves.
+	releaseFailures int
+	releaseErr      error
+	// stopHold and stopEntered are armed by a test through holdStop. While
+	// stopHold is non-nil the next Stop closes stopEntered and waits for
+	// stopHold to close before it closes the consumer, so a test can keep a
+	// runner inside its post-error teardown.
+	stopHold    chan struct{}
+	stopEntered chan struct{}
 }
 
 func (c *reconnectTestConsumer) Messages() <-chan driver.InboundMessage { return c.messages }
@@ -187,7 +239,33 @@ func (c *reconnectTestConsumer) Drain(context.Context) error {
 	return nil
 }
 
+// holdStop arms this consumer's next Stop to signal entered and then block
+// until the returned release runs, before it closes the consumer. It lets a
+// test hold a runner inside its post-error teardown while a second runner of
+// the same subscription name starts. release is idempotent. A consumer whose
+// Stop was never armed ignores it, and an armed hold applies to one Stop only.
+func (c *reconnectTestConsumer) holdStop() (entered <-chan struct{}, release func()) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	held := make(chan struct{})
+	signal := make(chan struct{})
+	c.stopHold = held
+	c.stopEntered = signal
+	var once sync.Once
+	return signal, func() { once.Do(func() { close(held) }) }
+}
+
 func (c *reconnectTestConsumer) Stop(context.Context) error {
+	c.mu.Lock()
+	held := c.stopHold
+	entered := c.stopEntered
+	c.stopHold = nil
+	c.stopEntered = nil
+	c.mu.Unlock()
+	if held != nil {
+		close(entered)
+		<-held
+	}
 	c.close()
 	return nil
 }
@@ -196,10 +274,28 @@ func (c *reconnectTestConsumer) Release(context.Context) error {
 	if c.drainRelease != nil {
 		return nil
 	}
+	c.mu.Lock()
+	if c.releaseFailures > 0 {
+		c.releaseFailures--
+		err := c.releaseErr
+		c.mu.Unlock()
+		return err
+	}
+	c.mu.Unlock()
 	c.close()
 	return nil
 }
 
+func (c *reconnectTestConsumer) setFailRelease(n int, err error) {
+	c.mu.Lock()
+	c.releaseFailures = n
+	c.releaseErr = err
+	c.mu.Unlock()
+}
+
+// close releases the consumer from its connection. Both Release and Stop end
+// here, and a consumer that Release leaves open never reaches it, so the
+// connection's count follows the consumers that are really gone.
 func (c *reconnectTestConsumer) close() {
 	c.once.Do(func() {
 		c.mu.Lock()
@@ -207,6 +303,9 @@ func (c *reconnectTestConsumer) close() {
 		close(c.messages)
 		close(c.errors)
 		c.mu.Unlock()
+		if c.conn != nil {
+			c.conn.openConsumers.Add(-1)
+		}
 	})
 }
 
@@ -360,7 +459,6 @@ func newReconnectTestClientWithLogger(t *testing.T, d *reconnectTestDriver, c cl
 	cfg.Broker.MaxReconnectAttempts = maxAttempts
 	cfg.Lifecycle.DrainTimeout = 500 * time.Millisecond
 	cfg.Lifecycle.HandlerGrace = 100 * time.Millisecond
-	cfg.Lifecycle.FlushTimeout = 100 * time.Millisecond
 	cfg.Lifecycle.CloseTimeout = 100 * time.Millisecond
 	options := []Option{WithDriver(d)}
 	if logger != nil {
@@ -368,7 +466,7 @@ func newReconnectTestClientWithLogger(t *testing.T, d *reconnectTestDriver, c cl
 	}
 	options = append(options, extra...)
 	if c != nil {
-		options = append(options, WithClock(c))
+		options = append(options, withClock(c))
 	}
 	client, err := New(context.Background(), cfg, options...)
 	if err != nil {
@@ -627,7 +725,7 @@ func TestRunnerReconnectReportsGenerationCause(t *testing.T) {
 	runDone := make(chan error, 1)
 	go func() { runDone <- runner.Run(runCtx) }()
 	first := <-d.created
-	waitReconnectCondition(t, func() bool { return runner.lifecycle.Ready() })
+	waitReconnectCondition(t, func() bool { return runner.lifecycle.State() == lifecycle.Ready })
 	d.setFailConsumersWithError(1, cause)
 	first.sendError(&driver.Error{
 		Driver: d.Name(),
@@ -637,7 +735,7 @@ func TestRunnerReconnectReportsGenerationCause(t *testing.T) {
 	})
 	advanceReconnect(t, recorded, 500*time.Millisecond, 1)
 	waitReconnectCondition(t, func() bool {
-		return d.OpenCount() >= 2 && runner.lifecycle.Ready() && !client.isReconnecting()
+		return d.OpenCount() >= 2 && runner.lifecycle.State() == lifecycle.Ready && !client.isReconnecting()
 	})
 	assertReconnectStartedLog(t, configuredOutput.String(), cause)
 	if got := defaultOutput.String(); got != "" {
@@ -925,7 +1023,7 @@ func TestRunConsumesSuccessfulPreRunReconnectOwner(t *testing.T) {
 	runDone := make(chan error, 1)
 	go func() { runDone <- runner.Run(runCtx) }()
 	first := <-d.created
-	waitReconnectCondition(t, func() bool { return runner.lifecycle.Ready() })
+	waitReconnectCondition(t, func() bool { return runner.lifecycle.State() == lifecycle.Ready })
 	runner.mu.Lock()
 	preRunCause := runner.reconnectCause
 	preRunAttempt := runner.reconnectCauseAttempt
@@ -958,7 +1056,7 @@ func TestRunConsumesSuccessfulPreRunReconnectOwner(t *testing.T) {
 	releaseDecisionGate()
 	second := <-d.created
 	waitReconnectCondition(t, func() bool {
-		return runner.lifecycle.Ready() && !client.isReconnecting()
+		return runner.lifecycle.State() == lifecycle.Ready && !client.isReconnecting()
 	})
 	if !second.send(validReconnectMessage(t, "after-pre-run-owner")) {
 		t.Fatal("replacement consumer rejected a message")
@@ -1090,7 +1188,7 @@ func TestRunWaitsForNewerPreRunReconnectOwner(t *testing.T) {
 		t.Fatalf("newer pre-run reconnect = %v, want nil", err)
 	}
 	first := <-d.created
-	waitReconnectCondition(t, func() bool { return runner.lifecycle.Ready() })
+	waitReconnectCondition(t, func() bool { return runner.lifecycle.State() == lifecycle.Ready })
 	if !first.send(validReconnectMessage(t, "after-newer-pre-run-owner")) {
 		t.Fatal("consumer rejected the message after newer pre-run reconnect")
 	}
@@ -1241,7 +1339,7 @@ func TestRunPreservesGenuinePreRunCause(t *testing.T) {
 	runDone := make(chan error, 1)
 	go func() { runDone <- runner.Run(runCtx) }()
 	first := <-d.created
-	waitReconnectCondition(t, func() bool { return runner.lifecycle.Ready() })
+	waitReconnectCondition(t, func() bool { return runner.lifecycle.State() == lifecycle.Ready })
 	first.sendError(&driver.Error{
 		Driver: d.Name(),
 		Op:     "consumer",
@@ -1257,7 +1355,7 @@ func TestRunPreservesGenuinePreRunCause(t *testing.T) {
 		t.Fatal("runner did not expose the genuine pre-run cause")
 	}
 	second := <-d.created
-	waitReconnectCondition(t, func() bool { return runner.lifecycle.Ready() })
+	waitReconnectCondition(t, func() bool { return runner.lifecycle.State() == lifecycle.Ready })
 	if !second.send(validReconnectMessage(t, "after-genuine-pre-run-cause")) {
 		t.Fatal("replacement consumer rejected the message")
 	}
@@ -1368,7 +1466,7 @@ func TestRunAdoptsNewerOwnerAfterFailedPreRunReconnect(t *testing.T) {
 	}
 	client.finishReconnect(attemptB, nil)
 	first := <-d.created
-	waitReconnectCondition(t, func() bool { return runner.lifecycle.Ready() })
+	waitReconnectCondition(t, func() bool { return runner.lifecycle.State() == lifecycle.Ready })
 	if !first.send(validReconnectMessage(t, "after-adopted-pre-run-owner")) {
 		t.Fatal("consumer rejected the message after adopting the newer owner")
 	}
@@ -1562,7 +1660,7 @@ func TestFatalConsumerErrorStopsOnlyItsRunner(t *testing.T) {
 		}
 	}
 	waitReconnectCondition(t, func() bool {
-		return fatalRunner.lifecycle.Ready() && healthyRunner.lifecycle.Ready()
+		return fatalRunner.lifecycle.State() == lifecycle.Ready && healthyRunner.lifecycle.State() == lifecycle.Ready
 	})
 
 	cause := &driver.Error{Driver: d.Name(), Op: "consumer", K: driver.KindFatal, Err: errors.New("permission denied")}
@@ -1583,8 +1681,8 @@ func TestFatalConsumerErrorStopsOnlyItsRunner(t *testing.T) {
 	if d.OpenCount() != 1 || client.isReconnecting() {
 		t.Fatalf("fatal runner triggered reconnect: opens=%d reconnecting=%t", d.OpenCount(), client.isReconnecting())
 	}
-	if !healthyRunner.lifecycle.Ready() || !healthyRunner.lifecycle.Live() {
-		t.Fatalf("healthy runner state = %s, ready=%t live=%t", healthyRunner.lifecycle.State(), healthyRunner.lifecycle.Ready(), healthyRunner.lifecycle.Live())
+	if healthyRunner.lifecycle.State() != lifecycle.Ready {
+		t.Fatalf("healthy runner state = %s, want ready", healthyRunner.lifecycle.State())
 	}
 	if !consumers["healthy"].send(validReconnectMessage(t, "healthy-after-fatal")) {
 		t.Fatal("healthy consumer rejected a message after sibling failure")
@@ -1626,7 +1724,7 @@ func TestFatalConsumerErrorSkipsConcurrentReconnect(t *testing.T) {
 		runner.mu.Lock()
 		machine := runner.lifecycle
 		runner.mu.Unlock()
-		return machine != nil && machine.Ready()
+		return machine != nil && machine.State() == lifecycle.Ready
 	})
 	attempt := &reconnectAttempt{done: make(chan struct{})}
 	client.mu.Lock()
@@ -1722,7 +1820,7 @@ func TestDrainGivesInFlightHandlerItsGraceBudget(t *testing.T) {
 	runDone := make(chan error, 1)
 	go func() { runDone <- runner.Run(context.Background()) }()
 	consumer := <-d.created
-	waitReconnectCondition(t, func() bool { return runner.lifecycle.Ready() })
+	waitReconnectCondition(t, func() bool { return runner.lifecycle.State() == lifecycle.Ready })
 	if !consumer.send(validReconnectMessage(t, "drain-grace-in-flight")) {
 		t.Fatal("consumer rejected the in-flight message")
 	}
@@ -1812,7 +1910,7 @@ func TestDrainCancelsInFlightHandlerIntoRetryLane(t *testing.T) {
 		runner.mu.Lock()
 		machine := runner.lifecycle
 		runner.mu.Unlock()
-		return machine != nil && machine.Ready()
+		return machine != nil && machine.State() == lifecycle.Ready
 	})
 	settler := &graceContextSettler{}
 	consumer.messages <- retryBridgeMessage(t, Envelope{
@@ -1876,13 +1974,13 @@ func TestRunnerRepairsConsumerAndResumesDelivery(t *testing.T) {
 	runDone := make(chan error, 1)
 	go func() { runDone <- runner.Run(context.Background()) }()
 	first := <-d.created
-	waitReconnectCondition(t, func() bool { return runner.lifecycle.Ready() })
+	waitReconnectCondition(t, func() bool { return runner.lifecycle.State() == lifecycle.Ready })
 	first.sendError(&driver.Error{Driver: d.Name(), Op: "consumer", K: driver.KindTransient, Err: errors.New("transient")})
 	second := <-d.created
 	if first == second {
 		t.Fatal("repair reused the old consumer")
 	}
-	waitReconnectCondition(t, func() bool { return runner.lifecycle.Ready() })
+	waitReconnectCondition(t, func() bool { return runner.lifecycle.State() == lifecycle.Ready })
 	if client.isReconnecting() {
 		t.Fatal("lane repair entered client reconnecting state")
 	}
@@ -1893,8 +1991,8 @@ func TestRunnerRepairsConsumerAndResumesDelivery(t *testing.T) {
 	if publishErr != nil {
 		t.Fatalf("publish during lane repair = %v", publishErr)
 	}
-	if !runner.lifecycle.Ready() || !runner.lifecycle.Live() {
-		t.Fatalf("runner probes during lane repair = ready %t live %t", runner.lifecycle.Ready(), runner.lifecycle.Live())
+	if runner.lifecycle.State() != lifecycle.Ready {
+		t.Fatalf("runner state during lane repair = %s, want ready", runner.lifecycle.State())
 	}
 	if d.OpenCount() != 1 {
 		t.Fatalf("driver Open count = %d, want 1", d.OpenCount())
@@ -1993,7 +2091,7 @@ func TestSupervisorReconnectKeepsAbandonedSiblingRunning(t *testing.T) {
 		}
 	}
 	waitReconnectCondition(t, func() bool {
-		return causingRunner.lifecycle.Ready() && victimRunner.lifecycle.Ready()
+		return causingRunner.lifecycle.State() == lifecycle.Ready && victimRunner.lifecycle.State() == lifecycle.Ready
 	})
 	if err := client.Health(context.Background()); err != nil {
 		t.Fatalf("Health before supervisor reconnect = %v, want nil", err)
@@ -2228,7 +2326,7 @@ func TestSupervisorReconnectPreservesNewestAbandonedOwner(t *testing.T) {
 		}
 	}
 	waitReconnectCondition(t, func() bool {
-		return causingRunner.lifecycle.Ready() && victimRunner.lifecycle.Ready()
+		return causingRunner.lifecycle.State() == lifecycle.Ready && victimRunner.lifecycle.State() == lifecycle.Ready
 	})
 
 	causeB := errors.New("first supervisor reconnect")
@@ -2425,7 +2523,7 @@ func TestRunnerPreservesOwnerThroughConsumerOpenCancellation(t *testing.T) {
 		}
 	}
 	waitReconnectCondition(t, func() bool {
-		return causingRunner.lifecycle.Ready() && victimRunner.lifecycle.Ready()
+		return causingRunner.lifecycle.State() == lifecycle.Ready && victimRunner.lifecycle.State() == lifecycle.Ready
 	})
 
 	initial["victim"].sendError(&driver.Error{
@@ -2540,6 +2638,203 @@ func TestRunnerPreservesOwnerThroughConsumerOpenCancellation(t *testing.T) {
 	stopService()
 }
 
+// TestRunnerStartedDuringReconnectOpensOnTheReplacementConnection proves that a
+// runner which starts while a reconnect is in progress opens its consumer on
+// the connection the reconnect leaves live, instead of on the connection that
+// reconnect is about to retire.
+func TestRunnerStartedDuringReconnectOpensOnTheReplacementConnection(t *testing.T) {
+	fake := clock.NewFake(time.Unix(400, 0))
+	recorded := &recordingClock{Fake: fake, sleepStarted: make(chan chan struct{}, 4)}
+	d := &reconnectTestDriver{created: make(chan *reconnectTestConsumer, 4)}
+	client := newReconnectTestClient(t, d, recorded, 0)
+	client.reconnectRandom = func() float64 { return 0 }
+
+	if _, err := client.requestReconnect(errors.New("supervisor reconnect")); err != nil {
+		t.Fatalf("requestReconnect = %v, want nil", err)
+	}
+	select {
+	case token := <-recorded.sleepStarted:
+		<-token
+	case <-clock.NewReal().Timer(2 * time.Second).C:
+		t.Fatal("supervisor reconnect sleep did not start")
+	}
+	// The supervisor is parked in its backoff. It has abandoned the runners it
+	// knew about and has not opened the replacement, so c.conn is still the
+	// connection it is going to retire.
+
+	runner, err := client.Subscribe(context.Background(), Subscription{
+		Name:           "orders",
+		Topics:         []string{"orders.created"},
+		Prefetch:       12,
+		HandlerTimeout: 10 * time.Millisecond,
+		Handlers: map[string]Handler{
+			"orders.created": HandlerFunc(func(context.Context, *Event) error { return nil }),
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	runCtx, cancelRun := context.WithCancel(context.Background())
+	t.Cleanup(cancelRun)
+	runDone := make(chan error, 1)
+	waiting := make(chan struct{}, 1)
+	runner.reconnectWaitHook = func() {
+		select {
+		case waiting <- struct{}{}:
+		default:
+		}
+	}
+	go func() { runDone <- runner.Run(runCtx) }()
+
+	select {
+	case <-waiting:
+		fake.Advance(0)
+		waitReconnectCondition(t, func() bool { return !client.isReconnecting() })
+	case consumer := <-d.created:
+		t.Fatalf("runner consumer connection = %p, opened while the reconnect was in progress, want the replacement connection", consumer.conn)
+	case <-clock.NewReal().Timer(2 * time.Second).C:
+		t.Fatal("runner neither waited for the reconnect nor opened a consumer")
+	}
+
+	d.mu.Lock()
+	connections := append([]*reconnectTestConn(nil), d.connections...)
+	d.mu.Unlock()
+	if len(connections) != 2 {
+		t.Fatalf("driver connections after the reconnect = %d, want 2", len(connections))
+	}
+	oldConn, replacement := connections[0], connections[1]
+
+	var consumer *reconnectTestConsumer
+	select {
+	case consumer = <-d.created:
+	case <-clock.NewReal().Timer(2 * time.Second).C:
+		t.Fatal("runner opened no consumer")
+	}
+	if consumer.conn != replacement {
+		t.Fatalf("runner consumer connection = %p, want the replacement connection %p", consumer.conn, replacement)
+	}
+	if got := oldConn.openAtClose.Load(); got != 0 {
+		t.Fatalf("consumers open when the retired connection closed = %d, want 0", got)
+	}
+	select {
+	case err := <-runDone:
+		t.Fatalf("runner Run returned during the reconnect: %v", err)
+	default:
+	}
+}
+
+// TestConsumerOpenedAsAReconnectBeginsIsReleased proves that a consumer whose
+// open straddles the start of a reconnect is released rather than adopted: the
+// reconnect's abandon ran before that consumer existed, so nothing else would
+// ever close it, and the connection it was opened on would be retired with a
+// consumer still on it.
+func TestConsumerOpenedAsAReconnectBeginsIsReleased(t *testing.T) {
+	fake := clock.NewFake(time.Unix(400, 0))
+	recorded := &recordingClock{Fake: fake, sleepStarted: make(chan chan struct{}, 4)}
+	d := &reconnectTestDriver{created: make(chan *reconnectTestConsumer, 4)}
+	client := newReconnectTestClient(t, d, recorded, 0)
+	client.reconnectRandom = func() float64 { return 0 }
+
+	runner, err := client.Subscribe(context.Background(), Subscription{
+		Name:           "orders",
+		Topics:         []string{"orders.created"},
+		Prefetch:       12,
+		HandlerTimeout: 10 * time.Millisecond,
+		Handlers: map[string]Handler{
+			"orders.created": HandlerFunc(func(context.Context, *Event) error { return nil }),
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	runCtx, cancelRun := context.WithCancel(context.Background())
+	t.Cleanup(cancelRun)
+	runDone := make(chan error, 1)
+	go func() { runDone <- runner.Run(runCtx) }()
+
+	failing := <-d.created
+	d.mu.Lock()
+	retiring := d.connections[0]
+	d.mu.Unlock()
+	waitReconnectCondition(t, func() bool { return runner.lifecycle.State() == lifecycle.Ready })
+
+	// The next open is the one that straddles the reconnect: it asks for a
+	// reconnect and waits until the supervisor has abandoned the runners (the
+	// backoff it parks in is after the abandon), so its consumer is created
+	// after that abandon and lands on the connection now being retired.
+	var gateOnce sync.Once
+	var gateFailed atomic.Bool
+	d.mu.Lock()
+	d.consumerOpenHook = func(context.Context, string) error {
+		gateOnce.Do(func() {
+			if _, err := client.requestReconnect(errors.New("consumer open requested reconnect")); err != nil {
+				gateFailed.Store(true)
+				return
+			}
+			select {
+			case token := <-recorded.sleepStarted:
+				<-token
+			case <-clock.NewReal().Timer(time.Second).C:
+				gateFailed.Store(true)
+			}
+		})
+		return nil
+	}
+	d.mu.Unlock()
+
+	failing.sendError(&driver.Error{Driver: d.Name(), Op: "consumer", K: driver.KindTransient, Err: errors.New("consumer disconnected")})
+	var replacement *reconnectTestConsumer
+	select {
+	case replacement = <-d.created:
+	case <-clock.NewReal().Timer(2 * time.Second).C:
+		t.Fatal("runner opened no replacement consumer")
+	}
+	if replacement.conn != retiring {
+		t.Fatalf("replacement consumer connection = %p, want the retiring connection %p", replacement.conn, retiring)
+	}
+
+	// The runner either releases the consumer it opened here or adopts it as
+	// its generation's consumer. Waiting for that decision makes the count the
+	// retiring connection records the runner's decision, not the order two
+	// goroutines reached the connection in.
+	waitReconnectCondition(t, func() bool {
+		if retiring.openConsumers.Load() == 0 {
+			return true
+		}
+		runner.mu.Lock()
+		defer runner.mu.Unlock()
+		return runner.consumer == replacement
+	})
+
+	fake.Advance(0)
+	waitReconnectCondition(t, func() bool { return !client.isReconnecting() })
+
+	if got := retiring.openAtClose.Load(); got != 0 {
+		t.Fatalf("consumers open when the retired connection closed = %d, want 0", got)
+	}
+	d.mu.Lock()
+	connections := append([]*reconnectTestConn(nil), d.connections...)
+	d.mu.Unlock()
+	if len(connections) != 2 {
+		t.Fatalf("driver connections after the reconnect = %d, want 2", len(connections))
+	}
+	liveOn := connections[1]
+	waitReconnectCondition(t, func() bool {
+		runner.mu.Lock()
+		defer runner.mu.Unlock()
+		consumer, ok := runner.consumer.(*reconnectTestConsumer)
+		return ok && consumer.conn == liveOn
+	})
+	if gateFailed.Load() {
+		t.Fatal("consumer open gate did not reach the running abandon")
+	}
+	select {
+	case err := <-runDone:
+		t.Fatalf("runner Run returned during the reconnect: %v", err)
+	default:
+	}
+}
+
 // TestAbandonForReconnectPreservesRunnerOwnCause proves that a runner which
 // already recorded its own driver error before a client-wide reconnect began
 // keeps that error through supervisor abandonment, instead of having it
@@ -2600,7 +2895,7 @@ func TestAbandonForReconnectPreservesRunnerOwnCause(t *testing.T) {
 		}
 	}
 	waitReconnectCondition(t, func() bool {
-		return causingRunner.lifecycle.Ready() && victimRunner.lifecycle.Ready()
+		return causingRunner.lifecycle.State() == lifecycle.Ready && victimRunner.lifecycle.State() == lifecycle.Ready
 	})
 
 	// The victim runner records its own driver error, the same way
@@ -2716,7 +3011,7 @@ func TestAbandonForReconnectPreservesRunnerOwnCause(t *testing.T) {
 	waitReconnectCondition(t, func() bool {
 		serviceMu.Lock()
 		defer serviceMu.Unlock()
-		settled := causingRunner.lifecycle.Ready() && victimRunner.lifecycle.Ready() && !client.isReconnecting()
+		settled := causingRunner.lifecycle.State() == lifecycle.Ready && victimRunner.lifecycle.State() == lifecycle.Ready && !client.isReconnecting()
 		if settled {
 			stopServing()
 		}
@@ -2938,7 +3233,7 @@ func TestFiniteReconnectBudgetDrainsRunnerAndReturnsFatal(t *testing.T) {
 	runDone := make(chan error, 1)
 	go func() { runDone <- runner.Run(context.Background()) }()
 	first := <-d.created
-	waitReconnectCondition(t, func() bool { return runner.lifecycle.Ready() })
+	waitReconnectCondition(t, func() bool { return runner.lifecycle.State() == lifecycle.Ready })
 	d.setFailConsumers(1)
 	d.setFailOpens(1)
 	first.sendError(&driver.Error{Driver: d.Name(), Op: "consumer", K: driver.KindTransient, Err: errors.New("transient")})
@@ -3005,4 +3300,630 @@ func TestReconnectPolicyUsesFullJitter(t *testing.T) {
 			t.Fatalf("FullJitter(%s,%v) = %s, want %s", test.nominal, test.sample, got, test.want)
 		}
 	}
+}
+
+// --- Which stopped subscriptions reach Client.Health ---
+
+func TestSuccessorPublishFailureRecordsTheStoppedSubscription(t *testing.T) {
+	d := &reconnectTestDriver{created: make(chan *reconnectTestConsumer, 8)}
+	client := newReconnectTestClient(t, d, nil, 0)
+	runner, err := client.Subscribe(context.Background(), Subscription{
+		Name:           "orders",
+		Topics:         []string{"orders.created"},
+		Prefetch:       12,
+		Retry:          RetryConfig{MaxAttempts: 1},
+		HandlerTimeout: 10 * time.Millisecond,
+		Handlers: map[string]Handler{
+			"orders.created": HandlerFunc(func(context.Context, *Event) error {
+				return errors.New("handler failed")
+			}),
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	publishErr := errors.New("dead-letter publish failed")
+	d.setPublishError(publishErr)
+	runCtx, cancelRun := context.WithCancel(context.Background())
+	t.Cleanup(cancelRun)
+	runDone := make(chan error, 1)
+	go func() { runDone <- runner.Run(runCtx) }()
+	consumer := <-d.created
+	waitReconnectCondition(t, func() bool { return runner.lifecycle.State() == lifecycle.Ready })
+	if !consumer.send(validReconnectMessage(t, "successor-publish-failure")) {
+		t.Fatal("consumer rejected the message")
+	}
+	var runErr error
+	select {
+	case runErr = <-runDone:
+	case <-clock.NewReal().Timer(3 * time.Second).C:
+		t.Fatal("runner did not stop after its successor publish failed")
+	}
+	if !errors.Is(runErr, publishErr) {
+		t.Fatalf("Run() = %v, want the successor publish failure %v", runErr, publishErr)
+	}
+	healthErr := client.Health(context.Background())
+	if !errors.Is(healthErr, publishErr) {
+		t.Fatalf("Health() = %v, want the successor publish failure %v", healthErr, publishErr)
+	}
+	if !strings.Contains(healthErr.Error(), "subscription orders failed") {
+		t.Fatalf("Health() = %v, want the orders subscription named", healthErr)
+	}
+}
+
+func TestFatalReconnectFailureRecordsTheStoppedSubscription(t *testing.T) {
+	d := &reconnectTestDriver{created: make(chan *reconnectTestConsumer, 8)}
+	client := newReconnectTestClient(t, d, nil, 0)
+	client.reconnectRandom = func() float64 { return 0 }
+	runner, err := client.Subscribe(context.Background(), Subscription{
+		Name:           "orders",
+		Topics:         []string{"orders.created"},
+		Prefetch:       12,
+		HandlerTimeout: 10 * time.Millisecond,
+		Handlers: map[string]Handler{
+			"orders.created": HandlerFunc(func(context.Context, *Event) error { return nil }),
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	runCtx, cancelRun := context.WithCancel(context.Background())
+	t.Cleanup(cancelRun)
+	runDone := make(chan error, 1)
+	go func() { runDone <- runner.Run(runCtx) }()
+	<-d.created
+	waitReconnectCondition(t, func() bool { return runner.lifecycle.State() == lifecycle.Ready })
+
+	openErr := &driver.Error{Driver: d.Name(), Op: "open", K: driver.KindFatal, Err: errors.New("credentials rejected")}
+	d.setFailOpensWithError(1, openErr)
+	if _, err := client.requestReconnect(errors.New("connection lost")); err != nil {
+		t.Fatal(err)
+	}
+	var runErr error
+	select {
+	case runErr = <-runDone:
+	case <-clock.NewReal().Timer(3 * time.Second).C:
+		t.Fatal("runner did not stop after a fatal reconnect failure")
+	}
+	if !errors.Is(runErr, openErr) {
+		t.Fatalf("Run() = %v, want the fatal reconnect failure %v", runErr, openErr)
+	}
+	healthErr := client.Health(context.Background())
+	if !errors.Is(healthErr, openErr) {
+		t.Fatalf("Health() = %v, want the fatal reconnect failure %v", healthErr, openErr)
+	}
+	if !strings.Contains(healthErr.Error(), "subscription orders failed") {
+		t.Fatalf("Health() = %v, want the orders subscription named", healthErr)
+	}
+}
+
+func TestReconnectReleaseFailureStillAbandonsEverySubscription(t *testing.T) {
+	var sink logSink
+	d := &reconnectTestDriver{created: make(chan *reconnectTestConsumer, 8)}
+	client := newReconnectTestClientWithLogger(t, d, nil, 0, slog.New(slog.NewTextHandler(&sink, nil)))
+	client.reconnectRandom = func() float64 { return 0 }
+	subscribe := func(name string, handled *atomic.Int32) *Runner {
+		t.Helper()
+		runner, err := client.Subscribe(context.Background(), Subscription{
+			Name:           name,
+			Topics:         []string{"orders.created"},
+			Prefetch:       12,
+			HandlerTimeout: 10 * time.Millisecond,
+			Handlers: map[string]Handler{
+				"orders.created": HandlerFunc(func(context.Context, *Event) error {
+					handled.Add(1)
+					return nil
+				}),
+			},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return runner
+	}
+	var alphaHandled, betaHandled atomic.Int32
+	alpha := subscribe("alpha", &alphaHandled)
+	beta := subscribe("beta", &betaHandled)
+	alphaCtx, cancelAlpha := context.WithCancel(context.Background())
+	betaCtx, cancelBeta := context.WithCancel(context.Background())
+	t.Cleanup(func() {
+		cancelAlpha()
+		cancelBeta()
+	})
+	alphaDone := make(chan error, 1)
+	betaDone := make(chan error, 1)
+	go func() { alphaDone <- alpha.Run(alphaCtx) }()
+	go func() { betaDone <- beta.Run(betaCtx) }()
+
+	initial := make(map[string]*reconnectTestConsumer, 2)
+	initialTimer := clock.NewReal().Timer(2 * time.Second)
+	defer initialTimer.Stop()
+	for len(initial) < 2 {
+		select {
+		case consumer := <-d.created:
+			initial[consumer.group] = consumer
+		case <-initialTimer.C:
+			t.Fatal("timed out waiting for both initial consumers")
+		}
+	}
+	waitReconnectCondition(t, func() bool {
+		return alpha.lifecycle.State() == lifecycle.Ready && beta.lifecycle.State() == lifecycle.Ready
+	})
+
+	releaseErr := errors.New("release failed")
+	initial["alpha"].setFailRelease(1, releaseErr)
+	if _, err := client.requestReconnect(errors.New("connection lost")); err != nil {
+		t.Fatal(err)
+	}
+
+	rebuilt := make(map[string]*reconnectTestConsumer, 2)
+	rebuiltTimer := clock.NewReal().Timer(2 * time.Second)
+	defer rebuiltTimer.Stop()
+	for len(rebuilt) < 2 {
+		select {
+		case consumer := <-d.created:
+			rebuilt[consumer.group] = consumer
+		case <-rebuiltTimer.C:
+			t.Fatal("timed out waiting for both rebuilt consumers")
+		}
+	}
+	waitReconnectCondition(t, func() bool {
+		return alpha.lifecycle.State() == lifecycle.Ready && beta.lifecycle.State() == lifecycle.Ready
+	})
+	if !rebuilt["alpha"].send(validReconnectMessage(t, "alpha-after-abandon")) {
+		t.Fatal("rebuilt alpha consumer rejected a message")
+	}
+	if !rebuilt["beta"].send(validReconnectMessage(t, "beta-after-abandon")) {
+		t.Fatal("rebuilt beta consumer rejected a message")
+	}
+	waitReconnectCondition(t, func() bool {
+		return alphaHandled.Load() == 1 && betaHandled.Load() == 1
+	})
+	select {
+	case err := <-alphaDone:
+		t.Fatalf("alpha Run returned during the reconnect: %v", err)
+	default:
+	}
+	select {
+	case err := <-betaDone:
+		t.Fatalf("beta Run returned during the reconnect: %v", err)
+	default:
+	}
+	if err := client.Health(context.Background()); err != nil {
+		t.Fatalf("Health after the reconnect = %v, want nil", err)
+	}
+	output := sink.String()
+	if !strings.Contains(output, "level=WARN") || !strings.Contains(output, "subscription=alpha") || !strings.Contains(output, releaseErr.Error()) {
+		t.Fatalf("reconnect log = %q, want a warning naming alpha and %v", output, releaseErr)
+	}
+}
+
+func TestRecordedSubscriptionFailureClearsOnlyOnAFreshStart(t *testing.T) {
+	d := &reconnectTestDriver{created: make(chan *reconnectTestConsumer, 8)}
+	client := newReconnectTestClient(t, d, nil, 0)
+	client.reconnectRandom = func() float64 { return 0 }
+	subscribe := func() *Runner {
+		t.Helper()
+		runner, err := client.Subscribe(context.Background(), Subscription{
+			Name:           "orders",
+			Topics:         []string{"orders.created"},
+			Prefetch:       12,
+			HandlerTimeout: 10 * time.Millisecond,
+			Handlers: map[string]Handler{
+				"orders.created": HandlerFunc(func(context.Context, *Event) error { return nil }),
+			},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return runner
+	}
+	start := func(runner *Runner) (context.CancelFunc, <-chan error) {
+		t.Helper()
+		runCtx, cancelRun := context.WithCancel(context.Background())
+		t.Cleanup(cancelRun)
+		runDone := make(chan error, 1)
+		go func() { runDone <- runner.Run(runCtx) }()
+		return cancelRun, runDone
+	}
+
+	_, firstDone := start(subscribe())
+	firstConsumer := <-d.created
+	firstFatal := &driver.Error{Driver: d.Name(), Op: "consumer", K: driver.KindFatal, Err: errors.New("permission denied")}
+	firstConsumer.sendError(firstFatal)
+	select {
+	case err := <-firstDone:
+		if !errors.Is(err, firstFatal) {
+			t.Fatalf("first Run() = %v, want the fatal consumer error %v", err, firstFatal)
+		}
+	case <-clock.NewReal().Timer(2 * time.Second).C:
+		t.Fatal("first runner did not stop after a fatal consumer error")
+	}
+	healthErr := client.Health(context.Background())
+	if !errors.Is(healthErr, firstFatal) || !strings.Contains(healthErr.Error(), "subscription orders failed") {
+		t.Fatalf("Health after a fatal consumer error = %v, want the orders failure", healthErr)
+	}
+
+	second := subscribe()
+	_, _ = start(second)
+	<-d.created
+	waitReconnectCondition(t, func() bool { return second.lifecycle.State() == lifecycle.Ready })
+	if err := client.Health(context.Background()); err != nil {
+		t.Fatalf("Health after the name reached ready again = %v, want nil", err)
+	}
+
+	third := subscribe()
+	_, thirdDone := start(third)
+	thirdConsumer := <-d.created
+	waitReconnectCondition(t, func() bool { return third.lifecycle.State() == lifecycle.Ready })
+	thirdFatal := &driver.Error{Driver: d.Name(), Op: "consumer", K: driver.KindFatal, Err: errors.New("quota exceeded")}
+	thirdConsumer.sendError(thirdFatal)
+	select {
+	case err := <-thirdDone:
+		if !errors.Is(err, thirdFatal) {
+			t.Fatalf("third Run() = %v, want the fatal consumer error %v", err, thirdFatal)
+		}
+	case <-clock.NewReal().Timer(2 * time.Second).C:
+		t.Fatal("third runner did not stop after a fatal consumer error")
+	}
+	if _, err := client.requestReconnect(errors.New("connection lost")); err != nil {
+		t.Fatal(err)
+	}
+	waitReconnectCondition(t, func() bool {
+		return d.OpenCount() == 2 && second.lifecycle.State() == lifecycle.Ready && !client.isReconnecting()
+	})
+	healthErr = client.Health(context.Background())
+	if !errors.Is(healthErr, thirdFatal) {
+		t.Fatalf("Health after a live runner reconnected = %v, want the recorded %v", healthErr, thirdFatal)
+	}
+}
+
+func TestRecordedSubscriptionFailureIsOneEntryPerName(t *testing.T) {
+	d := &reconnectTestDriver{created: make(chan *reconnectTestConsumer, 8)}
+	client := newReconnectTestClient(t, d, nil, 0)
+	first := subscribeOrders(t, client)
+	second := subscribeOrders(t, client)
+	firstCtx, cancelFirst := context.WithCancel(context.Background())
+	secondCtx, cancelSecond := context.WithCancel(context.Background())
+	t.Cleanup(func() {
+		cancelFirst()
+		cancelSecond()
+	})
+	firstDone := make(chan error, 1)
+	secondDone := make(chan error, 1)
+	go func() { firstDone <- first.Run(firstCtx) }()
+	go func() { secondDone <- second.Run(secondCtx) }()
+
+	consumers := make([]*reconnectTestConsumer, 0, 2)
+	consumersTimer := clock.NewReal().Timer(2 * time.Second)
+	defer consumersTimer.Stop()
+	for len(consumers) < 2 {
+		select {
+		case consumer := <-d.created:
+			consumers = append(consumers, consumer)
+		case <-consumersTimer.C:
+			t.Fatal("timed out waiting for both consumers of the shared subscription name")
+		}
+	}
+	waitReconnectCondition(t, func() bool {
+		return first.lifecycle.State() == lifecycle.Ready && second.lifecycle.State() == lifecycle.Ready
+	})
+
+	// Two runners carry one subscription name and each stops on its own fatal
+	// consumer error, so the name is recorded twice unless a record replaces
+	// the entry the name already has.
+	firstFatal := &driver.Error{Driver: d.Name(), Op: "consumer", K: driver.KindFatal, Err: errors.New("permission denied")}
+	secondFatal := &driver.Error{Driver: d.Name(), Op: "consumer", K: driver.KindFatal, Err: errors.New("quota exceeded")}
+	consumers[0].sendError(firstFatal)
+	consumers[1].sendError(secondFatal)
+	for name, done := range map[string]<-chan error{"first": firstDone, "second": secondDone} {
+		select {
+		case err := <-done:
+			if err == nil {
+				t.Fatalf("%s Run() = nil, want a fatal consumer error", name)
+			}
+		case <-clock.NewReal().Timer(2 * time.Second).C:
+			t.Fatalf("%s runner did not stop after a fatal consumer error", name)
+		}
+	}
+	healthErr := client.Health(context.Background())
+	if !errors.Is(healthErr, firstFatal) && !errors.Is(healthErr, secondFatal) {
+		t.Fatalf("Health() = %v, want one of the two fatal consumer errors", healthErr)
+	}
+	if got := strings.Count(healthErr.Error(), "f1: subscription orders failed"); got != 1 {
+		t.Fatalf("Health() reports the orders failure %d times, want 1: %v", got, healthErr)
+	}
+}
+
+func TestCancelledDrainedAndRefusedRunsDoNotRecordFailures(t *testing.T) {
+	t.Run("caller cancel", func(t *testing.T) {
+		openEntered := make(chan struct{})
+		d := &reconnectTestDriver{created: make(chan *reconnectTestConsumer, 8)}
+		d.consumerOpenHook = func(ctx context.Context, _ string) error {
+			close(openEntered)
+			<-ctx.Done()
+			return context.Canceled
+		}
+		client := newReconnectTestClient(t, d, nil, 0)
+		runner, err := client.Subscribe(context.Background(), Subscription{
+			Name:           "orders",
+			Topics:         []string{"orders.created"},
+			Prefetch:       12,
+			HandlerTimeout: 10 * time.Millisecond,
+			Handlers: map[string]Handler{
+				"orders.created": HandlerFunc(func(context.Context, *Event) error { return nil }),
+			},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		runCtx, cancelRun := context.WithCancel(context.Background())
+		runDone := make(chan error, 1)
+		go func() { runDone <- runner.Run(runCtx) }()
+		<-openEntered
+		cancelRun()
+		select {
+		case runErr := <-runDone:
+			if runErr == nil {
+				t.Fatal("Run() = nil, want the cancelled consumer open error")
+			}
+		case <-clock.NewReal().Timer(2 * time.Second).C:
+			t.Fatal("runner did not stop after the caller cancelled")
+		}
+		if err := client.Health(context.Background()); err != nil {
+			t.Fatalf("Health after the caller cancelled = %v, want nil", err)
+		}
+		assertNoRecordedFailure(t, client, "orders")
+	})
+
+	t.Run("client close", func(t *testing.T) {
+		openEntered := make(chan struct{})
+		d := &reconnectTestDriver{created: make(chan *reconnectTestConsumer, 8)}
+		d.consumerOpenHook = func(ctx context.Context, _ string) error {
+			close(openEntered)
+			<-ctx.Done()
+			return context.Canceled
+		}
+		client := newReconnectTestClient(t, d, nil, 0)
+		runner, err := client.Subscribe(context.Background(), Subscription{
+			Name:           "orders",
+			Topics:         []string{"orders.created"},
+			Prefetch:       12,
+			HandlerTimeout: 10 * time.Millisecond,
+			Handlers: map[string]Handler{
+				"orders.created": HandlerFunc(func(context.Context, *Event) error { return nil }),
+			},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		runDone := make(chan error, 1)
+		go func() { runDone <- runner.Run(context.Background()) }()
+		<-openEntered
+		if err := client.Close(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		select {
+		case <-runDone:
+		case <-clock.NewReal().Timer(2 * time.Second).C:
+			t.Fatal("runner did not stop after Close")
+		}
+		if err := client.Health(context.Background()); err == nil || !strings.Contains(err.Error(), "closed") {
+			t.Fatalf("Health after Close = %v, want the closed-client error", err)
+		}
+		assertNoRecordedFailure(t, client, "orders")
+	})
+
+	t.Run("second run refused", func(t *testing.T) {
+		d := &reconnectTestDriver{created: make(chan *reconnectTestConsumer, 8)}
+		client := newReconnectTestClient(t, d, nil, 0)
+		runner, err := client.Subscribe(context.Background(), Subscription{
+			Name:           "orders",
+			Topics:         []string{"orders.created"},
+			Prefetch:       12,
+			HandlerTimeout: 10 * time.Millisecond,
+			Handlers: map[string]Handler{
+				"orders.created": HandlerFunc(func(context.Context, *Event) error { return nil }),
+			},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		runCtx, cancelRun := context.WithCancel(context.Background())
+		t.Cleanup(cancelRun)
+		runDone := make(chan error, 1)
+		go func() { runDone <- runner.Run(runCtx) }()
+		<-d.created
+		waitReconnectCondition(t, func() bool { return runner.lifecycle.State() == lifecycle.Ready })
+		if err := runner.Run(context.Background()); err == nil || !strings.Contains(err.Error(), "already running") {
+			t.Fatalf("second Run() = %v, want the already-running refusal", err)
+		}
+		if err := client.Health(context.Background()); err != nil {
+			t.Fatalf("Health after a refused second Run = %v, want nil", err)
+		}
+		assertNoRecordedFailure(t, client, "orders")
+		select {
+		case err := <-runDone:
+			t.Fatalf("first Run returned after a refused second Run: %v", err)
+		default:
+		}
+	})
+}
+
+// assertNoRecordedFailure fails when the client holds a stopped-subscription
+// record for name. Health cannot observe the record once the client is closed,
+// so the test reads the record itself.
+func assertNoRecordedFailure(t *testing.T, client *Client, name string) {
+	t.Helper()
+	client.mu.Lock()
+	defer client.mu.Unlock()
+	for _, failed := range client.failedSubscriptions {
+		if failed.name == name {
+			t.Fatalf("subscription %s is recorded as failed: %v", name, failed.err)
+		}
+	}
+}
+
+// subscribeOrders subscribes a runner named orders with a no-op handler, so a
+// test can hold two runners under one subscription name.
+func subscribeOrders(t *testing.T, client *Client) *Runner {
+	t.Helper()
+	runner, err := client.Subscribe(context.Background(), Subscription{
+		Name:           "orders",
+		Topics:         []string{"orders.created"},
+		Prefetch:       12,
+		HandlerTimeout: 10 * time.Millisecond,
+		Handlers: map[string]Handler{
+			"orders.created": HandlerFunc(func(context.Context, *Event) error { return nil }),
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return runner
+}
+
+// TestLateExitDoesNotRestoreAFailureANewerRunnerCleared holds a failed
+// runner's consumer teardown open while a second runner of the same
+// subscription name starts. The failed runner's exit must not mark that live
+// name failed again, and must not overwrite the failure the newer runner
+// records.
+func TestLateExitDoesNotRestoreAFailureANewerRunnerCleared(t *testing.T) {
+	t.Run("cleared by a newer ready runner", func(t *testing.T) {
+		d := &reconnectTestDriver{created: make(chan *reconnectTestConsumer, 8)}
+		client := newReconnectTestClient(t, d, nil, 0)
+		oldRunner := subscribeOrders(t, client)
+		oldCtx, cancelOld := context.WithCancel(context.Background())
+		t.Cleanup(cancelOld)
+		oldDone := make(chan error, 1)
+		go func() { oldDone <- oldRunner.Run(oldCtx) }()
+		oldConsumer := <-d.created
+
+		entered, release := oldConsumer.holdStop()
+		t.Cleanup(release)
+		waitReconnectCondition(t, func() bool { return oldRunner.lifecycle.State() == lifecycle.Ready })
+
+		fatal := &driver.Error{Driver: d.Name(), Op: "consumer", K: driver.KindFatal, Err: errors.New("permission denied")}
+		oldConsumer.sendError(fatal)
+		waitReconnectCondition(t, func() bool {
+			return errors.Is(client.Health(context.Background()), fatal)
+		})
+		select {
+		case <-entered:
+		case <-clock.NewReal().Timer(2 * time.Second).C:
+			t.Fatal("the failed runner did not reach its consumer teardown")
+		}
+		select {
+		case err := <-oldDone:
+			t.Fatalf("the failed runner returned while its teardown was held: %v", err)
+		default:
+		}
+
+		newRunner := subscribeOrders(t, client)
+		newCtx, cancelNew := context.WithCancel(context.Background())
+		t.Cleanup(cancelNew)
+		newDone := make(chan error, 1)
+		go func() { newDone <- newRunner.Run(newCtx) }()
+		<-d.created
+		waitReconnectCondition(t, func() bool { return newRunner.lifecycle.State() == lifecycle.Ready })
+		select {
+		case err := <-oldDone:
+			t.Fatalf("the failed runner returned before its teardown was released: %v", err)
+		default:
+		}
+		if err := client.Health(context.Background()); err != nil {
+			t.Fatalf("Health after a newer runner of the same name reached ready = %v, want nil", err)
+		}
+
+		release()
+		select {
+		case err := <-oldDone:
+			if !errors.Is(err, fatal) {
+				t.Fatalf("the superseded runner Run() = %v, want %v", err, fatal)
+			}
+		case <-clock.NewReal().Timer(2 * time.Second).C:
+			t.Fatal("the superseded runner did not return after its teardown was released")
+		}
+		if err := client.Health(context.Background()); err != nil {
+			t.Fatalf("Health after the superseded runner exited = %v, want nil", err)
+		}
+	})
+
+	t.Run("replaced by a newer runner's failure", func(t *testing.T) {
+		d := &reconnectTestDriver{created: make(chan *reconnectTestConsumer, 8)}
+		client := newReconnectTestClient(t, d, nil, 0)
+		oldRunner := subscribeOrders(t, client)
+		oldCtx, cancelOld := context.WithCancel(context.Background())
+		t.Cleanup(cancelOld)
+		oldDone := make(chan error, 1)
+		go func() { oldDone <- oldRunner.Run(oldCtx) }()
+		oldConsumer := <-d.created
+
+		entered, release := oldConsumer.holdStop()
+		t.Cleanup(release)
+		waitReconnectCondition(t, func() bool { return oldRunner.lifecycle.State() == lifecycle.Ready })
+
+		fatal := &driver.Error{Driver: d.Name(), Op: "consumer", K: driver.KindFatal, Err: errors.New("permission denied")}
+		oldConsumer.sendError(fatal)
+		waitReconnectCondition(t, func() bool {
+			return errors.Is(client.Health(context.Background()), fatal)
+		})
+		select {
+		case <-entered:
+		case <-clock.NewReal().Timer(2 * time.Second).C:
+			t.Fatal("the failed runner did not reach its consumer teardown")
+		}
+		select {
+		case err := <-oldDone:
+			t.Fatalf("the failed runner returned while its teardown was held: %v", err)
+		default:
+		}
+
+		newRunner := subscribeOrders(t, client)
+		newCtx, cancelNew := context.WithCancel(context.Background())
+		t.Cleanup(cancelNew)
+		newDone := make(chan error, 1)
+		go func() { newDone <- newRunner.Run(newCtx) }()
+		newConsumer := <-d.created
+		waitReconnectCondition(t, func() bool { return newRunner.lifecycle.State() == lifecycle.Ready })
+		select {
+		case err := <-oldDone:
+			t.Fatalf("the failed runner returned before its teardown was released: %v", err)
+		default:
+		}
+		if err := client.Health(context.Background()); err != nil {
+			t.Fatalf("Health after a newer runner of the same name reached ready = %v, want nil", err)
+		}
+
+		newFatal := &driver.Error{Driver: d.Name(), Op: "consumer", K: driver.KindFatal, Err: errors.New("quota exceeded")}
+		newConsumer.sendError(newFatal)
+		select {
+		case err := <-newDone:
+			if !errors.Is(err, newFatal) {
+				t.Fatalf("the newer runner Run() = %v, want %v", err, newFatal)
+			}
+		case <-clock.NewReal().Timer(2 * time.Second).C:
+			t.Fatal("the newer runner did not stop after a fatal consumer error")
+		}
+		if healthErr := client.Health(context.Background()); !errors.Is(healthErr, newFatal) {
+			t.Fatalf("Health after the newer runner failed = %v, want %v", healthErr, newFatal)
+		}
+
+		release()
+		select {
+		case err := <-oldDone:
+			if !errors.Is(err, fatal) {
+				t.Fatalf("the superseded runner Run() = %v, want %v", err, fatal)
+			}
+		case <-clock.NewReal().Timer(2 * time.Second).C:
+			t.Fatal("the superseded runner did not return after its teardown was released")
+		}
+		healthErr := client.Health(context.Background())
+		if !errors.Is(healthErr, newFatal) {
+			t.Fatalf("Health after the superseded runner exited = %v, want the newer failure %v", healthErr, newFatal)
+		}
+		if errors.Is(healthErr, fatal) {
+			t.Fatalf("Health = %v, want no trace of the superseded runner's %v", healthErr, fatal)
+		}
+	})
 }

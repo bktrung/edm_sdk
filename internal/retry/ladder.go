@@ -12,7 +12,6 @@ type Config struct {
 	InitialInterval time.Duration
 	Multiplier      float64
 	MaxInterval     time.Duration
-	Jitter          float64
 	Tiers           []time.Duration
 }
 
@@ -95,12 +94,13 @@ func ResolveTier(c Config, attempt int) int {
 }
 
 // ResolveRetryAfter routes an explicit delay to its nearest nominal tier and
-// clamps it to that tier's jitter band. The bool reports whether clamping was
-// required. A zero-tier ladder returns zero values without panicking.
-func ResolveRetryAfter(c Config, requested time.Duration) (tier int, delay time.Duration, clamped bool) {
+// returns that tier's nominal delay, so a delay a handler asked for still lands
+// on a tier the ladder has a destination for. A zero-tier ladder returns zero
+// values without panicking.
+func ResolveRetryAfter(c Config, requested time.Duration) (tier int, delay time.Duration) {
 	count := c.TierCount()
 	if count == 0 {
-		return 0, 0, false
+		return 0, 0
 	}
 	if requested < 0 {
 		requested = 0
@@ -114,30 +114,7 @@ func ResolveRetryAfter(c Config, requested time.Duration) (tier int, delay time.
 			bestDistance = distance
 		}
 	}
-	nominal := c.DelayFor(tier)
-	low, high := jitterBand(nominal, c.Jitter)
-	delay = requested
-	if delay < low {
-		delay = low
-		clamped = true
-	}
-	if delay > high {
-		delay = high
-		clamped = true
-	}
-	return tier, delay, clamped
-}
-
-func jitterBand(nominal time.Duration, jitter float64) (time.Duration, time.Duration) {
-	if jitter < 0 {
-		jitter = 0
-	}
-	if jitter > 1 {
-		jitter = 1
-	}
-	low := time.Duration(float64(nominal) * (1 - jitter))
-	high := time.Duration(float64(nominal) * (1 + jitter))
-	return low, high
+	return tier, c.DelayFor(tier)
 }
 
 func absDuration(value time.Duration) time.Duration {

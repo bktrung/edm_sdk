@@ -39,21 +39,6 @@ func runPublish(group *groupContext) {
 		group.vector.Add(BehaviorEvent{ID: "zero-value", Outcome: "ok", FinalDestination: "publish.zero"})
 	})
 
-	group.Check("flush is safe after a confirmed publish", func(t *testing.T) {
-		producer := newProducer(t, group, profileDestination(group, "publish.flush"), driver.ProducerConfig{RequireDurableAck: true, Effective: group.effective})
-		if err := producer.Publish(group.ctx, driver.OutboundMessage{Destination: "publish.flush", Body: []byte("flush")}); err != nil {
-			t.Fatalf("Publish() error = %v", err)
-		}
-		before := inspectDestination(t, group, "publish.flush").Ready
-		if err := producer.Flush(group.ctx); err != nil {
-			t.Fatalf("Flush() error = %v", err)
-		}
-		if got := inspectDestination(t, group, "publish.flush").Ready; got != before {
-			t.Fatalf("Ready after Flush = %d, want unchanged at %d", got, before)
-		}
-		group.vector.Add(BehaviorEvent{ID: "flush-safe", Outcome: "ok", FinalDestination: "publish.flush"})
-	})
-
 	group.Check("canceled Producer creation returns transient without a producer", func(t *testing.T) {
 		ctx, cancel := context.WithCancel(group.ctx)
 		cancel()
@@ -71,21 +56,6 @@ func runPublish(group *groupContext) {
 			t.Fatalf("Producer.Close() after cancelled construction = %v", err)
 		}
 		group.vector.Add(BehaviorEvent{ID: "cancel-producer", Outcome: "cancelled", FinalDestination: "producer"})
-	})
-
-	group.Check("cancelled Flush returns transient and leaves the producer usable", func(t *testing.T) {
-		name := "publish.cancel-flush"
-		producer := newProducer(t, group, profileDestination(group, name), driver.ProducerConfig{Effective: group.effective})
-		ctx, cancel := context.WithCancel(group.ctx)
-		cancel()
-		assertCancelled(t, "Flush", producer.Flush(ctx))
-		if err := producer.Publish(group.ctx, driver.OutboundMessage{Destination: name}); err != nil {
-			t.Fatalf("Publish() after cancelled Flush() = %v", err)
-		}
-		if got := inspectDestination(t, group, name).Ready; got != 1 {
-			t.Fatalf("Ready after cancelled Flush = %d, want 1", got)
-		}
-		group.vector.Add(BehaviorEvent{ID: "cancel-flush", Outcome: "cancelled", FinalDestination: name})
 	})
 
 	group.Check("cancelled producer Close returns transient and leaves the producer usable", func(t *testing.T) {

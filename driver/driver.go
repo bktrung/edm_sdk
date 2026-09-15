@@ -84,9 +84,6 @@ type Producer interface {
 	// failed subset. Publish must be safe for concurrent use.
 	Publish(ctx context.Context, msgs ...OutboundMessage) error
 
-	// Flush waits until all buffered messages are acknowledged.
-	Flush(ctx context.Context) error
-
 	// Close releases producer resources.
 	Close(ctx context.Context) error
 }

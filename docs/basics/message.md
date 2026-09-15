@@ -235,7 +235,7 @@ decision:
 | --- | --- |
 | `nil` | Acknowledge the delivery as handled. |
 | Ordinary error | Apply the subscription retry policy. |
-| `f1.RetryAfter(err, delay)` | Retry with an explicit delay for this attempt. |
+| `f1.RetryAfter(err, delay)` | Retry at the ladder tier nearest the requested delay. |
 | `f1.Terminal(err)` | Stop retrying and dead-letter the event. |
 | `f1.Drop(err)` | Acknowledge the event without applying its effect or retaining a copy. |
 

@@ -182,20 +182,6 @@ func failedPublishIndexes(records []*kgo.Record, results kgo.ProduceResults) (ma
 	return failed, nil
 }
 
-func (p *producer) Flush(ctx context.Context) error {
-	if err := ctx.Err(); err != nil {
-		return classify("flush", driver.KindTransient, err)
-	}
-	if err := p.beginOperation("flush"); err != nil {
-		return err
-	}
-	defer p.endOperation()
-	if err := p.client.Flush(ctx); err != nil {
-		return classify("flush", kafkaErrorKind(err), err)
-	}
-	return nil
-}
-
 // defaultKafkaBatchLinger is franz-go's own producer linger default. It is
 // passed explicitly rather than left unset so that the value in force is the
 // driver's, and so a reader can see it without reading the client library.

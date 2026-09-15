@@ -47,7 +47,7 @@ func TestEnsureTopologyIgnoresBindings(t *testing.T) {
 func openTest(t *testing.T, clk clock.Clock, specs ...driver.DestinationSpec) (context.Context, driver.Conn, driver.Producer) {
 	t.Helper()
 	ctx := context.Background()
-	conn, err := Driver{Clock: clk}.Open(ctx, driver.Config{})
+	conn, err := Driver{clock: clk}.Open(ctx, driver.Config{})
 	require.NoError(t, err)
 	_, err = conn.Admin().EnsureTopology(ctx, driver.TopologySpec{Destinations: specs})
 	require.NoError(t, err)

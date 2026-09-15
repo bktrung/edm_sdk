@@ -18,10 +18,6 @@ const (
 	Reconnecting
 	// Draining means new fetches are stopped and accepted work is finishing.
 	Draining
-	// Settling means in-flight deliveries are being settled.
-	Settling
-	// Flushing means successor messages and producers are being flushed.
-	Flushing
 	// Closed means all owned resources have been released.
 	Closed
 	// Aborted means shutdown exceeded a deadline or a fatal shutdown error occurred.
@@ -41,10 +37,6 @@ func (s State) String() string {
 		return "reconnecting"
 	case Draining:
 		return "draining"
-	case Settling:
-		return "settling"
-	case Flushing:
-		return "flushing"
 	case Closed:
 		return "closed"
 	case Aborted:
@@ -89,13 +81,6 @@ func (m *Machine) Transition(next State) error {
 	return nil
 }
 
-// Ready reports whether the machine is ready for traffic.
-func (m *Machine) Ready() bool { return m != nil && m.State() == Ready }
-
-// Live reports whether the process should remain alive. Draining and Failed are
-// live; only Aborted is unhealthy for liveness.
-func (m *Machine) Live() bool { return m != nil && m.State() != Aborted }
-
 func allowed(from, to State) bool {
 	if from == to {
 		return true
@@ -114,10 +99,6 @@ func allowed(from, to State) bool {
 	case Reconnecting:
 		return to == Ready || to == Draining
 	case Draining:
-		return to == Settling
-	case Settling:
-		return to == Flushing
-	case Flushing:
 		return to == Closed
 	default:
 		return false

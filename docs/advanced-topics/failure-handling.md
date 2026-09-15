@@ -19,7 +19,7 @@ Return the outcome that matches the business meaning of the failure:
 | --- | --- |
 | `nil` | Acknowledge the delivery as handled. |
 | An ordinary error | Retry according to the subscription ladder, then dead-letter when the effective attempt limit is reached. |
-| `f1.RetryAfter(err, delay)` | Retry with an explicit delay for this attempt, still subject to the attempt limit. |
+| `f1.RetryAfter(err, delay)` | Retry at the ladder tier nearest the requested delay, still subject to the attempt limit. |
 | `f1.Terminal(err)` | Stop retrying and publish the message to the dead-letter destination. |
 | `f1.Drop(err)` | Acknowledge the delivery without applying its effect or retaining a dead-letter copy. |
 
@@ -80,7 +80,6 @@ runner, err := client.Subscribe(ctx, f1.Subscription{
 		InitialInterval: time.Second,
 		Multiplier:      2,
 		MaxInterval:     time.Minute,
-		Jitter:          0.2,
 	},
 	Handlers: map[string]f1.Handler{
 		"orders.created.v1": f1.HandlerFunc(handleOrder),
@@ -97,10 +96,12 @@ ordinary or `RetryAfter` error becomes `ReasonMaxAttempts` and follows the
 dead-letter path.
 
 When no explicit retry tiers are configured, F1 derives them from
-`InitialInterval`, `Multiplier`, `MaxInterval`, and `Jitter`. Explicit
-`Tiers` can define the delays directly. `RetryAfter` selects the delay for the
-current retry but does not bypass the configured attempt cap. The validation
-and delay calculation live in [`config.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/config.go); keep service
+`InitialInterval`, `Multiplier`, and `MaxInterval`. Explicit `Tiers` can define
+the delays directly. `RetryAfter` replaces the current retry's delay with the
+nominal delay of the tier nearest the requested value, so it rounds a handler's
+request onto the configured ladder instead of parking the event for an
+arbitrary interval, and it does not bypass the configured attempt cap. The
+validation and delay calculation live in [`config.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/config.go); keep service
 policy in configuration rather than implementing a second retry loop in a
 handler or middleware.
 

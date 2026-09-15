@@ -112,7 +112,6 @@ func (*abortTeardownConn) Close(context.Context) error { return nil }
 type abortTeardownProducer struct{}
 
 func (abortTeardownProducer) Publish(context.Context, ...driver.OutboundMessage) error { return nil }
-func (abortTeardownProducer) Flush(context.Context) error                              { return nil }
 func (abortTeardownProducer) Close(context.Context) error                              { return nil }
 
 type abortTeardownAdmin struct{}

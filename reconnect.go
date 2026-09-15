@@ -107,9 +107,7 @@ func (c *Client) waitReconnect(ctx context.Context, attempt *reconnectAttempt) e
 }
 
 func (c *Client) reconnectOnce(ctx context.Context, cause error, attempt *reconnectAttempt) error {
-	if err := c.abandonRunners(ctx, attempt); err != nil {
-		return err
-	}
+	c.abandonRunners(ctx, attempt)
 	if err := c.waitPublishIdle(ctx); err != nil {
 		return err
 	}
@@ -188,7 +186,15 @@ func (c *Client) reconnectSample() float64 {
 	return rand.Float64() //nolint:gosec // jitter needs a fast non-cryptographic sample
 }
 
-func (c *Client) abandonRunners(ctx context.Context, attempt *reconnectAttempt) error {
+// abandonRunners hands every runner to attempt and gives back the deliveries
+// they hold unsettled. A failed Release is logged and the abandon continues:
+// the connection is being replaced because it may be broken, so its teardown
+// calls can fail for the same reason, and every other step that retires that
+// connection is already logged and continued. Aborting instead would strand
+// the runners already cancelled on a client that stays healthy and leave the
+// rest un-abandoned. A consumer left open by its failed Release is the same
+// leak the retiring connection already logs, not a second defect.
+func (c *Client) abandonRunners(ctx context.Context, attempt *reconnectAttempt) {
 	c.mu.Lock()
 	runners := make([]*Runner, 0, len(c.runners))
 	for runner := range c.runners {
@@ -197,10 +203,9 @@ func (c *Client) abandonRunners(ctx context.Context, attempt *reconnectAttempt) 
 	c.mu.Unlock()
 	for _, runner := range runners {
 		if err := runner.abandonForReconnect(ctx, attempt); err != nil {
-			return err
+			lastResortClientLogger(c).Warn("f1 subscription release failed during reconnect", "subscription", runner.subscription.Name, "error", err)
 		}
 	}
-	return nil
 }
 
 func (c *Client) waitPublishIdle(ctx context.Context) error {
@@ -282,19 +287,52 @@ func (r *Runner) transitionToReconnecting() {
 	}
 }
 
+// drainAfterRun releases a runner at the end of Run: it waits for in-flight
+// deliveries to leave the registry within DrainTimeout and then releases the
+// consumer within CloseTimeout.
+//
+// The release runs even when the wait fails. A consumer left open past the
+// wait keeps redelivering work that nothing is settling, so the failure path
+// releases on a context detached from the settlement context: the wait ended
+// because that context was cancelled or its deadline passed, and the release
+// must not inherit the cancellation that ended the wait and return at once.
 func (r *Runner) drainAfterRun(runCtx context.Context) error {
 	shutdownCtx := runnerSettlementContext(r, runCtx)
-	return r.lifecycle.Drain(shutdownCtx, lifecycle.Config{
-		Clock:        r.client.options.clock,
-		DrainTimeout: r.client.config.Lifecycle.DrainTimeout,
-		FlushTimeout: r.client.config.Lifecycle.FlushTimeout,
-		CloseTimeout: r.client.config.Lifecycle.CloseTimeout,
-	}, lifecycle.Hooks{
-		WaitSettled: func(ctx context.Context) error {
-			return r.inflight.WaitZero(ctx)
-		},
-		Close: func(ctx context.Context) error {
-			return stopRunnerConsumer(r, ctx)
-		},
-	})
+	machine := r.lifecycle
+	if machine != nil {
+		switch machine.State() {
+		case lifecycle.Ready, lifecycle.Reconnecting:
+			if err := machine.Transition(lifecycle.Draining); err != nil {
+				return err
+			}
+		case lifecycle.Draining, lifecycle.Failed:
+		default:
+			return fmt.Errorf("f1: runner cannot drain from lifecycle state %s", machine.State())
+		}
+	}
+	phaseClock := r.client.options.clock
+	drainTimeout := r.client.config.Lifecycle.DrainTimeout
+	closeTimeout := r.client.config.Lifecycle.CloseTimeout
+	release := func(ctx context.Context) error { return stopRunnerConsumer(r, ctx) }
+	if waitErr := runWithClockTimeout(shutdownCtx, phaseClock, drainTimeout, "drain", r.inflight.WaitZero); waitErr != nil {
+		releaseErr := runWithClockTimeout(context.WithoutCancel(shutdownCtx), phaseClock, closeTimeout, "close", release)
+		if machine != nil {
+			if err := machine.Transition(lifecycle.Aborted); err != nil {
+				return errors.Join(waitErr, releaseErr, err)
+			}
+		}
+		return errors.Join(waitErr, releaseErr)
+	}
+	if releaseErr := runWithClockTimeout(shutdownCtx, phaseClock, closeTimeout, "close", release); releaseErr != nil {
+		if machine != nil {
+			if err := machine.Transition(lifecycle.Aborted); err != nil {
+				return errors.Join(releaseErr, err)
+			}
+		}
+		return releaseErr
+	}
+	if machine == nil || machine.State() == lifecycle.Failed {
+		return nil
+	}
+	return machine.Transition(lifecycle.Closed)
 }

@@ -20,7 +20,6 @@ type consumer struct {
 	paused                  map[string]bool
 	draining                bool
 	stopped                 bool
-	group                   *groupState
 	startAfter              map[string]uint64
 	outstanding             int
 	unsettled               map[string]int
@@ -226,8 +225,9 @@ func (s *settler) settle(ctx context.Context, opt driver.NackOptions, nack bool)
 			s.consumer.unsettledKey[deliveryKey]--
 		} else {
 			delete(s.consumer.unsettledKey, deliveryKey)
-			if dest, ok := s.conn.destinations[name]; ok && dest.affinity[key] == s.consumer {
-				delete(dest.affinity, key)
+			affinity := affinityKey{group: s.consumer.cfg.Group, key: key}
+			if dest, ok := s.conn.destinations[name]; ok && dest.affinity[affinity] == s.consumer {
+				delete(dest.affinity, affinity)
 			}
 		}
 	}
@@ -238,12 +238,7 @@ func (s *settler) settle(ctx context.Context, opt driver.NackOptions, nack bool)
 			delete(s.message.deliveredGroups, s.consumer.cfg.Group)
 		}
 		if dest, ok := s.conn.destinations[s.message.message.Destination]; ok {
-			dest.messages = append([]*queuedMessage{s.message}, dest.messages...)
-		}
-	}
-	if s.consumer.group != nil && (!nack || !opt.Requeue) {
-		if s.message.sequence > s.consumer.group.positions[name] {
-			s.consumer.group.positions[name] = s.message.sequence
+			dest.requeueLocked(s.message)
 		}
 	}
 	s.conn.dispatchLocked()

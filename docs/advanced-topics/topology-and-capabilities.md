@@ -62,11 +62,13 @@ configuration mistake.
 Topology checks happen at the resource boundary, not at every message:
 
 - `New` opens the selected driver and, when `WithPublishTopics` is present and
-  the policy is not `TopologyNone`, ensures the publisher entry points;
+  the policy is not `TopologyNone`, ensures the publisher entry points (under
+  `TopologyNone` the call still happens but the driver does no broker work);
 - `Subscribe` validates the subscription and returns a `Runner`; it does not
   open a consumer; and
 - `Runner.Run` opens the consumer and ensures the subscription's main, retry,
-  and dead-letter destinations when the policy is not `TopologyNone`.
+  and dead-letter destinations. Under `TopologyNone` the admin records the
+  spec and the driver performs no broker work.
 
 The same checks are repeated for resources rebuilt during reconnect. A startup
 or reconnect topology error should be surfaced to the service rather than

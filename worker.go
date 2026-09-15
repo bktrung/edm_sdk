@@ -41,6 +41,20 @@ type delivery struct {
 	message driver.InboundMessage
 }
 
+// settlementOperation identifies the kind of settlement call made for a
+// delivery, so a failed one can be retried in kind rather than guessed at.
+type settlementOperation uint8
+
+const (
+	// settlementOperationNone means no settlement call has been made.
+	settlementOperationNone settlementOperation = iota
+	// settlementOperationAck means the delivery was asked to be acknowledged.
+	settlementOperationAck
+	// settlementOperationNack means the delivery was asked to be negatively
+	// acknowledged.
+	settlementOperationNack
+)
+
 // deliveryState records attempted versus settled ownership. operation and
 // nackOptions preserve the exact settlement operation for deferred retries.
 type deliveryState struct {
@@ -64,7 +78,13 @@ type poisonDropReport struct {
 
 // Run starts the consumer, owns its fetcher and workers, and returns when the
 // consumer stops, the caller cancels ctx, or a driver error requests shutdown.
-func (r *Runner) Run(ctx context.Context) error {
+// Cancelling ctx stops the runner immediately: in-flight handlers see their
+// context cancelled at once, and HandlerGrace does not apply. Drain is the
+// graceful stop.
+// A non-nil result after the runner started is recorded against its
+// subscription name for Client.Health, except when the caller cancelled, the
+// runner was drained, or the client is shutting down.
+func (r *Runner) Run(ctx context.Context) (runErr error) {
 	if r == nil {
 		return errors.New("f1: runner is nil")
 	}
@@ -106,7 +126,6 @@ func (r *Runner) Run(ctx context.Context) error {
 	r.drainStarted = make(chan struct{})
 	r.inflight = newInflightRegistry()
 	r.lifecycle = lifecycle.New()
-	r.accounting = lifecycle.NewAccounting(r.inflight.registry)
 	handlerCtx, handlerCancel := context.WithCancel(ctx)
 	r.handlerCtx, r.handlerCancel = handlerCtx, handlerCancel
 	handlerShutdownCtx, handlerShutdownCancel := context.WithCancel(context.Background())
@@ -117,6 +136,11 @@ func (r *Runner) Run(ctx context.Context) error {
 	r.client.mu.Unlock()
 
 	defer finishRunner(r)
+	// Registered after the pre-start refusals, so a refused Run never records
+	// anything, and before the first return that follows a start. Deferred
+	// after finishRunner so it runs first and reads the result Run is about to
+	// hand back, including an error joined in by drainAfterRun.
+	defer func() { r.recordRunExit(ctx, runErr) }()
 	if preRunReconnectErr != nil {
 		return preRunReconnectErr
 	}
@@ -128,7 +152,6 @@ func (r *Runner) Run(ctx context.Context) error {
 			return err
 		}
 	}
-	var runErr error
 	var runCtx context.Context
 	var cancel context.CancelFunc
 	generation := 0
@@ -159,7 +182,7 @@ func (r *Runner) Run(ctx context.Context) error {
 		// sizes the ordered worker queues from it, so both read the same number
 		// instead of deriving it again from a formula that could drift.
 		prefetch := runnerConsumerPrefetch(r.config.Prefetch, runnerLanePlan(r))
-		consumer, err := openRunnerConsumerWith(r, runCtx, prefetch)
+		consumer, openedOn, err := openRunnerConsumerWith(r, runCtx, prefetch)
 		r.mu.Lock()
 		draining = r.draining
 		r.mu.Unlock()
@@ -206,16 +229,35 @@ func (r *Runner) Run(ctx context.Context) error {
 			}
 			continue
 		}
+		// Admit only a consumer opened on the connection that is still live.
+		// requestReconnect marks the client before abandoning runners, so this
+		// critical section either rejects and releases this consumer or records
+		// it before abandonForReconnect can release it.
+		r.client.mu.Lock()
+		r.mu.Lock()
+		admitted := !r.client.reconnecting && sameConnection(r.client.conn, openedOn)
+		if admitted {
+			r.consumer = consumer
+		}
+		r.mu.Unlock()
+		r.client.mu.Unlock()
+		if !admitted {
+			if closeErr := runWithClockTimeout(context.WithoutCancel(runCtx), r.client.options.clock, r.client.config.Lifecycle.CloseTimeout, "consumer release", func(closeCtx context.Context) error {
+				return consumer.Release(closeCtx)
+			}); closeErr != nil {
+				lastResortRunnerLogger(r).Warn("f1 consumer release failed during reconnect", "subscription", r.subscription.Name, "error", closeErr)
+			}
+			cancel()
+			continue
+		}
+
 		generation++
 		if repairCause != nil {
 			lastResortRunnerLogger(r).Info("f1 consumer repaired", "subscription", r.subscription.Name, "cause", repairCause)
 			repairCause = nil
 		}
-		r.mu.Lock()
-		r.consumer = consumer
-		r.mu.Unlock()
-
-		switch r.lifecycle.State() {
+		state := r.lifecycle.State()
+		switch state {
 		case lifecycle.Starting, lifecycle.Reconnecting:
 			r.mu.Lock()
 			r.repairCycleActive = false
@@ -223,6 +265,11 @@ func (r *Runner) Run(ctx context.Context) error {
 			r.mu.Unlock()
 			if err := r.lifecycle.Transition(lifecycle.Ready); err != nil {
 				runErr = err
+			} else if state == lifecycle.Starting {
+				// A runner that started afresh under this name has replaced the
+				// one whose failure is recorded. A runner returning to ready
+				// from reconnecting has replaced nothing.
+				r.client.clearFailedSubscription(r.subscription.Name)
 			}
 		case lifecycle.Ready:
 		default:
@@ -328,6 +375,40 @@ func (r *Runner) Run(ctx context.Context) error {
 		runErr = errors.Join(runErr, shutdownErr)
 	}
 	return runErr
+}
+
+// recordRunExit records a stopped runner against its subscription name, so a
+// subscription that ended on its own is visible through Client.Health rather
+// than only as a drained client with no consumer. It runs as Run returns, so
+// it sees the value the caller receives.
+//
+// Three exits are not subscription failures and stay unrecorded: the caller's
+// cancel, a drain, and a client that has begun shutting down. The caller's
+// cancel is read from ctx rather than from the result, because a cancel can
+// surface as nil or as a context error depending on which branch observed it
+// first.
+//
+// Record ownership decides the rest, and it is compared by owner rather than
+// by error: the error here can be joined with a drain error, so it is not the
+// value the runner recorded early. A runner that recorded early keeps only the
+// entry it still owns, and a runner that never recorded writes one.
+func (r *Runner) recordRunExit(ctx context.Context, err error) {
+	if err == nil || ctx.Err() != nil {
+		return
+	}
+	r.mu.Lock()
+	draining := r.draining
+	r.mu.Unlock()
+	if draining {
+		return
+	}
+	c := r.client
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.shutdownStarted {
+		return
+	}
+	c.recordRunnerExitLocked(r, err)
 }
 
 func (r *Runner) requestAndWaitReconnect(ctx context.Context, cause error) error {
@@ -707,7 +788,7 @@ func newRunnerScheduler(r *Runner) (*sched.Scheduler, error) {
 			Budget: lane.budget, Capacity: lane.capacity,
 		})
 	}
-	return sched.New(specs, r.client.options.clock, r.subscription.Fairness.AgingEnabled)
+	return sched.New(specs, r.client.options.clock, !r.subscription.Fairness.DisableAging)
 }
 
 func schedulerLaneID(topic string, priority Priority, tier int) string {
@@ -825,7 +906,7 @@ func (r *Runner) Drain(ctx context.Context) error {
 			case <-ctx.Done():
 				return ctx.Err()
 			}
-		case lifecycle.Draining, lifecycle.Settling, lifecycle.Flushing:
+		case lifecycle.Draining:
 		case lifecycle.Closed:
 			r.mu.Unlock()
 			return nil
@@ -1075,20 +1156,42 @@ func lastResortRunnerLogger(r *Runner) *slog.Logger {
 // ordered queue depth are the same number even when they are not both derived
 // from the configuration at the same point in time.
 func openRunnerConsumer(r *Runner, ctx context.Context) (driver.Consumer, error) {
-	return openRunnerConsumerWith(r, ctx, runnerConsumerPrefetch(r.config.Prefetch, runnerLanePlan(r)))
+	consumer, _, err := openRunnerConsumerWith(r, ctx, runnerConsumerPrefetch(r.config.Prefetch, runnerLanePlan(r)))
+	return consumer, err
 }
 
 // openRunnerConsumerWith opens the consumer for a generation whose total
-// in-flight budget is prefetch, as derived by Run.
-func openRunnerConsumerWith(r *Runner, ctx context.Context, prefetch int) (driver.Consumer, error) {
-	r.client.mu.Lock()
-	conn := r.client.conn
-	effective := r.client.effective
-	source := r.client.source
-	r.client.mu.Unlock()
+// in-flight budget is prefetch, as derived by Run, and returns the connection
+// used to open it.
+func openRunnerConsumerWith(r *Runner, ctx context.Context, prefetch int) (driver.Consumer, driver.Conn, error) {
+	var conn driver.Conn
+	var effective driver.Capabilities
+	var source string
+	for {
+		r.client.mu.Lock()
+		if r.client.reconnecting && r.client.reconnect != nil {
+			attempt := r.client.reconnect
+			r.client.mu.Unlock()
+			r.mu.Lock()
+			waitHook := r.reconnectWaitHook
+			r.mu.Unlock()
+			if waitHook != nil {
+				waitHook()
+			}
+			if err := r.client.waitReconnect(ctx, attempt); err != nil {
+				return nil, nil, err
+			}
+			continue
+		}
+		conn = r.client.conn
+		effective = r.client.effective
+		source = r.client.source
+		r.client.mu.Unlock()
+		break
+	}
 	policy := r.client.topologyPolicy()
 	if conn == nil {
-		return nil, errors.New("f1: client is not connected")
+		return nil, nil, errors.New("f1: client is not connected")
 	}
 	destinations := subscriptionDestinations(effective, source, r.subscription)
 	retryDestinationTiers := retryDestinationTierMap(source, r.subscription)
@@ -1101,13 +1204,13 @@ func openRunnerConsumerWith(r *Runner, ctx context.Context, prefetch int) (drive
 	// the call.
 	admin := conn.Admin()
 	if admin == nil {
-		return nil, errors.New("f1: consumer topology requires driver admin")
+		return nil, nil, errors.New("f1: consumer topology requires driver admin")
 	}
 	topology := subscriptionTopologySpecs(effective, source, r.subscription)
 	topology.Policy = policy
 	diff, err := admin.EnsureTopology(ctx, topology)
 	if err != nil {
-		return nil, fmt.Errorf("f1: ensure subscription topology: %w", err)
+		return nil, nil, fmt.Errorf("f1: ensure subscription topology: %w", err)
 	}
 	logTopologyDrift(lastResortRunnerLogger(r), diff)
 	// Each destination's cap is its lane's capacity, so a lane can never hold
@@ -1132,12 +1235,12 @@ func openRunnerConsumerWith(r *Runner, ctx context.Context, prefetch int) (drive
 		StartAt:        driver.StartEarliest,
 	})
 	if err != nil {
-		return nil, fmt.Errorf("f1: create subscription %s: %w", r.subscription.Name, err)
+		return nil, nil, fmt.Errorf("f1: create subscription %s: %w", r.subscription.Name, err)
 	}
 	if consumer == nil {
-		return nil, errors.New("f1: driver returned a nil consumer")
+		return nil, nil, errors.New("f1: driver returned a nil consumer")
 	}
-	return consumer, nil
+	return consumer, conn, nil
 }
 
 func consumeRunnerErrors(r *Runner, ctx context.Context) error {
@@ -1227,7 +1330,7 @@ func recordFatalConsumerError(r *Runner, err error) {
 			setRunnerError(r, errors.Join(err, transitionErr))
 		}
 	}
-	r.client.recordFailedRunner(r, err)
+	r.client.recordFailedSubscription(r.subscription.Name, err, r)
 }
 
 // --- Intake and cancellation ---
@@ -1310,12 +1413,8 @@ func enqueueDelivery(r *Runner, ctx context.Context, dispatch chan<- delivery, m
 		// A cancellation path may still have a delivery in the channel. Put it
 		// back through the broker rather than losing it locally.
 		state := &deliveryState{id: id}
-		err := nackDelivery(r, runnerSettlementContext(r, ctx), message, driver.NackOptions{Requeue: true}, state)
-		outcome := settlementOutcomeRequeued
-		if err != nil {
-			outcome = settlementOutcomeUnknown
-		}
-		r.inflight.RemoveAs(id, outcome)
+		_ = nackDelivery(r, runnerSettlementContext(r, ctx), message, driver.NackOptions{Requeue: true}, state)
+		r.inflight.Remove(id)
 		return false
 	}
 }
@@ -1335,20 +1434,12 @@ func processDelivery(r *Runner, ctx context.Context, item delivery) {
 			_ = nackDelivery(r, runnerSettlementContext(r, ctx), item.message, driver.NackOptions{Requeue: true}, state)
 		}
 		retryDeliverySettlement(r, ctx, item.message, state)
-		// The outcome names the delivery's terminal result: a delivery whose
-		// delayed cleanup eventually settled reports that settlement, and
-		// abandoned is reserved for one that never settled at all.
-		operation := state.operation
-		outcome := settlementOutcomeUnknown
-		switch {
-		case state.settled && operation == settlementOperationNack:
-			outcome = settlementOutcomeRequeued
-		case state.settled:
-			outcome = settlementOutcomeSettled
-		case abandoned:
-			outcome = settlementOutcomeAbandoned
-		}
-		r.inflight.RemoveAs(item.id, outcome)
+		// The registry entry leaves only after the delivery's settlement
+		// path finished, so a drain neither reads zero while the broker
+		// still owns the message nor waits on an entry nothing will
+		// remove. An abandoned delivery leaves at the end of the bounded
+		// budget.
+		r.inflight.Remove(item.id)
 	}()
 	dispatchMessage(r, ctx, item.message, &envelope, &abandoned, state)
 }
@@ -1464,11 +1555,11 @@ func dispatchMessage(r *Runner, ctx context.Context, message driver.InboundMessa
 		return ackDelivery(r, runnerSettlementContext(r, ctx), message, state)
 	}
 	outcome := classifyRetryError(result.err)
-	switch outcome.Kind {
-	case retry.Drop:
+	switch outcome {
+	case retryOutcomeDrop:
 		runnerNotifyDiscarded(r, runnerSettlementContext(r, ctx), Discarded{Envelope: envelope, Body: append([]byte(nil), message.Body...), Reason: DiscardDropped, Err: result.err})
 		return ackDelivery(r, runnerSettlementContext(r, ctx), message, state)
-	case retry.Terminal:
+	case retryOutcomeTerminal:
 		return deadLetterAndSettle(r, ctx, message, envelope, ReasonTerminal, result.err, state)
 	}
 	if envelope.Attempt >= maxAttempts {
@@ -1477,20 +1568,33 @@ func dispatchMessage(r *Runner, ctx context.Context, message driver.InboundMessa
 	return retryAndSettle(r, ctx, message, envelope, result.err, state)
 }
 
-func classifyRetryError(err error) retry.Outcome {
+// retryOutcome names the settlement path a handler error takes: retried
+// within the attempt budget, acknowledged without a successor copy, or
+// dead-lettered without another attempt.
+type retryOutcome uint8
+
+const (
+	// retryOutcomeRetry publishes a successor copy so the delivery is
+	// attempted again.
+	retryOutcomeRetry retryOutcome = iota
+	// retryOutcomeDrop acknowledges the delivery without a successor copy.
+	retryOutcomeDrop
+	// retryOutcomeTerminal dead-letters the delivery without another attempt.
+	retryOutcomeTerminal
+)
+
+// classifyRetryError maps a handler error to the settlement path it asks
+// for: a terminal error is dead-lettered without another attempt, a dropped
+// error is acknowledged without a successor copy, and anything else is
+// retried.
+func classifyRetryError(err error) retryOutcome {
 	switch {
 	case IsTerminal(err):
-		return retry.Outcome{Kind: retry.Terminal, Err: err}
+		return retryOutcomeTerminal
 	case IsDropped(err):
-		return retry.Outcome{Kind: retry.Drop, Err: err}
+		return retryOutcomeDrop
 	}
-	if delay, ok := RetryDelay(err); ok {
-		if delay < 0 {
-			delay = 0
-		}
-		return retry.Outcome{Kind: retry.RetryAfter, Delay: delay, Err: err}
-	}
-	return retry.Classify(err)
+	return retryOutcomeRetry
 }
 
 func stateFor(states []*deliveryState) *deliveryState {
@@ -1624,22 +1728,23 @@ func runnerIsDraining(r *Runner) bool {
 // --- Settlement primitives ---
 
 func ackDelivery(r *Runner, ctx context.Context, message driver.InboundMessage, states ...*deliveryState) bool {
-	return ackDeliveryAs(r, ctx, message, lifecycle.Handled, states...)
+	return ackDeliveryAs(r, ctx, message, true, states...)
 }
 
-func ackDeliveryAs(r *Runner, ctx context.Context, message driver.InboundMessage, disposition lifecycle.Disposition, states ...*deliveryState) bool {
+// ackDeliveryAs acknowledges the delivery. handled records whether the ack
+// ends a handled delivery rather than a dead-lettered or retried one; only a
+// handled ack counts the generation's successfulDelivery, which the
+// reconnect decision reads.
+func ackDeliveryAs(r *Runner, ctx context.Context, message driver.InboundMessage, handled bool, states ...*deliveryState) bool {
 	state := stateFor(states)
 	if message.Settle == nil {
 		return false
 	}
 	state.operation = settlementOperationAck
-	if r != nil && r.inflight != nil {
-		r.inflight.SetDisposition(state.id, dispatch.Disposition(disposition))
-	}
 	err := message.Settle.Ack(ctx)
 	state.attempted = true
 	state.settled = err == nil
-	if r != nil && state.settled && disposition == lifecycle.Handled {
+	if r != nil && state.settled && handled {
 		r.mu.Lock()
 		r.successfulDelivery = true
 		r.mu.Unlock()
@@ -1654,9 +1759,6 @@ func nackDelivery(r *Runner, ctx context.Context, message driver.InboundMessage,
 	}
 	state.operation = settlementOperationNack
 	state.nackOptions = options
-	if r != nil && r.inflight != nil {
-		r.inflight.SetDisposition(state.id, dispatch.DispositionRequeued)
-	}
 	err := message.Settle.Nack(ctx, options)
 	state.attempted = true
 	state.settled = err == nil
@@ -1669,7 +1771,7 @@ func deadLetterAndSettle(r *Runner, ctx context.Context, message driver.InboundM
 		if reason == ReasonPoison && isMissingDeadLetterRoute(err) {
 			state.poisonDrop = &poisonDropReport{envelope: envelope, cause: err}
 			sctx := runnerSettlementContext(r, ctx)
-			settled := ackDeliveryAs(r, sctx, message, lifecycle.Handled, state)
+			settled := ackDeliveryAs(r, sctx, message, true, state)
 			if settled {
 				reportPendingPoisonDrop(r, sctx, message, state)
 			}
@@ -1678,7 +1780,7 @@ func deadLetterAndSettle(r *Runner, ctx context.Context, message driver.InboundM
 		failSuccessorHandoff(r, runnerSettlementContext(r, ctx), "dead_letter", eventFromDelivery(r, message, envelope, state.headerMaxBytes), err)
 		return false
 	}
-	return ackDeliveryAs(r, runnerSettlementContext(r, ctx), message, lifecycle.DeadLettered, state)
+	return ackDeliveryAs(r, runnerSettlementContext(r, ctx), message, false, state)
 }
 
 func isMissingDeadLetterRoute(err error) bool {
@@ -1865,7 +1967,9 @@ func failSuccessorHandoff(r *Runner, ctx context.Context, op string, event *Even
 // retryAndSettle republishes message to its retry destination, carrying the
 // already-received body forward unchanged. Like deadLetter, it deliberately
 // does not apply codec.maxBodyBytes: that limit only guards a publish the
-// application originated, and this body was already accepted once.
+// application originated, and this body was already accepted once. A retry
+// copy whose headers cannot be encoded is handed to the dead-letter path
+// rather than settled.
 func retryAndSettle(r *Runner, ctx context.Context, message driver.InboundMessage, envelope Envelope, lastErr error, states ...*deliveryState) bool {
 	state := stateFor(states)
 	copyEnvelope := envelope
@@ -1883,7 +1987,6 @@ func retryAndSettle(r *Runner, ctx context.Context, message driver.InboundMessag
 		InitialInterval: r.subscription.Retry.InitialInterval,
 		Multiplier:      r.subscription.Retry.Multiplier,
 		MaxInterval:     r.subscription.Retry.MaxInterval,
-		Jitter:          r.subscription.Retry.Jitter,
 		Tiers:           r.subscription.Retry.Tiers,
 	}
 	tiers := retryConfig.TierCount()
@@ -1893,7 +1996,7 @@ func retryAndSettle(r *Runner, ctx context.Context, message driver.InboundMessag
 	tier := retry.ResolveTier(retryConfig, envelope.Attempt)
 	delay := retryConfig.DelayFor(tier)
 	if requested, ok := RetryDelay(lastErr); ok {
-		resolvedTier, resolvedDelay, _ := retry.ResolveRetryAfter(retryConfig, requested)
+		resolvedTier, resolvedDelay := retry.ResolveRetryAfter(retryConfig, requested)
 		tier, delay = resolvedTier, resolvedDelay
 	}
 	now := r.client.options.clock.Now().UTC()
@@ -1901,8 +2004,8 @@ func retryAndSettle(r *Runner, ctx context.Context, message driver.InboundMessag
 	copyEnvelope.DueTime = &due
 	encoded, err := copyEnvelope.EncodeHeaders(state.headerMaxBytes)
 	if err != nil {
-		_ = nackDelivery(r, runnerSettlementContext(r, ctx), message, driver.NackOptions{CountAsFailure: true}, state)
-		return false
+		return deadLetterAndSettle(r, ctx, message, envelope, ReasonTerminal,
+			errors.Join(lastErr, fmt.Errorf("f1: retry copy cannot be encoded: %w", err)), state)
 	}
 	destination := retryDestination(r, copyEnvelope, message, tier)
 	out := driver.OutboundMessage{Destination: destination, Key: append([]byte(nil), message.Key...), Body: append([]byte(nil), message.Body...), DelayUntil: due}
@@ -1914,7 +2017,7 @@ func retryAndSettle(r *Runner, ctx context.Context, message driver.InboundMessag
 		failSuccessorHandoff(r, runnerSettlementContext(r, ctx), "retry", eventFromDelivery(r, message, envelope, state.headerMaxBytes), err)
 		return false
 	}
-	return ackDeliveryAs(r, runnerSettlementContext(r, ctx), message, lifecycle.Retried, state)
+	return ackDeliveryAs(r, runnerSettlementContext(r, ctx), message, false, state)
 }
 
 // A Stop refusal for outstanding messages is a redelivery case, not a retry

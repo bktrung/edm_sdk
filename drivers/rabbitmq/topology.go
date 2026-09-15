@@ -529,9 +529,9 @@ func queueArguments(spec driver.DestinationSpec, kind queueKind, consumerTimeout
 // delay rounds into.
 //
 // Eight rungs cover every delay the retry path can produce with a rung to
-// spare. Config.DelayFor tops out at MaxInterval and ResolveRetryAfter clamps
-// into the nearest tier's jitter band, whose top is 36s at the shipped
-// defaults (MaxInterval 30s, Jitter .2), while the top rung is 64s. A delay
+// spare. Config.DelayFor tops out at MaxInterval, and ResolveRetryAfter
+// returns the nominal delay of the tier it picks, so the largest delay at the
+// shipped defaults is MaxInterval 30s while the top rung is 64s. A delay
 // above the top rung routes to no rung at all: see target.
 var parkRungs = [...]time.Duration{
 	500 * time.Millisecond,

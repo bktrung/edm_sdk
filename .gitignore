@@ -1,6 +1,7 @@
 # Build output
 /bin/
 /dist/
+slides/build/
 docs/.vitepress/cache/
 docs/.vitepress/.temp/
 docs/.vitepress/dist/

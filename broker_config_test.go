@@ -118,3 +118,39 @@ func TestDriverOptionsDocumented(t *testing.T) {
 		})
 	}
 }
+
+// TestRemovedRabbitMQOptionsFailToLoad pins the trimmed RabbitMQ whitelist. A
+// key that no resolver reads is refused when the configuration loads rather
+// than accepted and silently ignored, so a config naming one never starts. The
+// four keys that are read still load, which is what separates a trimmed list
+// from an emptied one.
+func TestRemovedRabbitMQOptionsFailToLoad(t *testing.T) {
+	t.Parallel()
+	for _, test := range []struct {
+		key   string
+		value string
+	}{
+		{key: "maxLength", value: "1000"},
+		{key: "deliveryLimitMargin", value: "2"},
+		{key: "deadLetterStrategy", value: "reject"},
+		{key: "useNativeDelay", value: "true"},
+		{key: "publisherConfirmTimeout", value: "5s"},
+		{key: "quorumInitialGroupSize", value: "3"},
+	} {
+		t.Run(test.key, func(t *testing.T) {
+			t.Parallel()
+			path := writeConfig(t, "f1:\n  env: test\n  service: orders\n  broker:\n    driver: rabbitmq\n    endpoints: [amqp://broker:5672/]\n    rabbitmq:\n      "+test.key+": "+test.value+"\n")
+			_, err := LoadConfig(path)
+			if err == nil || !strings.Contains(err.Error(), "broker.rabbitmq."+test.key) {
+				t.Fatalf("LoadConfig() with %s set error = %v, want an error naming broker.rabbitmq.%s", test.key, err, test.key)
+			}
+		})
+	}
+	t.Run("the keys that are read still load", func(t *testing.T) {
+		t.Parallel()
+		path := writeConfig(t, "f1:\n  env: test\n  service: orders\n  broker:\n    driver: rabbitmq\n    endpoints: [amqp://broker:5672/]\n    rabbitmq:\n      vhost: /orders\n      queueType: quorum\n      consumerTimeout: 90s\n      managementPort: 15672\n")
+		if _, err := LoadConfig(path); err != nil {
+			t.Fatalf("LoadConfig() with the four live RabbitMQ keys error = %v", err)
+		}
+	})
+}

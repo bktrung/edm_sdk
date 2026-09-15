@@ -106,7 +106,6 @@
     "UnrecognisedValueError",
     "UnrecognisedValueError.Error",
     "WithCausedBy",
-    "WithClock",
     "WithCodec",
     "WithCorrelationID",
     "WithDetails",

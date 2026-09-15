@@ -222,11 +222,11 @@ func clearSubscriptionEnvironment(t *testing.T, name string) {
 	keys := []string{
 		"topics", "mode", "concurrency", "prefetch", "priorities",
 		"handlerTimeout", "unmatchedPolicy", "fairness.retryWeightDivisor",
-		"fairness.costModel", "fairness.prefetchFactor", "fairness.agingEnabled",
+		"fairness.prefetchFactor", "fairness.disableAging",
 		"fairness.weights.high", "fairness.weights.medium", "fairness.weights.low",
 		"fairness.budgets.high", "fairness.budgets.medium", "fairness.budgets.low",
 		"retry.maxAttempts", "retry.initialInterval", "retry.multiplier",
-		"retry.maxInterval", "retry.jitter", "retry.tiers",
+		"retry.maxInterval", "retry.tiers",
 	}
 	prefix := subscriptionEnvPrefix(name)
 	for _, key := range keys {
@@ -273,7 +273,7 @@ f1:
 	}
 }
 
-func TestSubscribePreservesExplicitYAMLFairnessZero(t *testing.T) {
+func TestSubscribePreservesExplicitYAMLDisableAging(t *testing.T) {
 	t.Parallel()
 	cfg, err := LoadConfig(writeConfig(t, `
 f1:
@@ -285,7 +285,7 @@ f1:
     orders:
       topics: [orders.created]
       fairness:
-        agingEnabled: false
+        disableAging: true
 `))
 	if err != nil {
 		t.Fatal(err)
@@ -299,8 +299,61 @@ f1:
 	if err != nil {
 		t.Fatal(err)
 	}
-	if runner.config.Fairness.AgingEnabled {
-		t.Fatal("explicit YAML agingEnabled: false was replaced by the default")
+	if !runner.config.Fairness.DisableAging {
+		t.Fatal("explicit YAML disableAging: true was replaced by the default")
+	}
+}
+
+func TestSubscribeMergesGoBuiltRetryOverDefaults(t *testing.T) {
+	t.Parallel()
+	cfg := Config{
+		Env:     "test",
+		Service: "orders",
+		Broker:  BrokerConfig{Driver: "inmem"},
+		Subscriptions: map[string]SubscriptionConfig{
+			"orders": {Topics: []string{"orders.created"}, Retry: RetryConfig{MaxAttempts: 7}},
+		},
+	}
+	client, err := New(context.Background(), cfg, WithDriver(&testDriver{conn: &testConn{info: testBrokerInfo()}}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = client.Close(context.Background()) })
+	runner, err := client.Subscribe(context.Background(), Subscription{Name: "orders"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := defaultSubscription().Retry
+	want.MaxAttempts = 7
+	if got := runner.config.Retry; !reflect.DeepEqual(got, want) {
+		t.Fatalf("resolved retry = %+v, want %+v", got, want)
+	}
+}
+
+func TestSubscribeMergesGoBuiltFairnessOverDefaults(t *testing.T) {
+	t.Parallel()
+	weights := map[Priority]int{PriorityHigh: 5, PriorityMedium: 2}
+	cfg := Config{
+		Env:     "test",
+		Service: "orders",
+		Broker:  BrokerConfig{Driver: "inmem"},
+		Subscriptions: map[string]SubscriptionConfig{
+			"orders": {Topics: []string{"orders.created"}, Fairness: FairnessConfig{Weights: weights}},
+		},
+	}
+	client, err := New(context.Background(), cfg, WithDriver(&testDriver{conn: &testConn{info: testBrokerInfo()}}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = client.Close(context.Background()) })
+	runner, err := client.Subscribe(context.Background(), Subscription{Name: "orders"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := defaultSubscription().Fairness
+	want.Weights = weights
+	if got := runner.config.Fairness; !reflect.DeepEqual(got, want) {
+		t.Fatalf("resolved fairness = %+v, want %+v", got, want)
 	}
 }
 

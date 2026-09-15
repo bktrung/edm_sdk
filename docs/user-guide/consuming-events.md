@@ -59,6 +59,13 @@ and publish the same logical key with `f1.WithKey`. F1 preserves order per key;
 it does not provide global ordering across partitions or queues. Check
 `client.Limits()` when a deployment must make a capability decision explicit.
 
+Per-key order does not survive a retry. A delivery that fails is acknowledged
+as soon as its retry copy is stored, which releases the key, so the next
+message with that key is handled before the retry comes back. When a key must
+not be handled out of order at all, either set `RetryConfig{MaxAttempts: 1}` so
+a failure goes straight to the dead-letter destination, or make the handler
+tolerate the reorder.
+
 For worker, settlement, dispatch, and scheduling internals, see the
 [consume flow](/development/consume-flow) and
 [ordering and scheduling guide](/advanced-topics/ordering-and-scheduling).
