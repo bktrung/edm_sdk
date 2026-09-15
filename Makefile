@@ -202,7 +202,7 @@ $(APIDIFF): tools/apidiff/go.mod tools/apidiff/go.sum
 $(APIDIFF_NORMALIZE): tools/apidiff/normalize.go tools/apidiff/go.mod tools/apidiff/go.sum
 	cd tools/apidiff && go build -o ../../.tools/bin/apidiff-normalize .
 
-.PHONY: broker-up broker-down broker-reset broker-smoke test-rabbitmq test-rabbitmq-driver test-rabbitmq-conformance test-kafka test-infra test-driver-flip test-kafka-conformance kafka-up kafka-down
+.PHONY: broker-up broker-down broker-reset broker-smoke test-rabbitmq test-rabbitmq-driver test-rabbitmq-conformance test-kafka test-infra test-driver-flip test-kafka-conformance kafka-up kafka-down bench
 
 ## test-rabbitmq: run the RabbitMQ driver suite and its conformance suite
 ## against the selected fixture, starting it first. The integration tag selects
@@ -258,6 +258,28 @@ test-driver-flip: kafka-up broker-up broker-smoke
 ## keeps the run explicit; the integration tag makes it required.
 test-kafka-conformance: kafka-up
 	F1_KAFKA_ENDPOINT=$${F1_KAFKA_ENDPOINT:-localhost:$(KAFKA_PORT)} F1_KAFKA_CONFORMANCE=1 go test -v -count=1 -tags integration -run TestConformance -timeout 20m ./drivers/kafka/...
+
+## bench: measure publish, consume, latency and retry throughput through the
+## public API against both brokers, starting the fixtures first. Consume runs
+## twice: at one handler at a time, and at the concurrency a caller who sets
+## none gets. A subscription over several partitions shares its handler slots
+## between them, so the second rate is not the first one times a number, and a
+## partition count is decided against the second. This target is not a gate and
+## must not join one: every number it prints depends on the machine it ran on,
+## and a gate that fails on a slow or busy box is a gate people learn to ignore.
+## Read its output as a comparison between the two drivers taken on one quiet
+## machine, never as a threshold.
+##
+## -benchtime=1000x -count=3: 1000 messages per benchmark run is enough for the
+## publish, consume and latency rates to settle, and small enough that the
+## retry path, which pays one parked delay per message, stays inside the
+## budget; three runs give a median and the spread around it. The whole target
+## took 306s on a 14-CPU machine with both fixtures on the same host, against
+## the 15 minutes or less this target is allowed.
+bench: kafka-up broker-up broker-smoke
+	F1_KAFKA_ENDPOINT=$${F1_KAFKA_ENDPOINT:-localhost:$(KAFKA_PORT)} \
+	F1_RABBITMQ_ENDPOINT=$${F1_RABBITMQ_ENDPOINT:-amqp://guest:guest@localhost:$(RABBITMQ_PORT)/} \
+	go test -tags integration -run '^$$' -bench . -benchtime=1000x -count=3 -timeout 30m ./examples/bench/
 
 ## kafka-up: start the Kafka fixture without starting RabbitMQ. KAFKA_PORT
 ## defaults to the historical port and KAFKA_PROJECT to the existing compose

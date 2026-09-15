@@ -199,6 +199,14 @@ into documentation or test scripts. Each passes `-tags integration` and an
 explicit endpoint, so an unreachable fixture fails the run rather than turning
 that suite into a skip.
 
+`bench` measures the same public API through both drivers: publish throughput
+at one, four and sixteen concurrent publishers, consume-and-settle throughput
+on one lane, end-to-end latency, and retry-path throughput beside its tier
+delay. It starts both fixtures, writes nothing, and joins no gate, because a
+throughput number describes the machine it ran on and a gate that fails on a
+busy one is a gate people learn to ignore. Run it on a quiet machine and read
+its output as a comparison between the two drivers, never as a threshold.
+
 `test-driver-flip` is the driver-flip acceptance: it builds the two
 `examples/acceptance` services once, runs the identical binaries against Kafka
 and RabbitMQ with one corpus, and diffs the behaviour vectors. It needs both
@@ -233,6 +241,11 @@ The per-driver targets are the same tag with a narrower package list:
 `test-rabbitmq-conformance`, `test-kafka-conformance`, and `test-driver-flip`.
 Each starts the fixtures it needs and passes `-tags integration`, so each one
 keeps running the tests it names.
+
+`bench` is the same tag as well: it contacts both brokers and starts the
+fixtures it needs. Its package also holds the in-memory harness test, which
+needs no broker and is untagged, so the target passes `-run '^$'` beside
+`-bench` to select the benchmarks and leave that test out.
 
 `F1_KAFKA_ENDPOINT` and `F1_RABBITMQ_ENDPOINT` say *where* a fixture is. Unset
 means the documented default address, and a test pointed at nothing fails rather
