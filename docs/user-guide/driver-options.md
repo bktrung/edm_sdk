@@ -77,22 +77,18 @@ which is the floor. Bounded memory is what the lateness buys.
 
 | Key | What it does | Accepted values | Default | Read at |
 | --- | --- | --- | --- | --- |
-| `broker.rabbitmq.vhost` | Vhost the management API inspects when it reads queue arguments and bindings. It does not change the AMQP connection: the endpoint URI still selects the vhost that messages are published to. | Any string, used as the vhost name. Empty falls back to the endpoint URI. | The endpoint URI's path with a leading `/`: `/` when the URI has no path, and `/orders` for `amqp://host/orders`. | Open |
+| `broker.rabbitmq.vhost` | Vhost the management API inspects when it reads queue arguments and bindings. It does not change the AMQP connection: the endpoint URI still selects the vhost that messages are published to. | Any string, used as the vhost name. Empty falls back to the endpoint URI. | The endpoint URI's vhost as the AMQP client parses it: `/` when the URI has no path, and `orders` for `amqp://host/orders`. | Open |
 | `broker.rabbitmq.queueType` | Queue type every destination and its parking queue is declared with. `classic` also clears the delivery-count and dead-letter capabilities, both of which are quorum arguments. | `quorum` or `classic`, case-insensitive, with surrounding whitespace ignored. Any other value fails `Open`, and `env: prod` requires the exact string `quorum`. | `quorum` | Open |
 | `broker.rabbitmq.consumerTimeout` | `x-consumer-timeout` declared on quorum destination queues. The broker cancels a consumer that has held one delivery this long. | Go duration of at least `1ms`, and at least three times every subscription's `handlerTimeout`. Shorter, zero, negative, or unparsable fails `Open`. | None: nothing is declared and the broker's own default stays in force. | Open |
 | `broker.rabbitmq.managementPort` | Port the management HTTP API listens on. | Integer from 1 to 65535. Any other value fails `Open`. | The AMQP port plus 10000, so 15672 for the usual 5672. | Open |
 
-`broker.rabbitmq.vhost` deserves the extra sentences, because the derived
-default is not the vhost the AMQP connection uses once the endpoint names a
-vhost other than the default. The AMQP client reads `amqp://host/orders` as the
-vhost `orders`, while the management client reads the same URI as `/orders`: it
-takes the URI's path with a leading slash. Management calls then address a vhost
-of a different name, which usually exists nowhere, so the queues and bindings
-the driver inspects belong to no visible vhost. The two readings agree when the
-URI has no path, where both are `/`, and when the URI carries the vhost
-percent-encoded with its own slash, `amqp://host/%2Forders` for the vhost
-`/orders`. For any other named vhost, set this key to the vhost the endpoint
-names, which is what the key is for.
+`broker.rabbitmq.vhost` deserves the extra sentences, because the management
+client and the AMQP connection must read the same vhost from the endpoint.
+Both parse it once through the AMQP client: `amqp://host/orders` is the vhost
+`orders`, and a URI with no path is the default vhost `/`. The two readings
+agree everywhere, including the percent-encoded `amqp://host/%2Forders` for
+the vhost `/orders`. Set this key only when the management API must inspect a
+vhost other than the one the endpoint names, which is what the key is for.
 
 ## Validation before the driver
 

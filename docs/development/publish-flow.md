@@ -66,7 +66,7 @@ The function checks the caller context, requires a non-empty event type, rejects
 nil publish options, applies each option, and validates the resulting priority.
 Option behavior is defined beside the option constructors in
 [`publisher.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/publisher.go). `WithMaxAttempts` validates its own
-producer retry cap while the subscription policy remains the consumer-side
+per-event attempt cap while the subscription policy remains the consumer-side
 ceiling.
 
 The option values contribute to the envelope and routing inputs:

@@ -202,7 +202,7 @@ that suite into a skip.
 `bench` measures the same public API through both drivers: publish throughput
 at one, four and sixteen concurrent publishers, consume-and-settle throughput
 on one lane, end-to-end latency, and retry-path throughput beside its tier
-delay. It starts both fixtures, writes nothing, and joins no gate, because a
+delay. It starts both fixtures, creates only its own namespaced destinations and deletes them afterwards, and joins no gate, because a
 throughput number describes the machine it ran on and a gate that fails on a
 busy one is a gate people learn to ignore. Run it on a quiet machine and read
 its output as a comparison between the two drivers, never as a threshold.

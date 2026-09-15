@@ -35,6 +35,7 @@ export default defineConfig({
         link: '/development/architecture',
         activeMatch: '^/(development/|runtime-overview|drivers-and-capabilities)',
       },
+      { text: 'Deep dives', link: '/deep-dives/kafka-ack-tracker', activeMatch: '^/deep-dives/' },
     ],
     // One sidebar for every page, in reading order, so a reader always sees
     // where the current page sits in the whole site.
@@ -84,6 +85,17 @@ export default defineConfig({
           { text: 'Drivers and capabilities', link: '/drivers-and-capabilities' },
           { text: 'Testing strategy', link: '/development/testing' },
           { text: 'Source-reading guide', link: '/development/source-reading-guide' },
+          { text: 'Writing style', link: '/development/writing-style' },
+        ],
+      },
+      {
+        text: 'Deep dives',
+        collapsed: false,
+        items: [
+          { text: 'Kafka ack tracker', link: '/deep-dives/kafka-ack-tracker' },
+          { text: 'Kafka lane balancer', link: '/deep-dives/kafka-lane-balancer' },
+          { text: 'RabbitMQ delay ladder', link: '/deep-dives/rabbitmq-delay-ladder' },
+          { text: 'Scheduler and worker', link: '/deep-dives/scheduler-and-worker' },
         ],
       },
     ],

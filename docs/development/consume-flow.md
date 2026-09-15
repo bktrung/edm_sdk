@@ -106,8 +106,10 @@ physical names through the port. Fanout capability determines whether a
 subscription consumes a subscription-specific destination or shares the
 publish entry point.
 
-When topology policy is not `TopologyNone`, the runner passes a
-`driver.TopologySpec` to `driver.Admin.EnsureTopology`. The spec includes the
+Every policy goes through the admin, `TopologyNone` included: the runner passes
+a `driver.TopologySpec` carrying the selected policy to
+`driver.Admin.EnsureTopology`, and under `TopologyNone` the driver does no
+broker work but still records what the spec said. The spec includes the
 main, retry, dead-letter, and capability-dependent broker backstop objects.
 Missing or drifted topology fails consumer startup according to the selected
 policy.
@@ -164,10 +166,10 @@ execution. `newRunnerScheduler` creates a lane for each topic, priority, and
 retry tier. Retry tiers share a retry group so retry pressure can be weighted
 below fresh traffic without losing per-tier visibility.
 
-The scheduler uses:
-
 - bounded lane capacity derived from subscription concurrency, fairness weights,
-  prefetch, and the prefetch factor;
+  and the prefetch factor: each lane holds at least its weighted share of the
+  concurrency, and the total prefetch the driver may hold is capped by the sum
+  of those capacities;
 - deficit weighted round-robin selection across groups; and
 - optional age-based promotion when a lane exceeds its configured budget.
 
@@ -318,10 +320,11 @@ must not be applied more than once by a driver.
 ## In-flight registry and settlement cleanup
 
 The runtime tracks one fact for each accepted delivery: whether it is still in
-flight. `internal/dispatch.Registry` registers a delivery before dispatch and
+flight. The in-flight registry (root `registry.go`, backed by
+`internal/dispatch.Registry`) registers a delivery before dispatch and
 removes it once its settlement path finished, or when the bounded cleanup
-budget runs out. `WaitZero` is the runner's proof that accepted work has left the
-in-flight set.
+budget runs out. `WaitZero` is the runner's proof that accepted work has left
+the in-flight set.
 
 `processDelivery` owns the final cleanup defer. It:
 

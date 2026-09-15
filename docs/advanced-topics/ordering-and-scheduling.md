@@ -101,7 +101,7 @@ slots do not help when most work hashes to one key.
 | Setting | Controls | Main trade-off |
 | --- | --- | --- |
 | `Concurrency` | Number of handler workers available to a subscription | More parallelism requires thread-safe, idempotent handler effects and more downstream capacity. |
-| `Prefetch` | How many deliveries the consumer may hold ahead of settlement, and the dispatch queue budget | More buffering can improve utilization but increases in-flight work, memory, and shutdown backlog. |
+| `Prefetch` | How many deliveries the consumer may hold ahead of settlement; in ordered mode it is also the dispatch queue budget | More buffering can improve utilization but increases in-flight work, memory, and shutdown backlog. |
 
 F1 keeps admission and scheduling bounded. A delivery passes through the
 driver's prefetch budget, the fetch-to-dispatch boundary, bounded scheduler

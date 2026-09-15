@@ -86,10 +86,10 @@ the port alone:
 - `drivers/inmem/conformance_test.go` adapts the in-memory connection, exposes
   broker state, injects deterministic faults, and supplies the fake-clock
   deadline fixture.
-- `drivers/rabbitmq/conformance_test.go` adapts RabbitMQ queue and parked
+- `drivers/rabbitmq/conformance_integration_test.go` adapts RabbitMQ queue and parked
   message inspection and uses the RabbitMQ fault injector from
   [`drivers/rabbitmq/fault_injector_test.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/drivers/rabbitmq/fault_injector_test.go).
-- `drivers/kafka/conformance_test.go` adapts Kafka offsets, consumer-group
+- `drivers/kafka/conformance_integration_test.go` adapts Kafka offsets, consumer-group
   state, deferred records, and the Kafka fault injector. Its `TestConformance`
   is gated by `F1_KAFKA_CONFORMANCE` because the live suite is intentionally
   explicit and long-running.
@@ -307,7 +307,7 @@ only the shared conformance test after the fixture is available, use:
 ```sh
 make broker-up
 make broker-smoke
-F1_REQUIRE_RABBITMQ=1 go test -race -count=1 -run '^TestConformance$' ./drivers/rabbitmq/...
+go test -race -count=1 -tags integration -run '^TestConformance$' ./drivers/rabbitmq/...
 ```
 
 The broader adapter command is [`make test-rabbitmq`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/Makefile). Stop
@@ -325,7 +325,7 @@ The target and its environment contract are defined in
 [`Makefile`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/Makefile). Running `make test-kafka` exercises the regular
 Kafka driver suite, but does not opt into the gated conformance run. The
 Kafka test itself also documents why the gate exists in
-[`drivers/kafka/conformance_test.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/drivers/kafka/conformance_test.go).
+[`drivers/kafka/conformance_integration_test.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/drivers/kafka/conformance_integration_test.go).
 
 When changing a port contract or adapter lifecycle, run the shared harness,
 the in-memory conformance, and the affected broker-backed suite. The repository
