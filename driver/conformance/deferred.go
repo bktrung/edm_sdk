@@ -94,7 +94,9 @@ func runDeferred(group *groupContext) {
 		if err := producer.Publish(group.ctx, driver.OutboundMessage{Destination: name, Body: []byte("bounded"), DelayUntil: due}); err != nil {
 			t.Fatal(err)
 		}
-		advanceDeferredTo(group, due.Add(deferredLateBound))
+		// Half the bound past the due time, not onto it, for the reason the due-order
+		// check's advance comment below gives.
+		advanceDeferredTo(group, due.Add(deferredLateBound/2))
 		message := receiveBefore(t, group, consumer, due.Add(deferredLateBound), "bounded deferred delivery")
 		if message.ReceivedAt.Before(due) || message.ReceivedAt.After(due.Add(deferredLateBound)) {
 			t.Fatalf("ReceivedAt=%s, want between %s and %s", message.ReceivedAt, due, due.Add(deferredLateBound))
@@ -129,7 +131,9 @@ func runDeferred(group *groupContext) {
 		}
 		for i, offset := range offsets {
 			due := base.Add(offset)
-			advanceDeferredTo(group, due.Add(deferredLateBound))
+			// Half the bound past the due time, not onto it, for the reason the due-order
+			// check's advance comment below gives.
+			advanceDeferredTo(group, due.Add(deferredLateBound/2))
 			message := receiveBefore(t, group, consumer, due.Add(deferredLateBound), "in-band deferred delivery")
 			due, ok := dues[string(message.Body)]
 			if !ok {
