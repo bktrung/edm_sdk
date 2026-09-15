@@ -261,14 +261,15 @@ test-kafka-conformance: kafka-up
 
 ## bench: measure publish, consume, latency and retry throughput through the
 ## public API against both brokers, starting the fixtures first. Consume runs
-## twice: at one handler at a time, and at the concurrency a caller who sets
-## none gets. A subscription over several partitions shares its handler slots
-## between them, so the second rate is not the first one times a number, and a
-## partition count is decided against the second. This target is not a gate and
-## must not join one: every number it prints depends on the machine it ran on,
-## and a gate that fails on a slow or busy box is a gate people learn to ignore.
-## Read its output as a comparison between the two drivers taken on one quiet
-## machine, never as a threshold.
+## five times: at one handler at a time, at three, and at the concurrency a
+## caller who sets none gets, the last three holding each message for 5ms.
+## A subscription over several partitions shares its handler slots between
+## them, so the shipped-concurrency rate is not the single-handler rate times a
+## number, and a partition count is decided against that rate. This target is
+## not a gate and must not join one: every number it prints depends on the
+## machine it ran on, and a gate that fails on a slow or busy box is a gate
+## people learn to ignore. Read its output as a comparison between the two
+## drivers taken on one quiet machine, never as a threshold.
 ##
 ## -benchtime=1000x -count=3: 1000 messages per benchmark run is enough for the
 ## publish, consume and latency rates to settle, and small enough that the

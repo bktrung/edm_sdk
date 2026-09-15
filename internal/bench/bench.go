@@ -84,6 +84,12 @@ type Config struct {
 	Publishers int
 	// Concurrency is the handler concurrency of the single lane.
 	Concurrency int
+	// HandlerWork is how long the consume measurement's handler holds each
+	// delivery before returning. It applies to the consume measurement alone:
+	// the publish, latency and retry measurements keep the handler that returns
+	// at once, so their numbers stay comparable with the ones taken before this
+	// field existed. A zero value is that handler.
+	HandlerWork time.Duration
 	// RetryTier is the retry delay the retry measurement configures as the only
 	// tier of a two-attempt ladder, so the handler's failed first attempt comes
 	// back after exactly this delay. Other measurements keep the shipped
@@ -101,6 +107,10 @@ type Result struct {
 	Publishers int
 	// Concurrency is the handler concurrency of the one lane.
 	Concurrency int
+	// HandlerWork is the handler hold time the measurement configured. The
+	// consume measurement is the one that applies it, and a zero value is a
+	// handler that returns at once.
+	HandlerWork time.Duration
 	// Elapsed is the measured window.
 	Elapsed time.Duration
 	// Latencies is one publish-to-ack duration per message, in sequence order.
@@ -174,6 +184,9 @@ func New(drv driver.Driver, cfg Config) (*Harness, error) {
 	}
 	if cfg.RetryTier < 0 {
 		return nil, fmt.Errorf("bench: retry tier must not be negative, got %s", cfg.RetryTier)
+	}
+	if cfg.HandlerWork < 0 {
+		return nil, fmt.Errorf("bench: handler work must not be negative, got %s", cfg.HandlerWork)
 	}
 	if cfg.Timeout <= 0 {
 		return nil, errors.New("bench: timeout must be positive")
@@ -522,6 +535,7 @@ func (h *Harness) measure(ctx context.Context, m mode) (Result, error) {
 		Messages:    h.cfg.Messages,
 		Publishers:  h.cfg.Publishers,
 		Concurrency: h.cfg.Concurrency,
+		HandlerWork: h.cfg.HandlerWork,
 		Elapsed:     elapsed,
 		Latencies:   r.tr.latencies(),
 		RetryTier:   h.cfg.RetryTier,
@@ -576,10 +590,20 @@ func (r *run) subscribe(ctx context.Context) error {
 	}
 }
 
-// handle is the subscription's handler. It records the delivery and, for the
-// retry measurement, fails every first attempt.
-func (r *run) handle(_ context.Context, event *f1.Event) error {
+// handle is the subscription's handler. It records the delivery, holds it for
+// the configured work when this measurement applies one, and for the retry
+// measurement fails every first attempt.
+//
+// The hold is a wait on the harness clock, and the context's error is returned
+// when that wait is cut short: a delivery whose wait was interrupted was not
+// handled, and settling it would count a message the handler never finished.
+func (r *run) handle(ctx context.Context, event *f1.Event) error {
 	r.tr.noteDelivery(string(event.Raw()))
+	if r.m == modeConsume && r.h.cfg.HandlerWork > 0 {
+		if err := r.h.clk.Sleep(ctx, r.h.cfg.HandlerWork); err != nil {
+			return err
+		}
+	}
 	if r.m == modeRetry && event.Attempt() < 2 {
 		return errors.New("bench: forced retry")
 	}

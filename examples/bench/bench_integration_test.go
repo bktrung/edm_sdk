@@ -28,13 +28,26 @@ const (
 	// DestinationSpec.Partitions is zero - so the broker's own
 	// KAFKA_NUM_PARTITIONS applies, and docker/docker-compose.yml sets it to 3.
 	// The count is reported beside every Kafka number because it is part of the
-	// shape measured, not because it bounds the rate: on these three partitions
-	// the subscription reached 430.1 msgs/s at the shipped handler concurrency
-	// and 76.47 msgs/s with one handler at a time, which is more than three
-	// times the single-handler rate and therefore past any bound the count
-	// could impose. A run against another broker states its own count in
-	// F1_KAFKA_PARTITIONS.
+	// shape measured: it is how many partitions the corpus is spread over, and
+	// the work-5ms/concurrency-3 consume cell uses it as the handler
+	// concurrency a subscription limited to one handler per partition would
+	// have. The consume cells open their window before the corpus is published,
+	// so each Kafka consume number here is read against the publish benchmark's
+	// rate at consumeLoadPublishers, not as a ceiling the partition count
+	// supplies. Measured at 3f6cbfa that rate was 20127 msgs/s, no Kafka consume
+	// cell came within 10 percent of it, and the work-5ms shipped cell's 2561
+	// msgs/s needs about thirteen handlers in flight, which three partitions
+	// cannot supply one each. A run against another broker states its own count
+	// in F1_KAFKA_PARTITIONS.
 	kafkaFixturePartitions = 3
+
+	// slowHandlerWork is the handler hold time the work-5ms consume cells
+	// measure with. A handler that holds a delivery is what makes a consume rate
+	// describe what the handler concurrency buys: with a handler that returns at
+	// once the handler slots are not what the cell runs out of, so no slot count
+	// can be read from it. The wait is orders of magnitude inside the harness's
+	// handler timeout, so it is never what ends a delivery.
+	slowHandlerWork = 5 * time.Millisecond
 
 	// kafkaRetryTier is the retry delay the Kafka retry benchmark configures.
 	// The driver checks a deferred record's due time against a band whose lower
@@ -52,11 +65,17 @@ const (
 	// accuracy, so anything shorter is delivered a full rung late regardless.
 	rabbitRetryTier = 500 * time.Millisecond
 
-	// loadPublishers is how many publishers fill the corpus for the consume,
-	// latency and retry measurements. One publisher would put its own confirm
-	// latency in front of every message and the rate would describe the
-	// publisher rather than the consumer.
+	// loadPublishers is how many publishers fill the corpus for the retry
+	// measurement. The consume measurement has its own count, because its rate
+	// is read against its load.
 	loadPublishers = 4
+
+	// consumeLoadPublishers is how many publishers fill the corpus for the
+	// consume measurement. A consume measurement opens its window before the
+	// corpus is published, so a consume rate can never beat the rate this load
+	// reaches, and 16 is the highest publisher count the publish benchmark
+	// measures, which is what a consume cell's ceiling is read against.
+	consumeLoadPublishers = 16
 
 	// measurementTimeout bounds one measurement, including client construction,
 	// warm-up and drain. The retry measurement on RabbitMQ is the slow one: the
@@ -77,13 +96,19 @@ func BenchmarkRabbitMQPublish(b *testing.B) {
 }
 
 // BenchmarkKafkaConsume measures Kafka consume-and-settle throughput on one
-// lane, at one handler at a time and at the shipped handler concurrency.
+// lane. With a handler that returns at once it runs at one handler at a time
+// and at the shipped handler concurrency; with a handler that holds every
+// delivery for 5ms it runs at one handler at a time, at three, and at the
+// shipped handler concurrency.
 func BenchmarkKafkaConsume(b *testing.B) {
 	benchmarkConsume(b, kafka.Driver{}, kafkaEndpoint())
 }
 
 // BenchmarkRabbitMQConsume measures RabbitMQ consume-and-settle throughput on
-// one lane, at one handler at a time and at the shipped handler concurrency.
+// one lane. With a handler that returns at once it runs at one handler at a
+// time and at the shipped handler concurrency; with a handler that holds every
+// delivery for 5ms it runs at one handler at a time, at three, and at the
+// shipped handler concurrency.
 func BenchmarkRabbitMQConsume(b *testing.B) {
 	benchmarkConsume(b, rabbitmq.Driver{}, rabbitMQEndpoint())
 }
@@ -138,7 +163,15 @@ func benchmarkPublish(b *testing.B, drv driver.Driver, endpoint string) {
 	}
 }
 
-// benchmarkConsume runs the consume-and-settle measurement twice per driver.
+// benchmarkConsume runs the consume-and-settle measurement five times per
+// driver.
+//
+// Every consume measurement opens its window before the corpus is published, so
+// a rate it reports contains its own load: the corpus can only arrive as fast as
+// consumeLoadPublishers publish it, and a cell whose rate is level with the
+// publish benchmark at that same publisher count is describing the load rather
+// than the consumer. Each cell below is read against that publish rate, which at
+// 3f6cbfa was 20127 msgs/s on Kafka and 2815 on RabbitMQ.
 //
 // concurrency-1 is one handler at a time across all of the subscription's
 // partitions: the rate one message-at-a-time handling reaches, whatever the
@@ -148,9 +181,24 @@ func benchmarkPublish(b *testing.B, drv driver.Driver, endpoint string) {
 // the rate a subscription of this shape actually reaches. The two are not
 // interchangeable: a subscription over several partitions shares its handler
 // slots between them, so the second number is not the first one multiplied by
-// anything. On three Kafka partitions, measured, the first was 76.47 msgs/s and
-// the second 430.1 msgs/s, above three times the first, so what bounds this
-// shape is the handler concurrency and not the partition count.
+// anything. Measured at 3f6cbfa with a handler that returns at once, Kafka
+// reached 3625 msgs/s at one handler and 7178 at the shipped concurrency, both
+// far under its load, so those two cells describe the consumer; RabbitMQ
+// reached 742.5 and 2828, and the second of those sits at the load rate, so
+// that one cell is bound by the load and says nothing about the consumer.
+//
+// The three work-5ms cells hold each delivery in the handler for 5ms, which is
+// what shows what the handler concurrency buys once a handler takes time.
+// concurrency-3 is the Kafka fixture's partition count, so that cell is the
+// rate a subscription limited to one handler per partition would reach on three
+// partitions; the other two are the same single-slot and shipped shapes.
+// Measured at 3f6cbfa against ceilings of 200, 600 and 3200 msgs/s for one,
+// three and sixteen slots, Kafka reached 177.6, 529.7 and 2561, which is 88.8,
+// 88.3 and 80.0 percent of them, and RabbitMQ reached 173.1, 395.8 and 2021,
+// 86.6, 66.0 and 63.2 percent. No work-5ms cell is within 10 percent of its
+// driver's load rate, so each of the six measures the consumer; RabbitMQ's
+// shipped cell gets 2021 msgs/s out of the sixteen slots, about ten of them
+// busy on average.
 //
 // The shipped case passes zero rather than the value the client ships with, so
 // the case keeps measuring the shipped value if that value changes.
@@ -159,17 +207,22 @@ func benchmarkConsume(b *testing.B, drv driver.Driver, endpoint string) {
 	for _, c := range []struct {
 		name        string
 		concurrency int
+		handlerWork time.Duration
 	}{
 		{name: "concurrency-1", concurrency: 1},
 		{name: "concurrency-shipped"},
+		{name: "work-5ms/concurrency-1", concurrency: 1, handlerWork: slowHandlerWork},
+		{name: "work-5ms/concurrency-3", concurrency: kafkaFixturePartitions, handlerWork: slowHandlerWork},
+		{name: "work-5ms/concurrency-shipped", handlerWork: slowHandlerWork},
 	} {
 		b.Run(c.name, func(b *testing.B) {
 			h := newBench(b, drv, bench.Config{
 				Namespace:   namespace,
 				Endpoint:    endpoint,
 				Messages:    b.N,
-				Publishers:  loadPublishers,
+				Publishers:  consumeLoadPublishers,
 				Concurrency: c.concurrency,
+				HandlerWork: c.handlerWork,
 				Timeout:     measurementTimeout,
 			})
 			defer closeBench(b, h)
