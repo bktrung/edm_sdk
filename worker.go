@@ -71,7 +71,18 @@ type deliveryState struct {
 
 type poisonDropReport struct {
 	envelope Envelope
-	cause    error
+	// reason is the death reason the dropped delivery was settling with.
+	reason DeathReason
+	// headline leads both the report and the last-resort log line, so a drop
+	// that is not a missing route does not borrow the poison wording.
+	headline string
+	// description fills the report's slot after the destination and logMessage
+	// is the last-resort logger's text. They are separate because the
+	// missing-route drop has a different phrase on each surface today, and
+	// generalizing the report must not edit either one.
+	description string
+	logMessage  string
+	cause       error
 }
 
 // --- Public runner API and generation lifecycle ---
@@ -1768,17 +1779,36 @@ func nackDelivery(r *Runner, ctx context.Context, message driver.InboundMessage,
 func deadLetterAndSettle(r *Runner, ctx context.Context, message driver.InboundMessage, envelope Envelope, reason DeathReason, lastErr error, states ...*deliveryState) bool {
 	state := stateFor(states)
 	if err := deadLetter(r, ctx, message, envelope, reason, lastErr, state.headerMaxBytes); err != nil {
-		if reason == ReasonPoison && isMissingDeadLetterRoute(err) {
-			state.poisonDrop = &poisonDropReport{envelope: envelope, cause: err}
-			sctx := runnerSettlementContext(r, ctx)
-			settled := ackDeliveryAs(r, sctx, message, true, state)
-			if settled {
-				reportPendingPoisonDrop(r, sctx, message, state)
+		switch {
+		case reason == ReasonPoison && isMissingDeadLetterRoute(err):
+			state.poisonDrop = &poisonDropReport{
+				envelope:    envelope,
+				reason:      reason,
+				headline:    "poison message dropped",
+				description: "no dead-letter route available",
+				logMessage:  "no dead-letter route",
+				cause:       err,
 			}
-			return settled
+		case successorNeverPublishable(err):
+			dropped := successorDropDescription(reason, err)
+			state.poisonDrop = &poisonDropReport{
+				envelope:    envelope,
+				reason:      reason,
+				headline:    "message dropped",
+				description: dropped,
+				logMessage:  dropped,
+				cause:       err,
+			}
+		default:
+			failSuccessorHandoff(r, runnerSettlementContext(r, ctx), "dead_letter", eventFromDelivery(r, message, envelope, state.headerMaxBytes), err)
+			return false
 		}
-		failSuccessorHandoff(r, runnerSettlementContext(r, ctx), "dead_letter", eventFromDelivery(r, message, envelope, state.headerMaxBytes), err)
-		return false
+		sctx := runnerSettlementContext(r, ctx)
+		settled := ackDeliveryAs(r, sctx, message, true, state)
+		if settled {
+			reportPendingPoisonDrop(r, sctx, message, state)
+		}
+		return settled
 	}
 	return ackDeliveryAs(r, runnerSettlementContext(r, ctx), message, false, state)
 }
@@ -1791,28 +1821,58 @@ func isMissingDeadLetterRoute(err error) bool {
 	return classified && kind == driver.KindNotFound
 }
 
-func reportPoisonDrop(r *Runner, ctx context.Context, message driver.InboundMessage, envelope Envelope, headerMaxBytes int, cause error) {
-	dropErr := fmt.Errorf("f1: poison message dropped: event_id=%q destination=%q attempt=%d: no dead-letter route available: %w", envelope.ID, message.Destination, envelope.Attempt, cause)
+// errSuccessorCopyUnencodable marks a successor copy this process could not
+// encode at all, as opposed to one a broker refused. It is unexported because
+// only the drop decision in this file reads it; the encoding error it wraps
+// keeps ErrEnvelopeTooLarge reachable through errors.Is.
+var errSuccessorCopyUnencodable = errors.New("f1: successor copy cannot be encoded")
+
+// successorNeverPublishable reports whether err says the copy itself will never
+// be accepted, rather than that its destination is temporarily unable to take
+// it: the broker refused the copy as too large, or the copy could not be
+// encoded at all. Either repeats on every redelivery and after every restart,
+// so such a delivery is settled instead of stopping the subscription.
+func successorNeverPublishable(err error) bool {
+	if errors.Is(err, errSuccessorCopyUnencodable) {
+		return true
+	}
+	kind, classified := driver.Classify(err)
+	return classified && kind == driver.KindTooLarge
+}
+
+// successorDropDescription names, for the drop report, why a successor that can
+// never be published was dropped. It fills the slot the missing-route drop
+// fills with the route it could not find.
+func successorDropDescription(reason DeathReason, err error) string {
+	shape := "dead-letter copy exceeds the broker limit"
+	if errors.Is(err, errSuccessorCopyUnencodable) {
+		shape = "dead-letter copy cannot be encoded"
+	}
+	return fmt.Sprintf("%s (death reason %s)", shape, reason)
+}
+
+func reportPoisonDrop(r *Runner, ctx context.Context, message driver.InboundMessage, report poisonDropReport, headerMaxBytes int) {
+	dropErr := fmt.Errorf("f1: %s: event_id=%q destination=%q attempt=%d: %s: %w", report.headline, report.envelope.ID, message.Destination, report.envelope.Attempt, report.description, report.cause)
 	if r.client.options.errorHandler == nil {
-		lastResortRunnerLogger(r).Error("f1 poison message dropped; no dead-letter route",
-			"event_id", envelope.ID,
+		lastResortRunnerLogger(r).Error("f1 "+report.headline+"; "+report.logMessage,
+			"event_id", report.envelope.ID,
 			"destination", message.Destination,
-			"attempt", envelope.Attempt,
-			"reason", ReasonPoison,
-			"error", cause,
+			"attempt", report.envelope.Attempt,
+			"reason", report.reason,
+			"error", report.cause,
 		)
 		return
 	}
-	runnerNotifyError(r, ctx, eventFromDelivery(r, message, envelope, headerMaxBytes), dropErr)
+	runnerNotifyError(r, ctx, eventFromDelivery(r, message, report.envelope, headerMaxBytes), dropErr)
 }
 
 func reportPendingPoisonDrop(r *Runner, ctx context.Context, message driver.InboundMessage, state *deliveryState) {
 	if state == nil || state.poisonDrop == nil {
 		return
 	}
-	report := state.poisonDrop
+	report := *state.poisonDrop
 	state.poisonDrop = nil
-	reportPoisonDrop(r, ctx, message, report.envelope, state.headerMaxBytes, report.cause)
+	reportPoisonDrop(r, ctx, message, report, state.headerMaxBytes)
 }
 
 // deadLetter republishes message to its dead-letter destination, carrying
@@ -1873,7 +1933,10 @@ func deadLetter(r *Runner, ctx context.Context, message driver.InboundMessage, e
 	destination := deadLetterDestination(r, death, message)
 	encoded, err := death.EncodeHeaders(headerMaxBytes)
 	if err != nil {
-		return err
+		// Marked rather than returned bare: the caller decides what to do with
+		// an unencodable copy, and it must not have to match on the text to
+		// tell this apart from a destination refusing the copy.
+		return fmt.Errorf("%w: %w", errSuccessorCopyUnencodable, err)
 	}
 	out := driver.OutboundMessage{Destination: destination, Key: append([]byte(nil), message.Key...), Body: append([]byte(nil), message.Body...)}
 	for key, value := range encoded {
@@ -1968,8 +2031,9 @@ func failSuccessorHandoff(r *Runner, ctx context.Context, op string, event *Even
 // already-received body forward unchanged. Like deadLetter, it deliberately
 // does not apply codec.maxBodyBytes: that limit only guards a publish the
 // application originated, and this body was already accepted once. A retry
-// copy whose headers cannot be encoded is handed to the dead-letter path
-// rather than settled.
+// copy that cannot be encoded, or that the broker refuses as too large, is
+// handed to the dead-letter path rather than settled: a copy the message
+// itself makes unacceptable fails the same way on every redelivery.
 func retryAndSettle(r *Runner, ctx context.Context, message driver.InboundMessage, envelope Envelope, lastErr error, states ...*deliveryState) bool {
 	state := stateFor(states)
 	copyEnvelope := envelope
@@ -2014,6 +2078,13 @@ func retryAndSettle(r *Runner, ctx context.Context, message driver.InboundMessag
 	}
 	sort.Slice(out.Headers, func(i, j int) bool { return out.Headers[i].Key < out.Headers[j].Key })
 	if err := publishSuccessor(r, runnerSettlementContext(r, ctx), out); err != nil {
+		if successorNeverPublishable(err) {
+			// The copy is unacceptable on its own terms, so it would be refused
+			// again on every redelivery: hand the message to the dead-letter
+			// path instead of stopping the subscription over it.
+			return deadLetterAndSettle(r, ctx, message, envelope, ReasonTerminal,
+				errors.Join(lastErr, fmt.Errorf("f1: retry copy cannot be published: %w", err)), state)
+		}
 		failSuccessorHandoff(r, runnerSettlementContext(r, ctx), "retry", eventFromDelivery(r, message, envelope, state.headerMaxBytes), err)
 		return false
 	}

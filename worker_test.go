@@ -466,17 +466,17 @@ func oneSecondTimer(t *testing.T) clock.Timer {
 	return timer
 }
 
-// TestRetryCopyThatCannotEncodeGoesToTheDeadLetterPath proves a delivery
-// whose retry copy will not fit the header cap is handed to the dead-letter
-// path instead of being settled: the original stays unsettled for the broker
-// to redeliver, the consumer is released, and the error handler is told the
-// hand-off failed. The dead-letter copy cannot fit either, but for a
-// different reason than the retry copy's: it is built from the original
-// envelope, so it carries no due time, and it adds the never-shed
-// f1deathreason and f1deathtime on top of the cap the original already needs.
-// The hand-off failure is therefore the ruled outcome and no dead-letter
-// notification happens.
-func TestRetryCopyThatCannotEncodeGoesToTheDeadLetterPath(t *testing.T) {
+// TestRetryAndDeadLetterCopiesBothUnencodableDropOnce proves the encode twin of
+// the too-large chain: a retry copy that will not fit the header cap is handed
+// to the dead-letter path instead of being settled, and the dead-letter copy
+// does not fit either, for a different reason than the retry copy's: it is
+// built from the original envelope, so it carries no due time, and it adds the
+// never-shed f1deathreason and f1deathtime on top of the cap the original
+// already needs. A copy the message itself makes unbuildable is dropped: the
+// original is acknowledged and never nacked, the consumer is not released, and
+// one drop report replaces the hand-off failure. The subscription is not
+// stopped, so no health error is recorded.
+func TestRetryAndDeadLetterCopiesBothUnencodableDropOnce(t *testing.T) {
 	recorder := newErrorHandlerRecorder()
 	consumer := newDispatchConsumer()
 	producer := &dispatchProducer{}
@@ -520,41 +520,40 @@ func TestRetryCopyThatCannotEncodeGoesToTheDeadLetterPath(t *testing.T) {
 		t.Fatalf("retry copy EncodeHeaders(%d) error = %v, want %v: the premise that the copy cannot be built does not hold", limit, err, ErrEnvelopeTooLarge)
 	}
 
-	if retryAndSettle(runner, context.Background(), message, envelope, errors.New("temporary"), &deliveryState{headerMaxBytes: limit}) {
-		t.Fatal("retryAndSettle reported success for a retry copy it could not encode")
+	if !retryAndSettle(runner, context.Background(), message, envelope, errors.New("temporary"), &deliveryState{headerMaxBytes: limit}) {
+		t.Fatal("retryAndSettle did not report the delivery settled: a copy that can never be built is dropped rather than handed back")
 	}
-	if settler.acks != 0 {
-		t.Fatalf("Ack calls = %d, want 0: the original must stay unsettled", settler.acks)
+	if settler.acks != 1 {
+		t.Fatalf("Ack calls = %d, want 1: the drop acknowledges the original", settler.acks)
 	}
 	if len(settler.nacks) != 0 {
-		t.Fatalf("Nack calls = %+v, want none: the original must stay unsettled", settler.nacks)
+		t.Fatalf("Nack calls = %+v, want none: a dropped delivery is acknowledged, never handed back", settler.nacks)
 	}
 	producer.mu.Lock()
 	published := len(producer.messages)
 	producer.mu.Unlock()
 	if published != 0 {
-		t.Fatalf("published messages = %d, want 0: an unencodable retry copy must not be published", published)
+		t.Fatalf("published messages = %d, want 0: neither copy can be encoded, so neither is published", published)
 	}
 	consumer.mu.Lock()
 	released := consumer.released
 	consumer.mu.Unlock()
-	if !released {
-		t.Fatal("consumer was not released: nothing would redeliver the still-unsettled original")
+	if released {
+		t.Fatal("consumer was released: a dropped delivery is settled, so there is nothing to hand back for redelivery")
 	}
 
 	recorder.waitForCall(t, time.Second)
 	if got := recorder.count(); got != 1 {
-		t.Fatalf("error handler calls = %d, want 1", got)
+		t.Fatalf("error handler calls = %d, want 1: the chain is reported once", got)
 	}
 	recorder.mu.Lock()
 	call := recorder.calls[0]
 	recorder.mu.Unlock()
-	classified, ok := errors.AsType[*driver.Error](call.err)
-	if !ok {
-		t.Fatalf("error = %v, want a classified *driver.Error", call.err)
+	if !strings.HasPrefix(call.err.Error(), "f1: message dropped: event_id=") {
+		t.Fatalf("error = %q, want the message-drop headline a dropped delivery is reported under", call.err)
 	}
-	if classified.Op != "dead_letter" {
-		t.Fatalf("driver error op = %q, want %q", classified.Op, "dead_letter")
+	if classified, ok := errors.AsType[*driver.Error](call.err); ok {
+		t.Fatalf("error = %v, want a drop report, got the classified %s hand-off failure", call.err, classified.Op)
 	}
 	if !errors.Is(call.err, ErrEnvelopeTooLarge) {
 		t.Fatalf("error = %v, want it to wrap %v", call.err, ErrEnvelopeTooLarge)
@@ -564,5 +563,8 @@ func TestRetryCopyThatCannotEncodeGoesToTheDeadLetterPath(t *testing.T) {
 	}
 	if got := call.event.ID(); got != envelope.ID {
 		t.Fatalf("event ID = %q, want %q", got, envelope.ID)
+	}
+	if err := client.Health(context.Background()); err != nil {
+		t.Fatalf("Health() = %v, want nil: a dropped message does not stop the subscription", err)
 	}
 }
