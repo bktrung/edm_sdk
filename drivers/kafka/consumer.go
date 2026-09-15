@@ -803,13 +803,32 @@ func (c *consumer) requestLeave() {
 	c.leaveMu.Unlock()
 }
 
+// requestLeaveAndWait asks the leave loop to leave the group and returns the
+// leave's error alone. A caller whose decision also depends on whether the
+// leave finished, rather than on the wait being abandoned, uses waitForLeave.
 func (c *consumer) requestLeaveAndWait(ctx context.Context) error {
+	_, err := c.waitForLeave(ctx)
+	return err
+}
+
+// waitForLeave asks the leave loop to leave the group and waits for the
+// outcome. It reports whether the leave is over: true means leaveErr carries
+// the outcome the loop reached, which may be nil, or that the consumer had
+// already been torn down, which reports nil; false means ctx ended first, the
+// loop is still running, and a later call with a fresh context observes that
+// same outcome.
+//
+// The two returns cannot be told apart by the error. The leave runs on its own
+// timeout, so a leave that finished can fail with a context error of its own;
+// and finishLeave closes leaveFinished once and keeps leaveErr, so the outcome
+// the loop reached is the only one any later wait will see.
+func (c *consumer) waitForLeave(ctx context.Context) (finished bool, leaveErr error) {
 	c.leaveMu.Lock()
 	c.mu.Lock()
 	if c.leaveClosed {
 		c.mu.Unlock()
 		c.leaveMu.Unlock()
-		return nil
+		return true, nil
 	}
 	c.leaveRequested = true
 	c.requestLeaveLocked()
@@ -817,13 +836,24 @@ func (c *consumer) requestLeaveAndWait(ctx context.Context) error {
 	c.leaveMu.Unlock()
 	select {
 	case <-c.leaveFinished:
-		c.mu.Lock()
-		err := c.leaveErr
-		c.mu.Unlock()
-		return err
 	case <-ctx.Done():
-		return ctx.Err()
+		// The context ending means this caller gave up only if the leave really
+		// is still in flight. Both cases are ready whenever the leave finished
+		// around the moment ctx ended, and select then picks between ready
+		// cases at random, so the finished outcome is re-checked here rather
+		// than left to that coin flip: it is the outcome the caller has to act
+		// on, and taking the context instead would skip the teardown a finished
+		// leave runs.
+		select {
+		case <-c.leaveFinished:
+		default:
+			return false, ctx.Err()
+		}
 	}
+	c.mu.Lock()
+	leaveErr = c.leaveErr
+	c.mu.Unlock()
+	return true, leaveErr
 }
 
 func (c *consumer) finishLeave(err error) {
@@ -842,10 +872,22 @@ func (c *consumer) leaveGroup(ctx context.Context, request leaveRequest) error {
 	// The membership selector lives in production: forcing the static
 	// condition false routes every member through the dynamic operation,
 	// which the leave-selection test observes.
+	var err error
 	if request.static && request.instanceID != "" {
-		return c.leaveStatic(ctx, request.group, request.instanceID)
+		err = c.leaveStatic(ctx, request.group, request.instanceID)
+	} else {
+		err = c.leaveDynamic(ctx)
 	}
-	return c.leaveDynamic(ctx)
+	// UNKNOWN_MEMBER_ID means the coordinator does not know this member, which
+	// is the state a leave exists to reach: the member was expired, or the
+	// shutdown landed before its join completed, as a rolling deploy does. It
+	// is reported as a clean leave so it does not surface as a failure. Every
+	// other code keeps its error, including FENCED_INSTANCE_ID, where the
+	// member is still in the group and the caller has to know.
+	if errors.Is(err, kerr.UnknownMemberID) {
+		return nil
+	}
+	return err
 }
 
 func (c *consumer) leaveLoop() {
@@ -2381,14 +2423,23 @@ func (c *consumer) setPauseReasonLocked(destination string, reason pauseReason, 
 }
 
 func (c *consumer) Drain(ctx context.Context) error {
+	_, err := c.drain(ctx)
+	return err
+}
+
+// drain is Drain's body. It reports whether the leave it waited on finished, so
+// its caller can tell a leave that reached an outcome from a wait this caller's
+// context abandoned; Drain itself discards that and returns the error alone. A
+// false return with a nil error means no leave was waited on at all.
+func (c *consumer) drain(ctx context.Context) (leaveFinished bool, err error) {
 	if err := ctx.Err(); err != nil {
-		return classify("drain", driver.KindTransient, err)
+		return false, classify("drain", driver.KindTransient, err)
 	}
 	c.stopForwarders()
 	c.mu.Lock()
 	if c.stopped {
 		c.mu.Unlock()
-		return nil
+		return false, nil
 	}
 	if !c.draining {
 		c.draining = true
@@ -2400,17 +2451,19 @@ func (c *consumer) Drain(ctx context.Context) error {
 	pollDone := c.pollDone
 	c.mu.Unlock()
 	if err := c.waitPoll(ctx, "drain", pollDone); err != nil {
-		return err
+		return false, err
 	}
 	c.mu.Lock()
 	leaveNow := len(c.settlers) == 0 && !c.leaveRequested
 	c.mu.Unlock()
 	if leaveNow {
-		if err := c.requestLeaveAndWait(ctx); err != nil {
-			return classify("drain", kafkaErrorKind(err), err)
+		finished, leaveErr := c.waitForLeave(ctx)
+		if leaveErr != nil {
+			return finished, classify("drain", kafkaErrorKind(leaveErr), leaveErr)
 		}
+		return finished, nil
 	}
-	return nil
+	return false, nil
 }
 
 func (c *consumer) waitPoll(ctx context.Context, operation string, pollDone <-chan struct{}) error {
@@ -2426,11 +2479,21 @@ func (c *consumer) Stop(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
 		return stopContextError(err)
 	}
-	if err := c.Drain(ctx); err != nil {
-		if errors.Is(err, context.DeadlineExceeded) && !errors.Is(err, driver.ErrDrainTimeout) {
-			return classify("stop", driver.KindTransient, fmt.Errorf("%w: %w", driver.ErrDrainTimeout, err))
+	// A drain that met a finished leave does not end the stop here, whether that
+	// leave succeeded or not: the consumer is torn down below and the error is
+	// returned after it, the same rule Release follows. The checks below still
+	// apply, so an outstanding settler still refuses the stop with the consumer
+	// registered, and a concurrent Stop or Release that tears down first still
+	// makes this call return nil. The early return stays for every other drain
+	// failure, including a leave the caller's context abandoned, because nothing
+	// has finished there and the consumer has to stay registered for a later
+	// Stop or Release to complete the leave.
+	drainFinished, drainErr := c.drain(ctx)
+	if drainErr != nil && !drainFinished {
+		if errors.Is(drainErr, context.DeadlineExceeded) && !errors.Is(drainErr, driver.ErrDrainTimeout) {
+			return classify("stop", driver.KindTransient, fmt.Errorf("%w: %w", driver.ErrDrainTimeout, drainErr))
 		}
-		return err
+		return drainErr
 	}
 
 	c.mu.Lock()
@@ -2451,8 +2514,18 @@ func (c *consumer) Stop(ctx context.Context) error {
 	}
 	c.mu.Unlock()
 
-	if err := c.requestLeaveAndWait(ctx); err != nil {
-		return stopContextError(err)
+	// Same rule as Release: a finished leave ends the consumer whether or not it
+	// succeeded. The broker expires the member on its session timeout anyway, so
+	// staying registered buys no membership and strands the connection, because
+	// conn.Close refuses while any consumer is registered and finishLeave keeps
+	// leaveErr for every later wait. The error is not swallowed: finishLeave
+	// already sent it to Errors(), and Stop returns it below, unless another
+	// caller had already stopped the consumer, whose completed stop returns nil.
+	// Only a context that ended while the leave was still in flight returns here,
+	// and that consumer stays registered so a later call completes the leave.
+	leaveFinished, leaveErr := c.waitForLeave(ctx)
+	if !leaveFinished {
+		return stopContextError(leaveErr)
 	}
 
 	c.mu.Lock()
@@ -2470,6 +2543,9 @@ func (c *consumer) Stop(ctx context.Context) error {
 	c.mu.Unlock()
 
 	c.closeTeardown(ctx)
+	if leaveErr != nil {
+		return stopContextError(leaveErr)
+	}
 	return nil
 }
 
@@ -2601,9 +2677,22 @@ func (c *consumer) Release(ctx context.Context) error {
 		tracker.Drop()
 	}
 
-	if err := c.requestLeaveAndWait(ctx); err != nil {
-		return classify("release", kafkaErrorKind(err), err)
+	// The wait has two returns and they mean different things: the leave
+	// finished, with whatever error it carries, or this caller's context ended
+	// while the leave was still in flight. Only the second leaves the consumer
+	// with work still pending, so only the second keeps it registered.
+	leaveFinished, leaveErr := c.waitForLeave(ctx)
+	if !leaveFinished {
+		return classify("release", kafkaErrorKind(leaveErr), leaveErr)
 	}
+	// A finished leave ends the consumer whether or not it succeeded. The
+	// broker expires the member on its session timeout anyway, so holding the
+	// registration buys no membership and strands the connection: conn.Close
+	// refuses while any consumer is registered, and no retry can clear this,
+	// because finishLeave keeps leaveErr for every later wait. The error is not
+	// swallowed: finishLeave already sent it to Errors(), and this call returns
+	// it below, unless another caller had already stopped the consumer, whose
+	// completed stop returns nil.
 
 	c.mu.Lock()
 	if c.stopped {
@@ -2620,6 +2709,9 @@ func (c *consumer) Release(ctx context.Context) error {
 	c.mu.Unlock()
 
 	c.closeTeardown(ctx)
+	if leaveErr != nil {
+		return classify("release", kafkaErrorKind(leaveErr), leaveErr)
+	}
 	return nil
 }
 
