@@ -833,6 +833,80 @@ func classifyAMQP(op string, fallback driver.Kind, err error) error {
 	return classify(op, kind, err)
 }
 
+// classifyPublishClose classifies the close of a channel a publish was running
+// on, where a message the broker refused for its size has to be told apart from
+// the many other ways a publish channel ends.
+//
+// Only the size refusal is classified here rather than by classifyAMQP. It is
+// the one close that names the limit the broker applies, so it is the one kind
+// a message's own body can answer for: the window that read this close reports
+// every message over that limit as too large, whether or not it is the message
+// the broker refused.
+//
+// Every other close keeps the transient kind a closed publish channel has
+// always had, whatever code it carried. That includes a server-sent 501-504,
+// where classifyAMQP would say fatal: transient is what makes the core take the
+// connection down and build it again, which is the only answer to a frame the
+// broker refused, and the connection is gone either way. The frame error is the
+// one of those that reaches this path in practice - the broker sends it for a
+// content-header frame over its frame limit, which a message with a large
+// header set produces - and a reconnect is what recovers it.
+func classifyPublishClose(err error) error {
+	if _, refused := sizeRefusalLimit(err); refused {
+		return classify("publish", driver.KindTooLarge, err)
+	}
+	return classify("publish", driver.KindTransient, err)
+}
+
+// sizeLimitPrefix is the phrase a size refusal states the broker's limit after,
+// in both wordings of that refusal.
+const sizeLimitPrefix = "max size "
+
+// sizeRefusalLimit reports the limit the broker named, when err is the close of
+// a channel it refused a publish on for the size of the message.
+//
+// The reply code alone cannot decide it. Every publish precondition the broker
+// can fail arrives as 406 PRECONDITION_FAILED, so a message carrying an
+// expiration the broker cannot parse is refused with the same code, and so is
+// any other check the channel makes before routing. The reason is the only part
+// that separates them, and the wording is the one RabbitMQ has used for this
+// refusal since it grew the limit, unchanged from 3.8 through 4.3:
+//
+//	PRECONDITION_FAILED - message size 16777217 is larger than configured max size 16777216
+//
+// A broker that applies a limit that is not a configured one words the same
+// refusal "is larger than max size N" instead, so the two phrases matched below
+// are what both wordings share, and neither is a phrase another publish
+// precondition uses.
+//
+// The number after the last "max size" is the limit the broker applies, not the
+// size it refused: the size it refused appears after "message size" instead, and
+// reading that one would compare every later message of a window against the
+// length of the message that was refused. The limit it names is what makes a
+// body length answerable for a refusal, which is the one thing a driver holding
+// no declared message limit of its own can use. A 406 that carries both phrases
+// but no number readable after "max size" is not treated as a size refusal:
+// nothing here would then know the limit, and a refusal the driver cannot
+// measure is the closed publish channel it was before.
+func sizeRefusalLimit(err error) (int, bool) {
+	amqpErr, ok := errors.AsType[*amqp.Error](err)
+	if !ok ||
+		amqpErr.Code != 406 ||
+		!strings.Contains(amqpErr.Reason, "message size") ||
+		!strings.Contains(amqpErr.Reason, "larger than") {
+		return 0, false
+	}
+	index := strings.LastIndex(amqpErr.Reason, sizeLimitPrefix)
+	if index < 0 {
+		return 0, false
+	}
+	var limit int
+	if _, scanErr := fmt.Sscanf(amqpErr.Reason[index+len(sizeLimitPrefix):], "%d", &limit); scanErr != nil {
+		return 0, false
+	}
+	return limit, true
+}
+
 func (c *conn) removeProducer(producer *producer) {
 	c.mu.Lock()
 	delete(c.producers, producer)

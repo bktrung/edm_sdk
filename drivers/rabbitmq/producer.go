@@ -42,6 +42,12 @@ type publishChannel struct {
 	channel  *amqp.Channel
 	confirms chan amqp.Confirmation
 	returns  chan amqp.Return
+	// closes receives the reason the channel closed, which is the only place
+	// the broker's own words for a refused publish survive. The client sends it
+	// once, before it closes the return stream and then the confirm stream, and
+	// sends nothing at all when it has no reason to report, so one slot is all
+	// a reader can be given.
+	closes chan *amqp.Error
 }
 
 type producer struct {
@@ -115,8 +121,8 @@ func newProducer(ctx context.Context, conn *conn, cfg driver.ProducerConfig) (*p
 	return p, nil
 }
 
-// openChannel opens one confirm-mode channel and registers the two streams the
-// publish window reads from it.
+// openChannel opens one confirm-mode channel and registers the three streams
+// the publish window reads from it.
 //
 // A block is waited out before anything is opened: the two round trips below
 // are synchronous, and a broker that is blocking publishers has stopped
@@ -155,9 +161,11 @@ func (p *producer) openChannel(ctx context.Context) (*publishChannel, error) {
 		channel:  raw,
 		confirms: make(chan amqp.Confirmation, publishWindowSize),
 		returns:  make(chan amqp.Return, publishWindowSize),
+		closes:   make(chan *amqp.Error, 1),
 	}
 	raw.NotifyPublish(channel.confirms)
 	raw.NotifyReturn(channel.returns)
+	raw.NotifyClose(channel.closes)
 	return channel, nil
 }
 
@@ -193,10 +201,12 @@ func (p *producer) Publish(ctx context.Context, msgs ...driver.OutboundMessage) 
 	for base := 0; base < len(msgs); {
 		consumed, err := p.publishWindow(channel, ctx, msgs, base, failed)
 		if err != nil {
-			// The channel is gone. Every index the window did not decide
-			// failed for that same reason, and no message after it can be
-			// published on the channel either.
-			for index := base; index < len(msgs); index++ {
+			// Every message the window decided keeps the outcome it decided:
+			// the ones it confirmed before the channel closed are published,
+			// and the ones it wrote into failed carry their own failure. What
+			// fails here with the window's own error is the tail it could not
+			// account for, which is the part a lost channel leaves undecided.
+			for index := base + consumed; index < len(msgs); index++ {
 				if _, decided := failed[index]; !decided {
 					failed[index] = err
 				}
@@ -315,12 +325,18 @@ func (p *producer) discard(ctx context.Context, channel *publishChannel) {
 
 // publishWindow publishes the window of messages that starts at base and then
 // reads one confirmation per published message, in order. It reports how many
-// messages it consumed.
+// leading messages of that window have a decided outcome.
 //
 // A nil error means every index in the window has a decided outcome: its own
 // entry in failed, or a durable confirmation. An error means the channel must
 // not be published on again: the caller discards it, which is what keeps the
-// confirmations it is still owed from being read against a later publish.
+// confirmations it is still owed from being read against a later publish. The
+// count reported with that error is the number of leading messages of the batch
+// that do not need the caller's error to have an outcome: it is zero for every
+// error that leaves the whole window undecided, and it covers every message the
+// window decided itself, published or failed to encode, when the error is the
+// broker refusing a message for its size, since the limit in that refusal
+// decides the messages the window left open.
 //
 // Confirmations are read in the order the client delivers them, which is
 // delivery-tag order whatever order the broker acknowledged in, so the i-th
@@ -395,9 +411,49 @@ func (p *producer) publishWindow(channel *publishChannel, ctx context.Context, m
 		}
 	}
 	returned := make(map[string]error, len(window))
-	for _, item := range window {
+	for offset, item := range window {
 		confirmation, err := channel.waitConfirm(ctx, returned)
 		if err != nil {
+			// The broker closed this channel. When it says it refused a
+			// message for its size, the close names the limit it applies, and
+			// that limit answers for every message of this window whose
+			// outcome is still unknown: the messages before this read have an
+			// outcome already, and of the rest, a message whose body is over
+			// the limit is one the broker refuses whenever it reaches it, and
+			// a message at or under it went down with the channel and keeps
+			// the transient failure an undecided message has always had.
+			//
+			// The limit is what a window can decide where the confirmation
+			// order cannot. The broker confirms a quorum queue's persistent
+			// messages asynchronously, so the confirmation this read is
+			// waiting for can lose the race to the close a later message's
+			// size caused, and reading that as this message's refusal would
+			// blame a message the broker published, which is at or under the
+			// limit by definition.
+			if limit, refused := sizeRefusalLimit(err); refused {
+				lengths := make([]int, len(window))
+				for index, published := range window {
+					lengths[index] = len(published.publishing.Body)
+				}
+				for index, kind := range sizeRefusalKinds(lengths, offset, limit) {
+					target := window[offset+index]
+					if kind == driver.KindTooLarge {
+						// The close is the failure of every message over the
+						// limit: the limit in it decides the kind, and its
+						// text is the broker's own reason for the refusal,
+						// naming the size the broker refused rather than this
+						// one's wherever the two differ.
+						failed[target.index] = err
+						continue
+					}
+					failed[target.index] = classify("publish", driver.KindTransient, amqp.ErrClosed)
+				}
+				// Every message this window published now has an outcome of
+				// its own, so only the messages behind the window are left
+				// for the caller to fail, and the channel never published
+				// those.
+				return consumed, classify("publish", driver.KindTransient, amqp.ErrClosed)
+			}
 			return 0, err
 		}
 		if !confirmation.Ack {
@@ -414,6 +470,42 @@ func (p *producer) publishWindow(channel *publishChannel, ctx context.Context, m
 		}
 	}
 	return consumed, nil
+}
+
+// sizeRefusalKinds returns the outcome of every message of a window the broker
+// closed for the size of one of them, given the body length of each message of
+// that window in publish order, the number of leading messages whose outcome
+// the window already knows, and the limit the broker named.
+//
+// Being over the limit is a property of a message rather than of the window.
+// The broker refuses such a message wherever it reaches it, so the kind is true
+// of every message it names, including a message the broker never reached
+// because a different one closed the channel first. The split is what makes the
+// answer hold while a confirmation is still missing: a quorum queue commits a
+// persistent message asynchronously, so the close can beat the confirmation for
+// a message in front of the refused one, and calling that message the refused
+// one would report a failure the broker never produced. A message at or under
+// the limit was publishable, so it is transient, which is the failure an
+// undecided message has always carried and what sends it round again.
+//
+// decided counts the leading messages the caller has already dealt with -
+// confirmed, or failed for a reason of their own - and the result holds one
+// kind per message after them. Those must not be classified again: a
+// confirmation is the broker saying it published the message, and a length
+// compared against the limit cannot contradict that. Passing the count rather
+// than the window is what keeps this a function of three values, with no
+// channel, no broker and no clock in it.
+func sizeRefusalKinds(lengths []int, decided, limit int) []driver.Kind {
+	decided = min(decided, len(lengths))
+	kinds := make([]driver.Kind, 0, len(lengths)-decided)
+	for _, length := range lengths[decided:] {
+		if length > limit {
+			kinds = append(kinds, driver.KindTooLarge)
+			continue
+		}
+		kinds = append(kinds, driver.KindTransient)
+	}
+	return kinds
 }
 
 // target decides AMQP routing for one outbound message. Whether Destination
@@ -487,23 +579,37 @@ func expirationMillis(remaining time.Duration) string {
 // parked under its MessageId and matched by the caller when that message's
 // confirmation is read.
 //
-// An error means the confirmation was abandoned on ctx.Done, or one of the two
-// streams closed, so this channel must not be used for a later publish.
+// A stream that closed is reported as the reason the channel closed, as the
+// client received it, and only once every confirmation the client had already
+// delivered is served. Serving those first is what keeps a message the broker
+// published from being reported as one the close covers: the client delivers
+// the close notification before it closes the confirm stream, so a confirmation
+// it had already dispatched can be sitting behind that notification, and a
+// quorum queue makes that likely rather than rare, because it confirms a
+// persistent message only once that message's commit completes and the close a
+// later message's size caused can win that race.
+//
+// A close read here is therefore a close the message being waited for has no
+// confirmation under, and no more: which message the broker refused is not this
+// function's to say. The close names only what it refused, and the caller reads
+// the limit out of it and decides from the body lengths of the window.
+//
+// An error means the close arrived while the message being waited for had no
+// confirmation, or the confirmation was abandoned on ctx.Done, and the channel
+// must not be used for a later publish either way.
 func (c *publishChannel) waitConfirm(ctx context.Context, returned map[string]error) (amqp.Confirmation, error) {
 	for {
 		select {
 		case item, ok := <-c.returns:
 			if !ok {
-				return amqp.Confirmation{}, classify("publish", driver.KindTransient, amqp.ErrClosed)
+				return c.confirmOrClose(returned)
 			}
 			returned[item.MessageId] = returnedPublishError(item)
 		case confirmation, ok := <-c.confirms:
 			if !ok {
-				return amqp.Confirmation{}, classify("publish", driver.KindTransient, amqp.ErrClosed)
+				return amqp.Confirmation{}, c.closeError()
 			}
-			if !c.drainReturns(returned) {
-				return amqp.Confirmation{}, classify("publish", driver.KindTransient, amqp.ErrClosed)
-			}
+			c.drainReturns(returned)
 			return confirmation, nil
 		case <-ctx.Done():
 			return amqp.Confirmation{}, classify("publish", driver.KindTransient, ctx.Err())
@@ -511,22 +617,72 @@ func (c *publishChannel) waitConfirm(ctx context.Context, returned map[string]er
 	}
 }
 
-// drainReturns parks every return the client has already dispatched and
-// reports whether the return stream is still open. It runs before a
-// confirmation is acted on for two reasons: the drain is what keeps a window's
-// worth of returns from filling the buffer the client's dispatch path sends
-// into, and a confirmation can be selected while the return for that same
-// message is still queued.
-func (c *publishChannel) drainReturns(returned map[string]error) bool {
+// confirmOrClose serves the confirmation of a message the broker had already
+// confirmed when the return stream closed, and reports the close once the
+// confirmations the client delivered are gone.
+//
+// The client closes the return stream before the confirm stream, so a close
+// observed here says nothing yet about the message this window is waiting for
+// while a confirmation for it is still queued: reading that one first is what
+// keeps a message the broker published from being reported as one the close
+// covers. With nothing queued, no confirmation is going to arrive for the
+// message being waited for, and the caller reads the close in its place. That
+// close carries the broker's own reason, and a reason that names a limit is
+// what the caller decides the window's messages by; this function attributes
+// the close to no message of the window.
+func (c *publishChannel) confirmOrClose(returned map[string]error) (amqp.Confirmation, error) {
+	select {
+	case confirmation, ok := <-c.confirms:
+		if !ok {
+			return amqp.Confirmation{}, c.closeError()
+		}
+		c.drainReturns(returned)
+		return confirmation, nil
+	default:
+		return amqp.Confirmation{}, c.closeError()
+	}
+}
+
+// closeError classifies the channel's close, which is where a publish the
+// broker refused for its size is recognised.
+//
+// The client sends the close notification once and before it closes the
+// confirm and return streams, so a close this window observed is already
+// buffered: the read below cannot block and cannot miss it. A close that
+// carried no reason - a clean shutdown of the connection, or one the client
+// withheld while it recovered the channel - keeps the bare amqp.ErrClosed a
+// closed publish channel has always reported.
+func (c *publishChannel) closeError() error {
+	select {
+	case err, ok := <-c.closes:
+		if ok && err != nil {
+			return classifyPublishClose(err)
+		}
+	default:
+	}
+	return classify("publish", driver.KindTransient, amqp.ErrClosed)
+}
+
+// drainReturns parks every return the client has already dispatched, until the
+// return stream is exhausted. It runs before a confirmation is acted on for two
+// reasons: the drain is what keeps a window's worth of returns from filling the
+// buffer the client's dispatch path sends into, and a confirmation can be
+// selected while the return for that same message is still queued.
+//
+// A closed return stream is deliberately not reported from here: the
+// confirmations the client delivered before it closed are still readable, and
+// only waitConfirm knows whether the message this window is waiting for is one
+// of them.
+func (c *publishChannel) drainReturns(returned map[string]error) {
 	for {
 		select {
 		case item, ok := <-c.returns:
 			if !ok {
-				return false
+				return
 			}
 			returned[item.MessageId] = returnedPublishError(item)
 		default:
-			return true
+			return
 		}
 	}
 }

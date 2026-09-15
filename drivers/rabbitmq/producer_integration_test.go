@@ -489,6 +489,163 @@ func TestProducerNegativeConfirmFailsItsOwnIndex(t *testing.T) {
 	}
 }
 
+// oversizedBodyBytes is one byte past the largest message the fixture broker
+// accepts, which is what makes it refuse the publish. The fixture runs
+// rabbitmq:4.3.4-management and configures no limit, so the broker's own
+// max_message_size default of 16777216 bytes applies. The size is taken from
+// the broker rather than from the driver because the driver declares no
+// message limit, and a limit it guessed would be a second answer that could
+// disagree with the one that refuses the publish.
+const oversizedBodyBytes = (1 << 24) + 1
+
+// TestProducerSizeRefusalFailsOnlyItsOwnIndex proves a publish the broker
+// refuses for its size is reported against the messages whose body is too large
+// and no other: the refused message is over the broker's limit, so it is too
+// large, and the message behind it went down with the channel while under the
+// limit, so it stays the undecided transient failure a lost channel has always
+// produced. The producer then publishes again, because the channel that carried
+// the refusal is gone and the next publish opens one of its own.
+//
+// The destination is the quorum kind this driver defaults to, and the message
+// in front of the refused one is where that shows. A quorum queue commits a
+// persistent message asynchronously, so the close can beat that message's
+// confirmation: the window then finds it undecided and reports it transient,
+// which is the retry an unconfirmed message gets. What it must never be is too
+// large, and that is what this test pins about it, because the broker published
+// it and a length at or under the limit cannot be refused for its size.
+func TestProducerSizeRefusalFailsOnlyItsOwnIndex(t *testing.T) {
+	requireBroker(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	const queue = "rabbitmq-driver-producer-size-refusal"
+	conn, rawChannel := openProducerFixture(t, ctx, queue)
+	if _, err := conn.Admin().EnsureTopology(ctx, driver.TopologySpec{
+		Destinations: []driver.DestinationSpec{{Name: queue, Durable: true}},
+	}); err != nil {
+		t.Fatalf("EnsureTopology: %v", err)
+	}
+	rawProducer, err := conn.Producer(ctx, driver.ProducerConfig{RequireDurableAck: true})
+	if err != nil {
+		t.Fatalf("Producer: %v", err)
+	}
+	t.Cleanup(func() { _ = rawProducer.Close(context.Background()) })
+	deliveries, err := rawChannel.Consume(queue, "producer-size-refusal", false, false, false, false, nil)
+	if err != nil {
+		t.Fatalf("Consume: %v", err)
+	}
+	messages := []driver.OutboundMessage{
+		{
+			Destination: queue,
+			Headers:     []driver.Header{{Key: "id", Value: []byte("size-0")}},
+			Body:        []byte("confirmed-before-the-refusal"),
+		},
+		{
+			Destination: queue,
+			Headers:     []driver.Header{{Key: "id", Value: []byte("size-1")}},
+			Body:        make([]byte, oversizedBodyBytes),
+		},
+		{
+			Destination: queue,
+			Headers:     []driver.Header{{Key: "id", Value: []byte("size-2")}},
+			Body:        []byte("discarded-with-the-channel"),
+		},
+	}
+	err = rawProducer.Publish(ctx, messages...)
+	var publishErr *driver.PublishError
+	if !errors.As(err, &publishErr) {
+		t.Fatalf("batch Publish error = %v, want *driver.PublishError", err)
+	}
+	failure, ok := publishErr.Failed[1]
+	if !ok {
+		t.Fatalf("failed indexes = %v, want the oversized message at index 1", publishErr.Failed)
+	}
+	if kind, classified := driver.Classify(failure); !classified || kind != driver.KindTooLarge {
+		t.Fatalf("failed[1] classification = (%v, %t), want (too large, true)", kind, classified)
+	}
+	undecided, ok := publishErr.Failed[2]
+	if !ok {
+		t.Fatalf("failed indexes = %v, want the message behind the refusal at index 2", publishErr.Failed)
+	}
+	if kind, classified := driver.Classify(undecided); !classified || kind != driver.KindTransient {
+		t.Fatalf("failed[2] classification = (%v, %t), want (transient, true)", kind, classified)
+	}
+	if failure, failed := publishErr.Failed[0]; failed {
+		if kind, classified := driver.Classify(failure); !classified || kind == driver.KindTooLarge {
+			t.Fatalf("failed[0] classification = (%v, %t), want a message under the limit never too large", kind, classified)
+		}
+	}
+	for index := range publishErr.Failed {
+		if index > 2 {
+			t.Fatalf("failed indexes = %v, want only the messages of this batch", publishErr.Failed)
+		}
+	}
+	select {
+	case delivery := <-deliveries:
+		if string(delivery.Body) != "confirmed-before-the-refusal" {
+			t.Fatalf("delivered body = %q, want the message in front of the refusal", delivery.Body)
+		}
+		if err := delivery.Ack(false); err != nil {
+			t.Fatalf("Ack: %v", err)
+		}
+	case <-ctx.Done():
+		t.Fatalf("receiving the message in front of the refusal: %v", ctx.Err())
+	}
+	if err := rawProducer.Publish(ctx, driver.OutboundMessage{Destination: queue, Body: []byte("after-the-refusal")}); err != nil {
+		t.Fatalf("Publish after the refusal = %v, want the producer to publish on a channel of its own", err)
+	}
+}
+
+// TestProducerSizeRefusalIsTheOnlyFailure proves the smallest window that can
+// hold a refusal reports it and nothing else. One message, refused for its
+// size, is the case a caller reads a failure map for: a copy that can never be
+// published reaches the caller as that one entry, which is what keeps it from
+// being retried forever or from stopping the subscription that produced it.
+func TestProducerSizeRefusalIsTheOnlyFailure(t *testing.T) {
+	requireBroker(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	const queue = "rabbitmq-driver-producer-size-only"
+	conn, _ := openProducerFixture(t, ctx, queue)
+	if _, err := conn.Admin().EnsureTopology(ctx, driver.TopologySpec{
+		Destinations: []driver.DestinationSpec{{Name: queue, Durable: true}},
+	}); err != nil {
+		t.Fatalf("EnsureTopology: %v", err)
+	}
+	rawProducer, err := conn.Producer(ctx, driver.ProducerConfig{RequireDurableAck: true})
+	if err != nil {
+		t.Fatalf("Producer: %v", err)
+	}
+	t.Cleanup(func() { _ = rawProducer.Close(context.Background()) })
+
+	err = rawProducer.Publish(ctx, driver.OutboundMessage{
+		Destination: queue,
+		Headers:     []driver.Header{{Key: "id", Value: []byte("size-only")}},
+		Body:        make([]byte, oversizedBodyBytes),
+	})
+	var publishErr *driver.PublishError
+	if !errors.As(err, &publishErr) {
+		t.Fatalf("Publish error = %v, want *driver.PublishError", err)
+	}
+	if len(publishErr.Failed) != 1 {
+		t.Fatalf("failed indexes = %v, want only the refused message", publishErr.Failed)
+	}
+	failure, ok := publishErr.Failed[0]
+	if !ok {
+		t.Fatalf("failed indexes = %v, want index 0", publishErr.Failed)
+	}
+	if kind, classified := driver.Classify(failure); !classified || kind != driver.KindTooLarge {
+		t.Fatalf("failed[0] classification = (%v, %t), want (too large, true)", kind, classified)
+	}
+	// The broker's own words for the refusal are the only thing that tells an
+	// operator which limit was exceeded, and they are what the driver used to
+	// throw away by reporting the closed channel instead.
+	if !strings.Contains(failure.Error(), "message size") {
+		t.Fatalf("failed[0] = %v, want the broker's reason for the refusal", failure)
+	}
+}
+
 // TestProducerConfirmsArriveInPublishOrder asserts the property the window
 // rests on rather than assuming it: the client re-sequences confirmations
 // before delivering them, so the i-th confirmation read from the channel is
