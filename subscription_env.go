@@ -67,9 +67,6 @@ func applySubscriptionEnvironment(name string, cfg *SubscriptionConfig) error {
 		}
 		cfg.Fairness.RetryWeightDivisor = parsed
 	}
-	if value, ok := lookupSubscriptionEnv(prefix, "fairness.costModel"); ok {
-		cfg.Fairness.CostModel = value
-	}
 	if value, ok := lookupSubscriptionEnv(prefix, "fairness.prefetchFactor"); ok {
 		parsed, err := strconv.Atoi(value)
 		if err != nil {
@@ -77,12 +74,12 @@ func applySubscriptionEnvironment(name string, cfg *SubscriptionConfig) error {
 		}
 		cfg.Fairness.PrefetchFactor = parsed
 	}
-	if value, ok := lookupSubscriptionEnv(prefix, "fairness.agingEnabled"); ok {
+	if value, ok := lookupSubscriptionEnv(prefix, "fairness.disableAging"); ok {
 		parsed, err := strconv.ParseBool(value)
 		if err != nil {
-			return fmt.Errorf("f1: %s: %w", envKey(prefix, "fairness.agingEnabled"), err)
+			return fmt.Errorf("f1: %s: %w", envKey(prefix, "fairness.disableAging"), err)
 		}
-		cfg.Fairness.AgingEnabled = parsed
+		cfg.Fairness.DisableAging = parsed
 	}
 	for _, priority := range []Priority{PriorityHigh, PriorityMedium, PriorityLow} {
 		if value, ok := lookupSubscriptionEnv(prefix, "fairness.weights."+priority.String()); ok {
@@ -133,13 +130,6 @@ func applySubscriptionEnvironment(name string, cfg *SubscriptionConfig) error {
 			return fmt.Errorf("f1: %s: %w", envKey(prefix, "retry.maxInterval"), err)
 		}
 		cfg.Retry.MaxInterval = parsed
-	}
-	if value, ok := lookupSubscriptionEnv(prefix, "retry.jitter"); ok {
-		parsed, err := strconv.ParseFloat(value, 64)
-		if err != nil {
-			return fmt.Errorf("f1: %s: %w", envKey(prefix, "retry.jitter"), err)
-		}
-		cfg.Retry.Jitter = parsed
 	}
 	if value, ok := lookupSubscriptionEnv(prefix, "retry.tiers"); ok {
 		tiers := make([]time.Duration, 0)

@@ -256,7 +256,7 @@ func TestInvokeHandlerReportsSequentialStuckThresholds(t *testing.T) {
 	var output logSink
 	client, err := New(context.Background(), testClientConfig(t),
 		WithDriver(&dispatchDriver{conn: &dispatchConn{producer: &dispatchProducer{}}}),
-		WithClock(fake),
+		withClock(fake),
 		WithLogger(slog.New(slog.NewTextHandler(&output, nil))),
 	)
 	if err != nil {

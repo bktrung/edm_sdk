@@ -26,7 +26,7 @@ func newRetryBridgeRunner(t *testing.T, producer *dispatchProducer, topic string
 			Name:           "orders",
 			Topics:         []string{topic},
 			Priorities:     []Priority{PriorityHigh},
-			Retry:          RetryConfig{MaxAttempts: 3, Tiers: []time.Duration{time.Second, 2 * time.Second}, Jitter: 0.2},
+			Retry:          RetryConfig{MaxAttempts: 3, Tiers: []time.Duration{time.Second, 2 * time.Second}},
 			HandlerTimeout: time.Second,
 		},
 	}

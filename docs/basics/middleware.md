@@ -147,7 +147,7 @@ The final error returned by the chain is interpreted by the F1 runtime:
 | --- | --- |
 | `nil` | The delivery is acknowledged as handled. |
 | Ordinary error | F1 applies the subscription retry policy. |
-| `f1.RetryAfter(err, delay)` | F1 retries with the requested delay. |
+| `f1.RetryAfter(err, delay)` | F1 retries at the ladder tier nearest the requested delay. |
 | `f1.Terminal(err)` | F1 stops retrying and dead-letters the event. |
 | `f1.Drop(err)` | F1 acknowledges the event without applying its effect or retaining a copy. |
 

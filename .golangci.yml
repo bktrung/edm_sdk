@@ -163,10 +163,11 @@ linters:
             - fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/driver
             - fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/drivers/inmem
             - fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/clock
+            - fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/testhook
             - go.opentelemetry.io/otel
           deny:
             - pkg: $all
-              desc: "f1test may import only the SDK, in-memory driver, clock, test assertions, and metric reader"
+              desc: "f1test may import only the SDK, in-memory driver, clock, test hook, test assertions, and metric reader"
 
         drivers-kafka:
           files:
@@ -202,12 +203,13 @@ linters:
             - $gostd
             - fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/driver
             - fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/clock
+            - fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/testhook
             - github.com/stretchr/testify
           deny:
             - pkg: fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/drivers
               desc: "a driver must not import another driver"
             - pkg: $all
-              desc: "the in-memory driver may import only the standard library, port, clock, and test assertions"
+              desc: "the in-memory driver may import only the standard library, port, clock, test hook, and test assertions"
 
     # The forbidden list replaces the defaults, so list every blocked API.
     forbidigo:

@@ -213,7 +213,7 @@ func TestConformance(t *testing.T) {
 	// time deterministically. Its origin is arbitrary now that receiveBefore spends
 	// its own waitTimeout budget instead of time.Until of a fixture instant.
 	fake := clock.NewFake(clock.NewReal().Now())
-	report := runConformance(t, Driver{Clock: fake})
+	report := runConformance(t, Driver{clock: fake})
 	if err := report.WriteMarkdown(&output); err != nil {
 		t.Fatal(err)
 	}
@@ -225,7 +225,7 @@ func TestConformanceMinimalCapabilities(t *testing.T) {
 	// This named fixture only weakens native declarations and removes limits;
 	// ScalingPartitionBound is the one preserved declaration needed to execute
 	// that capability's branch, and the check uses one consumer accordingly.
-	runConformance(t, Driver{Clock: fake, minimal: true})
+	runConformance(t, Driver{clock: fake, minimal: true})
 }
 
 func runConformance(t *testing.T, candidate Driver) conformance.Report {

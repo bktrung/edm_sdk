@@ -247,7 +247,7 @@ only to make a shutdown test pass:
 | `DrainTimeout` | Runner handler-drain and settlement phases | Must be positive; subscription `HandlerTimeout` must be shorter. |
 | `HandlerGrace` | Final cancellation grace window for handlers during drain | Must not be negative; a value outside the drain budget is not useful. |
 | `ConsumerDrainTimeout` | `Client.Close`'s wait for all runner drains | Zero leaves the caller's context as the only bound. |
-| `CloseTimeout` | Producer and connection close operations | Zero leaves the caller's context as the only bound. |
+| `CloseTimeout` | Producer and connection close operations | Zero selects the package default. |
 
 `DrainTimeout` is applied to the runner's drain and settlement waits as separate
 phase budgets, not as one promise that the entire client close will finish in

@@ -21,7 +21,7 @@ func TestClientCloseBoundsProducerClose(t *testing.T) {
 		closeStarted: make(chan struct{}),
 		closeRelease: make(chan struct{}),
 	}
-	client := newPublishClient(t, producer, WithClock(fake))
+	client := newPublishClient(t, producer, withClock(fake))
 	client.config.Lifecycle.CloseTimeout = 5 * time.Second
 	defer close(producer.closeRelease)
 	if _, err := client.Publisher().Publish(context.Background(), "orders.created", "payload"); err != nil {
@@ -46,7 +46,7 @@ func TestClientCloseBoundsConnectionClose(t *testing.T) {
 		closeStarted: make(chan struct{}),
 		closeRelease: make(chan struct{}),
 	}
-	client, err := New(context.Background(), testClientConfig(t), WithDriver(&publishDriver{conn: conn}), WithClock(fake))
+	client, err := New(context.Background(), testClientConfig(t), WithDriver(&publishDriver{conn: conn}), withClock(fake))
 	if err != nil {
 		t.Fatal(err)
 	}

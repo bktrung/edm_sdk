@@ -25,7 +25,7 @@ func TestClientCloseDefersConnCloseUntilProducerCloseReturns(t *testing.T) {
 		closeRelease: make(chan struct{}),
 	}
 	conn := &publishConn{producer: producer, info: driver.BrokerInfo{Kind: "test", Version: "1"}, closeStarted: make(chan struct{})}
-	client, err := New(context.Background(), testClientConfig(t), WithDriver(&publishDriver{conn: conn}), WithClock(fake))
+	client, err := New(context.Background(), testClientConfig(t), WithDriver(&publishDriver{conn: conn}), withClock(fake))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -191,7 +191,7 @@ func beginTimedOutProducerClose(t *testing.T) (*Client, *recordingProducer, *pub
 		closeRelease: make(chan struct{}),
 	}
 	conn := &publishConn{producer: producer, info: driver.BrokerInfo{Kind: "test", Version: "1"}}
-	client, err := New(context.Background(), testClientConfig(t), WithDriver(&publishDriver{conn: conn}), WithClock(fake))
+	client, err := New(context.Background(), testClientConfig(t), WithDriver(&publishDriver{conn: conn}), withClock(fake))
 	if err != nil {
 		t.Fatal(err)
 	}

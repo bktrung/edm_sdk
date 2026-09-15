@@ -10,6 +10,7 @@ import (
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/codec"
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/driver"
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/clock"
+	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/testhook"
 )
 
 // Option configures a Client during New.
@@ -94,16 +95,25 @@ func WithLogger(logger *slog.Logger) Option {
 	}
 }
 
-// WithClock supplies the clock used by time-dependent core behavior in tests.
-func WithClock(c clock.Clock) Option {
+// withClock returns the option that runs time-dependent core behavior on c.
+//
+// It is unexported because the clock type is internal: an outside module cannot
+// name it, so a public option could only ever be handed nil. Package f1
+// registers it with internal/testhook during init for the module's own tests,
+// and the f1 tests call it directly. A nil clock is refused here rather than
+// stored, because the zero value would panic at the first Now or Timer instead
+// of failing New with a message that names the option.
+func withClock(c clock.Clock) Option {
 	return func(options *clientOptions) error {
 		if isNil(c) {
-			return fmt.Errorf("f1: WithClock requires a non-nil clock")
+			return fmt.Errorf("f1: withClock requires a non-nil clock")
 		}
 		options.clock = c
 		return nil
 	}
 }
+
+func init() { testhook.RegisterClientOption(func(c clock.Clock) any { return withClock(c) }) }
 
 // WithStrictPortability disables native capability shortcuts for this Client.
 func WithStrictPortability() Option {

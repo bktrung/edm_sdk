@@ -13,6 +13,7 @@ import (
 	//nolint:depguard // integration tests exercise the SDK through the in-memory driver
 	f1 "fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk"
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/clock"
+	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/testhook"
 )
 
 // TestDrainCompletesWithoutFiringTheHandlerGraceTimer pins Drain's cost to the
@@ -57,7 +58,7 @@ func TestDrainCompletesWithoutFiringTheHandlerGraceTimer(t *testing.T) {
 	clk := &graceClock{Fake: clock.NewFake(time.Unix(0, 0)), delay: graceDelay, armed: make(chan struct{})}
 	client, err := f1.New(context.Background(), cfg,
 		f1.WithDriver(&settlementDriver{}),
-		f1.WithClock(clk),
+		testhook.ClientOption(clk).(f1.Option),
 		f1.WithLogger(slog.New(slog.NewTextHandler(io.Discard, nil))),
 	)
 	require.NoError(t, err)

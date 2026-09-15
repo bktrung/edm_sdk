@@ -12,6 +12,7 @@ import (
 	//nolint:depguard // these tests exercise the runner through the in-memory driver.
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/drivers/inmem"
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/clock"
+	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/testhook"
 )
 
 const (
@@ -71,7 +72,7 @@ func TestRunnerSchedulerAgesLowPriorityWork(t *testing.T) {
 	fake := clock.NewFake(time.Unix(0, 0))
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	client, err := f1.New(ctx, schedulingConfig(), f1.WithDriver(inmem.New(fake)), f1.WithClock(fake))
+	client, err := f1.New(ctx, schedulingConfig(), f1.WithDriver(testhook.Driver(fake)), testhook.ClientOption(fake).(f1.Option))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -152,7 +153,7 @@ func TestRunnerSchedulerAgesLowPriorityWork(t *testing.T) {
 func TestRunnerSchedulerPreservesOrderedKeys(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	client, err := f1.New(ctx, schedulingConfig(), f1.WithDriver(inmem.New(nil)))
+	client, err := f1.New(ctx, schedulingConfig(), f1.WithDriver(inmem.New()))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -220,7 +221,7 @@ func TestRunnerSchedulerRetriesThroughPipeline(t *testing.T) {
 	fake := clock.NewFake(time.Unix(0, 0))
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	client, err := f1.New(ctx, schedulingConfig(), f1.WithDriver(inmem.New(fake)), f1.WithClock(fake))
+	client, err := f1.New(ctx, schedulingConfig(), f1.WithDriver(testhook.Driver(fake)), testhook.ClientOption(fake).(f1.Option))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -275,7 +276,7 @@ func runPriorityShare(t *testing.T, weights map[f1.Priority]int) []f1.Priority {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	client, err := f1.New(ctx, schedulingConfig(), f1.WithDriver(inmem.New(nil)))
+	client, err := f1.New(ctx, schedulingConfig(), f1.WithDriver(inmem.New()))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -324,7 +325,7 @@ func schedulingSubscriptionWithMode(mode f1.Mode, weights map[f1.Priority]int, b
 		Concurrency:    1,
 		Prefetch:       64,
 		Priorities:     []f1.Priority{f1.PriorityHigh, f1.PriorityLow},
-		Fairness:       f1.FairnessConfig{Weights: weights, Budgets: budgets, AgingEnabled: budgets != nil, PrefetchFactor: 2},
+		Fairness:       f1.FairnessConfig{Weights: weights, Budgets: budgets, DisableAging: budgets == nil, PrefetchFactor: 2},
 		Retry:          f1.RetryConfig{MaxAttempts: 1},
 		HandlerTimeout: time.Second,
 		Handlers:       map[string]f1.Handler{"orders.created": handler},

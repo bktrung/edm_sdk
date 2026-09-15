@@ -49,12 +49,12 @@ type CodecConfig struct {
 	MaxBodyBytes   int    `yaml:"maxBodyBytes"`
 }
 
-// LifecycleConfig configures the timing of graceful client shutdown. Zero
-// disables the corresponding delay or deadline; negative values are invalid.
-// DrainTimeout is the exception: it must be positive, since a disabled drain
-// deadline means shutdown never completes.
+// LifecycleConfig configures the timing of graceful client shutdown. A zero
+// field selects the package default, so a Go caller that leaves one out
+// behaves the same as a YAML config that omits it; negative values are
+// invalid. ConsumerDrainTimeout is the one exception, where zero means no
+// bound at all.
 type LifecycleConfig struct {
-	PreStopDelay time.Duration `yaml:"preStopDelay"`
 	DrainTimeout time.Duration `yaml:"drainTimeout"`
 	HandlerGrace time.Duration `yaml:"handlerGrace"`
 	// ConsumerDrainTimeout bounds how long Close waits for subscription
@@ -96,9 +96,10 @@ type FairnessConfig struct {
 	Weights            map[Priority]int
 	Budgets            map[Priority]time.Duration
 	RetryWeightDivisor int
-	CostModel          string
 	PrefetchFactor     int
-	AgingEnabled       bool
+	// DisableAging turns off age-based promotion for lanes that exceed their
+	// budget. The zero value leaves aging on, which is the default.
+	DisableAging bool
 }
 
 // RetryConfig configures a Subscription's retry ladder.
@@ -107,7 +108,6 @@ type RetryConfig struct {
 	InitialInterval time.Duration
 	Multiplier      float64
 	MaxInterval     time.Duration
-	Jitter          float64
 	Tiers           []time.Duration
 }
 
@@ -121,7 +121,6 @@ func (r RetryConfig) DelayFor(attempt int) time.Duration {
 		InitialInterval: r.InitialInterval,
 		Multiplier:      r.Multiplier,
 		MaxInterval:     r.MaxInterval,
-		Jitter:          r.Jitter,
 		Tiers:           r.Tiers,
 	}.DelayFor(attempt)
 }
@@ -174,7 +173,7 @@ func defaultConfig() Config {
 		Broker:        BrokerConfig{ConnectTimeout: 30 * time.Second, DefaultPrefetch: 64},
 		Topology:      TopologyConfig{VerifyOnStart: true, Priorities: []Priority{PriorityHigh, PriorityMedium, PriorityLow}},
 		Codec:         CodecConfig{Default: "json", ContentMode: "binary", MaxHeaderBytes: CoreMaxHeaderBytes, MaxBodyBytes: 1024 * 1024},
-		Lifecycle:     LifecycleConfig{PreStopDelay: 5 * time.Second, DrainTimeout: time.Minute, HandlerGrace: 5 * time.Second, CloseTimeout: 10 * time.Second, RebalanceDrainTimeout: 25 * time.Second},
+		Lifecycle:     LifecycleConfig{DrainTimeout: time.Minute, HandlerGrace: 5 * time.Second, CloseTimeout: 10 * time.Second, RebalanceDrainTimeout: 25 * time.Second},
 		Subscriptions: map[string]SubscriptionConfig{},
 	}
 }
@@ -217,9 +216,6 @@ func normalizeConfig(cfg Config) Config {
 
 	if len(cfg.Topology.Priorities) == 0 {
 		cfg.Topology.Priorities = append([]Priority(nil), defaults.Topology.Priorities...)
-	}
-	if cfg.Lifecycle.PreStopDelay == 0 {
-		cfg.Lifecycle.PreStopDelay = defaults.Lifecycle.PreStopDelay
 	}
 	if cfg.Lifecycle.DrainTimeout == 0 {
 		cfg.Lifecycle.DrainTimeout = defaults.Lifecycle.DrainTimeout
@@ -470,9 +466,6 @@ func validateRetryConfig(path string, retry RetryConfig) error {
 			}
 		}
 	}
-	if retry.Jitter < 0 || retry.Jitter > .5 || math.IsNaN(retry.Jitter) || math.IsInf(retry.Jitter, 0) {
-		return fmt.Errorf("f1: %s.jitter must be finite and between 0 and 0.5", path)
-	}
 	for i, tier := range retry.Tiers {
 		if tier <= 0 {
 			return fmt.Errorf("f1: %s.tiers[%d] must be positive", path, i)
@@ -493,7 +486,6 @@ func validateLifecycleConfig(lifecycle LifecycleConfig) error {
 		name  string
 		value time.Duration
 	}{
-		{name: "preStopDelay", value: lifecycle.PreStopDelay},
 		{name: "handlerGrace", value: lifecycle.HandlerGrace},
 		{name: "consumerDrainTimeout", value: lifecycle.ConsumerDrainTimeout},
 		{name: "closeTimeout", value: lifecycle.CloseTimeout},
@@ -619,7 +611,7 @@ func (p *rawPriority) UnmarshalYAML(value *yaml.Node) error {
 type rawRetry RetryConfig
 
 func (r *rawRetry) UnmarshalYAML(value *yaml.Node) error {
-	if err := requireKnownKeys(value, "maxAttempts", "initialInterval", "multiplier", "maxInterval", "jitter", "tiers"); err != nil {
+	if err := requireKnownKeys(value, "maxAttempts", "initialInterval", "multiplier", "maxInterval", "tiers"); err != nil {
 		return err
 	}
 	raw := struct {
@@ -627,9 +619,8 @@ func (r *rawRetry) UnmarshalYAML(value *yaml.Node) error {
 		InitialInterval time.Duration   `yaml:"initialInterval"`
 		Multiplier      float64         `yaml:"multiplier"`
 		MaxInterval     time.Duration   `yaml:"maxInterval"`
-		Jitter          float64         `yaml:"jitter"`
 		Tiers           []time.Duration `yaml:"tiers"`
-	}{MaxAttempts: r.MaxAttempts, InitialInterval: r.InitialInterval, Multiplier: r.Multiplier, MaxInterval: r.MaxInterval, Jitter: r.Jitter, Tiers: r.Tiers}
+	}{MaxAttempts: r.MaxAttempts, InitialInterval: r.InitialInterval, Multiplier: r.Multiplier, MaxInterval: r.MaxInterval, Tiers: r.Tiers}
 	if err := value.Decode(&raw); err != nil {
 		return err
 	}
@@ -667,8 +658,8 @@ type rawSubscription struct {
 func defaultSubscription() SubscriptionConfig {
 	return SubscriptionConfig{
 		Concurrency: 16, Priorities: []Priority{PriorityHigh, PriorityMedium, PriorityLow},
-		Fairness: FairnessConfig{Weights: map[Priority]int{PriorityHigh: 8, PriorityMedium: 4, PriorityLow: 1}, Budgets: map[Priority]time.Duration{PriorityHigh: 5 * time.Second, PriorityMedium: 30 * time.Second, PriorityLow: 120 * time.Second}, RetryWeightDivisor: 2, CostModel: "count", PrefetchFactor: 2, AgingEnabled: true},
-		Retry:    RetryConfig{MaxAttempts: 4, InitialInterval: time.Second, Multiplier: 5, MaxInterval: 30 * time.Second, Jitter: .2}, HandlerTimeout: 30 * time.Second,
+		Fairness: FairnessConfig{Weights: map[Priority]int{PriorityHigh: 8, PriorityMedium: 4, PriorityLow: 1}, Budgets: map[Priority]time.Duration{PriorityHigh: 5 * time.Second, PriorityMedium: 30 * time.Second, PriorityLow: 120 * time.Second}, RetryWeightDivisor: 2, PrefetchFactor: 2},
+		Retry:    RetryConfig{MaxAttempts: 4, InitialInterval: time.Second, Multiplier: 5, MaxInterval: 30 * time.Second}, HandlerTimeout: 30 * time.Second,
 	}
 }
 
@@ -711,7 +702,7 @@ func rawSubscriptionFromConfig(subscription SubscriptionConfig) rawSubscription 
 	for priority, budget := range subscription.Fairness.Budgets {
 		budgets[priority.String()] = budget
 	}
-	return rawSubscription{Topics: subscription.Topics, Mode: rawMode(subscription.Mode), Concurrency: subscription.Concurrency, Prefetch: subscription.Prefetch, Priorities: priorities, Fairness: rawFairness{Weights: weights, Budgets: budgets, RetryWeightDivisor: subscription.Fairness.RetryWeightDivisor, CostModel: subscription.Fairness.CostModel, PrefetchFactor: subscription.Fairness.PrefetchFactor, AgingEnabled: subscription.Fairness.AgingEnabled}, Retry: rawRetry(subscription.Retry), HandlerTimeout: subscription.HandlerTimeout, UnmatchedPolicy: rawPolicy(subscription.UnmatchedPolicy), presence: subscription.presence}
+	return rawSubscription{Topics: subscription.Topics, Mode: rawMode(subscription.Mode), Concurrency: subscription.Concurrency, Prefetch: subscription.Prefetch, Priorities: priorities, Fairness: rawFairness{Weights: weights, Budgets: budgets, RetryWeightDivisor: subscription.Fairness.RetryWeightDivisor, PrefetchFactor: subscription.Fairness.PrefetchFactor, DisableAging: subscription.Fairness.DisableAging}, Retry: rawRetry(subscription.Retry), HandlerTimeout: subscription.HandlerTimeout, UnmatchedPolicy: rawPolicy(subscription.UnmatchedPolicy), presence: subscription.presence}
 }
 
 func subscriptionPresenceFromNode(node *yaml.Node) subscriptionPresence {
@@ -748,23 +739,21 @@ type rawFairness struct {
 	Weights            map[string]int           `yaml:"weights"`
 	Budgets            map[string]time.Duration `yaml:"budgets"`
 	RetryWeightDivisor int                      `yaml:"retryWeightDivisor"`
-	CostModel          string                   `yaml:"costModel"`
 	PrefetchFactor     int                      `yaml:"prefetchFactor"`
-	AgingEnabled       bool                     `yaml:"agingEnabled"`
+	DisableAging       bool                     `yaml:"disableAging"`
 }
 
 func (r *rawFairness) UnmarshalYAML(value *yaml.Node) error {
-	if err := requireKnownKeys(value, "weights", "budgets", "retryWeightDivisor", "costModel", "prefetchFactor", "agingEnabled"); err != nil {
+	if err := requireKnownKeys(value, "weights", "budgets", "retryWeightDivisor", "prefetchFactor", "disableAging"); err != nil {
 		return err
 	}
 	input := struct {
 		Weights            map[string]int           `yaml:"weights"`
 		Budgets            map[string]time.Duration `yaml:"budgets"`
 		RetryWeightDivisor int                      `yaml:"retryWeightDivisor"`
-		CostModel          string                   `yaml:"costModel"`
 		PrefetchFactor     int                      `yaml:"prefetchFactor"`
-		AgingEnabled       bool                     `yaml:"agingEnabled"`
-	}{RetryWeightDivisor: r.RetryWeightDivisor, CostModel: r.CostModel, PrefetchFactor: r.PrefetchFactor, AgingEnabled: r.AgingEnabled}
+		DisableAging       bool                     `yaml:"disableAging"`
+	}{RetryWeightDivisor: r.RetryWeightDivisor, PrefetchFactor: r.PrefetchFactor, DisableAging: r.DisableAging}
 	if err := value.Decode(&input); err != nil {
 		return err
 	}
@@ -795,7 +784,7 @@ func (r rawFairness) config() (FairnessConfig, error) {
 		}
 		budgets[priority] = budget
 	}
-	return FairnessConfig{Weights: weights, Budgets: budgets, RetryWeightDivisor: r.RetryWeightDivisor, CostModel: r.CostModel, PrefetchFactor: r.PrefetchFactor, AgingEnabled: r.AgingEnabled}, nil
+	return FairnessConfig{Weights: weights, Budgets: budgets, RetryWeightDivisor: r.RetryWeightDivisor, PrefetchFactor: r.PrefetchFactor, DisableAging: r.DisableAging}, nil
 }
 
 func requireKnownKeys(node *yaml.Node, keys ...string) error {

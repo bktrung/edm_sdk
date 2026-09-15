@@ -11,7 +11,7 @@ import (
 
 func TestSharedDriverRefcountsConnectionsAndKeepsDefaultIsolated(t *testing.T) {
 	ctx := context.Background()
-	shared := NewShared(nil)
+	shared := NewShared()
 	first, err := shared.Open(ctx, driver.Config{})
 	require.NoError(t, err)
 	second, err := shared.Open(ctx, driver.Config{})

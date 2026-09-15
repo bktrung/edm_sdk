@@ -510,14 +510,11 @@ func mergeFairness(base, override FairnessConfig) FairnessConfig {
 	if override.RetryWeightDivisor != 0 {
 		base.RetryWeightDivisor = override.RetryWeightDivisor
 	}
-	if override.CostModel != "" {
-		base.CostModel = override.CostModel
-	}
 	if override.PrefetchFactor != 0 {
 		base.PrefetchFactor = override.PrefetchFactor
 	}
-	if override.AgingEnabled {
-		base.AgingEnabled = true
+	if override.DisableAging {
+		base.DisableAging = true
 	}
 	return base
 }
@@ -535,9 +532,6 @@ func mergeRetry(base, override RetryConfig) RetryConfig {
 	if override.MaxInterval != 0 {
 		base.MaxInterval = override.MaxInterval
 	}
-	if override.Jitter != 0 {
-		base.Jitter = override.Jitter
-	}
 	if override.Tiers != nil {
 		base.Tiers = append([]time.Duration(nil), override.Tiers...)
 	}
@@ -545,11 +539,11 @@ func mergeRetry(base, override RetryConfig) RetryConfig {
 }
 
 func fairnessZero(value FairnessConfig) bool {
-	return value.Weights == nil && value.Budgets == nil && value.RetryWeightDivisor == 0 && value.CostModel == "" && value.PrefetchFactor == 0 && !value.AgingEnabled
+	return value.Weights == nil && value.Budgets == nil && value.RetryWeightDivisor == 0 && value.PrefetchFactor == 0 && !value.DisableAging
 }
 
 func retryZero(value RetryConfig) bool {
-	return value.MaxAttempts == 0 && value.InitialInterval == 0 && value.Multiplier == 0 && value.MaxInterval == 0 && value.Jitter == 0 && value.Tiers == nil
+	return value.MaxAttempts == 0 && value.InitialInterval == 0 && value.Multiplier == 0 && value.MaxInterval == 0 && value.Tiers == nil
 }
 
 func clonePriorityWeights(value map[Priority]int) map[Priority]int {

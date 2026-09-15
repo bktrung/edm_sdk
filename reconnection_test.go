@@ -466,7 +466,7 @@ func newReconnectTestClientWithLogger(t *testing.T, d *reconnectTestDriver, c cl
 	}
 	options = append(options, extra...)
 	if c != nil {
-		options = append(options, WithClock(c))
+		options = append(options, withClock(c))
 	}
 	client, err := New(context.Background(), cfg, options...)
 	if err != nil {

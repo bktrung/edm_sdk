@@ -15,6 +15,7 @@ import (
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/driver"
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/drivers/inmem"
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/clock"
+	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/testhook"
 )
 
 // Client wraps an f1.Client backed by the in-memory driver and a fake clock.
@@ -75,8 +76,8 @@ func newClient(opts ...f1.Option) (*Client, error) {
 	// These options are last so every helper always observes the same fake
 	// clock that the in-memory driver's deferred-delivery queue uses.
 	options = append(options,
-		f1.WithDriver(captureDriver{inner: inmem.New(observedClock), captures: captures, state: state}),
-		f1.WithClock(observedClock),
+		f1.WithDriver(captureDriver{inner: testhook.Driver(observedClock).(inmem.Driver), captures: captures, state: state}),
+		testhook.ClientOption(observedClock).(f1.Option),
 	)
 	core, err := f1.New(context.Background(), testConfig(), options...)
 	if err != nil {

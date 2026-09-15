@@ -341,18 +341,6 @@ func TestLoadConfigSubscriptionUsesPackagePrefetchFallback(t *testing.T) {
 	}
 }
 
-func TestLoadConfigPreservesExplicitFalseAging(t *testing.T) {
-	t.Parallel()
-	path := writeConfig(t, "f1:\n  env: test\n  service: orders\n  broker:\n    driver: inmem\n  subscriptions:\n    orders:\n      topics: [orders]\n      fairness:\n        agingEnabled: false\n")
-	cfg, err := LoadConfig(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if cfg.Subscriptions["orders"].Fairness.AgingEnabled {
-		t.Fatal("AgingEnabled = true, want explicit false")
-	}
-}
-
 func TestLoadConfigRejectsUnknownFairnessPriority(t *testing.T) {
 	t.Parallel()
 	path := writeConfig(t, "f1:\n  env: test\n  service: orders\n  broker:\n    driver: inmem\n  subscriptions:\n    orders:\n      topics: [orders]\n      fairness:\n        weights: {bogus: 99}\n")
@@ -621,7 +609,6 @@ func TestValidateConfigRejectsNegativeLifecycleDurations(t *testing.T) {
 		name string
 		set  func(*LifecycleConfig)
 	}{
-		{name: "pre stop delay", set: func(cfg *LifecycleConfig) { cfg.PreStopDelay = -time.Second }},
 		{name: "drain timeout", set: func(cfg *LifecycleConfig) { cfg.DrainTimeout = -time.Second }},
 		{name: "handler grace", set: func(cfg *LifecycleConfig) { cfg.HandlerGrace = -time.Second }},
 		{name: "consumer drain timeout", set: func(cfg *LifecycleConfig) { cfg.ConsumerDrainTimeout = -time.Second }},
@@ -660,7 +647,6 @@ func TestRetryConfigDelayForAgreesWithInternalRetryLadder(t *testing.T) {
 				InitialInterval: test.cfg.InitialInterval,
 				Multiplier:      test.cfg.Multiplier,
 				MaxInterval:     test.cfg.MaxInterval,
-				Jitter:          test.cfg.Jitter,
 				Tiers:           test.cfg.Tiers,
 			}
 			want := internalCfg.DelayFor(test.attempt)
@@ -840,8 +826,6 @@ func invalidRetryValueCases() []struct {
 		{name: "positive infinity multiplier", field: "multiplier", set: func(cfg *RetryConfig) { cfg.Multiplier = math.Inf(1) }},
 		{name: "negative infinity multiplier", field: "multiplier", set: func(cfg *RetryConfig) { cfg.Multiplier = math.Inf(-1) }},
 		{name: "negative max interval", field: "maxInterval", set: func(cfg *RetryConfig) { cfg.MaxInterval = -time.Second }},
-		{name: "nan jitter", field: "jitter", set: func(cfg *RetryConfig) { cfg.Jitter = math.NaN() }},
-		{name: "positive infinity jitter", field: "jitter", set: func(cfg *RetryConfig) { cfg.Jitter = math.Inf(1) }},
 		{name: "negative retry tier", field: "tiers", set: func(cfg *RetryConfig) { cfg.Tiers = []time.Duration{-time.Second} }},
 	}
 }
@@ -859,6 +843,29 @@ func TestLoadConfigRejectsRemovedFlushTimeout(t *testing.T) {
 	path := writeConfig(t, "f1:\n  env: test\n  service: orders\n  broker:\n    driver: inmem\n  lifecycle:\n    flushTimeout: 20s\n")
 	if _, err := LoadConfig(path); err == nil || !strings.Contains(err.Error(), "flushTimeout") {
 		t.Fatalf("LoadConfig() error = %v, want flushTimeout rejection", err)
+	}
+}
+
+func TestLoadConfigRejectsRemovedKeys(t *testing.T) {
+	t.Parallel()
+	const subscription = "  subscriptions:\n    orders:\n      topics: [orders]\n"
+	for _, test := range []struct {
+		name string
+		key  string
+		body string
+	}{
+		{name: "pre stop delay", key: "preStopDelay", body: "  lifecycle:\n    preStopDelay: 5s\n"},
+		{name: "cost model", key: "costModel", body: subscription + "      fairness:\n        costModel: count\n"},
+		{name: "retry jitter", key: "jitter", body: subscription + "      retry:\n        jitter: 0.2\n"},
+		{name: "aging enabled", key: "agingEnabled", body: subscription + "      fairness:\n        agingEnabled: false\n"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			path := writeConfig(t, "f1:\n  env: test\n  service: orders\n  broker:\n    driver: inmem\n"+test.body)
+			if _, err := LoadConfig(path); err == nil || !strings.Contains(err.Error(), test.key) {
+				t.Fatalf("LoadConfig() error = %v, want rejection naming %s", err, test.key)
+			}
+		})
 	}
 }
 

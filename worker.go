@@ -788,7 +788,7 @@ func newRunnerScheduler(r *Runner) (*sched.Scheduler, error) {
 			Budget: lane.budget, Capacity: lane.capacity,
 		})
 	}
-	return sched.New(specs, r.client.options.clock, r.subscription.Fairness.AgingEnabled)
+	return sched.New(specs, r.client.options.clock, !r.subscription.Fairness.DisableAging)
 }
 
 func schedulerLaneID(topic string, priority Priority, tier int) string {
@@ -1987,7 +1987,6 @@ func retryAndSettle(r *Runner, ctx context.Context, message driver.InboundMessag
 		InitialInterval: r.subscription.Retry.InitialInterval,
 		Multiplier:      r.subscription.Retry.Multiplier,
 		MaxInterval:     r.subscription.Retry.MaxInterval,
-		Jitter:          r.subscription.Retry.Jitter,
 		Tiers:           r.subscription.Retry.Tiers,
 	}
 	tiers := retryConfig.TierCount()
@@ -1997,7 +1996,7 @@ func retryAndSettle(r *Runner, ctx context.Context, message driver.InboundMessag
 	tier := retry.ResolveTier(retryConfig, envelope.Attempt)
 	delay := retryConfig.DelayFor(tier)
 	if requested, ok := RetryDelay(lastErr); ok {
-		resolvedTier, resolvedDelay, _ := retry.ResolveRetryAfter(retryConfig, requested)
+		resolvedTier, resolvedDelay := retry.ResolveRetryAfter(retryConfig, requested)
 		tier, delay = resolvedTier, resolvedDelay
 	}
 	now := r.client.options.clock.Now().UTC()

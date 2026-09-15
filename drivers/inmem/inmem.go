@@ -12,14 +12,14 @@ import (
 
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/driver"
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/clock"
+	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/testhook"
 )
 
 // Driver is an in-memory driver factory. New returns isolated connections;
-// NewShared returns connections over one broker. Clock selects the time source
-// used by connections; a nil clock uses the real clock. The minimal capability
-// mode is conformance-only and intentionally unexported.
+// NewShared returns connections over one broker. The minimal capability mode is
+// conformance-only and intentionally unexported.
 type Driver struct {
-	Clock   clock.Clock
+	clock   clock.Clock
 	minimal bool
 	shared  *sharedBroker
 }
@@ -45,12 +45,21 @@ const (
 
 var _ driver.Driver = Driver{}
 
-// New returns a driver using c for all time-dependent behavior.
-func New(c clock.Clock) Driver { return Driver{Clock: c} }
+// New returns a driver whose connections read time from the real clock source.
+func New() Driver { return Driver{} }
 
-// NewShared returns a driver whose repeated Open calls share one broker.
-func NewShared(c clock.Clock) Driver {
-	return Driver{Clock: c, shared: &sharedBroker{}}
+// NewShared returns a driver whose repeated Open calls share one broker and read
+// time from the real clock source.
+func NewShared() Driver {
+	return Driver{shared: &sharedBroker{}}
+}
+
+// init hands the module's own tests a way to build on a fake clock. The clock
+// type is internal, so New cannot take one from an outside caller, and the
+// deferred-delivery queue has to share the test's clock or a test that advances
+// time measures nothing.
+func init() {
+	testhook.RegisterDriver(func(c clock.Clock) driver.Driver { return Driver{clock: c} })
 }
 
 // Name returns the stable in-memory driver key.
@@ -117,7 +126,7 @@ func (d Driver) Open(ctx context.Context, _ driver.Config) (driver.Conn, error) 
 		return &sharedConn{Conn: d.shared.conn, broker: d.shared}, nil
 	}
 
-	c := d.Clock
+	c := d.clock
 	if c == nil {
 		c = clock.NewReal()
 	}

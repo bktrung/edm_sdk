@@ -149,7 +149,9 @@ func Terminal(err error) error {
 	return &classifiedError{err: err, terminal: true}
 }
 
-// RetryAfter marks err as retryable with an explicit delay for this attempt.
+// RetryAfter marks err as retryable and asks for delay on the next attempt.
+// The runtime routes delay to the nearest retry tier and uses that tier's
+// nominal delay, so delay selects a tier rather than the exact wait.
 func RetryAfter(err error, delay time.Duration) error {
 	if err == nil {
 		return nil

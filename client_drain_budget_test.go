@@ -23,7 +23,7 @@ func newBudgetTestClient(t *testing.T) (*Client, *Runner, *clock.Fake, func()) {
 	fake := clock.NewFake(time.Unix(0, 0))
 	client, err := New(context.Background(), testClientConfig(t),
 		WithDriver(&dispatchDriver{conn: &dispatchConn{producer: &dispatchProducer{}, consumer: newDispatchConsumer()}}),
-		WithClock(fake))
+		withClock(fake))
 	if err != nil {
 		t.Fatal(err)
 	}

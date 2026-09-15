@@ -18,7 +18,7 @@ func TestClientCloseRejoinsTimedOutProducerClose(t *testing.T) {
 		closeStarted: make(chan struct{}),
 		closeRelease: make(chan struct{}),
 	}
-	client := newPublishClient(t, producer, WithClock(fake))
+	client := newPublishClient(t, producer, withClock(fake))
 	client.config.Lifecycle.CloseTimeout = 5 * time.Second
 	if _, err := client.Publisher().Publish(context.Background(), "orders.created", "payload"); err != nil {
 		t.Fatal(err)
@@ -107,7 +107,7 @@ func TestClientCloseRejoinsTimedOutConnectionClose(t *testing.T) {
 		started: make(chan struct{}),
 		release: make(chan struct{}),
 	}
-	client, err := New(context.Background(), testClientConfig(t), WithDriver(&phaseTestDriver{conn: conn}), WithClock(fake))
+	client, err := New(context.Background(), testClientConfig(t), WithDriver(&phaseTestDriver{conn: conn}), withClock(fake))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -160,7 +160,7 @@ func TestHealthReturnsPromptlyWhileCloseClosesTheProducer(t *testing.T) {
 		closeStarted: make(chan struct{}),
 		closeRelease: make(chan struct{}),
 	}
-	client := newPublishClient(t, producer, WithClock(fake))
+	client := newPublishClient(t, producer, withClock(fake))
 	if _, err := client.Publisher().Publish(context.Background(), "orders.created", "payload"); err != nil {
 		t.Fatal(err)
 	}

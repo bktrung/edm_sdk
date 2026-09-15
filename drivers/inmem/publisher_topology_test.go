@@ -18,7 +18,7 @@ func TestPublisherOnlyClientReachesSeparateSubscriber(t *testing.T) {
 	defer cancel()
 
 	cfg := publisherTopologyTestConfig()
-	shared := NewShared(nil)
+	shared := NewShared()
 	publisher, err := f1.New(ctx, cfg, f1.WithDriver(shared), f1.WithPublishTopics("orders.created"))
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = publisher.Close(context.Background()) })

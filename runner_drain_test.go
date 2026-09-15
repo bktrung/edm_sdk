@@ -88,7 +88,7 @@ func newDrainRunner(t *testing.T, consumer driver.Consumer, ready bool) (*Runner
 	fake := clock.NewFake(time.Unix(0, 0))
 	client, err := New(context.Background(), testClientConfig(t),
 		WithDriver(&dispatchDriver{conn: &dispatchConn{producer: &dispatchProducer{}, consumer: newDispatchConsumer()}}),
-		WithClock(fake))
+		withClock(fake))
 	if err != nil {
 		t.Fatal(err)
 	}

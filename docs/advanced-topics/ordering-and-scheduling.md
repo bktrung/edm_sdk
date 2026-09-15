@@ -162,7 +162,6 @@ capacity policy rather than copying defaults into application code:
 	},
 	RetryWeightDivisor: 2,
 	PrefetchFactor:     2,
-	AgingEnabled:       true,
 }
 ```
 
@@ -172,8 +171,8 @@ The fields have distinct jobs:
 - `Budgets` defines how long a lane may wait before aging can promote it;
 - `RetryWeightDivisor` reduces retry pressure relative to fresh work;
 - `PrefetchFactor` scales each scheduler lane's bounded capacity; and
-- `AgingEnabled` enables age-based promotion for lanes that exceed their
-  budget.
+- `DisableAging` turns off age-based promotion for lanes that exceed their
+  budget. Its zero value leaves promotion on, which is the default.
 
 The scheduler uses weighted round-robin when no lane has exceeded its aging
 budget. When aging is enabled, the lane with the greatest budget overrun may

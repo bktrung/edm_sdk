@@ -222,11 +222,11 @@ func clearSubscriptionEnvironment(t *testing.T, name string) {
 	keys := []string{
 		"topics", "mode", "concurrency", "prefetch", "priorities",
 		"handlerTimeout", "unmatchedPolicy", "fairness.retryWeightDivisor",
-		"fairness.costModel", "fairness.prefetchFactor", "fairness.agingEnabled",
+		"fairness.prefetchFactor", "fairness.disableAging",
 		"fairness.weights.high", "fairness.weights.medium", "fairness.weights.low",
 		"fairness.budgets.high", "fairness.budgets.medium", "fairness.budgets.low",
 		"retry.maxAttempts", "retry.initialInterval", "retry.multiplier",
-		"retry.maxInterval", "retry.jitter", "retry.tiers",
+		"retry.maxInterval", "retry.tiers",
 	}
 	prefix := subscriptionEnvPrefix(name)
 	for _, key := range keys {
@@ -273,7 +273,7 @@ f1:
 	}
 }
 
-func TestSubscribePreservesExplicitYAMLFairnessZero(t *testing.T) {
+func TestSubscribePreservesExplicitYAMLDisableAging(t *testing.T) {
 	t.Parallel()
 	cfg, err := LoadConfig(writeConfig(t, `
 f1:
@@ -285,7 +285,7 @@ f1:
     orders:
       topics: [orders.created]
       fairness:
-        agingEnabled: false
+        disableAging: true
 `))
 	if err != nil {
 		t.Fatal(err)
@@ -299,8 +299,8 @@ f1:
 	if err != nil {
 		t.Fatal(err)
 	}
-	if runner.config.Fairness.AgingEnabled {
-		t.Fatal("explicit YAML agingEnabled: false was replaced by the default")
+	if !runner.config.Fairness.DisableAging {
+		t.Fatal("explicit YAML disableAging: true was replaced by the default")
 	}
 }
 
