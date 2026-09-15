@@ -405,11 +405,15 @@ func (c *conn) Producer(ctx context.Context, cfg driver.ProducerConfig) (driver.
 	c.mu.Lock()
 	if c.closed || c.closing || c.amqp.IsClosed() {
 		c.mu.Unlock()
-		// The producer was never registered, so its channel is closed here
-		// rather than by closeLocked, and with the same bound: the connection
-		// was closing when this raced it, which says nothing about whether the
-		// broker is reading it.
-		_ = c.awaitChannelClose(ctx, c.startChannelClose(producer.channel))
+		// The producer was never registered, so its channels are closed here
+		// rather than by Close, and with the same bound: the connection was
+		// closing when this raced it, which says nothing about whether the
+		// broker is reading it. It was never handed to a caller, so the only
+		// channel it opened is the first one, and this closes whichever ones
+		// it has should that ever change.
+		for _, done := range producer.startChannelCloses() {
+			_ = c.awaitChannelClose(ctx, done)
+		}
 		return nil, classify("producer", driver.KindTransient, amqp.ErrClosed)
 	}
 	c.producers[producer] = struct{}{}

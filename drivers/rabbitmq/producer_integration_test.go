@@ -93,6 +93,12 @@ func TestProducerConfirmAndReturn(t *testing.T) {
 	}
 }
 
+// TestProducerAbandonedConfirmationRelay proves the one thing a discarded
+// window must not leave behind: its own confirmation, for the next publish on
+// its channel to read as its own. Message A's confirmation arrives on the
+// channel the driver is not reading, A's window is abandoned, and A's channel
+// is discarded with that confirmation still unread on it, so message B must run
+// on a channel of its own and be confirmed by the broker there.
 func TestProducerAbandonedConfirmationRelay(t *testing.T) {
 	requireBroker(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
@@ -109,20 +115,19 @@ func TestProducerAbandonedConfirmationRelay(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Producer: %v", err)
 	}
-	p := rawProducer.(*producer)
-	brokerConfirms := p.confirms
-	controlledConfirms := make(chan amqp.Confirmation, 2)
-	p.confirms = controlledConfirms
 	t.Cleanup(func() { _ = rawProducer.Close(context.Background()) })
+	p := rawProducer.(*producer)
+	aChannel := producerFreeChannel(t, ctx, p)
+	brokerConfirms := aChannel.confirms
+	aChannel.confirms = make(chan amqp.Confirmation, publishWindowSize)
 
 	aCtx, cancelA := context.WithCancel(ctx)
 	aDone := make(chan error, 1)
 	go func() {
 		aDone <- rawProducer.Publish(aCtx, driver.OutboundMessage{Destination: queue, Body: []byte("message-a")})
 	}()
-	var aConfirmation amqp.Confirmation
 	select {
-	case aConfirmation = <-brokerConfirms:
+	case <-brokerConfirms:
 	case <-ctx.Done():
 		t.Fatalf("message A confirmation: %v", ctx.Err())
 	}
@@ -145,72 +150,19 @@ func TestProducerAbandonedConfirmationRelay(t *testing.T) {
 
 	bCtx, cancelB := context.WithTimeout(ctx, 5*time.Second)
 	defer cancelB()
-	bDone := make(chan error, 1)
-	go func() {
-		bDone <- rawProducer.Publish(bCtx, driver.OutboundMessage{Destination: queue, Body: []byte("message-b")})
-	}()
-	timer := time.NewTimer(2 * time.Second) //nolint:forbidigo // bounded live-broker relay guard
-	select {
-	case err := <-bDone:
-		if err == nil {
-			t.Fatal("message B Publish succeeded through a producer with an abandoned confirmation")
-		}
-		kind, classified := driver.Classify(err)
-		if !classified || kind != driver.KindTransient {
-			t.Fatalf("message B error = %v, kind=%v classified=%t; want transient", err, kind, classified)
-		}
-		if !errors.Is(err, amqp.ErrClosed) {
-			t.Fatalf("message B error = %v; want amqp.ErrClosed", err)
-		}
-	case bConfirmation, ok := <-brokerConfirms:
-		if !ok {
-			select {
-			case err := <-bDone:
-				if err == nil {
-					t.Fatal("message B succeeded after the confirmation stream closed")
-				}
-				if !errors.Is(err, amqp.ErrClosed) {
-					t.Fatalf("message B error after confirmation stream closed = %v; want amqp.ErrClosed", err)
-				}
-			case <-ctx.Done():
-				t.Fatalf("message B result after confirmation stream closed: %v", ctx.Err())
-			}
-			break
-		}
-		if aConfirmation.DeliveryTag == bConfirmation.DeliveryTag {
-			t.Fatalf("confirmation tags are equal: A=%d B=%d", aConfirmation.DeliveryTag, bConfirmation.DeliveryTag)
-		}
-		controlledConfirms <- aConfirmation
-		select {
-		case err := <-bDone:
-			if err == nil {
-				t.Fatalf("message B succeeded from message A confirmation: A tag=%d B tag=%d", aConfirmation.DeliveryTag, bConfirmation.DeliveryTag)
-			}
-			t.Fatalf("message B reached the broker after producer invalidation: %v", err)
-		case <-ctx.Done():
-			t.Fatalf("message B result after confirmation relay: %v", ctx.Err())
-		}
-	case <-timer.C:
-		t.Fatal("message B did not fail after producer invalidation")
+	if err := rawProducer.Publish(bCtx, driver.OutboundMessage{Destination: queue, Body: []byte("message-b")}); err != nil {
+		t.Fatalf("message B Publish = %v; it must not be answered by message A's abandoned confirmation", err)
 	}
-	if !timer.Stop() {
-		select {
-		case <-timer.C:
-		default:
-		}
+	replacement := producerFreeChannel(t, ctx, p)
+	if replacement == aChannel {
+		t.Fatal("message B ran on the channel whose confirmation was abandoned")
 	}
-	select {
-	case confirmation, ok := <-brokerConfirms:
-		if ok {
-			t.Fatalf("stale confirmation remained available after message B was rejected: tag=%d", confirmation.DeliveryTag)
-		}
-	case <-time.After(500 * time.Millisecond): //nolint:forbidigo // bounded live-broker confirmation guard
+	awaitChannelClosed(t, ctx, aChannel.channel)
+	if err := rawProducer.Close(ctx); err != nil {
+		t.Fatalf("first Producer.Close: %v", err)
 	}
 	if err := rawProducer.Close(ctx); err != nil {
-		t.Fatalf("first poisoned Producer.Close: %v", err)
-	}
-	if err := rawProducer.Close(ctx); err != nil {
-		t.Fatalf("second poisoned Producer.Close: %v", err)
+		t.Fatalf("second Producer.Close: %v", err)
 	}
 }
 
@@ -264,8 +216,9 @@ func TestProducerBatchPublishesWindowBeforeReadingConfirmation(t *testing.T) {
 		t.Fatalf("Producer: %v", err)
 	}
 	p := rawProducer.(*producer)
+	channel := producerFreeChannel(t, ctx, p)
 	confirms := make(chan amqp.Confirmation, publishWindowSize)
-	p.confirms = confirms
+	channel.confirms = confirms
 	t.Cleanup(func() { _ = rawProducer.Close(context.Background()) })
 	deliveries, err := rawChannel.Consume(queue, "producer-batch-window", false, false, false, false, nil)
 	if err != nil {
@@ -330,10 +283,11 @@ func TestProducerBatchReturnFailsItsOwnIndex(t *testing.T) {
 		t.Fatalf("Producer: %v", err)
 	}
 	p := rawProducer.(*producer)
+	channel := producerFreeChannel(t, ctx, p)
 	confirms := make(chan amqp.Confirmation, 3)
-	p.confirms = confirms
+	channel.confirms = confirms
 	returns := make(chan amqp.Return, 3)
-	p.returns = returns
+	channel.returns = returns
 	t.Cleanup(func() { _ = rawProducer.Close(context.Background()) })
 	deliveries, err := rawChannel.Consume(queue, "producer-batch-return", false, false, false, false, nil)
 	if err != nil {
@@ -484,8 +438,9 @@ func TestProducerNegativeConfirmFailsItsOwnIndex(t *testing.T) {
 		t.Fatalf("Producer: %v", err)
 	}
 	p := rawProducer.(*producer)
+	channel := producerFreeChannel(t, ctx, p)
 	confirms := make(chan amqp.Confirmation, 3)
-	p.confirms = confirms
+	channel.confirms = confirms
 	t.Cleanup(func() { _ = rawProducer.Close(context.Background()) })
 	deliveries, err := rawChannel.Consume(queue, "producer-batch-negative", false, false, false, false, nil)
 	if err != nil {
@@ -558,7 +513,8 @@ func TestProducerConfirmsArriveInPublishOrder(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = rawProducer.Close(context.Background()) })
 	p := rawProducer.(*producer)
-	captured := p.channel.NotifyPublish(make(chan amqp.Confirmation, batch))
+	channel := producerFreeChannel(t, ctx, p)
+	captured := channel.channel.NotifyPublish(make(chan amqp.Confirmation, batch))
 	messages := make([]driver.OutboundMessage, batch)
 	for index := range messages {
 		messages[index] = driver.OutboundMessage{
@@ -587,9 +543,10 @@ func TestProducerConfirmsArriveInPublishOrder(t *testing.T) {
 
 // TestProducerCancelledWindowInvalidatesChannel proves a cancelled batch
 // leaves nothing behind: every message the window published is reported
-// failed, the channel is invalidated so its unread confirmations can never be
-// read against a later publish, and a fresh producer on the same connection
-// publishes normally.
+// failed, the window's channel is closed so its unread confirmations can never
+// be read against a later publish, the producer itself still publishes on a
+// channel of its own, and a fresh producer on the same connection publishes
+// normally.
 func TestProducerCancelledWindowInvalidatesChannel(t *testing.T) {
 	requireBroker(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -607,8 +564,9 @@ func TestProducerCancelledWindowInvalidatesChannel(t *testing.T) {
 		t.Fatalf("Producer: %v", err)
 	}
 	p := rawProducer.(*producer)
+	cancelledChannel := producerFreeChannel(t, ctx, p)
 	confirms := make(chan amqp.Confirmation, publishWindowSize)
-	p.confirms = confirms
+	cancelledChannel.confirms = confirms
 	t.Cleanup(func() { _ = rawProducer.Close(context.Background()) })
 	deliveries, err := rawChannel.Consume(queue, "producer-cancelled-window", false, false, false, false, nil)
 	if err != nil {
@@ -647,10 +605,26 @@ func TestProducerCancelledWindowInvalidatesChannel(t *testing.T) {
 		t.Fatalf("failed indexes = %v, want every index of the cancelled window", publishErr.Failed)
 	}
 	// The confirmations owed to the cancelled window must never be read
-	// against a later publish, so the channel is gone and no further publish
-	// is attempted on it.
-	if err := rawProducer.Publish(ctx, driver.OutboundMessage{Destination: queue}); !errors.Is(err, amqp.ErrClosed) {
-		t.Fatalf("Publish after a cancelled window = %v, want amqp.ErrClosed", err)
+	// against a later publish, so the window's channel is gone. The producer
+	// is not: the next publish on it runs on a channel of its own.
+	awaitChannelClosed(t, ctx, cancelledChannel.channel)
+	if err := rawProducer.Publish(ctx, driver.OutboundMessage{
+		Destination: queue,
+		Headers:     []driver.Header{{Key: "id", Value: []byte("after-discard")}},
+		Body:        []byte("after-discard"),
+	}); err != nil {
+		t.Fatalf("Publish after a cancelled window: %v", err)
+	}
+	select {
+	case delivery := <-deliveries:
+		if string(delivery.Body) != "after-discard" {
+			t.Fatalf("delivered body = %q, want after-discard", delivery.Body)
+		}
+		if err := delivery.Ack(false); err != nil {
+			t.Fatalf("Ack: %v", err)
+		}
+	case <-ctx.Done():
+		t.Fatalf("receiving the publish that followed the cancelled window: %v", ctx.Err())
 	}
 
 	fresh, err := conn.Producer(ctx, driver.ProducerConfig{RequireDurableAck: true})
