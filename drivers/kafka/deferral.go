@@ -157,7 +157,15 @@ func (c *consumer) admissionLocked(record *kgo.Record) bool {
 		return false
 	}
 	if c.unsettled[destination] >= budget && !hasRequeue {
-		c.setPauseReasonLocked(destination, pauseReasonPrefetch, true)
+		// A requeue lifts this pause so the rewound partition can be fetched,
+		// and it keeps its slot charged until the redelivery settles. Pausing
+		// again here would forbid the very fetch the requeue is waiting for:
+		// franz-go does not fetch a paused topic, so the redelivery would never
+		// arrive. The pause comes back when the redelivery fills the budget in
+		// emit, or at the next refusal once the requeue has resolved.
+		if !c.hasPendingRequeueLocked(destination) {
+			c.setPauseReasonLocked(destination, pauseReasonPrefetch, true)
+		}
 		return false
 	}
 	return true

@@ -929,12 +929,15 @@ func (c *consumer) poll(ctx context.Context) {
 			continue
 		}
 
-		var fetches kgo.Fetches
-		if bounded {
-			fetches = c.client.PollRecords(fetchCtx, 0)
-		} else {
-			fetches = c.client.PollRecords(fetchCtx, 1)
-		}
+		// The whole response is taken, not one record of it. Whatever is left
+		// buffered in the client is what the next prefetch pause throws away:
+		// franz-go strips a paused topic's buffered records and rewinds its
+		// cursor, so the read-ahead is fetched and buffered again, once per
+		// pause. Draining each fetch into pending leaves the pause nothing to
+		// strip, and pending is bounded by the records one response carried,
+		// because while a destination is at budget for the prefetch reason no
+		// further fetch for it is issued.
+		fetches := c.client.PollRecords(fetchCtx, 0)
 		// A wake ends the wait with a synthetic cancellation fetch. It reports
 		// no broker fault; it reports that admission has to run over pending
 		// again, which is what a bounded poll's own timeout also asks for.
