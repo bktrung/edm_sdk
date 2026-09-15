@@ -471,18 +471,6 @@ func amqpPublishing(message driver.OutboundMessage) (amqp.Publishing, error) {
 	return publishing, nil
 }
 
-func (p *producer) Flush(ctx context.Context) error {
-	if err := ctx.Err(); err != nil {
-		return classify("flush", driver.KindTransient, err)
-	}
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	if p.closed {
-		return classify("flush", driver.KindTransient, amqp.ErrClosed)
-	}
-	return nil
-}
-
 func (p *producer) Close(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
 		return classify("producer.close", driver.KindTransient, err)

@@ -244,7 +244,6 @@ type retiredCloseProducer struct {
 }
 
 func (*retiredCloseProducer) Publish(context.Context, ...driver.OutboundMessage) error { return nil }
-func (*retiredCloseProducer) Flush(context.Context) error                              { return nil }
 func (p *retiredCloseProducer) Close(context.Context) error                            { return p.err }
 
 func TestRetiredCloseFailuresUseLastResortLogger(t *testing.T) {

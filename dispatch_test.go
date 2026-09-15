@@ -523,7 +523,7 @@ func (p *dispatchProducer) Publish(_ context.Context, messages ...driver.Outboun
 	}
 	return nil
 }
-func (*dispatchProducer) Flush(context.Context) error { return nil }
+
 func (p *dispatchProducer) Close(context.Context) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()

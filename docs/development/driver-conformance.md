@@ -192,7 +192,7 @@ the useful reading guide, not a second test manifest:
 
 | Behavior | What the group protects | Source |
 | --- | --- | --- |
-| Publish | Durable visibility, empty and canceled calls, body/header/key preservation, partial and total failure, limits, concurrency, and flush/close behavior | [`publish.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/driver/conformance/publish.go) |
+| Publish | Durable visibility, empty and canceled calls, body/header/key preservation, partial and total failure, limits, concurrency, and producer-close behavior | [`publish.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/driver/conformance/publish.go) |
 | Consume | Identity, delivery count, multi-destination intake, prefetch shares, pause/resume, start position, channel liveness, and cancellation | [`consume.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/driver/conformance/consume.go) |
 | Settlement | Ack, requeue and discard nack, no double settlement, out-of-order accounting, concurrent settlement, and cancellation | [`settle.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/driver/conformance/settle.go) |
 | Retry and redelivery | Transient recovery, delivery faults, redelivery count, stale settlement, and classified fatal errors at the driver boundary | [`failure.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/driver/conformance/failure.go) |

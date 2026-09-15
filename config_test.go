@@ -625,7 +625,6 @@ func TestValidateConfigRejectsNegativeLifecycleDurations(t *testing.T) {
 		{name: "drain timeout", set: func(cfg *LifecycleConfig) { cfg.DrainTimeout = -time.Second }},
 		{name: "handler grace", set: func(cfg *LifecycleConfig) { cfg.HandlerGrace = -time.Second }},
 		{name: "consumer drain timeout", set: func(cfg *LifecycleConfig) { cfg.ConsumerDrainTimeout = -time.Second }},
-		{name: "flush timeout", set: func(cfg *LifecycleConfig) { cfg.FlushTimeout = -time.Second }},
 		{name: "close timeout", set: func(cfg *LifecycleConfig) { cfg.CloseTimeout = -time.Second }},
 		{name: "rebalance drain timeout", set: func(cfg *LifecycleConfig) { cfg.RebalanceDrainTimeout = -time.Second }},
 	}
@@ -852,6 +851,14 @@ func TestLoadConfigRejectsUnknownBrokerOption(t *testing.T) {
 	path := writeConfig(t, "f1:\n  env: test\n  service: orders\n  broker:\n    driver: kafka\n    kafka:\n      typo: true\n")
 	if _, err := LoadConfig(path); err == nil || !strings.Contains(err.Error(), "broker.kafka.typo") {
 		t.Fatalf("LoadConfig() error = %v, want broker-key error", err)
+	}
+}
+
+func TestLoadConfigRejectsRemovedFlushTimeout(t *testing.T) {
+	t.Parallel()
+	path := writeConfig(t, "f1:\n  env: test\n  service: orders\n  broker:\n    driver: inmem\n  lifecycle:\n    flushTimeout: 20s\n")
+	if _, err := LoadConfig(path); err == nil || !strings.Contains(err.Error(), "flushTimeout") {
+		t.Fatalf("LoadConfig() error = %v, want flushTimeout rejection", err)
 	}
 }
 

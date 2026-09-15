@@ -92,7 +92,6 @@ func publisherTopologyTestConfig() f1.Config {
 		Lifecycle: f1.LifecycleConfig{
 			DrainTimeout:          time.Minute,
 			HandlerGrace:          5 * time.Second,
-			FlushTimeout:          20 * time.Second,
 			CloseTimeout:          10 * time.Second,
 			RebalanceDrainTimeout: 25 * time.Second,
 		},

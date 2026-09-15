@@ -101,7 +101,6 @@ func newReconnectSettlementRunner(t *testing.T, d *reconnectDriver, handler func
 	cfg.Broker.DefaultPrefetch = 1
 	cfg.Lifecycle.DrainTimeout = 500 * time.Millisecond
 	cfg.Lifecycle.HandlerGrace = 499 * time.Millisecond
-	cfg.Lifecycle.FlushTimeout = time.Second
 	cfg.Lifecycle.CloseTimeout = time.Second
 	client, err := f1.New(context.Background(), cfg,
 		f1.WithDriver(d),

@@ -193,7 +193,7 @@ type reconnectTestProducer struct {
 func (p *reconnectTestProducer) Publish(context.Context, ...driver.OutboundMessage) error {
 	return p.conn.driver.publishError()
 }
-func (*reconnectTestProducer) Flush(context.Context) error { return nil }
+
 func (p *reconnectTestProducer) Close(context.Context) error {
 	p.conn.producer.Add(-1)
 	return nil
@@ -459,7 +459,6 @@ func newReconnectTestClientWithLogger(t *testing.T, d *reconnectTestDriver, c cl
 	cfg.Broker.MaxReconnectAttempts = maxAttempts
 	cfg.Lifecycle.DrainTimeout = 500 * time.Millisecond
 	cfg.Lifecycle.HandlerGrace = 100 * time.Millisecond
-	cfg.Lifecycle.FlushTimeout = 100 * time.Millisecond
 	cfg.Lifecycle.CloseTimeout = 100 * time.Millisecond
 	options := []Option{WithDriver(d)}
 	if logger != nil {
@@ -726,7 +725,7 @@ func TestRunnerReconnectReportsGenerationCause(t *testing.T) {
 	runDone := make(chan error, 1)
 	go func() { runDone <- runner.Run(runCtx) }()
 	first := <-d.created
-	waitReconnectCondition(t, func() bool { return runner.lifecycle.Ready() })
+	waitReconnectCondition(t, func() bool { return runner.lifecycle.State() == lifecycle.Ready })
 	d.setFailConsumersWithError(1, cause)
 	first.sendError(&driver.Error{
 		Driver: d.Name(),
@@ -736,7 +735,7 @@ func TestRunnerReconnectReportsGenerationCause(t *testing.T) {
 	})
 	advanceReconnect(t, recorded, 500*time.Millisecond, 1)
 	waitReconnectCondition(t, func() bool {
-		return d.OpenCount() >= 2 && runner.lifecycle.Ready() && !client.isReconnecting()
+		return d.OpenCount() >= 2 && runner.lifecycle.State() == lifecycle.Ready && !client.isReconnecting()
 	})
 	assertReconnectStartedLog(t, configuredOutput.String(), cause)
 	if got := defaultOutput.String(); got != "" {
@@ -1024,7 +1023,7 @@ func TestRunConsumesSuccessfulPreRunReconnectOwner(t *testing.T) {
 	runDone := make(chan error, 1)
 	go func() { runDone <- runner.Run(runCtx) }()
 	first := <-d.created
-	waitReconnectCondition(t, func() bool { return runner.lifecycle.Ready() })
+	waitReconnectCondition(t, func() bool { return runner.lifecycle.State() == lifecycle.Ready })
 	runner.mu.Lock()
 	preRunCause := runner.reconnectCause
 	preRunAttempt := runner.reconnectCauseAttempt
@@ -1057,7 +1056,7 @@ func TestRunConsumesSuccessfulPreRunReconnectOwner(t *testing.T) {
 	releaseDecisionGate()
 	second := <-d.created
 	waitReconnectCondition(t, func() bool {
-		return runner.lifecycle.Ready() && !client.isReconnecting()
+		return runner.lifecycle.State() == lifecycle.Ready && !client.isReconnecting()
 	})
 	if !second.send(validReconnectMessage(t, "after-pre-run-owner")) {
 		t.Fatal("replacement consumer rejected a message")
@@ -1189,7 +1188,7 @@ func TestRunWaitsForNewerPreRunReconnectOwner(t *testing.T) {
 		t.Fatalf("newer pre-run reconnect = %v, want nil", err)
 	}
 	first := <-d.created
-	waitReconnectCondition(t, func() bool { return runner.lifecycle.Ready() })
+	waitReconnectCondition(t, func() bool { return runner.lifecycle.State() == lifecycle.Ready })
 	if !first.send(validReconnectMessage(t, "after-newer-pre-run-owner")) {
 		t.Fatal("consumer rejected the message after newer pre-run reconnect")
 	}
@@ -1340,7 +1339,7 @@ func TestRunPreservesGenuinePreRunCause(t *testing.T) {
 	runDone := make(chan error, 1)
 	go func() { runDone <- runner.Run(runCtx) }()
 	first := <-d.created
-	waitReconnectCondition(t, func() bool { return runner.lifecycle.Ready() })
+	waitReconnectCondition(t, func() bool { return runner.lifecycle.State() == lifecycle.Ready })
 	first.sendError(&driver.Error{
 		Driver: d.Name(),
 		Op:     "consumer",
@@ -1356,7 +1355,7 @@ func TestRunPreservesGenuinePreRunCause(t *testing.T) {
 		t.Fatal("runner did not expose the genuine pre-run cause")
 	}
 	second := <-d.created
-	waitReconnectCondition(t, func() bool { return runner.lifecycle.Ready() })
+	waitReconnectCondition(t, func() bool { return runner.lifecycle.State() == lifecycle.Ready })
 	if !second.send(validReconnectMessage(t, "after-genuine-pre-run-cause")) {
 		t.Fatal("replacement consumer rejected the message")
 	}
@@ -1467,7 +1466,7 @@ func TestRunAdoptsNewerOwnerAfterFailedPreRunReconnect(t *testing.T) {
 	}
 	client.finishReconnect(attemptB, nil)
 	first := <-d.created
-	waitReconnectCondition(t, func() bool { return runner.lifecycle.Ready() })
+	waitReconnectCondition(t, func() bool { return runner.lifecycle.State() == lifecycle.Ready })
 	if !first.send(validReconnectMessage(t, "after-adopted-pre-run-owner")) {
 		t.Fatal("consumer rejected the message after adopting the newer owner")
 	}
@@ -1661,7 +1660,7 @@ func TestFatalConsumerErrorStopsOnlyItsRunner(t *testing.T) {
 		}
 	}
 	waitReconnectCondition(t, func() bool {
-		return fatalRunner.lifecycle.Ready() && healthyRunner.lifecycle.Ready()
+		return fatalRunner.lifecycle.State() == lifecycle.Ready && healthyRunner.lifecycle.State() == lifecycle.Ready
 	})
 
 	cause := &driver.Error{Driver: d.Name(), Op: "consumer", K: driver.KindFatal, Err: errors.New("permission denied")}
@@ -1682,8 +1681,8 @@ func TestFatalConsumerErrorStopsOnlyItsRunner(t *testing.T) {
 	if d.OpenCount() != 1 || client.isReconnecting() {
 		t.Fatalf("fatal runner triggered reconnect: opens=%d reconnecting=%t", d.OpenCount(), client.isReconnecting())
 	}
-	if !healthyRunner.lifecycle.Ready() || !healthyRunner.lifecycle.Live() {
-		t.Fatalf("healthy runner state = %s, ready=%t live=%t", healthyRunner.lifecycle.State(), healthyRunner.lifecycle.Ready(), healthyRunner.lifecycle.Live())
+	if healthyRunner.lifecycle.State() != lifecycle.Ready {
+		t.Fatalf("healthy runner state = %s, want ready", healthyRunner.lifecycle.State())
 	}
 	if !consumers["healthy"].send(validReconnectMessage(t, "healthy-after-fatal")) {
 		t.Fatal("healthy consumer rejected a message after sibling failure")
@@ -1725,7 +1724,7 @@ func TestFatalConsumerErrorSkipsConcurrentReconnect(t *testing.T) {
 		runner.mu.Lock()
 		machine := runner.lifecycle
 		runner.mu.Unlock()
-		return machine != nil && machine.Ready()
+		return machine != nil && machine.State() == lifecycle.Ready
 	})
 	attempt := &reconnectAttempt{done: make(chan struct{})}
 	client.mu.Lock()
@@ -1821,7 +1820,7 @@ func TestDrainGivesInFlightHandlerItsGraceBudget(t *testing.T) {
 	runDone := make(chan error, 1)
 	go func() { runDone <- runner.Run(context.Background()) }()
 	consumer := <-d.created
-	waitReconnectCondition(t, func() bool { return runner.lifecycle.Ready() })
+	waitReconnectCondition(t, func() bool { return runner.lifecycle.State() == lifecycle.Ready })
 	if !consumer.send(validReconnectMessage(t, "drain-grace-in-flight")) {
 		t.Fatal("consumer rejected the in-flight message")
 	}
@@ -1911,7 +1910,7 @@ func TestDrainCancelsInFlightHandlerIntoRetryLane(t *testing.T) {
 		runner.mu.Lock()
 		machine := runner.lifecycle
 		runner.mu.Unlock()
-		return machine != nil && machine.Ready()
+		return machine != nil && machine.State() == lifecycle.Ready
 	})
 	settler := &graceContextSettler{}
 	consumer.messages <- retryBridgeMessage(t, Envelope{
@@ -1975,13 +1974,13 @@ func TestRunnerRepairsConsumerAndResumesDelivery(t *testing.T) {
 	runDone := make(chan error, 1)
 	go func() { runDone <- runner.Run(context.Background()) }()
 	first := <-d.created
-	waitReconnectCondition(t, func() bool { return runner.lifecycle.Ready() })
+	waitReconnectCondition(t, func() bool { return runner.lifecycle.State() == lifecycle.Ready })
 	first.sendError(&driver.Error{Driver: d.Name(), Op: "consumer", K: driver.KindTransient, Err: errors.New("transient")})
 	second := <-d.created
 	if first == second {
 		t.Fatal("repair reused the old consumer")
 	}
-	waitReconnectCondition(t, func() bool { return runner.lifecycle.Ready() })
+	waitReconnectCondition(t, func() bool { return runner.lifecycle.State() == lifecycle.Ready })
 	if client.isReconnecting() {
 		t.Fatal("lane repair entered client reconnecting state")
 	}
@@ -1992,8 +1991,8 @@ func TestRunnerRepairsConsumerAndResumesDelivery(t *testing.T) {
 	if publishErr != nil {
 		t.Fatalf("publish during lane repair = %v", publishErr)
 	}
-	if !runner.lifecycle.Ready() || !runner.lifecycle.Live() {
-		t.Fatalf("runner probes during lane repair = ready %t live %t", runner.lifecycle.Ready(), runner.lifecycle.Live())
+	if runner.lifecycle.State() != lifecycle.Ready {
+		t.Fatalf("runner state during lane repair = %s, want ready", runner.lifecycle.State())
 	}
 	if d.OpenCount() != 1 {
 		t.Fatalf("driver Open count = %d, want 1", d.OpenCount())
@@ -2092,7 +2091,7 @@ func TestSupervisorReconnectKeepsAbandonedSiblingRunning(t *testing.T) {
 		}
 	}
 	waitReconnectCondition(t, func() bool {
-		return causingRunner.lifecycle.Ready() && victimRunner.lifecycle.Ready()
+		return causingRunner.lifecycle.State() == lifecycle.Ready && victimRunner.lifecycle.State() == lifecycle.Ready
 	})
 	if err := client.Health(context.Background()); err != nil {
 		t.Fatalf("Health before supervisor reconnect = %v, want nil", err)
@@ -2327,7 +2326,7 @@ func TestSupervisorReconnectPreservesNewestAbandonedOwner(t *testing.T) {
 		}
 	}
 	waitReconnectCondition(t, func() bool {
-		return causingRunner.lifecycle.Ready() && victimRunner.lifecycle.Ready()
+		return causingRunner.lifecycle.State() == lifecycle.Ready && victimRunner.lifecycle.State() == lifecycle.Ready
 	})
 
 	causeB := errors.New("first supervisor reconnect")
@@ -2524,7 +2523,7 @@ func TestRunnerPreservesOwnerThroughConsumerOpenCancellation(t *testing.T) {
 		}
 	}
 	waitReconnectCondition(t, func() bool {
-		return causingRunner.lifecycle.Ready() && victimRunner.lifecycle.Ready()
+		return causingRunner.lifecycle.State() == lifecycle.Ready && victimRunner.lifecycle.State() == lifecycle.Ready
 	})
 
 	initial["victim"].sendError(&driver.Error{
@@ -2757,7 +2756,7 @@ func TestConsumerOpenedAsAReconnectBeginsIsReleased(t *testing.T) {
 	d.mu.Lock()
 	retiring := d.connections[0]
 	d.mu.Unlock()
-	waitReconnectCondition(t, func() bool { return runner.lifecycle.Ready() })
+	waitReconnectCondition(t, func() bool { return runner.lifecycle.State() == lifecycle.Ready })
 
 	// The next open is the one that straddles the reconnect: it asks for a
 	// reconnect and waits until the supervisor has abandoned the runners (the
@@ -2896,7 +2895,7 @@ func TestAbandonForReconnectPreservesRunnerOwnCause(t *testing.T) {
 		}
 	}
 	waitReconnectCondition(t, func() bool {
-		return causingRunner.lifecycle.Ready() && victimRunner.lifecycle.Ready()
+		return causingRunner.lifecycle.State() == lifecycle.Ready && victimRunner.lifecycle.State() == lifecycle.Ready
 	})
 
 	// The victim runner records its own driver error, the same way
@@ -3012,7 +3011,7 @@ func TestAbandonForReconnectPreservesRunnerOwnCause(t *testing.T) {
 	waitReconnectCondition(t, func() bool {
 		serviceMu.Lock()
 		defer serviceMu.Unlock()
-		settled := causingRunner.lifecycle.Ready() && victimRunner.lifecycle.Ready() && !client.isReconnecting()
+		settled := causingRunner.lifecycle.State() == lifecycle.Ready && victimRunner.lifecycle.State() == lifecycle.Ready && !client.isReconnecting()
 		if settled {
 			stopServing()
 		}
@@ -3234,7 +3233,7 @@ func TestFiniteReconnectBudgetDrainsRunnerAndReturnsFatal(t *testing.T) {
 	runDone := make(chan error, 1)
 	go func() { runDone <- runner.Run(context.Background()) }()
 	first := <-d.created
-	waitReconnectCondition(t, func() bool { return runner.lifecycle.Ready() })
+	waitReconnectCondition(t, func() bool { return runner.lifecycle.State() == lifecycle.Ready })
 	d.setFailConsumers(1)
 	d.setFailOpens(1)
 	first.sendError(&driver.Error{Driver: d.Name(), Op: "consumer", K: driver.KindTransient, Err: errors.New("transient")})
@@ -3330,7 +3329,7 @@ func TestSuccessorPublishFailureRecordsTheStoppedSubscription(t *testing.T) {
 	runDone := make(chan error, 1)
 	go func() { runDone <- runner.Run(runCtx) }()
 	consumer := <-d.created
-	waitReconnectCondition(t, func() bool { return runner.lifecycle.Ready() })
+	waitReconnectCondition(t, func() bool { return runner.lifecycle.State() == lifecycle.Ready })
 	if !consumer.send(validReconnectMessage(t, "successor-publish-failure")) {
 		t.Fatal("consumer rejected the message")
 	}
@@ -3373,7 +3372,7 @@ func TestFatalReconnectFailureRecordsTheStoppedSubscription(t *testing.T) {
 	runDone := make(chan error, 1)
 	go func() { runDone <- runner.Run(runCtx) }()
 	<-d.created
-	waitReconnectCondition(t, func() bool { return runner.lifecycle.Ready() })
+	waitReconnectCondition(t, func() bool { return runner.lifecycle.State() == lifecycle.Ready })
 
 	openErr := &driver.Error{Driver: d.Name(), Op: "open", K: driver.KindFatal, Err: errors.New("credentials rejected")}
 	d.setFailOpensWithError(1, openErr)
@@ -3448,7 +3447,7 @@ func TestReconnectReleaseFailureStillAbandonsEverySubscription(t *testing.T) {
 		}
 	}
 	waitReconnectCondition(t, func() bool {
-		return alpha.lifecycle.Ready() && beta.lifecycle.Ready()
+		return alpha.lifecycle.State() == lifecycle.Ready && beta.lifecycle.State() == lifecycle.Ready
 	})
 
 	releaseErr := errors.New("release failed")
@@ -3469,7 +3468,7 @@ func TestReconnectReleaseFailureStillAbandonsEverySubscription(t *testing.T) {
 		}
 	}
 	waitReconnectCondition(t, func() bool {
-		return alpha.lifecycle.Ready() && beta.lifecycle.Ready()
+		return alpha.lifecycle.State() == lifecycle.Ready && beta.lifecycle.State() == lifecycle.Ready
 	})
 	if !rebuilt["alpha"].send(validReconnectMessage(t, "alpha-after-abandon")) {
 		t.Fatal("rebuilt alpha consumer rejected a message")
@@ -3548,7 +3547,7 @@ func TestRecordedSubscriptionFailureClearsOnlyOnAFreshStart(t *testing.T) {
 	second := subscribe()
 	_, _ = start(second)
 	<-d.created
-	waitReconnectCondition(t, func() bool { return second.lifecycle.Ready() })
+	waitReconnectCondition(t, func() bool { return second.lifecycle.State() == lifecycle.Ready })
 	if err := client.Health(context.Background()); err != nil {
 		t.Fatalf("Health after the name reached ready again = %v, want nil", err)
 	}
@@ -3556,7 +3555,7 @@ func TestRecordedSubscriptionFailureClearsOnlyOnAFreshStart(t *testing.T) {
 	third := subscribe()
 	_, thirdDone := start(third)
 	thirdConsumer := <-d.created
-	waitReconnectCondition(t, func() bool { return third.lifecycle.Ready() })
+	waitReconnectCondition(t, func() bool { return third.lifecycle.State() == lifecycle.Ready })
 	thirdFatal := &driver.Error{Driver: d.Name(), Op: "consumer", K: driver.KindFatal, Err: errors.New("quota exceeded")}
 	thirdConsumer.sendError(thirdFatal)
 	select {
@@ -3571,7 +3570,7 @@ func TestRecordedSubscriptionFailureClearsOnlyOnAFreshStart(t *testing.T) {
 		t.Fatal(err)
 	}
 	waitReconnectCondition(t, func() bool {
-		return d.OpenCount() == 2 && second.lifecycle.Ready() && !client.isReconnecting()
+		return d.OpenCount() == 2 && second.lifecycle.State() == lifecycle.Ready && !client.isReconnecting()
 	})
 	healthErr = client.Health(context.Background())
 	if !errors.Is(healthErr, thirdFatal) {
@@ -3607,7 +3606,7 @@ func TestRecordedSubscriptionFailureIsOneEntryPerName(t *testing.T) {
 		}
 	}
 	waitReconnectCondition(t, func() bool {
-		return first.lifecycle.Ready() && second.lifecycle.Ready()
+		return first.lifecycle.State() == lifecycle.Ready && second.lifecycle.State() == lifecycle.Ready
 	})
 
 	// Two runners carry one subscription name and each stops on its own fatal
@@ -3735,7 +3734,7 @@ func TestCancelledDrainedAndRefusedRunsDoNotRecordFailures(t *testing.T) {
 		runDone := make(chan error, 1)
 		go func() { runDone <- runner.Run(runCtx) }()
 		<-d.created
-		waitReconnectCondition(t, func() bool { return runner.lifecycle.Ready() })
+		waitReconnectCondition(t, func() bool { return runner.lifecycle.State() == lifecycle.Ready })
 		if err := runner.Run(context.Background()); err == nil || !strings.Contains(err.Error(), "already running") {
 			t.Fatalf("second Run() = %v, want the already-running refusal", err)
 		}
@@ -3802,7 +3801,7 @@ func TestLateExitDoesNotRestoreAFailureANewerRunnerCleared(t *testing.T) {
 
 		entered, release := oldConsumer.holdStop()
 		t.Cleanup(release)
-		waitReconnectCondition(t, func() bool { return oldRunner.lifecycle.Ready() })
+		waitReconnectCondition(t, func() bool { return oldRunner.lifecycle.State() == lifecycle.Ready })
 
 		fatal := &driver.Error{Driver: d.Name(), Op: "consumer", K: driver.KindFatal, Err: errors.New("permission denied")}
 		oldConsumer.sendError(fatal)
@@ -3826,7 +3825,7 @@ func TestLateExitDoesNotRestoreAFailureANewerRunnerCleared(t *testing.T) {
 		newDone := make(chan error, 1)
 		go func() { newDone <- newRunner.Run(newCtx) }()
 		<-d.created
-		waitReconnectCondition(t, func() bool { return newRunner.lifecycle.Ready() })
+		waitReconnectCondition(t, func() bool { return newRunner.lifecycle.State() == lifecycle.Ready })
 		select {
 		case err := <-oldDone:
 			t.Fatalf("the failed runner returned before its teardown was released: %v", err)
@@ -3862,7 +3861,7 @@ func TestLateExitDoesNotRestoreAFailureANewerRunnerCleared(t *testing.T) {
 
 		entered, release := oldConsumer.holdStop()
 		t.Cleanup(release)
-		waitReconnectCondition(t, func() bool { return oldRunner.lifecycle.Ready() })
+		waitReconnectCondition(t, func() bool { return oldRunner.lifecycle.State() == lifecycle.Ready })
 
 		fatal := &driver.Error{Driver: d.Name(), Op: "consumer", K: driver.KindFatal, Err: errors.New("permission denied")}
 		oldConsumer.sendError(fatal)
@@ -3886,7 +3885,7 @@ func TestLateExitDoesNotRestoreAFailureANewerRunnerCleared(t *testing.T) {
 		newDone := make(chan error, 1)
 		go func() { newDone <- newRunner.Run(newCtx) }()
 		newConsumer := <-d.created
-		waitReconnectCondition(t, func() bool { return newRunner.lifecycle.Ready() })
+		waitReconnectCondition(t, func() bool { return newRunner.lifecycle.State() == lifecycle.Ready })
 		select {
 		case err := <-oldDone:
 			t.Fatalf("the failed runner returned before its teardown was released: %v", err)

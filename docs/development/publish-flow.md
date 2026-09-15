@@ -205,8 +205,8 @@ a connection that reconnect has already replaced.
 
 `beginPublish`/`endPublish` maintain the active-publish count. `Client.Close`
 uses that count as a barrier: it drains runners, waits until active publishes
-reach zero, atomically prevents further producer admission, flushes the shared
-producer, then closes the producer and connection. The close path is owned by
+reach zero, atomically prevents further producer admission, then closes the
+producer and connection. The close path is owned by
 [`Client.Close`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/client.go), with focused coverage in
 [`client_publish_quiescence_test.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/client_publish_quiescence_test.go)
 and [`publish_test.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/publish_test.go).
@@ -226,8 +226,8 @@ The port contract is intentionally small:
   acknowledgement;
 - a partial outcome is returned as `*driver.PublishError`, whose `Failed` map
   identifies per-message failures by input index;
-- `Flush` waits for buffered acknowledgements during shutdown;
-- `Close` releases producer resources;
+- `Close` releases producer resources and is the only teardown call the core
+  makes on the producer, once application publishes reach quiescence;
 - implementations must be safe for concurrent use.
 
 The contract is defined in [`driver/driver.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/driver/driver.go), and

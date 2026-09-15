@@ -39,9 +39,9 @@ if err := client.Close(closeCtx); err != nil {
 ```
 
 `Client.Close` also drains registered runners, so it is the final safety net
-when a service owns multiple subscriptions. Flush and connection-close errors
-are returned; keep and report them rather than discarding them. A successful
-close is safe to call again.
+when a service owns multiple subscriptions. Producer-close and
+connection-close errors are returned; keep and report them rather than
+discarding them. A successful close is safe to call again.
 
 See [`examples/consumer/main.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/examples/consumer/main.go) for the full
 signal and cleanup flow, and [Lifecycle and shutdown](/advanced-topics/lifecycle-and-shutdown)

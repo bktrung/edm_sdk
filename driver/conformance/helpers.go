@@ -165,10 +165,6 @@ func (p *profileProducer) Publish(ctx context.Context, messages ...driver.Outbou
 	return profileError(p.group, err)
 }
 
-func (p *profileProducer) Flush(ctx context.Context) error {
-	return p.producer.Flush(ctx)
-}
-
 func (p *profileProducer) Close(ctx context.Context) error {
 	return p.producer.Close(ctx)
 }

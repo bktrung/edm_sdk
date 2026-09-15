@@ -38,8 +38,6 @@ func (p *flightCountingProducer) Publish(context.Context, ...driver.OutboundMess
 	return nil
 }
 
-func (*flightCountingProducer) Flush(context.Context) error { return nil }
-
 func (p *flightCountingProducer) Close(context.Context) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()

@@ -51,7 +51,6 @@ func TestDrainCompletesWithoutFiringTheHandlerGraceTimer(t *testing.T) {
 	// millisecond between these two, which hides the defect entirely.
 	cfg.Lifecycle.DrainTimeout = 2 * time.Second
 	cfg.Lifecycle.HandlerGrace = 200 * time.Millisecond
-	cfg.Lifecycle.FlushTimeout = time.Second
 	cfg.Lifecycle.CloseTimeout = time.Second
 
 	graceDelay := cfg.Lifecycle.DrainTimeout - cfg.Lifecycle.HandlerGrace

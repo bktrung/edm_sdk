@@ -53,8 +53,6 @@ func (p *admissionProducer) Publish(context.Context, ...driver.OutboundMessage) 
 	return nil
 }
 
-func (*admissionProducer) Flush(context.Context) error { return nil }
-
 func (p *admissionProducer) Close(context.Context) error {
 	p.mu.Lock()
 	p.closeCalls++

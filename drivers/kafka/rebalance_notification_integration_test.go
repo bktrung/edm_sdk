@@ -253,7 +253,6 @@ func kafkaPublicTestConfig() f1.Config {
 		Lifecycle: f1.LifecycleConfig{
 			DrainTimeout:          10 * time.Second,
 			HandlerGrace:          time.Second,
-			FlushTimeout:          time.Second,
 			CloseTimeout:          time.Second,
 			RebalanceDrainTimeout: time.Second,
 		},

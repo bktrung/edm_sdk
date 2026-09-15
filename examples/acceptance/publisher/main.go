@@ -113,7 +113,6 @@ func serviceConfig(service string) f1.Config {
 		Lifecycle: f1.LifecycleConfig{
 			DrainTimeout: 10 * time.Second,
 			HandlerGrace: 1 * time.Second,
-			FlushTimeout: 5 * time.Second,
 			CloseTimeout: 5 * time.Second,
 		},
 	}

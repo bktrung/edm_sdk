@@ -344,7 +344,7 @@ func schedulingConfig() f1.Config {
 		Broker:    f1.BrokerConfig{Driver: "inmem", DefaultPrefetch: 64},
 		Topology:  f1.TopologyConfig{AutoCreate: true, VerifyOnStart: true, Priorities: []f1.Priority{f1.PriorityHigh, f1.PriorityLow}},
 		Codec:     f1.CodecConfig{Default: "json", ContentMode: "binary", MaxHeaderBytes: f1.CoreMaxHeaderBytes, MaxBodyBytes: 1 << 20},
-		Lifecycle: f1.LifecycleConfig{DrainTimeout: 10 * time.Second, HandlerGrace: time.Second, FlushTimeout: time.Second, CloseTimeout: time.Second},
+		Lifecycle: f1.LifecycleConfig{DrainTimeout: 10 * time.Second, HandlerGrace: time.Second, CloseTimeout: time.Second},
 	}
 }
 

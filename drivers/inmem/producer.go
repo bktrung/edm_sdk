@@ -83,13 +83,6 @@ func headerBytes(headers []driver.Header) int {
 	return total
 }
 
-func (p *producer) Flush(ctx context.Context) error {
-	if err := ctx.Err(); err != nil {
-		return classify("flush", driver.KindTransient, err)
-	}
-	return nil
-}
-
 func (p *producer) Close(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
 		return classify("producer.close", driver.KindTransient, err)

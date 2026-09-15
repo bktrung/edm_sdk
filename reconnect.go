@@ -287,19 +287,52 @@ func (r *Runner) transitionToReconnecting() {
 	}
 }
 
+// drainAfterRun releases a runner at the end of Run: it waits for in-flight
+// deliveries to leave the registry within DrainTimeout and then releases the
+// consumer within CloseTimeout.
+//
+// The release runs even when the wait fails. A consumer left open past the
+// wait keeps redelivering work that nothing is settling, so the failure path
+// releases on a context detached from the settlement context: the wait ended
+// because that context was cancelled or its deadline passed, and the release
+// must not inherit the cancellation that ended the wait and return at once.
 func (r *Runner) drainAfterRun(runCtx context.Context) error {
 	shutdownCtx := runnerSettlementContext(r, runCtx)
-	return r.lifecycle.Drain(shutdownCtx, lifecycle.Config{
-		Clock:        r.client.options.clock,
-		DrainTimeout: r.client.config.Lifecycle.DrainTimeout,
-		FlushTimeout: r.client.config.Lifecycle.FlushTimeout,
-		CloseTimeout: r.client.config.Lifecycle.CloseTimeout,
-	}, lifecycle.Hooks{
-		WaitSettled: func(ctx context.Context) error {
-			return r.inflight.WaitZero(ctx)
-		},
-		Close: func(ctx context.Context) error {
-			return stopRunnerConsumer(r, ctx)
-		},
-	})
+	machine := r.lifecycle
+	if machine != nil {
+		switch machine.State() {
+		case lifecycle.Ready, lifecycle.Reconnecting:
+			if err := machine.Transition(lifecycle.Draining); err != nil {
+				return err
+			}
+		case lifecycle.Draining, lifecycle.Failed:
+		default:
+			return fmt.Errorf("f1: runner cannot drain from lifecycle state %s", machine.State())
+		}
+	}
+	phaseClock := r.client.options.clock
+	drainTimeout := r.client.config.Lifecycle.DrainTimeout
+	closeTimeout := r.client.config.Lifecycle.CloseTimeout
+	release := func(ctx context.Context) error { return stopRunnerConsumer(r, ctx) }
+	if waitErr := runWithClockTimeout(shutdownCtx, phaseClock, drainTimeout, "drain", r.inflight.WaitZero); waitErr != nil {
+		releaseErr := runWithClockTimeout(context.WithoutCancel(shutdownCtx), phaseClock, closeTimeout, "close", release)
+		if machine != nil {
+			if err := machine.Transition(lifecycle.Aborted); err != nil {
+				return errors.Join(waitErr, releaseErr, err)
+			}
+		}
+		return errors.Join(waitErr, releaseErr)
+	}
+	if releaseErr := runWithClockTimeout(shutdownCtx, phaseClock, closeTimeout, "close", release); releaseErr != nil {
+		if machine != nil {
+			if err := machine.Transition(lifecycle.Aborted); err != nil {
+				return errors.Join(releaseErr, err)
+			}
+		}
+		return releaseErr
+	}
+	if machine == nil || machine.State() == lifecycle.Failed {
+		return nil
+	}
+	return machine.Transition(lifecycle.Closed)
 }

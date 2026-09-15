@@ -91,10 +91,6 @@ type Client struct {
 	// retried Close rejoins this same call instead of starting a second one
 	// against the same producer.
 	producerCloseWait <-chan error
-	// flushWait holds a still-running producer Flush call from a prior Close
-	// attempt. A retried Close rejoins this same call instead of starting a
-	// second one against the same producer.
-	flushWait <-chan error
 	// connCloseWait holds a still-running connection Close call from a prior
 	// Close attempt. A retried Close rejoins this same call instead of starting
 	// a second one against the same connection.
@@ -551,42 +547,11 @@ func (c *Client) closeResources(ctx context.Context) error {
 	if producer == nil {
 		return c.closeConnection(ctx, conn, nil)
 	}
-	if err := c.flushProducer(ctx, producer); err != nil {
-		return c.failClose(err)
-	}
 	producerCloseErr, resolved := c.closeProducer(ctx, producer)
 	if !resolved {
 		return c.failClose(producerCloseErr)
 	}
 	return c.closeConnection(ctx, conn, producerCloseErr)
-}
-
-func (c *Client) flushProducer(ctx context.Context, producer driver.Producer) error {
-	c.mu.Lock()
-	producerCloseWait := c.producerCloseWait
-	flushWait := c.flushWait
-	c.mu.Unlock()
-	if producerCloseWait != nil {
-		return nil
-	}
-	if flushWait == nil {
-		//nolint:contextcheck // this shutdown call must outlive the attempt and is rejoined on retry.
-		flushWait = startShutdownPhase(context.Background(), producer.Flush)
-		c.mu.Lock()
-		c.flushWait = flushWait
-		c.mu.Unlock()
-	}
-	flushErr, resolved := c.joinShutdownPhase(ctx, c.config.Lifecycle.FlushTimeout, "flush", flushWait)
-	if !resolved {
-		return flushErr
-	}
-	c.mu.Lock()
-	c.flushWait = nil
-	c.mu.Unlock()
-	if flushErr != nil {
-		return flushErr
-	}
-	return nil
 }
 
 func (c *Client) closeProducer(ctx context.Context, producer driver.Producer) (error, bool) {

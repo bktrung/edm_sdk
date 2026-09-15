@@ -495,7 +495,6 @@ func (p *runTestProducer) Publish(_ context.Context, messages ...driver.Outbound
 	}
 	return nil
 }
-func (*runTestProducer) Flush(context.Context) error { return nil }
 func (*runTestProducer) Close(context.Context) error { return nil }
 
 type runTestConsumer struct {

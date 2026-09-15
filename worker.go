@@ -906,7 +906,7 @@ func (r *Runner) Drain(ctx context.Context) error {
 			case <-ctx.Done():
 				return ctx.Err()
 			}
-		case lifecycle.Draining, lifecycle.Settling, lifecycle.Flushing:
+		case lifecycle.Draining:
 		case lifecycle.Closed:
 			r.mu.Unlock()
 			return nil

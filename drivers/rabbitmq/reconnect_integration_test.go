@@ -358,7 +358,6 @@ func TestRabbitMQCoreRepairsAfterSyntheticTransientFault(t *testing.T) {
 		Lifecycle: f1.LifecycleConfig{
 			DrainTimeout: 5 * time.Second,
 			HandlerGrace: 500 * time.Millisecond,
-			FlushTimeout: 5 * time.Second,
 			CloseTimeout: 5 * time.Second,
 		},
 	}
@@ -460,7 +459,6 @@ func TestRabbitMQCoreReconnectsAfterRealConnectionDeath(t *testing.T) {
 		Lifecycle: f1.LifecycleConfig{
 			DrainTimeout: 5 * time.Second,
 			HandlerGrace: 500 * time.Millisecond,
-			FlushTimeout: 5 * time.Second,
 			CloseTimeout: 5 * time.Second,
 		},
 	}
@@ -565,7 +563,6 @@ func TestRabbitMQCoreReconnectsAfterSocketReset(t *testing.T) {
 		Lifecycle: f1.LifecycleConfig{
 			DrainTimeout: 5 * time.Second,
 			HandlerGrace: 500 * time.Millisecond,
-			FlushTimeout: 5 * time.Second,
 			CloseTimeout: 5 * time.Second,
 		},
 	}
@@ -694,7 +691,6 @@ func TestRabbitMQCoreReconnectBudgetAfterRealConnectionDeath(t *testing.T) {
 		Lifecycle: f1.LifecycleConfig{
 			DrainTimeout: 5 * time.Second,
 			HandlerGrace: 500 * time.Millisecond,
-			FlushTimeout: 5 * time.Second,
 			CloseTimeout: 5 * time.Second,
 		},
 	}
@@ -795,7 +791,6 @@ func TestRabbitMQCoreRebuildsAfterLaneChannelClosure(t *testing.T) {
 		Lifecycle: f1.LifecycleConfig{
 			DrainTimeout: 5 * time.Second,
 			HandlerGrace: 500 * time.Millisecond,
-			FlushTimeout: 5 * time.Second,
 			CloseTimeout: 5 * time.Second,
 		},
 	}

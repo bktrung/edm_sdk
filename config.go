@@ -63,7 +63,6 @@ type LifecycleConfig struct {
 	// as the only limit, which is the behavior every caller saw before this
 	// field existed.
 	ConsumerDrainTimeout  time.Duration `yaml:"consumerDrainTimeout"`
-	FlushTimeout          time.Duration `yaml:"flushTimeout"`
 	CloseTimeout          time.Duration `yaml:"closeTimeout"`
 	RebalanceDrainTimeout time.Duration `yaml:"rebalanceDrainTimeout"`
 }
@@ -175,7 +174,7 @@ func defaultConfig() Config {
 		Broker:        BrokerConfig{ConnectTimeout: 30 * time.Second, DefaultPrefetch: 64},
 		Topology:      TopologyConfig{VerifyOnStart: true, Priorities: []Priority{PriorityHigh, PriorityMedium, PriorityLow}},
 		Codec:         CodecConfig{Default: "json", ContentMode: "binary", MaxHeaderBytes: CoreMaxHeaderBytes, MaxBodyBytes: 1024 * 1024},
-		Lifecycle:     LifecycleConfig{PreStopDelay: 5 * time.Second, DrainTimeout: time.Minute, HandlerGrace: 5 * time.Second, FlushTimeout: 20 * time.Second, CloseTimeout: 10 * time.Second, RebalanceDrainTimeout: 25 * time.Second},
+		Lifecycle:     LifecycleConfig{PreStopDelay: 5 * time.Second, DrainTimeout: time.Minute, HandlerGrace: 5 * time.Second, CloseTimeout: 10 * time.Second, RebalanceDrainTimeout: 25 * time.Second},
 		Subscriptions: map[string]SubscriptionConfig{},
 	}
 }
@@ -227,9 +226,6 @@ func normalizeConfig(cfg Config) Config {
 	}
 	if cfg.Lifecycle.HandlerGrace == 0 {
 		cfg.Lifecycle.HandlerGrace = defaults.Lifecycle.HandlerGrace
-	}
-	if cfg.Lifecycle.FlushTimeout == 0 {
-		cfg.Lifecycle.FlushTimeout = defaults.Lifecycle.FlushTimeout
 	}
 	if cfg.Lifecycle.CloseTimeout == 0 {
 		cfg.Lifecycle.CloseTimeout = defaults.Lifecycle.CloseTimeout
@@ -500,7 +496,6 @@ func validateLifecycleConfig(lifecycle LifecycleConfig) error {
 		{name: "preStopDelay", value: lifecycle.PreStopDelay},
 		{name: "handlerGrace", value: lifecycle.HandlerGrace},
 		{name: "consumerDrainTimeout", value: lifecycle.ConsumerDrainTimeout},
-		{name: "flushTimeout", value: lifecycle.FlushTimeout},
 		{name: "closeTimeout", value: lifecycle.CloseTimeout},
 		{name: "rebalanceDrainTimeout", value: lifecycle.RebalanceDrainTimeout},
 	}

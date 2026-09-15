@@ -263,9 +263,9 @@ skips the grace period and abandons the handler that is already in flight. The
 section shows the pattern and the budgets it uses. Give shutdown a separate
 timeout so a stalled handler or driver cannot keep the process alive forever.
 For a whole-process shutdown, `client.Close` drains every registered runner,
-flushes accepted publishes, and releases the driver's producer and connection
-resources. Call `runner.Drain` directly when you need to stop one subscription
-while keeping the client alive for other work.
+waits until no publish is in flight, and releases the driver's producer and
+connection resources. Call `runner.Drain` directly when you need to stop one
+subscription while keeping the client alive for other work.
 
 ## Run the local example
 

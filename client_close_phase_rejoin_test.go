@@ -12,30 +12,30 @@ import (
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/clock"
 )
 
-func TestClientCloseRejoinsTimedOutFlush(t *testing.T) {
+func TestClientCloseRejoinsTimedOutProducerClose(t *testing.T) {
 	fake := clock.NewFake(time.Unix(0, 0))
 	producer := &recordingProducer{
-		flushStarted: make(chan struct{}),
-		flushRelease: make(chan struct{}),
+		closeStarted: make(chan struct{}),
+		closeRelease: make(chan struct{}),
 	}
 	client := newPublishClient(t, producer, WithClock(fake))
-	client.config.Lifecycle.FlushTimeout = 5 * time.Second
+	client.config.Lifecycle.CloseTimeout = 5 * time.Second
 	if _, err := client.Publisher().Publish(context.Background(), "orders.created", "payload"); err != nil {
 		t.Fatal(err)
 	}
 
 	var release sync.Once
-	releaseFlush := func() { release.Do(func() { close(producer.flushRelease) }) }
-	t.Cleanup(releaseFlush)
+	releaseClose := func() { release.Do(func() { close(producer.closeRelease) }) }
+	t.Cleanup(releaseClose)
 
 	firstDone := make(chan error, 1)
 	go func() { firstDone <- client.Close(context.Background()) }()
-	<-producer.flushStarted
+	<-producer.closeStarted
 	waitForFakeTimer(t, fake)
 	fake.Advance(5 * time.Second)
 	firstErr := <-firstDone
-	if !errors.Is(firstErr, context.DeadlineExceeded) || !strings.Contains(firstErr.Error(), "flush phase") {
-		t.Fatalf("first Close() error = %v, want flush phase deadline", firstErr)
+	if !errors.Is(firstErr, context.DeadlineExceeded) || !strings.Contains(firstErr.Error(), "close phase") {
+		t.Fatalf("first Close() error = %v, want close phase deadline", firstErr)
 	}
 
 	secondDone := make(chan error, 1)
@@ -43,21 +43,21 @@ func TestClientCloseRejoinsTimedOutFlush(t *testing.T) {
 	if waitForClosePhaseCalls(func() int {
 		producer.mu.Lock()
 		defer producer.mu.Unlock()
-		return producer.flushCalls
+		return producer.closeCalls
 	}, 2) {
-		releaseFlush()
+		releaseClose()
 		<-secondDone
-		t.Fatalf("Flush call count = 2, want the retry to rejoin the first call")
+		t.Fatalf("producer Close call count = 2, want the retry to rejoin the first call")
 	}
-	releaseFlush()
+	releaseClose()
 	if err := <-secondDone; err != nil {
 		t.Fatalf("retried Close() error = %v", err)
 	}
 	producer.mu.Lock()
-	flushCalls := producer.flushCalls
+	closeCalls := producer.closeCalls
 	producer.mu.Unlock()
-	if flushCalls != 1 {
-		t.Fatalf("Flush call count = %d, want 1", flushCalls)
+	if closeCalls != 1 {
+		t.Fatalf("producer Close call count = %d, want 1", closeCalls)
 	}
 }
 
@@ -154,24 +154,23 @@ func TestClientCloseRejoinsTimedOutConnectionClose(t *testing.T) {
 	}
 }
 
-func TestHealthReturnsPromptlyWhileCloseFlushes(t *testing.T) {
+func TestHealthReturnsPromptlyWhileCloseClosesTheProducer(t *testing.T) {
 	fake := clock.NewFake(time.Unix(0, 0))
 	producer := &recordingProducer{
-		flushStarted: make(chan struct{}),
-		flushRelease: make(chan struct{}),
+		closeStarted: make(chan struct{}),
+		closeRelease: make(chan struct{}),
 	}
 	client := newPublishClient(t, producer, WithClock(fake))
-	client.config.Lifecycle.FlushTimeout = 5 * time.Second
 	if _, err := client.Publisher().Publish(context.Background(), "orders.created", "payload"); err != nil {
 		t.Fatal(err)
 	}
 	var release sync.Once
-	releaseFlush := func() { release.Do(func() { close(producer.flushRelease) }) }
-	t.Cleanup(releaseFlush)
+	releaseClose := func() { release.Do(func() { close(producer.closeRelease) }) }
+	t.Cleanup(releaseClose)
 
 	closeDone := make(chan error, 1)
 	go func() { closeDone <- client.Close(context.Background()) }()
-	<-producer.flushStarted
+	<-producer.closeStarted
 	healthDone := make(chan error, 1)
 	go func() { healthDone <- client.Health(context.Background()) }()
 	healthTimer := clock.NewReal().Timer(100 * time.Millisecond)
@@ -182,11 +181,11 @@ func TestHealthReturnsPromptlyWhileCloseFlushes(t *testing.T) {
 			t.Fatalf("Health() error = %v, want client-closing error", healthErr)
 		}
 	case <-healthTimer.C:
-		releaseFlush()
+		releaseClose()
 		<-closeDone
-		t.Fatal("Health() blocked while Close was flushing")
+		t.Fatal("Health() blocked while Close was closing the producer")
 	}
-	releaseFlush()
+	releaseClose()
 	if err := <-closeDone; err != nil {
 		t.Fatalf("Close() error = %v", err)
 	}

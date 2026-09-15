@@ -9,7 +9,7 @@ F1 separates subscription lifecycle from client lifecycle:
 
 Choose the smallest scope that matches the operation. Do not close a shared
 client just to stop one subscription, and do not rely on a runner context
-cancel alone to flush the client's publisher.
+cancel alone to drain and release the client's driver resources.
 
 ## The lifecycle at a glance
 
@@ -21,12 +21,8 @@ stateDiagram-v2
     Reconnecting --> Ready: consumer repaired
     Ready --> Draining: Runner.Drain or Run context cancel
     Reconnecting --> Draining: Client.Close
-    Draining --> Settling: stop intake
-    Settling --> Flushing: accepted work settled
-    Flushing --> Closed: resources released
+    Draining --> Closed: work settled and consumer released
     Draining --> Aborted: deadline or fatal shutdown error
-    Settling --> Aborted: deadline or fatal shutdown error
-    Flushing --> Aborted: deadline or fatal shutdown error
     Ready --> Failed: terminal consumer error
 ```
 
@@ -141,8 +137,8 @@ driver or settlement failure can be surfaced through either lifecycle boundary.
 ## Close the client
 
 Use `Client.Close` at the process boundary. It drains all registered runners,
-waits for active publishes, flushes the shared producer, closes the producer,
-and finally closes the driver connection:
+waits until no publish is in flight, closes the shared producer, and finally
+closes the driver connection:
 
 ```go
 func shutdown(client *f1.Client) error {
@@ -161,11 +157,16 @@ The close sequence is intentionally settle-last and publish-aware:
 1. shutdown admission closes, so new application publishes and subscriptions
    are refused;
 2. the reconnect supervisor is stopped;
-3. registered runners drain concurrently;
-4. active application publishes reach quiescence;
-5. the shared producer is flushed;
-6. the producer is closed; and
-7. the driver connection is closed.
+3. registered runners drain concurrently, bounded by
+   `Lifecycle.ConsumerDrainTimeout`;
+4. active application publishes reach quiescence, bounded by
+   `Lifecycle.DrainTimeout`;
+5. the producer is closed; and
+6. the driver connection is closed.
+
+The producer and connection close steps share `Lifecycle.CloseTimeout`, and a
+retried `Close` rejoins a step that is still running rather than starting a
+second driver call.
 
 Core-generated retry and dead-letter successors are allowed to complete during
 runner drain so an accepted failed delivery is not lost merely because
@@ -246,7 +247,6 @@ only to make a shutdown test pass:
 | `DrainTimeout` | Runner handler-drain and settlement phases | Must be positive; subscription `HandlerTimeout` must be shorter. |
 | `HandlerGrace` | Final cancellation grace window for handlers during drain | Must not be negative; a value outside the drain budget is not useful. |
 | `ConsumerDrainTimeout` | `Client.Close`'s wait for all runner drains | Zero leaves the caller's context as the only bound. |
-| `FlushTimeout` | Shared producer flush | Zero leaves the caller's context as the only bound. |
 | `CloseTimeout` | Producer and connection close operations | Zero leaves the caller's context as the only bound. |
 
 `DrainTimeout` is applied to the runner's drain and settlement waits as separate
@@ -323,7 +323,7 @@ decisions that matter to the service:
   caller deadline.
 
 The lifecycle state machine is tested in
-[`internal/lifecycle/drain_test.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/internal/lifecycle/drain_test.go).
+[`internal/lifecycle/state_test.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/internal/lifecycle/state_test.go).
 Client-level timeout and retry behavior is covered by
 [`client_drain_budget_test.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/client_drain_budget_test.go) and
 [`client_close_sequencing_test.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/client_close_sequencing_test.go).

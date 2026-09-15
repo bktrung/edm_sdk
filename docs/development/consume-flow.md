@@ -363,24 +363,24 @@ stateDiagram-v2
     Ready --> Draining
     Reconnecting --> Ready
     Reconnecting --> Draining
-    Draining --> Settling
-    Settling --> Flushing
-    Flushing --> Closed
+    Draining --> Closed
     Draining --> Aborted
-    Settling --> Aborted
-    Flushing --> Aborted
 ```
 
-For a normal runner drain, `WaitSettled` waits for the in-flight registry to
-reach zero and the consumer is then stopped. If `Stop` refuses because the
-driver still owns outstanding deliveries, the runner uses `Release` so those
-deliveries can be redelivered. `Release` is not a retry disposition; it returns
-broker-owned work without claiming that the message was handled.
+For a normal runner drain, `drainAfterRun` waits for the in-flight registry to
+reach zero under `Lifecycle.DrainTimeout`, then releases the consumer under
+`Lifecycle.CloseTimeout`. A wait that fails still releases the consumer, on a
+context detached from the canceled run context, and ends the runner `Aborted`;
+a release error also ends `Aborted`; success ends `Closed`; and a runner that
+is already `Failed` stays `Failed` and returns nil. If `Stop` refuses because
+the driver still owns outstanding deliveries, the runner uses `Release` so
+those deliveries can be redelivered. `Release` is not a retry disposition; it
+returns broker-owned work without claiming that the message was handled.
 
-`Client.Close` drains all registered runners before waiting for active publishes
-and closing shared producer/connection resources. The lifecycle implementation
-is in [`internal/lifecycle/drain.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/internal/lifecycle/drain.go), with
-runner integration in [`Runner.Drain`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/worker.go),
+`Client.Close` drains all registered runners before waiting for publish
+quiescence and closing shared producer/connection resources. The lifecycle
+package holds the state machine only, with runner integration in
+[`Runner.Drain`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/worker.go),
 [`drainAfterRun`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/reconnect.go), and [`Client.Close`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/client.go).
 User-visible shutdown behavior is documented in
 [Lifecycle and shutdown](/advanced-topics/lifecycle-and-shutdown).
@@ -433,8 +433,8 @@ When changing consume behavior, follow this order:
 4. Fairness, retry-lane weighting, and aging in
    [`internal/sched/scheduler.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/internal/sched/scheduler.go).
 5. Retry classification and destination construction in
-   [`internal/retry/classify.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/internal/retry/classify.go) and
-   [`worker.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/worker.go).
+   [`worker.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/worker.go) and
+   [`internal/retry/ladder.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/internal/retry/ladder.go).
 6. Driver delivery and settlement semantics in
    [`driver/driver.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/driver/driver.go) and
    [`driver/message.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/driver/message.go).
