@@ -24,7 +24,9 @@ RABBITMQ_COMPOSE := RABBITMQ_PORT=$(RABBITMQ_PORT) RABBITMQ_MANAGEMENT_PORT=$(RA
 # Every RabbitMQ test target needs the same endpoint. Sharing the prefix keeps a
 # new target from being added with a different one. Whether a test needs a broker
 # is decided by the integration build tag now, not by an environment variable.
-RABBITMQ_TEST_ENV = F1_RABBITMQ_ENDPOINT=$${F1_RABBITMQ_ENDPOINT:-amqp://guest:guest@localhost:$(RABBITMQ_PORT)/}
+# The container id travels with it for the tests that have to raise a real alarm
+# inside the fixture, which is the only way to make the broker block publishing.
+RABBITMQ_TEST_ENV = F1_RABBITMQ_ENDPOINT=$${F1_RABBITMQ_ENDPOINT:-amqp://guest:guest@localhost:$(RABBITMQ_PORT)/} F1_RABBITMQ_CONTAINER=$$($(RABBITMQ_COMPOSE) ps -q rabbitmq)
 KAFKA_PORT ?= 19092
 KAFKA_PROJECT ?= docker
 KAFKA_COMPOSE := KAFKA_PORT=$(KAFKA_PORT) docker compose --project-name "$(KAFKA_PROJECT)" -f docker/docker-compose.yml

@@ -43,10 +43,34 @@ var _ driver.Producer = (*producer)(nil)
 // confirmation for the same message, so a buffer smaller than the outstanding
 // window can stall dispatch. W = 1 is the one-confirm-at-a-time behaviour this
 // replaces, which keeps the constant usable for bisecting a regression.
+//
+// The sizing is also what a channel whose close outlived its caller depends on.
+// Once the broker unblocks it still delivers acks and returns for a window
+// nobody is reading any more, since the producer is already closed and the
+// close that ends the channel is still in flight; a receiver smaller than the
+// window would stall the frame reader on such a send instead of taking it.
 const publishWindowSize = 64
 
-func newProducer(conn *conn, cfg driver.ProducerConfig) (*producer, error) {
+func newProducer(ctx context.Context, conn *conn, cfg driver.ProducerConfig) (*producer, error) {
 	_ = cfg
+	// A block is waited out before anything is opened: the two round trips below
+	// are synchronous, and a broker that is blocking publishers has stopped
+	// reading this connection, so neither can complete until the block clears.
+	// The wait is outside the connection lock because it can last as long as the
+	// caller's context, and holding the read lock across it would park every
+	// other call on the connection behind an alarm - a Close that only wanted to
+	// report outstanding resources included. Nothing is decided here: a
+	// connection that closed during the wait is caught by the check below, and
+	// one that closed after this producer was built is caught by the caller's
+	// re-check, which closes the channel it never registered.
+	//
+	// What this cannot cover is a connection the broker has just begun blocking
+	// for its own publishing and has not told us about yet: there is no state to
+	// wait on during that gap, and the channel open that follows is a round trip
+	// amqp091 gives no context to end.
+	if err := conn.awaitUnblocked(ctx); err != nil {
+		return nil, classify("producer", driver.KindTransient, err)
+	}
 	conn.mu.RLock()
 	if conn.closed || conn.amqp.IsClosed() {
 		conn.mu.RUnlock()
@@ -58,7 +82,7 @@ func newProducer(conn *conn, cfg driver.ProducerConfig) (*producer, error) {
 		return nil, classifyAMQP("producer", driver.KindTransient, err)
 	}
 	if err := channel.Confirm(false); err != nil {
-		_ = channel.Close()
+		_ = conn.awaitChannelClose(ctx, conn.startChannelClose(channel))
 		return nil, classifyAMQP("producer", driver.KindFatal, err)
 	}
 	p := &producer{
@@ -177,14 +201,28 @@ func (p *producer) publishWindow(ctx context.Context, msgs []driver.OutboundMess
 			if offset > 0 {
 				// Messages already published here are unconfirmed, and their
 				// confirmations must not be read against a later publish.
-				p.invalidateLocked()
+				p.invalidateLocked(ctx)
+			}
+			return 0, classify("publish", driver.KindTransient, err)
+		}
+		// A broker that is blocking publishers has stopped reading this
+		// connection, and PublishWithContext checks ctx only on entry: the
+		// socket write it makes next is the one a caller's deadline cannot
+		// reach, so it is gated per message and not once per Publish. A batch
+		// that starts before the alarm must not keep writing into it, and a
+		// wait whose end is the caller's context keeps the semantics a caller
+		// already has instead of failing every publish the moment an alarm is
+		// raised, which would turn a minute of alarm into a retry storm.
+		if err := p.conn.awaitUnblocked(ctx); err != nil {
+			if offset > 0 {
+				p.invalidateLocked(ctx)
 			}
 			return 0, classify("publish", driver.KindTransient, err)
 		}
 		if err := p.channel.PublishWithContext(ctx, item.exchange, item.routingKey, true, false, item.publishing); err != nil {
 			// A publish that failed on the wire leaves the channel's delivery
 			// tags out of step with the messages that were not published.
-			p.invalidateLocked()
+			p.invalidateLocked(ctx)
 			return 0, classifyAMQP("publish", driver.KindTransient, err)
 		}
 	}
@@ -192,7 +230,7 @@ func (p *producer) publishWindow(ctx context.Context, msgs []driver.OutboundMess
 	for _, item := range window {
 		confirmation, err := p.waitConfirm(ctx, returned)
 		if err != nil {
-			p.invalidateLocked()
+			p.invalidateLocked(ctx)
 			return 0, err
 		}
 		if !confirmation.Ack {
@@ -450,7 +488,7 @@ func (p *producer) Close(ctx context.Context) error {
 		return classify("producer.close", driver.KindTransient, err)
 	}
 	p.mu.Lock()
-	err := p.closeLocked()
+	err := p.closeLocked(ctx)
 	p.mu.Unlock()
 	if errors.Is(err, amqp.ErrClosed) {
 		return nil
@@ -461,16 +499,33 @@ func (p *producer) Close(ctx context.Context) error {
 	return nil
 }
 
-func (p *producer) invalidateLocked() {
-	_ = p.closeLocked()
+// invalidateLocked closes the producer because its channel can no longer be
+// published on. ctx is the context of the operation that reached here: on the
+// deadline paths the caller has already run out of time, so the close must not
+// be what holds it to the broker's pace.
+func (p *producer) invalidateLocked(ctx context.Context) {
+	_ = p.closeLocked(ctx)
 }
 
-func (p *producer) closeLocked() error {
+// closeLocked marks the producer closed, unregisters it, and closes its
+// channel, waiting on that close only as long as ctx allows.
+//
+// The producer is dead to callers before the wait begins: p.closed is set and
+// the connection has dropped it, under the lock its caller holds, so a caller
+// that gave up on the close is left holding a producer nothing else can reach
+// and whose next publish is refused rather than answered against a channel on
+// its way out.
+//
+// Starting the close before unregistering is what makes conn.Close able to wait
+// for it. Dropping a producer takes the connection lock, so a Close that saw
+// the producer set empty did so after this close was registered, and the wait
+// it then performs covers it.
+func (p *producer) closeLocked(ctx context.Context) error {
 	if p.closed {
 		return nil
 	}
 	p.closed = true
-	err := p.channel.Close()
+	done := p.conn.startChannelClose(p.channel)
 	p.conn.removeProducer(p)
-	return err
+	return p.conn.awaitChannelClose(ctx, done)
 }
