@@ -448,6 +448,55 @@ func TestPublishBatchTransientCauseStillReconnects(t *testing.T) {
 	}
 }
 
+func TestSinglePublishTransientFailureRequestsReconnect(t *testing.T) {
+	t.Parallel()
+	var logs logSink
+	cause := &driver.Error{Driver: "test", Op: "publish", K: driver.KindTransient, Err: errors.New("broker reset the connection")}
+	producer := &recordingProducer{publishErr: cause}
+	client := newPublishClient(t, producer, WithLogger(slog.New(slog.NewTextHandler(&logs, nil))))
+	if _, err := client.Publisher().Publish(context.Background(), "orders.created", "payload"); !errors.Is(err, cause) {
+		t.Fatalf("Publish() error = %v, want it to wrap %v", err, cause)
+	}
+	quiescePublishClient(t, client)
+	if !reconnectRequested(client, logs.String()) {
+		t.Fatalf("a single publish its driver classified transient did not reconnect the client; logs=%s", logs.String())
+	}
+}
+
+func TestSinglePublishFatalFailureDoesNotRequestReconnect(t *testing.T) {
+	t.Parallel()
+	var logs logSink
+	cause := &driver.Error{Driver: "test", Op: "publish", K: driver.KindFatal, Err: errors.New("broker rejected the publish")}
+	producer := &recordingProducer{publishErr: cause}
+	client := newPublishClient(t, producer, WithLogger(slog.New(slog.NewTextHandler(&logs, nil))))
+	if _, err := client.Publisher().Publish(context.Background(), "orders.created", "payload"); !errors.Is(err, cause) {
+		t.Fatalf("Publish() error = %v, want it to wrap %v", err, cause)
+	}
+	quiescePublishClient(t, client)
+	if reconnectRequested(client, logs.String()) {
+		t.Fatalf("a single publish its driver classified fatal reconnected the client; logs=%s", logs.String())
+	}
+}
+
+func TestProducerCreationTransientFailureRequestsReconnect(t *testing.T) {
+	t.Parallel()
+	var logs logSink
+	cause := &driver.Error{Driver: "test", Op: "producer", K: driver.KindTransient, Err: errors.New("broker closed the channel")}
+	conn := &publishConn{
+		producer:    &recordingProducer{},
+		producerErr: cause,
+		info:        driver.BrokerInfo{Kind: "test", Version: "1"},
+	}
+	client := newPublishClientWithConn(t, conn, WithLogger(slog.New(slog.NewTextHandler(&logs, nil))))
+	if _, err := client.Publisher().Publish(context.Background(), "orders.created", "payload"); !errors.Is(err, cause) {
+		t.Fatalf("Publish() error = %v, want it to wrap %v", err, cause)
+	}
+	quiescePublishClient(t, client)
+	if !reconnectRequested(client, logs.String()) {
+		t.Fatalf("a producer creation its driver classified transient did not reconnect the client; logs=%s", logs.String())
+	}
+}
+
 func TestNewLogsNonNativeCapabilities(t *testing.T) {
 	t.Parallel()
 	var logs logSink
@@ -488,6 +537,13 @@ func TestTopicForOnlyStripsTrailingVersion(t *testing.T) {
 func newPublishClient(t *testing.T, producer *recordingProducer, opts ...Option) *Client {
 	t.Helper()
 	conn := &publishConn{producer: producer, info: driver.BrokerInfo{Kind: "test", Version: "1"}}
+	return newPublishClientWithConn(t, conn, opts...)
+}
+
+// newPublishClientWithConn builds a client over conn, for a test that needs a
+// connection shape the producer-only helper cannot express.
+func newPublishClientWithConn(t *testing.T, conn *publishConn, opts ...Option) *Client {
+	t.Helper()
 	options := []Option{WithDriver(&publishDriver{conn: conn})}
 	options = append(options, opts...)
 	client, err := New(context.Background(), testClientConfig(t), options...)
@@ -546,6 +602,7 @@ func (d *publishDriver) Open(context.Context, driver.Config) (driver.Conn, error
 type publishConn struct {
 	mu               sync.Mutex
 	producer         driver.Producer
+	producerErr      error
 	caps             driver.Capabilities
 	info             driver.BrokerInfo
 	producerCalls    int
@@ -562,8 +619,13 @@ func (c *publishConn) BrokerInfo() driver.BrokerInfo { return c.info }
 func (c *publishConn) Producer(context.Context, driver.ProducerConfig) (driver.Producer, error) {
 	c.mu.Lock()
 	c.producerCalls++
+	producer := c.producer
+	err := c.producerErr
 	c.mu.Unlock()
-	return c.producer, nil
+	if err != nil {
+		return nil, err
+	}
+	return producer, nil
 }
 
 func (*publishConn) Consumer(context.Context, driver.ConsumerConfig) (driver.Consumer, error) {
