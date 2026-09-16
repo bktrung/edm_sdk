@@ -654,7 +654,11 @@ func publishMessages(c *Client, ctx context.Context, messages ...driver.Outbound
 		return err
 	}
 	producer := c.producerHandle
+	// The connection and its incarnation are read together, in the section that
+	// decides whether this call builds a producer: the producer is built on
+	// that connection, and the admission after it compares the same claim.
 	conn := c.conn
+	epoch := c.epoch
 	effective := c.effective
 	if producer != nil {
 		beginPublish(c)
@@ -672,10 +676,7 @@ func publishMessages(c *Client, ctx context.Context, messages ...driver.Outbound
 
 		var loser driver.Producer
 		c.mu.Lock()
-		err = c.admit(workPublish, 0)
-		if err == nil && !sameConnection(c.conn, conn) {
-			err = c.reconnectingError("publish")
-		}
+		err = c.admit(workPublish, epoch)
 		if err == nil {
 			if c.producerHandle != nil {
 				producer = c.producerHandle

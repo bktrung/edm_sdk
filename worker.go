@@ -193,7 +193,7 @@ func (r *Runner) Run(ctx context.Context) (runErr error) {
 		// sizes the ordered worker queues from it, so both read the same number
 		// instead of deriving it again from a formula that could drift.
 		prefetch := runnerConsumerPrefetch(r, r.config.Prefetch, runnerLanePlan(r))
-		consumer, openedOn, err := openRunnerConsumerWith(r, runCtx, prefetch)
+		consumer, openedEpoch, err := openRunnerConsumerWith(r, runCtx, prefetch)
 		r.mu.Lock()
 		draining = r.draining
 		r.mu.Unlock()
@@ -243,16 +243,27 @@ func (r *Runner) Run(ctx context.Context) (runErr error) {
 		// Admit only a consumer opened on the connection that is still live.
 		// requestReconnect marks the client before abandoning runners, so this
 		// critical section either rejects and releases this consumer or records
-		// it before abandonForReconnect can release it.
+		// it before abandonForReconnect can release it. The epoch the runner
+		// captured with the connection is what the admission compares, and the
+		// current one is read under the same lock, so a rejection is reported
+		// against the incarnation the rejection was taken against.
 		r.client.mu.Lock()
 		r.mu.Lock()
-		admitted := !r.client.reconnecting && sameConnection(r.client.conn, openedOn)
-		if admitted {
+		admissionErr := r.client.admit(workConsumerAdmission, openedEpoch)
+		currentEpoch := r.client.epoch
+		if admissionErr == nil {
 			r.consumer = consumer
 		}
 		r.mu.Unlock()
 		r.client.mu.Unlock()
-		if !admitted {
+		if admissionErr != nil {
+			if currentEpoch != openedEpoch {
+				// A stale open is repaired at once by the next iteration, so it
+				// earns a debug line and not a Health entry: a surface that
+				// reports self-healing states teaches people to ignore it.
+				lastResortRunnerLogger(r).Debug("f1 consumer discarded after the connection was replaced",
+					"subscription", r.subscription.Name, "opened_epoch", openedEpoch, "current_epoch", currentEpoch)
+			}
 			if closeErr := runWithClockTimeout(context.WithoutCancel(runCtx), r.client.options.clock, r.client.config.Lifecycle.CloseTimeout, "consumer release", func(closeCtx context.Context) error {
 				return consumer.Release(closeCtx)
 			}); closeErr != nil {
@@ -1197,9 +1208,12 @@ func openRunnerConsumer(r *Runner, ctx context.Context) (driver.Consumer, error)
 
 // openRunnerConsumerWith opens the consumer for a generation whose total
 // in-flight budget is prefetch, as derived by Run, and returns the connection
-// used to open it.
-func openRunnerConsumerWith(r *Runner, ctx context.Context, prefetch int) (driver.Consumer, driver.Conn, error) {
+// incarnation it opened it on. The epoch is read in the same critical section
+// as the connection, so a caller that admits its consumer later compares the
+// number that belongs to the connection it actually used.
+func openRunnerConsumerWith(r *Runner, ctx context.Context, prefetch int) (driver.Consumer, uint64, error) {
 	var conn driver.Conn
+	var epoch uint64
 	var effective driver.Capabilities
 	var source string
 	for {
@@ -1214,11 +1228,12 @@ func openRunnerConsumerWith(r *Runner, ctx context.Context, prefetch int) (drive
 				waitHook()
 			}
 			if err := r.client.waitReconnect(ctx, attempt); err != nil {
-				return nil, nil, err
+				return nil, 0, err
 			}
 			continue
 		}
 		conn = r.client.conn
+		epoch = r.client.epoch
 		effective = r.client.effective
 		source = r.client.source
 		r.client.mu.Unlock()
@@ -1226,7 +1241,7 @@ func openRunnerConsumerWith(r *Runner, ctx context.Context, prefetch int) (drive
 	}
 	policy := r.client.topologyPolicy()
 	if conn == nil {
-		return nil, nil, errors.New("f1: client is not connected")
+		return nil, 0, errors.New("f1: client is not connected")
 	}
 	destinations := subscriptionDestinations(effective, source, r.subscription)
 	retryDestinationTiers := retryDestinationTierMap(source, r.subscription)
@@ -1239,13 +1254,13 @@ func openRunnerConsumerWith(r *Runner, ctx context.Context, prefetch int) (drive
 	// the call.
 	admin := conn.Admin()
 	if admin == nil {
-		return nil, nil, errors.New("f1: consumer topology requires driver admin")
+		return nil, 0, errors.New("f1: consumer topology requires driver admin")
 	}
 	topology := subscriptionTopologySpecs(effective, source, r.subscription)
 	topology.Policy = policy
 	diff, err := admin.EnsureTopology(ctx, topology)
 	if err != nil {
-		return nil, nil, fmt.Errorf("f1: ensure subscription topology: %w", err)
+		return nil, 0, fmt.Errorf("f1: ensure subscription topology: %w", err)
 	}
 	logTopologyDrift(lastResortRunnerLogger(r), diff)
 	// Each destination's cap is its lane's capacity, so a lane can never hold
@@ -1271,12 +1286,12 @@ func openRunnerConsumerWith(r *Runner, ctx context.Context, prefetch int) (drive
 		StartAt:        driver.StartEarliest,
 	})
 	if err != nil {
-		return nil, nil, fmt.Errorf("f1: create subscription %s: %w", r.subscription.Name, err)
+		return nil, 0, fmt.Errorf("f1: create subscription %s: %w", r.subscription.Name, err)
 	}
 	if consumer == nil {
-		return nil, nil, errors.New("f1: driver returned a nil consumer")
+		return nil, 0, errors.New("f1: driver returned a nil consumer")
 	}
-	return consumer, conn, nil
+	return consumer, epoch, nil
 }
 
 func consumeRunnerErrors(r *Runner, ctx context.Context) error {

@@ -2835,6 +2835,118 @@ func TestConsumerOpenedAsAReconnectBeginsIsReleased(t *testing.T) {
 	}
 }
 
+// TestConsumerOpenedAfterTheConnectionWasReplacedIsReleased proves that a
+// consumer whose open straddles a connection swap is released rather than
+// adopted: the runner captured its connection before the swap, so the consumer
+// it opened belongs to the incarnation the client has left and nothing would
+// release it once the connection is retired.
+//
+// The swap is installed inside the consumer open on purpose, because that is
+// where the runner's view of the connection is already fixed: it read the
+// connection and the incarnation together before asking the driver, and the
+// admission runs after the driver answers. Installing it there is what makes
+// the interleaving deterministic instead of a race the test would have to win.
+func TestConsumerOpenedAfterTheConnectionWasReplacedIsReleased(t *testing.T) {
+	fake := clock.NewFake(time.Unix(500, 0))
+	recorded := &recordingClock{Fake: fake, sleepStarted: make(chan chan struct{}, 4)}
+	d := &reconnectTestDriver{created: make(chan *reconnectTestConsumer, 8)}
+	var delivered atomic.Int32
+	client := newReconnectTestClient(t, d, recorded, 0)
+	client.reconnectRandom = func() float64 { return 0 }
+
+	runner, err := client.Subscribe(context.Background(), Subscription{
+		Name:           "orders",
+		Topics:         []string{"orders.created"},
+		Prefetch:       12,
+		HandlerTimeout: 10 * time.Millisecond,
+		Handlers: map[string]Handler{
+			"orders.created": HandlerFunc(func(context.Context, *Event) error {
+				delivered.Add(1)
+				return nil
+			}),
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	runCtx, cancelRun := context.WithCancel(context.Background())
+	t.Cleanup(cancelRun)
+	runDone := make(chan error, 1)
+	go func() { runDone <- runner.Run(runCtx) }()
+
+	initial := <-d.created
+	d.mu.Lock()
+	retiring := d.connections[0]
+	d.mu.Unlock()
+	waitReconnectCondition(t, func() bool { return runner.lifecycle.State() == lifecycle.Ready })
+
+	var gateOnce sync.Once
+	var gateFailed atomic.Bool
+	d.mu.Lock()
+	d.consumerOpenHook = func(ctx context.Context, _ string) error {
+		gateOnce.Do(func() {
+			replacement, openErr := d.Open(ctx, driver.Config{})
+			if openErr != nil {
+				gateFailed.Store(true)
+				return
+			}
+			client.mu.Lock()
+			client.conn = replacement
+			client.epoch++
+			client.mu.Unlock()
+		})
+		return nil
+	}
+	d.mu.Unlock()
+
+	// A transient consumer error ends the first generation, so the loop opens
+	// the next consumer through the gate above, on the connection the runner
+	// is about to lose.
+	initial.sendError(&driver.Error{Driver: d.Name(), Op: "consumer", K: driver.KindTransient, Err: errors.New("consumer disconnected")})
+
+	var stale *reconnectTestConsumer
+	select {
+	case stale = <-d.created:
+	case <-clock.NewReal().Timer(2 * time.Second).C:
+		t.Fatal("runner opened no consumer across the swap")
+	}
+	if stale.conn != retiring {
+		t.Fatalf("consumer opened across the swap = %p, want the retiring connection %p", stale.conn, retiring)
+	}
+
+	var live *reconnectTestConsumer
+	select {
+	case live = <-d.created:
+	case <-clock.NewReal().Timer(2 * time.Second).C:
+		t.Fatal("runner did not open a consumer again after the swap")
+	}
+	if live == stale {
+		t.Fatal("runner reused the consumer opened on the replaced connection")
+	}
+	if live.conn == retiring {
+		t.Fatalf("consumer after the swap = %p, want the replacement connection", live.conn)
+	}
+	if !stale.closed.Load() {
+		t.Fatal("the consumer opened on the replaced connection was not released")
+	}
+
+	// The generation the runner opened after the swap must be the one that
+	// serves deliveries, so the replacement consumer is exercised rather than
+	// only observed.
+	if !live.send(validReconnectMessage(t, "after-the-swap")) {
+		t.Fatal("the replacement consumer was already closed")
+	}
+	waitReconnectCondition(t, func() bool { return delivered.Load() == 1 })
+	if gateFailed.Load() {
+		t.Fatal("the consumer open gate did not install the replacement connection")
+	}
+	select {
+	case err := <-runDone:
+		t.Fatalf("runner Run returned after delivering on the replacement consumer: %v", err)
+	default:
+	}
+}
+
 // TestAbandonForReconnectPreservesRunnerOwnCause proves that a runner which
 // already recorded its own driver error before a client-wide reconnect began
 // keeps that error through supervisor abandonment, instead of having it
@@ -3092,6 +3204,11 @@ func TestPublishRefusesStaleConnection(t *testing.T) {
 	replacement := &reconnectTestConn{driver: d, admin: &reconnectTestAdmin{}}
 	client.mu.Lock()
 	client.conn = replacement
+	// The connection a swap installs and the incarnation it names move in one
+	// critical section, which is what makes the epoch the answer to "is this
+	// still the connection I started on". A publish that spans the swap is
+	// refused by that move.
+	client.epoch++
 	client.mu.Unlock()
 	if err := oldConn.Close(context.Background()); err != nil {
 		t.Fatal(err)

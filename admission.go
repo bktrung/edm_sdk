@@ -29,6 +29,14 @@ const (
 	workSubscribe
 	// workRun is Runner.Run's gate, which runs before a runner owns anything.
 	workRun
+	// workConsumerAdmission is the consumer a runner has just opened being
+	// admitted to the generation that opened it. It is not workRun: Run's gate
+	// runs before the runner owns a consumer and the open waits an attempt out,
+	// so that gate admits a connection that is being rebuilt, while this one
+	// refuses it. A consumer that appears after the reconnect supervisor has
+	// abandoned the runners is one nothing else will release, and the
+	// connection it was opened on is the one the swap is about to retire.
+	workConsumerAdmission
 	// workReconnect is Client.requestReconnect's gate, the one kind that runs
 	// while the connection is already being rebuilt.
 	workReconnect
@@ -108,6 +116,20 @@ func (c *Client) epochLocked() (uint64, <-chan struct{}) {
 	return c.epoch, c.wakeLocked()
 }
 
+// staleClaimLocked reports whether the connection a caller captured is no
+// longer the client's. The caller holds c.mu.
+//
+// A zero epoch is a caller that holds no connection and asks no question about
+// one, which is the value the sites that never captured a connection pass. A
+// caller that captured one passes the epoch it read in the same critical
+// section as the connection itself, and it is stale exactly when the client is
+// on a later incarnation: the supervisor moves the epoch in the critical
+// section that installs a connection, so a moved number means the connection
+// the caller holds was replaced under it.
+func (c *Client) staleClaimLocked(epoch uint64) bool {
+	return epoch != 0 && epoch != c.epoch
+}
+
 // admit reports whether kind may proceed, and returns the error the caller
 // returns when it may not. A nil error admits the call; every non-nil error is
 // the error the site this kind names returns today, text included. The caller
@@ -128,9 +150,13 @@ func (c *Client) epochLocked() (uint64, <-chan struct{}) {
 //	                 torn down, or no connection               "f1: client is closed"
 //	workPublish      the connection failed                     the retained reconnect error
 //	workPublish      the connection is reconnecting            the reconnecting error
+//	workPublish      the caller's connection was replaced      the reconnecting error
 //	workSubscribe    lifecycle is Closed, or no connection     "f1: client is closed"
 //	workSubscribe    any other non-Ready lifecycle             "f1: client is closing"
 //	workRun          lifecycle is not Ready, or no connection  "f1: client is closing"
+//	workConsumerAdmission an attempt is rebuilding the
+//	                 connection, or the caller's connection
+//	                 was replaced                              the reconnecting error
 //	workReconnect    lifecycle is not Ready                    "f1: client is closing"
 //	workReconnect    the connection failed                     the retained reconnect error
 //	workHealth       lifecycle is Closed                       "f1: client is closed"
@@ -147,9 +173,13 @@ func (c *Client) epochLocked() (uint64, <-chan struct{}) {
 // caller that only needs the connection, a health probe or a reconnect request,
 // does not care that shutdown has begun unless the connection is gone too.
 //
-// epoch is the connection incarnation the caller believes it holds. Nothing
-// reads it yet: the connection checks stay at the call sites until they move
-// here, and the sites pass the zero value.
+// epoch is the connection incarnation the caller captured, and the zero value
+// means the caller holds no connection and asks no question about one. A caller
+// that captured one passes the number it read in the same critical section as
+// the connection itself, and a kind that takes a live connection refuses once
+// that number is not the client's any more: the connection the caller holds was
+// replaced under it, which is the condition the reconnecting error already
+// reports.
 func (c *Client) admit(kind workKind, epoch uint64) error {
 	conn := c.connStateLocked()
 	life := c.lifecycleLocked()
@@ -168,6 +198,9 @@ func (c *Client) admit(kind workKind, epoch uint64) error {
 		if conn == connReconnecting {
 			return c.reconnectingError("publish")
 		}
+		if c.staleClaimLocked(epoch) {
+			return c.reconnectingError("publish")
+		}
 	case workSubscribe:
 		if life == lifecycle.Closed || conn == connNone {
 			return errors.New("f1: client is closed")
@@ -178,6 +211,19 @@ func (c *Client) admit(kind workKind, epoch uint64) error {
 	case workRun:
 		if life != lifecycle.Ready || conn == connNone {
 			return errors.New("f1: client is closing")
+		}
+	case workConsumerAdmission:
+		// The attempt flag is read here rather than the connection axis. The
+		// axis puts a retained reconnect decision before an attempt, which is
+		// the order a publish needs, and the attempt still owns the client
+		// while that decision is being recorded: reading the axis would admit a
+		// consumer in that window, and abandonRunners has already run by then,
+		// so nothing would release it at the swap.
+		if c.reconnecting {
+			return c.reconnectingError("consume")
+		}
+		if c.staleClaimLocked(epoch) {
+			return c.reconnectingError("consume")
 		}
 	case workReconnect:
 		if life != lifecycle.Ready {

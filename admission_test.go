@@ -38,6 +38,11 @@ type admitTestConn struct{ driver.Conn }
 // which is what distinguishes it from Health's plain one.
 const admitTestPublishReconnecting = "f1/admit-table: publish: f1: client is reconnecting (transient)"
 
+// admitTestConsumeReconnecting is the same error for the consumer a runner has
+// just opened: the site that admits it releases the consumer on a non-nil
+// result, so the operation it names is the one that call performs.
+const admitTestConsumeReconnecting = "f1/admit-table: consume: f1: client is reconnecting (transient)"
+
 // admitTestDriver is a driver.Driver that is never opened. The reconnecting
 // error names the driver it came from, so the table client needs one.
 type admitTestDriver struct{}
@@ -71,11 +76,23 @@ func (f admitFlags) client() *Client {
 	}
 	if f.connected {
 		client.conn = &admitTestConn{}
+		client.epoch = f.epochValue()
 	}
 	if f.reconnectFailed {
 		client.reconnectErr = admitTestExhaustion
 	}
 	return client
+}
+
+// epochValue is the incarnation a client in this combination is on. A client
+// that came through New holds the connection it opened on incarnation 1, and
+// the epoch moves only in the critical section that installs a connection, so
+// a connected client is on 1 and one with no connection is on 0.
+func (f admitFlags) epochValue() uint64 {
+	if !f.connected {
+		return 0
+	}
+	return 1
 }
 
 // name renders the combination as the flags that are set, for a failure message
@@ -165,6 +182,7 @@ var admitKinds = []workKind{
 	workPublish,
 	workSubscribe,
 	workRun,
+	workConsumerAdmission,
 	workReconnect,
 	workHealth,
 }
@@ -179,6 +197,8 @@ func admitKindName(kind workKind) string {
 		return "subscribe"
 	case workRun:
 		return "run"
+	case workConsumerAdmission:
+		return "consumer-admission"
 	case workReconnect:
 		return "reconnect"
 	case workHealth:
@@ -190,12 +210,13 @@ func admitKindName(kind workKind) string {
 
 // admitWants is one row's expected answer for each kind.
 type admitWants struct {
-	publishEntry string
-	publish      string
-	subscribe    string
-	run          string
-	reconnect    string
-	health       string
+	publishEntry      string
+	publish           string
+	subscribe         string
+	run               string
+	consumerAdmission string
+	reconnect         string
+	health            string
 }
 
 func (w admitWants) forKind(kind workKind) string {
@@ -208,6 +229,8 @@ func (w admitWants) forKind(kind workKind) string {
 		return w.subscribe
 	case workRun:
 		return w.run
+	case workConsumerAdmission:
+		return w.consumerAdmission
 	case workReconnect:
 		return w.reconnect
 	case workHealth:
@@ -240,16 +263,93 @@ func TestAdmitReproducesEachCallSitePredicate(t *testing.T) {
 
 	// A state the client can reach is in the upper group; the two below it are
 	// the ambiguous and the hand-built combinations, and their comments say
-	// which site answers them differently.
+	// which site answers them differently. claim is the incarnation the caller
+	// captured, or zero for a caller that captured no connection; the fixture
+	// gives a connected client incarnation 1, so claim 2 is one the client has
+	// left.
 	states := []struct {
 		name  string
 		flags admitFlags
+		claim uint64
 		want  admitWants
 	}{
 		{
 			name:  "ready-live",
 			flags: admitFlags{connected: true},
 			want:  admitWants{},
+		},
+		{
+			// The caller captured the connection the client is still on, so
+			// every kind answers what it answers with no claim at all.
+			name:  "ready-live-current-claim",
+			flags: admitFlags{connected: true},
+			claim: 1,
+			want:  admitWants{},
+		},
+		{
+			// The connection was replaced under the caller. Both publish sites
+			// refuse with the reconnecting error, which is the text the
+			// same-connection check returned for this case, and the consumer
+			// admission releases the consumer it has just opened.
+			name:  "ready-live-stale-claim",
+			flags: admitFlags{connected: true},
+			claim: 2,
+			want: admitWants{
+				publish:           admitTestPublishReconnecting,
+				consumerAdmission: admitTestConsumeReconnecting,
+			},
+		},
+		{
+			// The ordering the connection axis carries: a retained reconnect
+			// decision is read before the claim, so a publish reports the
+			// exhaustion its caller can act on rather than a swap that never
+			// happened. The consumer admission asks the other question, so it
+			// releases the consumer whose connection was replaced.
+			name:  "ready-live-connection-failed-stale-claim",
+			flags: admitFlags{connected: true, reconnectFailed: true},
+			claim: 2,
+			want: admitWants{
+				publish:           exhausted,
+				consumerAdmission: admitTestConsumeReconnecting,
+				reconnect:         exhausted,
+				health:            exhausted,
+			},
+		},
+		{
+			// A Close is draining and the caller's connection was replaced: a
+			// successor publish is admitted past the lifecycle and producer
+			// clauses and refused by the claim, which is the order the sites
+			// read them in.
+			name:  "draining-live-stale-claim",
+			flags: admitFlags{connected: true, closing: true, shutdownStarted: true},
+			claim: 2,
+			want: admitWants{
+				publishEntry:      closedText,
+				publish:           admitTestPublishReconnecting,
+				subscribe:         closingText,
+				run:               closingText,
+				consumerAdmission: admitTestConsumeReconnecting,
+				reconnect:         closingText,
+				health:            closingText,
+			},
+		},
+		{
+			// The lifecycle clause is read first, so a Close that finished
+			// reports its own text even though the caller's connection was
+			// replaced, while the consumer admission still releases a consumer
+			// that belongs to the replaced connection.
+			name:  "closed-live-stale-claim",
+			flags: admitFlags{connected: true, closed: true, shutdownStarted: true},
+			claim: 2,
+			want: admitWants{
+				publishEntry:      closedText,
+				publish:           closedText,
+				subscribe:         closedText,
+				run:               closingText,
+				consumerAdmission: admitTestConsumeReconnecting,
+				reconnect:         closingText,
+				health:            closedText,
+			},
 		},
 		{
 			name:  "ready-live-connection-failed",
@@ -262,7 +362,9 @@ func TestAdmitReproducesEachCallSitePredicate(t *testing.T) {
 			name:  "ready-live-reconnecting",
 			flags: admitFlags{connected: true, reconnecting: true},
 			want: admitWants{
-				publish: admitTestPublishReconnecting, health: reconnectText,
+				publish:           admitTestPublishReconnecting,
+				consumerAdmission: admitTestConsumeReconnecting,
+				health:            reconnectText,
 			},
 		},
 		{
@@ -272,7 +374,10 @@ func TestAdmitReproducesEachCallSitePredicate(t *testing.T) {
 			name:  "ready-live-reconnecting-connection-failed",
 			flags: admitFlags{connected: true, reconnecting: true, reconnectFailed: true},
 			want: admitWants{
-				publish: exhausted, reconnect: exhausted, health: exhausted,
+				publish:           exhausted,
+				consumerAdmission: admitTestConsumeReconnecting,
+				reconnect:         exhausted,
+				health:            exhausted,
 			},
 		},
 		{
@@ -427,10 +532,10 @@ func TestAdmitReproducesEachCallSitePredicate(t *testing.T) {
 				t.Parallel()
 				client := state.flags.client()
 				want := state.want.forKind(kind)
-				got := admitErrorText(client.admit(kind, 0))
+				got := admitErrorText(client.admit(kind, state.claim))
 				if got != want {
-					t.Fatalf("admit(%s) with %s = %q, want %q",
-						admitKindName(kind), state.flags.name(), got, want)
+					t.Fatalf("admit(%s) with %s and claim %d = %q, want %q",
+						admitKindName(kind), state.flags.name(), state.claim, got, want)
 				}
 			})
 		}
@@ -439,46 +544,79 @@ func TestAdmitReproducesEachCallSitePredicate(t *testing.T) {
 
 // TestAdmitAgreesWithTheSitesOnEveryReachableFlagCombination runs the same
 // claim over every combination the flags can take rather than the states a
-// person thought to write down. The expected answer is transcribed from the
-// sites as they read the flags today, in the order they read them, so this test
-// is a comparison against the code that was replaced and not a restatement of
-// admit.
+// person thought to write down, and over every connection a caller can claim to
+// hold in that combination: none, the one the client is on, and one it has left.
+// The expected answer is transcribed from the sites as they read the flags
+// today, in the order they read them, so this test is a comparison against the
+// code that was replaced and not a restatement of admit.
 func TestAdmitAgreesWithTheSitesOnEveryReachableFlagCombination(t *testing.T) {
 	t.Parallel()
 
 	for _, flags := range reachableAdmitFlags() {
 		for _, kind := range admitKinds {
-			t.Run(flags.name()+"/"+admitKindName(kind), func(t *testing.T) {
-				t.Parallel()
-				client := flags.client()
-				want := admitSiteAnswer(kind, flags)
-				got := admitErrorText(client.admit(kind, 0))
-				if got != want {
-					t.Fatalf("admit(%s) with %s = %q, want %q, the answer the sites give for these flags",
-						admitKindName(kind), flags.name(), got, want)
-				}
-			})
+			for _, claim := range flags.claims() {
+				t.Run(flags.name()+"/"+admitKindName(kind)+"/"+claimName(flags, claim), func(t *testing.T) {
+					t.Parallel()
+					client := flags.client()
+					want := admitSiteAnswer(kind, flags, claim)
+					got := admitErrorText(client.admit(kind, claim))
+					if got != want {
+						t.Fatalf("admit(%s) with %s and claim %d = %q, want %q, the answer the sites give for these flags",
+							admitKindName(kind), flags.name(), claim, got, want)
+					}
+				})
+			}
 		}
 	}
 }
 
+// claims enumerates the connections a caller can hold against a client in this
+// combination. A client with no connection has no incarnation for a caller to
+// have captured, so the only claim it can be asked about is the zero one, the
+// sites that never captured a connection pass; a connected one is asked about
+// that claim, the incarnation it is on, and one it has left.
+func (f admitFlags) claims() []uint64 {
+	if !f.connected {
+		return []uint64{0}
+	}
+	return []uint64{0, f.epochValue(), f.epochValue() + 1}
+}
+
+// claimName renders a claim against the client's incarnation, so a failing
+// subtest says which of the three a caller held.
+func claimName(f admitFlags, claim uint64) string {
+	switch {
+	case claim == 0:
+		return "no-claim"
+	case claim == f.epochValue():
+		return "current-claim"
+	default:
+		return "stale-claim"
+	}
+}
+
 // admitSiteAnswer transcribes what the sites admit replaced answer for one
-// combination of flags. Each branch is the predicate one of them ran, in the
-// order it ran it:
+// combination of flags and one connection the caller captured. Each branch is
+// the predicate one of them ran, in the order it ran it:
 //
 //   - the application publish's entry gate: closed, shutdownStarted, no
 //     connection;
 //   - the shared publish admission: closed, no connection, producer torn down,
-//     then the retained reconnect error, then a running attempt. It never read
+//     then the retained reconnect error, then a running attempt, then the
+//     caller's connection no longer being the client's. It never read
 //     shutdownStarted, which is what admits a successor publish while Close is
 //     draining;
 //   - Subscribe's gates: closed or no connection, then shutdownStarted;
 //   - Runner.Run's gate: closed, shutdownStarted, no connection;
+//   - the consumer admission: a running attempt, then the caller's connection
+//     no longer being the client's. It does not read the retained reconnect
+//     error, which reported a connection that is still the one the client
+//     holds;
 //   - requestReconnect's gate: closed or shutdownStarted, then the retained
 //     reconnect error;
 //   - Health: closed, then the retained reconnect error, then no connection,
 //     then a running attempt, then shutdownStarted.
-func admitSiteAnswer(kind workKind, f admitFlags) string {
+func admitSiteAnswer(kind workKind, f admitFlags, claim uint64) string {
 	switch kind {
 	case workPublishEntry:
 		if f.closed || f.shutdownStarted || !f.connected {
@@ -494,6 +632,9 @@ func admitSiteAnswer(kind workKind, f admitFlags) string {
 		if f.reconnecting {
 			return admitTestPublishReconnecting
 		}
+		if claim != 0 && claim != f.epochValue() {
+			return admitTestPublishReconnecting
+		}
 	case workSubscribe:
 		if f.closed || !f.connected {
 			return "f1: client is closed"
@@ -504,6 +645,13 @@ func admitSiteAnswer(kind workKind, f admitFlags) string {
 	case workRun:
 		if f.closed || f.shutdownStarted || !f.connected {
 			return "f1: client is closing"
+		}
+	case workConsumerAdmission:
+		if f.reconnecting {
+			return admitTestConsumeReconnecting
+		}
+		if claim != 0 && claim != f.epochValue() {
+			return admitTestConsumeReconnecting
 		}
 	case workReconnect:
 		if f.closed || f.shutdownStarted {

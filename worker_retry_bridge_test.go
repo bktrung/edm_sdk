@@ -1271,6 +1271,97 @@ func TestRunnerReleasesDeliveryAfterSuccessorPublishExhaustsBudget(t *testing.T)
 	}
 }
 
+// successorRepublishRunner builds the runner a successor publish serves: one
+// subscription with one retry tier, over a client whose connection the caller
+// controls, with the client's reconnect requests observable through its logger.
+func successorRepublishRunner(t *testing.T, conn *publishConn, logs *logSink) (*Client, *Runner) {
+	t.Helper()
+	client := newPublishClientWithConn(t, conn, WithLogger(slog.New(slog.NewTextHandler(logs, nil))))
+	return client, &Runner{
+		client: client,
+		subscription: Subscription{
+			Name:           "orders",
+			Topics:         []string{"orders.created"},
+			Priorities:     []Priority{PriorityHigh},
+			Retry:          RetryConfig{MaxAttempts: 3, Tiers: []time.Duration{time.Second}},
+			HandlerTimeout: time.Second,
+		},
+	}
+}
+
+func successorRepublishEnvelope(id string) Envelope {
+	return Envelope{
+		SpecVersion: "1.0",
+		ID:          id,
+		Source:      "/test/orders",
+		Type:        "orders.created.v1",
+		Priority:    PriorityHigh,
+		Attempt:     1,
+	}
+}
+
+// TestRetryRepublishProducerCreationFailureRequestsReconnect pins the reconnect
+// trigger a retry republish carries for the producer it cannot create: a
+// transient refusal there is evidence the connection is unhealthy, so the
+// republish must ask the client to rebuild it. The request is observed through
+// the client's existing reconnect helper, which reads the supervisor's queue
+// and the supervisor's own log line, so the test needs no new seam.
+func TestRetryRepublishProducerCreationFailureRequestsReconnect(t *testing.T) {
+	t.Parallel()
+	var logs logSink
+	cause := &driver.Error{Driver: "test", Op: "producer", K: driver.KindTransient, Err: errors.New("broker closed the channel")}
+	conn := &publishConn{
+		producer:    &recordingProducer{},
+		producerErr: cause,
+		info:        driver.BrokerInfo{Kind: "test", Version: "1"},
+	}
+	client, runner := successorRepublishRunner(t, conn, &logs)
+	envelope := successorRepublishEnvelope("successor-producer-creation")
+	message := retryBridgeMessage(t, envelope, &retryBridgeSettler{})
+	if retryAndSettle(runner, context.Background(), message, envelope, errors.New("temporary"), &deliveryState{}) {
+		t.Fatal("retry republish reported success while the successor producer could not be created")
+	}
+	quiescePublishClient(t, client)
+	conn.mu.Lock()
+	producerCalls := conn.producerCalls
+	conn.mu.Unlock()
+	if producerCalls == 0 {
+		t.Fatal("the retry republish never asked the connection for a successor producer")
+	}
+	if !reconnectRequested(client, logs.String()) {
+		t.Fatalf("a successor producer creation the driver classified transient did not request a reconnect; logs=%s", logs.String())
+	}
+}
+
+// TestRetryRepublishPublishFailureRequestsReconnect pins the same trigger one
+// step later, on the successor publish itself: a batch the producer refused
+// with a transient classification is also evidence the connection is unhealthy,
+// and the republish must ask for a reconnect rather than only hand the error
+// back to the settle path.
+func TestRetryRepublishPublishFailureRequestsReconnect(t *testing.T) {
+	t.Parallel()
+	var logs logSink
+	cause := &driver.Error{Driver: "test", Op: "publish", K: driver.KindTransient, Err: errors.New("broker reset the connection")}
+	producer := &recordingProducer{publishErr: cause}
+	conn := &publishConn{producer: producer, info: driver.BrokerInfo{Kind: "test", Version: "1"}}
+	client, runner := successorRepublishRunner(t, conn, &logs)
+	envelope := successorRepublishEnvelope("successor-publish-failure")
+	message := retryBridgeMessage(t, envelope, &retryBridgeSettler{})
+	if retryAndSettle(runner, context.Background(), message, envelope, errors.New("temporary"), &deliveryState{}) {
+		t.Fatal("retry republish reported success while the successor publish failed")
+	}
+	quiescePublishClient(t, client)
+	producer.mu.Lock()
+	published := len(producer.messages)
+	producer.mu.Unlock()
+	if published == 0 {
+		t.Fatal("the retry republish never reached the successor producer")
+	}
+	if !reconnectRequested(client, logs.String()) {
+		t.Fatalf("a successor publish the driver classified transient did not request a reconnect; logs=%s", logs.String())
+	}
+}
+
 type unsupportedReleaseConsumer struct {
 	stopCalls int
 }

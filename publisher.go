@@ -183,7 +183,13 @@ func (p *Publisher) PublishBatch(ctx context.Context, messages []Message) (Batch
 		p.client.mu.Unlock()
 		return result, err
 	}
+	// The connection and its incarnation are read together here, in the section
+	// that records this publish as in flight: the producer this call builds and
+	// the admission it takes later both belong to the connection that was
+	// current when the publish was admitted. Reading the epoch anywhere else
+	// would compare a claim about one incarnation against another.
 	conn := p.client.conn
+	epoch := p.client.epoch
 	effective := p.client.effective
 	headerMaxBytes := effectiveHeaderLimit(p.client.config.Codec.MaxHeaderBytes, effective.MaxHeaderBytes)
 	options := p.client.options
@@ -227,13 +233,9 @@ func (p *Publisher) PublishBatch(ctx context.Context, messages []Message) (Batch
 	// in-flight publishes, which cannot happen while this call is one of
 	// them. Moving beginPublish to run after this check would break that.
 	p.client.mu.Lock()
-	if err := p.client.admit(workPublish, 0); err != nil {
+	if err := p.client.admit(workPublish, epoch); err != nil {
 		p.client.mu.Unlock()
 		return result, err
-	}
-	if !sameConnection(p.client.conn, conn) {
-		p.client.mu.Unlock()
-		return result, p.client.reconnectingError("publish")
 	}
 	producer := p.client.producerHandle
 	if producer != nil {
@@ -252,10 +254,7 @@ func (p *Publisher) PublishBatch(ctx context.Context, messages []Message) (Batch
 
 		var loser driver.Producer
 		p.client.mu.Lock()
-		err = p.client.admit(workPublish, 0)
-		if err == nil && !sameConnection(p.client.conn, conn) {
-			err = p.client.reconnectingError("publish")
-		}
+		err = p.client.admit(workPublish, epoch)
 		if err == nil {
 			if p.client.producerHandle != nil {
 				producer = p.client.producerHandle
