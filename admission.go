@@ -95,7 +95,7 @@ func (c *Client) lifecycleLocked() lifecycle.State {
 // says nothing about what a caller can do next.
 func (c *Client) connStateLocked() connState {
 	switch {
-	case c.conn == nil:
+	case c.current.conn == nil:
 		return connNone
 	case c.reconnectErr != nil:
 		return connFailed
@@ -113,7 +113,7 @@ func (c *Client) connStateLocked() connState {
 // the wake fires, and it carries the outcome of the attempt that released the
 // waiter.
 func (c *Client) epochLocked() (uint64, <-chan struct{}) {
-	return c.epoch, c.wakeLocked()
+	return c.current.epoch, c.wakeLocked()
 }
 
 // staleClaimLocked reports whether the connection a caller captured is no
@@ -121,13 +121,12 @@ func (c *Client) epochLocked() (uint64, <-chan struct{}) {
 //
 // A zero epoch is a caller that holds no connection and asks no question about
 // one, which is the value the sites that never captured a connection pass. A
-// caller that captured one passes the epoch it read in the same critical
-// section as the connection itself, and it is stale exactly when the client is
-// on a later incarnation: the supervisor moves the epoch in the critical
-// section that installs a connection, so a moved number means the connection
-// the caller holds was replaced under it.
+// caller that captured one passes the number that came with the connection it
+// read, and it is stale exactly when the client is on a later incarnation: the
+// supervisor installs a connection and its number as one value, so a moved
+// number means the connection the caller holds was replaced under it.
 func (c *Client) staleClaimLocked(epoch uint64) bool {
-	return epoch != 0 && epoch != c.epoch
+	return epoch != 0 && epoch != c.current.epoch
 }
 
 // admit reports whether kind may proceed, and returns the error the caller
@@ -175,11 +174,10 @@ func (c *Client) staleClaimLocked(epoch uint64) bool {
 //
 // epoch is the connection incarnation the caller captured, and the zero value
 // means the caller holds no connection and asks no question about one. A caller
-// that captured one passes the number it read in the same critical section as
-// the connection itself, and a kind that takes a live connection refuses once
-// that number is not the client's any more: the connection the caller holds was
-// replaced under it, which is the condition the reconnecting error already
-// reports.
+// that captured one passes the number that came with the connection it read,
+// and a kind that takes a live connection refuses once that number is not the
+// client's any more: the connection the caller holds was replaced under it,
+// which is the condition the reconnecting error already reports.
 func (c *Client) admit(kind workKind, epoch uint64) error {
 	conn := c.connStateLocked()
 	life := c.lifecycleLocked()

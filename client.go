@@ -42,9 +42,20 @@ type failedSubscription struct {
 	owner *Runner
 }
 
+// currentConnection is the connection the client is on, together with the
+// number that names that incarnation. The two are one value because they are
+// one fact: the number counts the incarnations of the connection, and the
+// supervisor installs a new connection with its new number in a single critical
+// section. A reader that holds mu therefore takes the connection and the number
+// it will later compare against in one read, and no read of the client can pair
+// a connection with another incarnation's number.
+type currentConnection struct {
+	conn  driver.Conn
+	epoch uint64
+}
+
 // Client is an eagerly connected messaging client.
 type Client struct {
-	conn           driver.Conn
 	limits         Limits
 	effective      driver.Capabilities
 	options        clientOptions
@@ -74,12 +85,10 @@ type Client struct {
 	runners             map[*Runner]struct{}
 	failedSubscriptions []failedSubscription
 
-	// epoch names the connection incarnation. It moves by one in the same
-	// critical section that installs a new connection, so a reader that holds
-	// mu sees the connection pointer and the epoch of that same incarnation and
-	// never a pair from two of them. It is 1 for the connection New opened, and
-	// 0 means the client holds none.
-	epoch uint64
+	// current is the connection the client is on and the number that names it.
+	// Its epoch is 1 for the connection New opened, and a nil conn means the
+	// client holds none.
+	current currentConnection
 	// reconnecting reports connection usability, independently of shutdownStarted.
 	reconnecting bool
 	// reconnectErr records a terminal reconnect decision for the current client
@@ -162,8 +171,7 @@ func New(ctx context.Context, cfg Config, opts ...Option) (*Client, error) {
 	}
 	supervisorCtx, supervisorCancel := context.WithCancel(context.Background())
 	client := &Client{
-		conn:              connection,
-		epoch:             1,
+		current:           currentConnection{conn: connection, epoch: 1},
 		effective:         effective,
 		options:           options,
 		driverName:        driverName,
@@ -214,7 +222,7 @@ func (c *Client) topologyPolicy() driver.TopologyPolicy {
 
 func (c *Client) ensurePublisherTopology(ctx context.Context) error {
 	c.mu.Lock()
-	conn := c.conn
+	conn := c.current.conn
 	effective := c.effective
 	c.mu.Unlock()
 	return c.ensurePublisherTopologyOn(ctx, conn, effective)
@@ -321,7 +329,7 @@ func (c *Client) Health(ctx context.Context) error {
 		c.mu.Unlock()
 		return err
 	}
-	conn := c.conn
+	conn := c.current.conn
 	c.mu.Unlock()
 	if err := conn.Ping(ctx); err != nil {
 		return err
@@ -549,7 +557,7 @@ func (c *Client) waitForPublishes(ctx context.Context) error {
 func (c *Client) closeResources(ctx context.Context) error {
 	c.mu.Lock()
 	producer := c.producerHandle
-	conn := c.conn
+	conn := c.current.conn
 	c.mu.Unlock()
 	if producer == nil {
 		return c.closeConnection(ctx, conn, nil)
@@ -654,11 +662,13 @@ func publishMessages(c *Client, ctx context.Context, messages ...driver.Outbound
 		return err
 	}
 	producer := c.producerHandle
-	// The connection and its incarnation are read together, in the section that
-	// decides whether this call builds a producer: the producer is built on
-	// that connection, and the admission after it compares the same claim.
-	conn := c.conn
-	epoch := c.epoch
+	// The connection and its incarnation are one value, read in the section
+	// that decides whether this call builds a producer: the producer is built
+	// on that connection, and the admission after it compares the claim that
+	// came with it.
+	current := c.current
+	conn := current.conn
+	epoch := current.epoch
 	effective := c.effective
 	if producer != nil {
 		beginPublish(c)

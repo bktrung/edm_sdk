@@ -280,8 +280,7 @@ func TestPublishRejectsProducerFromRetiredConnection(t *testing.T) {
 		publishConn: retired,
 		build: func() (driver.Producer, error) {
 			client.mu.Lock()
-			client.conn = current
-			client.epoch++
+			client.current = currentConnection{conn: current, epoch: client.current.epoch + 1}
 			client.mu.Unlock()
 			return built, nil
 		},
@@ -430,8 +429,7 @@ func TestPublishBatchRejectsStaleConnectionAfterProducerBuild(t *testing.T) {
 	}()
 	waitForSignal(t, buildStarted, "batch producer construction")
 	client.mu.Lock()
-	client.conn = current
-	client.epoch++
+	client.current = currentConnection{conn: current, epoch: client.current.epoch + 1}
 	client.mu.Unlock()
 	releaseOnce.Do(func() { close(buildRelease) })
 	response := <-batchDone

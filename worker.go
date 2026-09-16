@@ -250,7 +250,7 @@ func (r *Runner) Run(ctx context.Context) (runErr error) {
 		r.client.mu.Lock()
 		r.mu.Lock()
 		admissionErr := r.client.admit(workConsumerAdmission, openedEpoch)
-		currentEpoch := r.client.epoch
+		currentEpoch := r.client.current.epoch
 		if admissionErr == nil {
 			r.consumer = consumer
 		}
@@ -1208,8 +1208,8 @@ func openRunnerConsumer(r *Runner, ctx context.Context) (driver.Consumer, error)
 
 // openRunnerConsumerWith opens the consumer for a generation whose total
 // in-flight budget is prefetch, as derived by Run, and returns the connection
-// incarnation it opened it on. The epoch is read in the same critical section
-// as the connection, so a caller that admits its consumer later compares the
+// incarnation it opened it on. The connection and the incarnation are one value
+// on the client, so the number the caller admits its consumer with later is the
 // number that belongs to the connection it actually used.
 func openRunnerConsumerWith(r *Runner, ctx context.Context, prefetch int) (driver.Consumer, uint64, error) {
 	var conn driver.Conn
@@ -1232,8 +1232,9 @@ func openRunnerConsumerWith(r *Runner, ctx context.Context, prefetch int) (drive
 			}
 			continue
 		}
-		conn = r.client.conn
-		epoch = r.client.epoch
+		current := r.client.current
+		conn = current.conn
+		epoch = current.epoch
 		effective = r.client.effective
 		source = r.client.source
 		r.client.mu.Unlock()

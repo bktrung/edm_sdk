@@ -75,8 +75,7 @@ func (f admitFlags) client() *Client {
 		reconnecting:     f.reconnecting,
 	}
 	if f.connected {
-		client.conn = &admitTestConn{}
-		client.epoch = f.epochValue()
+		client.current = currentConnection{conn: &admitTestConn{}, epoch: f.epochValue()}
 	}
 	if f.reconnectFailed {
 		client.reconnectErr = admitTestExhaustion
@@ -820,8 +819,8 @@ func TestSupervisorExitReleasesTheWaiterParkedWithNoAttemptInFlight(t *testing.T
 	}
 	client.mu.Lock()
 	defer client.mu.Unlock()
-	if client.epoch != epoch {
-		t.Fatalf("epoch after the supervisor exited = %d, want %d", client.epoch, epoch)
+	if client.current.epoch != epoch {
+		t.Fatalf("epoch after the supervisor exited = %d, want %d", client.current.epoch, epoch)
 	}
 	if !errors.Is(client.attemptErr, context.Canceled) {
 		t.Fatalf("attempt error after the supervisor exited = %v, want context canceled", client.attemptErr)

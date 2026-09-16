@@ -183,13 +183,14 @@ func (p *Publisher) PublishBatch(ctx context.Context, messages []Message) (Batch
 		p.client.mu.Unlock()
 		return result, err
 	}
-	// The connection and its incarnation are read together here, in the section
+	// The connection and its incarnation are one value, read in the section
 	// that records this publish as in flight: the producer this call builds and
 	// the admission it takes later both belong to the connection that was
 	// current when the publish was admitted. Reading the epoch anywhere else
 	// would compare a claim about one incarnation against another.
-	conn := p.client.conn
-	epoch := p.client.epoch
+	current := p.client.current
+	conn := current.conn
+	epoch := current.epoch
 	effective := p.client.effective
 	headerMaxBytes := effectiveHeaderLimit(p.client.config.Codec.MaxHeaderBytes, effective.MaxHeaderBytes)
 	options := p.client.options

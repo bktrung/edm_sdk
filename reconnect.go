@@ -153,7 +153,7 @@ func (c *Client) reconnectOnce(ctx context.Context, cause error, attempt *reconn
 	}
 
 	c.mu.Lock()
-	oldConn := c.conn
+	oldConn := c.current.conn
 	oldProducer := c.producerHandle
 	c.mu.Unlock()
 
@@ -180,18 +180,17 @@ func (c *Client) reconnectOnce(ctx context.Context, cause error, attempt *reconn
 						_ = connection.Close(context.WithoutCancel(ctx))
 						return errors.New("f1: client is closing")
 					}
-					c.conn = connection
+					// The connection and the number of its incarnation are
+					// installed as one value here, inside this one critical
+					// section, so a reader that holds mu sees the new connection
+					// with the new number and never the old one with it, and a
+					// waiter parked on the old incarnation is released with the
+					// number of the connection that replaced it.
+					c.current = currentConnection{conn: connection, epoch: c.current.epoch + 1}
 					c.effective = effective
 					c.limits = limitsFor(c.options.driver.Name(), connection.BrokerInfo(), effective)
 					c.reconnectErr = nil
 					c.producerHandle = nil
-					// The epoch and the wake move with the pointer inside this
-					// one critical section, so a reader that holds mu sees the
-					// new connection with the new number and never the old one
-					// with it, and a waiter parked on the old incarnation is
-					// released with the number of the connection that replaced
-					// it.
-					c.epoch++
 					c.wakeWaitersLocked(nil)
 					c.mu.Unlock()
 					c.retireConnection(ctx, oldProducer, oldConn, connection)

@@ -2839,11 +2839,14 @@ func TestConsumerOpenedAsAReconnectBeginsIsReleased(t *testing.T) {
 // consumer whose open straddles a connection swap is released rather than
 // adopted: the runner captured its connection before the swap, so the consumer
 // it opened belongs to the incarnation the client has left and nothing would
-// release it once the connection is retired.
+// release it once the connection is retired. It also pins the shape of the one
+// thing that discard reports: a single debug entry naming the subscription and
+// both incarnations, and no Health entry, because a discard the runtime repairs
+// on its next iteration is not a health transition.
 //
 // The swap is installed inside the consumer open on purpose, because that is
 // where the runner's view of the connection is already fixed: it read the
-// connection and the incarnation together before asking the driver, and the
+// connection and its incarnation as one value before asking the driver, and the
 // admission runs after the driver answers. Installing it there is what makes
 // the interleaving deterministic instead of a race the test would have to win.
 func TestConsumerOpenedAfterTheConnectionWasReplacedIsReleased(t *testing.T) {
@@ -2851,7 +2854,11 @@ func TestConsumerOpenedAfterTheConnectionWasReplacedIsReleased(t *testing.T) {
 	recorded := &recordingClock{Fake: fake, sleepStarted: make(chan chan struct{}, 4)}
 	d := &reconnectTestDriver{created: make(chan *reconnectTestConsumer, 8)}
 	var delivered atomic.Int32
-	client := newReconnectTestClient(t, d, recorded, 0)
+	var output logSink
+	// The discard is reported at debug level, so the handler has to admit debug
+	// entries for the sink to see it.
+	logger := slog.New(slog.NewTextHandler(&output, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	client := newReconnectTestClientWithLogger(t, d, recorded, 0, logger)
 	client.reconnectRandom = func() float64 { return 0 }
 
 	runner, err := client.Subscribe(context.Background(), Subscription{
@@ -2891,8 +2898,7 @@ func TestConsumerOpenedAfterTheConnectionWasReplacedIsReleased(t *testing.T) {
 				return
 			}
 			client.mu.Lock()
-			client.conn = replacement
-			client.epoch++
+			client.current = currentConnection{conn: replacement, epoch: client.current.epoch + 1}
 			client.mu.Unlock()
 		})
 		return nil
@@ -2940,6 +2946,29 @@ func TestConsumerOpenedAfterTheConnectionWasReplacedIsReleased(t *testing.T) {
 	if gateFailed.Load() {
 		t.Fatal("the consumer open gate did not install the replacement connection")
 	}
+
+	// The discard reports itself once, naming the incarnations it compared: the
+	// connection New opened is incarnation 1, the swap installed 2, and those
+	// are the numbers the discard saw. It is not a Health entry, so Health still
+	// answers for a client whose runner discarded a consumer and went on.
+	var discards []string
+	for line := range strings.SplitSeq(output.String(), "\n") {
+		if strings.Contains(line, "f1 consumer discarded after the connection was replaced") {
+			discards = append(discards, line)
+		}
+	}
+	if len(discards) != 1 {
+		t.Fatalf("consumer discard entries = %d, want 1; output = %q", len(discards), output.String())
+	}
+	for _, want := range []string{"level=DEBUG", "subscription=orders", "opened_epoch=1", "current_epoch=2"} {
+		if !strings.Contains(discards[0], want) {
+			t.Fatalf("consumer discard entry = %q, want %s", discards[0], want)
+		}
+	}
+	if err := client.Health(context.Background()); err != nil {
+		t.Fatalf("Health() after a discarded consumer = %v, want nil", err)
+	}
+
 	select {
 	case err := <-runDone:
 		t.Fatalf("runner Run returned after delivering on the replacement consumer: %v", err)
@@ -3203,12 +3232,11 @@ func TestPublishRefusesStaleConnection(t *testing.T) {
 
 	replacement := &reconnectTestConn{driver: d, admin: &reconnectTestAdmin{}}
 	client.mu.Lock()
-	client.conn = replacement
-	// The connection a swap installs and the incarnation it names move in one
-	// critical section, which is what makes the epoch the answer to "is this
-	// still the connection I started on". A publish that spans the swap is
-	// refused by that move.
-	client.epoch++
+	// The connection a swap installs and the incarnation it names are one
+	// value, which is what makes the epoch the answer to "is this still the
+	// connection I started on". A publish that spans the swap is refused by the
+	// move.
+	client.current = currentConnection{conn: replacement, epoch: client.current.epoch + 1}
 	client.mu.Unlock()
 	if err := oldConn.Close(context.Background()); err != nil {
 		t.Fatal(err)
