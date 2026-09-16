@@ -163,6 +163,18 @@ func (c *consumer) admissionLocked(record *kgo.Record) bool {
 		}
 		return false
 	}
+	if c.outstanding[key] > 0 && !hasRequeue {
+		// The hold rule: this partition already has a delivery outstanding, and
+		// the next one waits for it to settle. A requeue is the exception,
+		// because the redelivery of the outstanding offset is that partition's
+		// one delivery rather than a second one; it re-enters emission as a
+		// reuse and is not charged again.
+		//
+		// The refused record stays in the poll loop's pending list, exactly as a
+		// record over the destination budget does, and the settle that clears
+		// the count wakes the loop to admit it.
+		return false
+	}
 	return true
 }
 
@@ -272,4 +284,104 @@ func (c *consumer) heldByDestination(pending []*kgo.Record) map[string]int {
 // first record is what hides everything behind it.
 func (c *consumer) deferredHoldLimit(destination string) int {
 	return max(c.budgets[destination], kafkaDeferredHoldMinimum)
+}
+
+// syncReadAheadPauses reconciles the per-partition fetch holds with the records
+// the poll loop is holding. The loop runs it before every poll, beside
+// syncDeferredPauses, so a partition's fetches are held while the loop already
+// carries its read-ahead limit in pending for it and released once it drops
+// below.
+//
+// The hold is keyed by partition and never by destination. Under the hold rule
+// c.unsettled[destination] can never exceed the partitions this member holds,
+// so the destination budget's own pause is unreachable in most shapes and
+// nothing else bounds pending; a destination-keyed bound would also let one
+// slow partition stop its siblings' fetches. franz-go keeps a partition pause
+// apart from a topic pause, so this hold cannot resume a pause the caller set.
+//
+// A partition whose redelivery a requeue is waiting for is never held. That
+// redelivery arrives from the broker, and the partition's count is waiting for
+// it to settle, so holding the fetch would strand a requeue that nothing else
+// can release.
+func (c *consumer) syncReadAheadPauses(pending []*kgo.Record) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	held := c.countPendingLocked(pending)
+	for key := range c.readAheadPaused {
+		if held[key] < c.readAheadLimit(key.destination) || c.requeued[key] > 0 {
+			c.releaseReadAheadHoldLocked(key)
+		}
+	}
+	for key, count := range held {
+		if count < c.readAheadLimit(key.destination) || c.requeued[key] > 0 {
+			continue
+		}
+		if _, already := c.readAheadPaused[key]; already {
+			continue
+		}
+		c.holdReadAheadLocked(key)
+	}
+}
+
+// countPendingLocked recounts, per partition, the records pending holds, which
+// decides the partitions this pass holds and releases. The poll loop is the
+// only writer and it runs this before every poll, so the count describes the
+// pending list the next poll leaves behind.
+//
+// Nothing outside the reconcile may read the count. A settle releasing a
+// partition's charge does not consult it: a count taken before this iteration's
+// fetch is stale exactly while the loop is on its way to a wait, so a wake
+// skipped on it would strand every record the count described.
+func (c *consumer) countPendingLocked(pending []*kgo.Record) map[partitionKey]int {
+	if c.pendingHeld == nil {
+		c.pendingHeld = make(map[partitionKey]int, len(c.destinations))
+	}
+	clear(c.pendingHeld)
+	for _, record := range pending {
+		c.pendingHeld[partitionKey{destination: record.Topic, partition: record.Partition}]++
+	}
+	return c.pendingHeld
+}
+
+// readAheadLimitNoHold is the read-ahead limit this sitting measures with. It
+// clears the per-partition backlog of the widest shape under measurement, which
+// is the compact corpus's 1000 records over 16 partitions at about 62 records
+// each, so no partition reaches the limit and the hold never toggles. The value
+// is an experiment rather than configuration: the destination's prefetch share
+// is the window the port was built around, and this replaces it only until the
+// measurement says which of the two costs the limit carries.
+const readAheadLimitNoHold = 100
+
+// readAheadLimit is how many of one partition's records the poll loop may carry
+// in pending before that partition's fetches are held. It is the destination's
+// prefetch share floored at readAheadLimitNoHold: the shares the measured
+// subscriptions run with (22 at the shipped concurrency, 6 below it) are all
+// under that floor, so none of them is ever held, while a caller that asks for a
+// wider window than the floor still gets the window it asked for. The floor is
+// never below one, so a partition may always carry the successor its own settle
+// is about to admit, which a limit of zero would forbid.
+func (c *consumer) readAheadLimit(destination string) int {
+	return max(c.budgets[destination], readAheadLimitNoHold)
+}
+
+// holdReadAheadLocked holds one partition's fetches and records the hold, so
+// the next reconcile knows which partitions this driver is holding. The caller
+// must hold c.mu.
+func (c *consumer) holdReadAheadLocked(key partitionKey) {
+	if c.readAheadPaused == nil {
+		c.readAheadPaused = make(map[partitionKey]struct{})
+	}
+	c.readAheadPaused[key] = struct{}{}
+	if c.client != nil {
+		c.client.PauseFetchPartitions(map[string][]int32{key.destination: {key.partition}})
+	}
+}
+
+// releaseReadAheadHoldLocked returns one partition's fetches and forgets the
+// hold. The caller must hold c.mu.
+func (c *consumer) releaseReadAheadHoldLocked(key partitionKey) {
+	delete(c.readAheadPaused, key)
+	if c.client != nil {
+		c.client.ResumeFetchPartitions(map[string][]int32{key.destination: {key.partition}})
+	}
 }

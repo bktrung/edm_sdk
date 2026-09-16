@@ -142,7 +142,22 @@ type consumer struct {
 	// when ownership transfers to the queued handoff; a draining revoked
 	// settler remains counted until its caller reaches a terminal state, so
 	// draining still observes every outstanding delivery.
-	unsettled             map[string]int
+	unsettled map[string]int
+	// outstanding counts, per partition, the deliveries this consumer emitted
+	// for it and has not released. It carries the hold rule: at most one
+	// delivery per partition is outstanding, so the admission gate refuses a
+	// partition's next record while its count is non-zero. It follows the
+	// destination slot's charge and release points exactly, which is what keeps
+	// a requeue's redelivery holding its partition until it settles, and a
+	// delivery emitted for a handoff is counted on the consumer that emitted it.
+	outstanding map[partitionKey]int
+	// readAheadPaused holds the partitions whose fetches this driver is holding
+	// because the poll loop already carries the partition's read-ahead limit in
+	// pending, and pendingHeld counts, per partition, what pending held when
+	// that was last reconciled. A settle reads that count to tell whether the
+	// partition it just freed still has a record waiting for it.
+	readAheadPaused       map[partitionKey]struct{}
+	pendingHeld           map[partitionKey]int
 	settlers              map[*settler]struct{}
 	trackers              map[partitionKey]*ackTracker
 	trackerGenerations    map[partitionKey]uint64
@@ -512,6 +527,9 @@ func newConsumer(ctx context.Context, connection *conn, cfg driver.ConsumerConfi
 		forwarderStopC:        make(chan struct{}),
 		pauseReasons:          make(map[string]pauseReasonSet, len(cfg.Destinations)),
 		unsettled:             make(map[string]int, len(cfg.Destinations)),
+		outstanding:           make(map[partitionKey]int),
+		readAheadPaused:       make(map[partitionKey]struct{}),
+		pendingHeld:           make(map[partitionKey]int),
 		settlers:              make(map[*settler]struct{}),
 		trackers:              make(map[partitionKey]*ackTracker),
 		trackerGenerations:    make(map[partitionKey]uint64),
@@ -956,6 +974,7 @@ func (c *consumer) poll(ctx context.Context) {
 			return
 		}
 		c.syncDeferredPauses(pending)
+		c.syncReadAheadPauses(pending)
 
 		fetchCtx := ctx
 		bounded := false
@@ -970,7 +989,6 @@ func (c *consumer) poll(ctx context.Context) {
 			cancelFetch()
 			continue
 		}
-
 		// The whole response is taken, not one record of it. Whatever is left
 		// buffered in the client is what the next prefetch pause throws away:
 		// franz-go strips a paused topic's buffered records and rewinds its
@@ -1281,6 +1299,59 @@ func (c *consumer) releaseSlotsLocked(destination string, slots int) {
 	go c.redriveDestinationHandoffs(destination)
 }
 
+// chargeDeliveryLocked records that key's partition has one more delivery
+// outstanding. It is called once per emitted delivery, at the destination
+// slot's own charge: a redelivery a requeue admitted re-enters emission as a
+// reuse and is not charged again, because the slot its predecessor charged is
+// still held.
+//
+// A consumer built as a literal by a test has no counter and no charged
+// delivery, which is what a nil map means here. The caller must hold c.mu.
+func (c *consumer) chargeDeliveryLocked(key partitionKey) {
+	if c.outstanding == nil {
+		c.outstanding = make(map[partitionKey]int)
+	}
+	c.outstanding[key]++
+}
+
+// releasePartitionLocked returns up to slots of one partition's outstanding
+// deliveries, and wakes the poll loop when that takes the count to zero.
+//
+// The wake is the hold rule's turnaround path. A record admission refused stays
+// in the loop's pending list and franz-go never offers it again, so without the
+// wake the partition would wait for the next broker response, up to the fetch
+// wait, for a delivery its own settle has just made possible. The wake is
+// recorded in the same critical section that takes the count to zero, under
+// c.mu, so a wake that races the poll loop's registration is not lost; that is
+// the pattern claimPollWake uses for the flush race.
+//
+// The wake is unconditional rather than gated on a snapshot of what is waiting
+// on the partition: the loop's read-ahead hold is recomputed once per iteration,
+// after that iteration's admission pass, so a settle landing in between clears
+// the charge while the mirror still reads zero, and the gate would drop exactly
+// the wake the window needed. The loop already re-runs admission on every wake,
+// so the extra iteration is the harmless direction to be wrong in.
+//
+// The charge and the release are the destination slot's own, so a second
+// release is already refused by slotReleased and the clamp here only keeps the
+// two counters in step. The caller must hold c.mu.
+func (c *consumer) releasePartitionLocked(key partitionKey, slots int) {
+	charged := c.outstanding[key]
+	if slots > charged {
+		slots = charged
+	}
+	if slots == 0 {
+		return
+	}
+	remaining := charged - slots
+	if remaining == 0 {
+		delete(c.outstanding, key)
+		c.wakePollLocked()
+		return
+	}
+	c.outstanding[key] = remaining
+}
+
 func (c *consumer) suppressSettledTransfer(key partitionKey, offset int64) {
 	c.deliveryMu.Lock()
 	defer c.deliveryMu.Unlock()
@@ -1346,6 +1417,7 @@ drain:
 		delete(c.settlers, settler)
 		if !settler.slotReleased {
 			c.releaseSlotsLocked(key.destination, 1)
+			c.releasePartitionLocked(settler.key, 1)
 			settler.slotReleased = true
 		}
 		reconcile = true
@@ -1443,6 +1515,7 @@ func (c *consumer) emit(record *kgo.Record) (delivered, active, created bool) {
 	delete(c.recordGenerations, record)
 	if !reused {
 		c.unsettled[record.Topic]++
+		c.chargeDeliveryLocked(key)
 	}
 	if c.unsettled[record.Topic] >= budget {
 		c.setPauseReasonLocked(record.Topic, pauseReasonPrefetch, true)
@@ -1474,6 +1547,7 @@ func (c *consumer) abortSettler(settler *settler, reused bool) {
 	delete(c.settlers, settler)
 	if !reused {
 		c.releaseSlotsLocked(settler.record.Topic, 1)
+		c.releasePartitionLocked(settler.key, 1)
 	}
 	c.signalSettlerDoneLocked()
 	shouldLeave := c.draining && len(c.settlers) == 0 && !c.leaveRequested
@@ -1499,6 +1573,9 @@ func (c *consumer) detachAllTrackersLocked() []*ackTracker {
 	clear(c.requeued)
 	clear(c.discarded)
 	clear(c.unsettled)
+	clear(c.outstanding)
+	clear(c.readAheadPaused)
+	clear(c.pendingHeld)
 	clear(c.recordGenerations)
 	clear(c.tenures)
 	clear(c.activeGenerations)
@@ -1816,6 +1893,7 @@ func (c *consumer) dropTracker(destination string, partition int32) {
 		if _, wasBuffered := buffered[settler]; wasBuffered {
 			delete(c.settlers, settler)
 			c.releaseSlotsLocked(destination, 1)
+			c.releasePartitionLocked(key, 1)
 			continue
 		}
 		if retainTracker && !settler.forceRevoked && settlerTracker == tracker && tracker.holds(settler.record.Offset) {
@@ -1847,6 +1925,7 @@ func (c *consumer) dropTracker(destination string, partition int32) {
 		pending = c.unsettled[destination]
 	}
 	c.releaseSlotsLocked(destination, pending)
+	c.releasePartitionLocked(key, pending)
 	budget := c.budgets[destination]
 	if budget > 0 && c.unsettled[destination] < budget {
 		c.setPauseReasonLocked(destination, pauseReasonPrefetch, false)
@@ -1951,6 +2030,7 @@ func (c *consumer) transferOwnershipLocked(rp revokedPartition) transferResult {
 			c.forgetSelfTransferLocked(settler)
 			if !settler.slotReleased {
 				c.releaseSlotsLocked(destination, 1)
+				c.releasePartitionLocked(settler.key, 1)
 				settler.slotReleased = true
 			}
 		}
@@ -2150,6 +2230,7 @@ func (c *consumer) completeSettlement(settler *settler, preserveUnsettled bool) 
 		c.forgetSelfTransferLocked(settler)
 		if !preserveUnsettled && !settler.slotReleased {
 			c.releaseSlotsLocked(settler.record.Topic, 1)
+			c.releasePartitionLocked(settler.key, 1)
 			settler.slotReleased = true
 		}
 		c.refreshAckGapLocked(settler.record.Topic)
@@ -2167,6 +2248,7 @@ func (c *consumer) completeSettlement(settler *settler, preserveUnsettled bool) 
 	delete(c.settlers, settler)
 	if !preserveUnsettled && !settler.slotReleased {
 		c.releaseSlotsLocked(settler.record.Topic, 1)
+		c.releasePartitionLocked(settler.key, 1)
 	}
 	budget := c.budgets[settler.record.Topic]
 	if budget > 0 && (preserveUnsettled || c.unsettled[settler.record.Topic] < budget) {
