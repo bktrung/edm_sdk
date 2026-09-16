@@ -91,7 +91,10 @@ const (
 	// nothing back, which is not the state the test is about.
 	portMinAbandoned = 3
 
-	// portReleaseCorpus is the numbered corpus the release test hands back.
+	// portReleaseCorpus is the numbered corpus the release test hands back. It
+	// is published one key per partition and is the destination's partition
+	// count: the departing consumer takes the whole corpus without settling any
+	// of it, and one unsettled delivery per partition is all a partition carries.
 	portReleaseCorpus = 6
 	// portNackCorpus is the numbered corpus the requeue test publishes. Every
 	// message carries the same key, so all of them share one partition and the
@@ -201,8 +204,26 @@ func TestPortAtLeastOnceAcrossJoinAndLeave(t *testing.T) {
 
 	assigned := joiner.notifications.awaitAssignment(t, portAssignmentTimeout, "the joining consumer")
 	settledAtAssignment := ledger.settledCount()
-	portAwaitHoldings(t, clk, holdings, portJoinSettlements+portMinAbandoned,
-		"the joining consumer to take a share of the corpus")
+	// The joining consumer holds no more unsettled deliveries at once than the
+	// partitions it was assigned, and a two-member split of portPartitions
+	// hands it fewer than portJoinSettlements+portMinAbandoned of them, so the
+	// share it settles before it leaves is taken and settled a delivery at a
+	// time rather than taken whole: a settlement frees its partition for that
+	// partition's next record, which is how a consumer works through any
+	// corpus. The arithmetic asserted below is unchanged: portJoinSettlements
+	// deliveries settle before the leave, and portMinAbandoned are still in
+	// hand when it happens.
+	settledHere := make(map[string]bool, portJoinSettlements)
+	settled := 0
+	for settled < portJoinSettlements {
+		portAwaitHoldings(t, clk, holdings, settled+1, "the joining consumer to take a share of the corpus")
+		holding := holdings.all()[settled]
+		settled++
+		ledger.acknowledge(ctx, holding.message)
+		settledHere[holding.sequence] = true
+	}
+	portAwaitHoldings(t, clk, holdings, settled+portMinAbandoned,
+		"the joining consumer to hold its share of the corpus")
 
 	// Taking stops before the held deliveries are read, so the set the leaver
 	// holds is fixed. A snapshot taken while it was still taking would leave
@@ -218,11 +239,6 @@ func TestPortAtLeastOnceAcrossJoinAndLeave(t *testing.T) {
 	// mid-stream rather than after the work was over.
 	t.Logf("port-join test=at-least-once ms=%d settled=%d held=%d",
 		clk.Since(joiningAt).Milliseconds(), settledAtAssignment, len(held))
-	settledHere := make(map[string]bool, portJoinSettlements)
-	for _, holding := range held[:portJoinSettlements] {
-		ledger.acknowledge(ctx, holding.message)
-		settledHere[holding.sequence] = true
-	}
 	// A consumer can take one sequence twice, because a handoff and its own
 	// fetch can both carry the same record, and this file counts that as a
 	// duplicate rather than a defect. A sequence settled above is therefore
@@ -231,12 +247,16 @@ func TestPortAtLeastOnceAcrossJoinAndLeave(t *testing.T) {
 	// sequence this test settled before it.
 	abandoned := make([]portHolding, 0, len(held))
 	seen := make(map[string]bool, len(held))
-	for _, holding := range held[portJoinSettlements:] {
+	for _, holding := range held {
 		if settledHere[holding.sequence] || seen[holding.sequence] {
 			continue
 		}
 		seen[holding.sequence] = true
 		abandoned = append(abandoned, holding)
+	}
+	if len(abandoned) < portMinAbandoned {
+		t.Fatalf("the leaving consumer held %d unsettled deliveries, want at least %d: a leave that hands back fewer than that is not the state this test measures",
+			len(abandoned), portMinAbandoned)
 	}
 	leftAt := clk.Now()
 	if err := joiner.Release(ctx); err != nil {
@@ -372,13 +392,14 @@ func TestPortHeldDeliveryDoesNotHoldRevoke(t *testing.T) {
 func TestPortReleaseWithoutSettleRedelivers(t *testing.T) {
 	fixture := newPortFixture(t, "release")
 	clk, ctx := fixture.clock, fixture.ctx
+	keys := portKeysByPartition(t)
 	sequences := portSequences(portReleaseCorpus)
 	ledger := newPortLedger(clk)
 
 	departing := fixture.subscribe(t, fixture.consumerConfig(fixture.group, len(sequences)))
 	departing.notifications.awaitAssignment(t, portAssignmentTimeout, "the departing consumer")
 
-	fixture.publish(t, sequences, nil)
+	fixture.publish(t, sequences, portKeyedSequences(sequences, keys))
 
 	for range sequences {
 		message := portAwaitDelivery(t, clk, departing, portDeliveryTimeout, "the departing consumer to take the whole corpus")
