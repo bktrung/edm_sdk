@@ -39,6 +39,34 @@ func realTimer(duration time.Duration) *time.Timer {
 	return time.NewTimer(duration)
 }
 
+// deliveryCeiling reports how many deliveries a driver declaring capabilities
+// may hold unsettled at once on one destination, given that a check's traffic
+// reaches partitions distinct broker-side partitions, and capped at want.
+//
+// The cap needs both declarations the inference rests on. ScalingPartitionBound
+// says one consumer holds one delivery per partition; OrderedByKey says a
+// message key reaches one partition, so the key count a caller has is a
+// partition count. A driver that denies key ordering has no key-to-partition
+// map, so a key count cannot be converted into a partition count for it and it
+// keeps the count it was asked for, which is the count the checks asked for
+// before the waiver. Reading the partition bound off ScalingPartitionBound
+// alone would take a per-partition admission ceiling from a driver that need
+// not have partitions at all.
+//
+// A check derives its count here instead of hard-coding one because the port
+// carries no partition count. A driver satisfying both declarations decides a
+// destination's outstanding capacity from partitions the check cannot see, and
+// a check that asks for more than the placement allows fails on the placement
+// rather than on the behaviour it asserts. The result is compared with the
+// inspector's view for equality, so partitions must be the number of partitions
+// the traffic reaches and at least one.
+func deliveryCeiling(capabilities driver.Capabilities, partitions, want int) int {
+	if capabilities.OrderedByKey && capabilities.ConsumerScaling == driver.ScalingPartitionBound {
+		return min(want, partitions)
+	}
+	return want
+}
+
 // Run opens one connection, executes both profiles, and compares their vectors.
 func Run(t *testing.T, suite Suite) Report {
 	t.Helper()
