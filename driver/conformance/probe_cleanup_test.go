@@ -51,7 +51,7 @@ func TestInspectProbeReclaimsItsDestination(t *testing.T) {
 	const destination = "conformance.inspect.reclaim-test-run.full.probe"
 
 	if !t.Run("completed profile", func(t *testing.T) {
-		runProfile(t, context.Background(), conn, probeTestInspect(conn), runID, ProfileFull, driver.Capabilities{}, nil, nil, &Report{}, probeTestDriver{conn: conn}, driver.Config{}, nil)
+		runProfile(t, context.Background(), conn, probeTestInspect(conn), runID, ProfileFull, driver.Capabilities{}, nil, nil, &Report{}, probeTestDriver{conn: conn}, driver.Config{}, nil, DeferralExact)
 	}) {
 		t.Fatal("completed profile failed")
 	}

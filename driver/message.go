@@ -25,6 +25,15 @@ type OutboundMessage struct {
 
 	// DelayUntil is the time when a deferred message becomes eligible for
 	// delivery. Zero means deliver immediately.
+	//
+	// A driver may instead deliver a deferred message sent to a destination that
+	// declares a delay at the message's publish instant plus that delay, whatever
+	// this field says, and never earlier than that instant. Such a driver delivers
+	// the messages it deferred within one partition of a destination in the order it
+	// published them, which for a destination with one partition is the destination's
+	// own order. The core writes this field as the instant it builds the retry copy
+	// plus the retry tier's delay, unless the application asked for a custom retry
+	// delay.
 	DelayUntil time.Time
 }
 

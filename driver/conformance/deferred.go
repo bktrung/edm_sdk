@@ -21,6 +21,18 @@ const (
 	// destination declaring deferredDelay. See the check for why they are that
 	// far apart and why they are not further.
 	deferredOrderDelay = deferredDelay * 6
+
+	// publishOrderCount is how many messages the publish-order check publishes, in
+	// order, to one destination.
+	publishOrderCount = 20
+
+	// publishOrderName is the destination the publish-order check declares, with
+	// publishOrderPartitions partitions. The count belongs to the check rather than
+	// to the warm-up: the destination-delay model owes publish order within a
+	// destination's partition, so two partitions would be two ordering units and the
+	// assertion would stop meaning what it says.
+	publishOrderName       = "deferred.publish-order"
+	publishOrderPartitions = 1
 )
 
 func init() { registerGroup("deferred", runDeferred) }
@@ -42,6 +54,15 @@ func deferredDestinations(group *groupContext) []driver.DestinationSpec {
 		{Name: "deferred.ready.control"},
 		{Name: "deferred.release", Delay: deferredDelay},
 		{Name: "deferred.release.control"},
+	}
+	if destinationDelayModel(group) {
+		// Declared only for the model whose check uses it, and with one partition,
+		// because that model owes publish order within a destination's partition
+		// rather than across its partitions. An exact harness skips the check, so it
+		// provisions nothing for it.
+		destinations = append(destinations, driver.DestinationSpec{
+			Name: publishOrderName, Partitions: publishOrderPartitions, Delay: deferredDelay,
+		})
 	}
 	if group.deadline != nil {
 		destinations = append(destinations,
@@ -133,6 +154,11 @@ func runDeferred(group *groupContext) {
 	})
 
 	group.Check("each in-band due time is delivered", func(t *testing.T) {
+		if destinationDelayModel(group) {
+			group.Skip(t, "each in-band due time is delivered",
+				"offsets of 4/5 and 6/5 of the declared delay are due times other than publish plus the destination delay, which is the only due time this model owes")
+			return
+		}
 		name := "deferred.band"
 		producer := newDeferredProducer(t, group, profileDestination(group, name), deferredDelay)
 		consumer := deferredConsumer(t, group, []string{name}, map[string]time.Duration{name: deferredDelay}, 3)
@@ -185,6 +211,11 @@ func runDeferred(group *groupContext) {
 	})
 
 	group.Check("a nearer due time published after a farther one is delivered in due order", func(t *testing.T) {
+		if destinationDelayModel(group) {
+			group.Skip(t, "a nearer due time published after a farther one is delivered in due order",
+				"both messages are owed the declared destination delay after their own publish instants, so the due-order inversion this check publishes is not a due time the model produces")
+			return
+		}
 		name := "deferred.due-order"
 		producer := newDeferredProducer(t, group, profileDestination(group, name), deferredOrderDelay)
 		consumer := deferredConsumer(t, group, []string{name}, map[string]time.Duration{name: deferredOrderDelay}, 2)
@@ -269,6 +300,50 @@ func runDeferred(group *groupContext) {
 				"nearer", nearer.ReceivedAt, "farther", farther.ReceivedAt)
 		}
 		group.vector.Add(BehaviorEvent{ID: "deferred-due-order", Outcome: "due-order", FinalDestination: name})
+	})
+
+	group.Check("destination delay delivers a destination's messages in publish order", func(t *testing.T) {
+		if !destinationDelayModel(group) {
+			group.Skip(t, "destination delay delivers a destination's messages in publish order",
+				"publish order rests on due times being the declared delay after each publish instant, which only the destination-delay model owes")
+			return
+		}
+		name := publishOrderName
+		// Declared here as well as in the group's warm-up, with the same partition
+		// count, because the count is what makes this destination one ordering unit.
+		producer := newDeferredProducerFor(t, group, driver.DestinationSpec{
+			Name: profileDestination(group, name), Partitions: publishOrderPartitions, Delay: deferredDelay,
+		})
+		consumer := deferredConsumer(t, group, []string{name}, map[string]time.Duration{name: deferredDelay}, publishOrderCount)
+		// Every message carries the due time the core would write for it: the declared
+		// destination delay after the instant the publish is handed over. The
+		// destination-delay model derives that instant itself rather than reading this
+		// one, so the order is the whole instrument. Due times along a destination's
+		// partition do not decrease under that model, which is what leaves the order a
+		// driver owes equal to the order it received, and a driver that releases a later
+		// message ahead of an earlier one fails here even though every message still
+		// arrives at an instant the model is entitled to pick.
+		for i := range publishOrderCount {
+			body := fmt.Sprintf("order-%02d", i)
+			if err := producer.Publish(group.ctx, driver.OutboundMessage{Destination: name, Body: []byte(body), DelayUntil: deferredNow(group).Add(deferredDelay)}); err != nil {
+				t.Fatal(err)
+			}
+		}
+		// The release and the waits below are anchored to the instant after the last
+		// publish rather than to one instant read before the loop. A broker clock
+		// spends wall time in the loop, and the last message is the one its delay puts
+		// furthest out, so a bound taken before the loop would expire while a correct
+		// driver was still publishing.
+		advanceDeferredTo(group, deferredNow(group).Add(deferredDelay))
+		deadline := deferredNow(group).Add(deferredDelay + deferredLateBound)
+		for i := range publishOrderCount {
+			message := receiveBefore(t, group, consumer, deadline, "publish-order delivery")
+			if want := fmt.Sprintf("order-%02d", i); string(message.Body) != want {
+				t.Fatalf("delivery %d is body %q, want %q: a destination's messages were not delivered in publish order", i, message.Body, want)
+			}
+			ackMessage(t, group, message)
+		}
+		group.vector.Add(BehaviorEvent{ID: "deferred-publish-order", Outcome: "in-order", FinalDestination: name})
 	})
 
 	group.Check("destination delay supplies a zero due time", func(t *testing.T) {
@@ -453,28 +528,43 @@ func runDeferred(group *groupContext) {
 	})
 }
 
+// destinationDelayModel reports whether this run's harness declared the model in
+// which a driver owes every deferred message its destination's declared delay
+// after the message's publish instant.
+func destinationDelayModel(group *groupContext) bool {
+	return group.deferralModel == DeferralDestinationDelay
+}
+
 func newDeferredProducer(t *testing.T, group *groupContext, destination string, delay time.Duration) driver.Producer {
 	t.Helper()
+	return newDeferredProducerFor(t, group, driver.DestinationSpec{Name: destination, Delay: delay})
+}
+
+// newDeferredProducerFor is newDeferredProducer for a check that declares its own
+// destination spec, because a spec carries more than a name and a delay: the
+// publish-order check pins a partition count through it.
+func newDeferredProducerFor(t *testing.T, group *groupContext, spec driver.DestinationSpec) driver.Producer {
+	t.Helper()
 	if _, err := group.conn.Admin().EnsureTopology(group.ctx, driver.TopologySpec{
-		Destinations: []driver.DestinationSpec{{Name: destination, Delay: delay}}, Effective: group.effective,
+		Destinations: []driver.DestinationSpec{spec}, Effective: group.effective,
 	}); err != nil {
-		t.Fatalf("EnsureTopology(%q): %v", destination, err)
+		t.Fatalf("EnsureTopology(%q): %v", spec.Name, err)
 	}
 	producer, err := group.conn.Producer(group.ctx, driver.ProducerConfig{Effective: group.effective})
 	if err != nil {
-		t.Fatalf("Producer(%q): %v", destination, err)
+		t.Fatalf("Producer(%q): %v", spec.Name, err)
 	}
 	t.Cleanup(func() {
 		if err := producer.Close(group.ctx); err != nil {
-			t.Errorf("close producer %q: %v", destination, err)
+			t.Errorf("close producer %q: %v", spec.Name, err)
 		}
 	})
 	t.Cleanup(func() {
-		if err := purgeIfSupported(group.ctx, group.conn, destination); err != nil {
-			t.Errorf("purge destination %q: %v", destination, err)
+		if err := purgeIfSupported(group.ctx, group.conn, spec.Name); err != nil {
+			t.Errorf("purge destination %q: %v", spec.Name, err)
 		}
 	})
-	return &profileProducer{group: group, producer: producer, scoped: destination != unprofileDestination(group, destination)}
+	return &profileProducer{group: group, producer: producer, scoped: spec.Name != unprofileDestination(group, spec.Name)}
 }
 
 // deferredConsumer builds a consumer over destinations, with delays giving the

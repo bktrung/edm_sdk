@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"slices"
 	"testing"
 	"time"
 
@@ -213,11 +214,29 @@ func TestConformance(t *testing.T) {
 	// time deterministically. Its origin is arbitrary now that receiveBefore spends
 	// its own waitTimeout budget instead of time.Until of a fixture instant.
 	fake := clock.NewFake(clock.NewReal().Now())
-	report := runConformance(t, Driver{clock: fake})
+	report := runConformance(t, Driver{clock: fake}, conformance.DeferralExact)
+	assertDeferredSkips(t, report, "destination delay delivers a destination's messages in publish order")
 	if err := report.WriteMarkdown(&output); err != nil {
 		t.Fatal(err)
 	}
 	t.Log(output.String())
+}
+
+// TestConformanceDestinationDelay runs the same suite again under the model in
+// which a driver owes a deferred message its publish instant plus its
+// destination's declared delay, whatever due time the message carries. The
+// in-memory driver honours exact due times, so the run proves the declared model
+// reaches the group, that the group registers its eleven checks under either
+// model, that it records exactly the two skips whose due times this model would
+// not produce, and that the check this model adds passes on a driver that also
+// owes the exact due time it was handed.
+func TestConformanceDestinationDelay(t *testing.T) {
+	fake := clock.NewFake(clock.NewReal().Now())
+	report := runConformance(t, Driver{clock: fake}, conformance.DeferralDestinationDelay)
+	assertDeferredSkips(t, report,
+		"each in-band due time is delivered",
+		"a nearer due time published after a farther one is delivered in due order",
+	)
 }
 
 func TestConformanceMinimalCapabilities(t *testing.T) {
@@ -225,10 +244,10 @@ func TestConformanceMinimalCapabilities(t *testing.T) {
 	// This named fixture only weakens native declarations and removes limits;
 	// ScalingPartitionBound is the one preserved declaration needed to execute
 	// that capability's branch, and the check uses one consumer accordingly.
-	runConformance(t, Driver{clock: fake, minimal: true})
+	runConformance(t, Driver{clock: fake, minimal: true}, conformance.DeferralExact)
 }
 
-func runConformance(t *testing.T, candidate Driver) conformance.Report {
+func runConformance(t *testing.T, candidate Driver, model conformance.DeferralModel) conformance.Report {
 	t.Helper()
 	return conformance.Run(t, conformance.Suite{
 		Driver:             candidate,
@@ -236,5 +255,36 @@ func runConformance(t *testing.T, candidate Driver) conformance.Report {
 		NewInspector:       newInspector,
 		NewFaultInjector:   newFaultInjector,
 		NewDeadlineFixture: newDeadlineFixture,
+		DeferralModel:      model,
 	})
+}
+
+// assertDeferredSkips requires the deferred group to have recorded exactly the
+// named skips, in both profiles, each carrying its reason. A check that should
+// have run and was skipped instead leaves the group green, so the names are the
+// only thing that tells a deliberate skip from a hole.
+func assertDeferredSkips(t *testing.T, report conformance.Report, names ...string) {
+	t.Helper()
+	want := slices.Sorted(slices.Values(names))
+	if len(report.Profiles) != 2 {
+		t.Fatalf("conformance ran %d profiles, want 2", len(report.Profiles))
+	}
+	for _, profile := range report.Profiles {
+		var skipped []conformance.CheckSkip
+		for _, group := range profile.Groups {
+			if group.Name == "deferred" {
+				skipped = group.Skipped
+			}
+		}
+		got := make([]string, 0, len(skipped))
+		for _, skip := range skipped {
+			if skip.Reason == "" {
+				t.Fatalf("profile %s recorded skip %q with no reason", profile.Profile, skip.Name)
+			}
+			got = append(got, skip.Name)
+		}
+		if !slices.Equal(slices.Sorted(slices.Values(got)), want) {
+			t.Fatalf("profile %s skipped %v, want %v", profile.Profile, got, want)
+		}
+	}
 }
