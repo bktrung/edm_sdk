@@ -123,6 +123,15 @@ Drivers transport the body, headers, key, optional priority hint, and optional
 effective capability profile and the portable path selected by the core; it
 must not change the observable F1 result silently.
 
+A driver may defer on its own terms rather than honour `DelayUntil`. A message
+sent to a destination that declares a delay may be delivered at that message's
+publish instant plus the declared delay, whatever due time the message carries,
+and never earlier; within one partition of a destination, the messages it
+deferred are then delivered in the order they were published. That is a property
+of the driver rather than a capability, because it describes the semantics the
+driver owes instead of an optimisation it performs, so it is declared to the
+conformance suite rather than reported by `Capabilities`.
+
 ### `InboundMessage`
 
 An inbound message must include the physical destination, body, headers, broker
@@ -328,6 +337,10 @@ interpreted only by that driver.
 `ConsumerConfig` carries:
 
 - group identity and physical destinations;
+- the delay each destination declares, keyed by its physical name, for a driver
+  that defers on the consumer side. The core fills it from the same topology it
+  passes to `EnsureTopology`, and a destination absent from the map has no
+  delay, which is how a driver is told a destination defers nothing;
 - total prefetch and the core-calculated `PerDestination` allocation;
 - exclusive mode;
 - start position for a new group only; and

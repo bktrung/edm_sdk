@@ -81,6 +81,12 @@ func TestHarnessOnInmem(t *testing.T) {
 		if result.Rate() <= 0 {
 			t.Fatalf("rate = %v, want a positive consume rate", result.Rate())
 		}
+		// The heap figure is sampled over the window rather than derived from
+		// the corpus, so a metric read that produced nothing would leave it at
+		// zero and still pass every other check here.
+		if result.HeapMax == 0 {
+			t.Fatal("heap max = 0, want the live heap the measurement sampled")
+		}
 	})
 
 	t.Run("latency", func(t *testing.T) {
@@ -183,6 +189,109 @@ func TestNewRefusesNegativeHandlerWork(t *testing.T) {
 		t.Fatal("bench.New accepted a negative handler work")
 	}
 }
+
+// TestHarnessCountsDuplicatesOnInmem proves that a delivery the shape did not
+// expect is a figure a measurement can report instead of a failure, which is
+// what a path that trades duplicates for something else needs from the harness.
+//
+// The driver hands one corpus message to the core twice. The run still has to
+// end on the corpus it expected and settle every message exactly once: a count
+// that let the copy end the window would report a rate for a corpus that had not
+// settled, and a count that left the copy out of the window would report zero
+// for a run that produced one.
+func TestHarnessCountsDuplicatesOnInmem(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
+	defer cancel()
+	h := newHarness(t, &duplicatingDriver{Driver: inmem.New()}, bench.Config{
+		Namespace:       benchNamespace(t),
+		Messages:        corpus,
+		Publishers:      1,
+		Concurrency:     1,
+		CountDuplicates: true,
+		Timeout:         stepTimeout,
+	})
+	defer closeHarness(ctx, t, h)
+	result, err := h.Consume(ctx)
+	if err != nil {
+		t.Fatalf("consume: %v", err)
+	}
+	if result.Duplicates != 1 {
+		t.Fatalf("duplicates = %d, want 1", result.Duplicates)
+	}
+	if result.Messages != corpus {
+		t.Fatalf("messages = %d, want %d", result.Messages, corpus)
+	}
+}
+
+// duplicatingDriver hands one delivery to the core twice, which is what a
+// measurement of a path that trades duplicates for a bound has to be able to
+// report.
+type duplicatingDriver struct {
+	driver.Driver
+}
+
+func (d *duplicatingDriver) Open(ctx context.Context, cfg driver.Config) (driver.Conn, error) {
+	conn, err := d.Driver.Open(ctx, cfg)
+	if err != nil || conn == nil {
+		return conn, err
+	}
+	return &duplicatingConn{Conn: conn}, nil
+}
+
+type duplicatingConn struct {
+	driver.Conn
+}
+
+func (c *duplicatingConn) Consumer(ctx context.Context, cfg driver.ConsumerConfig) (driver.Consumer, error) {
+	consumer, err := c.Conn.Consumer(ctx, cfg)
+	if err != nil || consumer == nil {
+		return consumer, err
+	}
+	return &duplicatingConsumer{Consumer: consumer}, nil
+}
+
+// duplicatingConsumer copies the second delivery it sees and leaves the rest
+// alone. The first delivery of a run is the warm-up message the harness settles
+// before its window opens, so the copy is of a message the measurement counts.
+//
+// The copy carries a settlement that reports success without reaching the
+// driver. The driver's record is settled by the delivery it belongs to, and a
+// second settlement of one record is a driver error rather than anything the
+// harness counts: the figure under test is a delivery, so the copy has to be
+// one without disturbing what the driver tracks.
+type duplicatingConsumer struct {
+	driver.Consumer
+}
+
+func (c *duplicatingConsumer) Messages() <-chan driver.InboundMessage {
+	source := c.Consumer.Messages()
+	out := make(chan driver.InboundMessage)
+	go func() {
+		defer close(out)
+		var warmUp, duplicated bool
+		for message := range source {
+			out <- message
+			if !warmUp {
+				warmUp = true
+				continue
+			}
+			if duplicated {
+				continue
+			}
+			duplicated = true
+			message.Settle = settledAnyway{}
+			out <- message
+		}
+	}()
+	return out
+}
+
+// settledAnyway reports a settlement without reaching the driver.
+type settledAnyway struct{}
+
+func (settledAnyway) Ack(context.Context) error { return nil }
+
+func (settledAnyway) Nack(context.Context, driver.NackOptions) error { return nil }
 
 func newHarness(t *testing.T, drv driver.Driver, cfg bench.Config) *bench.Harness {
 	t.Helper()

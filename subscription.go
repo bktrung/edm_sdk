@@ -134,6 +134,13 @@ type Runner struct {
 	retryDestinationTiers map[string]int
 	lifecycle             *lifecycle.Machine
 	dispatchPool          *dispatch.Pool
+
+	// prefetchConfigured records whether the caller named an in-flight budget
+	// on this subscription, as opposed to taking the broker default. A cap on
+	// a budget nobody named is not reported: the default is not the caller's
+	// decision, and the line would fire on nearly every subscription, which is
+	// what leaves it unread when a caller's own budget is capped.
+	prefetchConfigured bool
 }
 
 const terminalNotificationTimeout = time.Second
@@ -264,7 +271,7 @@ func (c *Client) Subscribe(ctx context.Context, sub Subscription) (*Runner, erro
 	}
 	c.mu.Unlock()
 
-	resolved, err := resolveSubscription(c, sub)
+	resolved, prefetchConfigured, err := resolveSubscription(c, sub)
 	if err != nil {
 		return nil, err
 	}
@@ -298,7 +305,7 @@ func (c *Client) Subscribe(ctx context.Context, sub Subscription) (*Runner, erro
 	effective.HandlerTimeout = resolved.HandlerTimeout
 	effective.UnmatchedPolicy = resolved.UnmatchedPolicy
 	effective.Handlers = wrapHandlers(c.options.middleware, sub.Handlers)
-	runner := &Runner{client: c, subscription: effective, config: resolved}
+	runner := &Runner{client: c, subscription: effective, config: resolved, prefetchConfigured: prefetchConfigured}
 	c.mu.Lock()
 	if c.closed || c.shutdownStarted || c.conn == nil {
 		c.mu.Unlock()
@@ -320,20 +327,33 @@ func wrapHandlers(middleware []Middleware, handlers map[string]Handler) map[stri
 	return wrapped
 }
 
-func resolveSubscription(c *Client, sub Subscription) (SubscriptionConfig, error) {
-	defaults := defaultSubscription()
-	resolved := defaults
+func resolveSubscription(c *Client, sub Subscription) (resolved SubscriptionConfig, prefetchConfigured bool, err error) {
+	resolved = defaultSubscription()
+	// Whether the caller named an in-flight budget, as opposed to taking the
+	// broker default. Three things name one: the Subscription, the loaded
+	// configuration block, and the environment overlay. The block is read
+	// through its presence flag rather than its value, because a block that
+	// named no prefetch has already been filled with the broker default by
+	// config normalization, so its value cannot tell the two apart. The
+	// environment overlay writes the value directly, so its key is read beside
+	// it. A budget nobody named is not reported when the lane windows cap it:
+	// that line would fire for every subscription on the shipped defaults.
+	prefetchConfigured = sub.Prefetch != 0
 	if loaded, ok := c.config.Subscriptions[sub.Name]; ok {
+		prefetchConfigured = prefetchConfigured || loaded.presence.Prefetch
 		overlayLoadedSubscription(&resolved, loaded)
 	}
-	if err := applySubscriptionEnvironment(sub.Name, &resolved); err != nil {
-		return SubscriptionConfig{}, err
+	if _, ok := lookupSubscriptionEnv(subscriptionEnvPrefix(sub.Name), "prefetch"); ok {
+		prefetchConfigured = true
+	}
+	if err = applySubscriptionEnvironment(sub.Name, &resolved); err != nil {
+		return SubscriptionConfig{}, false, err
 	}
 	overlayExplicitSubscription(&resolved, sub)
 	if resolved.Prefetch == 0 {
 		resolved.Prefetch = resolvePrefetch(resolved.Prefetch, c.config.Broker.DefaultPrefetch)
 	}
-	return resolved, nil
+	return resolved, prefetchConfigured, nil
 }
 
 func overlayLoadedSubscription(dst *SubscriptionConfig, src SubscriptionConfig) {

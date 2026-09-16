@@ -227,6 +227,14 @@ type ConsumerConfig struct {
 	Prefetch       int
 	PerDestination map[string]int
 
+	// Delays is the delay each destination in Destinations declares, keyed by
+	// the physical destination name the records on it carry. A destination
+	// absent from the map has no delay. The core fills it from the same topology
+	// it passes to EnsureTopology, so a consumer that defers reads the delay it
+	// needs here rather than from state an earlier call left on the connection.
+	// A driver that defers on the producer side may ignore it.
+	Delays map[string]time.Duration
+
 	Exclusive bool          // request single-active-consumer semantics
 	StartAt   StartPosition // Earliest or Latest for a new group only
 

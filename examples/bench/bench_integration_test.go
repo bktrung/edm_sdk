@@ -23,22 +23,27 @@ const (
 	defaultKafkaEndpoint    = "localhost:19092"
 	defaultRabbitMQEndpoint = "amqp://guest:guest@localhost:5672/" //nolint:gosec // test fixture endpoint
 
-	// kafkaFixturePartitions is the partition count a Kafka topic gets in this
-	// repository's fixture. The core requests no explicit count -
-	// DestinationSpec.Partitions is zero - so the broker's own
-	// KAFKA_NUM_PARTITIONS applies, and docker/docker-compose.yml sets it to 3.
+	// kafkaDriverName is the driver whose cells carry a partition count.
+	kafkaDriverName = "kafka"
+
+	// kafkaFixturePartitions is the partition count a Kafka run asks for when
+	// F1_KAFKA_PARTITIONS names none, which is the count this repository's
+	// fixture creates when nothing asks for one: docker/docker-compose.yml sets
+	// KAFKA_NUM_PARTITIONS to 3. A run states its own count in that variable,
+	// and the count travels to the broker as the driver option a deployment
+	// sets for its own topics, so the number a cell reports is the one its
+	// destinations were created with.
+	//
 	// The count is reported beside every Kafka number because it is part of the
 	// shape measured: it is how many partitions the corpus is spread over, and
-	// the work-5ms/concurrency-3 consume cell uses it as the handler
-	// concurrency a subscription limited to one handler per partition would
-	// have. The consume cells open their window before the corpus is published,
-	// so each Kafka consume number here is read against the publish benchmark's
-	// rate at consumeLoadPublishers, not as a ceiling the partition count
-	// supplies. Measured at 3f6cbfa that rate was 20127 msgs/s, no Kafka consume
-	// cell came within 10 percent of it, and the work-5ms shipped cell's 2561
-	// msgs/s needs about thirteen handlers in flight, which three partitions
-	// cannot supply one each. A run against another broker states its own count
-	// in F1_KAFKA_PARTITIONS.
+	// it is the ceiling a subscription limited to one handler per partition
+	// runs into. The consume cells open their window before the corpus is
+	// published, so each Kafka consume number here is read against the publish
+	// benchmark's rate at consumeLoadPublishers, not as a ceiling the partition
+	// count supplies. Measured at 3f6cbfa that rate was 20127 msgs/s, no Kafka
+	// consume cell came within 10 percent of it, and the work-5ms shipped
+	// cell's 2561 msgs/s needs about thirteen handlers in flight, which three
+	// partitions cannot supply one each.
 	kafkaFixturePartitions = 3
 
 	// slowHandlerWork is the handler hold time the work-5ms consume cells
@@ -48,6 +53,15 @@ const (
 	// can be read from it. The wait is orders of magnitude inside the harness's
 	// handler timeout, so it is never what ends a delivery.
 	slowHandlerWork = 5 * time.Millisecond
+
+	// longHandlerWork is the hold the work-200ms cell measures with. It is long
+	// enough that one handler is idle between deliveries whatever the broker
+	// does, so the rate that cell reports is the hold and nothing else, and one
+	// handler cannot keep the subscription's own work moving. That is what makes
+	// the lag and heap the cell samples figures about how much the subscription
+	// let pile up behind a single slow handler: at a 5ms hold the arrivals keep
+	// up with the handler, and the same bound is hidden behind them.
+	longHandlerWork = 200 * time.Millisecond
 
 	// kafkaRetryTier is the retry delay the Kafka retry benchmark configures.
 	// The driver checks a deferred record's due time against a band whose lower
@@ -98,8 +112,10 @@ func BenchmarkRabbitMQPublish(b *testing.B) {
 // BenchmarkKafkaConsume measures Kafka consume-and-settle throughput on one
 // lane. With a handler that returns at once it runs at one handler at a time
 // and at the shipped handler concurrency; with a handler that holds every
-// delivery for 5ms it runs at one handler at a time, at three, and at the
-// shipped handler concurrency.
+// delivery for 5ms it runs at one handler at a time, at three, at the shipped
+// handler concurrency, and on an ordered subscription at the shipped handler
+// concurrency; with a handler that holds every delivery for 200ms it runs at
+// one handler at a time.
 func BenchmarkKafkaConsume(b *testing.B) {
 	benchmarkConsume(b, kafka.Driver{}, kafkaEndpoint())
 }
@@ -107,8 +123,9 @@ func BenchmarkKafkaConsume(b *testing.B) {
 // BenchmarkRabbitMQConsume measures RabbitMQ consume-and-settle throughput on
 // one lane. With a handler that returns at once it runs at one handler at a
 // time and at the shipped handler concurrency; with a handler that holds every
-// delivery for 5ms it runs at one handler at a time, at three, and at the
-// shipped handler concurrency.
+// delivery for 5ms it runs at one handler at a time, at three, at the shipped
+// handler concurrency, and on an ordered subscription at the shipped handler
+// concurrency.
 func BenchmarkRabbitMQConsume(b *testing.B) {
 	benchmarkConsume(b, rabbitmq.Driver{}, rabbitMQEndpoint())
 }
@@ -148,6 +165,7 @@ func benchmarkPublish(b *testing.B, drv driver.Driver, endpoint string) {
 				Endpoint:   endpoint,
 				Messages:   b.N,
 				Publishers: publishers,
+				Partitions: kafkaPartitions(),
 				Timeout:    measurementTimeout,
 			})
 			defer closeBench(b, h)
@@ -159,12 +177,15 @@ func benchmarkPublish(b *testing.B, drv driver.Driver, endpoint string) {
 			}
 			reportPartitions(b, drv)
 			b.ReportMetric(result.Rate(), "msgs/s")
+			b.ReportMetric(float64(result.Duplicates), "dups")
+			b.ReportMetric(float64(result.GoroutineDelta), "goroutines-delta")
 		})
 	}
 }
 
-// benchmarkConsume runs the consume-and-settle measurement five times per
-// driver.
+// benchmarkConsume runs the consume-and-settle measurement six times per
+// driver, and a seventh time on Kafka, which is the driver whose destinations
+// have a partition count.
 //
 // Every consume measurement opens its window before the corpus is published, so
 // a rate it reports contains its own load: the corpus can only arrive as fast as
@@ -189,9 +210,9 @@ func benchmarkPublish(b *testing.B, drv driver.Driver, endpoint string) {
 //
 // The three work-5ms cells hold each delivery in the handler for 5ms, which is
 // what shows what the handler concurrency buys once a handler takes time.
-// concurrency-3 is the Kafka fixture's partition count, so that cell is the
-// rate a subscription limited to one handler per partition would reach on three
-// partitions; the other two are the same single-slot and shipped shapes.
+// concurrency-3 is three handler slots, which was the fixture's partition count
+// when the cell was recorded; the other two are the same single-slot and shipped
+// shapes.
 // Measured at 3f6cbfa against ceilings of 200, 600 and 3200 msgs/s for one,
 // three and sixteen slots, Kafka reached 177.6, 529.7 and 2561, which is 88.8,
 // 88.3 and 80.0 percent of them, and RabbitMQ reached 173.1, 395.8 and 2021,
@@ -199,6 +220,19 @@ func benchmarkPublish(b *testing.B, drv driver.Driver, endpoint string) {
 // driver's load rate, so each of the six measures the consumer; RabbitMQ's
 // shipped cell gets 2021 msgs/s out of the sixteen slots, about ten of them
 // busy on average.
+//
+// The ordered cell is the same 5ms hold at the shipped handler concurrency on a
+// subscription that handles deliveries sharing a key one at a time, with the
+// publishers spreading the corpus over a fixed key set. It is the only cell that
+// measures the ordered path, and its rate is read against the unordered
+// work-5ms shipped cell beside it: the difference between the two is what the
+// ordering costs at this hold, whatever the partition count it runs at.
+//
+// The work-200ms cell holds each delivery for 200ms at one handler, which is
+// long enough that no broker or harness cost can show through the hold: its rate
+// is the hold and nothing else. The figures to read on it are therefore the lag
+// and the heap it samples, which are what the subscription let pile up behind
+// one slow handler. It is measured on Kafka alone.
 //
 // The shipped case passes zero rather than the value the client ships with, so
 // the case keeps measuring the shipped value if that value changes.
@@ -208,13 +242,20 @@ func benchmarkConsume(b *testing.B, drv driver.Driver, endpoint string) {
 		name        string
 		concurrency int
 		handlerWork time.Duration
+		ordered     bool
+		kafkaOnly   bool
 	}{
 		{name: "concurrency-1", concurrency: 1},
 		{name: "concurrency-shipped"},
 		{name: "work-5ms/concurrency-1", concurrency: 1, handlerWork: slowHandlerWork},
 		{name: "work-5ms/concurrency-3", concurrency: kafkaFixturePartitions, handlerWork: slowHandlerWork},
 		{name: "work-5ms/concurrency-shipped", handlerWork: slowHandlerWork},
+		{name: "work-5ms/ordered/concurrency-shipped", handlerWork: slowHandlerWork, ordered: true},
+		{name: "work-200ms/concurrency-1", concurrency: 1, handlerWork: longHandlerWork, kafkaOnly: true},
 	} {
+		if c.kafkaOnly && drv.Name() != kafkaDriverName {
+			continue
+		}
 		b.Run(c.name, func(b *testing.B) {
 			h := newBench(b, drv, bench.Config{
 				Namespace:   namespace,
@@ -223,6 +264,8 @@ func benchmarkConsume(b *testing.B, drv driver.Driver, endpoint string) {
 				Publishers:  consumeLoadPublishers,
 				Concurrency: c.concurrency,
 				HandlerWork: c.handlerWork,
+				Ordered:     c.ordered,
+				Partitions:  kafkaPartitions(),
 				Timeout:     measurementTimeout,
 			})
 			defer closeBench(b, h)
@@ -234,6 +277,10 @@ func benchmarkConsume(b *testing.B, drv driver.Driver, endpoint string) {
 			}
 			reportPartitions(b, drv)
 			b.ReportMetric(result.Rate(), "msgs/s")
+			b.ReportMetric(float64(result.Duplicates), "dups")
+			b.ReportMetric(float64(result.LagMax), "lag-max")
+			b.ReportMetric(float64(result.HeapMax), "heap-max")
+			b.ReportMetric(float64(result.GoroutineDelta), "goroutines-delta")
 		})
 	}
 }
@@ -247,6 +294,7 @@ func benchmarkLatency(b *testing.B, drv driver.Driver, endpoint string) {
 		Messages:    b.N,
 		Publishers:  1,
 		Concurrency: 1,
+		Partitions:  kafkaPartitions(),
 		Timeout:     measurementTimeout,
 	})
 	defer closeBench(b, h)
@@ -259,6 +307,8 @@ func benchmarkLatency(b *testing.B, drv driver.Driver, endpoint string) {
 	reportPartitions(b, drv)
 	b.ReportMetric(float64(result.Percentile(50))/float64(time.Millisecond), "p50-ms")
 	b.ReportMetric(float64(result.Percentile(99))/float64(time.Millisecond), "p99-ms")
+	b.ReportMetric(float64(result.Duplicates), "dups")
+	b.ReportMetric(float64(result.GoroutineDelta), "goroutines-delta")
 }
 
 // benchmarkRetry runs the retry-path measurement. The tier delay is reported
@@ -273,6 +323,7 @@ func benchmarkRetry(b *testing.B, drv driver.Driver, endpoint string, tier time.
 		Publishers:  loadPublishers,
 		Concurrency: 1,
 		RetryTier:   tier,
+		Partitions:  kafkaPartitions(),
 		Timeout:     measurementTimeout,
 	})
 	defer closeBench(b, h)
@@ -285,18 +336,34 @@ func benchmarkRetry(b *testing.B, drv driver.Driver, endpoint string, tier time.
 	reportPartitions(b, drv)
 	b.ReportMetric(result.Rate(), "msgs/s")
 	b.ReportMetric(float64(result.RetryTier)/float64(time.Millisecond), "tier-ms")
+	b.ReportMetric(float64(result.Duplicates), "dups")
+	b.ReportMetric(float64(result.GoroutineDelta), "goroutines-delta")
 }
 
-// reportPartitions records the Kafka partition count the run's topics were
-// created with. Other drivers deliver from a shared destination and have no
+// reportPartitions records the partition count a Kafka run created its
+// destinations with. Other drivers deliver from a shared destination and have no
 // partition count to report.
+//
+// The count reported is the one the run asked for, through the driver option
+// that both gives a destination naming no count that many partitions and refuses
+// one that has fewer. It is not read back from the topic: the port has no
+// partition-count read, and an example may not reach the broker through a broker
+// client of its own, which is what reading it back would take. What makes the
+// two the same number is that each run creates its destinations fresh and the
+// driver's own floor check fails the run when a destination has fewer partitions
+// than it was given, so a run that reported a count it did not get would have
+// failed rather than reported it.
 func reportPartitions(b *testing.B, drv driver.Driver) {
-	if drv.Name() != "kafka" {
+	if drv.Name() != kafkaDriverName {
 		return
 	}
 	b.ReportMetric(float64(kafkaPartitions()), "partitions")
 }
 
+// kafkaPartitions is the partition count a Kafka run creates its destinations
+// with, read once from F1_KAFKA_PARTITIONS. A value that is missing or unusable
+// keeps the fixture's count, so a run that states nothing measures the shape
+// the recorded baseline was taken at.
 func kafkaPartitions() int {
 	value, err := strconv.Atoi(os.Getenv("F1_KAFKA_PARTITIONS"))
 	if err != nil || value < 1 {

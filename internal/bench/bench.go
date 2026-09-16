@@ -21,7 +21,10 @@ import (
 	"log/slog"
 	"math"
 	"os"
+	"runtime"
+	"runtime/metrics"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -59,6 +62,26 @@ const (
 	// cleanupTimeout bounds one cleanup, which runs after the caller's context
 	// may already be done.
 	cleanupTimeout = 2 * time.Minute
+
+	// sampleInterval is how often a consume measurement samples the consumer's
+	// backlog and the process's live heap. One backlog query is the whole cost
+	// of a tick, which is what makes a tick this short affordable, and a corpus
+	// whose arrival spreads over seconds is seen at this resolution.
+	sampleInterval = 100 * time.Millisecond
+
+	// orderedKeys is how many keys an ordered measurement spreads its corpus
+	// over. One key would serialise the whole corpus through one handler slot
+	// and measure the key choice rather than the ordering path, and a key per
+	// message would leave nothing for the ordering to serialise. The set is
+	// fixed rather than derived from the corpus, so two corpora of different
+	// sizes divide the same way and their figures compare.
+	orderedKeys = 64
+
+	// kafkaDriverName is the driver whose destinations carry a partition count.
+	// The count is configured through a Kafka option, so the harness sets it
+	// only for that driver: the same key on another driver is a configuration
+	// error rather than an ignored setting.
+	kafkaDriverName = "kafka"
 )
 
 // sequence numbers each harness, so two harnesses built from one namespace
@@ -95,6 +118,25 @@ type Config struct {
 	// back after exactly this delay. Other measurements keep the shipped
 	// ladder, and a retry measurement without a tier is refused.
 	RetryTier time.Duration
+	// Partitions is the partition count the measurement's destinations are
+	// created with, on a driver whose destinations have partitions. It is
+	// applied through the driver's documented partition-floor option, which
+	// gives that many partitions to a destination that names none, so a
+	// measurement of a partition count exercises the lever a deployment pulls
+	// and not a seam. A zero value names no count and leaves the decision to
+	// the broker, which is what a deployment that configures nothing gets. It
+	// is ignored on a driver whose destinations have no partitions.
+	Partitions int
+	// Ordered makes the subscription an ordered one, so deliveries sharing a
+	// key are handled one at a time, and makes the publishers spread the corpus
+	// over a fixed key set, so the ordering has something to serialise. A
+	// measurement without it keeps the unordered default.
+	Ordered bool
+	// CountDuplicates reports duplicate deliveries instead of failing the run
+	// on them. A measurement without it fails on any delivery its shape did not
+	// expect, which is what every measurement did before this field existed, and
+	// is what keeps a regression from hiding inside a rate.
+	CountDuplicates bool
 	// Timeout bounds one measurement, from client construction to drain.
 	Timeout time.Duration
 }
@@ -119,6 +161,25 @@ type Result struct {
 	// RetryTier is the retry delay the measurement configured, and zero when it
 	// kept the shipped ladder.
 	RetryTier time.Duration
+	// Duplicates is how many deliveries arrived past the ones this shape
+	// expects, summed over the corpus. A corpus message is delivered once per
+	// attempt when the path is working, so the count is zero unless the run
+	// delivered a message more often than that: a rate cannot show that, and a
+	// run that fails on it cannot report it.
+	Duplicates int
+	// LagMax is the largest backlog the consumer reported over the measured
+	// window, in messages, taken across the destinations the subscription
+	// reads. It is populated by the consume measurement, and only when the
+	// driver declares that it can be queried at all; it is zero otherwise.
+	LagMax int64
+	// HeapMax is the largest number of bytes the process's live heap held over
+	// the measured window. It is populated by the consume measurement, and it
+	// is what shows a subscription holding on to work it has not handed over.
+	HeapMax uint64
+	// GoroutineDelta is how many goroutines the process gained between the
+	// client being built and the client being closed with its consumer stopped,
+	// which is where a run that leaves work behind shows up.
+	GoroutineDelta int
 }
 
 // Rate reports messages per second over the measured window.
@@ -156,6 +217,11 @@ type Harness struct {
 	clk          clock.Clock
 	topic        string
 	subscription string
+	// keys is the key set the publishers of an ordered measurement spread the
+	// corpus over, built once so a publisher allocates nothing per message for
+	// a key. It is empty for an unordered measurement, whose messages carry no
+	// key.
+	keys []string
 
 	// declared holds every destination the core asked the driver to create, so
 	// cleanup deletes exactly what this run made. Reading the names back from
@@ -191,15 +257,25 @@ func New(drv driver.Driver, cfg Config) (*Harness, error) {
 	if cfg.Timeout <= 0 {
 		return nil, errors.New("bench: timeout must be positive")
 	}
+	if cfg.Partitions < 0 {
+		return nil, fmt.Errorf("bench: partitions must not be negative, got %d", cfg.Partitions)
+	}
 	name := fmt.Sprintf("%s-%d", cfg.Namespace, sequence.Add(1))
-	return &Harness{
+	harness := &Harness{
 		cfg:          cfg,
 		drv:          drv,
 		clk:          clock.NewReal(),
 		topic:        name,
 		subscription: name,
 		declared:     make(map[string]struct{}),
-	}, nil
+	}
+	if cfg.Ordered {
+		harness.keys = make([]string, orderedKeys)
+		for index := range orderedKeys {
+			harness.keys[index] = strconv.Itoa(index)
+		}
+	}
+	return harness, nil
 }
 
 // Publish measures single-message publish throughput with cfg.Publishers
@@ -371,15 +447,25 @@ func validateNamespace(namespace string) error {
 // clientConfig is the configuration every measurement runs on: the shipped
 // defaults except where a measurement needs a known shape, and one lane.
 func (h *Harness) clientConfig() f1.Config {
+	broker := f1.BrokerConfig{
+		Driver:         h.drv.Name(),
+		Endpoints:      h.endpoints(),
+		ConnectTimeout: connectTimeout,
+	}
+	if h.drv.Name() == kafkaDriverName && h.cfg.Partitions > 0 {
+		// The count travels as the driver option a deployment would set. Its
+		// floor half is a guard rather than a measurement: the topics a run
+		// creates are new, so nothing this run declares has fewer partitions
+		// than it asks for.
+		broker.DriverOptions = map[string]string{
+			"kafka.maxExpectedInstances": strconv.Itoa(h.cfg.Partitions),
+		}
+	}
 	return f1.Config{
 		Env:        "bench",
 		Service:    "bench",
 		InstanceID: h.subscription,
-		Broker: f1.BrokerConfig{
-			Driver:         h.drv.Name(),
-			Endpoints:      h.endpoints(),
-			ConnectTimeout: connectTimeout,
-		},
+		Broker:     broker,
 		Topology: f1.TopologyConfig{
 			AutoCreate: true,
 			Priorities: []f1.Priority{lane},
@@ -426,6 +512,14 @@ type run struct {
 	m      mode
 	tr     *tracker
 	client *f1.Client
+	// wrapped is the one counting driver this run handed the client. The
+	// connection and the consumer the client opens hang off it, which is how
+	// the sampler reaches the consumer to ask it for its backlog.
+	wrapped *countingDriver
+	// sample is the run's sampler, and is nil for a measurement that records no
+	// backlog and no heap. The teardown stops it before it releases anything the
+	// sampler queries, so this field is the sampler's whole lifetime.
+	sample *sampler
 
 	ready     chan struct{}
 	readyOnce sync.Once
@@ -446,11 +540,17 @@ func (h *Harness) measure(ctx context.Context, m mode) (Result, error) {
 	r := &run{
 		h:     h,
 		m:     m,
-		tr:    newTracker(h.clk, h.cfg.Messages, h.cfg.Messages*m.attempts()),
+		tr:    newTracker(h.clk, h.cfg.Messages, m.attempts()),
 		ready: make(chan struct{}),
 	}
+	r.wrapped = r.wrappedDriver()
+	// The baseline the goroutine delta is read against is taken before the
+	// client exists, so it holds the harness's own goroutines and the driver
+	// code already loaded, and what is left of the delta at the end is what
+	// this run left behind.
+	before := runtime.NumGoroutine()
 	client, err := f1.New(ctx, h.clientConfig(),
-		f1.WithDriver(r.wrappedDriver()),
+		f1.WithDriver(r.wrapped),
 		f1.WithPublishTopics(h.topic),
 		f1.WithLogger(benchmarkLogger()),
 	)
@@ -491,6 +591,15 @@ func (h *Harness) measure(ctx context.Context, m mode) (Result, error) {
 			return Result{}, errors.Join(err, r.stop(ctx))
 		}
 	}
+	// A consume measurement samples while its window is open: the backlog the
+	// consumer has not read and the live heap are both figures the run's rate
+	// cannot show, and both belong to the interval the clock covers. The
+	// sampler belongs to the run, so the teardown stops it before the teardown
+	// releases the consumer it queries, and its goroutine is gone before the
+	// delta counted below is read.
+	if m == modeConsume {
+		r.sample = newSampler(ctx, h.clk, r.wrapped.consumer(), h.drv.Capabilities().LagQueryable)
+	}
 	start := h.clk.Now()
 	r.tr.arm()
 	if m == modeLatency {
@@ -511,10 +620,11 @@ func (h *Harness) measure(ctx context.Context, m mode) (Result, error) {
 			return Result{}, err
 		}
 		return Result{
-			Messages:    h.cfg.Messages,
-			Publishers:  h.cfg.Publishers,
-			Concurrency: h.cfg.Concurrency,
-			Elapsed:     elapsed,
+			Messages:       h.cfg.Messages,
+			Publishers:     h.cfg.Publishers,
+			Concurrency:    h.cfg.Concurrency,
+			Elapsed:        elapsed,
+			GoroutineDelta: runtime.NumGoroutine() - before,
 		}, nil
 	}
 	if err := r.await(ctx, r.tr.hasStopped); err != nil {
@@ -522,23 +632,44 @@ func (h *Harness) measure(ctx context.Context, m mode) (Result, error) {
 	}
 	elapsed := r.tr.stopTime().Sub(start)
 	atStop := r.tr.snapshot()
+	var (
+		lagMax  int64
+		heapMax uint64
+	)
+	if r.sample != nil {
+		// The window has closed, so the sampling is stopped here rather than
+		// left to the teardown: a sample taken while the run is torn down is a
+		// figure about a consumer that is being released, not about the
+		// interval that was measured.
+		r.sample.stop()
+		lagMax, heapMax = r.sample.lagMax(), r.sample.heapMax()
+	}
 	if err := r.stop(ctx); err != nil {
 		return Result{}, err
 	}
-	if err := atStop.verify(h.cfg.Messages, m.attempts(), "when the clock stopped"); err != nil {
+	// The sample is taken once the client is closed and the consumer it opened
+	// has stopped, which is the quiet point the delta is meaningful at. Both
+	// verifications run first so a run that failed on its own counts is
+	// reported as that rather than as the goroutines it was holding.
+	if err := atStop.verify(h.cfg.Messages, m.attempts(), h.cfg.CountDuplicates, "when the clock stopped"); err != nil {
 		return Result{}, err
 	}
-	if err := r.tr.snapshot().verify(h.cfg.Messages, m.attempts(), "after the run stopped"); err != nil {
+	afterStop := r.tr.snapshot()
+	if err := afterStop.verify(h.cfg.Messages, m.attempts(), h.cfg.CountDuplicates, "after the run stopped"); err != nil {
 		return Result{}, err
 	}
 	return Result{
-		Messages:    h.cfg.Messages,
-		Publishers:  h.cfg.Publishers,
-		Concurrency: h.cfg.Concurrency,
-		HandlerWork: h.cfg.HandlerWork,
-		Elapsed:     elapsed,
-		Latencies:   r.tr.latencies(),
-		RetryTier:   h.cfg.RetryTier,
+		Messages:       h.cfg.Messages,
+		Publishers:     h.cfg.Publishers,
+		Concurrency:    h.cfg.Concurrency,
+		HandlerWork:    h.cfg.HandlerWork,
+		Elapsed:        elapsed,
+		Latencies:      r.tr.latencies(),
+		RetryTier:      h.cfg.RetryTier,
+		Duplicates:     afterStop.duplicates,
+		LagMax:         lagMax,
+		HeapMax:        heapMax,
+		GoroutineDelta: runtime.NumGoroutine() - before,
 	}, nil
 }
 
@@ -564,6 +695,9 @@ func (r *run) subscribe(ctx context.Context) error {
 		Concurrency:    r.h.cfg.Concurrency,
 		HandlerTimeout: handlerTimeout,
 		Handlers:       map[string]f1.Handler{r.h.topic: f1.HandlerFunc(r.handle)},
+	}
+	if r.h.cfg.Ordered {
+		sub.Mode = f1.OrderedByKey
 	}
 	if r.m == modeRetry {
 		// Two attempts, one tier: the first delivery fails and the retry copy
@@ -610,6 +744,20 @@ func (r *run) handle(ctx context.Context, event *f1.Event) error {
 	return nil
 }
 
+// publish sends one corpus message. An ordered measurement attaches the key
+// its sequence maps to, which is what gives the subscription's ordering
+// something to serialise; an unordered measurement sends no key, exactly as
+// every measurement did before ordering existed.
+func (r *run) publish(ctx context.Context, seq int) error {
+	if !r.h.cfg.Ordered {
+		_, err := r.client.Publisher().Publish(ctx, r.h.topic, payload{Seq: seq})
+		return err
+	}
+	_, err := r.client.Publisher().Publish(ctx, r.h.topic, payload{Seq: seq},
+		f1.WithKey(r.h.keys[seq%orderedKeys]))
+	return err
+}
+
 // publishBulk distributes the corpus across the configured publishers.
 func (r *run) publishBulk(ctx context.Context) error {
 	var (
@@ -622,7 +770,7 @@ func (r *run) publishBulk(ctx context.Context) error {
 		go func() {
 			defer wait.Done()
 			for seq := publisher; seq < r.h.cfg.Messages; seq += r.h.cfg.Publishers {
-				if _, err := r.client.Publisher().Publish(ctx, r.h.topic, payload{Seq: seq}); err != nil {
+				if err := r.publish(ctx, seq); err != nil {
 					mu.Lock()
 					failed = errors.Join(failed, fmt.Errorf("bench: publish %d: %w", seq, err))
 					mu.Unlock()
@@ -641,7 +789,7 @@ func (r *run) publishBulk(ctx context.Context) error {
 func (r *run) publishSequential(ctx context.Context) error {
 	for seq := range r.h.cfg.Messages {
 		r.tr.notePublishedAt(seq, r.h.clk.Now())
-		if _, err := r.client.Publisher().Publish(ctx, r.h.topic, payload{Seq: seq}); err != nil {
+		if err := r.publish(ctx, seq); err != nil {
 			return fmt.Errorf("bench: publish %d: %w", seq, err)
 		}
 		settled := seq + 1
@@ -682,7 +830,7 @@ func (r *run) runError() error {
 // the entry point routes to a bound destination and the consumer is attached.
 // It runs outside every measured window.
 func (r *run) warmUp(ctx context.Context) error {
-	if _, err := r.client.Publisher().Publish(ctx, r.h.topic, payload{Seq: 0}); err != nil {
+	if err := r.publish(ctx, 0); err != nil {
 		return fmt.Errorf("bench: warm-up publish: %w", err)
 	}
 	want := r.m.attempts()
@@ -722,6 +870,11 @@ func (r *run) stop(ctx context.Context) error {
 
 func (r *run) stopNow(ctx context.Context) error {
 	var problems []error
+	// The sampler goes first: it queries the consumer, and everything below
+	// releases it. Stopping it here rather than at the callers covers every
+	// path out of a measurement, including the ones that return on an error
+	// and never reach the window's own end.
+	r.sample.stop()
 	parent := context.WithoutCancel(ctx)
 	if r.runner != nil && !r.drained {
 		drainCtx, cancel := context.WithTimeout(parent, drainTimeout)
@@ -755,6 +908,132 @@ func benchmarkLogger() *slog.Logger {
 	return slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelWarn}))
 }
 
+// heapLiveBytes is the runtime/metrics figure for the bytes live objects
+// occupy: the heap in use, without the spans and the free space the runtime
+// holds for it. It is read through runtime/metrics and never through
+// runtime.ReadMemStats, which stops the world: a stop-the-world read during a
+// measured window would delay the very corpus the window exists to time.
+const heapLiveBytes = "/memory/classes/heap/objects:bytes"
+
+// sampler records, over one measured window, the two figures a rate cannot
+// show: the backlog the consumer has not read yet, and the live heap the
+// process holds.
+//
+// Both are recorded as the largest value seen rather than as an average. The
+// question they answer is whether something grew without bound, and a mean over
+// a window that starts empty and ends drained answers it with a number that
+// hides its own peak.
+type sampler struct {
+	clk      clock.Clock
+	consumer driver.Consumer
+	// queryLag is cleared when the consumer cannot answer for its backlog, so
+	// one refusal does not turn into a query on every tick. It is written by
+	// the sampling goroutine alone after the sampler is built.
+	queryLag bool
+
+	cancel context.CancelFunc
+	done   chan struct{}
+	once   sync.Once
+
+	mu       sync.Mutex
+	peakLag  int64
+	peakHeap uint64
+}
+
+// newSampler starts sampling and returns it. The consumer may be nil, and a
+// driver that cannot be asked for its backlog is not asked: the heap is then
+// the whole of what is recorded.
+func newSampler(parent context.Context, clk clock.Clock, consumer driver.Consumer, queryLag bool) *sampler {
+	ctx, cancel := context.WithCancel(parent)
+	s := &sampler{
+		clk:      clk,
+		consumer: consumer,
+		queryLag: queryLag && consumer != nil,
+		cancel:   cancel,
+		done:     make(chan struct{}),
+	}
+	go s.run(ctx)
+	return s
+}
+
+// run samples until ctx is done and then closes done, which is how a
+// measurement waits for the last query to return before it counts the process's
+// goroutines.
+func (s *sampler) run(ctx context.Context) {
+	defer close(s.done)
+	// The first sample is taken before the first wait, so a window shorter than
+	// a sample interval still carries a figure instead of the zero value a
+	// sleep-then-sample loop would leave behind.
+	heap := []metrics.Sample{{Name: heapLiveBytes}}
+	for {
+		if s.queryLag {
+			backlog, err := s.consumer.Lag(ctx)
+			if err != nil {
+				// A measurement does not fail over a figure it reports beside
+				// the rate, and a driver whose backlog cannot be read has
+				// nothing to contribute to it. The heap sample continues.
+				s.queryLag = false
+			} else {
+				s.noteLag(backlog)
+			}
+		}
+		metrics.Read(heap)
+		s.noteHeap(heap[0].Value)
+		if err := s.clk.Sleep(ctx, sampleInterval); err != nil {
+			return
+		}
+	}
+}
+
+// noteLag records the largest backlog the consumer reported, across the
+// destinations it reads.
+func (s *sampler) noteLag(backlog map[string]int64) {
+	var largest int64
+	for _, depth := range backlog {
+		largest = max(largest, depth)
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.peakLag = max(s.peakLag, largest)
+}
+
+// noteHeap records the live heap a sample read.
+func (s *sampler) noteHeap(value metrics.Value) {
+	if value.Kind() != metrics.KindUint64 {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.peakHeap = max(s.peakHeap, value.Uint64())
+}
+
+// stop ends the sampling and waits for it to return. A nil sampler is a
+// measurement that records neither figure, which is every mode but consume, and
+// stopping one is a no-op so a teardown can stop whatever it has.
+func (s *sampler) stop() {
+	if s == nil {
+		return
+	}
+	s.once.Do(func() {
+		s.cancel()
+		<-s.done
+	})
+}
+
+// lagMax reports the largest backlog recorded.
+func (s *sampler) lagMax() int64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.peakLag
+}
+
+// heapMax reports the largest live heap recorded, in bytes.
+func (s *sampler) heapMax() uint64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.peakHeap
+}
+
 // payload is one corpus message. Its encoded form is what the tracker keys a
 // publish, a delivery and a settlement on, so a message and its retry copy -
 // republished with the same body and one more attempt - land on one sequence.
@@ -774,8 +1053,9 @@ func corpusBody(seq int) string {
 // tracker records what one measurement published, delivered and settled, keyed
 // by the corpus sequence a body carries.
 type tracker struct {
-	clk  clock.Clock
-	want int
+	clk      clock.Clock
+	attempts int
+	want     int
 
 	mu          sync.Mutex
 	seqByBody   map[string]int
@@ -784,6 +1064,14 @@ type tracker struct {
 	settles     []int
 	publishedAt []time.Time
 	settledAt   []time.Time
+
+	// settled counts the settlements that advanced the corpus, and is what the
+	// measurement ends on. It is maintained as it happens rather than summed
+	// from settles, which is O(corpus) per message and would put the harness's
+	// own work inside the window it measures.
+	settled int
+	// duplicates counts deliveries past the ones the shape expects.
+	duplicates int
 
 	unknownPublishes   int
 	unknownDeliveries  int
@@ -805,14 +1093,15 @@ type tracker struct {
 	change chan struct{}
 }
 
-func newTracker(clk clock.Clock, corpus, want int) *tracker {
+func newTracker(clk clock.Clock, corpus, attempts int) *tracker {
 	seqByBody := make(map[string]int, corpus)
 	for seq := range corpus {
 		seqByBody[corpusBody(seq)] = seq
 	}
 	return &tracker{
 		clk:         clk,
-		want:        want,
+		attempts:    attempts,
+		want:        corpus * attempts,
 		seqByBody:   seqByBody,
 		publishes:   make([]int, corpus),
 		deliveries:  make([]int, corpus),
@@ -907,6 +1196,9 @@ func (t *tracker) noteDelivery(body string) {
 		t.unknownDeliveries++
 	} else {
 		t.deliveries[seq]++
+		if t.deliveries[seq] > t.attempts {
+			t.duplicates++
+		}
 	}
 	t.signalLocked()
 }
@@ -916,6 +1208,12 @@ func (t *tracker) noteDelivery(body string) {
 // measurement ends: a delivery, or a handler that has been entered, is a step
 // before settlement, and stopping there would report a rate for work that has
 // not finished.
+//
+// A settlement counts towards the total only while its sequence has fewer than
+// the shape's attempts recorded. A redelivery arrives after its sequence is
+// already complete, and counting it would reach the expected total while a
+// message was still unsettled, ending the window early and reporting a rate for
+// a corpus that had not finished.
 func (t *tracker) noteSettled(body string) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -931,10 +1229,13 @@ func (t *tracker) noteSettled(body string) {
 		return
 	}
 	t.settles[seq]++
+	if t.settles[seq] <= t.attempts {
+		t.settled++
+	}
 	if t.settledAt[seq].IsZero() {
 		t.settledAt[seq] = t.clk.Now()
 	}
-	t.stopIfReachedLocked(t.settledTotalLocked())
+	t.stopIfReachedLocked(t.settled)
 	t.signalLocked()
 }
 
@@ -946,21 +1247,13 @@ func (t *tracker) stopIfReachedLocked(count int) {
 	}
 	t.stopped = true
 	t.stopAt = t.clk.Now()
-	t.settledAtStop = t.settledTotalLocked()
-}
-
-func (t *tracker) settledTotalLocked() int {
-	total := 0
-	for _, count := range t.settles {
-		total += count
-	}
-	return total
+	t.settledAtStop = count
 }
 
 func (t *tracker) settledTotal() int {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	return t.settledTotalLocked()
+	return t.settled
 }
 
 func (t *tracker) hasStopped() bool {
@@ -995,6 +1288,8 @@ type snapshot struct {
 	deliveries []int
 	settles    []int
 
+	duplicates int
+
 	unknownPublishes   int
 	unknownDeliveries  int
 	unknownSettlements int
@@ -1010,6 +1305,7 @@ func (t *tracker) snapshot() snapshot {
 		publishes:          slices.Clone(t.publishes),
 		deliveries:         slices.Clone(t.deliveries),
 		settles:            slices.Clone(t.settles),
+		duplicates:         t.duplicates,
 		unknownPublishes:   t.unknownPublishes,
 		unknownDeliveries:  t.unknownDeliveries,
 		unknownSettlements: t.unknownSettlements,
@@ -1038,7 +1334,15 @@ func (s snapshot) verifyPublished(corpus int, when string) error {
 // message was published, delivered and settled exactly once per attempt, with
 // nothing that was not published arriving at all. when names the instant, so a
 // failure says which check saw it.
-func (s snapshot) verify(corpus, attempts int, when string) error {
+//
+// countDuplicates makes a delivery or a settlement past the shape's attempts a
+// figure to report rather than a failure, which is how a measurement of a path
+// that trades duplicates for something else keeps its correctness claim on
+// everything else. A shortfall still fails, and so does a publish past the
+// shape's attempts: neither is what that trade produces. A measurement without
+// it fails on a delivery it did not expect, which is what every measurement
+// did before the flag existed.
+func (s snapshot) verify(corpus, attempts int, countDuplicates bool, when string) error {
 	var problems []error
 	if s.stopped && s.settledAtStop != corpus*attempts {
 		problems = append(problems, fmt.Errorf(
@@ -1049,10 +1353,10 @@ func (s snapshot) verify(corpus, attempts int, when string) error {
 		if s.publishes[seq] != attempts {
 			problems = append(problems, fmt.Errorf("%s: message %d was published %d times, want %d", when, seq, s.publishes[seq], attempts))
 		}
-		if s.deliveries[seq] != attempts {
+		if s.deliveries[seq] != attempts && (!countDuplicates || s.deliveries[seq] <= attempts) {
 			problems = append(problems, fmt.Errorf("%s: message %d was delivered %d times, want %d", when, seq, s.deliveries[seq], attempts))
 		}
-		if s.settles[seq] != attempts {
+		if s.settles[seq] != attempts && (!countDuplicates || s.settles[seq] <= attempts) {
 			problems = append(problems, fmt.Errorf("%s: message %d was settled %d times, want %d", when, seq, s.settles[seq], attempts))
 		}
 	}
@@ -1077,18 +1381,37 @@ type countingDriver struct {
 	ready     chan struct{}
 	readyOnce *sync.Once
 	onSpec    func([]driver.DestinationSpec)
+
+	// conn is the connection the client opened through this wrapper. The core
+	// keeps its connection to itself, so this is where the wrapper finds the
+	// consumer the core opened, which is the one a backlog sample queries. The
+	// read is the last write the client made, and a measurement queries it after
+	// the subscription exists.
+	conn atomic.Pointer[countingConn]
 }
 
 func (d *countingDriver) Name() string { return d.inner.Name() }
 
 func (d *countingDriver) Capabilities() driver.Capabilities { return d.inner.Capabilities() }
 
+// consumer returns the consumer the client opened through this wrapper, and nil
+// before it has opened one.
+func (d *countingDriver) consumer() *countingConsumer {
+	conn := d.conn.Load()
+	if conn == nil {
+		return nil
+	}
+	return conn.consumer.Load()
+}
+
 func (d *countingDriver) Open(ctx context.Context, cfg driver.Config) (driver.Conn, error) {
 	conn, err := d.inner.Open(ctx, cfg)
 	if err != nil || conn == nil {
 		return conn, err
 	}
-	return &countingConn{Conn: conn, tr: d.tr, ready: d.ready, readyOnce: d.readyOnce, onSpec: d.onSpec}, nil
+	wrapped := &countingConn{Conn: conn, tr: d.tr, ready: d.ready, readyOnce: d.readyOnce, onSpec: d.onSpec}
+	d.conn.Store(wrapped)
+	return wrapped, nil
 }
 
 type countingConn struct {
@@ -1097,6 +1420,12 @@ type countingConn struct {
 	ready     chan struct{}
 	readyOnce *sync.Once
 	onSpec    func([]driver.DestinationSpec)
+
+	// consumer is the last consumer this connection handed out, which is the one
+	// the subscription's runner reads. It is kept here rather than derived from
+	// the tracker because a backlog query is a question about a live consumer,
+	// not a count.
+	consumer atomic.Pointer[countingConsumer]
 }
 
 func (c *countingConn) Admin() driver.Admin {
@@ -1125,7 +1454,9 @@ func (c *countingConn) Consumer(ctx context.Context, cfg driver.ConsumerConfig) 
 		tr:       c.tr,
 		out:      make(chan driver.InboundMessage),
 		stopped:  make(chan struct{}),
+		drained:  make(chan struct{}),
 	}
+	c.consumer.Store(wrapped)
 	go wrapped.pump()
 	return wrapped, nil
 }
@@ -1177,6 +1508,10 @@ type countingConsumer struct {
 	tr      *tracker
 	out     chan driver.InboundMessage
 	stopped chan struct{}
+	// drained is closed when the pump goroutine has returned, which is how a
+	// caller knows the one goroutine this wrapper adds is gone. The goroutine
+	// delta is counted after it, so a wrapper cannot be mistaken for a leak.
+	drained chan struct{}
 	once    sync.Once
 }
 
@@ -1190,6 +1525,7 @@ func (c *countingConsumer) Messages() <-chan driver.InboundMessage { return c.ou
 // has returned, so a core that has stopped reading cannot leave this goroutine
 // blocked on a send that will never be taken.
 func (c *countingConsumer) pump() {
+	defer close(c.drained)
 	defer close(c.out)
 	source := c.Consumer.Messages()
 	for {
@@ -1212,15 +1548,23 @@ func (c *countingConsumer) pump() {
 	}
 }
 
+// Stop stops the wrapped consumer and waits for the pump goroutine to return.
+// The wait is what makes the goroutines this port was asked to stop count as
+// stopped: the wrapper's own goroutine would otherwise be free to outlive the
+// call, and every later count of the process's goroutines would carry it.
 func (c *countingConsumer) Stop(ctx context.Context) error {
 	err := c.Consumer.Stop(ctx)
 	c.once.Do(func() { close(c.stopped) })
+	<-c.drained
 	return err
 }
 
+// Release releases the wrapped consumer and waits for the pump goroutine to
+// return, for the reason Stop does.
 func (c *countingConsumer) Release(ctx context.Context) error {
 	err := c.Consumer.Release(ctx)
 	c.once.Do(func() { close(c.stopped) })
+	<-c.drained
 	return err
 }
 

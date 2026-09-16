@@ -317,6 +317,16 @@ func validateConfig(cfg Config, driverName string) error {
 	if cfg.Broker.Driver != "kafka" && cfg.Broker.Driver != "rabbitmq" && cfg.Broker.Driver != "inmem" {
 		return fmt.Errorf("f1: broker.driver %q is unsupported", cfg.Broker.Driver)
 	}
+	// The namespace is the driver this configuration declares, which is the
+	// name a key carries in the file and the only name both callers of this
+	// function agree on: LoadConfig has no driver instance at all, and New may
+	// have opened one under a different name, which it logs as a mismatch
+	// rather than reading back into the configuration. The check sits above the
+	// rest of the driver checks so that a bad key still fails as early as the
+	// decoder used to refuse it.
+	if err := validateOptionKeys(cfg.Broker.DriverOptions, cfg.Broker.Driver); err != nil {
+		return err
+	}
 	if (driverName == "kafka" || driverName == "rabbitmq") && len(cfg.Broker.Endpoints) == 0 {
 		return fmt.Errorf("f1: broker.endpoints must not be empty")
 	}

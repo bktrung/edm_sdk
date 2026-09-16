@@ -148,11 +148,28 @@ stall delivery or shutdown.
 
 The dead-letter publication is confirmed before F1 acknowledges the original
 delivery. If the successor cannot be published within the bounded successor
-handoff budget, F1 reports the runtime error and releases the consumer without
-acknowledging the original delivery, allowing the driver to redeliver it. This
-settle-last ordering prevents a failed dead-letter handoff from becoming
-silent loss. The full settlement sequence is described in
+handoff budget, F1 stops the subscription: it reports the runtime error through
+`WithErrorHandler`, releases the consumer without acknowledging the original
+delivery, and records the failure so `Health` reports it against that
+subscription. `Release` leaves the delivery unsettled, so the broker still owns
+it, but nothing redelivers it until the runner is started again. This
+settle-last ordering prevents a failed dead-letter handoff from becoming silent
+loss. The full settlement sequence is described in
 [Lifecycle and shutdown](/advanced-topics/lifecycle-and-shutdown).
+
+A successor that can never be published is the one exception. When the broker
+refuses a dead-letter copy as too large, or the copy's headers cannot be
+encoded, every redelivery would fail the same way and so would every restart.
+F1 acknowledges the original and reports the drop through `WithErrorHandler`
+instead of stopping the subscription. The report names the event, the
+destination, the death reason, and the cause. A retry copy the broker refuses
+as too large is dead-lettered first, and if that dead-letter copy is then
+unpublishable too, the same drop applies. Dropping is deliberate here: apart
+from a dead-letter route that does not exist, this is the only case where F1
+discards a delivery on its own initiative, without the application selecting
+`f1.Drop` or an unmatched-event policy. A failure that can heal never drops, so
+transient, permission, and fatal successor failures still stop the
+subscription.
 
 ## Drop and unmatched events
 
@@ -199,7 +216,7 @@ There are two different kinds of failure notification:
 | --- | --- | --- |
 | `Subscription.OnDeadLetter` | A confirmed dead-letter outcome and its reason | A failed successor handoff that was not confirmed |
 | `Subscription.OnDiscarded` | An unmatched or explicitly dropped event | Retried or dead-lettered handler errors |
-| `f1.WithErrorHandler` | Driver-level asynchronous errors and retry/dead-letter successor-publish failures | Ordinary errors returned by a handler |
+| `f1.WithErrorHandler` | Driver-level asynchronous errors, retry/dead-letter successor-publish failures, and a delivery dropped because its successor can never be published | Ordinary errors returned by a handler |
 
 Configure [`WithErrorHandler`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/options.go) for runtime failures that the
 handler result cannot represent. The event argument identifies the affected

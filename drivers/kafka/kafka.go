@@ -73,7 +73,7 @@ type conn struct {
 	rebalanceDrainTimeout time.Duration
 	staticMembership      bool
 	balancer              kgo.GroupBalancer
-	delays                map[string]time.Duration
+	delays                map[string]time.Duration // producer-only; a consumer reads its own config
 	caps                  driver.Capabilities
 	info                  driver.BrokerInfo
 	consumers             map[*consumer]struct{}

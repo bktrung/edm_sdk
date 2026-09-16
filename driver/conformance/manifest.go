@@ -18,7 +18,7 @@ var groupManifest = []manifestEntry{
 	{name: "consume", declared: 21},
 	{name: "settle", declared: 16},
 	{name: "ordering", declared: 8},
-	{name: "deferred", declared: 10},
+	{name: "deferred", declared: 11},
 	{name: "drain", declared: 16},
 	{name: "rebalance", declared: 11},
 	{name: "failure", declared: 23},
@@ -38,6 +38,7 @@ type groupContext struct {
 	profile             Profile
 	effective           driver.Capabilities
 	factoryCapabilities driver.Capabilities
+	deferralModel       DeferralModel
 	vector              BehaviorVector
 	checks              int
 	checkNames          map[string]struct{}
@@ -88,9 +89,10 @@ func (g *groupContext) Check(name string, fn func(*testing.T)) {
 	g.checks++
 }
 
-// Skip records a fixture-gated check before marking its subtest skipped. It
-// distinguishes an intentional unavailable-fixture result from t.Skip used
-// to pad a group while still satisfying its manifest count.
+// Skip records a check the harness's declared conditions gate before marking its
+// subtest skipped. It distinguishes an intentional result, such as an absent
+// fixture or a deferral model the check does not apply to, from t.Skip used to
+// pad a group while still satisfying its manifest count.
 func (g *groupContext) Skip(t *testing.T, name, reason string) {
 	if g.skips == nil {
 		g.skips = make(map[string]string)

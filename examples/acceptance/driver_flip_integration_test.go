@@ -723,7 +723,13 @@ func declaredCapabilityDifference(feature string, a, b driver.Capabilities) (str
 	case "ordered_by_key":
 		return fmt.Sprintf("declared OrderedByKey %t vs %t", a.OrderedByKey, b.OrderedByKey), a.OrderedByKey != b.OrderedByKey
 	case "native_delay":
-		return fmt.Sprintf("declared NativeDelay %t vs %t", a.NativeDelay, b.NativeDelay), a.NativeDelay != b.NativeDelay
+		// The limits detail for native_delay carries the accuracy the driver
+		// declares, so the feature differs when either the capability or the
+		// bound on lateness differs. Comparing only NativeDelay reports a
+		// difference the drivers declared as undeclared.
+		return fmt.Sprintf("declared NativeDelay %t vs %t, DelayAccuracy %+v vs %+v",
+				a.NativeDelay, b.NativeDelay, a.DelayAccuracy, b.DelayAccuracy),
+			a.NativeDelay != b.NativeDelay || a.DelayAccuracy != b.DelayAccuracy
 	case "delivery_count":
 		return fmt.Sprintf("declared NativeDeliveryCount %t vs %t", a.NativeDeliveryCount, b.NativeDeliveryCount), a.NativeDeliveryCount != b.NativeDeliveryCount
 	case "dlq_backstop":
@@ -736,6 +742,62 @@ func declaredCapabilityDifference(feature string, a, b driver.Capabilities) (str
 		return "the core emulates priority_fairness for every driver, so it has no declaring capability", false
 	default:
 		return fmt.Sprintf("feature %q has no declared capability", feature), false
+	}
+}
+
+// TestDeclaredCapabilityDifferenceNativeDelay pins the native_delay declaration
+// check without a broker. The feature's limits detail carries the accuracy the
+// driver declares, so a difference in either the capability or the accuracy is
+// a difference the drivers declared. Without the accuracy arm, a run of two
+// drivers where one declares a bound and the other does not reports a declared
+// difference as undeclared, and the acceptance run fails on its own bookkeeping
+// rather than on a divergence.
+func TestDeclaredCapabilityDifferenceNativeDelay(t *testing.T) {
+	declared := driver.DelayAccuracy{Floor: 500 * time.Millisecond, Relative: 1, MaxDelay: 64 * time.Second}
+	tests := []struct {
+		name        string
+		a           driver.Capabilities
+		b           driver.Capabilities
+		wantDiffers bool
+	}{
+		{
+			name: "equal on both fields",
+			a:    driver.Capabilities{NativeDelay: true, DelayAccuracy: declared},
+			b:    driver.Capabilities{NativeDelay: true, DelayAccuracy: declared},
+		},
+		{
+			name:        "native delay differs",
+			a:           driver.Capabilities{NativeDelay: true, DelayAccuracy: declared},
+			b:           driver.Capabilities{NativeDelay: false, DelayAccuracy: declared},
+			wantDiffers: true,
+		},
+		{
+			name:        "delay accuracy differs",
+			a:           driver.Capabilities{NativeDelay: false},
+			b:           driver.Capabilities{NativeDelay: false, DelayAccuracy: declared},
+			wantDiffers: true,
+		},
+		{
+			name:        "both differ",
+			a:           driver.Capabilities{NativeDelay: true},
+			b:           driver.Capabilities{NativeDelay: false, DelayAccuracy: declared},
+			wantDiffers: true,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			declaration, differs := declaredCapabilityDifference("native_delay", test.a, test.b)
+			if differs != test.wantDiffers {
+				t.Errorf("declaredCapabilityDifference(native_delay, ...) = %t, want %t: %s", differs, test.wantDiffers, declaration)
+			}
+			// The declaration is a failure's only account of what was compared,
+			// so it names both fields the feature reports on.
+			for _, field := range []string{"NativeDelay", "DelayAccuracy"} {
+				if !strings.Contains(declaration, field) {
+					t.Errorf("declaration %q does not name %s", declaration, field)
+				}
+			}
+		})
 	}
 }
 

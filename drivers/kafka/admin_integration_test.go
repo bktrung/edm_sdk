@@ -517,6 +517,11 @@ func TestPublicSubscriptionHonoursRetryDelayUnderTopologyNone(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
 	t.Cleanup(cancel)
+	// The client is built without WithLogger, so the driver warns through the
+	// process default and this capture sees a deferral fault on the retry path
+	// the test is measuring.
+	var faults deferralLogSink
+	swapProcessDefault(t, &faults)
 	client, err := f1.New(ctx, kafkaPublicTestConfig(),
 		f1.WithDriver(Driver{}),
 		f1.WithTopology(f1.TopologyNone),
@@ -592,6 +597,12 @@ func TestPublicSubscriptionHonoursRetryDelayUnderTopologyNone(t *testing.T) {
 	}
 	if elapsed > 10*time.Second {
 		t.Fatalf("second attempt arrived %s after the failed attempt, want no longer than 10s", elapsed)
+	}
+	// The delay the retry waited out came from the consumer's own configuration,
+	// so a due time the destination does not declare is the fault that says the
+	// two disagree, and the wait above would not have happened.
+	if logged := faults.String(); strings.Contains(logged, "kafka deferred delivery fault") {
+		t.Fatalf("the retry path logged a deferral fault: %s", logged)
 	}
 
 	if err := client.Close(context.Background()); err != nil {

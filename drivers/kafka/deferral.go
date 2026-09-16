@@ -32,13 +32,15 @@ func kafkaNow() time.Time {
 	return time.Now() //nolint:forbidigo // Kafka record timestamps and due headers use wall time.
 }
 
-func evaluateDeferral(record *kgo.Record, delay time.Duration, known bool, now time.Time) deferralDecision {
+// evaluateDeferral decides what one record's due-time header means. delay is
+// the destination's declared delay, and zero is a destination that declares
+// none: a due-time header for such a destination is the fault below, not a
+// state to report, because the consumer reads the delay from its own config and
+// an absent destination is the answer rather than a gap in it.
+func evaluateDeferral(record *kgo.Record, delay time.Duration, now time.Time) deferralDecision {
 	due, present, err := recordDelayUntil(record)
 	if err != nil {
 		return deferralDecision{present: present, err: err}
-	}
-	if !known {
-		return deferralDecision{present: present, err: errors.New("destination delay is unknown")}
 	}
 	if !present {
 		if delay > 0 {
@@ -114,17 +116,10 @@ func (c *consumer) currentTime() time.Time {
 	return c.clock.Now()
 }
 
-func (c *consumer) destinationDelay(destination string) (time.Duration, bool) {
-	if c.conn == nil {
-		return 0, false
-	}
-	return c.conn.destinationDelay(destination)
-}
-
 func (c *consumer) admissionLocked(record *kgo.Record) bool {
 	destination := record.Topic
-	delay, known := c.destinationDelay(destination)
-	decision := evaluateDeferral(record, delay, known, c.currentTime())
+	delay := c.cfg.Delays[destination]
+	decision := evaluateDeferral(record, delay, c.currentTime())
 	if decision.err != nil {
 		c.reportDeferralErrorLocked(record, decision.err)
 	}
@@ -205,8 +200,8 @@ func (c *consumer) pendingDeadline(pending []*kgo.Record) (time.Time, bool) {
 		found    bool
 	)
 	for _, record := range pending {
-		delay, known := c.destinationDelay(record.Topic)
-		decision := evaluateDeferral(record, delay, known, now)
+		delay := c.cfg.Delays[record.Topic]
+		decision := evaluateDeferral(record, delay, now)
 		if !decision.wait || (found && !decision.due.Before(earliest)) {
 			continue
 		}
@@ -261,8 +256,8 @@ func (c *consumer) heldByDestination(pending []*kgo.Record) map[string]int {
 	held := make(map[string]int, len(c.destinations))
 	now := c.currentTime()
 	for _, record := range pending {
-		delay, known := c.destinationDelay(record.Topic)
-		if evaluateDeferral(record, delay, known, now).wait {
+		delay := c.cfg.Delays[record.Topic]
+		if evaluateDeferral(record, delay, now).wait {
 			held[record.Topic]++
 		}
 	}

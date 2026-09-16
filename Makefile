@@ -261,26 +261,39 @@ test-kafka-conformance: kafka-up
 
 ## bench: measure publish, consume, latency and retry throughput through the
 ## public API against both brokers, starting the fixtures first. Consume runs
-## five times: at one handler at a time, at three, and at the concurrency a
-## caller who sets none gets, the last three holding each message for 5ms.
-## A subscription over several partitions shares its handler slots between
-## them, so the shipped-concurrency rate is not the single-handler rate times a
-## number, and a partition count is decided against that rate. This target is
-## not a gate and must not join one: every number it prints depends on the
-## machine it ran on, and a gate that fails on a slow or busy box is a gate
-## people learn to ignore. Read its output as a comparison between the two
-## drivers taken on one quiet machine, never as a threshold.
+## seven cells on Kafka and six on RabbitMQ: at one handler at a time and at the
+## concurrency a caller who sets none gets; the work-5ms cells hold each message
+## for 5ms at one handler at a time, at three, and at the shipped concurrency,
+## and one of them does it on an ordered subscription; and Kafka adds a cell that
+## holds each message for 200ms at one handler, which is the cell a bound on
+## pending work shows up in. A subscription over several partitions shares its
+## handler slots between them, so the shipped-concurrency rate is not the
+## single-handler rate times a number, and a partition count is decided against
+## that rate. The partition count is F1_KAFKA_PARTITIONS: the run creates its
+## destinations with that many partitions through the driver option that does it,
+## reports the count it asked for, and uses the fixture's 3 when the variable is
+## unset, so a run with no variable measures the shape the recorded baseline was
+## taken at.
+##
+## This target is not a gate and must not join one: every number it prints
+## depends on the machine it ran on, and a gate that fails on a slow or busy box
+## is a gate people learn to ignore. Read its output as a comparison between the
+## two drivers taken on one quiet machine, never as a threshold.
 ##
 ## -benchtime=1000x -count=3: 1000 messages per benchmark run is enough for the
 ## publish, consume and latency rates to settle, and small enough that the
-## retry path, which pays one parked delay per message, stays inside the
-## budget; three runs give a median and the spread around it. The whole target
-## took 306s on a 14-CPU machine with both fixtures on the same host, against
-## the 15 minutes or less this target is allowed.
+## retry path, which pays one parked delay per message, stays inside the budget;
+## three runs give a median and the spread around it. -benchmem reports the
+## allocations and bytes each cell's corpus cost, which is the difference a
+## change to the delivery path shows up in even when a rate is too noisy to
+## read. The whole target took 306s on a 14-CPU machine with both fixtures on
+## the same host before the work-200ms cell existed; that cell alone holds 1000
+## deliveries for 200ms each per run, so budget about 15 minutes for the target
+## and read the numbers of a run that had the machine to itself.
 bench: kafka-up broker-up broker-smoke
 	F1_KAFKA_ENDPOINT=$${F1_KAFKA_ENDPOINT:-localhost:$(KAFKA_PORT)} \
 	F1_RABBITMQ_ENDPOINT=$${F1_RABBITMQ_ENDPOINT:-amqp://guest:guest@localhost:$(RABBITMQ_PORT)/} \
-	go test -tags integration -run '^$$' -bench . -benchtime=1000x -count=3 -timeout 30m ./examples/bench/
+	go test -tags integration -run '^$$' -bench . -benchmem -benchtime=1000x -count=3 -timeout 30m ./examples/bench/
 
 ## kafka-up: start the Kafka fixture without starting RabbitMQ. KAFKA_PORT
 ## defaults to the historical port and KAFKA_PROJECT to the existing compose

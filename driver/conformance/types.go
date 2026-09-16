@@ -75,6 +75,23 @@ type DeadlineFixture interface {
 // The fixture is conformance-only; the frozen driver port remains unchanged.
 type DeadlineFixtureFactory func(driver.Conn) (DeadlineFixture, error)
 
+// DeferralModel names the model a driver implements for a message that carries
+// a due time.
+type DeferralModel int
+
+const (
+	// DeferralExact delivers a deferred message at the due time the message
+	// carries. It is the zero value, so a harness that declares no model keeps
+	// exact deferral.
+	DeferralExact DeferralModel = iota
+	// DeferralDestinationDelay delivers a deferred message at its publish instant
+	// plus the delay its destination declares, whatever due time the message
+	// carries. It is never earlier than that instant, and the messages it deferred
+	// within one partition of a destination are delivered in the order they were
+	// published.
+	DeferralDestinationDelay
+)
+
 // Suite describes one driver conformance run. Run executes both profiles.
 type Suite struct {
 	Driver             driver.Driver
@@ -82,6 +99,13 @@ type Suite struct {
 	NewInspector       InspectorFactory
 	NewFaultInjector   func(driver.Conn) (FaultInjector, error)
 	NewDeadlineFixture DeadlineFixtureFactory
+
+	// DeferralModel names the model the driver under test implements and selects
+	// the deferred checks that model owes. It is a harness declaration rather than
+	// a capability, because it describes semantics rather than an optimisation. The
+	// zero value is DeferralExact, so a suite that leaves it unset keeps exact
+	// deferral.
+	DeferralModel DeferralModel
 }
 
 // BehaviorEvent is one observable event in a behavior vector.

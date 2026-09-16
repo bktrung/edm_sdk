@@ -276,8 +276,13 @@ func TestTopologyVerifyRejectsUnsupportedDeliveryLimit(t *testing.T) {
 }
 
 // A deferred destination must survive TopologyVerify, and the successful call
-// must teach the connection the lane's delay: a consumer that does not learn it
-// delivers the record immediately instead of waiting for its due time.
+// must teach the connection the lane's delay. What survives Verify is the
+// produce path's read of it: the producer stamps a due time from the recorded
+// delay on a publish that carries none of its own. So this publishes without
+// DelayUntil and holds the record to the due time that stamp implies. A
+// connection that never learned the delay stamps nothing, and the consumer here
+// delivers the record at once instead of at the due time the destination
+// declares.
 func TestTopologyVerifyPopulatesDeferredDestinationDelay(t *testing.T) {
 	ctx, connection, admin := openKafkaAdminTest(t)
 	destination := kafkaTestTopic(t, "verify-deferred")
@@ -301,19 +306,26 @@ func TestTopologyVerifyPopulatesDeferredDestinationDelay(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = producer.Close(context.Background()) })
 	consumer, err := connection.Consumer(ctx, driver.ConsumerConfig{
-		Group: group, Destinations: []string{destination}, Prefetch: 1, Effective: connection.Capabilities(),
+		Group: group, Destinations: []string{destination}, Prefetch: 1,
+		Delays:    map[string]time.Duration{destination: delay},
+		Effective: connection.Capabilities(),
 	})
 	if err != nil {
 		t.Fatalf("Consumer: %v", err)
 	}
 	t.Cleanup(func() { closeKafkaConsumer(consumer) })
 
-	due := kafkaNow().Add(delay)
+	// The publish carries no due time, so the only due time the record can have
+	// is the one the producer stamps from the delay Verify recorded. The
+	// producer reads its clock after this snapshot, which makes the stamped due
+	// time at or after the one asserted below.
+	publishedAt := kafkaNow()
 	if err := producer.Publish(ctx, driver.OutboundMessage{
-		Destination: destination, Body: []byte("deferred"), DelayUntil: due,
+		Destination: destination, Body: []byte("deferred"),
 	}); err != nil {
 		t.Fatalf("Publish: %v", err)
 	}
+	due := publishedAt.Add(delay)
 	message := receiveKafkaMessageBefore(t, consumer, due.Add(2*time.Second))
 	if message.Destination != destination || message.ReceivedAt.Before(due) {
 		t.Fatalf("deferred delivery = %+v, want destination %q received at or after %s", message, destination, due)

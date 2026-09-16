@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -292,6 +293,330 @@ func TestClassifyAMQPTransportLoss(t *testing.T) {
 			}
 			if got := errors.Is(err, driver.ErrDestinationMissing); got != test.wantMissing {
 				t.Fatalf("errors.Is(%v, ErrDestinationMissing) = %t, want %t", err, got, test.wantMissing)
+			}
+		})
+	}
+}
+
+// TestSizeRefusalLimit covers the reply the size refusal is told apart by, and
+// the number the window compares a body against. The code alone cannot decide
+// it: the broker answers every publish precondition it fails with 406, so a
+// message whose expiration it cannot parse is refused the same way, and only
+// the reason separates an oversized message from that one. Both wordings of the
+// refusal are here, because which one a broker sends is not something this
+// driver chooses, and the limit is the number after "max size" rather than the
+// one after "message size".
+func TestSizeRefusalLimit(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		err       error
+		wantLimit int
+		want      bool
+	}{
+		{
+			name: "broker on a configured limit",
+			err: &amqp.Error{
+				Code:   406,
+				Server: true,
+				Reason: "PRECONDITION_FAILED - message size 16777217 is larger than configured max size 16777216",
+			},
+			wantLimit: 16777216,
+			want:      true,
+		},
+		{
+			name: "broker on a built-in limit",
+			err: &amqp.Error{
+				Code:   406,
+				Server: true,
+				Reason: "PRECONDITION_FAILED - message size 536870913 is larger than max size 536870912",
+			},
+			wantLimit: 536870912,
+			want:      true,
+		},
+		{
+			name: "another publish precondition",
+			err: &amqp.Error{
+				Code:   406,
+				Server: true,
+				Reason: "PRECONDITION_FAILED - invalid expiration 'tomorrow'",
+			},
+		},
+		{
+			name: "the phrases without a limit",
+			err: &amqp.Error{
+				Code:   406,
+				Server: true,
+				Reason: "PRECONDITION_FAILED - message size 16777217 is larger than max size",
+			},
+		},
+		{
+			name: "the same words under another code",
+			err: &amqp.Error{
+				Code:   404,
+				Server: true,
+				Reason: "NOT_FOUND - message size 16777217 is larger than configured max size 16777216",
+			},
+		},
+		{
+			name: "the client lost the connection",
+			err:  amqp.ErrClosed,
+		},
+		{
+			name: "the broker forced the connection closed",
+			err: &amqp.Error{
+				Code:   320,
+				Server: true,
+				Reason: "CONNECTION_FORCED - broker forced connection closure with reason 'shutdown'",
+			},
+		},
+		{
+			name: "the broker refused a frame",
+			err: &amqp.Error{
+				Code:   501,
+				Server: true,
+				Reason: "FRAME_ERROR - type 2, all octets = <<>>: {frame_too_large,200027,131064}",
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			limit, refused := sizeRefusalLimit(test.err)
+			if refused != test.want {
+				t.Fatalf("sizeRefusalLimit(%v) = %d, %t, want %t", test.err, limit, refused, test.want)
+			}
+			if limit != test.wantLimit {
+				t.Fatalf("sizeRefusalLimit(%v) limit = %d, want %d", test.err, limit, test.wantLimit)
+			}
+		})
+	}
+}
+
+// TestSizeRefusalKinds covers the decision a window makes once the broker has
+// closed its channel for the size of one of its messages, with no broker and no
+// channel in the test. The rows are the shapes that race produces: the message
+// in front of the refused one is the one a quorum queue can leave unconfirmed,
+// a window can hold more than one message over the limit, and a message exactly
+// at the limit is publishable.
+func TestSizeRefusalKinds(t *testing.T) {
+	const limit = 1 << 10
+	small := limit / 2
+	over := limit + 1
+	for _, test := range []struct {
+		name    string
+		lengths []int
+		decided int
+		want    []driver.Kind
+	}{
+		{
+			name:    "the message in front of the refusal is unconfirmed",
+			lengths: []int{small, over},
+			decided: 0,
+			want:    []driver.Kind{driver.KindTransient, driver.KindTooLarge},
+		},
+		{
+			name:    "two oversized messages in one window",
+			lengths: []int{over, small, over},
+			decided: 0,
+			want:    []driver.Kind{driver.KindTooLarge, driver.KindTransient, driver.KindTooLarge},
+		},
+		{
+			name:    "only the last message is oversized",
+			lengths: []int{small, small, over},
+			decided: 0,
+			want:    []driver.Kind{driver.KindTransient, driver.KindTransient, driver.KindTooLarge},
+		},
+		{
+			name:    "a body exactly at the limit",
+			lengths: []int{limit},
+			decided: 0,
+			want:    []driver.Kind{driver.KindTransient},
+		},
+		{
+			name:    "the messages the window already decided",
+			lengths: []int{small, over, over},
+			decided: 1,
+			want:    []driver.Kind{driver.KindTooLarge, driver.KindTooLarge},
+		},
+		{
+			name:    "every message of the window decided",
+			lengths: []int{small, over},
+			decided: 2,
+			want:    []driver.Kind{},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			got := sizeRefusalKinds(test.lengths, test.decided, limit)
+			if !slices.Equal(got, test.want) {
+				t.Fatalf("sizeRefusalKinds(%v, %d, %d) = %v, want %v", test.lengths, test.decided, limit, got, test.want)
+			}
+		})
+	}
+}
+
+// TestClassifyPublishClose covers what a publish channel that closed is
+// reported as. The size refusal is the message's own failure, and the broker's
+// own words for it survive into the error the caller reads. Every other close
+// is the transient failure a closed publish channel has always been, including
+// the server-sent frame error: transient is what makes the core take the
+// connection down and build it again, which is the only thing that recovers a
+// connection the broker refused a frame on, and the broker's reason for it
+// survives there too.
+func TestClassifyPublishClose(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		err        error
+		want       driver.Kind
+		wantReason string
+	}{
+		{
+			name: "size refusal",
+			err: &amqp.Error{
+				Code:   406,
+				Server: true,
+				Reason: "PRECONDITION_FAILED - message size 16777217 is larger than configured max size 16777216",
+			},
+			want:       driver.KindTooLarge,
+			wantReason: "message size 16777217 is larger than configured max size 16777216",
+		},
+		{
+			name: "another publish precondition",
+			err: &amqp.Error{
+				Code:   406,
+				Server: true,
+				Reason: "PRECONDITION_FAILED - invalid expiration 'tomorrow'",
+			},
+			want: driver.KindTransient,
+		},
+		{
+			name: "client lost connection",
+			err:  amqp.ErrClosed,
+			want: driver.KindTransient,
+		},
+		{
+			name: "broker forced the connection closed",
+			err: &amqp.Error{
+				Code:   320,
+				Server: true,
+				Reason: "CONNECTION_FORCED - broker forced connection closure with reason 'shutdown'",
+			},
+			want: driver.KindTransient,
+		},
+		{
+			name: "broker refused a frame",
+			err: &amqp.Error{
+				Code:   501,
+				Server: true,
+				Reason: "FRAME_ERROR - type 2, all octets = <<>>: {frame_too_large,200027,131064}",
+			},
+			want:       driver.KindTransient,
+			wantReason: "frame_too_large,200027,131064",
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			err := classifyPublishClose(test.err)
+			kind, ok := driver.Classify(err)
+			if !ok || kind != test.want {
+				t.Fatalf("Classify(%v) = %v, %t, want %v, true", err, kind, ok, test.want)
+			}
+			if test.wantReason != "" && !strings.Contains(err.Error(), test.wantReason) {
+				t.Fatalf("error = %v, want the broker's reason %q to survive", err, test.wantReason)
+			}
+		})
+	}
+}
+
+// TestConfirmOrCloseServesAQueuedConfirmation pins the interleaving a refused
+// publish leaves behind: the client closes the return stream before the confirm
+// stream, so a confirmation it had already delivered can be sitting behind the
+// close. That confirmation is the broker saying it published the message the
+// window is waiting for, and reporting the close instead would report a message
+// the broker published as one the close covers.
+//
+// The second half is the same channel once those confirmations are gone: no
+// confirmation is left for the message being waited for, so the close is what
+// the window reads. The close is classified too large here, which is what the
+// limit it carries makes it; which message of the window that covers is decided
+// by the window, not by this path.
+func TestConfirmOrCloseServesAQueuedConfirmation(t *testing.T) {
+	closedReturns := make(chan amqp.Return)
+	close(closedReturns)
+	channel := &publishChannel{
+		confirms: make(chan amqp.Confirmation, 1),
+		returns:  closedReturns,
+		closes:   make(chan *amqp.Error, 1),
+	}
+	channel.closes <- &amqp.Error{
+		Code:   406,
+		Server: true,
+		Reason: "PRECONDITION_FAILED - message size 16777217 is larger than configured max size 16777216",
+	}
+	channel.confirms <- amqp.Confirmation{DeliveryTag: 1, Ack: true}
+
+	confirmation, err := channel.confirmOrClose(nil)
+	if err != nil {
+		t.Fatalf("confirmOrClose() error = %v, want the confirmation that was already delivered", err)
+	}
+	if !confirmation.Ack || confirmation.DeliveryTag != 1 {
+		t.Fatalf("confirmOrClose() = %+v, want the confirmation that was already delivered", confirmation)
+	}
+
+	_, err = channel.confirmOrClose(nil)
+	kind, classified := driver.Classify(err)
+	if err == nil || !classified || kind != driver.KindTooLarge {
+		t.Fatalf("confirmOrClose() error = %v, kind = %v, %t, want the close of a refused message", err, kind, classified)
+	}
+}
+
+// TestPublishChannelCloseError covers what a channel's close is reported as
+// once nothing is left of it but the client's notification: the reason the
+// broker gave when there is one, and the closed publish channel this driver has
+// always reported when there is not. Both shapes of "no reason" are pinned,
+// because only one of them is the state a reader expects the notification to be
+// in: the client closes the notification stream whether or not it had something
+// to send on it.
+func TestPublishChannelCloseError(t *testing.T) {
+	for _, test := range []struct {
+		name         string
+		notification *amqp.Error
+		closeStream  bool
+		want         driver.Kind
+		wantSentinel error
+	}{
+		{
+			name: "the broker refused the message for its size",
+			notification: &amqp.Error{
+				Code:   406,
+				Server: true,
+				Reason: "PRECONDITION_FAILED - message size 16777217 is larger than configured max size 16777216",
+			},
+			closeStream: true,
+			want:        driver.KindTooLarge,
+		},
+		{
+			name:         "the client closed the notification without sending one",
+			closeStream:  true,
+			want:         driver.KindTransient,
+			wantSentinel: amqp.ErrClosed,
+		},
+		{
+			name:         "no notification has arrived yet",
+			want:         driver.KindTransient,
+			wantSentinel: amqp.ErrClosed,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			closes := make(chan *amqp.Error, 1)
+			if test.notification != nil {
+				closes <- test.notification
+			}
+			if test.closeStream {
+				close(closes)
+			}
+			err := (&publishChannel{closes: closes}).closeError()
+			if kind, ok := driver.Classify(err); !ok || kind != test.want {
+				t.Fatalf("Classify(closeError()) = %v, %t, want %v, true", kind, ok, test.want)
+			}
+			if test.wantSentinel != nil && !errors.Is(err, test.wantSentinel) {
+				t.Fatalf("closeError() = %v, want %v", err, test.wantSentinel)
 			}
 		})
 	}

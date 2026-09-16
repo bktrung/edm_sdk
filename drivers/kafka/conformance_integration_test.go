@@ -258,7 +258,7 @@ func countDeferredRecords(ctx context.Context, connection *conn, destination str
 			continue
 		}
 		for _, record := range records {
-			decision := evaluateDeferral(record, delay, true, kafkaNow())
+			decision := evaluateDeferral(record, delay, kafkaNow())
 			if decision.err != nil {
 				if !decision.present {
 					continue
