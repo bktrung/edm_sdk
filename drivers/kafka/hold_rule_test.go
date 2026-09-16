@@ -441,8 +441,8 @@ func newHoldRuleConsumer(t *testing.T, budget int) (*consumer, partitionKey) {
 	c := newLeaveTestConsumer(t, newLeaveTestConnection(holdRuleDestination), holdRuleDestination, budget)
 	c.onPartitionsAssigned(context.Background(), nil, map[string][]int32{holdRuleDestination: {0}})
 	key := partitionKey{destination: holdRuleDestination, partition: 0}
-	if generation := c.activeGenerations[key]; generation == 0 {
-		t.Fatalf("active generation for %+v = 0, want the assignment's generation", key)
+	if !c.owned[key] {
+		t.Fatalf("partition %+v is not owned, want the assignment to have marked it owned", key)
 	}
 	return c, key
 }

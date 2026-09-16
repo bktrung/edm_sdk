@@ -14,7 +14,7 @@ var (
 
 type ackTracker struct {
 	// mu guards internal offset bookkeeping state: base, acked, outstanding,
-	// requeued, generation, and the revoked tombstone flag.
+	// requeued, and the revoked tombstone flag.
 	mu sync.Mutex
 	// commitMu serializes Ack's commit callback and failure rollback for this
 	// partition so that broker commits never regress and a rollback cannot trample
@@ -25,17 +25,15 @@ type ackTracker struct {
 	acked       map[int64]struct{}
 	outstanding map[int64]int
 	requeued    map[int64]int
-	generation  uint64
 	revoked     bool
 }
 
-func newAckTracker(base int64, generation uint64) *ackTracker {
+func newAckTracker(base int64) *ackTracker {
 	return &ackTracker{
 		base:        base,
 		acked:       make(map[int64]struct{}),
 		outstanding: make(map[int64]int),
 		requeued:    make(map[int64]int),
-		generation:  generation,
 	}
 }
 
@@ -209,10 +207,4 @@ func (t *ackTracker) Unacked() int {
 		count += outstanding
 	}
 	return count
-}
-
-func (t *ackTracker) Generation() uint64 {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	return t.generation
 }

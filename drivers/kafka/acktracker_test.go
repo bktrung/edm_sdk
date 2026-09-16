@@ -3,7 +3,6 @@ package kafka
 import (
 	"context"
 	"errors"
-	"slices"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -16,7 +15,7 @@ import (
 )
 
 func TestAckTrackerInOrderAcks(t *testing.T) {
-	tracker := newAckTracker(10, 1)
+	tracker := newAckTracker(10)
 	for offset := int64(10); offset < 15; offset++ {
 		if err := tracker.Track(offset); err != nil {
 			t.Fatalf("Track(%d): %v", offset, err)
@@ -37,7 +36,7 @@ func TestAckTrackerInOrderAcks(t *testing.T) {
 }
 
 func TestAckTrackerOutOfOrderAcks(t *testing.T) {
-	tracker := newAckTracker(0, 1)
+	tracker := newAckTracker(0)
 	for offset := range 4 {
 		if err := tracker.Track(int64(offset)); err != nil {
 			t.Fatalf("Track(%d): %v", offset, err)
@@ -83,7 +82,7 @@ func TestAckTrackerRandomInterleaving(t *testing.T) {
 		base  = int64(100)
 		count = 1000
 	)
-	tracker := newAckTracker(base, 1)
+	tracker := newAckTracker(base)
 	for offset := base; offset < base+count; offset++ {
 		if err := tracker.Track(offset); err != nil {
 			t.Fatalf("Track(%d): %v", offset, err)
@@ -116,7 +115,7 @@ func TestAckTrackerRandomInterleaving(t *testing.T) {
 }
 
 func TestAckTrackerRejectsDuplicateAck(t *testing.T) {
-	tracker := newAckTracker(0, 1)
+	tracker := newAckTracker(0)
 	if err := tracker.Track(0); err != nil {
 		t.Fatalf("Track(0): %v", err)
 	}
@@ -132,7 +131,7 @@ func TestAckTrackerRejectsDuplicateAck(t *testing.T) {
 }
 
 func TestAckTrackerRollbackOnCommitFailure(t *testing.T) {
-	tracker := newAckTracker(0, 1)
+	tracker := newAckTracker(0)
 	for offset := range 2 {
 		if err := tracker.Track(int64(offset)); err != nil {
 			t.Fatalf("Track(%d): %v", offset, err)
@@ -163,7 +162,7 @@ func TestAckTrackerRollbackOnCommitFailure(t *testing.T) {
 }
 
 func TestAckTrackerRequeueRetainsUnackedOffset(t *testing.T) {
-	tracker := newAckTracker(0, 1)
+	tracker := newAckTracker(0)
 	if err := tracker.Track(0); err != nil {
 		t.Fatalf("Track(0): %v", err)
 	}
@@ -195,7 +194,7 @@ func TestAckTrackerRequeueRetainsUnackedOffset(t *testing.T) {
 }
 
 func TestAckTrackerLowestRequeue(t *testing.T) {
-	tracker := newAckTracker(10, 1)
+	tracker := newAckTracker(10)
 	for offset := int64(10); offset <= 11; offset++ {
 		if err := tracker.Track(offset); err != nil {
 			t.Fatalf("Track(%d): %v", offset, err)
@@ -219,11 +218,13 @@ func TestAckTrackerLowestRequeue(t *testing.T) {
 	}
 }
 
-func TestAckTrackerGenerationTombstone(t *testing.T) {
-	tracker := newAckTracker(4, 9)
-	if got := tracker.Generation(); got != 9 {
-		t.Fatalf("Generation = %d, want 9", got)
-	}
+// A dropped tracker refuses every settlement of the ownership it belonged to:
+// the ack, the release that would requeue the offset and the track that would
+// admit a new delivery. What the ownership had already settled and what it
+// still held are unchanged, so the delivery that was charged stays charged
+// until its caller reaches a terminal state.
+func TestAckTrackerDropRevokesSettlements(t *testing.T) {
+	tracker := newAckTracker(4)
 	if err := tracker.Track(4); err != nil {
 		t.Fatalf("Track(4): %v", err)
 	}
@@ -247,7 +248,7 @@ func TestAckTrackerGenerationTombstone(t *testing.T) {
 
 func TestAckTrackerConcurrentAcks(t *testing.T) {
 	const count = 1000
-	tracker := newAckTracker(0, 1)
+	tracker := newAckTracker(0)
 	for offset := range count {
 		if err := tracker.Track(int64(offset)); err != nil {
 			t.Fatalf("Track(%d): %v", offset, err)
@@ -286,26 +287,33 @@ func TestAckTrackerMaxGapAndOptions(t *testing.T) {
 	}
 }
 
-func TestConsumerTrackerGenerationAndCounter(t *testing.T) {
+// A revoke detaches the partition's tracker without revoking it, and the wait's
+// end is what tombstones it: a delivery still in hand settles during the window,
+// which is the wait's whole point, and the settlement that arrives after it
+// fails with the classified revoked error so revocation wins over a commit. The
+// charge the refused settlement held is released once, and the partition's next
+// assignment starts a fresh tracker rather than inheriting the commit point of
+// the ownership that ended.
+func TestConsumerRevokeRevokesRetainedSettler(t *testing.T) {
 	const destination = "topic"
+	key := partitionKey{destination: destination, partition: 0}
 	consumer := &consumer{
-		trackers:              make(map[partitionKey]*ackTracker),
-		settlers:              make(map[*settler]struct{}),
-		unsettled:             map[string]int{destination: 2},
-		budgets:               map[string]int{destination: 2},
-		pauseReasons:          make(map[string]pauseReasonSet),
-		activeGenerations:     make(map[partitionKey]uint64),
-		assignmentGenerations: make(map[partitionKey]uint64),
-		fenced:                make(map[partitionKey]bool),
+		trackers:     make(map[partitionKey]*ackTracker),
+		settlers:     make(map[*settler]struct{}),
+		unsettled:    map[string]int{destination: 2},
+		outstanding:  map[partitionKey]int{key: 2},
+		budgets:      map[string]int{destination: 2},
+		pauseReasons: make(map[string]pauseReasonSet),
+		owned:        make(map[partitionKey]bool),
 	}
 	consumer.onPartitionsAssigned(context.Background(), nil, map[string][]int32{destination: {0}})
-	firstRecord := &kgo.Record{Topic: destination, Partition: 0, Offset: 10}
-	consumer.mu.Lock()
-	first := consumer.trackerForLocked(firstRecord)
-	consumer.mu.Unlock()
-	if first.Generation() != 1 {
-		t.Fatalf("first tracker generation = %d, want 1", first.Generation())
+	if !consumer.owned[key] {
+		t.Fatal("assignment did not mark the partition owned")
 	}
+
+	consumer.mu.Lock()
+	first := consumer.trackerForLocked(&kgo.Record{Topic: destination, Partition: 0, Offset: 10})
+	consumer.mu.Unlock()
 	if err := first.Track(10); err != nil {
 		t.Fatalf("Track(10): %v", err)
 	}
@@ -315,61 +323,96 @@ func TestConsumerTrackerGenerationAndCounter(t *testing.T) {
 	if got := first.Unacked(); got != consumer.unsettled[destination] {
 		t.Fatalf("tracker unacked = %d, consumer unsettled = %d", got, consumer.unsettled[destination])
 	}
-	racingSettler := &settler{
-		owner:   consumer,
-		tracker: first,
-		record:  &kgo.Record{Topic: destination, Partition: 0, Offset: 10},
-		key:     partitionKey{destination: destination, partition: 0},
-	}
-	consumer.mu.Lock()
-	consumer.settlers[racingSettler] = struct{}{}
-	consumer.mu.Unlock()
-	if err := first.Ack(10, nil); err != nil {
-		t.Fatalf("Ack(10) before drop: %v", err)
+
+	settlers := make(map[int64]*settler)
+	for _, offset := range []int64{10, 11} {
+		delivery := &settler{
+			owner:   consumer,
+			tracker: first,
+			record:  &kgo.Record{Topic: destination, Partition: 0, Offset: offset},
+			key:     key,
+		}
+		consumer.mu.Lock()
+		consumer.settlers[delivery] = struct{}{}
+		consumer.mu.Unlock()
+		settlers[offset] = delivery
 	}
 
-	consumer.dropTracker(destination, 0)
-	if got := consumer.unsettled[destination]; got != 1 {
-		t.Fatalf("unsettled after tracker drop = %d, want 1 for retained settler", got)
+	revoked := consumer.unown(map[string][]int32{destination: {0}})
+	if consumer.owned[key] {
+		t.Fatal("unown left the partition owned")
 	}
-	if err := racingSettler.Ack(context.Background()); !errors.Is(err, ErrRevoked) {
-		t.Fatalf("retained settler Ack after drop = %v, want ErrRevoked", err)
+	if got := consumer.unsettled[destination]; got != 2 {
+		t.Fatalf("unsettled after unown = %d, want 2: unown detaches the tracker without revoking the deliveries in hand", got)
+	}
+
+	// The settlement that must still succeed is the one whose ack does not move
+	// the commit point: a broker-free consumer has no client to commit an
+	// advanced prefix through, and the prefix itself is not what this case is
+	// about.
+	if err := settlers[11].Ack(context.Background()); err != nil {
+		t.Fatalf("settle during the revoke wait = %v, want nil", err)
+	}
+	if got := consumer.unsettled[destination]; got != 1 {
+		t.Fatalf("unsettled after settling during the wait = %d, want 1", got)
+	}
+	if got := consumer.outstanding[key]; got != 1 {
+		t.Fatalf("outstanding after settling during the wait = %d, want 1", got)
+	}
+
+	consumer.revokeTrackers(revoked)
+	err := settlers[10].Ack(context.Background())
+	if !errors.Is(err, ErrRevoked) {
+		t.Fatalf("settle after revoke = %v, want ErrRevoked", err)
+	}
+	var classified *driver.Error
+	if !errors.As(err, &classified) || classified.Kind() != driver.KindFatal {
+		t.Fatalf("settle after revoke = %v, want a fatal driver error", err)
 	}
 	if got := consumer.unsettled[destination]; got != 0 {
-		t.Fatalf("unsettled after revoked settlement = %d, want 0", got)
+		t.Fatalf("unsettled after the refused settlement = %d, want 0", got)
 	}
+	if got := consumer.outstanding[key]; got != 0 {
+		t.Fatalf("outstanding after the refused settlement = %d, want 0", got)
+	}
+	if err := settlers[10].Ack(context.Background()); !errors.Is(err, driver.ErrAlreadySettled) {
+		t.Fatalf("second settle through the refused delivery = %v, want already-settled", err)
+	}
+	if got := consumer.unsettled[destination]; got != 0 {
+		t.Fatalf("unsettled after re-settling a refused delivery = %d, want 0", got)
+	}
+
 	consumer.onPartitionsAssigned(context.Background(), nil, map[string][]int32{destination: {0}})
 	consumer.mu.Lock()
 	second := consumer.trackerForLocked(&kgo.Record{Topic: destination, Partition: 0, Offset: 10})
-	if second.Generation() != 2 {
-		t.Fatalf("second tracker generation = %d, want 2", second.Generation())
-	}
+	consumer.mu.Unlock()
 	if second == first {
-		t.Fatal("tracker was reused after drop")
+		t.Fatal("the next assignment inherited the tracker of the ownership that ended")
 	}
 }
 
+// A record the broker offers again after its offset was committed is refused
+// rather than delivered a second time, and the refusal has to release the
+// record the driver took out of franz-go: a stale in-hand entry would hold a
+// later tracker's base below an offset this consumer has already settled. The
+// requeued offset is the exception, and it re-enters emission on its
+// predecessor's charge.
 func TestAlreadySettledRedeliveryReleasesItsRecord(t *testing.T) {
 	const destination = "topic"
 	key := partitionKey{destination: destination, partition: 0}
 	c := &consumer{
-		trackers:              make(map[partitionKey]*ackTracker),
-		trackerGenerations:    make(map[partitionKey]uint64),
-		assignmentGenerations: make(map[partitionKey]uint64),
-		activeGenerations:     make(map[partitionKey]uint64),
-		fenced:                make(map[partitionKey]bool),
-		recordGenerations:     make(map[*kgo.Record]uint64),
-		tenures:               make(map[partitionKey]uint64),
-		settlers:              make(map[*settler]struct{}),
-		messages:              make(chan driver.InboundMessage, 32),
-		budgets:               map[string]int{destination: 100},
-		unsettled:             map[string]int{destination: 0},
-		pauseReasons:          make(map[string]pauseReasonSet),
-		discarded:             make(map[partitionKey]map[int64]struct{}),
-		reportedDeferrals:     map[string]struct{}{destination: {}},
-		requeued:              make(map[partitionKey]int),
-		maxAckGap:             10000,
-		clock:                 clock.NewFake(time.Unix(0, 0)),
+		trackers:          make(map[partitionKey]*ackTracker),
+		settlers:          make(map[*settler]struct{}),
+		messages:          make(chan driver.InboundMessage, 32),
+		budgets:           map[string]int{destination: 100},
+		unsettled:         map[string]int{destination: 0},
+		outstanding:       make(map[partitionKey]int),
+		pauseReasons:      make(map[string]pauseReasonSet),
+		discarded:         make(map[partitionKey]map[int64]struct{}),
+		reportedDeferrals: map[string]struct{}{destination: {}},
+		requeued:          make(map[partitionKey]int),
+		maxAckGap:         10000,
+		clock:             clock.NewFake(time.Unix(0, 0)),
 	}
 	ctx := context.Background()
 	c.onPartitionsAssigned(ctx, nil, map[string][]int32{destination: {0}})
@@ -384,9 +427,9 @@ func TestAlreadySettledRedeliveryReleasesItsRecord(t *testing.T) {
 			Value:     []byte("value"),
 		}
 		c.tagRecord(record)
-		delivered, active, created := c.emit(record)
-		if !delivered || !active || !created {
-			t.Fatalf("initial emit(%d) = delivered %t, active %t, created %t", offset, delivered, active, created)
+		delivered, active := c.emit(record)
+		if !delivered || !active {
+			t.Fatalf("initial emit(%d) = delivered %t, active %t", offset, delivered, active)
 		}
 		initial[offset] = (<-c.messages).Settle.(*settler)
 		// The hold rule admits one delivery per partition at a time, so each
@@ -407,17 +450,50 @@ func TestAlreadySettledRedeliveryReleasesItsRecord(t *testing.T) {
 		}
 	}
 
-	requeued := initial[11]
-	requeued.requeued = true
 	if err := tracker.Release(11); err != nil {
 		t.Fatalf("Release(11): %v", err)
 	}
 	c.mu.Lock()
 	c.requeued[key]++
 	c.mu.Unlock()
-	c.completeSettlement(requeued, true)
+	c.completeSettlement(initial[11], true)
 
-	for offset := int64(11); offset < 15; offset++ {
+	// The requeued offset is redelivered, and it re-enters emission on the
+	// charge its requeue kept rather than charging a second one.
+	rewound := &kgo.Record{
+		Topic:     destination,
+		Partition: 0,
+		Offset:    11,
+		Key:       []byte("key"),
+		Value:     []byte("value"),
+	}
+	c.tagRecord(rewound)
+	delivered, active := c.emit(rewound)
+	if !delivered || !active {
+		t.Fatalf("rewound emit(11) = delivered %t, active %t", delivered, active)
+	}
+	redelivery := (<-c.messages).Settle.(*settler)
+	if got := redelivery.record.Offset; got != 11 {
+		t.Fatalf("redelivered offset = %d, want 11", got)
+	}
+	c.mu.Lock()
+	pendingRequeues := len(c.requeued)
+	unsettled := c.unsettled[destination]
+	c.mu.Unlock()
+	if pendingRequeues != 0 {
+		t.Fatalf("consumer requeues during the redelivery = %d, want 0", pendingRequeues)
+	}
+	if unsettled != 0 {
+		t.Fatalf("unsettled during the redelivery = %d, want 0: a reuse is not charged again", unsettled)
+	}
+	if err := tracker.Ack(11, nil); err != nil {
+		t.Fatalf("Ack(redelivery 11): %v", err)
+	}
+	c.completeSettlement(redelivery, false)
+
+	// Every offset the requeue settled now sits behind the commit point, and
+	// the broker offering them again must not deliver them.
+	for offset := int64(12); offset < 15; offset++ {
 		record := &kgo.Record{
 			Topic:     destination,
 			Partition: 0,
@@ -426,64 +502,71 @@ func TestAlreadySettledRedeliveryReleasesItsRecord(t *testing.T) {
 			Value:     []byte("value"),
 		}
 		c.tagRecord(record)
-		delivered, active, created := c.emit(record)
+		delivered, active := c.emit(record)
 		if !delivered || !active {
-			t.Fatalf("rewound emit(%d) = delivered %t, active %t, created %t", offset, delivered, active, created)
+			t.Fatalf("already-settled emit(%d) = delivered %t, active %t", offset, delivered, active)
 		}
-		if offset == 11 {
-			if !created {
-				t.Fatal("requeued offset 11 was not emitted")
-			}
-			redelivery := (<-c.messages).Settle.(*settler)
-			if err := tracker.Ack(11, nil); err != nil {
-				t.Fatalf("Ack(redelivery 11): %v", err)
-			}
-			c.completeSettlement(redelivery, false)
-			continue
-		}
-		if created {
-			t.Fatalf("already-settled offset %d was emitted", offset)
+		select {
+		case message := <-c.messages:
+			t.Fatalf("already-settled offset %d was emitted at offset %d", offset, message.Ref.Offset)
+		default:
 		}
 	}
 
-	leaked := make([]int64, 0)
 	c.mu.Lock()
-	for record := range c.recordGenerations {
-		if record.Topic == key.destination && record.Partition == key.partition {
-			leaked = append(leaked, record.Offset)
-		}
-	}
-	commitPoint := tracker.CommitPoint()
+	inHand := len(c.inHand)
+	remainingUnsettled := c.unsettled[destination]
 	c.mu.Unlock()
-	slices.Sort(leaked)
-	if len(leaked) != 0 {
-		t.Fatalf("record generations for offsets %v = %d, want 0", leaked, len(leaked))
+	if inHand != 0 {
+		t.Fatalf("records left in hand = %d, want 0", inHand)
 	}
-	if commitPoint != 15 {
+	if remainingUnsettled != 0 {
+		t.Fatalf("unsettled after the refused offers = %d, want 0", remainingUnsettled)
+	}
+	if commitPoint := tracker.CommitPoint(); commitPoint != 15 {
 		t.Fatalf("commit point after requeued redelivery = %d, want 15", commitPoint)
 	}
 }
 
-func TestSettlerRejectsTombstonedTracker(t *testing.T) {
-	tracker := newAckTracker(0, 1)
-	tracker.Drop()
-	settler := &settler{
-		owner:   &consumer{},
-		record:  &kgo.Record{Topic: "topic", Partition: 0, Offset: 0},
-		tracker: tracker,
-		key:     partitionKey{destination: "topic", partition: 0},
+// A settle that arrives for a delivery whose tracker the consumer already
+// detached, which is what a draining revoke leaves behind, fails with the
+// classified revoked error and commits nothing: the delivery is no longer among
+// the consumer's settlers, so its refusal releases no charge.
+func TestSettlerRejectsDetachedTracker(t *testing.T) {
+	key := partitionKey{destination: "topic", partition: 0}
+	owner := &consumer{
+		settlers:     make(map[*settler]struct{}),
+		unsettled:    map[string]int{"topic": 1},
+		outstanding:  map[partitionKey]int{key: 1},
+		budgets:      map[string]int{"topic": 1},
+		pauseReasons: make(map[string]pauseReasonSet),
 	}
-	err := settler.Ack(context.Background())
+	detached := &settler{
+		owner:  owner,
+		record: &kgo.Record{Topic: "topic", Partition: 0, Offset: 0},
+		key:    key,
+	}
+	err := detached.Ack(context.Background())
 	if !errors.Is(err, ErrRevoked) {
-		t.Fatalf("Ack on dropped tracker = %v, want ErrRevoked", err)
+		t.Fatalf("Ack on a detached tracker = %v, want ErrRevoked", err)
+	}
+	var classified *driver.Error
+	if !errors.As(err, &classified) || classified.Kind() != driver.KindFatal {
+		t.Fatalf("Ack on a detached tracker = %v, want a fatal driver error", err)
 	}
 	if errors.Is(err, driver.ErrAlreadySettled) {
-		t.Fatalf("Ack on dropped tracker = %v, unexpectedly already-settled", err)
+		t.Fatalf("Ack on a detached tracker = %v, unexpectedly already-settled", err)
+	}
+	if got := owner.unsettled["topic"]; got != 1 {
+		t.Fatalf("unsettled after a detached settle = %d, want 1", got)
+	}
+	if got := owner.outstanding[key]; got != 1 {
+		t.Fatalf("outstanding after a detached settle = %d, want 1", got)
 	}
 }
 
 func TestAckTrackerDropDoesNotWaitOnCommit(t *testing.T) {
-	tracker := newAckTracker(0, 1)
+	tracker := newAckTracker(0)
 	if err := tracker.Track(0); err != nil {
 		t.Fatalf("Track(0): %v", err)
 	}
@@ -537,7 +620,7 @@ func TestAckTrackerDropDoesNotWaitOnCommit(t *testing.T) {
 }
 
 func TestAckTrackerRevocationWinsFailedCommit(t *testing.T) {
-	tracker := newAckTracker(0, 1)
+	tracker := newAckTracker(0)
 	if err := tracker.Track(0); err != nil {
 		t.Fatalf("Track(0): %v", err)
 	}
@@ -574,7 +657,7 @@ func TestAckTrackerRevocationWinsFailedCommit(t *testing.T) {
 }
 
 func TestAckTrackerTrackDoesNotWaitOnCommit(t *testing.T) {
-	tracker := newAckTracker(0, 1)
+	tracker := newAckTracker(0)
 	if err := tracker.Track(0); err != nil {
 		t.Fatalf("Track(0): %v", err)
 	}
@@ -631,7 +714,7 @@ func TestAckTrackerTrackDoesNotWaitOnCommit(t *testing.T) {
 }
 
 func TestAckTrackerCommitsNeverRegress(t *testing.T) {
-	tracker := newAckTracker(0, 1)
+	tracker := newAckTracker(0)
 	if err := tracker.Track(0); err != nil {
 		t.Fatalf("Track(0): %v", err)
 	}
