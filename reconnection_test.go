@@ -1987,7 +1987,7 @@ func TestRunnerRepairsConsumerAndResumesDelivery(t *testing.T) {
 	if err := client.Health(context.Background()); err != nil {
 		t.Fatalf("Health during lane repair = %v, want nil", err)
 	}
-	publishErr := publishMessages(client, context.Background(), false, driver.OutboundMessage{Destination: "test"})
+	publishErr := publishMessages(client, context.Background(), driver.OutboundMessage{Destination: "test"})
 	if publishErr != nil {
 		t.Fatalf("publish during lane repair = %v", publishErr)
 	}

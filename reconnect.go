@@ -20,6 +20,17 @@ var reconnectPolicy = retry.Config{
 
 func (c *Client) reconnectSupervisor() {
 	defer close(c.supervisorDone)
+	// The supervisor's own exit ends whatever attempt was in flight, so the
+	// wake is released here too, however the loop ended: a cancelled context, a
+	// request that arrived after it, or a panic unwinding through reconnectOnce.
+	// Every release replaces the channel, so an exit that follows an attempt
+	// end releases the waiters that arrived in between rather than closing a
+	// channel that is already closed.
+	defer func() {
+		c.mu.Lock()
+		c.wakeWaitersLocked(c.supervisorCtx.Err())
+		c.mu.Unlock()
+	}()
 	for {
 		select {
 		case request := <-c.reconnectRequests:
@@ -42,21 +53,45 @@ func (c *Client) reconnectSupervisor() {
 	}
 }
 
+// wakeLocked returns the wake a waiter parks on, creating it for a client that
+// has not released one yet. The zero Client is a shape this package's tests
+// build directly, and a nil channel could not be released.
+func (c *Client) wakeLocked() chan struct{} {
+	if c.attemptEnded == nil {
+		c.attemptEnded = make(chan struct{})
+	}
+	return c.attemptEnded
+}
+
+// wakeWaitersLocked stores err as the outcome of the attempt that is ending and
+// releases every waiter parked on the current wake, then installs the next one.
+// The caller holds c.mu, so a waiter that observes the release reads an
+// attemptErr that belongs to the change that released it and not to a later
+// one.
+//
+// It is called from the two places a waiter's view of the client changes: the
+// swap, which moves the epoch in the same critical section, and the end of
+// every attempt, which is where an attempt that failed gives up no connection
+// at all and the waiter must read the connection state instead of waiting
+// again.
+func (c *Client) wakeWaitersLocked(err error) {
+	c.attemptErr = err
+	close(c.wakeLocked())
+	c.attemptEnded = make(chan struct{})
+}
+
 func (c *Client) requestReconnect(cause error) (*reconnectAttempt, error) {
 	if cause == nil {
 		cause = errClientReconnecting
 	}
 	c.mu.Lock()
-	if c.closed || c.shutdownStarted {
-		c.mu.Unlock()
-		return nil, errors.New("f1: client is closing")
-	}
-	if c.reconnectErr != nil {
-		err := c.reconnectErr
+	if err := c.admit(workReconnect, 0); err != nil {
 		c.mu.Unlock()
 		return nil, err
 	}
-	if c.reconnecting && c.reconnect != nil {
+	if c.connStateLocked() == connReconnecting {
+		// An attempt already owns the client. The caller joins it instead of
+		// starting a second one, and the supervisor owns it until it ends.
 		attempt := c.reconnect
 		c.mu.Unlock()
 		return attempt, nil
@@ -89,6 +124,11 @@ func (c *Client) finishReconnectLocked(attempt *reconnectAttempt, err error) {
 	c.reconnect = nil
 	c.reconnecting = false
 	close(attempt.done)
+	// Every path out of reconnectOnce ends here, so this is where a waiter that
+	// parked during the attempt learns how the attempt ended. One that failed
+	// leaves the epoch alone, and the waiter must read the connection state and
+	// this error rather than wait for a connection that is not coming.
+	c.wakeWaitersLocked(err)
 }
 
 func (c *Client) waitReconnect(ctx context.Context, attempt *reconnectAttempt) error {
@@ -145,6 +185,14 @@ func (c *Client) reconnectOnce(ctx context.Context, cause error, attempt *reconn
 					c.limits = limitsFor(c.options.driver.Name(), connection.BrokerInfo(), effective)
 					c.reconnectErr = nil
 					c.producerHandle = nil
+					// The epoch and the wake move with the pointer inside this
+					// one critical section, so a reader that holds mu sees the
+					// new connection with the new number and never the old one
+					// with it, and a waiter parked on the old incarnation is
+					// released with the number of the connection that replaced
+					// it.
+					c.epoch++
+					c.wakeWaitersLocked(nil)
 					c.mu.Unlock()
 					c.retireConnection(ctx, oldProducer, oldConn, connection)
 					return nil

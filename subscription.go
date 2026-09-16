@@ -261,13 +261,9 @@ func (c *Client) Subscribe(ctx context.Context, sub Subscription) (*Runner, erro
 		return nil, err
 	}
 	c.mu.Lock()
-	if c.closed || c.conn == nil {
+	if err := c.admit(workSubscribe, 0); err != nil {
 		c.mu.Unlock()
-		return nil, errors.New("f1: client is closed")
-	}
-	if c.shutdownStarted {
-		c.mu.Unlock()
-		return nil, errors.New("f1: client is closing")
+		return nil, err
 	}
 	c.mu.Unlock()
 
@@ -285,13 +281,9 @@ func (c *Client) Subscribe(ctx context.Context, sub Subscription) (*Runner, erro
 		return nil, fmt.Errorf("f1: subscription %s requests ordered_by_key, but feature is unavailable", sub.Name)
 	}
 	c.mu.Lock()
-	if c.closed || c.conn == nil {
+	if err := c.admit(workSubscribe, 0); err != nil {
 		c.mu.Unlock()
-		return nil, errors.New("f1: client is closed")
-	}
-	if c.shutdownStarted {
-		c.mu.Unlock()
-		return nil, errors.New("f1: client is closing")
+		return nil, err
 	}
 	c.mu.Unlock()
 	effective := sub
@@ -307,9 +299,9 @@ func (c *Client) Subscribe(ctx context.Context, sub Subscription) (*Runner, erro
 	effective.Handlers = wrapHandlers(c.options.middleware, sub.Handlers)
 	runner := &Runner{client: c, subscription: effective, config: resolved, prefetchConfigured: prefetchConfigured}
 	c.mu.Lock()
-	if c.closed || c.shutdownStarted || c.conn == nil {
+	if err := c.admit(workSubscribe, 0); err != nil {
 		c.mu.Unlock()
-		return nil, errors.New("f1: client is closing")
+		return nil, err
 	}
 	c.runners[runner] = struct{}{}
 	c.mu.Unlock()

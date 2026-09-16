@@ -105,9 +105,9 @@ func (r *Runner) Run(ctx context.Context) (runErr error) {
 	var preRunReconnect *reconnectAttempt
 	var preRunReconnectErr error
 	r.client.mu.Lock()
-	if r.client.closed || r.client.shutdownStarted || r.client.conn == nil {
+	if err := r.client.admit(workRun, 0); err != nil {
 		r.client.mu.Unlock()
-		return errors.New("f1: client is closing")
+		return err
 	}
 	r.mu.Lock()
 	if r.started {
@@ -2003,7 +2003,7 @@ func publishSuccessor(r *Runner, ctx context.Context, messages ...driver.Outboun
 			}
 			break
 		}
-		err := publishMessages(r.client, ctx, true, messages...)
+		err := publishMessages(r.client, ctx, messages...)
 		if err == nil {
 			return nil
 		}

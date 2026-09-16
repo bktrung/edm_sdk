@@ -14,6 +14,7 @@ import (
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/codec"
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/driver"
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/clock"
+	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/lifecycle"
 )
 
 var errClientReconnecting = errors.New("f1: client is reconnecting")
@@ -73,6 +74,12 @@ type Client struct {
 	runners             map[*Runner]struct{}
 	failedSubscriptions []failedSubscription
 
+	// epoch names the connection incarnation. It moves by one in the same
+	// critical section that installs a new connection, so a reader that holds
+	// mu sees the connection pointer and the epoch of that same incarnation and
+	// never a pair from two of them. It is 1 for the connection New opened, and
+	// 0 means the client holds none.
+	epoch uint64
 	// reconnecting reports connection usability, independently of shutdownStarted.
 	reconnecting bool
 	// reconnectErr records a terminal reconnect decision for the current client
@@ -85,6 +92,15 @@ type Client struct {
 	supervisorCtx     context.Context
 	supervisorCancel  context.CancelFunc
 	supervisorDone    chan struct{}
+	// attemptErr is the outcome of the attempt that last released
+	// attemptEnded, and is read only after that release.
+	attemptErr error
+	// attemptEnded is released, and immediately replaced, when the connection
+	// incarnation changes and when a reconnect attempt ends without changing
+	// it. A waiter captures it under mu beside the epoch and compares epochs
+	// after it fires: a moved epoch is a new connection, and an unchanged one
+	// means the attempt ended and the connection state is what it is.
+	attemptEnded chan struct{}
 
 	// producerCloseWait holds a still-running producer Close call from a
 	// prior Close attempt that did not return within its close timeout. A
@@ -147,6 +163,7 @@ func New(ctx context.Context, cfg Config, opts ...Option) (*Client, error) {
 	supervisorCtx, supervisorCancel := context.WithCancel(context.Background())
 	client := &Client{
 		conn:              connection,
+		epoch:             1,
 		effective:         effective,
 		options:           options,
 		driverName:        driverName,
@@ -158,6 +175,7 @@ func New(ctx context.Context, cfg Config, opts ...Option) (*Client, error) {
 		supervisorCtx:     supervisorCtx,
 		supervisorCancel:  supervisorCancel,
 		supervisorDone:    make(chan struct{}),
+		attemptEnded:      make(chan struct{}),
 		runners:           make(map[*Runner]struct{}),
 	}
 	client.limits = limitsFor(driverName, connection.BrokerInfo(), effective)
@@ -299,26 +317,9 @@ func (c *Client) Health(ctx context.Context) error {
 		return fmt.Errorf("f1: client is not connected")
 	}
 	c.mu.Lock()
-	if c.closed {
-		c.mu.Unlock()
-		return fmt.Errorf("f1: client is closed")
-	}
-	if c.reconnectErr != nil {
-		err := c.reconnectErr
+	if err := c.admit(workHealth, 0); err != nil {
 		c.mu.Unlock()
 		return err
-	}
-	if c.conn == nil {
-		c.mu.Unlock()
-		return fmt.Errorf("f1: client is not connected")
-	}
-	if c.reconnecting {
-		c.mu.Unlock()
-		return fmt.Errorf("f1: client is reconnecting")
-	}
-	if c.shutdownStarted {
-		c.mu.Unlock()
-		return fmt.Errorf("f1: client is closing")
 	}
 	conn := c.conn
 	c.mu.Unlock()
@@ -446,10 +447,16 @@ func (c *Client) Close(ctx context.Context) error {
 func (c *Client) beginClose() ([]*Runner, bool, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.closed {
+	// A Close that has already finished succeeds again without doing anything,
+	// and one that is already running is refused so the caller keeps to one
+	// phase sequence at a time. Aborted proceeds: it is a Close that failed
+	// part way, either a bound expired or the connection close did not return,
+	// and a retried Close rejoins the phase that is still pending. That is why
+	// shutdownStarted stays set once it is set and closing does not.
+	switch c.lifecycleLocked() {
+	case lifecycle.Closed:
 		return nil, true, nil
-	}
-	if c.closing {
+	case lifecycle.Draining:
 		return nil, false, fmt.Errorf("f1: client is closing")
 	}
 	c.closing = true
@@ -636,14 +643,13 @@ func (c *Client) joinShutdownPhase(ctx context.Context, timeout time.Duration, p
 }
 
 // publishMessages sends core-generated successor messages through the client's
-// shared producer. allowClosing is reserved for workers finishing a delivery
-// after Close has stopped admission of new application publishes.
-func publishMessages(c *Client, ctx context.Context, allowClosing bool, messages ...driver.OutboundMessage) error {
+// shared producer, on the admission every publish through that producer uses.
+func publishMessages(c *Client, ctx context.Context, messages ...driver.OutboundMessage) error {
 	if len(messages) == 0 {
 		return nil
 	}
 	c.mu.Lock()
-	if err := publishAdmissionLocked(c, allowClosing); err != nil {
+	if err := c.admit(workPublish, 0); err != nil {
 		c.mu.Unlock()
 		return err
 	}
@@ -666,7 +672,7 @@ func publishMessages(c *Client, ctx context.Context, allowClosing bool, messages
 
 		var loser driver.Producer
 		c.mu.Lock()
-		err = publishAdmissionLocked(c, allowClosing)
+		err = c.admit(workPublish, 0)
 		if err == nil && !sameConnection(c.conn, conn) {
 			err = c.reconnectingError("publish")
 		}
@@ -693,19 +699,6 @@ func publishMessages(c *Client, ctx context.Context, allowClosing bool, messages
 	err := producer.Publish(ctx, messages...)
 	requestReconnectOnTransient(c, err)
 	return err
-}
-
-func publishAdmissionLocked(c *Client, allowClosing bool) error {
-	if c.closed || c.conn == nil || (!allowClosing && c.shutdownStarted) || (allowClosing && c.producerTeardown) {
-		return errors.New("f1: client is closed")
-	}
-	if c.reconnectErr != nil {
-		return c.reconnectErr
-	}
-	if c.reconnecting {
-		return c.reconnectingError("publish")
-	}
-	return nil
 }
 
 func closeDiscardedProducer(c *Client, producer driver.Producer, ctx context.Context) {

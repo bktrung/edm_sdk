@@ -115,7 +115,7 @@ func TestPublishProducerBuildDoesNotHoldClientLock(t *testing.T) {
 		_ = client.Close(context.Background())
 	})
 	go func() {
-		publishDone <- publishMessages(client, context.Background(), true, driver.OutboundMessage{Destination: "orders.created"})
+		publishDone <- publishMessages(client, context.Background(), driver.OutboundMessage{Destination: "orders.created"})
 	}()
 	waitForSignal(t, buildStarted, "producer construction")
 
@@ -191,7 +191,7 @@ func TestConcurrentFirstPublishesInstallOneProducerAndCloseLoser(t *testing.T) {
 	})
 	for range 2 {
 		go func() {
-			results <- publishMessages(client, context.Background(), true, driver.OutboundMessage{Destination: "orders.created"})
+			results <- publishMessages(client, context.Background(), driver.OutboundMessage{Destination: "orders.created"})
 		}()
 	}
 	waitForSignal(t, built, "first producer build")
@@ -231,7 +231,7 @@ func TestConcurrentFirstPublishesInstallOneProducerAndCloseLoser(t *testing.T) {
 		}
 	}
 
-	if err := publishMessages(client, context.Background(), true, driver.OutboundMessage{Destination: "orders.created"}); err != nil {
+	if err := publishMessages(client, context.Background(), driver.OutboundMessage{Destination: "orders.created"}); err != nil {
 		t.Fatalf("later publish = %v, want nil", err)
 	}
 	conn.mu.Lock()
@@ -262,7 +262,7 @@ func TestPublishRejectsProducerWhenCloseWinsDuringBuild(t *testing.T) {
 	}
 	defer func() { _ = client.Close(context.Background()) }()
 
-	err = publishMessages(client, context.Background(), true, driver.OutboundMessage{Destination: "orders.created"})
+	err = publishMessages(client, context.Background(), driver.OutboundMessage{Destination: "orders.created"})
 	if err == nil || err.Error() != "f1: client is closed" {
 		t.Fatalf("publish after close wins = %v, want client is closed", err)
 	}
@@ -292,7 +292,7 @@ func TestPublishRejectsProducerFromRetiredConnection(t *testing.T) {
 	}
 	defer func() { _ = client.Close(context.Background()) }()
 
-	err = publishMessages(client, context.Background(), true, driver.OutboundMessage{Destination: "orders.created"})
+	err = publishMessages(client, context.Background(), driver.OutboundMessage{Destination: "orders.created"})
 	if err == nil || !strings.Contains(err.Error(), "reconnecting") {
 		t.Fatalf("publish with retired connection = %v, want reconnecting error", err)
 	}
