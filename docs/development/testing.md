@@ -201,9 +201,24 @@ that suite into a skip.
 
 `bench` measures the same public API through both drivers: publish throughput
 at one, four and sixteen concurrent publishers, consume-and-settle throughput
-on one lane at several handler concurrencies, three of them with a handler that
-holds each message for 5ms, end-to-end latency, and retry-path throughput
-beside its tier delay. It starts both fixtures, creates only its own namespaced destinations and deletes them afterwards, and joins no gate, because a
+on one lane at several handler concurrencies and handler hold times, and also
+on an ordered subscription, end-to-end latency, and retry-path throughput
+beside its tier delay. The comment on the `bench` entry in the
+[Makefile](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/Makefile)
+names the cells and says what each shape measures, and it is the enumeration to
+read rather than a copy here that a moved cell leaves silently wrong. Every
+cell prints `dups`, the deliveries it saw beyond what its shape expects, and
+`goroutines-delta`, the goroutines the run left behind; a bench cell fails on a
+duplicate rather than absorb one into its rate, so `dups` prints zero on a
+passing run. The consume cells add `lag-max` and `heap-max`, the largest
+backlog the consumer reported and the largest live heap the process held, and
+`-benchmem` adds the allocations and the bytes each corpus cost, so a cell can
+show pending work as well as a rate. A Kafka run creates its destinations with
+`F1_KAFKA_PARTITIONS` partitions through the driver's partition-count option,
+so the count its output reports is the one the run asked for rather than one
+the broker chose, and the fixture's own count stands in when the variable is
+unset or unusable. It starts both fixtures, creates only its own namespaced
+destinations and deletes them afterwards, and joins no gate, because a
 throughput number describes the machine it ran on and a gate that fails on a
 busy one is a gate people learn to ignore. Run it on a quiet machine and read
 its output as a comparison between the two drivers, never as a threshold.
