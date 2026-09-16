@@ -200,10 +200,10 @@ so.
 
 ## Kafka driver
 
-The Kafka adapter uses classic consumer groups and franz-go. Share-group mode
-is not implemented. Its connection-derived capabilities expose partition-bound
-scaling and the core-emulated paths for delay, priority, delivery count, and
-dead-letter behavior where Kafka has no native equivalent.
+The Kafka adapter uses consumer groups and franz-go. Its connection-derived
+capabilities expose partition-bound scaling and the core-emulated paths for
+delay, priority, delivery count, and dead-letter behavior where Kafka has no
+native equivalent.
 
 Provider-specific behavior includes producer confirmation, partition and
 offset ownership, consumer-group rebalance, deferred records, lag queries,

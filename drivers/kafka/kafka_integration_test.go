@@ -21,59 +21,62 @@ import (
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/driver"
 )
 
-func TestCapabilityCeilingAndReduction(t *testing.T) {
-	ceiling := Driver{}.Capabilities()
-	if !ceiling.PerMessageAck {
-		t.Error("ceiling PerMessageAck = false, want true")
+func TestCapabilityDeclarationAndBrokerLimits(t *testing.T) {
+	declared := Driver{}.Capabilities()
+	if declared.PerMessageAck {
+		t.Error("PerMessageAck = true, want false")
 	}
-	if !ceiling.OrderedByKey {
-		t.Error("ceiling OrderedByKey = false, want true")
+	if declared.NativeDeliveryCount {
+		t.Error("NativeDeliveryCount = true, want false")
 	}
-	if !ceiling.NativeDeliveryCount {
-		t.Error("ceiling NativeDeliveryCount = false, want true")
+	if declared.ConsumerScaling != driver.ScalingPartitionBound {
+		t.Errorf("ConsumerScaling = %v, want partition-bound", declared.ConsumerScaling)
 	}
-	if ceiling.NativeDLQ {
-		t.Error("ceiling NativeDLQ = true, want false")
+	if !declared.OrderedByKey {
+		t.Error("OrderedByKey = false, want true")
 	}
-	if ceiling.ConsumerScaling != driver.ScalingFree {
-		t.Errorf("ceiling ConsumerScaling = %v, want free", ceiling.ConsumerScaling)
+	if declared.NativeDLQ {
+		t.Error("NativeDLQ = true, want false")
 	}
-	if ceiling.Fanout != driver.FanoutAtConsume {
-		t.Errorf("ceiling Fanout = %v, want consume", ceiling.Fanout)
+	if declared.Fanout != driver.FanoutAtConsume {
+		t.Errorf("Fanout = %v, want consume", declared.Fanout)
 	}
-	if !ceiling.LagQueryable {
-		t.Error("ceiling LagQueryable = false, want true")
+	if !declared.LagQueryable {
+		t.Error("LagQueryable = false, want true")
 	}
-	if ceiling.NativePriority != driver.PriorityNone {
-		t.Errorf("ceiling NativePriority = %v, want none", ceiling.NativePriority)
+	if declared.NativePriority != driver.PriorityNone {
+		t.Errorf("NativePriority = %v, want none", declared.NativePriority)
 	}
-	if ceiling.NativeDelay {
-		t.Error("ceiling NativeDelay = true, want false")
+	if declared.NativeDelay {
+		t.Error("NativeDelay = true, want false")
 	}
 
 	const maxMessageBytes = 123456
-	reduced := classicCapabilities(maxMessageBytes)
-	if reduced.PerMessageAck {
-		t.Error("classic PerMessageAck = true, want false")
+	// A connection reports this value, so it may add the broker's own limits
+	// and must not turn a capability back on: a connection wider than the
+	// factory is a driver claiming something on a connection it does not have.
+	connected := brokerCapabilities(maxMessageBytes)
+	if connected.PerMessageAck {
+		t.Error("connected PerMessageAck = true, want false")
 	}
-	if reduced.NativeDeliveryCount {
-		t.Error("classic NativeDeliveryCount = true, want false")
+	if connected.NativeDeliveryCount {
+		t.Error("connected NativeDeliveryCount = true, want false")
 	}
-	if reduced.ConsumerScaling != driver.ScalingPartitionBound {
-		t.Errorf("classic ConsumerScaling = %v, want partition-bound", reduced.ConsumerScaling)
+	if connected.ConsumerScaling != driver.ScalingPartitionBound {
+		t.Errorf("connected ConsumerScaling = %v, want partition-bound", connected.ConsumerScaling)
 	}
-	if !reduced.OrderedByKey {
-		t.Error("classic OrderedByKey = false, want true")
+	if !connected.OrderedByKey {
+		t.Error("connected OrderedByKey = false, want true")
 	}
 	// Kafka exposes no header limit.
-	if reduced.MaxHeaderBytes != 0 {
-		t.Errorf("classic MaxHeaderBytes = %d, want 0", reduced.MaxHeaderBytes)
+	if connected.MaxHeaderBytes != 0 {
+		t.Errorf("connected MaxHeaderBytes = %d, want 0", connected.MaxHeaderBytes)
 	}
-	if reduced.MaxMessageBytes != maxMessageBytes {
-		t.Errorf("classic MaxMessageBytes = %d, want %d", reduced.MaxMessageBytes, maxMessageBytes)
+	if connected.MaxMessageBytes != maxMessageBytes {
+		t.Errorf("connected MaxMessageBytes = %d, want %d", connected.MaxMessageBytes, maxMessageBytes)
 	}
 
-	strict := reduced.Strict()
+	strict := connected.Strict()
 	wantStrict := driver.Capabilities{
 		OrderedByKey:    true,
 		Fanout:          driver.FanoutAtConsume,
@@ -81,7 +84,7 @@ func TestCapabilityCeilingAndReduction(t *testing.T) {
 		MaxMessageBytes: maxMessageBytes,
 	}
 	if !reflect.DeepEqual(strict, wantStrict) {
-		t.Fatalf("classic Strict() = %#v, want %#v", strict, wantStrict)
+		t.Fatalf("Strict() = %#v, want %#v", strict, wantStrict)
 	}
 }
 
@@ -187,43 +190,6 @@ func TestKafkaErrorKind(t *testing.T) {
 				t.Fatalf("kafkaErrorKind(%v) = %v, want %v", tc.err, got, tc.want)
 			}
 		})
-	}
-}
-
-func TestModeResolution(t *testing.T) {
-	cases := []struct {
-		name    string
-		options map[string]string
-		want    consumeMode
-	}{
-		{name: "absent", want: classicMode},
-		{name: "auto", options: map[string]string{"kafka.useShareGroups": "auto"}, want: classicMode},
-		{name: "never", options: map[string]string{"kafka.useShareGroups": "never"}, want: classicMode},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			got, err := resolveMode(tc.options)
-			if err != nil {
-				t.Fatalf("resolveMode() error = %v", err)
-			}
-			if got != tc.want {
-				t.Fatalf("resolveMode() = %q, want %q", got, tc.want)
-			}
-		})
-	}
-
-	_, err := (Driver{}).Open(context.Background(), driver.Config{
-		DriverOptions: map[string]string{"kafka.useShareGroups": "always"},
-	})
-	if err == nil || !strings.Contains(err.Error(), "share groups mode is not implemented") {
-		t.Fatalf("Open(always) error = %v, want unimplemented share groups error", err)
-	}
-
-	_, err = (Driver{}).Open(context.Background(), driver.Config{
-		DriverOptions: map[string]string{"kafka.useShareGroups": "unexpected"},
-	})
-	if err == nil || !strings.Contains(err.Error(), "invalid useShareGroups mode") {
-		t.Fatalf("Open(unexpected) error = %v, want invalid mode error", err)
 	}
 }
 

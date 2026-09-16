@@ -626,7 +626,7 @@ func consumerClientOpts(connection *conn, cfg driver.ConsumerConfig, group strin
 		kgo.DisableAutoCommit(),
 		consumerStartOffset(cfg.StartAt),
 		kgo.Balancers(balancer),
-		// Franz-go defaults FetchMaxWait to 5000ms for non-share groups. When a
+		// Franz-go defaults FetchMaxWait to 5000ms. When a
 		// multi-destination consumer settles a message on a destination whose
 		// broker partition is currently exhausted, franz-go issues a Fetch
 		// request for that destination which the broker holds for up to
