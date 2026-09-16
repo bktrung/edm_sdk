@@ -45,6 +45,28 @@ func handleOrderCreated(ctx context.Context, event *f1.Event) error {
 Returning `nil` acknowledges the delivery. Failure classification is covered
 in [Handling failures](/user-guide/handling-failures).
 
+## Size the prefetch window
+
+`Concurrency` is how many handlers run at once. `Prefetch` is the ceiling on
+the subscription's in-flight budget, not the amount the broker is asked to
+hand over at a time: each destination gets a window derived from the handler
+concurrency and the fairness weights, and it is that window, not the
+configured prefetch, that lets a handler that takes time find the next
+delivery waiting instead of waiting on the broker round trip that follows its
+own acknowledgement.
+
+When the configured `Prefetch` is larger than those windows add up to, the
+consumer is capped at the lower total rather than left to fetch work ahead of
+the lanes that can hold it, and F1 logs a warning naming the configured value
+and the effective one. That warning is about a budget you named: a subscription
+that names no `Prefetch` takes the broker default silently, and is not told its
+budget was capped, because the default is F1's number rather than yours. A
+prefetch that was not honoured is therefore visible at startup rather than only
+in a rate that never arrives. A prefetch smaller than the windows add up to
+does not shrink them: each destination keeps the window its lanes need, and the
+lanes, not the total, are what stop the driver fetching ahead of the work the
+subscription can run.
+
 ## Read event metadata
 
 Handlers can inspect the event ID, type, subject, attempt number, priority,

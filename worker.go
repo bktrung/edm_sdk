@@ -26,7 +26,7 @@ const (
 	defaultRetryWeightDivisor     = 2
 	defaultPrefetchFactor         = 2
 	retryBudgetMultiplier         = 2
-	minimumLaneCapacity           = 2
+	minimumLaneCapacity           = 3
 	stuckPhaseMultiplier          = 2
 	stuckAbortMultiplier          = 4
 	deathErrorCap                 = 4 << 10
@@ -192,7 +192,7 @@ func (r *Runner) Run(ctx context.Context) (runErr error) {
 		// The driver enforces it as its outstanding limit, and the pipeline
 		// sizes the ordered worker queues from it, so both read the same number
 		// instead of deriving it again from a formula that could drift.
-		prefetch := runnerConsumerPrefetch(r.config.Prefetch, runnerLanePlan(r))
+		prefetch := runnerConsumerPrefetch(r, r.config.Prefetch, runnerLanePlan(r))
 		consumer, openedOn, err := openRunnerConsumerWith(r, runCtx, prefetch)
 		r.mu.Lock()
 		draining = r.draining
@@ -706,6 +706,15 @@ type runnerLane struct {
 // lane capacities and the driver's per-destination caps, so a lane can never
 // be asked to hold more than the destination feeding it may have outstanding.
 //
+// A lane's capacity is its weighted share of the handler concurrency, times
+// the prefetch factor, and never less than minimumLaneCapacity shares. The
+// floor is what binds at one and three handler slots, where the share is one
+// and two units: a window of two leaves two of three slots waiting a broker
+// round trip behind their own acknowledgements instead of finding work in
+// hand, which a 5ms handler measures as 2.5ms of stall per message. Three
+// covers that round trip and binds only where the share is smaller than it,
+// so the shipped concurrency keeps the window it had.
+//
 // Lane IDs and destination names are different strings: a lane ID is
 // topic.priority.main or topic.priority.retry.N, while the destination comes
 // from the naming helpers that declare topology. The two are resolved here,
@@ -777,13 +786,28 @@ func runnerLanePlan(r *Runner) []runnerLane {
 // total would let the driver fetch work ahead of the lanes that can hold it,
 // which is the buffering the lane bound exists to keep out: fetch must pause
 // on a full destination rather than queue behind it.
-func runnerConsumerPrefetch(configured int, lanes []runnerLane) int {
+//
+// A cap on a prefetch the caller named is reported, because that is a budget
+// the caller set and the destinations carry less. A prefetch nobody named is
+// not: the broker default is not the caller's decision, and a line that fires
+// on every subscription is unread when a caller's own budget is capped. The
+// report runs on every call rather than holding state to report once, so the
+// line repeats at the rate the caller's own reconnect loop repeats, which is
+// the rate the condition is re-decided.
+func runnerConsumerPrefetch(r *Runner, configured int, lanes []runnerLane) int {
 	total := 0
 	for _, lane := range lanes {
 		total += lane.capacity
 	}
 	if total < 1 {
 		return configured
+	}
+	if configured > total && r.prefetchConfigured {
+		lastResortRunnerLogger(r).Warn("f1 configured prefetch exceeds the destination windows",
+			"subscription", r.subscription.Name,
+			"configured", configured,
+			"effective", total,
+		)
 	}
 	return min(configured, total)
 }
@@ -1167,7 +1191,7 @@ func lastResortRunnerLogger(r *Runner) *slog.Logger {
 // ordered queue depth are the same number even when they are not both derived
 // from the configuration at the same point in time.
 func openRunnerConsumer(r *Runner, ctx context.Context) (driver.Consumer, error) {
-	consumer, _, err := openRunnerConsumerWith(r, ctx, runnerConsumerPrefetch(r.config.Prefetch, runnerLanePlan(r)))
+	consumer, _, err := openRunnerConsumerWith(r, ctx, runnerConsumerPrefetch(r, r.config.Prefetch, runnerLanePlan(r)))
 	return consumer, err
 }
 
