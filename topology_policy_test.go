@@ -164,7 +164,7 @@ func TestConsumerTopologyErrorsWithoutAdmin(t *testing.T) {
 		},
 		config: SubscriptionConfig{Prefetch: 1},
 	}
-	_, err = openRunnerConsumer(runner, context.Background())
+	_, err = openRunnerConsumerForTest(runner, context.Background())
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "requires driver admin")
 }

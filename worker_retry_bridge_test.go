@@ -1007,7 +1007,7 @@ func TestOpenRunnerConsumerBuildsRetryDestinationTiers(t *testing.T) {
 		},
 		config: SubscriptionConfig{Prefetch: 1},
 	}
-	if _, err := openRunnerConsumer(runner, context.Background()); err != nil {
+	if _, err := openRunnerConsumerForTest(runner, context.Background()); err != nil {
 		t.Fatal(err)
 	}
 	wantDestination := retryDestinationFor(client.source, "orders.created", PriorityHigh, 2, "orders")

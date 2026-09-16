@@ -537,8 +537,10 @@ func TestPublishBatchRejectsReconnectInFlight(t *testing.T) {
 	d := &reconnectTestDriver{created: make(chan *reconnectTestConsumer, 1)}
 	client := newReconnectTestClient(t, d, recorded, 0)
 	client.reconnectRandom = func() float64 { return 1 }
-	attempt, err := client.requestReconnect(errors.New("batch reconnect"))
-	if err != nil {
+	client.mu.Lock()
+	epoch := client.current.epoch
+	client.mu.Unlock()
+	if err := client.requestReconnect(errors.New("batch reconnect"), epoch); err != nil {
 		t.Fatal(err)
 	}
 	waitReconnectCondition(t, func() bool { return recorded.sleepCount() == 1 })
@@ -554,8 +556,9 @@ func TestPublishBatchRejectsReconnectInFlight(t *testing.T) {
 	}
 	fake.BlockUntil(1)
 	fake.Advance(500 * time.Millisecond)
-	if err := client.waitReconnect(context.Background(), attempt); err != nil {
-		t.Fatalf("reconnect = %v, want nil", err)
+	waitReconnectCondition(t, func() bool { return !client.isReconnecting() })
+	if err := client.Health(context.Background()); err != nil {
+		t.Fatalf("Health() after the reconnect = %v, want nil", err)
 	}
 }
 

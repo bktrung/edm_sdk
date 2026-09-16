@@ -699,14 +699,12 @@ func TestReconnectSwapMovesTheEpochAndReleasesTheWaiterParkedBeforeIt(t *testing
 		t.Fatalf("epoch on the connection New opened = %d, want 1", epoch)
 	}
 
-	attempt := &reconnectAttempt{done: make(chan struct{})}
 	client.mu.Lock()
 	client.reconnecting = true
-	client.reconnect = attempt
 	client.mu.Unlock()
 
 	attemptDone := make(chan error, 1)
-	go func() { attemptDone <- client.reconnectOnce(context.Background(), errors.New("transient"), attempt) }()
+	go func() { attemptDone <- client.reconnectOnce(context.Background(), errors.New("transient")) }()
 	advanceReconnect(t, recorded, 500*time.Millisecond, 1)
 	advanceReconnect(t, recorded, time.Second, 2)
 
@@ -737,7 +735,7 @@ func TestReconnectSwapMovesTheEpochAndReleasesTheWaiterParkedBeforeIt(t *testing
 		t.Fatalf("reconnectOnce() = %v, want nil after a successful swap", err)
 	}
 
-	client.finishReconnect(attempt, nil)
+	client.finishReconnect(nil)
 	select {
 	case <-next:
 	case <-clock.NewReal().Timer(time.Second).C:
@@ -766,7 +764,7 @@ func TestReconnectExhaustionReleasesTheWaiterWithTheEpochUnchanged(t *testing.T)
 	client.mu.Lock()
 	epoch, parked := client.epochLocked()
 	client.mu.Unlock()
-	if _, err := client.requestReconnect(errors.New("transient")); err != nil {
+	if err := client.requestReconnect(errors.New("transient"), epoch); err != nil {
 		t.Fatal(err)
 	}
 	advanceReconnect(t, recorded, 500*time.Millisecond, 1)
@@ -840,7 +838,10 @@ func TestSubscribeIsAdmittedWhileTheConnectionIsFailed(t *testing.T) {
 	client.reconnectRandom = func() float64 { return 1 }
 	d.setFailOpens(1)
 
-	if _, err := client.requestReconnect(errors.New("transient")); err != nil {
+	client.mu.Lock()
+	epoch := client.current.epoch
+	client.mu.Unlock()
+	if err := client.requestReconnect(errors.New("transient"), epoch); err != nil {
 		t.Fatal(err)
 	}
 	advanceReconnect(t, recorded, 500*time.Millisecond, 1)

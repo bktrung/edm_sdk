@@ -23,13 +23,13 @@ const reconnectDriverInitialInterval = 500 * time.Millisecond
 
 const reconnectDriverMaxInterval = 30 * time.Second
 
-type reconnectAttempt struct {
-	done chan struct{}
-	err  error
-}
-
+// reconnectRequest is a caller's ask: rebuild the connection that carried this
+// epoch. The epoch is what lets the supervisor drop a request the swap has
+// already answered, because the connection the caller asked about is no longer
+// the one the client is on.
 type reconnectRequest struct {
 	cause error
+	epoch uint64
 }
 
 // A failedSubscription records one stopped subscription by name. owner is the
@@ -95,7 +95,6 @@ type Client struct {
 	// state. It is guarded by mu and remains separate from shutdownStarted:
 	// reconnect exhaustion does not mean Close has been entered.
 	reconnectErr      error
-	reconnect         *reconnectAttempt
 	reconnectRequests chan reconnectRequest
 	reconnectRandom   func() float64
 	supervisorCtx     context.Context
@@ -677,7 +676,7 @@ func publishMessages(c *Client, ctx context.Context, messages ...driver.Outbound
 		c.mu.Unlock()
 		builtProducer, err := conn.Producer(ctx, driver.ProducerConfig{RequireDurableAck: true, Effective: effective})
 		if err != nil {
-			requestReconnectOnTransient(c, err)
+			requestReconnectOnTransient(c, err, epoch)
 			return err
 		}
 		if builtProducer == nil {
@@ -708,7 +707,7 @@ func publishMessages(c *Client, ctx context.Context, messages ...driver.Outbound
 	}
 	defer endPublish(c)
 	err := producer.Publish(ctx, messages...)
-	requestReconnectOnTransient(c, err)
+	requestReconnectOnTransient(c, err, epoch)
 	return err
 }
 
@@ -722,7 +721,8 @@ func closeDiscardedProducer(c *Client, producer driver.Producer, ctx context.Con
 }
 
 // requestReconnectOnTransient requests a reconnect when err is evidence that
-// the connection is unhealthy.
+// the connection is unhealthy, naming the connection the failed call was made
+// on by its epoch, so a request a swap has already answered is dropped.
 //
 // A *driver.PublishError is that evidence only when a failed message carries an
 // error the driver itself classified transient; a driver that said transient
@@ -732,7 +732,7 @@ func closeDiscardedProducer(c *Client, producer driver.Producer, ctx context.Con
 // untranslated reports KindTransient and reports it as classified. That default
 // is a retry hint for the caller and says nothing about the socket, so it must
 // not bring the connection down.
-func requestReconnectOnTransient(c *Client, err error) {
+func requestReconnectOnTransient(c *Client, err error, epoch uint64) {
 	if c == nil || err == nil {
 		return
 	}
@@ -742,7 +742,7 @@ func requestReconnectOnTransient(c *Client, err error) {
 	if partial, ok := errors.AsType[*driver.PublishError](err); ok && !carriesTransientCause(partial) {
 		return
 	}
-	_, _ = c.requestReconnect(err)
+	_ = c.requestReconnect(err, epoch)
 }
 
 // carriesTransientCause reports whether any failed message in a batch carries

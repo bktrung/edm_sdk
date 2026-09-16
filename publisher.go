@@ -249,7 +249,7 @@ func (p *Publisher) PublishBatch(ctx context.Context, messages []Message) (Batch
 		}
 		if err != nil {
 			warnUnclassified(p.client.options.logger, err)
-			requestReconnectOnTransient(p.client, err)
+			requestReconnectOnTransient(p.client, err, epoch)
 			return result, fmt.Errorf("f1: create publisher: %w", err)
 		}
 
@@ -283,7 +283,7 @@ func (p *Publisher) PublishBatch(ctx context.Context, messages []Message) (Batch
 	}
 
 	warnPublishError(p.client.options.logger, publishErr)
-	requestReconnectOnTransient(p.client, publishErr)
+	requestReconnectOnTransient(p.client, publishErr, epoch)
 	var partial *driver.PublishError
 	if errors.As(publishErr, &partial) && len(partial.Failed) > 0 {
 		for i, id := range ids {

@@ -105,21 +105,27 @@ type Runner struct {
 	drainStarted          chan struct{}
 	finished              bool
 	runErr                error
-	reconnectCause        error
+	// abandoned reports whether an attempt replacing the connection has
+	// released this runner's consumer. It is what tells a generation that ended
+	// without a failure of its own apart from one that simply finished: an
+	// abandoned runner waits the attempt out and reopens, or stops for the
+	// attempt's own outcome, and never treats the abandonment as its cause.
+	// beginRunnerGeneration clears it, so it describes the generation that just
+	// ended.
+	abandoned bool
+	// failureCause is this runner's own failure: the transient consumer or
+	// open error that a rebuild is asked for, and the failure the runner
+	// reports when a rebuild hands one back. It is a plain error with no
+	// attempt attached, and it is written only by this runner's own
+	// goroutines, never by the supervisor, so a cause another runner's
+	// reconnect produces cannot replace it. beginRunnerGeneration clears it.
+	failureCause error
 	// recordedFailure reports whether this runner has already recorded a
 	// failure against its subscription name. It is guarded by client.mu, not
 	// by mu: every record site and the clear already hold that lock, and the
 	// exit record reads it in the same critical section that decides whether
 	// the entry it would replace is still this runner's.
 	recordedFailure bool
-	// reconnectCauseAttempt is set only when the supervisor injects the generic
-	// reconnect cause, so a runner can wait for that exact client attempt.
-	reconnectCauseAttempt *reconnectAttempt
-	// reconnectDecisionHook is a test-only seam for pausing generation decisions.
-	reconnectDecisionHook func()
-	// reconnectWaitHook is a test-only seam, called when a runner is about to wait for a
-	// reconnect in progress before it opens its consumer.
-	reconnectWaitHook func()
 	// consumerError identifies a transient failure from Consumer.Errors in this generation.
 	consumerError bool
 	// successfulDelivery means this generation completed at least one handled delivery.
