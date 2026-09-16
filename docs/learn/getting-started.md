@@ -57,7 +57,7 @@ The application selects the concrete driver at the composition boundary. The
 service-facing code uses the root `f1` package; it does not use a broker client
 directly. The repository currently includes:
 
-- `drivers/kafka` for Kafka classic consumer groups and partition-bound scaling.
+- `drivers/kafka` for Kafka consumer groups and partition-bound scaling.
 - `drivers/rabbitmq` for RabbitMQ.
 - `drivers/inmem` for deterministic tests and local in-process use.
 

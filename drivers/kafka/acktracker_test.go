@@ -389,6 +389,12 @@ func TestAlreadySettledRedeliveryReleasesItsRecord(t *testing.T) {
 			t.Fatalf("initial emit(%d) = delivered %t, active %t, created %t", offset, delivered, active, created)
 		}
 		initial[offset] = (<-c.messages).Settle.(*settler)
+		// The hold rule admits one delivery per partition at a time, so each
+		// delivery is settled as it arrives and the partition admits the next
+		// one. The tracker entries this case is about outlive their deliveries:
+		// settling a delivery does not acknowledge its offset, so the acks
+		// below still run out of offset order.
+		c.completeSettlement(initial[offset], false)
 	}
 
 	tracker := c.trackers[key]
@@ -399,7 +405,6 @@ func TestAlreadySettledRedeliveryReleasesItsRecord(t *testing.T) {
 		if err := tracker.Ack(offset, nil); err != nil {
 			t.Fatalf("Ack(%d): %v", offset, err)
 		}
-		c.completeSettlement(initial[offset], false)
 	}
 
 	requeued := initial[11]

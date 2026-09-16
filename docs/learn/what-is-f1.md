@@ -22,10 +22,9 @@ Each guarantee is testable, and the repository gates exercise them.
 ## Current status
 
 The repository contains the core SDK, the public codec and driver ports, the deterministic
-in-memory driver, the RabbitMQ driver, and a connected Kafka driver. Kafka uses classic consumer
-groups; share groups are not implemented. Each driver reports its transport limits through
-`Client.Limits()`, and the core emulates F1 retry, delay, and dead-letter behavior where a broker
-has no native equivalent.
+in-memory driver, the RabbitMQ driver, and a connected Kafka driver. Kafka consumes with consumer
+groups. Each driver reports its transport limits through `Client.Limits()`, and the core emulates
+F1 retry, delay, and dead-letter behavior where a broker has no native equivalent.
 
 ## Where to go next
 

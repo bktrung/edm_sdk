@@ -44,7 +44,6 @@ var (
 
 var (
 	errMissingEndpoints = errors.New("kafka: broker endpoints must not be empty")
-	errShareGroups      = errors.New("kafka: share groups mode is not implemented")
 	errBrokerConfig     = errors.New("kafka: invalid broker configuration")
 	errProtocolResponse = errors.New("kafka: invalid protocol response")
 	errConnClosing      = errors.New("kafka: connection is closing")
@@ -53,13 +52,10 @@ var (
 // Driver is a stateless Kafka driver factory.
 type Driver struct{}
 
-type consumeMode string
-
 const (
-	classicMode                 consumeMode = "classic"
-	franzMinProducerBatchBytes              = 512
-	franzMaxProducerBatchBytes              = 1 << 30
-	kafkaV2RecordBatchBaseBytes             = 65
+	franzMinProducerBatchBytes  = 512
+	franzMaxProducerBatchBytes  = 1 << 30
+	kafkaV2RecordBatchBaseBytes = 65
 )
 
 // conn owns the single client used for connection, producer, and metadata
@@ -93,7 +89,11 @@ func (Driver) Name() string {
 	return "kafka"
 }
 
-// Capabilities reports the ceiling across classic and share-group modes.
+// Capabilities reports what every Kafka connection provides. Kafka consumes
+// with consumer groups, so parallelism is capped by the partition count, and
+// settles by offset, so there is no per-message acknowledgement and the broker
+// reports no redelivery count. The broker-derived limits are added by
+// brokerCapabilities once a connection has read them.
 //
 // No delay accuracy is declared. The driver does hold a deferred record and
 // release it from the poll loop once its due time arrives, but a record that is
@@ -104,11 +104,11 @@ func (Driver) Name() string {
 // the code holds to.
 func (Driver) Capabilities() driver.Capabilities {
 	return driver.Capabilities{
-		PerMessageAck:       true,
+		PerMessageAck:       false,
 		OrderedByKey:        true,
-		NativeDeliveryCount: true,
+		NativeDeliveryCount: false,
 		NativeDLQ:           false,
-		ConsumerScaling:     driver.ScalingFree,
+		ConsumerScaling:     driver.ScalingPartitionBound,
 		Fanout:              driver.FanoutAtConsume,
 		LagQueryable:        true,
 	}
@@ -121,9 +121,6 @@ func (Driver) Open(ctx context.Context, cfg driver.Config) (driver.Conn, error) 
 		return nil, classify("open", driver.KindTransient, err)
 	}
 
-	if _, err := resolveMode(cfg.DriverOptions); err != nil {
-		return nil, classify("open", driver.KindFatal, err)
-	}
 	staticMembership, err := resolveStaticMembership(cfg.DriverOptions)
 	if err != nil {
 		return nil, classify("open", driver.KindFatal, err)
@@ -251,7 +248,7 @@ func (Driver) Open(ctx context.Context, cfg driver.Config) (driver.Conn, error) 
 	producerBatchBytes = int32(effectiveBatchBytes) //nolint:gosec // effectiveProducerBatchBytes bounds the value to the int32 range.
 
 	info := brokerInfo(metadata, versionResponse)
-	caps := classicCapabilities(maxKafkaBodyBytes(effectiveBatchBytes))
+	caps := brokerCapabilities(maxKafkaBodyBytes(effectiveBatchBytes))
 	keepClient = true
 	rebalanceDrainTimeout := cfg.RebalanceDrainTimeout
 	if rebalanceDrainTimeout == 0 {
@@ -278,21 +275,6 @@ func (Driver) Open(ctx context.Context, cfg driver.Config) (driver.Conn, error) 
 		consumers:             make(map[*consumer]struct{}),
 		producers:             make(map[*producer]struct{}),
 	}, nil
-}
-
-func resolveMode(options map[string]string) (consumeMode, error) {
-	value, ok := options["kafka.useShareGroups"]
-	if !ok {
-		value = "auto"
-	}
-	switch value {
-	case "auto", "never":
-		return classicMode, nil
-	case "always":
-		return "", errShareGroups
-	default:
-		return "", fmt.Errorf("kafka: invalid useShareGroups mode %q; supported values: auto, always, never", value)
-	}
 }
 
 func resolveStaticMembership(options map[string]string) (bool, error) {
@@ -365,11 +347,10 @@ func kafkaBareRecordBatchBytes(bodyBytes int) int {
 	return kafkaV2RecordBatchBaseBytes + kafkaPositiveVarintLen(recordLength) + recordLength
 }
 
-func classicCapabilities(maxMessageBytes int) driver.Capabilities {
+// brokerCapabilities adds the limits the broker reports to the driver's
+// declaration. Everything else stays as Driver.Capabilities states it.
+func brokerCapabilities(maxMessageBytes int) driver.Capabilities {
 	caps := Driver{}.Capabilities()
-	caps.PerMessageAck = false
-	caps.NativeDeliveryCount = false
-	caps.ConsumerScaling = driver.ScalingPartitionBound
 	caps.MaxMessageBytes = maxMessageBytes
 	// Kafka exposes no header limit, so MaxHeaderBytes remains undeclared.
 	caps.MaxHeaderBytes = 0

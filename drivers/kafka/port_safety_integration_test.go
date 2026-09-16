@@ -91,7 +91,10 @@ const (
 	// nothing back, which is not the state the test is about.
 	portMinAbandoned = 3
 
-	// portReleaseCorpus is the numbered corpus the release test hands back.
+	// portReleaseCorpus is the numbered corpus the release test hands back. It
+	// is published one key per partition and is the destination's partition
+	// count: the departing consumer takes the whole corpus without settling any
+	// of it, and one unsettled delivery per partition is all a partition carries.
 	portReleaseCorpus = 6
 	// portNackCorpus is the numbered corpus the requeue test publishes. Every
 	// message carries the same key, so all of them share one partition and the
@@ -106,6 +109,26 @@ const (
 	// one record per partition and a larger share shows up as a short count
 	// rather than as the distribution a share is about.
 	portShare = 3
+
+	// portTurnaroundCorpus is how many records the turnaround measurement takes,
+	// settles and times. It is published under one key, so the whole corpus
+	// shares one partition and the gap between two consecutive deliveries is
+	// that partition's turnaround rather than a delivery another partition had
+	// already handed over.
+	portTurnaroundCorpus = 500
+	// portTurnaroundKey is the key every record of that corpus carries.
+	portTurnaroundKey = "port-turnaround-key"
+	// portTurnaroundShare is the prefetch share the turnaround consumer runs
+	// with, and so the read-ahead limit of the partition it measures. It is far
+	// larger than the corpus's arrival burst needs to be: a partition whose
+	// fetches are held too early starves its handler, and a settle that finds
+	// nothing waiting measures the broker's next response instead of the wake.
+	portTurnaroundShare = 64
+	// portTurnaroundBound is the p99 the turnaround measurement requires. A wake
+	// the settle failed to take shows up at the fetch wait, FetchMaxWait, which
+	// the driver sets to 50 ms (drivers/kafka/consumer.go), because the
+	// successor then waits for the next broker response instead.
+	portTurnaroundBound = 10 * time.Millisecond
 
 	// portKeyProbeRounds bounds how many candidate keys the partition probe
 	// publishes before it gives up.
@@ -181,8 +204,26 @@ func TestPortAtLeastOnceAcrossJoinAndLeave(t *testing.T) {
 
 	assigned := joiner.notifications.awaitAssignment(t, portAssignmentTimeout, "the joining consumer")
 	settledAtAssignment := ledger.settledCount()
-	portAwaitHoldings(t, clk, holdings, portJoinSettlements+portMinAbandoned,
-		"the joining consumer to take a share of the corpus")
+	// The joining consumer holds no more unsettled deliveries at once than the
+	// partitions it was assigned, and a two-member split of portPartitions
+	// hands it fewer than portJoinSettlements+portMinAbandoned of them, so the
+	// share it settles before it leaves is taken and settled a delivery at a
+	// time rather than taken whole: a settlement frees its partition for that
+	// partition's next record, which is how a consumer works through any
+	// corpus. The arithmetic asserted below is unchanged: portJoinSettlements
+	// deliveries settle before the leave, and portMinAbandoned are still in
+	// hand when it happens.
+	settledHere := make(map[string]bool, portJoinSettlements)
+	settled := 0
+	for settled < portJoinSettlements {
+		portAwaitHoldings(t, clk, holdings, settled+1, "the joining consumer to take a share of the corpus")
+		holding := holdings.all()[settled]
+		settled++
+		ledger.acknowledge(ctx, holding.message)
+		settledHere[holding.sequence] = true
+	}
+	portAwaitHoldings(t, clk, holdings, settled+portMinAbandoned,
+		"the joining consumer to hold its share of the corpus")
 
 	// Taking stops before the held deliveries are read, so the set the leaver
 	// holds is fixed. A snapshot taken while it was still taking would leave
@@ -198,11 +239,6 @@ func TestPortAtLeastOnceAcrossJoinAndLeave(t *testing.T) {
 	// mid-stream rather than after the work was over.
 	t.Logf("port-join test=at-least-once ms=%d settled=%d held=%d",
 		clk.Since(joiningAt).Milliseconds(), settledAtAssignment, len(held))
-	settledHere := make(map[string]bool, portJoinSettlements)
-	for _, holding := range held[:portJoinSettlements] {
-		ledger.acknowledge(ctx, holding.message)
-		settledHere[holding.sequence] = true
-	}
 	// A consumer can take one sequence twice, because a handoff and its own
 	// fetch can both carry the same record, and this file counts that as a
 	// duplicate rather than a defect. A sequence settled above is therefore
@@ -211,12 +247,16 @@ func TestPortAtLeastOnceAcrossJoinAndLeave(t *testing.T) {
 	// sequence this test settled before it.
 	abandoned := make([]portHolding, 0, len(held))
 	seen := make(map[string]bool, len(held))
-	for _, holding := range held[portJoinSettlements:] {
+	for _, holding := range held {
 		if settledHere[holding.sequence] || seen[holding.sequence] {
 			continue
 		}
 		seen[holding.sequence] = true
 		abandoned = append(abandoned, holding)
+	}
+	if len(abandoned) < portMinAbandoned {
+		t.Fatalf("the leaving consumer held %d unsettled deliveries, want at least %d: a leave that hands back fewer than that is not the state this test measures",
+			len(abandoned), portMinAbandoned)
 	}
 	leftAt := clk.Now()
 	if err := joiner.Release(ctx); err != nil {
@@ -352,13 +392,14 @@ func TestPortHeldDeliveryDoesNotHoldRevoke(t *testing.T) {
 func TestPortReleaseWithoutSettleRedelivers(t *testing.T) {
 	fixture := newPortFixture(t, "release")
 	clk, ctx := fixture.clock, fixture.ctx
+	keys := portKeysByPartition(t)
 	sequences := portSequences(portReleaseCorpus)
 	ledger := newPortLedger(clk)
 
 	departing := fixture.subscribe(t, fixture.consumerConfig(fixture.group, len(sequences)))
 	departing.notifications.awaitAssignment(t, portAssignmentTimeout, "the departing consumer")
 
-	fixture.publish(t, sequences, nil)
+	fixture.publish(t, sequences, portKeyedSequences(sequences, keys))
 
 	for range sequences {
 		message := portAwaitDelivery(t, clk, departing, portDeliveryTimeout, "the departing consumer to take the whole corpus")
@@ -536,6 +577,96 @@ func TestPortPrefetchShareHolds(t *testing.T) {
 	portAssertNoLoss(t, ledger, taken)
 	ledger.metrics(t, "prefetch-share", taken, firstDelivery)
 	consumer.notifications.assertNoFatal(t)
+}
+
+// TestPortTurnaroundAfterSettle measures the time from a settlement returning to
+// the arrival of that partition's next delivery, over a corpus that shares one
+// key so every delivery of it comes from one partition.
+//
+// This is the number a next-record wait rule lives or dies by. The successor is
+// already in the consumer's pending list when the settle returns, and the only
+// thing that admits it is the wake the settle takes, so a consumer that waits
+// for its next broker response instead measures the fetch wait here rather than
+// a wake. It reports port-metrics test=turnaround p50-ms=<n> p99-ms=<n> and
+// requires the p99 to stay under portTurnaroundBound.
+func TestPortTurnaroundAfterSettle(t *testing.T) {
+	fixture := newPortFixture(t, "turnaround")
+	clk, ctx := fixture.clock, fixture.ctx
+
+	keys := make([]string, portTurnaroundCorpus)
+	for index := range keys {
+		keys[index] = portTurnaroundKey
+	}
+	sequences := portSequences(portTurnaroundCorpus)
+	fixture.publish(t, sequences, keys)
+
+	config := fixture.consumerConfig(fixture.group, portTurnaroundShare)
+	consumer := fixture.subscribe(t, config)
+	assigned := consumer.notifications.awaitAssignment(t, portAssignmentTimeout, "the consumer")
+
+	ledger := newPortLedger(clk)
+	samples := make([]time.Duration, 0, portTurnaroundCorpus-1)
+	firstDelivery := time.Duration(0)
+	partition := int32(-1)
+	var settled time.Time
+	for index := range portTurnaroundCorpus {
+		message, ok := portCollect(t, clk, consumer, portDeliveryTimeout)
+		if !ok {
+			t.Fatalf("the consumer took %d of %d deliveries, then none within %s", index, portTurnaroundCorpus, portDeliveryTimeout)
+		}
+		arrived := clk.Now()
+		if index == 0 {
+			firstDelivery = clk.Since(assigned)
+			partition = message.Ref.Partition
+		}
+		if message.Ref.Partition != partition {
+			t.Fatalf("delivery %d arrived from partition %d after partition %d: the corpus shares one key, so every delivery of it comes from one partition and a gap between two of them is that partition's turnaround",
+				index, message.Ref.Partition, partition)
+		}
+		if !settled.IsZero() {
+			samples = append(samples, arrived.Sub(settled))
+		}
+		ledger.received(portSequenceOf(message))
+		ledger.acknowledge(ctx, message)
+		settled = clk.Now()
+	}
+
+	sort.Slice(samples, func(i, j int) bool { return samples[i] < samples[j] })
+	p50 := portTurnaroundPercentile(samples, 50)
+	p99 := portTurnaroundPercentile(samples, 99)
+	t.Logf("port-metrics test=turnaround p50-ms=%.3f p99-ms=%.3f",
+		float64(p50)/float64(time.Millisecond), float64(p99)/float64(time.Millisecond))
+	if p99 > portTurnaroundBound {
+		t.Fatalf("turnaround p99 = %s over %d deliveries, want at most %s: a settled delivery's successor is already in the consumer's pending list, and a consumer that measures the fetch wait here did not wake for it",
+			p99, len(samples), portTurnaroundBound)
+	}
+
+	if err := consumer.Drain(ctx); err != nil {
+		t.Fatalf("Drain the consumer: %v", err)
+	}
+	portSettleRemaining(ctx, ledger, consumer, nil)
+	if err := consumer.Stop(ctx); err != nil {
+		t.Fatalf("Stop the consumer: %v", err)
+	}
+	ledger.assertNoFailures(t)
+	ledger.metrics(t, "turnaround", sequences, firstDelivery)
+	consumer.notifications.assertNoFatal(t)
+}
+
+// portTurnaroundPercentile returns the nearest-rank percentile of sorted
+// samples, in the percent the caller names.
+func portTurnaroundPercentile(sorted []time.Duration, percent int) time.Duration {
+	if len(sorted) == 0 {
+		return 0
+	}
+	index := (len(sorted)*percent+99)/100 - 1
+	if index < 0 {
+		index = 0
+	}
+	if index >= len(sorted) {
+		index = len(sorted) - 1
+	}
+	return sorted[index]
 }
 
 // portFixture is the broker furniture one test needs: one connection, one

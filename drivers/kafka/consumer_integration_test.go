@@ -90,54 +90,93 @@ func TestConsumerAckGapPause(t *testing.T) {
 	cleanupKafkaTopics(t, admin, topic)
 	cleanupKafkaGroups(t, admin, group)
 	createKafkaTopic(t, admin, ctx, topic, 1)
-
-	producer, err := connection.Producer(ctx, driver.ProducerConfig{RequireDurableAck: true, Effective: connection.Capabilities()})
-	if err != nil {
-		t.Fatalf("Producer: %v", err)
+	// A destination that declares a delay gives every record published to it a
+	// due time one delay after its publish instant, so the head is pushed
+	// later within that destination's band to still be owed when the records
+	// behind it settle. The band is half a delay to a delay and a half.
+	const delay = 2 * time.Second
+	const headExtra = delay/2 - 100*time.Millisecond
+	if _, err := connection.Admin().EnsureTopology(ctx, driver.TopologySpec{
+		Destinations: []driver.DestinationSpec{{Name: topic, Delay: delay}},
+		Effective:    connection.Capabilities(),
+	}); err != nil {
+		t.Fatalf("EnsureTopology: %v", err)
 	}
-	defer func() { _ = producer.Close(context.Background()) }()
-	publishKafkaCount(t, producer, ctx, topic, 3)
 
 	consumerValue, err := connection.Consumer(ctx, driver.ConsumerConfig{
-		Group: group, Destinations: []string{topic}, Prefetch: 3, Effective: connection.Capabilities(),
+		Group: group, Destinations: []string{topic}, Prefetch: 3,
+		Delays:    map[string]time.Duration{topic: delay},
+		Effective: connection.Capabilities(),
 	})
 	if err != nil {
 		t.Fatalf("Consumer: %v", err)
 	}
 	t.Cleanup(func() { closeKafkaConsumer(consumerValue) })
-	concrete := consumerValue.(*consumer)
-	messages := []driver.InboundMessage{
-		receiveKafkaMessage(t, consumerValue),
-		receiveKafkaMessage(t, consumerValue),
-		receiveKafkaMessage(t, consumerValue),
+	producer, err := connection.Producer(ctx, driver.ProducerConfig{RequireDurableAck: true, Effective: connection.Capabilities()})
+	if err != nil {
+		t.Fatalf("Producer: %v", err)
 	}
-	if err := messages[2].Settle.Ack(ctx); err != nil {
-		t.Fatalf("Ack(high offset): %v", err)
+	defer func() { _ = producer.Close(context.Background()) }()
+	// The corpus is published after the consumer has joined, so the window the
+	// head's due time opens is the test's own and not the group join's.
+	due := kafkaNow().Add(delay + headExtra)
+	if err := producer.Publish(ctx,
+		driver.OutboundMessage{Destination: topic, Body: []byte("deferred"), DelayUntil: due},
+		driver.OutboundMessage{Destination: topic, Body: []byte("second")},
+		driver.OutboundMessage{Destination: topic, Body: []byte("third")},
+	); err != nil {
+		t.Fatalf("Publish: %v", err)
+	}
+	concrete := consumerValue.(*consumer)
+	// The hold rule admits one delivery of this partition at a time, so the
+	// only settlements that can run ahead of the commit point are those behind
+	// a record that is not due yet: the deferred head is refused and stays
+	// pending, and the two records behind it are delivered and acknowledged
+	// while it is still owed. The highest acknowledged offset is then two past
+	// the commit point, which is what the bound counts.
+	first := receiveKafkaMessage(t, consumerValue)
+	if first.Ref.Offset != 1 {
+		t.Fatalf("first delivery offset = %d, want 1: the deferred head at offset 0 is not due yet", first.Ref.Offset)
+	}
+	if err := first.Settle.Ack(ctx); err != nil {
+		t.Fatalf("Ack(offset 1): %v", err)
 	}
 	concrete.mu.Lock()
 	_, paused := concrete.pauseReasons[topic][pauseReasonAckGap]
 	concrete.mu.Unlock()
-	if !paused {
-		t.Fatalf("ack-gap pause reason missing after out-of-order Ack")
+	if paused {
+		t.Fatalf("ack-gap pause reason set while the gap is still within the bound")
 	}
-	if err := messages[0].Settle.Nack(ctx, driver.NackOptions{Requeue: true}); err != nil {
-		t.Fatalf("Nack(first offset): %v", err)
+	second := receiveKafkaMessage(t, consumerValue)
+	if second.Ref.Offset != 2 {
+		t.Fatalf("second delivery offset = %d, want 2", second.Ref.Offset)
 	}
-	redelivered := receiveKafkaMessage(t, consumerValue)
-	if redelivered.Ref.Offset != messages[0].Ref.Offset {
-		t.Fatalf("redelivery offset = %d, want %d", redelivered.Ref.Offset, messages[0].Ref.Offset)
-	}
-	if err := redelivered.Settle.Ack(ctx); err != nil {
-		t.Fatalf("Ack(redelivery): %v", err)
+	if err := second.Settle.Ack(ctx); err != nil {
+		t.Fatalf("Ack(offset 2): %v", err)
 	}
 	concrete.mu.Lock()
 	_, paused = concrete.pauseReasons[topic][pauseReasonAckGap]
 	concrete.mu.Unlock()
-	if paused {
-		t.Fatalf("ack-gap pause reason remained after gap returned to bound")
+	if !paused {
+		t.Fatalf("ack-gap pause reason missing after out-of-order Ack")
 	}
-	if err := messages[1].Settle.Ack(ctx); err != nil {
-		t.Fatalf("Ack(middle offset): %v", err)
+	// The pause is a liveness hazard under the hold rule, and it is asserted
+	// here rather than worked around. The only settlement that can close the
+	// gap is the deferred head's, because it is the base, and the head can only
+	// be settled by being delivered. The pause refuses exactly that delivery
+	// (pauseReasonAckGap does not hold records, so blocksDelivery is true), so
+	// the head stays pending past its due time and nothing on this partition
+	// moves again. Before the hold rule a later record could be in flight while
+	// the head waited, and its settlement is what closed the gap; the rule
+	// removed that path, so a destination with `kafka.maxAckGap` set and a
+	// deferred head reaches this state and stays in it. Phase 4 and 5 delete
+	// the ack-gap machinery, which is where this belongs.
+	expectNoKafkaMessage(t, consumerValue, time.Until(due)+250*time.Millisecond)
+	concrete.mu.Lock()
+	_, paused = concrete.pauseReasons[topic][pauseReasonAckGap]
+	concrete.mu.Unlock()
+	if !paused {
+		t.Fatalf("ack-gap pause reason cleared without the gap closing")
 	}
 	if err := consumerValue.Stop(ctx); err != nil {
 		t.Fatalf("Stop: %v", err)
@@ -399,12 +438,12 @@ func TestConsumerCommittedPrefixRestartsAtBase(t *testing.T) {
 		t.Fatalf("Consumer before restart: %v", err)
 	}
 	firstConcrete := firstConsumer.(*consumer)
-	firstMessages := []driver.InboundMessage{
-		receiveKafkaMessage(t, firstConsumer),
-		receiveKafkaMessage(t, firstConsumer),
-		receiveKafkaMessage(t, firstConsumer),
-	}
-	if err := firstMessages[0].Settle.Ack(ctx); err != nil {
+	// The hold rule admits one delivery of this partition at a time, so the
+	// committed prefix advances one delivery per Ack instead of three
+	// settlements arriving before the first one. The offsets the restart has to
+	// redeliver are unchanged: 0 is committed and 1 and 2 were never settled.
+	prefix := receiveKafkaMessage(t, firstConsumer)
+	if err := prefix.Settle.Ack(ctx); err != nil {
 		t.Fatalf("Ack(prefix): %v", err)
 	}
 	firstConcrete.client.Close()
@@ -974,6 +1013,25 @@ func TestConsumerPrefetchBound(t *testing.T) {
 	}
 }
 
+const (
+	// kafkaRefillSecondPartitions is how many partitions the destination with
+	// the larger share is created with. The hold rule admits one delivery per
+	// partition, so a destination can only hold a share larger than one if it
+	// has that many partitions.
+	kafkaRefillSecondPartitions = 3
+	// kafkaRefillSecondShare is the share that destination is configured with:
+	// one delivery per partition.
+	kafkaRefillSecondShare = kafkaRefillSecondPartitions
+	// kafkaRefillSecondRecords is how many records each of that destination's
+	// partitions is seeded with: the outstanding delivery, the refill, and the
+	// records the drain settles to exhaust the destination.
+	kafkaRefillSecondRecords = 3
+	// kafkaRefillFirstRecords is how many records the single-partition
+	// destination is seeded with: its initial delivery, its refill, and the
+	// final delivery the promptness assertion waits for.
+	kafkaRefillFirstRecords = 3
+)
+
 func TestConsumerPerDestinationShareRefillsOnSettlement(t *testing.T) {
 	ctx, connection, admin := openKafkaAdminTest(t)
 	first := kafkaTestTopic(t, "consumer-refill-first")
@@ -982,36 +1040,67 @@ func TestConsumerPerDestinationShareRefillsOnSettlement(t *testing.T) {
 	cleanupKafkaTopics(t, admin, first, second)
 	cleanupKafkaGroups(t, admin, group)
 	createKafkaTopic(t, admin, ctx, first, 1)
-	createKafkaTopic(t, admin, ctx, second, 1)
+	createKafkaTopic(t, admin, ctx, second, kafkaRefillSecondPartitions)
 
-	producer, err := connection.Producer(ctx, driver.ProducerConfig{Effective: connection.Capabilities()})
-	if err != nil {
-		t.Fatalf("Producer: %v", err)
-	}
-	defer func() { _ = producer.Close(context.Background()) }()
 	consumer, err := connection.Consumer(ctx, driver.ConsumerConfig{
 		Group: group, Destinations: []string{first, second}, Prefetch: 4,
-		PerDestination: map[string]int{first: 1, second: 3}, Effective: connection.Capabilities(),
+		PerDestination: map[string]int{first: 1, second: kafkaRefillSecondShare}, Effective: connection.Capabilities(),
 	})
 	if err != nil {
 		t.Fatalf("Consumer: %v", err)
 	}
 	t.Cleanup(func() { closeKafkaConsumer(consumer) })
-	publishKafkaCount(t, producer, ctx, first, 3)
-	publishKafkaCount(t, producer, ctx, second, 5)
+	// The hold rule admits one delivery per partition, so the destination whose
+	// share is more than one needs that many partitions to hold the share at
+	// all: its records are published one partition at a time, and the
+	// destination's own budget stays what the refill below measures. The
+	// destination whose share is one keeps its single partition.
+	publisher, err := kgo.NewClient(append([]kgo.Opt(nil), append(connection.clientOpts, kgo.RecordPartitioner(kgo.ManualPartitioner()))...)...)
+	if err != nil {
+		t.Fatalf("ManualPartitioner client: %v", err)
+	}
+	defer publisher.Close()
+	seedRefill := func(destination string, partitions int32, perPartition int) {
+		t.Helper()
+		for partition := range partitions {
+			for index := range perPartition {
+				record := &kgo.Record{
+					Topic:     destination,
+					Partition: partition,
+					Value:     []byte(fmt.Sprintf("%s-%d-%d", destination, partition, index)),
+				}
+				if err := publisher.ProduceSync(ctx, record).FirstErr(); err != nil {
+					t.Fatalf("ProduceSync %s partition %d record %d: %v", destination, partition, index, err)
+				}
+			}
+		}
+	}
+	// First holds one outstanding delivery, so it needs one more for the refill
+	// and its last one for the final delivery the promptness assertion waits
+	// for while second is exhausted.
+	seedRefill(first, 1, kafkaRefillFirstRecords)
+	// Second's share is one per partition: three outstanding, one refill, then
+	// the rest of each partition to drain it.
+	seedRefill(second, kafkaRefillSecondPartitions, kafkaRefillSecondRecords)
+
 	inspect, err := kafkaInspector(connection)
 	if err != nil {
 		t.Fatalf("Inspector: %v", err)
 	}
-	waitForKafkaShares(t, inspect, ctx, map[string]int{first: 1, second: 3})
+	waitForKafkaShares(t, inspect, ctx, map[string]int{first: 1, second: kafkaRefillSecondShare})
 	// Explicit initial 1/3 categorization asserting share saturation.
 	initial := make(map[string][]driver.InboundMessage)
 	for range 4 {
 		msg := receiveKafkaMessage(t, consumer)
 		initial[msg.Destination] = append(initial[msg.Destination], msg)
 	}
-	if len(initial[first]) != 1 || len(initial[second]) != 3 {
-		t.Fatalf("initial deliveries by destination: first=%d second=%d, want 1 and 3", len(initial[first]), len(initial[second]))
+	if len(initial[first]) != 1 || len(initial[second]) != kafkaRefillSecondShare {
+		t.Fatalf("initial deliveries by destination: first=%d second=%d, want 1 and %d",
+			len(initial[first]), len(initial[second]), kafkaRefillSecondShare)
+	}
+	if partitioned := kafkaDistinctPartitions(initial[second]); partitioned != kafkaRefillSecondShare {
+		t.Fatalf("second's %d initial deliveries came from %d partitions, want one per partition: the hold rule admits one delivery per partition",
+			len(initial[second]), partitioned)
 	}
 
 	// Settle exactly one message on each destination.
@@ -1048,13 +1137,19 @@ func TestConsumerPerDestinationShareRefillsOnSettlement(t *testing.T) {
 		}
 	}
 
-	// Drain the remaining message on second so that second is completely exhausted on the broker.
-	secondFinal := receiveKafkaMessageBefore(t, consumer, deadline)
-	if secondFinal.Destination != second {
-		t.Fatalf("received %q, want final %q", secondFinal.Destination, second)
-	}
-	if err := secondFinal.Settle.Ack(ctx); err != nil {
-		t.Fatalf("Ack(second final): %v", err)
+	// Drain the remaining messages on second so that second is completely
+	// exhausted on the broker. Each partition hands over its next record once
+	// its predecessor settles, so the drain settles as it goes: what is left is
+	// every seeded record minus the outstanding deliveries and the refill.
+	drain := kafkaRefillSecondPartitions*kafkaRefillSecondRecords - (kafkaRefillSecondShare + 1)
+	for index := range drain {
+		secondDrain := receiveKafkaMessageBefore(t, consumer, deadline)
+		if secondDrain.Destination != second {
+			t.Fatalf("received %q while draining %q, want %q", secondDrain.Destination, second, second)
+		}
+		if err := secondDrain.Settle.Ack(ctx); err != nil {
+			t.Fatalf("Ack(second drain %d): %v", index, err)
+		}
 	}
 
 	// Destination second is now exhausted on the broker and idle/unpaused.
@@ -1075,6 +1170,16 @@ func TestConsumerPerDestinationShareRefillsOnSettlement(t *testing.T) {
 	if err := consumer.Stop(ctx); err != nil {
 		t.Fatalf("Stop: %v", err)
 	}
+}
+
+// kafkaDistinctPartitions counts how many partitions a destination's deliveries
+// came from.
+func kafkaDistinctPartitions(messages []driver.InboundMessage) int {
+	partitions := make(map[int32]struct{}, len(messages))
+	for _, message := range messages {
+		partitions[message.Ref.Partition] = struct{}{}
+	}
+	return len(partitions)
 }
 
 func waitForKafkaShares(t *testing.T, inspect func(context.Context, string) (conformance.BrokerView, error), ctx context.Context, shares map[string]int) {
@@ -2587,16 +2692,20 @@ func TestConsumerQueuedHandoffDispatchesWhenCapacityFrees(t *testing.T) {
 	})
 
 	connection.rebalanceDrainTimeout = 200 * time.Millisecond
-	producer, err := connection.Producer(ctx, driver.ProducerConfig{
-		RequireDurableAck: true,
-		Effective:         connection.Capabilities(),
-	})
+	manualClient, err := kgo.NewClient(append([]kgo.Opt(nil), append(connection.clientOpts, kgo.RecordPartitioner(kgo.ManualPartitioner()))...)...)
 	if err != nil {
-		t.Fatalf("Producer: %v", err)
+		t.Fatalf("ManualPartitioner client: %v", err)
 	}
-	t.Cleanup(func() { _ = producer.Close(context.Background()) })
-	publishKafkaMessage(t, producer, ctx, topic, "trigger-a")
-	publishKafkaMessage(t, producer, ctx, topic, "trigger-b")
+	t.Cleanup(manualClient.Close)
+	// One record per partition: the hold rule admits one delivery of a
+	// partition at a time, so two records the source holds at once have to be
+	// the two partitions' own.
+	for partition, body := range map[int32]string{0: "trigger-a", 1: "trigger-b"} {
+		record := &kgo.Record{Topic: topic, Partition: partition, Value: []byte(body)}
+		if err := manualClient.ProduceSync(ctx, record).FirstErr(); err != nil {
+			t.Fatalf("ProduceSync partition %d (%s): %v", partition, body, err)
+		}
+	}
 
 	cfg := driver.ConsumerConfig{
 		Group:        group,
@@ -2679,13 +2788,23 @@ func TestConsumerQueuedHandoffDispatchesWhenCapacityFrees(t *testing.T) {
 			t.Fatalf("queued handoff was not dispatched after capacity freed: %v", secondCtx.Err())
 		}
 	}
-	if first.Ref.Offset == second.Ref.Offset {
-		t.Fatalf("both handoffs delivered offset %d, want one each", first.Ref.Offset)
+	// One record per partition, so a delivery is identified by its partition
+	// and offset: both records are offset 0.
+	type deliveryKey struct {
+		partition int32
+		offset    int64
 	}
-	delivered := map[int64]bool{first.Ref.Offset: true, second.Ref.Offset: true}
+	if first.Ref.Partition == second.Ref.Partition {
+		t.Fatalf("both handoffs delivered partition %d, want one each", first.Ref.Partition)
+	}
+	delivered := map[deliveryKey]bool{
+		{partition: first.Ref.Partition, offset: first.Ref.Offset}:   true,
+		{partition: second.Ref.Partition, offset: second.Ref.Offset}: true,
+	}
 	for _, message := range held {
-		if !delivered[message.Ref.Offset] {
-			t.Fatalf("held offset %d was never redelivered to the target", message.Ref.Offset)
+		if !delivered[deliveryKey{partition: message.Ref.Partition, offset: message.Ref.Offset}] {
+			t.Fatalf("held delivery partition %d offset %d was never redelivered to the target",
+				message.Ref.Partition, message.Ref.Offset)
 		}
 	}
 	waitForKafkaConsumerState(t, source, "no handoff is left queued", func() bool {

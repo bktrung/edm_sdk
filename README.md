@@ -60,9 +60,9 @@ Broker-backed jobs remain available there and run when `RUN_BROKER_TESTS=1` is s
 - Schema registry integration. v1 uses JSON plus a versioned envelope; the codec port has hooks for
   Avro/Protobuf, but no registry client ships in v1.
 - NATS JetStream / Pulsar drivers. The port is designed to accommodate them; neither is present.
-- Kafka share-group mode is not implemented. The Kafka adapter supports classic consumer groups;
-  its connected capability report exposes partition-bound scaling and the core-emulated paths for
-  delay, delivery count, and dead-letter behavior.
+- Kafka native per-message acknowledgement, native delivery counts, and scaling independent of the
+  partition count. The adapter consumes with consumer groups, settles by offset, and exposes the
+  core-emulated paths for delay, delivery count, and dead-letter behavior.
 - Multiple broker versions per broker. The RabbitMQ adapter targets one stable broker family.
 <!-- #endregion non-goals -->
 

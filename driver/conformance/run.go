@@ -184,7 +184,21 @@ func runProfile(
 	if err != nil {
 		t.Fatalf("inspect baseline: %v", err)
 	}
-	const n = 2
+	// A partition-bound driver decides how many records a destination can carry
+	// unsettled from a partition count the port does not carry, and this probe
+	// creates its destination by name alone, so the count is the driver's and may
+	// be one: a single partition cannot admit its next record before the first
+	// settles, and the check below requires all n of them outstanding at the same
+	// instant, so settling in between is not available either. The plurality
+	// check is therefore waived for such a driver, which asks for one outstanding
+	// record, and kept for a driver declaring free consumer scaling, whose
+	// destinations no partition count bounds. The waiver is a loss and not a
+	// simplification: two records also show Ready and Unsettled to be sums over
+	// more than one record, and one only shows the arithmetic.
+	n := 2
+	if factoryCapabilities.ConsumerScaling == driver.ScalingPartitionBound {
+		n = 1
+	}
 	for i := range n {
 		if err := producer.Publish(ctx, driver.OutboundMessage{
 			Destination: destination,
