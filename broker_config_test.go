@@ -1,6 +1,7 @@
 package f1
 
 import (
+	"context"
 	"go/ast"
 	"go/parser"
 	"go/token"
@@ -151,6 +152,99 @@ func TestRemovedRabbitMQOptionsFailToLoad(t *testing.T) {
 		path := writeConfig(t, "f1:\n  env: test\n  service: orders\n  broker:\n    driver: rabbitmq\n    endpoints: [amqp://broker:5672/]\n    rabbitmq:\n      vhost: /orders\n      queueType: quorum\n      consumerTimeout: 90s\n      managementPort: 15672\n")
 		if _, err := LoadConfig(path); err != nil {
 			t.Fatalf("LoadConfig() with the four live RabbitMQ keys error = %v", err)
+		}
+	})
+}
+
+// TestUnknownKafkaOptionsFailToLoad is the Kafka side of the guard the RabbitMQ
+// case above pins: a key no reader was written for is refused by name when the
+// configuration loads, rather than left in the option map for the driver to
+// ignore and report as a value the deployment never chose. No key has left the
+// Kafka list, so both cases here are names that were never on it, which is what
+// a typo or a remembered-but-absent option produces.
+func TestUnknownKafkaOptionsFailToLoad(t *testing.T) {
+	t.Parallel()
+	for _, test := range []struct {
+		key   string
+		value string
+	}{
+		{key: "linger", value: "5ms"},
+		{key: "partitions", value: "6"},
+	} {
+		t.Run(test.key, func(t *testing.T) {
+			t.Parallel()
+			path := writeConfig(t, "f1:\n  env: test\n  service: orders\n  broker:\n    driver: kafka\n    endpoints: [localhost:19092]\n    kafka:\n      "+test.key+": "+test.value+"\n")
+			_, err := LoadConfig(path)
+			if err == nil || !strings.Contains(err.Error(), "broker.kafka."+test.key) {
+				t.Fatalf("LoadConfig() with %s set error = %v, want an error naming broker.kafka.%s", test.key, err, test.key)
+			}
+		})
+	}
+}
+
+// TestNewRefusesUnknownDriverOptions loads no file: it builds the configuration
+// in Go and opens it, which is the other way an option arrives and the path the
+// refusal used to miss. Nothing between New and the driver reads a key - the map
+// is carried to the driver as an opaque passthrough - so a caller who misspells
+// one used to get a client that opened cleanly and a driver that kept its own
+// default.
+//
+// The last three cases are the same rule one step out. An option carries the
+// name of the driver that reads it, so a key naming the other broker, a key
+// naming no broker, and a key on a driver that reads no option at all are read
+// by nobody either: they are refused rather than delivered to a resolver that
+// will not look at them.
+func TestNewRefusesUnknownDriverOptions(t *testing.T) {
+	t.Parallel()
+	for _, test := range []struct {
+		name      string
+		driver    string
+		endpoints []string
+		key       string
+	}{
+		{name: "name the driver has no reader for", driver: "kafka", endpoints: []string{"localhost:19092"}, key: "kafka.maxExpectedInstancesX"},
+		{name: "key of the other broker", driver: "kafka", endpoints: []string{"localhost:19092"}, key: "rabbitmq.queueType"},
+		{name: "key naming no driver", driver: "kafka", endpoints: []string{"localhost:19092"}, key: "queueType"},
+		{name: "key on a driver that reads no option", driver: "inmem", key: "inmem.maxQueueDepth"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			cfg := Config{
+				Env:     "test",
+				Service: "orders",
+				Broker: BrokerConfig{
+					Driver:        test.driver,
+					Endpoints:     test.endpoints,
+					DriverOptions: map[string]string{test.key: "1"},
+				},
+			}
+			client, err := New(context.Background(), cfg, WithDriver(&testDriver{name: test.driver, conn: &testConn{}}))
+			if err == nil {
+				_ = client.Close(context.Background())
+				t.Fatalf("New() with %s in BrokerConfig.DriverOptions error = nil, want a refusal naming broker.%s", test.key, test.key)
+			}
+			if !strings.Contains(err.Error(), "f1: unknown broker."+test.key) {
+				t.Fatalf("New() error = %v, want an error naming broker.%s", err, test.key)
+			}
+		})
+	}
+	t.Run("the keys the driver reads still open", func(t *testing.T) {
+		t.Parallel()
+		cfg := Config{
+			Env:     "test",
+			Service: "orders",
+			Broker: BrokerConfig{
+				Driver:        "kafka",
+				Endpoints:     []string{"localhost:19092"},
+				DriverOptions: map[string]string{"kafka.compression": "lz4", "kafka.maxExpectedInstances": "6"},
+			},
+		}
+		client, err := New(context.Background(), cfg, WithDriver(&testDriver{name: "kafka", conn: &testConn{}}))
+		if err != nil {
+			t.Fatalf("New() with two accepted Kafka options error = %v", err)
+		}
+		if err := client.Close(context.Background()); err != nil {
+			t.Fatalf("Close() error = %v", err)
 		}
 	})
 }
