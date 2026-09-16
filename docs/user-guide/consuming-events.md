@@ -90,6 +90,13 @@ measure the real handler before relying on either figure. Raising `Prefetch`
 above the effective window described above does not raise the rate. The figures
 come from `BenchmarkRabbitMQConsumeSweep` in `examples/bench`.
 
+On a partition-bound driver, which is Kafka, the window is a ceiling the driver
+may fall short of: that driver admits one delivery per partition, so a
+destination whose traffic reaches fewer partitions than its window allows
+leaves handlers idle, and there the ceiling is the number of partitions
+assigned to the consumer rather than the window the lanes asked for. A larger
+`Prefetch` cannot raise it; more partitions, or a wider spread of keys, can.
+
 ## Read event metadata
 
 Handlers can inspect the event ID, type, subject, attempt number, priority,
