@@ -211,6 +211,7 @@ func TestClientAdvanceFiresDriverRetry(t *testing.T) {
 	c := NewClient(t, quietLogger())
 	ctx, cancel := context.WithCancel(context.Background())
 	first, second := make(chan struct{}), make(chan struct{})
+	retryHeld := make(chan struct{})
 	var calls int
 	runner, err := c.Subscribe(ctx, f1.Subscription{
 		Name:           "orders",
@@ -225,6 +226,7 @@ func TestClientAdvanceFiresDriverRetry(t *testing.T) {
 				calls++
 				if calls == 1 {
 					close(first)
+					<-retryHeld
 					return errors.New("try again")
 				}
 				close(second)
@@ -245,15 +247,16 @@ func TestClientAdvanceFiresDriverRetry(t *testing.T) {
 
 	c.Deliver(t, "orders.created.v1", map[string]string{"id": "order-3"})
 	waitFor(t, first, "first handler attempt did not run")
-	// Drain the initial publish and let the failed attempt finish its retry
-	// publish before advancing the fake clock.
+	// The retry publication is scheduled once the failed attempt returns, and
+	// that attempt holds until the test has drained, so the drain below sees
+	// the initial publication alone and the wait below always has a
+	// publication to wait for.
 	published := c.Published()
-	if !containsAttempt(published, "2") {
-		waitCtx, cancelWait := context.WithTimeout(context.Background(), time.Second)
-		require.NoError(t, c.captures.waitPublished(waitCtx))
-		cancelWait()
-		published = append(published, c.Published()...)
-	}
+	close(retryHeld)
+	waitCtx, cancelWait := context.WithTimeout(context.Background(), time.Second)
+	require.NoError(t, c.captures.waitPublished(waitCtx))
+	cancelWait()
+	published = append(published, c.Published()...)
 	require.True(t, containsAttempt(published, "2"), "retry publication was not observed")
 	c.Advance(time.Second)
 	select {
