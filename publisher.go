@@ -179,11 +179,18 @@ func (p *Publisher) PublishBatch(ctx context.Context, messages []Message) (Batch
 	// is rejected immediately; it is never given the chance to slip through
 	// a later check while Close is already tearing the connection down.
 	p.client.mu.Lock()
-	if p.client.closed || p.client.shutdownStarted || p.client.conn == nil {
+	if err := p.client.admit(workPublishEntry, 0); err != nil {
 		p.client.mu.Unlock()
-		return result, errors.New("f1: client is closed")
+		return result, err
 	}
-	conn := p.client.conn
+	// The connection and its incarnation are one value, read in the section
+	// that records this publish as in flight: the producer this call builds and
+	// the admission it takes later both belong to the connection that was
+	// current when the publish was admitted. Reading the epoch anywhere else
+	// would compare a claim about one incarnation against another.
+	current := p.client.current
+	conn := current.conn
+	epoch := current.epoch
 	effective := p.client.effective
 	headerMaxBytes := effectiveHeaderLimit(p.client.config.Codec.MaxHeaderBytes, effective.MaxHeaderBytes)
 	options := p.client.options
@@ -221,19 +228,15 @@ func (p *Publisher) PublishBatch(ctx context.Context, messages []Message) (Batch
 	// This publish was already admitted above and is counted in Close's
 	// idle wait, so closing may legitimately be true here; only a fully
 	// closed client or a torn-down connection stop it from proceeding.
-	// publishAdmissionLocked's producerTeardown branch cannot fire on this
-	// path: beginPublish above already counted this call as in flight, and
+	// The producer-teardown branch of admit cannot fire on this path:
+	// beginPublish above already counted this call as in flight, and
 	// producerTeardown is only set once the publish-idle wait observes zero
 	// in-flight publishes, which cannot happen while this call is one of
 	// them. Moving beginPublish to run after this check would break that.
 	p.client.mu.Lock()
-	if err := publishAdmissionLocked(p.client, true); err != nil {
+	if err := p.client.admit(workPublish, epoch); err != nil {
 		p.client.mu.Unlock()
 		return result, err
-	}
-	if !sameConnection(p.client.conn, conn) {
-		p.client.mu.Unlock()
-		return result, p.client.reconnectingError("publish")
 	}
 	producer := p.client.producerHandle
 	if producer != nil {
@@ -246,16 +249,13 @@ func (p *Publisher) PublishBatch(ctx context.Context, messages []Message) (Batch
 		}
 		if err != nil {
 			warnUnclassified(p.client.options.logger, err)
-			requestReconnectOnTransient(p.client, err)
+			requestReconnectOnTransient(p.client, err, epoch)
 			return result, fmt.Errorf("f1: create publisher: %w", err)
 		}
 
 		var loser driver.Producer
 		p.client.mu.Lock()
-		err = publishAdmissionLocked(p.client, true)
-		if err == nil && !sameConnection(p.client.conn, conn) {
-			err = p.client.reconnectingError("publish")
-		}
+		err = p.client.admit(workPublish, epoch)
 		if err == nil {
 			if p.client.producerHandle != nil {
 				producer = p.client.producerHandle
@@ -283,7 +283,7 @@ func (p *Publisher) PublishBatch(ctx context.Context, messages []Message) (Batch
 	}
 
 	warnPublishError(p.client.options.logger, publishErr)
-	requestReconnectOnTransient(p.client, publishErr)
+	requestReconnectOnTransient(p.client, publishErr, epoch)
 	var partial *driver.PublishError
 	if errors.As(publishErr, &partial) && len(partial.Failed) > 0 {
 		for i, id := range ids {

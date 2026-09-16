@@ -149,9 +149,9 @@ func TestCloseConsumerDrainBudgetIsThePublicContract(t *testing.T) {
 	if !ok {
 		t.Fatalf("producer handle is %T, want *dispatchProducer", client.producerHandle)
 	}
-	conn, ok := client.conn.(*dispatchConn)
+	conn, ok := client.current.conn.(*dispatchConn)
 	if !ok {
-		t.Fatalf("connection is %T, want *dispatchConn", client.conn)
+		t.Fatalf("connection is %T, want *dispatchConn", client.current.conn)
 	}
 
 	closed := make(chan error, 1)

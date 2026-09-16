@@ -14,6 +14,7 @@ import (
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/codec"
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/driver"
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/clock"
+	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/lifecycle"
 )
 
 var errClientReconnecting = errors.New("f1: client is reconnecting")
@@ -22,13 +23,13 @@ const reconnectDriverInitialInterval = 500 * time.Millisecond
 
 const reconnectDriverMaxInterval = 30 * time.Second
 
-type reconnectAttempt struct {
-	done chan struct{}
-	err  error
-}
-
+// reconnectRequest is a caller's ask: rebuild the connection that carried this
+// epoch. The epoch is what lets the supervisor drop a request the swap has
+// already answered, because the connection the caller asked about is no longer
+// the one the client is on.
 type reconnectRequest struct {
 	cause error
+	epoch uint64
 }
 
 // A failedSubscription records one stopped subscription by name. owner is the
@@ -41,9 +42,20 @@ type failedSubscription struct {
 	owner *Runner
 }
 
+// currentConnection is the connection the client is on, together with the
+// number that names that incarnation. The two are one value because they are
+// one fact: the number counts the incarnations of the connection, and the
+// supervisor installs a new connection with its new number in a single critical
+// section. A reader that holds mu therefore takes the connection and the number
+// it will later compare against in one read, and no read of the client can pair
+// a connection with another incarnation's number.
+type currentConnection struct {
+	conn  driver.Conn
+	epoch uint64
+}
+
 // Client is an eagerly connected messaging client.
 type Client struct {
-	conn           driver.Conn
 	limits         Limits
 	effective      driver.Capabilities
 	options        clientOptions
@@ -73,18 +85,30 @@ type Client struct {
 	runners             map[*Runner]struct{}
 	failedSubscriptions []failedSubscription
 
+	// current is the connection the client is on and the number that names it.
+	// Its epoch is 1 for the connection New opened, and a nil conn means the
+	// client holds none.
+	current currentConnection
 	// reconnecting reports connection usability, independently of shutdownStarted.
 	reconnecting bool
 	// reconnectErr records a terminal reconnect decision for the current client
 	// state. It is guarded by mu and remains separate from shutdownStarted:
 	// reconnect exhaustion does not mean Close has been entered.
 	reconnectErr      error
-	reconnect         *reconnectAttempt
 	reconnectRequests chan reconnectRequest
 	reconnectRandom   func() float64
 	supervisorCtx     context.Context
 	supervisorCancel  context.CancelFunc
 	supervisorDone    chan struct{}
+	// attemptErr is the outcome of the attempt that last released
+	// attemptEnded, and is read only after that release.
+	attemptErr error
+	// attemptEnded is released, and immediately replaced, when the connection
+	// incarnation changes and when a reconnect attempt ends without changing
+	// it. A waiter captures it under mu beside the epoch and compares epochs
+	// after it fires: a moved epoch is a new connection, and an unchanged one
+	// means the attempt ended and the connection state is what it is.
+	attemptEnded chan struct{}
 
 	// producerCloseWait holds a still-running producer Close call from a
 	// prior Close attempt that did not return within its close timeout. A
@@ -146,7 +170,7 @@ func New(ctx context.Context, cfg Config, opts ...Option) (*Client, error) {
 	}
 	supervisorCtx, supervisorCancel := context.WithCancel(context.Background())
 	client := &Client{
-		conn:              connection,
+		current:           currentConnection{conn: connection, epoch: 1},
 		effective:         effective,
 		options:           options,
 		driverName:        driverName,
@@ -158,6 +182,7 @@ func New(ctx context.Context, cfg Config, opts ...Option) (*Client, error) {
 		supervisorCtx:     supervisorCtx,
 		supervisorCancel:  supervisorCancel,
 		supervisorDone:    make(chan struct{}),
+		attemptEnded:      make(chan struct{}),
 		runners:           make(map[*Runner]struct{}),
 	}
 	client.limits = limitsFor(driverName, connection.BrokerInfo(), effective)
@@ -196,7 +221,7 @@ func (c *Client) topologyPolicy() driver.TopologyPolicy {
 
 func (c *Client) ensurePublisherTopology(ctx context.Context) error {
 	c.mu.Lock()
-	conn := c.conn
+	conn := c.current.conn
 	effective := c.effective
 	c.mu.Unlock()
 	return c.ensurePublisherTopologyOn(ctx, conn, effective)
@@ -299,28 +324,11 @@ func (c *Client) Health(ctx context.Context) error {
 		return fmt.Errorf("f1: client is not connected")
 	}
 	c.mu.Lock()
-	if c.closed {
-		c.mu.Unlock()
-		return fmt.Errorf("f1: client is closed")
-	}
-	if c.reconnectErr != nil {
-		err := c.reconnectErr
+	if err := c.admit(workHealth, 0); err != nil {
 		c.mu.Unlock()
 		return err
 	}
-	if c.conn == nil {
-		c.mu.Unlock()
-		return fmt.Errorf("f1: client is not connected")
-	}
-	if c.reconnecting {
-		c.mu.Unlock()
-		return fmt.Errorf("f1: client is reconnecting")
-	}
-	if c.shutdownStarted {
-		c.mu.Unlock()
-		return fmt.Errorf("f1: client is closing")
-	}
-	conn := c.conn
+	conn := c.current.conn
 	c.mu.Unlock()
 	if err := conn.Ping(ctx); err != nil {
 		return err
@@ -446,10 +454,16 @@ func (c *Client) Close(ctx context.Context) error {
 func (c *Client) beginClose() ([]*Runner, bool, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.closed {
+	// A Close that has already finished succeeds again without doing anything,
+	// and one that is already running is refused so the caller keeps to one
+	// phase sequence at a time. Aborted proceeds: it is a Close that failed
+	// part way, either a bound expired or the connection close did not return,
+	// and a retried Close rejoins the phase that is still pending. That is why
+	// shutdownStarted stays set once it is set and closing does not.
+	switch c.lifecycleLocked() {
+	case lifecycle.Closed:
 		return nil, true, nil
-	}
-	if c.closing {
+	case lifecycle.Draining:
 		return nil, false, fmt.Errorf("f1: client is closing")
 	}
 	c.closing = true
@@ -542,7 +556,7 @@ func (c *Client) waitForPublishes(ctx context.Context) error {
 func (c *Client) closeResources(ctx context.Context) error {
 	c.mu.Lock()
 	producer := c.producerHandle
-	conn := c.conn
+	conn := c.current.conn
 	c.mu.Unlock()
 	if producer == nil {
 		return c.closeConnection(ctx, conn, nil)
@@ -636,19 +650,24 @@ func (c *Client) joinShutdownPhase(ctx context.Context, timeout time.Duration, p
 }
 
 // publishMessages sends core-generated successor messages through the client's
-// shared producer. allowClosing is reserved for workers finishing a delivery
-// after Close has stopped admission of new application publishes.
-func publishMessages(c *Client, ctx context.Context, allowClosing bool, messages ...driver.OutboundMessage) error {
+// shared producer, on the admission every publish through that producer uses.
+func publishMessages(c *Client, ctx context.Context, messages ...driver.OutboundMessage) error {
 	if len(messages) == 0 {
 		return nil
 	}
 	c.mu.Lock()
-	if err := publishAdmissionLocked(c, allowClosing); err != nil {
+	if err := c.admit(workPublish, 0); err != nil {
 		c.mu.Unlock()
 		return err
 	}
 	producer := c.producerHandle
-	conn := c.conn
+	// The connection and its incarnation are one value, read in the section
+	// that decides whether this call builds a producer: the producer is built
+	// on that connection, and the admission after it compares the claim that
+	// came with it.
+	current := c.current
+	conn := current.conn
+	epoch := current.epoch
 	effective := c.effective
 	if producer != nil {
 		beginPublish(c)
@@ -657,7 +676,7 @@ func publishMessages(c *Client, ctx context.Context, allowClosing bool, messages
 		c.mu.Unlock()
 		builtProducer, err := conn.Producer(ctx, driver.ProducerConfig{RequireDurableAck: true, Effective: effective})
 		if err != nil {
-			requestReconnectOnTransient(c, err)
+			requestReconnectOnTransient(c, err, epoch)
 			return err
 		}
 		if builtProducer == nil {
@@ -666,10 +685,7 @@ func publishMessages(c *Client, ctx context.Context, allowClosing bool, messages
 
 		var loser driver.Producer
 		c.mu.Lock()
-		err = publishAdmissionLocked(c, allowClosing)
-		if err == nil && !sameConnection(c.conn, conn) {
-			err = c.reconnectingError("publish")
-		}
+		err = c.admit(workPublish, epoch)
 		if err == nil {
 			if c.producerHandle != nil {
 				producer = c.producerHandle
@@ -691,21 +707,8 @@ func publishMessages(c *Client, ctx context.Context, allowClosing bool, messages
 	}
 	defer endPublish(c)
 	err := producer.Publish(ctx, messages...)
-	requestReconnectOnTransient(c, err)
+	requestReconnectOnTransient(c, err, epoch)
 	return err
-}
-
-func publishAdmissionLocked(c *Client, allowClosing bool) error {
-	if c.closed || c.conn == nil || (!allowClosing && c.shutdownStarted) || (allowClosing && c.producerTeardown) {
-		return errors.New("f1: client is closed")
-	}
-	if c.reconnectErr != nil {
-		return c.reconnectErr
-	}
-	if c.reconnecting {
-		return c.reconnectingError("publish")
-	}
-	return nil
 }
 
 func closeDiscardedProducer(c *Client, producer driver.Producer, ctx context.Context) {
@@ -718,7 +721,8 @@ func closeDiscardedProducer(c *Client, producer driver.Producer, ctx context.Con
 }
 
 // requestReconnectOnTransient requests a reconnect when err is evidence that
-// the connection is unhealthy.
+// the connection is unhealthy, naming the connection the failed call was made
+// on by its epoch, so a request a swap has already answered is dropped.
 //
 // A *driver.PublishError is that evidence only when a failed message carries an
 // error the driver itself classified transient; a driver that said transient
@@ -728,7 +732,7 @@ func closeDiscardedProducer(c *Client, producer driver.Producer, ctx context.Con
 // untranslated reports KindTransient and reports it as classified. That default
 // is a retry hint for the caller and says nothing about the socket, so it must
 // not bring the connection down.
-func requestReconnectOnTransient(c *Client, err error) {
+func requestReconnectOnTransient(c *Client, err error, epoch uint64) {
 	if c == nil || err == nil {
 		return
 	}
@@ -738,7 +742,7 @@ func requestReconnectOnTransient(c *Client, err error) {
 	if partial, ok := errors.AsType[*driver.PublishError](err); ok && !carriesTransientCause(partial) {
 		return
 	}
-	_, _ = c.requestReconnect(err)
+	_ = c.requestReconnect(err, epoch)
 }
 
 // carriesTransientCause reports whether any failed message in a batch carries

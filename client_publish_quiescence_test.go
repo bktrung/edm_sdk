@@ -133,7 +133,7 @@ func TestCloseDoesNotCloseProducerWhileSuccessorPublishInFlight(t *testing.T) {
 
 	publishDone := make(chan error, 1)
 	go func() {
-		publishDone <- publishMessages(client, context.Background(), true, driver.OutboundMessage{Destination: "orders.created", Body: []byte("{}")})
+		publishDone <- publishMessages(client, context.Background(), driver.OutboundMessage{Destination: "orders.created", Body: []byte("{}")})
 	}()
 	timer := clock.NewReal().Timer(2 * time.Second)
 	defer timer.Stop()
@@ -209,7 +209,7 @@ func TestWaitForPublishesSpansLateGenerationsAndBarsTeardownAdmission(t *testing
 	if !barricaded {
 		t.Fatal("producer teardown barrier was not set when the wait observed zero")
 	}
-	if err := publishMessages(client, context.Background(), true, driver.OutboundMessage{Destination: "orders.created"}); err == nil {
+	if err := publishMessages(client, context.Background(), driver.OutboundMessage{Destination: "orders.created"}); err == nil {
 		t.Fatal("successor publish was admitted after producer teardown began")
 	}
 }
@@ -286,7 +286,7 @@ func TestFailedCloseKeepsProducerTeardownBarrierSet(t *testing.T) {
 		t.Fatalf("closing = %v, closed = %v, want a failed Close to leave the client retryable", closing, closed)
 	}
 
-	if err := publishMessages(client, context.Background(), true, driver.OutboundMessage{Destination: "orders.created"}); err == nil || !strings.Contains(err.Error(), "client is closed") {
+	if err := publishMessages(client, context.Background(), driver.OutboundMessage{Destination: "orders.created"}); err == nil || !strings.Contains(err.Error(), "client is closed") {
 		t.Fatalf("successor publish after a failed Close = %v, want refused with client is closed: the barrier must survive the failure", err)
 	}
 

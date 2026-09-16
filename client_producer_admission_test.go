@@ -115,7 +115,7 @@ func TestPublishProducerBuildDoesNotHoldClientLock(t *testing.T) {
 		_ = client.Close(context.Background())
 	})
 	go func() {
-		publishDone <- publishMessages(client, context.Background(), true, driver.OutboundMessage{Destination: "orders.created"})
+		publishDone <- publishMessages(client, context.Background(), driver.OutboundMessage{Destination: "orders.created"})
 	}()
 	waitForSignal(t, buildStarted, "producer construction")
 
@@ -191,7 +191,7 @@ func TestConcurrentFirstPublishesInstallOneProducerAndCloseLoser(t *testing.T) {
 	})
 	for range 2 {
 		go func() {
-			results <- publishMessages(client, context.Background(), true, driver.OutboundMessage{Destination: "orders.created"})
+			results <- publishMessages(client, context.Background(), driver.OutboundMessage{Destination: "orders.created"})
 		}()
 	}
 	waitForSignal(t, built, "first producer build")
@@ -231,7 +231,7 @@ func TestConcurrentFirstPublishesInstallOneProducerAndCloseLoser(t *testing.T) {
 		}
 	}
 
-	if err := publishMessages(client, context.Background(), true, driver.OutboundMessage{Destination: "orders.created"}); err != nil {
+	if err := publishMessages(client, context.Background(), driver.OutboundMessage{Destination: "orders.created"}); err != nil {
 		t.Fatalf("later publish = %v, want nil", err)
 	}
 	conn.mu.Lock()
@@ -262,7 +262,7 @@ func TestPublishRejectsProducerWhenCloseWinsDuringBuild(t *testing.T) {
 	}
 	defer func() { _ = client.Close(context.Background()) }()
 
-	err = publishMessages(client, context.Background(), true, driver.OutboundMessage{Destination: "orders.created"})
+	err = publishMessages(client, context.Background(), driver.OutboundMessage{Destination: "orders.created"})
 	if err == nil || err.Error() != "f1: client is closed" {
 		t.Fatalf("publish after close wins = %v, want client is closed", err)
 	}
@@ -280,7 +280,7 @@ func TestPublishRejectsProducerFromRetiredConnection(t *testing.T) {
 		publishConn: retired,
 		build: func() (driver.Producer, error) {
 			client.mu.Lock()
-			client.conn = current
+			client.current = currentConnection{conn: current, epoch: client.current.epoch + 1}
 			client.mu.Unlock()
 			return built, nil
 		},
@@ -292,7 +292,7 @@ func TestPublishRejectsProducerFromRetiredConnection(t *testing.T) {
 	}
 	defer func() { _ = client.Close(context.Background()) }()
 
-	err = publishMessages(client, context.Background(), true, driver.OutboundMessage{Destination: "orders.created"})
+	err = publishMessages(client, context.Background(), driver.OutboundMessage{Destination: "orders.created"})
 	if err == nil || !strings.Contains(err.Error(), "reconnecting") {
 		t.Fatalf("publish with retired connection = %v, want reconnecting error", err)
 	}
@@ -429,7 +429,7 @@ func TestPublishBatchRejectsStaleConnectionAfterProducerBuild(t *testing.T) {
 	}()
 	waitForSignal(t, buildStarted, "batch producer construction")
 	client.mu.Lock()
-	client.conn = current
+	client.current = currentConnection{conn: current, epoch: client.current.epoch + 1}
 	client.mu.Unlock()
 	releaseOnce.Do(func() { close(buildRelease) })
 	response := <-batchDone
@@ -537,8 +537,10 @@ func TestPublishBatchRejectsReconnectInFlight(t *testing.T) {
 	d := &reconnectTestDriver{created: make(chan *reconnectTestConsumer, 1)}
 	client := newReconnectTestClient(t, d, recorded, 0)
 	client.reconnectRandom = func() float64 { return 1 }
-	attempt, err := client.requestReconnect(errors.New("batch reconnect"))
-	if err != nil {
+	client.mu.Lock()
+	epoch := client.current.epoch
+	client.mu.Unlock()
+	if err := client.requestReconnect(errors.New("batch reconnect"), epoch); err != nil {
 		t.Fatal(err)
 	}
 	waitReconnectCondition(t, func() bool { return recorded.sleepCount() == 1 })
@@ -554,8 +556,9 @@ func TestPublishBatchRejectsReconnectInFlight(t *testing.T) {
 	}
 	fake.BlockUntil(1)
 	fake.Advance(500 * time.Millisecond)
-	if err := client.waitReconnect(context.Background(), attempt); err != nil {
-		t.Fatalf("reconnect = %v, want nil", err)
+	waitReconnectCondition(t, func() bool { return !client.isReconnecting() })
+	if err := client.Health(context.Background()); err != nil {
+		t.Fatalf("Health() after the reconnect = %v, want nil", err)
 	}
 }
 

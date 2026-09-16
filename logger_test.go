@@ -267,11 +267,18 @@ func TestRetiredCloseFailuresUseLastResortLogger(t *testing.T) {
 				t.Fatal(err)
 			}
 			t.Cleanup(func() { _ = client.Close(context.Background()) })
+			client.mu.Lock()
+			// The retirement the supervisor performs runs after the swap: the
+			// epoch the old connection was installed under is no longer the
+			// client's.
+			retiredEpoch := client.current.epoch
+			client.current.epoch++
+			client.mu.Unlock()
 			client.retireConnection(
 				context.Background(),
 				&retiredCloseProducer{err: errors.New("retired producer close failed")},
 				&testConn{closeErr: errors.New("retired connection close failed")},
-				&testConn{},
+				retiredEpoch,
 			)
 			if testCase.configuredLogger {
 				if got := configuredOutput.String(); !strings.Contains(got, "retired producer close failed") || !strings.Contains(got, "retired connection close failed") {

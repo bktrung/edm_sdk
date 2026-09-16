@@ -102,35 +102,16 @@ func (r *Runner) Run(ctx context.Context) (runErr error) {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	var preRunReconnect *reconnectAttempt
-	var preRunReconnectErr error
 	r.client.mu.Lock()
-	if r.client.closed || r.client.shutdownStarted || r.client.conn == nil {
+	if err := r.client.admit(workRun, 0); err != nil {
 		r.client.mu.Unlock()
-		return errors.New("f1: client is closing")
+		return err
 	}
 	r.mu.Lock()
 	if r.started {
 		r.mu.Unlock()
 		r.client.mu.Unlock()
 		return errors.New("f1: runner is already running")
-	}
-	if r.reconnectCause == errClientReconnecting && r.reconnectCauseAttempt != nil { //nolint:errorlint // exact sentinel identifies supervisor ownership
-		ownedAttempt := r.reconnectCauseAttempt
-		currentAttempt := r.client.reconnect
-		switch {
-		case currentAttempt != nil && currentAttempt != ownedAttempt:
-			r.reconnectCauseAttempt = currentAttempt
-			preRunReconnect = currentAttempt
-		case currentAttempt == ownedAttempt:
-			preRunReconnect = ownedAttempt
-		default:
-			preRunReconnectErr = ownedAttempt.err
-			if preRunReconnectErr == nil {
-				r.reconnectCause = nil
-				r.reconnectCauseAttempt = nil
-			}
-		}
 	}
 	r.started = true
 	r.done = make(chan struct{})
@@ -152,17 +133,6 @@ func (r *Runner) Run(ctx context.Context) (runErr error) {
 	// after finishRunner so it runs first and reads the result Run is about to
 	// hand back, including an error joined in by drainAfterRun.
 	defer func() { r.recordRunExit(ctx, runErr) }()
-	if preRunReconnectErr != nil {
-		return preRunReconnectErr
-	}
-	if preRunReconnect != nil {
-		if err := r.waitPreRunReconnect(ctx, preRunReconnect); err != nil {
-			if errors.Is(err, errRunnerDraining) {
-				return nil
-			}
-			return err
-		}
-	}
 	var runCtx context.Context
 	var cancel context.CancelFunc
 	generation := 0
@@ -193,7 +163,7 @@ func (r *Runner) Run(ctx context.Context) (runErr error) {
 		// sizes the ordered worker queues from it, so both read the same number
 		// instead of deriving it again from a formula that could drift.
 		prefetch := runnerConsumerPrefetch(r, r.config.Prefetch, runnerLanePlan(r))
-		consumer, openedOn, err := openRunnerConsumerWith(r, runCtx, prefetch)
+		consumer, openedEpoch, err := openRunnerConsumerWith(r, ctx, runCtx, prefetch)
 		r.mu.Lock()
 		draining = r.draining
 		r.mu.Unlock()
@@ -209,23 +179,26 @@ func (r *Runner) Run(ctx context.Context) (runErr error) {
 		}
 		if err != nil {
 			repairCause = nil
-			kind, classified := driver.Classify(err)
-			var ownedAttempt *reconnectAttempt
-			r.mu.Lock()
-			if r.reconnectCause == errClientReconnecting && r.reconnectCauseAttempt != nil { //nolint:errorlint // exact sentinel identifies supervisor ownership
-				ownedAttempt = r.reconnectCauseAttempt
-			} else if generation > 0 && (!classified || kind == driver.KindTransient) {
-				r.reconnectCause = err
-				r.reconnectCauseAttempt = nil
+			if errors.Is(err, errRunnerDraining) {
+				return nil
 			}
+			r.mu.Lock()
+			abandoned := r.abandoned
 			r.mu.Unlock()
-			if ownedAttempt != nil {
-				if reconnectErr := r.waitOwnedReconnect(ctx, ownedAttempt); reconnectErr != nil {
+			if abandoned {
+				// An attempt in flight released this consumer, and the open it
+				// cancelled is not a failure of the runner's: it waits for the
+				// attempt and opens again on what it leaves behind.
+				if reconnectErr := r.client.awaitRebuild(ctx, nil, 0, nil); reconnectErr != nil {
+					if errors.Is(reconnectErr, errRunnerDraining) {
+						return nil
+					}
 					runErr = reconnectErr
 					break
 				}
 				continue
 			}
+			kind, classified := driver.Classify(err)
 			if generation == 0 {
 				return err
 			}
@@ -233,8 +206,14 @@ func (r *Runner) Run(ctx context.Context) (runErr error) {
 				runErr = err
 				break
 			}
+			// The failure that could not open the consumer is the cause the
+			// rebuild is asked for, and it is what this runner reports if the
+			// rebuild hands one back.
 			r.transitionToReconnecting()
-			if reconnectErr := r.requestAndWaitReconnect(ctx, err); reconnectErr != nil {
+			if reconnectErr := r.client.awaitRebuild(ctx, err, 0, nil); reconnectErr != nil {
+				if errors.Is(reconnectErr, errRunnerDraining) {
+					return nil
+				}
 				runErr = reconnectErr
 				break
 			}
@@ -243,16 +222,27 @@ func (r *Runner) Run(ctx context.Context) (runErr error) {
 		// Admit only a consumer opened on the connection that is still live.
 		// requestReconnect marks the client before abandoning runners, so this
 		// critical section either rejects and releases this consumer or records
-		// it before abandonForReconnect can release it.
+		// it before abandonForReconnect can release it. The epoch the runner
+		// captured with the connection is what the admission compares, and the
+		// current one is read under the same lock, so a rejection is reported
+		// against the incarnation the rejection was taken against.
 		r.client.mu.Lock()
 		r.mu.Lock()
-		admitted := !r.client.reconnecting && sameConnection(r.client.conn, openedOn)
-		if admitted {
+		admissionErr := r.client.admit(workConsumerAdmission, openedEpoch)
+		currentEpoch := r.client.current.epoch
+		if admissionErr == nil {
 			r.consumer = consumer
 		}
 		r.mu.Unlock()
 		r.client.mu.Unlock()
-		if !admitted {
+		if admissionErr != nil {
+			if currentEpoch != openedEpoch {
+				// A stale open is repaired at once by the next iteration, so it
+				// earns a debug line and not a Health entry: a surface that
+				// reports self-healing states teaches people to ignore it.
+				lastResortRunnerLogger(r).Debug("f1 consumer discarded after the connection was replaced",
+					"subscription", r.subscription.Name, "opened_epoch", openedEpoch, "current_epoch", currentEpoch)
+			}
 			if closeErr := runWithClockTimeout(context.WithoutCancel(runCtx), r.client.options.clock, r.client.config.Lifecycle.CloseTimeout, "consumer release", func(closeCtx context.Context) error {
 				return consumer.Release(closeCtx)
 			}); closeErr != nil {
@@ -315,34 +305,36 @@ func (r *Runner) Run(ctx context.Context) (runErr error) {
 		// After group.Wait, this snapshot is the only reader window for the
 		// generation result. The later repair write-back remains a separate lock.
 		r.mu.Lock()
-		reconnectCause := r.reconnectCause
-		reconnectCauseAttempt := r.reconnectCauseAttempt
+		failureCause := r.failureCause
+		abandoned := r.abandoned
 		consumerError := r.consumerError
 		successfulDelivery := r.successfulDelivery
 		repairCycleActive := r.repairCycleActive
 		failedRepairCycles := r.failedRepairCycles
 		draining = r.draining
 		failedLifecycle := r.lifecycle != nil && r.lifecycle.State() == lifecycle.Failed
-		decisionHook := r.reconnectDecisionHook
 		r.mu.Unlock()
 		if failedLifecycle {
 			runErr = generationErr
 			break
 		}
-		if decisionHook != nil {
-			decisionHook()
-		}
+		// The runner's own failure is what a rebuild is asked for. A generation
+		// that failed for any other reason - a pipeline or fetcher error, or
+		// the cancellation an attempt abandoning this runner produces - is not
+		// a cause, and the runner stops for that error instead of asking for a
+		// rebuild on its behalf.
+		cause := failureCause
 		clientReconnecting := r.client.isReconnecting()
-		if ctx.Err() != nil || draining || (!clientReconnecting && reconnectCause == nil) {
+		// Three things keep a stopped generation alive. A generation whose
+		// connection has already been replaced reopens on the replacement,
+		// whether or not an attempt is still running for it. One abandoned by an
+		// attempt in flight waits that attempt out and reports its outcome,
+		// which is how a fatal rebuild stops every runner it abandoned. And one
+		// that failed for its own reason asks for a rebuild.
+		if ctx.Err() != nil || draining ||
+			(!clientReconnecting && cause == nil && !abandoned && !r.client.claimReplaced(openedEpoch)) {
 			runErr = generationErr
 			break
-		}
-		if reconnectCauseAttempt != nil && reconnectCause == errClientReconnecting { //nolint:errorlint // exact sentinel identifies supervisor ownership
-			if reconnectErr := r.waitOwnedReconnect(ctx, reconnectCauseAttempt); reconnectErr != nil {
-				runErr = reconnectErr
-				break
-			}
-			continue
 		}
 		if consumerError && !clientReconnecting {
 			if successfulDelivery {
@@ -359,21 +351,18 @@ func (r *Runner) Run(ctx context.Context) (runErr error) {
 			r.mu.Unlock()
 			if failedRepairCycles < 2 {
 				if releaseErr := releaseRunnerConsumer(r, context.WithoutCancel(runCtx)); releaseErr == nil {
-					repairCause = reconnectCause
+					repairCause = cause
 					continue
 				} else {
-					reconnectCause = errors.Join(reconnectCause, releaseErr)
+					cause = errors.Join(cause, releaseErr)
 				}
 			}
 		}
-		if reconnectCause == nil {
-			reconnectCause = generationErr
-		}
-		if reconnectCause == nil {
-			reconnectCause = errClientReconnecting
-		}
 		r.transitionToReconnecting()
-		if reconnectErr := r.requestAndWaitReconnect(ctx, reconnectCause); reconnectErr != nil {
+		if reconnectErr := r.client.awaitRebuild(ctx, cause, openedEpoch, nil); reconnectErr != nil {
+			if errors.Is(reconnectErr, errRunnerDraining) {
+				return nil
+			}
 			runErr = reconnectErr
 			break
 		}
@@ -422,96 +411,7 @@ func (r *Runner) recordRunExit(ctx context.Context, err error) {
 	c.recordRunnerExitLocked(r, err)
 }
 
-func (r *Runner) requestAndWaitReconnect(ctx context.Context, cause error) error {
-	attempt, err := r.client.requestReconnect(cause)
-	if err != nil {
-		return err
-	}
-	return r.client.waitReconnect(ctx, attempt)
-}
-
 var errRunnerDraining = errors.New("f1: runner is draining")
-
-func (r *Runner) waitOwnedReconnect(ctx context.Context, attempt *reconnectAttempt) error {
-	return r.waitOwnedReconnectUntil(ctx, attempt, nil)
-}
-
-func (r *Runner) waitPreRunReconnect(ctx context.Context, attempt *reconnectAttempt) error {
-	return r.waitOwnedReconnectUntil(ctx, attempt, r.drainStarted)
-}
-
-func (r *Runner) waitOwnedReconnectUntil(ctx context.Context, attempt *reconnectAttempt, drain <-chan struct{}) error {
-	for {
-		r.mu.Lock()
-		decisionHook := r.reconnectDecisionHook
-		r.mu.Unlock()
-		if decisionHook != nil {
-			decisionHook()
-		}
-		if attempt != nil {
-			select {
-			case <-attempt.done:
-			case <-ctx.Done():
-				return ctx.Err()
-			case <-drain:
-				return errRunnerDraining
-			}
-		}
-		r.client.mu.Lock()
-		var reconnectErr error
-		var currentAttempt *reconnectAttempt
-		if attempt != nil {
-			reconnectErr = attempt.err
-			currentAttempt = r.client.reconnect
-		}
-		// Keep Client.mu while taking Runner.mu. Ownership can move while this
-		// attempt is in flight: the supervisor records the newest attempt on the
-		// runner when it abandons it, and registers that same attempt on the
-		// client. Either record is newer than this attempt, so adopt it before
-		// reading any result, otherwise a superseded attempt's error would fail a
-		// runner the client is already recovering.
-		r.mu.Lock()
-		if attempt != nil &&
-			r.reconnectCause == errClientReconnecting { //nolint:errorlint // exact sentinel identifies supervisor ownership
-			nextAttempt := r.reconnectCauseAttempt
-			if nextAttempt == attempt && currentAttempt != nil && currentAttempt != attempt {
-				nextAttempt = currentAttempt
-			}
-			if nextAttempt != nil && nextAttempt != attempt {
-				r.reconnectCauseAttempt = nextAttempt
-				r.mu.Unlock()
-				r.client.mu.Unlock()
-				attempt = nextAttempt
-				continue
-			}
-		}
-		if reconnectErr != nil {
-			r.mu.Unlock()
-			r.client.mu.Unlock()
-			return reconnectErr
-		}
-		if r.reconnectCause == errClientReconnecting { //nolint:errorlint // exact sentinel identifies supervisor ownership
-			if r.reconnectCauseAttempt == attempt {
-				r.reconnectCause = nil
-				r.reconnectCauseAttempt = nil
-				r.mu.Unlock()
-				r.client.mu.Unlock()
-				return nil
-			}
-			nextAttempt := r.reconnectCauseAttempt
-			r.mu.Unlock()
-			r.client.mu.Unlock()
-			if nextAttempt != nil {
-				attempt = nextAttempt
-				continue
-			}
-			return nil
-		}
-		r.mu.Unlock()
-		r.client.mu.Unlock()
-		return nil
-	}
-}
 
 // beginRunnerGeneration resets the per-generation runner state at the top of
 // Run's loop, where the generation's run context is created. The settlement
@@ -536,9 +436,8 @@ func beginRunnerGeneration(r *Runner, runCtx context.Context, cancel context.Can
 	r.cancel = cancel
 	r.settleCtx = nil
 	r.settleCancel = nil
-	if r.reconnectCauseAttempt == nil {
-		r.reconnectCause = nil
-	}
+	r.abandoned = false
+	r.failureCause = nil
 	r.consumerError = false
 	r.successfulDelivery = false
 	group := new(errgroup.Group)
@@ -1185,40 +1084,48 @@ func lastResortRunnerLogger(r *Runner) *slog.Logger {
 	return slog.Default()
 }
 
-// openRunnerConsumer opens the consumer with the budget derived from the
-// runner's own configuration. Run derives that budget once per generation and
-// calls openRunnerConsumerWith, so the driver's limit and the pipeline's
-// ordered queue depth are the same number even when they are not both derived
-// from the configuration at the same point in time.
-func openRunnerConsumer(r *Runner, ctx context.Context) (driver.Consumer, error) {
-	consumer, _, err := openRunnerConsumerWith(r, ctx, runnerConsumerPrefetch(r, r.config.Prefetch, runnerLanePlan(r)))
-	return consumer, err
-}
-
 // openRunnerConsumerWith opens the consumer for a generation whose total
 // in-flight budget is prefetch, as derived by Run, and returns the connection
-// used to open it.
-func openRunnerConsumerWith(r *Runner, ctx context.Context, prefetch int) (driver.Consumer, driver.Conn, error) {
+// incarnation it opened it on. The connection and the incarnation are one value
+// on the client, so the number the caller admits its consumer with later is the
+// number that belongs to the connection it actually used.
+//
+// waitCtx is the runner's own context and genCtx is the generation's. The wait
+// for a rebuild ends on genCtx only when the caller cancels the runner: an
+// attempt that abandons this runner cancels genCtx to release the topology call
+// or consumer open in flight, and a runner waiting for that attempt has to keep
+// waiting, because the attempt is rebuilding the connection it is about to open
+// on. Its drain is what ends that wait early.
+func openRunnerConsumerWith(r *Runner, waitCtx, genCtx context.Context, prefetch int) (driver.Consumer, uint64, error) {
 	var conn driver.Conn
+	var epoch uint64
 	var effective driver.Capabilities
 	var source string
 	for {
 		r.client.mu.Lock()
-		if r.client.reconnecting && r.client.reconnect != nil {
-			attempt := r.client.reconnect
+		if r.client.reconnecting {
 			r.client.mu.Unlock()
-			r.mu.Lock()
-			waitHook := r.reconnectWaitHook
-			r.mu.Unlock()
-			if waitHook != nil {
-				waitHook()
-			}
-			if err := r.client.waitReconnect(ctx, attempt); err != nil {
-				return nil, nil, err
+			// The runner asks for nothing here: an attempt is already
+			// rebuilding the connection, and this runner waits for it before
+			// it opens a consumer on an incarnation the swap is about to
+			// retire.
+			if err := r.client.awaitRebuild(waitCtx, nil, 0, r.drainStarted); err != nil {
+				return nil, 0, err
 			}
 			continue
 		}
-		conn = r.client.conn
+		if r.client.connStateLocked() == connFailed {
+			// The connection was given up and nothing is rebuilding it. The
+			// runner needs one to open a consumer, and the decision that gave
+			// it up is what it reports instead of opening on a connection the
+			// client has already declared broken.
+			failed := r.client.reconnectErr
+			r.client.mu.Unlock()
+			return nil, 0, failed
+		}
+		current := r.client.current
+		conn = current.conn
+		epoch = current.epoch
 		effective = r.client.effective
 		source = r.client.source
 		r.client.mu.Unlock()
@@ -1226,7 +1133,7 @@ func openRunnerConsumerWith(r *Runner, ctx context.Context, prefetch int) (drive
 	}
 	policy := r.client.topologyPolicy()
 	if conn == nil {
-		return nil, nil, errors.New("f1: client is not connected")
+		return nil, 0, errors.New("f1: client is not connected")
 	}
 	destinations := subscriptionDestinations(effective, source, r.subscription)
 	retryDestinationTiers := retryDestinationTierMap(source, r.subscription)
@@ -1239,13 +1146,13 @@ func openRunnerConsumerWith(r *Runner, ctx context.Context, prefetch int) (drive
 	// the call.
 	admin := conn.Admin()
 	if admin == nil {
-		return nil, nil, errors.New("f1: consumer topology requires driver admin")
+		return nil, 0, errors.New("f1: consumer topology requires driver admin")
 	}
 	topology := subscriptionTopologySpecs(effective, source, r.subscription)
 	topology.Policy = policy
-	diff, err := admin.EnsureTopology(ctx, topology)
+	diff, err := admin.EnsureTopology(genCtx, topology)
 	if err != nil {
-		return nil, nil, fmt.Errorf("f1: ensure subscription topology: %w", err)
+		return nil, 0, fmt.Errorf("f1: ensure subscription topology: %w", err)
 	}
 	logTopologyDrift(lastResortRunnerLogger(r), diff)
 	// Each destination's cap is its lane's capacity, so a lane can never hold
@@ -1260,7 +1167,7 @@ func openRunnerConsumerWith(r *Runner, ctx context.Context, prefetch int) (drive
 	for _, lane := range lanes {
 		perDestination[lane.destination] = lane.capacity
 	}
-	consumer, err := conn.Consumer(ctx, driver.ConsumerConfig{
+	consumer, err := conn.Consumer(genCtx, driver.ConsumerConfig{
 		Group:          r.subscription.Name,
 		Destinations:   destinations,
 		Prefetch:       prefetch,
@@ -1271,12 +1178,12 @@ func openRunnerConsumerWith(r *Runner, ctx context.Context, prefetch int) (drive
 		StartAt:        driver.StartEarliest,
 	})
 	if err != nil {
-		return nil, nil, fmt.Errorf("f1: create subscription %s: %w", r.subscription.Name, err)
+		return nil, 0, fmt.Errorf("f1: create subscription %s: %w", r.subscription.Name, err)
 	}
 	if consumer == nil {
-		return nil, nil, errors.New("f1: driver returned a nil consumer")
+		return nil, 0, errors.New("f1: driver returned a nil consumer")
 	}
-	return consumer, conn, nil
+	return consumer, epoch, nil
 }
 
 func consumeRunnerErrors(r *Runner, ctx context.Context) error {
@@ -1331,9 +1238,8 @@ func consumeRunnerErrors(r *Runner, ctx context.Context) error {
 				if kind == driver.KindTransient {
 					r.consumerError = true
 				}
-				if r.reconnectCause == nil {
-					r.reconnectCause = err
-					r.reconnectCauseAttempt = nil
+				if r.failureCause == nil {
+					r.failureCause = err
 				}
 				cancel = r.cancel
 				r.mu.Unlock()
@@ -2003,7 +1909,7 @@ func publishSuccessor(r *Runner, ctx context.Context, messages ...driver.Outboun
 			}
 			break
 		}
-		err := publishMessages(r.client, ctx, true, messages...)
+		err := publishMessages(r.client, ctx, messages...)
 		if err == nil {
 			return nil
 		}

@@ -159,7 +159,7 @@ func TestSubscriberTopologyPolicyControlsAdminCalls(t *testing.T) {
 				},
 				config: SubscriptionConfig{Prefetch: 1},
 			}
-			_, err = openRunnerConsumer(runner, context.Background())
+			_, err = openRunnerConsumerForTest(runner, context.Background())
 			require.NoError(t, err)
 			require.NoError(t, client.Close(context.Background()))
 			// Every policy reaches the admin, TopologyNone included: under that
@@ -293,7 +293,7 @@ func TestSubscriberTopologyArgumentDriftWarns(t *testing.T) {
 		subscription: topologyTestSubscription(),
 		config:       SubscriptionConfig{Prefetch: 1},
 	}
-	consumer, err := openRunnerConsumer(runner, context.Background())
+	consumer, err := openRunnerConsumerForTest(runner, context.Background())
 	require.NoError(t, err)
 	require.NoError(t, consumer.Stop(context.Background()))
 
