@@ -176,12 +176,16 @@ func (l *recordingLog) describe() string {
 	return builder.String()
 }
 
-// publishHold is one publish the wrapper keeps open until its test releases it.
-// The hold sits between the driver's Publish return and the wrapper's own, so
-// the call the core admitted has not returned: the core still counts it in
-// flight, and Close must still wait it out. The driver call itself is already
-// made, so a drain that cancels the caller's context mid-hold cannot turn the
-// held publish into a failed one and change what the test is measuring.
+// publishHold is one wrapped driver call the wrapper keeps open until its test
+// releases it. It is named for the publish case it was written for; the
+// consumer and settle calls the wrapper holds use the same shape, so a reader
+// should read "publish" here as the call being held.
+//
+// The hold sits between the driver call's return and the wrapper's own, so the
+// call the core made has not returned: the core still counts it in flight, and
+// Close must still wait it out. The driver call itself is already made, so a
+// drain that cancels the caller's context mid-hold cannot turn the held call
+// into a failed one and change what the test is measuring.
 type publishHold struct {
 	started chan struct{}
 	release chan struct{}
@@ -192,11 +196,49 @@ func (h *publishHold) letGo() {
 	h.once.Do(func() { close(h.release) })
 }
 
-// await blocks until the test releases the hold, and reports that the publish
+// await blocks until the test releases the hold, and reports that the call
 // reached it by closing started.
 func (h *publishHold) await() {
 	close(h.started)
 	<-h.release
+}
+
+// callGate arranges for one call the wrapper observes next to be held open
+// until the test releases it. Holding is by the event kind the call records,
+// which is what the call sites already name: a test arms the kind it is about
+// and the wrapper consults the gate where it records that kind.
+//
+// A hold is taken by the first call of its kind, wherever in the log that call
+// falls, so a test that arms the release hold before it publishes still holds
+// the release the core makes later rather than waiting on a clock.
+type callGate struct {
+	mu   sync.Mutex
+	next map[recordingEventKind]*publishHold
+}
+
+func newCallGate() *callGate {
+	return &callGate{next: make(map[recordingEventKind]*publishHold)}
+}
+
+// holdNext arms the gate to keep the next call recording one of kinds open
+// until the returned hold is released.
+func (g *callGate) holdNext(kinds ...recordingEventKind) *publishHold {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	slot := &publishHold{started: make(chan struct{}), release: make(chan struct{})}
+	for _, kind := range kinds {
+		g.next[kind] = slot
+	}
+	return slot
+}
+
+// begin takes the hold armed for one call recording kind, if any.
+func (g *callGate) begin(kind recordingEventKind) *publishHold {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	hold := g.next[kind]
+	delete(g.next, kind)
+	return hold
 }
 
 // publishGate decides which publish calls the wrapper holds, and records how
@@ -273,6 +315,8 @@ type recordingDriver struct {
 	inner           inmem.Driver
 	log             *recordingLog
 	gate            *publishGate
+	calls           *callGate
+	injected        chan error
 	consumerCreated chan struct{}
 }
 
@@ -287,7 +331,7 @@ func (d *recordingDriver) Open(ctx context.Context, cfg driver.Config) (driver.C
 	if err != nil {
 		return nil, err
 	}
-	return &recordingConn{inner: conn, log: d.log, gate: d.gate, consumerCreated: d.consumerCreated}, nil
+	return &recordingConn{inner: conn, log: d.log, gate: d.gate, calls: d.calls, injected: d.injected, consumerCreated: d.consumerCreated}, nil
 }
 
 // recordingConn wraps one connection. consumerCreated closes once the runner
@@ -298,6 +342,8 @@ type recordingConn struct {
 	inner           driver.Conn
 	log             *recordingLog
 	gate            *publishGate
+	calls           *callGate
+	injected        chan error
 	consumerCreated chan struct{}
 	created         sync.Once
 }
@@ -318,13 +364,23 @@ func (c *recordingConn) Producer(ctx context.Context, cfg driver.ProducerConfig)
 }
 
 func (c *recordingConn) Consumer(ctx context.Context, cfg driver.ConsumerConfig) (driver.Consumer, error) {
+	hold := c.calls.begin(eventConsumerCreated)
 	consumer, err := c.inner.Consumer(ctx, cfg)
 	if err != nil {
 		return nil, err
 	}
+	if hold != nil {
+		hold.await()
+	}
 	c.log.record(eventConsumerCreated, "")
 	c.created.Do(func() { close(c.consumerCreated) })
-	return &recordingConsumer{inner: consumer, log: c.log, messages: recordingMessages(consumer, c.log)}, nil
+	return &recordingConsumer{
+		inner:    consumer,
+		log:      c.log,
+		calls:    c.calls,
+		errs:     relayConsumerErrors(consumer.Errors(), c.injected),
+		messages: recordingMessages(consumer, c.log, c.calls),
+	}, nil
 }
 
 func (c *recordingConn) Admin() driver.Admin { return c.inner.Admin() }
@@ -370,6 +426,8 @@ func (p *recordingProducer) Close(ctx context.Context) error {
 type recordingConsumer struct {
 	inner    driver.Consumer
 	log      *recordingLog
+	calls    *callGate
+	errs     <-chan error
 	messages <-chan driver.InboundMessage
 }
 
@@ -377,7 +435,7 @@ var _ driver.Consumer = (*recordingConsumer)(nil)
 
 func (c *recordingConsumer) Messages() <-chan driver.InboundMessage { return c.messages }
 
-func (c *recordingConsumer) Errors() <-chan error { return c.inner.Errors() }
+func (c *recordingConsumer) Errors() <-chan error { return c.errs }
 
 func (c *recordingConsumer) Pause(destinations ...string) error {
 	return c.inner.Pause(destinations...)
@@ -395,14 +453,25 @@ func (c *recordingConsumer) Drain(ctx context.Context) error {
 
 func (c *recordingConsumer) Stop(ctx context.Context) error {
 	err := c.inner.Stop(ctx)
+	c.awaitHold(eventConsumerStopped)
 	c.log.record(eventConsumerStopped, resultDetail("", err))
 	return err
 }
 
 func (c *recordingConsumer) Release(ctx context.Context) error {
 	err := c.inner.Release(ctx)
+	c.awaitHold(eventConsumerReleased)
 	c.log.record(eventConsumerReleased, resultDetail("", err))
 	return err
+}
+
+// awaitHold keeps one teardown call open after the driver has already made it,
+// so a test can assert that the core is still inside that call rather than
+// reading the order after the fact.
+func (c *recordingConsumer) awaitHold(kind recordingEventKind) {
+	if hold := c.calls.begin(kind); hold != nil {
+		hold.await()
+	}
 }
 
 func (c *recordingConsumer) Lag(ctx context.Context) (map[string]int64, error) {
@@ -416,6 +485,7 @@ func (c *recordingConsumer) Lag(ctx context.Context) (map[string]int64, error) {
 type recordingSettler struct {
 	inner       driver.Settler
 	log         *recordingLog
+	calls       *callGate
 	destination string
 	key         string
 }
@@ -424,14 +494,26 @@ var _ driver.Settler = (*recordingSettler)(nil)
 
 func (s *recordingSettler) Ack(ctx context.Context) error {
 	err := s.inner.Ack(ctx)
+	s.awaitHold(eventSettled)
 	s.log.recordMessage(eventSettled, s.destination, s.key, err)
 	return err
 }
 
 func (s *recordingSettler) Nack(ctx context.Context, options driver.NackOptions) error {
 	err := s.inner.Nack(ctx, options)
+	s.awaitHold(eventNacked)
 	s.log.recordMessage(eventNacked, s.destination, s.key, err)
 	return err
+}
+
+// awaitHold keeps one settle call open after the driver has already settled the
+// delivery, so a test can assert that the runner's shutdown still waits for the
+// settle to return rather than assuming it is done because the delivery left the
+// registry.
+func (s *recordingSettler) awaitHold(kind recordingEventKind) {
+	if hold := s.calls.begin(kind); hold != nil {
+		hold.await()
+	}
 }
 
 // recordingMessages relays the driver's deliveries through a channel of the
@@ -447,7 +529,7 @@ func (s *recordingSettler) Nack(ctx context.Context, options driver.NackOptions)
 // therefore keep deliveries off the consumer in the window where the client is
 // closing; close_order_test.go publishes its second event to a topic the
 // subscription does not consume for exactly that reason.
-func recordingMessages(inner driver.Consumer, log *recordingLog) <-chan driver.InboundMessage {
+func recordingMessages(inner driver.Consumer, log *recordingLog, calls *callGate) <-chan driver.InboundMessage {
 	messages := make(chan driver.InboundMessage)
 	go func() {
 		defer close(messages)
@@ -455,6 +537,7 @@ func recordingMessages(inner driver.Consumer, log *recordingLog) <-chan driver.I
 			message.Settle = &recordingSettler{
 				inner:       message.Settle,
 				log:         log,
+				calls:       calls,
 				destination: message.Destination,
 				key:         string(message.Key),
 			}
@@ -462,6 +545,33 @@ func recordingMessages(inner driver.Consumer, log *recordingLog) <-chan driver.I
 		}
 	}()
 	return messages
+}
+
+// relayConsumerErrors merges the driver's consumer errors with the ones a test
+// injects, so a test can drive the runner's error paths over the exported port.
+// The relay ends when the driver closes its channel, which the port does only
+// after Stop or Release completes, and a queued injection is dropped at that
+// point because the consumer it was meant for is gone.
+func relayConsumerErrors(inner <-chan error, injected <-chan error) <-chan error {
+	errs := make(chan error)
+	go func() {
+		defer close(errs)
+		for {
+			select {
+			case err, ok := <-inner:
+				if !ok {
+					return
+				}
+				errs <- err
+			case err, ok := <-injected:
+				if !ok {
+					return
+				}
+				errs <- err
+			}
+		}
+	}()
+	return errs
 }
 
 // messageDetail renders the destination and partition key of one message, so a
@@ -502,6 +612,8 @@ type recordingFixture struct {
 	client          *f1.Client
 	log             *recordingLog
 	gate            *publishGate
+	calls           *callGate
+	injected        chan error
 	consumerCreated <-chan struct{}
 }
 
@@ -509,8 +621,10 @@ func newRecordingFixture(t *testing.T, opts ...f1.Option) *recordingFixture {
 	t.Helper()
 	log := newRecordingLog()
 	gate := newPublishGate()
+	calls := newCallGate()
+	injected := make(chan error, 4)
 	consumerCreated := make(chan struct{})
-	wrapper := &recordingDriver{inner: inmem.New(), log: log, gate: gate, consumerCreated: consumerCreated}
+	wrapper := &recordingDriver{inner: inmem.New(), log: log, gate: gate, calls: calls, injected: injected, consumerCreated: consumerCreated}
 	options := append([]f1.Option{
 		f1.WithDriver(wrapper),
 		f1.WithLogger(slog.New(slog.NewTextHandler(io.Discard, nil))),
@@ -520,7 +634,21 @@ func newRecordingFixture(t *testing.T, opts ...f1.Option) *recordingFixture {
 		t.Fatalf("New() error = %v", err)
 	}
 	t.Cleanup(func() { _ = client.Close(context.Background()) })
-	return &recordingFixture{client: client, log: log, gate: gate, consumerCreated: consumerCreated}
+	return &recordingFixture{
+		client:          client,
+		log:             log,
+		gate:            gate,
+		calls:           calls,
+		injected:        injected,
+		consumerCreated: consumerCreated,
+	}
+}
+
+// injectError hands err to the runner as a consumer error, the same channel a
+// driver uses to report a broken consumer. It is how a test reaches the
+// runner's error paths over the exported port, which no public API exposes.
+func (f *recordingFixture) injectError(err error) {
+	f.injected <- err
 }
 
 // recordingClientConfig is the smallest resolvable configuration that carries a
