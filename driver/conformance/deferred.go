@@ -25,8 +25,8 @@ const (
 
 func init() { registerGroup("deferred", runDeferred) }
 
-// warmDeferredTopology pays Kafka's creation and metadata propagation cost before deferred timing checks.
-func warmDeferredTopology(group *groupContext) {
+// deferredDestinations is the topology the deferred group declares.
+func deferredDestinations(group *groupContext) []driver.DestinationSpec {
 	destinations := []driver.DestinationSpec{
 		{Name: "deferred.never-early", Delay: deferredDelay},
 		{Name: "deferred.never-early.control"},
@@ -49,6 +49,32 @@ func warmDeferredTopology(group *groupContext) {
 			driver.DestinationSpec{Name: "deferred.deadline.control"},
 		)
 	}
+	return destinations
+}
+
+// scopeDelays keys delays - logical destination names, as a check wrote them in
+// its topology - by the physical name a record carries. A destination a check
+// declares no delay for is left out, which is how the consumer built over it is
+// told that destination defers nothing.
+func scopeDelays(group *groupContext, delays map[string]time.Duration) map[string]time.Duration {
+	if len(delays) == 0 {
+		return nil
+	}
+	scoped := make(map[string]time.Duration, len(delays))
+	for destination, delay := range delays {
+		if delay > 0 {
+			scoped[profileDestination(group, destination)] = delay
+		}
+	}
+	if len(scoped) == 0 {
+		return nil
+	}
+	return scoped
+}
+
+// warmDeferredTopology pays Kafka's creation and metadata propagation cost before deferred timing checks.
+func warmDeferredTopology(group *groupContext) {
+	destinations := deferredDestinations(group)
 	warmTopology(group.t, group, driver.TopologySpec{
 		Destinations: destinations,
 		Effective:    group.effective,
@@ -62,7 +88,8 @@ func runDeferred(group *groupContext) {
 		control := "deferred.never-early.control"
 		producer := newDeferredProducer(t, group, profileDestination(group, deferred), deferredDelay)
 		controlProducer := newProducer(t, group, profileDestination(group, control), driver.ProducerConfig{Effective: group.effective})
-		consumer := deferredConsumer(t, group, []string{deferred, control}, 2)
+		consumer := deferredConsumer(t, group, []string{deferred, control},
+			map[string]time.Duration{deferred: deferredDelay}, 2)
 		publishedAt := deferredNow(group)
 		due := publishedAt.Add(deferredDelay)
 		if err := controlProducer.Publish(group.ctx, driver.OutboundMessage{Destination: control, Body: []byte("control")}); err != nil {
@@ -89,7 +116,7 @@ func runDeferred(group *groupContext) {
 	group.Check("deferred delivery is bounded in lateness", func(t *testing.T) {
 		name := "deferred.bounded-late"
 		producer := newDeferredProducer(t, group, profileDestination(group, name), deferredDelay)
-		consumer := deferredConsumer(t, group, []string{name}, 1)
+		consumer := deferredConsumer(t, group, []string{name}, map[string]time.Duration{name: deferredDelay}, 1)
 		due := deferredNow(group).Add(deferredDelay)
 		if err := producer.Publish(group.ctx, driver.OutboundMessage{Destination: name, Body: []byte("bounded"), DelayUntil: due}); err != nil {
 			t.Fatal(err)
@@ -108,7 +135,7 @@ func runDeferred(group *groupContext) {
 	group.Check("each in-band due time is delivered", func(t *testing.T) {
 		name := "deferred.band"
 		producer := newDeferredProducer(t, group, profileDestination(group, name), deferredDelay)
-		consumer := deferredConsumer(t, group, []string{name}, 3)
+		consumer := deferredConsumer(t, group, []string{name}, map[string]time.Duration{name: deferredDelay}, 3)
 		base := deferredNow(group)
 		// The offsets ascend, and that order is load-bearing rather than tidy: a driver
 		// that parks every deferred message of a destination in one queue releases them
@@ -160,7 +187,7 @@ func runDeferred(group *groupContext) {
 	group.Check("a nearer due time published after a farther one is delivered in due order", func(t *testing.T) {
 		name := "deferred.due-order"
 		producer := newDeferredProducer(t, group, profileDestination(group, name), deferredOrderDelay)
-		consumer := deferredConsumer(t, group, []string{name}, 2)
+		consumer := deferredConsumer(t, group, []string{name}, map[string]time.Duration{name: deferredOrderDelay}, 2)
 		// Publish order here is the opposite of due order, and that inversion is the
 		// whole instrument: a driver that parks every deferred message of one
 		// destination behind a single released head, or that holds a message waiting
@@ -249,7 +276,7 @@ func runDeferred(group *groupContext) {
 		control := "deferred.destination-delay.control"
 		producer := newDeferredProducer(t, group, profileDestination(group, name), deferredDelay)
 		controlProducer := newProducer(t, group, profileDestination(group, control), driver.ProducerConfig{Effective: group.effective})
-		consumer := deferredConsumer(t, group, []string{name, control}, 2)
+		consumer := deferredConsumer(t, group, []string{name, control}, map[string]time.Duration{name: deferredDelay}, 2)
 		publishedAt := deferredNow(group)
 		if err := producer.Publish(group.ctx, driver.OutboundMessage{Destination: name, Body: []byte("destination-delay")}); err != nil {
 			t.Fatal(err)
@@ -276,7 +303,7 @@ func runDeferred(group *groupContext) {
 	group.Check("zero destination delay and zero due time deliver immediately", func(t *testing.T) {
 		name := "deferred.zero"
 		producer := newProducer(t, group, profileDestination(group, name), driver.ProducerConfig{Effective: group.effective})
-		consumer := deferredConsumer(t, group, []string{name}, 1)
+		consumer := deferredConsumer(t, group, []string{name}, nil, 1)
 		publishedAt := deferredNow(group)
 		if err := producer.Publish(group.ctx, driver.OutboundMessage{Destination: name, Body: []byte("zero")}); err != nil {
 			t.Fatal(err)
@@ -375,7 +402,9 @@ func runDeferred(group *groupContext) {
 		producer := newDeferredProducer(t, group, profileDestination(group, name), deferredDelay)
 		controlProducer := newProducer(t, group, profileDestination(group, control), driver.ProducerConfig{Effective: group.effective})
 		cfg, logical := profileConsumerConfig(group, driver.ConsumerConfig{
-			Destinations: []string{name, control}, Prefetch: 2, Effective: group.effective,
+			Destinations: []string{name, control}, Prefetch: 2,
+			Delays:    scopeDelays(group, map[string]time.Duration{name: deferredDelay}),
+			Effective: group.effective,
 		})
 		rawConsumer, err := group.deadline.Consumer(group.ctx, 10*time.Millisecond, cfg)
 		if err != nil {
@@ -448,11 +477,17 @@ func newDeferredProducer(t *testing.T, group *groupContext, destination string, 
 	return &profileProducer{group: group, producer: producer, scoped: destination != unprofileDestination(group, destination)}
 }
 
-func deferredConsumer(t *testing.T, group *groupContext, destinations []string, prefetch int) driver.Consumer {
+// deferredConsumer builds a consumer over destinations, with delays giving the
+// delay each deferred destination declares, keyed by the logical name the check
+// wrote. A destination absent from delays defers nothing, which is the answer a
+// control destination needs rather than a gap in it.
+func deferredConsumer(t *testing.T, group *groupContext, destinations []string, delays map[string]time.Duration, prefetch int) driver.Consumer {
 	t.Helper()
 	scoped, logical := profileDestinations(group, destinations)
 	consumer, err := group.conn.Consumer(group.ctx, driver.ConsumerConfig{
-		Destinations: scoped, Prefetch: prefetch, Effective: group.effective,
+		Destinations: scoped, Prefetch: prefetch,
+		Delays:    scopeDelays(group, delays),
+		Effective: group.effective,
 	})
 	if err != nil {
 		t.Fatalf("Consumer(%v): %v", scoped, err)

@@ -328,6 +328,10 @@ interpreted only by that driver.
 `ConsumerConfig` carries:
 
 - group identity and physical destinations;
+- the delay each destination declares, keyed by its physical name, for a driver
+  that defers on the consumer side. The core fills it from the same topology it
+  passes to `EnsureTopology`, and a destination absent from the map has no
+  delay, which is how a driver is told a destination defers nothing;
 - total prefetch and the core-calculated `PerDestination` allocation;
 - exclusive mode;
 - start position for a new group only; and

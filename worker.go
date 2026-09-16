@@ -1241,6 +1241,7 @@ func openRunnerConsumerWith(r *Runner, ctx context.Context, prefetch int) (drive
 		Destinations:   destinations,
 		Prefetch:       prefetch,
 		PerDestination: perDestination,
+		Delays:         destinationDelays(topology),
 		Exclusive:      r.subscription.Mode == OrderedByKey,
 		Effective:      effective,
 		StartAt:        driver.StartEarliest,
@@ -2204,6 +2205,22 @@ func retryDestinationTierMap(source string, sub Subscription) map[string]int {
 		}
 	}
 	return result
+}
+
+// destinationDelays collects the delay each destination in spec declares, keyed
+// by the physical destination name its messages carry. A destination with no
+// declared delay is left out, which is how the port says it has none.
+func destinationDelays(spec driver.TopologySpec) map[string]time.Duration {
+	delays := make(map[string]time.Duration, len(spec.Destinations))
+	for _, destination := range spec.Destinations {
+		if destination.Delay > 0 {
+			delays[destination.Name] = destination.Delay
+		}
+	}
+	if len(delays) == 0 {
+		return nil
+	}
+	return delays
 }
 
 func subscriptionDestinations(effective driver.Capabilities, source string, sub Subscription) []string {

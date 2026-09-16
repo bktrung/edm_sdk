@@ -211,7 +211,9 @@ func TestConsumerDefersFutureRecordWithPositiveControl(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = producer.Close(context.Background()) })
 	consumer, err := connection.Consumer(ctx, driver.ConsumerConfig{
-		Group: group, Destinations: []string{deferred, control}, Prefetch: 2, Effective: connection.Capabilities(),
+		Group: group, Destinations: []string{deferred, control}, Prefetch: 2,
+		Delays:    map[string]time.Duration{deferred: delay},
+		Effective: connection.Capabilities(),
 	})
 	if err != nil {
 		t.Fatalf("Consumer: %v", err)
@@ -274,7 +276,9 @@ func TestConsumerLoneDeferredRecordArrivesAtDueTime(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = producer.Close(context.Background()) })
 	consumer, err := connection.Consumer(ctx, driver.ConsumerConfig{
-		Group: group, Destinations: []string{topic}, Prefetch: 1, Effective: connection.Capabilities(),
+		Group: group, Destinations: []string{topic}, Prefetch: 1,
+		Delays:    map[string]time.Duration{topic: delay},
+		Effective: connection.Capabilities(),
 	})
 	if err != nil {
 		t.Fatalf("Consumer: %v", err)
@@ -332,7 +336,9 @@ func TestConsumerRequeueWaitsBehindDeferredRecord(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = producer.Close(context.Background()) })
 	consumerValue, err := connection.Consumer(ctx, driver.ConsumerConfig{
-		Group: group, Destinations: []string{topic}, Prefetch: 2, Effective: connection.Capabilities(),
+		Group: group, Destinations: []string{topic}, Prefetch: 2,
+		Delays:    map[string]time.Duration{topic: delay},
+		Effective: connection.Capabilities(),
 	})
 	if err != nil {
 		t.Fatalf("Consumer: %v", err)
@@ -2047,7 +2053,6 @@ func TestConsumerRealRebalanceOwnershipTransfer(t *testing.T) {
 		rebalanceDrainTimeout: 200 * time.Millisecond,
 		caps:                  connection.caps,
 		info:                  connection.info,
-		delays:                connection.delays,
 		consumers:             make(map[*consumer]struct{}),
 	}
 	c1Raw, err := newConsumer(ctx, conn1, cfg1)
@@ -2104,7 +2109,6 @@ func TestConsumerRealRebalanceOwnershipTransfer(t *testing.T) {
 		rebalanceDrainTimeout: 200 * time.Millisecond,
 		caps:                  connection.caps,
 		info:                  connection.info,
-		delays:                connection.delays,
 		consumers:             make(map[*consumer]struct{}),
 	}
 	c2Raw, err := newConsumer(ctx, conn2, cfg2)
@@ -3120,7 +3124,9 @@ func TestConsumerBudgetRefusedRecordsResumeOnAck(t *testing.T) {
 	t.Cleanup(func() { _ = producer.Close(context.Background()) })
 	consumerValue, err := connection.Consumer(ctx, driver.ConsumerConfig{
 		Group: group, Destinations: []string{parked, ready}, Prefetch: 2,
-		PerDestination: map[string]int{parked: 1, ready: 1}, Effective: connection.Capabilities(),
+		PerDestination: map[string]int{parked: 1, ready: 1},
+		Delays:         map[string]time.Duration{parked: parkedDelay},
+		Effective:      connection.Capabilities(),
 	})
 	if err != nil {
 		t.Fatalf("Consumer: %v", err)

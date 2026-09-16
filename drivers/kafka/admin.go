@@ -278,8 +278,9 @@ func (a *admin) pruneGuard(ctx context.Context, name string) (string, error) {
 // dead lettering is unavailable, and the core retry ladder owns those semantics.
 //
 // Under TopologyNone it creates nothing and makes no broker request; it still
-// records each destination's delay, which is local bookkeeping the consume
-// path needs and not a broker round trip.
+// records each destination's delay, which is local bookkeeping the produce path
+// reads to stamp a due time on a publish that carries none of its own, and not a
+// broker round trip.
 func (a *admin) EnsureTopology(ctx context.Context, spec driver.TopologySpec) (driver.TopologyDiff, error) {
 	release, err := a.admission(ctx, "ensure_topology")
 	if err != nil {

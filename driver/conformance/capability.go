@@ -7,6 +7,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/driver"
 )
@@ -116,7 +117,7 @@ func runCapability(group *groupContext) {
 	group.Check("delayed delivery works with native and portable paths", func(t *testing.T) {
 		name := "capability.delay"
 		producer := newDeferredProducer(t, group, profileDestination(group, name), deferredDelay)
-		consumer := deferredConsumer(t, group, []string{name}, 1)
+		consumer := deferredConsumer(t, group, []string{name}, map[string]time.Duration{name: deferredDelay}, 1)
 		due := deferredNow(group).Add(deferredDelay)
 		if err := producer.Publish(group.ctx, driver.OutboundMessage{Destination: name, Body: []byte("delayed"), DelayUntil: due}); err != nil {
 			t.Fatal(err)

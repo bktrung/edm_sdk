@@ -27,7 +27,7 @@ func TestEvaluateDeferralDueInPastDelivers(t *testing.T) {
 	published := time.Unix(100, 0)
 	record := deferredTestRecord(published, published.Add(8*time.Second))
 
-	decision := evaluateDeferral(record, 10*time.Second, true, published.Add(9*time.Second))
+	decision := evaluateDeferral(record, 10*time.Second, published.Add(9*time.Second))
 	if decision.err != nil || decision.wait {
 		t.Fatalf("evaluateDeferral() = %#v, want no error and no wait", decision)
 	}
@@ -37,7 +37,7 @@ func TestEvaluateDeferralDueInFutureWaits(t *testing.T) {
 	published := time.Unix(100, 0)
 	record := deferredTestRecord(published, published.Add(10*time.Second))
 
-	decision := evaluateDeferral(record, 10*time.Second, true, published)
+	decision := evaluateDeferral(record, 10*time.Second, published)
 	if decision.err != nil || !decision.wait {
 		t.Fatalf("evaluateDeferral() = %#v, want no error and wait", decision)
 	}
@@ -48,7 +48,7 @@ func TestEvaluateDeferralAcceptsLowerBandEdge(t *testing.T) {
 	delay := 10 * time.Second
 	record := deferredTestRecord(published, published.Add(delay/2))
 
-	decision := evaluateDeferral(record, delay, true, published.Add(delay/2))
+	decision := evaluateDeferral(record, delay, published.Add(delay/2))
 	if decision.err != nil || decision.wait {
 		t.Fatalf("evaluateDeferral() = %#v, want accepted lower edge at due time", decision)
 	}
@@ -60,7 +60,7 @@ func TestEvaluateDeferralJitterHalfWaitsUntilDue(t *testing.T) {
 	due := published.Add(delay / 2)
 	record := deferredTestRecord(published, due)
 
-	decision := evaluateDeferral(record, delay, true, published)
+	decision := evaluateDeferral(record, delay, published)
 	if decision.err != nil || !decision.wait {
 		t.Fatalf("evaluateDeferral() = %#v, want legal jitter-0.5 due time to wait", decision)
 	}
@@ -71,7 +71,7 @@ func TestEvaluateDeferralRejectsJustBelowLowerBand(t *testing.T) {
 	delay := 10 * time.Second
 	record := deferredTestRecord(published, published.Add(delay/2-time.Nanosecond))
 
-	decision := evaluateDeferral(record, delay, true, published)
+	decision := evaluateDeferral(record, delay, published)
 	if decision.err == nil || decision.wait {
 		t.Fatalf("evaluateDeferral() = %#v, want lower-edge rejection without waiting", decision)
 	}
@@ -83,7 +83,7 @@ func TestEvaluateDeferralAllowsKafkaTimestampPrecisionAtUpperBand(t *testing.T) 
 	due := published.Add(delay + delay/2 + time.Millisecond)
 	record := deferredTestRecord(published, due)
 
-	decision := evaluateDeferral(record, delay, true, due)
+	decision := evaluateDeferral(record, delay, due)
 	if decision.err != nil || decision.wait {
 		t.Fatalf("evaluateDeferral() = %#v, want no error and no wait", decision)
 	}
@@ -95,7 +95,7 @@ func TestEvaluateDeferralRejectsJustAboveUpperBand(t *testing.T) {
 	upper := delay + delay/2 + time.Millisecond
 	record := deferredTestRecord(published, published.Add(upper+time.Nanosecond))
 
-	decision := evaluateDeferral(record, delay, true, published)
+	decision := evaluateDeferral(record, delay, published)
 	if decision.err == nil || decision.wait {
 		t.Fatalf("evaluateDeferral() = %#v, want upper-edge rejection without waiting", decision)
 	}
@@ -107,7 +107,7 @@ func TestEvaluateDeferralAcceptsLargeDelayWithoutUpperOverflow(t *testing.T) {
 	due := published.Add(delay)
 	record := deferredTestRecord(published, due)
 
-	decision := evaluateDeferral(record, delay, true, due)
+	decision := evaluateDeferral(record, delay, due)
 	if decision.err != nil || decision.wait {
 		t.Fatalf("evaluateDeferral() = %#v, want no error and no wait for a large nominal delay", decision)
 	}
@@ -118,7 +118,7 @@ func TestEvaluateDeferralDueExactlyNowDelivers(t *testing.T) {
 	now := published.Add(10 * time.Second)
 	record := deferredTestRecord(published, now)
 
-	decision := evaluateDeferral(record, 10*time.Second, true, now)
+	decision := evaluateDeferral(record, 10*time.Second, now)
 	if decision.err != nil || decision.wait {
 		t.Fatalf("evaluateDeferral() = %#v, want no error and no wait", decision)
 	}
@@ -127,7 +127,7 @@ func TestEvaluateDeferralDueExactlyNowDelivers(t *testing.T) {
 func TestEvaluateDeferralMissingHeaderSurfacesErrorAndDelivers(t *testing.T) {
 	record := &kgo.Record{Topic: "retry", Timestamp: time.Unix(100, 0)}
 
-	decision := evaluateDeferral(record, 10*time.Second, true, time.Unix(100, 0))
+	decision := evaluateDeferral(record, 10*time.Second, time.Unix(100, 0))
 	if decision.err == nil {
 		t.Fatal("evaluateDeferral() error = nil, want missing-header error")
 	}
@@ -158,7 +158,7 @@ func TestRecordForMessageUsesDestinationDelayWhenDueZero(t *testing.T) {
 func TestEvaluateDeferralZeroDelayAndZeroDueDeliversImmediately(t *testing.T) {
 	record := &kgo.Record{Topic: "main", Timestamp: time.Unix(100, 0)}
 
-	decision := evaluateDeferral(record, 0, true, time.Unix(100, 0))
+	decision := evaluateDeferral(record, 0, time.Unix(100, 0))
 	if decision.err != nil || decision.wait {
 		t.Fatalf("evaluateDeferral() = %#v, want immediate delivery", decision)
 	}
@@ -168,7 +168,7 @@ func TestEvaluateDeferralOutOfBandSurfacesErrorAndDoesNotWait(t *testing.T) {
 	published := time.Unix(100, 0)
 	record := deferredTestRecord(published, published.Add(30*time.Second))
 
-	decision := evaluateDeferral(record, 10*time.Second, true, published)
+	decision := evaluateDeferral(record, 10*time.Second, published)
 	if decision.wait {
 		t.Fatalf("evaluateDeferral() wait = true, want delivery after surfacing error")
 	}
@@ -177,13 +177,20 @@ func TestEvaluateDeferralOutOfBandSurfacesErrorAndDoesNotWait(t *testing.T) {
 	}
 }
 
-func TestEvaluateDeferralUnknownDestinationSurfacesErrorAndDoesNotWait(t *testing.T) {
+// A destination absent from the consumer's Delays has no delay, so a due-time
+// header on a record from it is a config that disagrees with the message, not a
+// consumer that cannot tell what the destination does. The record is faulted
+// and delivered, and the condition names the zero delay.
+func TestEvaluateDeferralAbsentDestinationDelaySurfacesZeroDelayError(t *testing.T) {
 	published := time.Unix(100, 0)
 	record := deferredTestRecord(published, published.Add(10*time.Second))
 
-	decision := evaluateDeferral(record, 10*time.Second, false, published)
+	decision := evaluateDeferral(record, 0, published)
 	if decision.err == nil {
-		t.Fatal("evaluateDeferral() error = nil, want unknown-delay error")
+		t.Fatal("evaluateDeferral() error = nil, want the zero-delay error for a destination the config leaves out")
+	}
+	if decision.err.Error() != "destination delay is zero" {
+		t.Fatalf("evaluateDeferral() error = %q, want a destination delay of zero", decision.err)
 	}
 	if decision.wait {
 		t.Fatal("evaluateDeferral() wait = true, want delivery after surfacing error")
@@ -195,7 +202,7 @@ func TestEvaluateDeferralMalformedHeaderSurfacesErrorAndDelivers(t *testing.T) {
 	record := deferredTestRecord(published, published.Add(10*time.Second))
 	record.Headers[0].Value = []byte("not-a-time")
 
-	decision := evaluateDeferral(record, 10*time.Second, true, published)
+	decision := evaluateDeferral(record, 10*time.Second, published)
 	if decision.err == nil || decision.wait {
 		t.Fatalf("evaluateDeferral() = %#v, want malformed-header error without waiting", decision)
 	}
@@ -206,7 +213,7 @@ func TestEvaluateDeferralDuplicateHeadersSurfacesErrorAndDelivers(t *testing.T) 
 	record := deferredTestRecord(published, published.Add(10*time.Second))
 	record.Headers = append(record.Headers, record.Headers[0])
 
-	decision := evaluateDeferral(record, 10*time.Second, true, published)
+	decision := evaluateDeferral(record, 10*time.Second, published)
 	if decision.err == nil || decision.wait {
 		t.Fatalf("evaluateDeferral() = %#v, want duplicate-header error without waiting", decision)
 	}
@@ -246,7 +253,7 @@ func TestPendingDeadlineEmptyPendingReturnsFalse(t *testing.T) {
 func TestPendingDeadlineAllRecordsDueReturnsFalse(t *testing.T) {
 	now := time.Unix(100, 0)
 	c := &consumer{
-		conn:  &conn{delays: map[string]time.Duration{"retry": 10 * time.Second}},
+		cfg:   driver.ConsumerConfig{Delays: map[string]time.Duration{"retry": 10 * time.Second}},
 		clock: clock.NewFake(now),
 	}
 	r1 := deferredTestTopicRecord("retry", 0, 1, now.Add(-10*time.Second), now)
@@ -260,7 +267,7 @@ func TestPendingDeadlineAllRecordsDueReturnsFalse(t *testing.T) {
 func TestPendingDeadlineReturnsEarliestDueWhenNotFirstElement(t *testing.T) {
 	now := time.Unix(100, 0)
 	c := &consumer{
-		conn: &conn{delays: map[string]time.Duration{
+		cfg: driver.ConsumerConfig{Delays: map[string]time.Duration{
 			"retry.mid":  20 * time.Second,
 			"retry.fast": 10 * time.Second,
 			"retry.slow": 30 * time.Second,
@@ -278,21 +285,23 @@ func TestPendingDeadlineReturnsEarliestDueWhenNotFirstElement(t *testing.T) {
 	}
 }
 
-func TestPendingDeadlineIgnoresUnknownDestinationAlongsideDeferrable(t *testing.T) {
+// A destination the config leaves out is skipped for the same reason it is
+// never deferred: it has no delay, so nothing on it is waiting for a due time.
+func TestPendingDeadlineIgnoresAbsentDestinationAlongsideDeferrable(t *testing.T) {
 	now := time.Unix(100, 0)
 	c := &consumer{
-		conn: &conn{delays: map[string]time.Duration{
+		cfg: driver.ConsumerConfig{Delays: map[string]time.Duration{
 			"retry.known": 10 * time.Second,
 		}},
 		clock: clock.NewFake(now),
 	}
-	rUnknown := deferredTestTopicRecord("unknown.topic", 0, 1, now, now.Add(10*time.Second))
+	rAbsent := deferredTestTopicRecord("absent.topic", 0, 1, now, now.Add(10*time.Second))
 	wantDue := now.Add(10 * time.Second)
 	rKnown := deferredTestTopicRecord("retry.known", 0, 2, now, wantDue)
 
-	deadline, ok := c.pendingDeadline([]*kgo.Record{rUnknown, rKnown})
+	deadline, ok := c.pendingDeadline([]*kgo.Record{rAbsent, rKnown})
 	if !ok || !deadline.Equal(wantDue) {
-		t.Fatalf("pendingDeadline(unknown + known) = %s, %t; want %s, true", deadline, ok, wantDue)
+		t.Fatalf("pendingDeadline(absent + known) = %s, %t; want %s, true", deadline, ok, wantDue)
 	}
 }
 
@@ -325,7 +334,7 @@ func TestDeferredPausesHoldFetchesOnlyAtTheHoldLimit(t *testing.T) {
 	newConsumer := func(budget int) *consumer {
 		return &consumer{
 			client:       newDeferredConsumerClient(t),
-			conn:         &conn{delays: map[string]time.Duration{destination: delay}},
+			cfg:          driver.ConsumerConfig{Delays: map[string]time.Duration{destination: delay}},
 			budgets:      map[string]int{destination: budget},
 			pauseReasons: make(map[string]pauseReasonSet),
 			unsettled:    make(map[string]int),
@@ -408,7 +417,7 @@ func TestDeferredReasonLeavingWakesThePollLoop(t *testing.T) {
 	woke := make(chan struct{}, 1)
 	c := &consumer{
 		client:       newDeferredConsumerClient(t),
-		conn:         &conn{delays: map[string]time.Duration{destination: delay}},
+		cfg:          driver.ConsumerConfig{Delays: map[string]time.Duration{destination: delay}},
 		budgets:      map[string]int{destination: 2},
 		pauseReasons: make(map[string]pauseReasonSet),
 		unsettled:    make(map[string]int),
@@ -503,7 +512,9 @@ func TestConsumerDeferredNearerDueTimeIsNotHeldBehindFartherDueTime(t *testing.T
 			}
 			t.Cleanup(func() { _ = producer.Close(context.Background()) })
 			consumerValue, err := connection.Consumer(ctx, driver.ConsumerConfig{
-				Group: group, Destinations: []string{topic}, Prefetch: 2, Effective: connection.Capabilities(),
+				Group: group, Destinations: []string{topic}, Prefetch: 2,
+				Delays:    map[string]time.Duration{topic: declaredDelay},
+				Effective: connection.Capabilities(),
 			})
 			if err != nil {
 				t.Fatalf("Consumer: %v", err)
@@ -577,6 +588,7 @@ func TestConsumerDeferredNearerDueTimeIsNotHeldBehindFartherDueTime(t *testing.T
 }
 
 func TestConsumerDeferralFaultDoesNotSendError(t *testing.T) {
+	now := time.Unix(100, 0)
 	c := &consumer{
 		conn:              &conn{logger: slog.New(slog.NewTextHandler(io.Discard, nil))},
 		errors:            make(chan error, 10),
@@ -585,9 +597,12 @@ func TestConsumerDeferralFaultDoesNotSendError(t *testing.T) {
 		unsettled:         make(map[string]int),
 		trackers:          make(map[partitionKey]*ackTracker),
 		reportedDeferrals: make(map[string]struct{}),
-		clock:             clock.NewFake(time.Unix(100, 0)),
+		clock:             clock.NewFake(now),
 	}
-	record := &kgo.Record{Topic: "retry", Partition: 0, Offset: 42}
+	// The config declares no delay for retry, so the due-time header this
+	// record carries is a fault rather than a wait.
+	record := deferredTestRecord(now, now.Add(time.Second))
+	record.Offset = 42
 	c.mu.Lock()
 	admitted := c.admissionLocked(record)
 	c.mu.Unlock()
@@ -604,6 +619,7 @@ func TestConsumerDeferralFaultDoesNotSendError(t *testing.T) {
 }
 
 func TestConsumerDeferralFaultLogsOncePerDestination(t *testing.T) {
+	now := time.Unix(100, 0)
 	var logs bytes.Buffer
 	c := &consumer{
 		conn:              &conn{logger: slog.New(slog.NewTextHandler(&logs, nil))},
@@ -613,11 +629,15 @@ func TestConsumerDeferralFaultLogsOncePerDestination(t *testing.T) {
 		unsettled:         make(map[string]int),
 		trackers:          make(map[partitionKey]*ackTracker),
 		reportedDeferrals: make(map[string]struct{}),
-		clock:             clock.NewFake(time.Unix(100, 0)),
+		clock:             clock.NewFake(now),
 	}
 
-	r1 := &kgo.Record{Topic: "retry", Partition: 0, Offset: 1}
-	r2 := &kgo.Record{Topic: "retry", Partition: 0, Offset: 2}
+	// Neither record's destination is in the config's delays, so both due-time
+	// headers are a fault on the destination they name.
+	r1 := deferredTestRecord(now, now.Add(time.Second))
+	r1.Offset = 1
+	r2 := deferredTestRecord(now, now.Add(time.Second))
+	r2.Offset = 2
 
 	c.mu.Lock()
 	c.admissionLocked(r1)
@@ -642,8 +662,49 @@ func TestConsumerDeferralFaultLogsOncePerDestination(t *testing.T) {
 	if !strings.Contains(line, "offset=1") {
 		t.Errorf("log line missing offset=1: %q", line)
 	}
-	if !strings.Contains(line, "destination delay is unknown") {
+	if !strings.Contains(line, "destination delay is zero") {
 		t.Errorf("log line missing condition: %q", line)
+	}
+}
+
+// TestConsumerDelayComesFromConfigNotConnection pins the source of the delay. A
+// connection that recorded one is not a substitute for the consumer's config,
+// because the delay the consumer acts on has to be the delay of the subscription
+// it was built for, and the config is the only place the core put it.
+//
+// The record's due time is in band for the connection's ten seconds, so only the
+// source decides the outcome: a consumer that reads the connection holds the
+// record for its due time, and a consumer that reads its config faults on the
+// due-time header of a destination the config leaves out and delivers.
+func TestConsumerDelayComesFromConfigNotConnection(t *testing.T) {
+	now := time.Unix(100, 0)
+	const destination = "retry"
+	var logs bytes.Buffer
+	c := &consumer{
+		conn:              &conn{logger: slog.New(slog.NewTextHandler(&logs, nil)), delays: map[string]time.Duration{destination: 10 * time.Second}},
+		errors:            make(chan error, 10),
+		budgets:           map[string]int{destination: 1},
+		pauseReasons:      make(map[string]pauseReasonSet),
+		unsettled:         make(map[string]int),
+		trackers:          make(map[partitionKey]*ackTracker),
+		reportedDeferrals: make(map[string]struct{}),
+		clock:             clock.NewFake(now),
+	}
+	record := deferredTestRecord(now, now.Add(10*time.Second))
+
+	c.mu.Lock()
+	admitted := c.admissionLocked(record)
+	_, deferred := c.pauseReasons[destination][pauseReasonDeferred]
+	c.mu.Unlock()
+
+	if deferred {
+		t.Fatal("the destination was marked as holding a record waiting for a due time; the config declares no delay for it, so nothing on it waits")
+	}
+	if !admitted {
+		t.Fatal("admissionLocked() = false, want the record admitted with the fault the config's absence earns it")
+	}
+	if logged := logs.String(); !strings.Contains(logged, "destination delay is zero") {
+		t.Fatalf("logger output = %q, want the zero-delay fault for a destination the config leaves out", logged)
 	}
 }
 
@@ -718,10 +779,12 @@ func openDeferralPublicClient(t *testing.T, ctx context.Context, logger *slog.Lo
 	return driverUnderTest.conn, driverUnderTest.opened
 }
 
-// assertDeferralFaultWarns publishes one record to a destination the connection
-// knows no delay for, consumes it, and requires the deferral fault warning with
-// all four identifying attributes in sink. The connection declares no topology,
-// which is what leaves the destination delay unknown.
+// assertDeferralFaultWarns publishes one deferred record to a destination the
+// consumer's config declares no delay for, consumes it, and requires the
+// deferral fault warning with all four identifying attributes in sink. The
+// consumer's config is built from the destination alone, so the due-time header
+// the record carries is a fault the record itself proves rather than one that
+// depends on what an earlier call left on the connection.
 func assertDeferralFaultWarns(t *testing.T, connection *conn, sink *deferralLogSink) {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -739,7 +802,11 @@ func assertDeferralFaultWarns(t *testing.T, connection *conn, sink *deferralLogS
 		t.Fatalf("Producer: %v", err)
 	}
 	defer func() { _ = producer.Close(ctx) }()
-	publishKafkaMessage(t, producer, ctx, topic, "deferral")
+	if err := producer.Publish(ctx, driver.OutboundMessage{
+		Destination: topic, Body: []byte("deferral"), DelayUntil: kafkaNow().Add(time.Second),
+	}); err != nil {
+		t.Fatalf("Publish(%q): %v", topic, err)
+	}
 
 	consumerValue, err := connection.Consumer(ctx, driver.ConsumerConfig{
 		Group: group, Destinations: []string{topic}, Prefetch: 1, Effective: connection.Capabilities(),
@@ -757,7 +824,7 @@ func assertDeferralFaultWarns(t *testing.T, connection *conn, sink *deferralLogS
 	for _, want := range []string{
 		"kafka deferred delivery fault",
 		"destination=" + topic,
-		"destination delay is unknown",
+		"destination delay is zero",
 		"partition=0",
 		"offset=0",
 	} {
