@@ -192,6 +192,124 @@ func TestConsumerHoldRuleBoundsPendingAndHoldsThePartition(t *testing.T) {
 	}
 }
 
+// TestConsumerHoldRuleKeepsARequeuePendingPartitionOffTheHold pins the acquire
+// edge of the requeue exemption: a partition whose redelivery a requeue is
+// waiting for is never held, however many of its records pending carries.
+//
+// The redelivery arrives from the broker and franz-go does not fetch a held
+// partition, so a hold here leaves the requeue with no event that can release
+// it: the partition's charge waits for the redelivery to settle, and the
+// redelivery waits for a fetch the hold forbids. The case drives the loop past
+// the limit with the requeue already pending and requires the hold to be absent
+// at every reconcile, including the one that reaches the limit, which is the
+// boundary the exemption is read on.
+func TestConsumerHoldRuleKeepsARequeuePendingPartitionOffTheHold(t *testing.T) {
+	const response = 5
+	c, key := newHoldRuleConsumer(t, holdRuleBudget)
+	limit := c.readAheadLimit(key.destination)
+	rounds := limit/response + 2
+
+	pending := make([]*kgo.Record, 0, rounds*response)
+	first := holdRuleRecord(key, 0)
+	c.tagRecord(first)
+	pending = append(pending, first)
+	if !c.flushPending(&pending) {
+		t.Fatal("flushPending returned false")
+	}
+	held := holdRuleDelivery(t, c)
+	if err := held.Settle.Nack(context.Background(), driver.NackOptions{Requeue: true}); err != nil {
+		t.Fatalf("Nack the held delivery with Requeue: %v", err)
+	}
+	if c.requeued[key] == 0 {
+		t.Fatal("no requeue is pending after the Nack, so the case has nothing to read the exemption for")
+	}
+
+	offset := first.Offset + 1
+	for range rounds {
+		for range response {
+			record := holdRuleRecord(key, offset)
+			offset++
+			c.tagRecord(record)
+			pending = append(pending, record)
+		}
+		if !c.flushPending(&pending) {
+			t.Fatal("flushPending returned false")
+		}
+		c.syncReadAheadPauses(pending)
+		if holdRulePartitionHeld(c, key) {
+			t.Fatalf("the client is holding the partition's fetches with %d of its records in pending against a read-ahead limit of %d while a requeue on the partition is pending: a held partition is not fetched, so the redelivery the requeue waits for cannot arrive and nothing else can release the partition",
+				len(pending), limit)
+		}
+	}
+	if len(pending) < limit {
+		t.Fatalf("pending carries %d of the partition's records after %d rounds against a read-ahead limit of %d, so the case never fed it the fill the hold's exemption is read at",
+			len(pending), rounds, limit)
+	}
+	if _, held := c.readAheadPaused[key]; held {
+		t.Fatalf("the partition is in the read-ahead hold with %d of its records in pending against a read-ahead limit of %d and a requeue pending, want no hold: the reconcile must read the exemption where it acquires a hold as well as where it releases one",
+			len(pending), limit)
+	}
+}
+
+// TestConsumerHoldRuleReleasesAHeldPartitionWhenARequeueArrives pins the other
+// edge of the same exemption: a partition held at the limit comes off the hold
+// at the next reconcile once it has a requeue pending.
+//
+// The release has to be the requeue's and not the count's fall below the limit.
+// The requeue keeps the partition charged, the charge keeps every later record
+// refused, and the case checks the count against the limit before the reconcile,
+// so the release it reads cannot be one the reconcile would have made anyway.
+func TestConsumerHoldRuleReleasesAHeldPartitionWhenARequeueArrives(t *testing.T) {
+	const response = 5
+	c, key := newHoldRuleConsumer(t, holdRuleBudget)
+	limit := c.readAheadLimit(key.destination)
+	rounds := limit/response + 2
+
+	pending := make([]*kgo.Record, 0, limit+response)
+	offset := int64(0)
+	for range rounds {
+		if !holdRulePartitionHeld(c, key) {
+			for range response {
+				record := holdRuleRecord(key, offset)
+				offset++
+				c.tagRecord(record)
+				pending = append(pending, record)
+			}
+		}
+		if !c.flushPending(&pending) {
+			t.Fatal("flushPending returned false")
+		}
+		c.syncReadAheadPauses(pending)
+	}
+	if !holdRulePartitionHeld(c, key) {
+		t.Fatalf("the partition's fetches were never held with %d of its records waiting in pending against a read-ahead limit of %d, so the case has no hold to release",
+			len(pending), limit)
+	}
+
+	held := holdRuleDelivery(t, c)
+	if err := held.Settle.Nack(context.Background(), driver.NackOptions{Requeue: true}); err != nil {
+		t.Fatalf("Nack the held delivery with Requeue: %v", err)
+	}
+	if c.requeued[key] == 0 {
+		t.Fatal("no requeue is pending after the Nack, so the case has nothing to read the exemption for")
+	}
+	if len(pending) < limit {
+		t.Fatalf("pending carries %d of the partition's records against a read-ahead limit of %d, so a release read here would be the count's and not the requeue's",
+			len(pending), limit)
+	}
+
+	c.syncReadAheadPauses(pending)
+
+	if holdRulePartitionHeld(c, key) {
+		t.Fatalf("the client is still holding the partition's fetches after a requeue arrived, with %d of the partition's records in pending against a read-ahead limit of %d: the reconcile must release the partition so the redelivery the requeue waits for can be fetched",
+			len(pending), limit)
+	}
+	if _, held := c.readAheadPaused[key]; held {
+		t.Fatalf("the partition is still in the read-ahead hold after a requeue arrived, with %d of its records in pending against a read-ahead limit of %d",
+			len(pending), limit)
+	}
+}
+
 // TestConsumerHoldRuleHoldStaysInertAtTheNoHoldLimit pins the premise of the
 // discriminator sitting: at the limit the sitting runs with, one partition's
 // whole backlog of the measured corpus sits below the limit, so the reconcile
