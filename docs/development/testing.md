@@ -409,6 +409,20 @@ These are repository contract checks, not substitutes for a handler or broker
 test. Run them when changing exported symbols, package boundaries, driver
 interfaces, or maintainer documentation.
 
+## Test deletion probe
+
+The test deletion probe asks whether one test fails when a covered production
+function or method is replaced by a zero-value body. Run the repeatable sample
+with `make probe-tests`; use `PROBE_SAMPLE=path/to/sample.txt make probe-tests`
+for another package-and-test list.
+
+Read `red` as evidence that the test defends the mutated subject. A `green`
+row means the test still passes, so it does not defend that subject. A
+`nosubject` means no covered production function or method matched the test
+name under the probe's word rule; review that name and its assertion together.
+Other rows identify `nocompile`, `timeout`, `skip`, or a baseline `notgreen`.
+TSV rows go to stdout; summaries and cap counts go to stderr.
+
 ## Choosing a test before changing code
 
 Ask where the claimed behavior lives:

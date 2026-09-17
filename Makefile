@@ -13,6 +13,8 @@ export GOPRIVATE := fgit.zapps.vn
 APISURFACE := $(CURDIR)/.tools/bin/apisurface
 APIDIFF := $(CURDIR)/.tools/bin/apidiff
 APIDIFF_NORMALIZE := $(CURDIR)/.tools/bin/apidiff-normalize
+TESTPROBE := $(CURDIR)/.tools/bin/testprobe
+PROBE_SAMPLE ?= tools/testprobe/sample.txt
 API_DIFF_BASELINE_DIR := $(CURDIR)/testdata/api-diff
 API_DIFF_BREAKING_CHANGE ?= 0
 API_DIFF_ENFORCE ?= 1
@@ -31,7 +33,7 @@ KAFKA_PORT ?= 19092
 KAFKA_PROJECT ?= docker
 KAFKA_COMPOSE := KAFKA_PORT=$(KAFKA_PORT) docker compose --project-name "$(KAFKA_PROJECT)" -f docker/docker-compose.yml
 
-.PHONY: build test-fast test lint verify-agnostic verify-self-contained check-fixture check-api-surface check-api-surface-codec check-api-surface-driver check-api-surface-f1test check-api-diff record-api-diff-baseline
+.PHONY: build test-fast test lint probe-tests verify-agnostic verify-self-contained check-fixture check-api-surface check-api-surface-codec check-api-surface-driver check-api-surface-f1test check-api-diff record-api-diff-baseline
 
 ## build: compile all packages with reproducible build flags.
 build:
@@ -48,6 +50,12 @@ test-fast:
 ## coverage. Nothing here reads a broker. See docs/development/testing.md.
 test:
 	go test -count=1 ./...
+
+## probe-tests: run the sampled test-deletion probe. Set PROBE_SAMPLE to use a
+## different package-and-test list.
+probe-tests: $(TESTPROBE)
+	@$(TESTPROBE) -sample "$(PROBE_SAMPLE)" -cache .cache/testprobe
+
 
 
 ## lint: run the pinned golangci-lint configuration.
@@ -192,6 +200,9 @@ record-api-diff-baseline: $(APIDIFF) $(APIDIFF_NORMALIZE)
 		$(APIDIFF_NORMALIZE) "$$raw" "$(API_DIFF_BASELINE_DIR)/$$baseline"; \
 		rm -f "$$raw"; \
 	done
+
+$(TESTPROBE): tools/testprobe/main.go tools/testprobe/go.mod tools/testprobe/go.sum
+	@mkdir -p .tools/bin && cd tools/testprobe && go build -o ../../.tools/bin/testprobe .
 
 $(APISURFACE): tools/apisurface/main.go tools/apisurface/go.mod
 	cd tools/apisurface && go build -o ../../.tools/bin/apisurface .

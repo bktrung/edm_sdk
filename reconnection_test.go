@@ -2424,6 +2424,24 @@ func TestRecordedSubscriptionFailureIsOneEntryPerName(t *testing.T) {
 }
 
 func TestCancelledDrainedAndRefusedRunsDoNotRecordFailures(t *testing.T) {
+	t.Run("ordinary failure is recorded", func(t *testing.T) {
+		d := &reconnectTestDriver{created: make(chan *reconnectTestConsumer, 8)}
+		client := newReconnectTestClient(t, d, nil, 0)
+		runner, err := client.Subscribe(context.Background(), Subscription{
+			Name:           "orders",
+			Topics:         []string{"orders.created"},
+			HandlerTimeout: 10 * time.Millisecond,
+			Handlers:       map[string]Handler{"orders.created": HandlerFunc(func(context.Context, *Event) error { return nil })},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		fatal := errors.New("ordinary runner failure")
+		runner.recordRunExit(context.Background(), fatal)
+		if healthErr := client.Health(context.Background()); !errors.Is(healthErr, fatal) {
+			t.Fatalf("Health() = %v, want ordinary runner failure", healthErr)
+		}
+	})
 	t.Run("caller cancel", func(t *testing.T) {
 		openEntered := make(chan struct{})
 		d := &reconnectTestDriver{created: make(chan *reconnectTestConsumer, 8)}

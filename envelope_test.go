@@ -886,14 +886,14 @@ func cloneHeaders(input map[string]string) map[string]string {
 func TestEnvelope_DeathErrorShrinkPreservesUTF8(t *testing.T) {
 	t.Parallel()
 	e := fullEnvelope()
-	e.DeathError = "\U0001F4A5\U0001F4A3\U0001F525\U0001F4A7"
+	e.DeathError = strings.Repeat("\U0001F4A5", 200)
 	withoutDeathError := e
 	withoutDeathError.DeathError = ""
 	baseHeaders, err := withoutDeathError.EncodeHeaders(0)
 	require.NoError(t, err)
-	limit := headerBytesOf(baseHeaders) + len("f1deatherror") + 5
-	headers, err := e.EncodeHeaders(limit)
+	headers, err := e.EncodeHeaders(headerBytesOf(baseHeaders))
 	require.NoError(t, err)
+	require.NotEmpty(t, headers["f1deatherror"])
 	require.True(t, utf8.ValidString(headers["f1deatherror"]))
-	require.LessOrEqual(t, headerBytesOf(headers), limit)
+	require.LessOrEqual(t, headerBytesOf(headers), headerBytesOf(baseHeaders))
 }
