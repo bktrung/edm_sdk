@@ -82,6 +82,11 @@ const (
 	// only for that driver: the same key on another driver is a configuration
 	// error rather than an ignored setting.
 	kafkaDriverName = "kafka"
+
+	// rabbitMQDriverName is the driver whose destinations carry a queue kind.
+	// The kind is configured through a RabbitMQ option, and it is set only for
+	// that driver for the reason the partition count is.
+	rabbitMQDriverName = "rabbitmq"
 )
 
 // sequence numbers each harness, so two harnesses built from one namespace
@@ -117,6 +122,20 @@ type Config struct {
 	// hold, so a value here is a request and not always the budget the driver
 	// is given.
 	Prefetch int
+	// Priorities is the priority set the subscription consumes, which is how
+	// many main destinations one subscription opens: the core derives one
+	// destination per topic and priority, and a driver with a channel per
+	// destination opens one channel per priority. A measurement with two
+	// priorities therefore reads one subscription over two destinations and two
+	// channels, sharing the handler concurrency between them, and its publishers
+	// spread the corpus over the set evenly so neither destination is loaded
+	// more than the other. Empty keeps the one lane every measurement had before
+	// this field existed.
+	//
+	// The in-flight budget is the subscription's, not a destination's: the core
+	// allocates it across the destinations, so two priorities means half the
+	// budget each unless the measurement asks for more.
+	Priorities []f1.Priority
 	// HandlerWork is how long the consume measurement's handler holds each
 	// delivery before returning. It applies to the consume measurement alone:
 	// the publish, latency and retry measurements keep the handler that returns
@@ -137,6 +156,16 @@ type Config struct {
 	// the broker, which is what a deployment that configures nothing gets. It
 	// is ignored on a driver whose destinations have no partitions.
 	Partitions int
+	// QueueType is the kind of queue a RabbitMQ measurement asks its
+	// destinations to be created as, named the way the driver's option names it
+	// ("quorum" or "classic"). It travels as the driver's documented queue-type
+	// option, which is the lever a deployment pulls, and an empty value names no
+	// kind and leaves the decision to the driver's own default, which is the
+	// rule the harness follows for every setting a measurement does not state.
+	// The value is not interpreted here: an unsupported one is refused by the
+	// driver that documents it. It is ignored on a driver whose queues have no
+	// kind.
+	QueueType string
 	// Ordered makes the subscription an ordered one, so deliveries sharing a
 	// key are handled one at a time, and makes the publishers spread the corpus
 	// over a fixed key set, so the ordering has something to serialise. A
@@ -145,7 +174,6 @@ type Config struct {
 	// Backlog publishes the consume measurement's corpus before its measured
 	// window opens, holding every delivery back from the core until it does, so
 	// the window contains the backlog's drain and not the load that made it.
-	//
 	// Without it the window contains both, and a cell whose consumer settles
 	// faster than the corpus is published reports the publisher rather than the
 	// consumer: the window then ends no earlier than the last publish returns,
@@ -158,6 +186,24 @@ type Config struct {
 	// It applies to the consume measurement. Every other measurement keeps the
 	// shape it had, and so does a consume measurement without it.
 	Backlog bool
+	// PublishBatch is how many corpus messages one publish call carries when
+	// the corpus is loaded. A zero value keeps the single-message path, which
+	// is what every measurement used before this field existed and is the path
+	// the publish measurements report.
+	//
+	// It exists because the two are far apart: a single-message publish waits
+	// for its own durable acknowledgement, so the loader offers about two and a
+	// half thousand messages a second whatever the publisher count, while a
+	// call carrying a batch of them fills a window of the driver's own size and
+	// is confirmed as one. A backlog measurement that wants a corpus far bigger
+	// than the single-message path can fill in a reasonable time sets this and
+	// reads its load rate against the control cell with the same batch size.
+	//
+	// The corpus load runs before a backlog measurement's window opens, so a
+	// batch here changes what the load costs and not what the window measures.
+	// It does change the CPU a measurement reports, because that figure covers
+	// the whole call rather than the window alone.
+	PublishBatch int
 	// CountDuplicates reports duplicate deliveries instead of failing the run
 	// on them. A measurement without it fails on any delivery its shape did not
 	// expect, which is what every measurement did before this field existed, and
@@ -309,6 +355,21 @@ func New(drv driver.Driver, cfg Config) (*Harness, error) {
 	}
 	if cfg.Partitions < 0 {
 		return nil, fmt.Errorf("bench: partitions must not be negative, got %d", cfg.Partitions)
+	}
+	if cfg.PublishBatch < 0 {
+		return nil, fmt.Errorf("bench: publish batch must not be negative, got %d", cfg.PublishBatch)
+	}
+	// A priority a subscription names twice would have the core derive one
+	// destination per entry and ask the driver for the same destination twice,
+	// which every adapter refuses. The shape is a defect wherever it comes from,
+	// so it is refused here rather than left to the driver to report as a
+	// duplicate destination.
+	seenPriorities := make(map[f1.Priority]struct{}, len(cfg.Priorities))
+	for _, priority := range cfg.Priorities {
+		if _, exists := seenPriorities[priority]; exists {
+			return nil, fmt.Errorf("bench: priority %q is configured twice", priority)
+		}
+		seenPriorities[priority] = struct{}{}
 	}
 	name := fmt.Sprintf("%s-%d", cfg.Namespace, sequence.Add(1))
 	harness := &Harness{
@@ -501,15 +562,7 @@ func (h *Harness) clientConfig() f1.Config {
 		Driver:         h.drv.Name(),
 		Endpoints:      h.endpoints(),
 		ConnectTimeout: connectTimeout,
-	}
-	if h.drv.Name() == kafkaDriverName && h.cfg.Partitions > 0 {
-		// The count travels as the driver option a deployment would set. Its
-		// floor half is a guard rather than a measurement: the topics a run
-		// creates are new, so nothing this run declares has fewer partitions
-		// than it asks for.
-		broker.DriverOptions = map[string]string{
-			"kafka.maxExpectedInstances": strconv.Itoa(h.cfg.Partitions),
-		}
+		DriverOptions:  h.driverOptions(),
 	}
 	return f1.Config{
 		Env:        "bench",
@@ -518,7 +571,7 @@ func (h *Harness) clientConfig() f1.Config {
 		Broker:     broker,
 		Topology: f1.TopologyConfig{
 			AutoCreate: true,
-			Priorities: []f1.Priority{lane},
+			Priorities: h.priorities(),
 		},
 		Codec: f1.CodecConfig{
 			Default:        "json",
@@ -532,6 +585,44 @@ func (h *Harness) clientConfig() f1.Config {
 			CloseTimeout: closeTimeout,
 		},
 	}
+}
+
+// driverOptions is the driver options a measurement's config carries: the
+// settings the harness exposes that travel as a documented driver option, and
+// nothing else, so a measurement of one exercises the lever a deployment pulls.
+// A key belongs to one driver, and a client is built for one driver, so at most
+// one of these applies; a setting this harness does not expose is absent rather
+// than set to a value the harness guessed.
+func (h *Harness) driverOptions() map[string]string {
+	options := make(map[string]string, 1)
+	if h.drv.Name() == kafkaDriverName && h.cfg.Partitions > 0 {
+		// The count travels as the driver option a deployment would set. Its
+		// floor half is a guard rather than a measurement: the topics a run
+		// creates are new, so nothing this run declares has fewer partitions
+		// than it asks for.
+		options["kafka.maxExpectedInstances"] = strconv.Itoa(h.cfg.Partitions)
+	}
+	if h.drv.Name() == rabbitMQDriverName && h.cfg.QueueType != "" {
+		// The kind travels the same way, and the driver refuses a value it does
+		// not support, so an option this harness carries and the driver does not
+		// document fails the run instead of measuring a shape nobody asked for.
+		options["rabbitmq.queueType"] = h.cfg.QueueType
+	}
+	if len(options) == 0 {
+		return nil
+	}
+	return options
+}
+
+// priorities is the priority set a measurement's subscription consumes and its
+// publishers address. A measurement that configures none keeps the harness's
+// one lane, which is the shape every measurement had before the setting
+// existed.
+func (h *Harness) priorities() []f1.Priority {
+	if len(h.cfg.Priorities) == 0 {
+		return []f1.Priority{lane}
+	}
+	return h.cfg.Priorities
 }
 
 // mode selects one measurement's handler policy and publish shape.
@@ -781,7 +872,7 @@ func (r *run) subscription() f1.Subscription {
 	sub := f1.Subscription{
 		Name:           r.h.subscription,
 		Topics:         []string{r.h.topic},
-		Priorities:     []f1.Priority{lane},
+		Priorities:     r.h.priorities(),
 		Concurrency:    r.h.cfg.Concurrency,
 		Prefetch:       r.h.cfg.Prefetch,
 		HandlerTimeout: handlerTimeout,
@@ -843,22 +934,37 @@ func (r *run) handle(ctx context.Context, event *f1.Event) error {
 	return nil
 }
 
-// publish sends one corpus message. An ordered measurement attaches the key
-// its sequence maps to, which is what gives the subscription's ordering
-// something to serialise; an unordered measurement sends no key, exactly as
-// every measurement did before ordering existed.
-func (r *run) publish(ctx context.Context, seq int) error {
-	if !r.h.cfg.Ordered {
-		_, err := r.client.Publisher().Publish(ctx, r.h.topic, payload{Seq: seq})
-		return err
+// publishOptions is the option set one corpus message is published with. An
+// ordered measurement attaches the key its sequence maps to, which is what
+// gives the subscription's ordering something to serialise; an unordered
+// measurement sends no key, exactly as every measurement did before ordering
+// existed. A measurement over more than one priority sends each sequence to the
+// priority its index maps to, so the corpus is split evenly across the
+// destinations and neither is the one thing the rate describes.
+func (r *run) publishOptions(seq int) []f1.PublishOption {
+	var options []f1.PublishOption
+	if r.h.cfg.Ordered {
+		options = append(options, f1.WithKey(r.h.keys[seq%orderedKeys]))
 	}
-	_, err := r.client.Publisher().Publish(ctx, r.h.topic, payload{Seq: seq},
-		f1.WithKey(r.h.keys[seq%orderedKeys]))
+	if priorities := r.h.priorities(); len(priorities) > 1 {
+		options = append(options, f1.WithPriority(priorities[seq%len(priorities)]))
+	}
+	return options
+}
+
+// publish sends one corpus message.
+func (r *run) publish(ctx context.Context, seq int) error {
+	_, err := r.client.Publisher().Publish(ctx, r.h.topic, payload{Seq: seq}, r.publishOptions(seq)...)
 	return err
 }
 
-// publishBulk distributes the corpus across the configured publishers.
+// publishBulk distributes the corpus across the configured publishers, by the
+// path the measurement configured: the single-message one, which is what every
+// measurement did before the batch setting existed, or the chunked one.
 func (r *run) publishBulk(ctx context.Context) error {
+	if r.h.cfg.PublishBatch > 0 {
+		return r.publishChunked(ctx)
+	}
 	var (
 		wait   sync.WaitGroup
 		mu     sync.Mutex
@@ -880,6 +986,56 @@ func (r *run) publishBulk(ctx context.Context) error {
 	}
 	wait.Wait()
 	return failed
+}
+
+// publishChunked loads the corpus one call per chunk, with each publisher
+// owning a contiguous span of it so no two publishers send the same sequence
+// and no sequence goes unsent.
+func (r *run) publishChunked(ctx context.Context) error {
+	var (
+		wait   sync.WaitGroup
+		mu     sync.Mutex
+		failed error
+	)
+	for _, span := range publishSpans(r.h.cfg.Messages, r.h.cfg.Publishers) {
+		wait.Add(1)
+		go func() {
+			defer wait.Done()
+			for start := span[0]; start < span[1]; start += r.h.cfg.PublishBatch {
+				end := min(start+r.h.cfg.PublishBatch, span[1])
+				messages := make([]f1.Message, 0, end-start)
+				for seq := start; seq < end; seq++ {
+					messages = append(messages, f1.Message{
+						EventType: r.h.topic,
+						Payload:   payload{Seq: seq},
+						Opts:      r.publishOptions(seq),
+					})
+				}
+				if _, err := r.client.Publisher().PublishBatch(ctx, messages); err != nil {
+					mu.Lock()
+					failed = errors.Join(failed, fmt.Errorf("bench: publish %d-%d: %w", start, end, err))
+					mu.Unlock()
+					return
+				}
+			}
+		}()
+	}
+	wait.Wait()
+	return failed
+}
+
+// publishSpans splits a corpus into one contiguous span per publisher. The
+// spans cover every sequence exactly once, which is what lets a chunked
+// publisher treat its span as the whole of its share: the tracker fails the
+// measurement on a sequence that was never published, so a span list that left
+// a gap would be a wrong corpus rather than a slower one.
+func publishSpans(messages, publishers int) [][2]int {
+	size := (messages + publishers - 1) / publishers
+	spans := make([][2]int, 0, publishers)
+	for start := 0; start < messages; start += size {
+		spans = append(spans, [2]int{start, min(start+size, messages)})
+	}
+	return spans
 }
 
 // publishSequential publishes one message at a time and waits for each one to
