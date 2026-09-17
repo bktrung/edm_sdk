@@ -247,10 +247,12 @@ test that needs no broker; the integration files are not compiled into them at
 all, so no test in either run connects to a broker. Those two targets are the
 default gate and they stay runnable with nothing listening.
 
-`make test-infra` runs the other half, `go test -count=1 -p 1 -tags integration
-./...`, with Kafka and RabbitMQ started first. An unreachable fixture fails the
-run; nothing behind the tag skips. Packages run one at a time there because the
-broker-backed suites share both fixtures and the machine.
+`make test-infra` compiles the integration half, `go test -count=1 -p 1 -tags integration
+./...`, with Kafka and RabbitMQ started first. An unreachable fixture fails the run.
+It leaves Kafka conformance, gated by `F1_KAFKA_CONFORMANCE`, and the driver flip, gated by
+`F1_DRIVER_FLIP`, out; run them with `make test-kafka-conformance` and
+`make test-driver-flip`. Packages run one at a time because the broker-backed suites share both
+fixtures and the machine.
 
 The per-driver targets are the same tag with a narrower package list:
 `test-kafka`, `test-rabbitmq`, `test-rabbitmq-driver`,

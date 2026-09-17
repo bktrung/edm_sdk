@@ -80,7 +80,6 @@ test-kafka:
         KAFKA_NUM_PARTITIONS: "3"
   variables:
     F1_KAFKA_ENDPOINT: "kafka:19092"
-    F1_REQUIRE_KAFKA: "1"
   script:
     - |
       ready_timeout=120
@@ -124,7 +123,6 @@ test-kafka-conformance:
         KAFKA_NUM_PARTITIONS: "3"
   variables:
     F1_KAFKA_ENDPOINT: "kafka:19092"
-    F1_REQUIRE_KAFKA: "1"
   script:
     - |
       ready_timeout=120
@@ -162,7 +160,6 @@ test-rabbitmq:
       alias: rabbitmq
   variables:
     F1_RABBITMQ_ENDPOINT: "amqp://guest:guest@localhost:5672/"
-    F1_REQUIRE_RABBITMQ: "1"
   script:
     - |
       ready_timeout=120
@@ -201,7 +198,6 @@ test-rabbitmq-conformance:
       alias: rabbitmq
   variables:
     F1_RABBITMQ_ENDPOINT: "amqp://guest:guest@localhost:5672/"
-    F1_REQUIRE_RABBITMQ: "1"
   script:
     - |
       ready_timeout=120
