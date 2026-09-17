@@ -359,13 +359,11 @@ func TestStopKeepsConsumerWhenDrainContextEndsFirst(t *testing.T) {
 	}
 }
 
-// newLeaveTestConnection returns a connection with the destination declared at
-// no delay, which is the state of a destination that is not deferred: an
-// undeclared destination faults every admission instead.
+// newLeaveTestConnection returns a connection for a test consumer that never
+// dials, so nothing in the connection touches a broker.
 func newLeaveTestConnection(destination string) *conn {
 	return &conn{
 		consumers: make(map[*consumer]struct{}),
-		delays:    map[string]time.Duration{destination: 0},
 	}
 }
 
@@ -404,9 +402,9 @@ func newLeaveTestConsumer(t *testing.T, connection *conn, destination string, bu
 		trackers:        make(map[partitionKey]*ackTracker),
 		owned:           make(map[partitionKey]bool),
 		requeued:        make(map[partitionKey]int),
-		discarded:       make(map[partitionKey]map[int64]struct{}),
-		readAheadPaused: make(map[partitionKey]struct{}),
-		pendingHeld:     make(map[partitionKey]int),
+		partitionPauses: make(map[partitionKey]partitionPauseSet),
+		pending:         make(map[partitionKey][]*kgo.Record),
+		heldUntil:       make(map[partitionKey]time.Time),
 		settlerCh:       make(chan struct{}, 1),
 		clock:           clock.NewReal(),
 		cancelPoll:      func() {},

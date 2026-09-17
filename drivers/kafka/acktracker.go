@@ -12,64 +12,23 @@ var (
 	errAckTrackerAlreadySettled = errors.New("kafka: offset already acknowledged")
 )
 
+// ackTracker is the committed cursor for one owned partition. Ack advances the
+// cursor one offset at a time; Drop permanently rejects settlements from the
+// ownership that created the tracker.
 type ackTracker struct {
-	// mu guards internal offset bookkeeping state: base, acked, outstanding,
-	// requeued, and the revoked tombstone flag.
-	mu sync.Mutex
-	// commitMu serializes Ack's commit callback and failure rollback for this
-	// partition so that broker commits never regress and a rollback cannot trample
-	// a concurrent advance. It is deliberately not acquired by Track or Drop,
-	// ensuring admission and tombstoning never wait on broker network I/O.
-	commitMu    sync.Mutex
-	base        int64
-	acked       map[int64]struct{}
-	outstanding map[int64]int
-	requeued    map[int64]int
-	revoked     bool
+	mu       sync.Mutex
+	commitMu sync.Mutex
+	base     int64
+	revoked  bool
 }
 
 func newAckTracker(base int64) *ackTracker {
-	return &ackTracker{
-		base:        base,
-		acked:       make(map[int64]struct{}),
-		outstanding: make(map[int64]int),
-		requeued:    make(map[int64]int),
-	}
+	return &ackTracker{base: base}
 }
 
-func (t *ackTracker) Track(offset int64) error {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	if t.revoked {
-		return ErrRevoked
-	}
-	t.outstanding[offset]++
-	return nil
-}
-
-func (t *ackTracker) TrackRedelivery(offset int64) (reused, deliver bool, err error) {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	if t.revoked {
-		return false, false, ErrRevoked
-	}
-	if t.requeued[offset] > 0 {
-		t.requeued[offset]--
-		if t.requeued[offset] == 0 {
-			delete(t.requeued, offset)
-		}
-		return true, true, nil
-	}
-	if offset < t.base || t.outstanding[offset] > 0 {
-		return false, false, nil
-	}
-	if _, exists := t.acked[offset]; exists {
-		return false, false, nil
-	}
-	t.outstanding[offset]++
-	return false, true, nil
-}
-
+// Ack advances the cursor through offset and commits the next offset. A failed
+// commit restores the old cursor unless Drop won the race while the broker call
+// was in flight.
 func (t *ackTracker) Ack(offset int64, commit func(int64) error) error {
 	t.commitMu.Lock()
 	defer t.commitMu.Unlock()
@@ -79,132 +38,42 @@ func (t *ackTracker) Ack(offset int64, commit func(int64) error) error {
 		t.mu.Unlock()
 		return ErrRevoked
 	}
-	if offset < t.base {
+	if offset != t.base {
 		t.mu.Unlock()
 		return errAckTrackerAlreadySettled
 	}
-	if _, exists := t.acked[offset]; exists {
-		t.mu.Unlock()
-		return errAckTrackerAlreadySettled
-	}
-
-	hadOutstanding := t.outstanding[offset] > 0
-	if hadOutstanding {
-		t.outstanding[offset]--
-		if t.outstanding[offset] == 0 {
-			delete(t.outstanding, offset)
-		}
-	}
-
 	oldBase := t.base
-	t.acked[offset] = struct{}{}
-	advanced := make([]int64, 0, 1)
-	for {
-		if _, exists := t.acked[t.base]; !exists {
-			break
-		}
-		delete(t.acked, t.base)
-		advanced = append(advanced, t.base)
-		t.base++
-	}
-	commitPoint := t.base
+	t.base = offset + 1
 	t.mu.Unlock()
 
-	if len(advanced) > 0 && commit != nil {
-		if err := commit(commitPoint); err != nil {
-			t.mu.Lock()
-			revoked := t.revoked
+	if commit == nil {
+		return nil
+	}
+	if err := commit(offset + 1); err != nil {
+		t.mu.Lock()
+		revoked := t.revoked
+		if !revoked {
 			t.base = oldBase
-			for _, advancedOffset := range advanced {
-				t.acked[advancedOffset] = struct{}{}
-			}
-			delete(t.acked, offset)
-			if hadOutstanding {
-				t.outstanding[offset]++
-			}
-			t.mu.Unlock()
-			if revoked {
-				return ErrRevoked
-			}
-			return err
 		}
+		t.mu.Unlock()
+		if revoked {
+			return ErrRevoked
+		}
+		return err
 	}
 	return nil
 }
 
-func (t *ackTracker) Release(offset int64) error {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	if t.revoked {
-		return ErrRevoked
-	}
-	if t.outstanding[offset] > 0 {
-		t.requeued[offset]++
-	}
-	return nil
-}
-
-func (t *ackTracker) lowestRequeue() (int64, bool) {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	var lowest int64
-	haveLowest := false
-	for offset, count := range t.requeued {
-		if count > 0 && (!haveLowest || offset < lowest) {
-			lowest = offset
-			haveLowest = true
-		}
-	}
-	return lowest, haveLowest
-}
-
-func (t *ackTracker) hasRequeue(offset int64) bool {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	return t.requeued[offset] > 0
-}
-
+// Drop revokes this tracker without waiting for an in-flight commit.
 func (t *ackTracker) Drop() {
 	t.mu.Lock()
 	t.revoked = true
 	t.mu.Unlock()
 }
 
+// CommitPoint returns the next offset this tracker has not committed.
 func (t *ackTracker) CommitPoint() int64 {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	return t.base
-}
-
-func (t *ackTracker) Gap() int64 {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	var highest int64
-	haveHighest := false
-	for offset := range t.acked {
-		if !haveHighest || offset > highest {
-			highest = offset
-			haveHighest = true
-		}
-	}
-	if !haveHighest || highest <= t.base {
-		return 0
-	}
-	return highest - t.base
-}
-
-func (t *ackTracker) holds(offset int64) bool {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	return t.outstanding[offset] > 0
-}
-
-func (t *ackTracker) Unacked() int {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	count := 0
-	for _, outstanding := range t.outstanding {
-		count += outstanding
-	}
-	return count
 }

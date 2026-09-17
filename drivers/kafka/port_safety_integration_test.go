@@ -103,6 +103,33 @@ const (
 	// portNackKey is the key every message of the requeue corpus carries.
 	portNackKey = "port-requeue-key"
 
+	// portOrderPartitions is how many partitions the partition-order test's
+	// destination carries. It is one: due times along a partition are its
+	// records' timestamps plus one fixed delay, so they never decrease and the
+	// head of the log is the earliest due. A destination with more than one
+	// partition would let a record of another partition be delivered while this
+	// partition's head is held, which is not the order this test asserts.
+	portOrderPartitions = 1
+	// portOrderCorpus is how many records the partition-order test publishes.
+	portOrderCorpus = 50
+	// portOwnDueCorpus is how many records the per-record due-time test publishes.
+	// It is small on purpose: each record is published on its own so its own
+	// window can be captured around the call, and the last record's due time is
+	// then later than the first's by the publishing time of the corpus, which the
+	// delivery bound has to contain.
+	portOwnDueCorpus = 3
+	// portOrderDelay is that destination's retry delay.
+	portOrderDelay = 500 * time.Millisecond
+	// portOrderLateBound is how long after its due time a record may arrive on
+	// top of the destination's delay, and it is 100 ms. It bounds one delivery's
+	// own turnaround: the partition-order test measures each record from its due
+	// time or from the release of the record before it, whichever is later, and
+	// the per-record test from its own publish window. A missed wake recovered by
+	// the next fetch return lands inside that allowance, so what this fails is a
+	// record held more than 100 ms past that instant, and a stall that never
+	// recovers fails the test's delivery wait.
+	portOrderLateBound = 100 * time.Millisecond
+
 	// portShare is the prefetch share the share test requests. It must not
 	// exceed the destination's partition count: a consumer can only hold one
 	// delivery per partition, so the share test's destination carries exactly
@@ -163,7 +190,7 @@ const (
 // redelivered it rather than the test having counted a delivery as its
 // settlement.
 func TestPortAtLeastOnceAcrossJoinAndLeave(t *testing.T) {
-	fixture := newPortFixture(t, "at-least-once")
+	fixture := newPortFixture(t, "at-least-once", portPartitions)
 	clk, ctx := fixture.clock, fixture.ctx
 	keys := portKeysByPartition(t)
 	sequences := portSequences(portCorpus)
@@ -298,7 +325,7 @@ func TestPortAtLeastOnceAcrossJoinAndLeave(t *testing.T) {
 // the rebalance moves, at least one delivery the holder is still holding sits on
 // one of them, so the settle window really is exercised.
 func TestPortHeldDeliveryDoesNotHoldRevoke(t *testing.T) {
-	fixture := newPortFixture(t, "held-revoke")
+	fixture := newPortFixture(t, "held-revoke", portPartitions)
 	clk, ctx := fixture.clock, fixture.ctx
 	keys := portKeysByPartition(t)
 	sequences := portSequences(fixture.partitions)
@@ -411,7 +438,7 @@ func TestPortHeldDeliveryDoesNotHoldRevoke(t *testing.T) {
 // group. The second consumer must receive every message, because Release hands
 // back what the first consumer was given.
 func TestPortReleaseWithoutSettleRedelivers(t *testing.T) {
-	fixture := newPortFixture(t, "release")
+	fixture := newPortFixture(t, "release", portPartitions)
 	clk, ctx := fixture.clock, fixture.ctx
 	keys := portKeysByPartition(t)
 	sequences := portSequences(portReleaseCorpus)
@@ -458,7 +485,7 @@ func TestPortReleaseWithoutSettleRedelivers(t *testing.T) {
 // settles the rest. It asserts that the requeued message arrives again and that
 // the later messages of the same partition are still delivered.
 func TestPortNackRequeueRedelivers(t *testing.T) {
-	fixture := newPortFixture(t, "nack-requeue")
+	fixture := newPortFixture(t, "nack-requeue", portPartitions)
 	clk, ctx := fixture.clock, fixture.ctx
 	sequences := portSequences(portNackCorpus)
 	ledger := newPortLedger(clk)
@@ -507,6 +534,146 @@ func TestPortNackRequeueRedelivers(t *testing.T) {
 	consumer.notifications.assertNoFatal(t)
 }
 
+// TestPortPartitionOrderHoldsDeferredHead publishes a corpus to a destination
+// with a fixed retry delay and one partition, and asserts that the records are
+// delivered in offset order, that none arrives before its record timestamp plus
+// that delay, and that each arrives within portOrderLateBound of it.
+//
+// One partition is the point of the test. A record's due time is the timestamp
+// the producer stamped it with plus the destination's one delay, so due times
+// along a partition never decrease and the head of the log is always the
+// earliest due. A driver that delivers a held head before it is due breaks the
+// never-early bound; one that admits a record behind a held head breaks the
+// offset order.
+//
+// The producer stamps its records from its own clock, in this process, so the
+// window the publish returns in bounds every record's timestamp. Kafka stores
+// that timestamp in milliseconds, which is the allowance the never-early bound
+// carries: the due time the driver waited for can be that much earlier than one
+// derived from this test's clock.
+// The bound is 500 ms plus 100 ms for every record, asserted as written. One
+// partition delivers its records one at a time and the test releases each before
+// the next is admitted, so the bound is measured from the later of a record's own
+// due time and the release of the record before it. That bounds one delivery's
+// turnaround rather than the corpus's serial cost; a record the driver holds far
+// past that instant fails it, and a stall that never recovers fails the
+// delivery wait.
+func TestPortPartitionOrderHoldsDeferredHead(t *testing.T) {
+	fixture := newPortFixture(t, "partition-order", portOrderPartitions)
+	clk, ctx := fixture.clock, fixture.ctx
+	sequences := portSequences(portOrderCorpus)
+	ledger := newPortLedger(clk)
+
+	config := fixture.consumerConfig(fixture.group, portOrderCorpus)
+	config.Delays = map[string]time.Duration{fixture.topic: portOrderDelay}
+
+	publishedBefore := clk.Now()
+	fixture.publish(t, sequences, nil)
+	publishedAfter := clk.Now()
+
+	consumer := fixture.subscribe(t, config)
+	assigned := consumer.notifications.awaitAssignment(t, portAssignmentTimeout, "the consumer")
+
+	earliest := publishedBefore.Add(portOrderDelay)
+	// The corpus is delivered one record at a time and the test releases each
+	// record before the next is admitted, so from the second record on the bound
+	// is measured from whichever is later: the record's own due time, or the
+	// release of the record before it.
+	latestFloor := publishedAfter.Add(portOrderDelay)
+	dueBasis := fmt.Sprintf("its record timestamp plus the destination's %s delay", portOrderDelay)
+	var releasedAt time.Time
+	firstDelivery := time.Duration(0)
+	lastDelivery := time.Duration(0)
+	for index, sequence := range sequences {
+		message := portAwaitDelivery(t, clk, consumer, portDeliveryTimeout,
+			fmt.Sprintf("delivery %d of %d", index+1, len(sequences)))
+		if index == 0 {
+			firstDelivery = clk.Since(assigned)
+		}
+		lastDelivery = clk.Since(assigned)
+		if message.Ref.Partition != 0 || message.Ref.Offset != int64(index) {
+			t.Fatalf("delivery %d of %d = %s at offset %d of partition %d, want the corpus in offset order on partition 0",
+				index+1, len(sequences), portSequenceOf(message), message.Ref.Offset, message.Ref.Partition)
+		}
+		if message.ReceivedAt.Before(earliest) {
+			t.Fatalf("%s arrived at %s, before its record timestamp plus the destination's %s delay (%s at the earliest)",
+				sequence, message.ReceivedAt, portOrderDelay, earliest)
+		}
+		latest := latestFloor.Add(portOrderLateBound)
+		boundFrom := dueBasis
+		if index > 0 && releasedAt.After(latestFloor) {
+			latest = releasedAt.Add(portOrderLateBound)
+			boundFrom = fmt.Sprintf("the release of delivery %d", index)
+		}
+		if message.ReceivedAt.After(latest) {
+			t.Fatalf("%s arrived at %s, more than %s after %s (by %s at the latest)",
+				sequence, message.ReceivedAt, portOrderLateBound, boundFrom, latest)
+		}
+		ledger.received(sequence)
+		ledger.acknowledge(ctx, message)
+		releasedAt = clk.Now()
+	}
+
+	ledger.assertNoFailures(t)
+	ledger.metrics(t, "partition-order", sequences, firstDelivery)
+	t.Logf("port-metrics test=partition-order drain-ms=%.3f late-bound-ms=%.3f",
+		float64(lastDelivery-firstDelivery)/float64(time.Millisecond), float64(portOrderLateBound)/float64(time.Millisecond))
+	consumer.notifications.assertNoFatal(t)
+}
+
+// TestPortEachRecordHoldsItsOwnDueTime pins the due rule against each record's
+// own publish instant rather than against the whole corpus's window. The
+// partition-order test publishes its fifty records as one burst and bounds each
+// delivery with the burst's window, which is wider than any one record's own
+// bound; here three records are published one at a time and each is bounded by
+// the instants captured around its own publish call, so a record delivered
+// before its own timestamp plus the destination's delay fails even when it lands
+// inside the burst's window. The producer stamps a record during Publish, so the
+// lower bound holds and the upper bound carries the client's own turnaround.
+func TestPortEachRecordHoldsItsOwnDueTime(t *testing.T) {
+	fixture := newPortFixture(t, "own-due", portOrderPartitions)
+	clk, ctx := fixture.clock, fixture.ctx
+	sequences := portSequences(portOwnDueCorpus)
+	ledger := newPortLedger(clk)
+
+	config := fixture.consumerConfig(fixture.group, portOwnDueCorpus)
+	config.Delays = map[string]time.Duration{fixture.topic: portOrderDelay}
+
+	before := make([]time.Time, 0, len(sequences))
+	after := make([]time.Time, 0, len(sequences))
+	for _, sequence := range sequences {
+		before = append(before, clk.Now())
+		fixture.publish(t, []string{sequence}, nil)
+		after = append(after, clk.Now())
+	}
+
+	consumer := fixture.subscribe(t, config)
+	consumer.notifications.awaitAssignment(t, portAssignmentTimeout, "the consumer")
+
+	for index, sequence := range sequences {
+		message := portAwaitDelivery(t, clk, consumer, portDeliveryTimeout,
+			fmt.Sprintf("delivery %d of %d", index+1, len(sequences)))
+		if message.Ref.Partition != 0 || message.Ref.Offset != int64(index) {
+			t.Fatalf("delivery %d of %d = %s at offset %d of partition %d, want the corpus in offset order on partition 0",
+				index+1, len(sequences), portSequenceOf(message), message.Ref.Offset, message.Ref.Partition)
+		}
+		earliest := before[index].Add(portOrderDelay)
+		if message.ReceivedAt.Before(earliest) {
+			t.Fatalf("%s arrived at %s, before its own publish instant plus the destination's %s delay (%s at the earliest)",
+				sequence, message.ReceivedAt, portOrderDelay, earliest)
+		}
+		latest := after[index].Add(portOrderDelay + portOrderLateBound)
+		if message.ReceivedAt.After(latest) {
+			t.Fatalf("%s arrived at %s, more than %s after its own publish instant plus the destination's %s delay (by %s at the latest)",
+				sequence, message.ReceivedAt, portOrderLateBound, portOrderDelay, latest)
+		}
+		ledger.received(sequence)
+		ledger.acknowledge(ctx, message)
+	}
+	ledger.assertNoFailures(t)
+	consumer.notifications.assertNoFatal(t)
+}
+
 // TestPortPrefetchShareHolds gives one consumer a prefetch share of portShare on
 // a destination whose every partition carries a record, and takes deliveries
 // without settling any of them. It asserts that exactly portShare arrive, that
@@ -517,7 +684,7 @@ func TestPortNackRequeueRedelivers(t *testing.T) {
 // every partition for the whole of the test: a share that was ignored could take
 // more, and a share that could not be reached would show up as a short count.
 func TestPortPrefetchShareHolds(t *testing.T) {
-	fixture := newPortFixture(t, "prefetch-share")
+	fixture := newPortFixture(t, "prefetch-share", portPartitions)
 	clk, ctx := fixture.clock, fixture.ctx
 	keys := portKeysByPartition(t)
 
@@ -611,7 +778,7 @@ func TestPortPrefetchShareHolds(t *testing.T) {
 // a wake. It reports port-metrics test=turnaround p50-ms=<n> p99-ms=<n> and
 // requires the p99 to stay under portTurnaroundBound.
 func TestPortTurnaroundAfterSettle(t *testing.T) {
-	fixture := newPortFixture(t, "turnaround")
+	fixture := newPortFixture(t, "turnaround", portPartitions)
 	clk, ctx := fixture.clock, fixture.ctx
 
 	keys := make([]string, portTurnaroundCorpus)
@@ -713,7 +880,8 @@ type portFixture struct {
 
 // newPortFixture creates the destination, the producer and the groups one test
 // owns, and registers their teardown in the order they have to come down in.
-func newPortFixture(t *testing.T, label string) *portFixture {
+// partitions is the destination's partition count.
+func newPortFixture(t *testing.T, label string, partitions int) *portFixture {
 	t.Helper()
 	requirePortBroker(t)
 
@@ -793,26 +961,26 @@ func newPortFixture(t *testing.T, label string) *portFixture {
 	})
 
 	if _, err := connection.Admin().EnsureTopology(ctx, driver.TopologySpec{
-		Destinations: []driver.DestinationSpec{{Name: topic, Partitions: portPartitions, Durable: true}},
+		Destinations: []driver.DestinationSpec{{Name: topic, Partitions: partitions, Durable: true}},
 		Policy:       driver.TopologyDeclare,
 		Effective:    connection.Capabilities(),
 	}); err != nil {
-		t.Fatalf("EnsureTopology(%q, %d partitions): %v", topic, portPartitions, err)
+		t.Fatalf("EnsureTopology(%q, %d partitions): %v", topic, partitions, err)
 	}
 
 	fixture := &portFixture{
-		ctx:      ctx,
-		clock:    clock.NewReal(),
-		conn:     connection,
-		producer: producer,
-		admin:    admin,
-		topic:    topic,
-		group:    group,
+		ctx:        ctx,
+		clock:      clock.NewReal(),
+		conn:       connection,
+		producer:   producer,
+		admin:      admin,
+		topic:      topic,
+		group:      group,
+		partitions: partitions,
 	}
-	fixture.partitions = fixture.awaitDestination(t)
-	if fixture.partitions != portPartitions {
-		t.Fatalf("destination %s has %d partitions, want %d: a rebalance and a prefetch share both need the partitions they are measured over",
-			topic, fixture.partitions, portPartitions)
+	if got := fixture.awaitDestination(t); got != partitions {
+		t.Fatalf("destination %s has %d partitions, want %d: the test reads the destination it asked for",
+			topic, got, partitions)
 	}
 	return fixture
 }
@@ -843,7 +1011,7 @@ func (f *portFixture) awaitDestination(t *testing.T) int {
 		case <-ticker.C:
 		case <-timer.C:
 			t.Fatalf("destination %s did not report a live leader for %d partitions within %s (last metadata error: %v)",
-				f.topic, portPartitions, portDestinationReadyTimeout, lastErr)
+				f.topic, f.partitions, portDestinationReadyTimeout, lastErr)
 		}
 	}
 }
@@ -1743,7 +1911,7 @@ func portKeysByPartition(t *testing.T) []string {
 // portDiscoverPartitionKeys publishes keyed candidates until every partition has
 // answered with at least one of them.
 func portDiscoverPartitionKeys(t *testing.T) ([]string, error) {
-	fixture := newPortFixture(t, "key-probe")
+	fixture := newPortFixture(t, "key-probe", portPartitions)
 	clk := fixture.clock
 	consumer := fixture.subscribe(t, fixture.consumerConfig(fixture.group, portKeyProbeBatch))
 

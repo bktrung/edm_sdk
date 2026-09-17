@@ -12,6 +12,7 @@ import (
 	"github.com/twmb/franz-go/pkg/kgo"
 
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/driver"
+	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/clock"
 )
 
 const (
@@ -117,7 +118,7 @@ func TestBacklogPollDrainsEachFetchIntoPending(t *testing.T) {
 	}
 	defer closeKafkaConsumer(value)
 
-	deadline := kafkaNow().Add(2 * time.Minute)
+	deadline := clock.NewReal().Now().Add(2 * time.Minute)
 	delivered := make(map[string]int, backlogPollMessages)
 	for range backlogPollMessages {
 		message := receiveKafkaMessageBefore(t, value, deadline)

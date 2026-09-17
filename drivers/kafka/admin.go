@@ -9,6 +9,7 @@ import (
 	"github.com/twmb/franz-go/pkg/kerr"
 
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/driver"
+	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/clock"
 )
 
 type admin struct {
@@ -278,9 +279,9 @@ func (a *admin) pruneGuard(ctx context.Context, name string) (string, error) {
 // dead lettering is unavailable, and the core retry ladder owns those semantics.
 //
 // Under TopologyNone it creates nothing and makes no broker request; it still
-// records each destination's delay, which is local bookkeeping the produce path
-// reads to stamp a due time on a publish that carries none of its own, and not a
-// broker round trip.
+// records each destination's delay, which is local bookkeeping the conformance
+// inspector reads and not a broker round trip. The consume path does not: a
+// consumer takes its due times from the delay its own config carries.
 func (a *admin) EnsureTopology(ctx context.Context, spec driver.TopologySpec) (driver.TopologyDiff, error) {
 	release, err := a.admission(ctx, "ensure_topology")
 	if err != nil {
@@ -289,7 +290,7 @@ func (a *admin) EnsureTopology(ctx context.Context, spec driver.TopologySpec) (d
 	defer release()
 	diff, err := a.ensureTopology(ctx, spec)
 	if err != nil {
-		return driver.TopologyDiff{}, err
+		return diff, err
 	}
 	a.recordDestinationDelays(spec.Destinations)
 	return diff, nil
@@ -301,18 +302,19 @@ func (a *admin) recordDestinationDelays(destinations []driver.DestinationSpec) {
 	}
 	a.conn.mu.Lock()
 	defer a.conn.mu.Unlock()
+	// The instant is read under the lock, not before it, because the history is
+	// read as ordered: two EnsureTopology calls that interleave would otherwise
+	// append their declarations in the order they took the clock rather than the
+	// order they appended, and destinationDelayAt walks the history forward and
+	// stops at the first declaration later than the record it is asked about.
+	now := clock.NewReal().Now()
 	for _, destination := range destinations {
-		a.conn.delays[destination.Name] = destination.Delay
+		history := a.conn.delays[destination.Name]
+		if len(history) > 0 && history[len(history)-1].delay == destination.Delay {
+			continue
+		}
+		a.conn.delays[destination.Name] = append(history, delayDeclaration{at: now, delay: destination.Delay})
 	}
-}
-
-func (a *admin) DescribeTopology(ctx context.Context, names []string) (driver.TopologyState, error) {
-	release, err := a.admission(ctx, "describe_topology")
-	if err != nil {
-		return driver.TopologyState{}, err
-	}
-	defer release()
-	return a.describeTopology(ctx, names)
 }
 
 func (a *admin) clearDestinationDelay(destination string) {
@@ -322,6 +324,15 @@ func (a *admin) clearDestinationDelay(destination string) {
 	a.conn.mu.Lock()
 	defer a.conn.mu.Unlock()
 	delete(a.conn.delays, destination)
+}
+
+func (a *admin) DescribeTopology(ctx context.Context, names []string) (driver.TopologyState, error) {
+	release, err := a.admission(ctx, "describe_topology")
+	if err != nil {
+		return driver.TopologyState{}, err
+	}
+	defer release()
+	return a.describeTopology(ctx, names)
 }
 
 func (a *admin) createTopic(ctx context.Context, topic kafkaTopicSpec) (kadm.CreateTopicResponse, error) {

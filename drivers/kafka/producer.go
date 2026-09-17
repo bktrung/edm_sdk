@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -14,10 +13,6 @@ import (
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/driver"
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/clock"
 )
-
-// delayUntilHeader is reserved for deferred Kafka delivery. It is driver-internal,
-// and the consume path must strip it before the message reaches the application.
-const delayUntilHeader = "x-f1-delay-until"
 
 type producer struct {
 	client     *kgo.Client
@@ -90,8 +85,7 @@ func (p *producer) Publish(ctx context.Context, msgs ...driver.OutboundMessage) 
 			failed[i] = classify("publish", driver.KindTooLarge, fmt.Errorf("message body exceeds MaxMessageBytes (%d)", p.cfg.Effective.MaxMessageBytes))
 			continue
 		}
-		delay, known := p.destinationDelay(msg.Destination)
-		records = append(records, recordForMessage(msg, delay, known, p.currentTime()))
+		records = append(records, recordForMessage(msg, p.currentTime()))
 		recordIndexes = append(recordIndexes, i)
 	}
 	if len(records) == 0 {
@@ -112,38 +106,26 @@ func (p *producer) Publish(ctx context.Context, msgs ...driver.OutboundMessage) 
 	return nil
 }
 
-func (p *producer) destinationDelay(destination string) (time.Duration, bool) {
-	if p.conn == nil {
-		return 0, false
-	}
-	return p.conn.destinationDelay(destination)
-}
-
 func (p *producer) currentTime() time.Time {
 	return p.clock.Now()
 }
 
-func recordForMessage(msg driver.OutboundMessage, destinationDelay time.Duration, known bool, now time.Time) *kgo.Record {
+// recordForMessage builds the record a publish carries. Timestamp is the
+// producer's clock, and the consumer derives a deferred destination's due time
+// from that timestamp plus the destination's delay, so the broker is the only
+// carrier of when the record was published.
+func recordForMessage(msg driver.OutboundMessage, now time.Time) *kgo.Record {
 	record := &kgo.Record{
 		Topic:     msg.Destination,
 		Key:       append([]byte(nil), msg.Key...),
 		Value:     append([]byte(nil), msg.Body...),
 		Timestamp: now,
-		Headers:   make([]kgo.RecordHeader, 0, len(msg.Headers)+1),
+		Headers:   make([]kgo.RecordHeader, 0, len(msg.Headers)),
 	}
 	for _, header := range msg.Headers {
-		if header.Key == delayUntilHeader {
-			continue
-		}
 		record.Headers = append(record.Headers, kgo.RecordHeader{
 			Key:   header.Key,
 			Value: append([]byte(nil), header.Value...),
-		})
-	}
-	if due := outboundDue(msg.DelayUntil, destinationDelay, known, now); !due.IsZero() {
-		record.Headers = append(record.Headers, kgo.RecordHeader{
-			Key:   delayUntilHeader,
-			Value: []byte(strconv.FormatInt(due.UnixNano(), 10)),
 		})
 	}
 	return record

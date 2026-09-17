@@ -21,47 +21,6 @@ import (
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/clock"
 )
 
-func TestPauseReasonSet(t *testing.T) {
-	reasons := []pauseReason{pauseReasonDeferred, pauseReasonPrefetch, pauseReasonAckGap, pauseReasonUserPaused}
-	orders := [][]pauseReason{
-		{reasons[0], reasons[1], reasons[2]},
-		{reasons[0], reasons[2], reasons[1]},
-		{reasons[1], reasons[0], reasons[2]},
-		{reasons[1], reasons[2], reasons[0]},
-		{reasons[2], reasons[0], reasons[1]},
-		{reasons[2], reasons[1], reasons[0]},
-	}
-	for _, order := range orders {
-		set := make(pauseReasonSet)
-		for index, reason := range order {
-			if got := set.add(reason); got != (index == 0) {
-				t.Fatalf("add(%q) becameNonEmpty=%t, want %t for order %v", reason, got, index == 0, order)
-			}
-		}
-		if set.add(order[0]) {
-			t.Fatalf("adding an existing reason became non-empty for order %v", order)
-		}
-		for index := len(order) - 1; index >= 0; index-- {
-			if got := set.remove(order[index]); got != (index == 0) {
-				t.Fatalf("remove(%q) becameEmpty=%t, want %t for order %v", order[index], got, index == 0, order)
-			}
-		}
-		if set.remove(pauseReasonDeferred) {
-			t.Fatalf("removing an absent reason became empty for order %v", order)
-		}
-	}
-
-	set := make(pauseReasonSet)
-	set.add(pauseReasonDeferred)
-	set.add(pauseReasonPrefetch)
-	if set.remove(pauseReasonDeferred) {
-		t.Fatal("removing one of two reasons became empty")
-	}
-	if !set.remove(pauseReasonPrefetch) {
-		t.Fatal("removing the second reason did not become empty")
-	}
-}
-
 func openKafkaConsumerTest(t *testing.T, options map[string]string) (context.Context, *conn, *kadm.Client) {
 	t.Helper()
 	requireBroker(t)
@@ -81,106 +40,6 @@ func openKafkaConsumerTest(t *testing.T, options map[string]string) (context.Con
 	}
 	t.Cleanup(func() { _ = connection.Close(context.Background()) })
 	return ctx, connection, kadm.NewClient(connection.client)
-}
-
-func TestConsumerAckGapPause(t *testing.T) {
-	ctx, connection, admin := openKafkaConsumerTest(t, map[string]string{"kafka.maxAckGap": "1"})
-	topic := kafkaTestTopic(t, "consumer-ack-gap")
-	group := kafkaTestTopic(t, "consumer-ack-gap-group")
-	cleanupKafkaTopics(t, admin, topic)
-	cleanupKafkaGroups(t, admin, group)
-	createKafkaTopic(t, admin, ctx, topic, 1)
-	// A destination that declares a delay gives every record published to it a
-	// due time one delay after its publish instant, so the head is pushed
-	// later within that destination's band to still be owed when the records
-	// behind it settle. The band is half a delay to a delay and a half.
-	const delay = 2 * time.Second
-	const headExtra = delay/2 - 100*time.Millisecond
-	if _, err := connection.Admin().EnsureTopology(ctx, driver.TopologySpec{
-		Destinations: []driver.DestinationSpec{{Name: topic, Delay: delay}},
-		Effective:    connection.Capabilities(),
-	}); err != nil {
-		t.Fatalf("EnsureTopology: %v", err)
-	}
-
-	consumerValue, err := connection.Consumer(ctx, driver.ConsumerConfig{
-		Group: group, Destinations: []string{topic}, Prefetch: 3,
-		Delays:    map[string]time.Duration{topic: delay},
-		Effective: connection.Capabilities(),
-	})
-	if err != nil {
-		t.Fatalf("Consumer: %v", err)
-	}
-	t.Cleanup(func() { closeKafkaConsumer(consumerValue) })
-	producer, err := connection.Producer(ctx, driver.ProducerConfig{RequireDurableAck: true, Effective: connection.Capabilities()})
-	if err != nil {
-		t.Fatalf("Producer: %v", err)
-	}
-	defer func() { _ = producer.Close(context.Background()) }()
-	// The corpus is published after the consumer has joined, so the window the
-	// head's due time opens is the test's own and not the group join's.
-	due := kafkaNow().Add(delay + headExtra)
-	if err := producer.Publish(ctx,
-		driver.OutboundMessage{Destination: topic, Body: []byte("deferred"), DelayUntil: due},
-		driver.OutboundMessage{Destination: topic, Body: []byte("second")},
-		driver.OutboundMessage{Destination: topic, Body: []byte("third")},
-	); err != nil {
-		t.Fatalf("Publish: %v", err)
-	}
-	concrete := consumerValue.(*consumer)
-	// The hold rule admits one delivery of this partition at a time, so the
-	// only settlements that can run ahead of the commit point are those behind
-	// a record that is not due yet: the deferred head is refused and stays
-	// pending, and the two records behind it are delivered and acknowledged
-	// while it is still owed. The highest acknowledged offset is then two past
-	// the commit point, which is what the bound counts.
-	first := receiveKafkaMessage(t, consumerValue)
-	if first.Ref.Offset != 1 {
-		t.Fatalf("first delivery offset = %d, want 1: the deferred head at offset 0 is not due yet", first.Ref.Offset)
-	}
-	if err := first.Settle.Ack(ctx); err != nil {
-		t.Fatalf("Ack(offset 1): %v", err)
-	}
-	concrete.mu.Lock()
-	_, paused := concrete.pauseReasons[topic][pauseReasonAckGap]
-	concrete.mu.Unlock()
-	if paused {
-		t.Fatalf("ack-gap pause reason set while the gap is still within the bound")
-	}
-	second := receiveKafkaMessage(t, consumerValue)
-	if second.Ref.Offset != 2 {
-		t.Fatalf("second delivery offset = %d, want 2", second.Ref.Offset)
-	}
-	if err := second.Settle.Ack(ctx); err != nil {
-		t.Fatalf("Ack(offset 2): %v", err)
-	}
-	concrete.mu.Lock()
-	_, paused = concrete.pauseReasons[topic][pauseReasonAckGap]
-	concrete.mu.Unlock()
-	if !paused {
-		t.Fatalf("ack-gap pause reason missing after out-of-order Ack")
-	}
-	// The pause is a liveness hazard under the hold rule, and it is asserted
-	// here rather than worked around. The only settlement that can close the
-	// gap is the deferred head's, because it is the base, and the head can only
-	// be settled by being delivered. The pause refuses exactly that delivery
-	// (pauseReasonAckGap does not hold records, so blocksDelivery is true), so
-	// the head stays pending past its due time and nothing on this partition
-	// moves again. Before the hold rule a later record could be in flight while
-	// the head waited, and its settlement is what closed the gap; the rule
-	// removed that path, so a destination with `kafka.maxAckGap` set and a
-	// deferred head reaches this state and stays in it. Phase 4 and 5 delete
-	// the ack-gap machinery, which is where this belongs.
-	expectNoKafkaMessage(t, consumerValue, time.Until(due)+250*time.Millisecond)
-	concrete.mu.Lock()
-	_, paused = concrete.pauseReasons[topic][pauseReasonAckGap]
-	concrete.mu.Unlock()
-	if !paused {
-		t.Fatalf("ack-gap pause reason cleared without the gap closing")
-	}
-	if err := consumerValue.Stop(ctx); err != nil {
-		t.Fatalf("Stop: %v", err)
-	}
 }
 
 func TestConsumerRequeueRedeliversInRun(t *testing.T) {
@@ -205,6 +64,12 @@ func TestConsumerRequeueRedeliversInRun(t *testing.T) {
 	}
 	t.Cleanup(func() { closeKafkaConsumer(consumer) })
 	first := receiveKafkaMessage(t, consumer)
+	published := append([]byte(nil), first.Body...)
+	// The handler's copy of the body is the handler's to change, and a
+	// redelivery reads the record the broker carried rather than that copy.
+	for index := range first.Body {
+		first.Body[index] = 'x'
+	}
 	if err := consumer.Pause(topic); err != nil {
 		t.Fatalf("Pause: %v", err)
 	}
@@ -216,8 +81,8 @@ func TestConsumerRequeueRedeliversInRun(t *testing.T) {
 		t.Fatalf("Resume: %v", err)
 	}
 	redelivered := receiveKafkaMessage(t, consumer)
-	if redelivered.Ref.Offset != first.Ref.Offset || !bytes.Equal(redelivered.Body, first.Body) {
-		t.Fatalf("redelivery = offset %d body %q, want offset %d body %q", redelivered.Ref.Offset, redelivered.Body, first.Ref.Offset, first.Body)
+	if redelivered.Ref.Offset != first.Ref.Offset || !bytes.Equal(redelivered.Body, published) {
+		t.Fatalf("redelivery = offset %d body %q, want offset %d body %q", redelivered.Ref.Offset, redelivered.Body, first.Ref.Offset, published)
 	}
 	if err := redelivered.Settle.Ack(ctx); err != nil {
 		t.Fatalf("Ack(redelivery): %v", err)
@@ -273,7 +138,7 @@ func TestConsumerDefersFutureRecordWithPositiveControl(t *testing.T) {
 	if err := controlMessage.Settle.Ack(ctx); err != nil {
 		t.Fatalf("Ack(control): %v", err)
 	}
-	due := kafkaNow().Add(delay)
+	due := clock.NewReal().Now().Add(delay)
 	if err := producer.Publish(ctx, driver.OutboundMessage{
 		Destination: deferred, Body: []byte("deferred"), DelayUntil: due,
 	}); err != nil {
@@ -324,7 +189,7 @@ func TestConsumerLoneDeferredRecordArrivesAtDueTime(t *testing.T) {
 	}
 	t.Cleanup(func() { closeKafkaConsumer(consumer) })
 
-	due := kafkaNow().Add(delay)
+	due := clock.NewReal().Now().Add(delay)
 	if err := producer.Publish(ctx, driver.OutboundMessage{
 		Destination: topic, Body: []byte("lone"), DelayUntil: due,
 	}); err != nil {
@@ -356,15 +221,28 @@ receive:
 	}
 }
 
-func TestConsumerRequeueWaitsBehindDeferredRecord(t *testing.T) {
+// TestConsumerRequeueIsDeliveredAheadOfTheQueuedRecords publishes two records
+// to a delayed destination and requeues the head once it has been delivered. It
+// asserts that nothing behind the held head arrives while it is held, and that
+// the requeued record comes back before the record that was already queued
+// behind it: a requeue takes the head of its partition's queue, and the
+// partition's one-in-flight rule keeps the record behind it waiting until the
+// redelivery settles.
+//
+// The destination carries one partition, because the hold and the queue this
+// test reads are a partition's: two records spread over two partitions would be
+// two heads and two queues, and a hold on one of them would say nothing about
+// the other.
+func TestConsumerRequeueIsDeliveredAheadOfTheQueuedRecords(t *testing.T) {
 	ctx, connection, admin := openKafkaAdminTest(t)
 	topic := kafkaTestTopic(t, "consumer-deferred-requeue")
 	group := kafkaTestTopic(t, "consumer-deferred-requeue-group")
 	cleanupKafkaTopics(t, admin, topic)
 	cleanupKafkaGroups(t, admin, group)
+	createKafkaTopic(t, admin, ctx, topic, 1)
 	const delay = 500 * time.Millisecond
 	if _, err := connection.Admin().EnsureTopology(ctx, driver.TopologySpec{
-		Destinations: []driver.DestinationSpec{{Name: topic, Delay: delay}},
+		Destinations: []driver.DestinationSpec{{Name: topic, Partitions: 1, Delay: delay}},
 		Effective:    connection.Capabilities(),
 	}); err != nil {
 		t.Fatalf("EnsureTopology: %v", err)
@@ -385,35 +263,42 @@ func TestConsumerRequeueWaitsBehindDeferredRecord(t *testing.T) {
 	t.Cleanup(func() { closeKafkaConsumer(consumerValue) })
 	consumer := consumerValue.(*consumer)
 
-	firstDue := kafkaNow().Add(delay)
+	// Both records are published before either is due, so the partition's head
+	// is the first one and its hold applies to the whole partition.
+	firstDue := clock.NewReal().Now().Add(delay)
 	if err := producer.Publish(ctx, driver.OutboundMessage{
 		Destination: topic, Body: []byte("first"), DelayUntil: firstDue,
 	}); err != nil {
 		t.Fatalf("Publish(first): %v", err)
 	}
-	first := receiveKafkaMessage(t, consumerValue)
-	secondDue := kafkaNow().Add(delay)
+	secondDue := clock.NewReal().Now().Add(delay)
 	if err := producer.Publish(ctx, driver.OutboundMessage{
 		Destination: topic, Body: []byte("second"), DelayUntil: secondDue,
 	}); err != nil {
 		t.Fatalf("Publish(second): %v", err)
 	}
 	waitForDeferredPause(t, consumer, topic)
+	expectNoKafkaMessage(t, consumerValue, 150*time.Millisecond)
+
+	first := receiveKafkaMessageBefore(t, consumerValue, firstDue.Add(2*time.Second))
 	if err := first.Settle.Nack(ctx, driver.NackOptions{Requeue: true}); err != nil {
 		t.Fatalf("Nack(first): %v", err)
 	}
-	expectNoKafkaMessage(t, consumerValue, 150*time.Millisecond)
 
-	seen := map[int64]driver.InboundMessage{}
+	// The redelivery and the record behind it, in that order. The first is the
+	// requeued offset and the second is the one that was already queued behind
+	// it, which can only be delivered after the redelivery settles.
+	offsets := make([]int64, 0, 2)
 	for range 2 {
 		message := receiveKafkaMessageBefore(t, consumerValue, secondDue.Add(2*time.Second))
-		seen[message.Ref.Offset] = message
+		offsets = append(offsets, message.Ref.Offset)
 		if err := message.Settle.Ack(ctx); err != nil {
 			t.Fatalf("Ack(offset %d): %v", message.Ref.Offset, err)
 		}
 	}
-	if _, ok := seen[first.Ref.Offset]; !ok {
-		t.Fatalf("redelivery offsets = %v, want first offset %d", seen, first.Ref.Offset)
+	if offsets[0] != first.Ref.Offset || offsets[1] != first.Ref.Offset+1 {
+		t.Fatalf("delivery offsets = %v, want the requeued offset %d then the record behind it at %d",
+			offsets, first.Ref.Offset, first.Ref.Offset+1)
 	}
 }
 
@@ -1112,7 +997,7 @@ func TestConsumerPerDestinationShareRefillsOnSettlement(t *testing.T) {
 	}
 
 	// Assert immediate per-destination refill: one further message delivered from each.
-	deadline := kafkaNow().Add(2 * time.Second)
+	deadline := clock.NewReal().Now().Add(2 * time.Second)
 	refills := make(map[string]driver.InboundMessage)
 	for range 2 {
 		msg := receiveKafkaMessageBefore(t, consumer, deadline)
@@ -1159,7 +1044,7 @@ func TestConsumerPerDestinationShareRefillsOnSettlement(t *testing.T) {
 	if err := refilledFirst.Settle.Ack(ctx); err != nil {
 		t.Fatalf("Ack(first refilled): %v", err)
 	}
-	firstFinal := receiveKafkaMessageBefore(t, consumer, kafkaNow().Add(2*time.Second))
+	firstFinal := receiveKafkaMessageBefore(t, consumer, clock.NewReal().Now().Add(2*time.Second))
 	if firstFinal.Destination != first {
 		t.Fatalf("received %q, want final %q", firstFinal.Destination, first)
 	}
@@ -1303,16 +1188,21 @@ func waitForDeferredPause(t *testing.T, value driver.Consumer, destination strin
 	defer cancel()
 	ticker := time.NewTicker(10 * time.Millisecond) //nolint:forbidigo // broker polling needs a bounded wall-clock retry
 	defer ticker.Stop()
+	key := partitionKey{destination: destination, partition: 0}
 	for {
 		consumer.mu.Lock()
-		_, paused := consumer.pauseReasons[destination][pauseReasonDeferred]
+		_, paused := consumer.partitionPauses[key][partitionPauseHeadHold]
+		state := fmt.Sprintf("queued=%d heldUntil=%v unsettled=%v outstanding=%v reasons=%v partitionPauses=%v owned=%v delays=%v",
+			len(consumer.pending[key]), consumer.heldUntil, consumer.unsettled,
+			consumer.outstanding, consumer.pauseReasons, consumer.partitionPauses,
+			consumer.owned, consumer.cfg.Delays)
 		consumer.mu.Unlock()
 		if paused {
 			return
 		}
 		select {
 		case <-ctx.Done():
-			t.Fatalf("deferred pause was not set: %v", ctx.Err())
+			t.Fatalf("head hold was not set: %v (%s)", ctx.Err(), state)
 		case <-ticker.C:
 		}
 	}
@@ -1632,9 +1522,6 @@ func TestConsumerStaticMembershipOptionInspection(t *testing.T) {
 func TestConsumerRevokeWaitsForSettlerInsideBound(t *testing.T) {
 	key := partitionKey{destination: "topic", partition: 0}
 	tracker := newAckTracker(0)
-	if err := tracker.Track(0); err != nil {
-		t.Fatalf("Track: %v", err)
-	}
 
 	c := &consumer{
 		client:                newRevokeTestConsumerClient(t),
@@ -1697,9 +1584,6 @@ func TestConsumerRevokeWaitsForSettlerInsideBound(t *testing.T) {
 func TestConsumerRevokeTombstonesAfterBound(t *testing.T) {
 	key := partitionKey{destination: "topic", partition: 0}
 	tracker := newAckTracker(0)
-	if err := tracker.Track(0); err != nil {
-		t.Fatalf("Track: %v", err)
-	}
 
 	c := &consumer{
 		client:                newRevokeTestConsumerClient(t),
@@ -1880,9 +1764,6 @@ func TestWaitForSettlersTimesOutOnFakeClock(t *testing.T) {
 func TestConsumerLostDropsImmediatelyWithoutWaiting(t *testing.T) {
 	key := partitionKey{destination: "topic", partition: 0}
 	tracker := newAckTracker(0)
-	if err := tracker.Track(0); err != nil {
-		t.Fatalf("Track: %v", err)
-	}
 
 	c := &consumer{
 		client:                newRevokeTestConsumerClient(t),
@@ -1967,16 +1848,16 @@ func TestConsumerBufferedRecordFencedAfterReassignment(t *testing.T) {
 		t.Fatal("partition is still owned after the revoke")
 	}
 
-	// 4. The pending buffer holds the record of the partition this consumer no
-	// longer owns.
-	pending := []*kgo.Record{record}
-	if !c.flushPending(&pending) {
+	// 4. The poll loop's queue holds the record of the partition this consumer
+	// no longer owns, and flushing it must drop rather than deliver the record.
+	seedQueuedRecords(c, record)
+	if !c.flushPending() {
 		t.Fatal("flushPending returned false")
 	}
 
-	// 5. That record must be discarded from pending and not emitted.
-	if len(pending) != 0 {
-		t.Fatalf("pending length = %d, want 0 (stale record discarded)", len(pending))
+	// 5. That record must be discarded from the queue and not emitted.
+	if queued := queuedRecords(c, key); len(queued) != 0 {
+		t.Fatalf("queued records = %d, want 0 (stale record discarded)", len(queued))
 	}
 	if len(c.messages) != 0 {
 		t.Fatalf("delivered messages = %d, want 0 (dropped by admission)", len(c.messages))
@@ -1995,16 +1876,17 @@ func TestConsumerUnassignedRecordIsDiscarded(t *testing.T) {
 		pauseReasons: make(map[string]pauseReasonSet),
 		clock:        clock.NewFake(time.Unix(0, 0)),
 	}
-	pending := []*kgo.Record{{Topic: key.destination, Partition: key.partition, Offset: 7, Value: []byte("unassigned")}}
-	c.tagRecord(pending[0])
-	if !c.isRecordStale(pending[0]) {
+	record := &kgo.Record{Topic: key.destination, Partition: key.partition, Offset: 7, Value: []byte("unassigned")}
+	c.tagRecord(record)
+	if !c.isRecordStale(record) {
 		t.Fatal("record of a partition this consumer does not own is not stale")
 	}
-	if !c.flushPending(&pending) {
+	seedQueuedRecords(c, record)
+	if !c.flushPending() {
 		t.Fatal("flushPending returned false")
 	}
-	if len(pending) != 0 {
-		t.Fatalf("pending length = %d, want 0 for unassigned record", len(pending))
+	if queued := queuedRecords(c, key); len(queued) != 0 {
+		t.Fatalf("queued records = %d, want 0 for unassigned record", len(queued))
 	}
 	if len(c.trackers) != 0 {
 		t.Fatalf("trackers = %d, want 0 for unassigned record", len(c.trackers))
@@ -2036,12 +1918,12 @@ func TestConsumerUnassignedRecordCannotReviveAfterAssignment(t *testing.T) {
 	// window in which admission reads it as stale. The assignment that follows
 	// must not revive this copy: what the new ownership delivers comes from the
 	// broker, from the offset the broker kept.
-	pending := []*kgo.Record{record}
-	if !c.flushPending(&pending) {
+	seedQueuedRecords(c, record)
+	if !c.flushPending() {
 		t.Fatal("flushPending returned false")
 	}
-	if len(pending) != 0 {
-		t.Fatalf("pending length = %d, want 0 while the record is unowned", len(pending))
+	if queued := queuedRecords(c, key); len(queued) != 0 {
+		t.Fatalf("queued records = %d, want 0 while the record is unowned", len(queued))
 	}
 	if len(c.messages) != 0 {
 		t.Fatalf("delivered messages = %d, want 0 while the record is unowned", len(c.messages))
@@ -2067,13 +1949,6 @@ func TestConsumerOnePartitionChangeDoesNotResetDestinationAccounting(t *testing.
 	key1 := partitionKey{destination: "topic", partition: 1}
 	tracker0 := newAckTracker(0)
 	tracker1 := newAckTracker(0)
-
-	for i := range int64(3) {
-		_ = tracker0.Track(i)
-	}
-	for i := range int64(4) {
-		_ = tracker1.Track(i)
-	}
 
 	c := &consumer{
 		trackers:     map[partitionKey]*ackTracker{key0: tracker0, key1: tracker1},
@@ -2692,7 +2567,7 @@ func TestConsumerBudgetRefusedRecordsResumeOnAck(t *testing.T) {
 	// frees the only ready slot; the other three were already refused, so only
 	// that ack can start them moving again.
 	for delivered := 1; delivered <= 4; delivered++ {
-		message := receiveKafkaMessageBefore(t, consumerValue, kafkaNow().Add(3*time.Second))
+		message := receiveKafkaMessageBefore(t, consumerValue, clock.NewReal().Now().Add(3*time.Second))
 		if message.Destination != ready {
 			t.Fatalf("delivery %d destination = %q, want %q", delivered, message.Destination, ready)
 		}
