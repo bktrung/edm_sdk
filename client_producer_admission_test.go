@@ -11,6 +11,7 @@ import (
 
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/driver"
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/clock"
+	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/lifecycle"
 )
 
 type producerAdmissionDriver struct {
@@ -251,7 +252,7 @@ func TestPublishRejectsProducerWhenCloseWinsDuringBuild(t *testing.T) {
 	conn := &producerAdmissionConn{
 		publishConn: &publishConn{info: driver.BrokerInfo{Kind: "test", Version: "1"}},
 		build: func() (driver.Producer, error) {
-			client.closed = true
+			setClientLifecycle(client, lifecycle.Closed)
 			return built, nil
 		},
 	}
@@ -573,9 +574,7 @@ func TestPublishBatchPreservesClosedAndReconnectErrors(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = client.Close(context.Background()) })
 
-	client.mu.Lock()
-	client.shutdownStarted = true
-	client.mu.Unlock()
+	setClientLifecycle(client, lifecycle.Aborted)
 	result, err := client.Publisher().PublishBatch(context.Background(), []Message{
 		{EventType: "orders.created", Payload: "closed"},
 	})
@@ -586,8 +585,8 @@ func TestPublishBatchPreservesClosedAndReconnectErrors(t *testing.T) {
 		t.Fatalf("closed result = %#v, want empty result entry", result.Results)
 	}
 
+	setClientLifecycle(client, lifecycle.Ready)
 	client.mu.Lock()
-	client.shutdownStarted = false
 	reconnectErr := errors.New("stored reconnect failure")
 	client.reconnectErr = reconnectErr
 	client.mu.Unlock()

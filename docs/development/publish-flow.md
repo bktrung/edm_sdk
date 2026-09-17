@@ -204,18 +204,24 @@ The connection recheck prevents a publish from using a producer built against
 a connection that reconnect has already replaced.
 
 `beginPublish`/`endPublish` maintain the active-publish count. `Client.Close`
-uses that count as a barrier: it drains runners, waits until active publishes
-reach zero, atomically prevents further producer admission, then closes the
-producer and connection. The close path is owned by
+uses that count as a barrier: it closes the application publish entry gate,
+drains runners, waits until active publishes reach zero, then closes the
+producer and connection. The entry gate is what refuses a new application
+publish; the successor handoff keeps using the same producer, and the same
+count, until the producer itself is closed. The close path is owned by
 [`Client.Close`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/client.go), with focused coverage in
 [`client_publish_quiescence_test.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/client_publish_quiescence_test.go)
 and [`publish_test.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/publish_test.go).
 
-Core-generated retry and dead-letter successors use
-[`publishMessages`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/client.go) with an internal `allowClosing` path. This
-allows a delivery already being drained to finish its successor handoff while
-the producer-teardown barrier is still open; application publishes do not get
-that exception.
+Core-generated retry and dead-letter successors go through
+[`publishMessages`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/client.go), which builds the shared producer with the same
+`workPublish` admission and the same constructor an application publish uses.
+What differs is the entry gate: `Publisher.Publish` first requires a `Ready`
+client, so a publish entered after `Close` began is refused, while the
+successor handoff has no such gate and is admitted while the client drains as
+long as the producer still stands. That is what lets a delivery already being
+drained finish its handoff instead of being lost to shutdown. Both paths
+discard a producer built across a connection swap rather than installing it.
 
 ## The `driver.Producer` boundary
 

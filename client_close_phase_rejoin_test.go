@@ -10,6 +10,7 @@ import (
 
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/driver"
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/clock"
+	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/lifecycle"
 )
 
 func TestClientCloseRejoinsTimedOutProducerClose(t *testing.T) {
@@ -88,7 +89,7 @@ func TestConcurrentCloseReportsInProgress(t *testing.T) {
 		t.Fatal("concurrent Close returned nil while the first Close was still running")
 	}
 	client.mu.Lock()
-	closed := client.closed
+	closed := client.lifecycleLocked() == lifecycle.Closed
 	client.mu.Unlock()
 	if closed {
 		t.Fatal("concurrent Close observed a closed client while the first Close was still running")

@@ -81,10 +81,10 @@ func newSettlementOrderingRunner(t *testing.T) (*Client, *Runner, *dispatchConsu
 	return client, runner, consumer
 }
 
-// TestRetriedDeliveryDoesNotCountAsHandled pins the flag the reconnect
-// decision reads: only a delivery the handler completed counts the
-// generation as having one, so a delivery that settles by publishing a retry
-// copy must leave it false.
+// TestRetriedDeliveryDoesNotCountAsHandled pins the report the reconnect
+// decision reads: only a delivery the handler completed makes the delivery
+// path report a handled delivery, so a delivery that settles by publishing a
+// retry copy must report nothing.
 func TestRetriedDeliveryDoesNotCountAsHandled(t *testing.T) {
 	newRunner := func(t *testing.T, handler Handler) (*dispatchProducer, *Runner) {
 		t.Helper()
@@ -96,6 +96,7 @@ func TestRetriedDeliveryDoesNotCountAsHandled(t *testing.T) {
 		t.Cleanup(func() { _ = client.Close(context.Background()) })
 		return producer, &Runner{
 			client: client,
+			events: make(chan runnerEvent, 8),
 			subscription: Subscription{
 				Name:           "orders",
 				Topics:         []string{"orders.created"},
@@ -129,8 +130,8 @@ func TestRetriedDeliveryDoesNotCountAsHandled(t *testing.T) {
 		if !settler.acked || settler.nacked {
 			t.Fatalf("retry settlement = acked %t nacked %t, want the original acked once its retry copy was published", settler.acked, settler.nacked)
 		}
-		if runner.successfulDelivery {
-			t.Fatal("a generation whose only delivery was retried counted it as handled")
+		if reportedHandledDeliveries(runner) != 0 {
+			t.Fatal("a generation whose only delivery was retried reported it as handled")
 		}
 	})
 
@@ -149,21 +150,38 @@ func TestRetriedDeliveryDoesNotCountAsHandled(t *testing.T) {
 		if !settler.acked || settler.nacked {
 			t.Fatalf("handled settlement = acked %t nacked %t, want one ack", settler.acked, settler.nacked)
 		}
-		if !runner.successfulDelivery {
-			t.Fatal("a handled delivery did not count the generation as having one")
+		if reportedHandledDeliveries(runner) != 1 {
+			t.Fatal("a handled delivery did not report the generation as having one")
 		}
 	})
 }
 
+// reportedHandledDeliveries counts the handled-delivery reports a runner's
+// delivery path has sent to its owner, without waiting for any that have not
+// arrived.
+func reportedHandledDeliveries(runner *Runner) int {
+	reported := 0
+	for {
+		select {
+		case event := <-runner.events:
+			if event.kind == runnerEventHandledDelivery {
+				reported++
+			}
+		default:
+			return reported
+		}
+	}
+}
+
 // TestDrainSetupKeepsInstalledSettlementContextLive pins the context
-// ordering between deferred delivery cleanup and drain setup. The cleanup of
-// an abandoned delivery builds a settlement context the first time it needs
-// one, and the drain setup may build one at the same moment. Whichever
-// context the cleanup captured must stay live: cancelling it underneath a
-// settlement call that is about to reach the driver turns that call into a
-// transient context failure before the driver ever sees it, and the
-// delivery's remaining cleanup budget is spent recovering from a cancellation
-// the drain itself caused.
+// ordering between deferred delivery cleanup and drain setup. A settlement
+// call that runs on a context which is already finished is given the runner's
+// own settlement context instead, and the drain setup may build one at the
+// same moment. Whichever context the cleanup captured must stay live:
+// cancelling it underneath a settlement call that is about to reach the
+// driver turns that call into a transient context failure before the driver
+// ever sees it, and the delivery's remaining cleanup budget is spent
+// recovering from a cancellation the runner itself caused.
 func TestDrainSetupKeepsInstalledSettlementContextLive(t *testing.T) {
 	_, runner, consumer := newSettlementOrderingRunner(t)
 
@@ -181,92 +199,149 @@ func TestDrainSetupKeepsInstalledSettlementContextLive(t *testing.T) {
 	}
 }
 
-// TestGenerationStartReplacesExpiredSettlementContext spans two generations
-// and crosses the settlement budget. Generation 1 is abandoned for a
-// reconnect, which cancels its run context; the first settlement that runs
-// after that installs the runner's settlement context with a full drain
-// budget starting then. The runner lives longer than that budget, so by the
-// time a later generation drains at Close the inherited context is already
-// dead - and first-wins kept it, so every drain settlement failed on an
-// expired context without reaching the driver. Starting a generation must
-// retire the previous generation's settlement context so the next install
-// carries a fresh, live budget.
-func TestGenerationStartReplacesExpiredSettlementContext(t *testing.T) {
-	_, runner, consumer := newSettlementOrderingRunner(t)
+// TestExpiredSettlementWindowIsReplaced pins what a runner does with a
+// settlement window whose budget has run out. The runner lives on after it,
+// and every settlement that reaches the driver on the expired window fails at
+// once without the driver seeing the call, so the next settlement that needs
+// the runner's own context is given a fresh one.
+func TestExpiredSettlementWindowIsReplaced(t *testing.T) {
+	_, runner, _ := newSettlementOrderingRunner(t)
 
 	runner.client.config.Lifecycle.DrainTimeout = 30 * time.Millisecond
 
 	fallback, cancelFallback := context.WithCancel(context.Background())
 	cancelFallback()
 
-	generationOne := runnerSettlementContext(runner, fallback)
-	if err := generationOne.Err(); err != nil {
-		t.Fatalf("installed err right after install: %v", err)
+	first := runnerSettlementContext(runner, fallback)
+	if err := first.Err(); err != nil {
+		t.Fatalf("settlement window right after install = %v", err)
 	}
 
 	deadline := clock.NewReal().Timer(5 * time.Second)
 	defer deadline.Stop()
-	for generationOne.Err() == nil {
+	for first.Err() == nil {
 		select {
 		case <-deadline.C:
-			t.Fatal("settlement context did not expire within 5s of a 30ms budget")
+			t.Fatal("settlement window did not expire within 5s of a 30ms budget")
 		default:
 			_ = clock.NewReal().Sleep(context.Background(), 5*time.Millisecond)
 		}
 	}
-	if !errors.Is(generationOne.Err(), context.DeadlineExceeded) {
-		t.Fatalf("generation one settlement context ended with %v, want context deadline exceeded", generationOne.Err())
+	if !errors.Is(first.Err(), context.DeadlineExceeded) {
+		t.Fatalf("settlement window ended with %v, want context deadline exceeded", first.Err())
 	}
 
-	cancelGenerationTwo := func() {}
-	beginRunnerGeneration(runner, fallback, cancelGenerationTwo)
-
-	if err := fetchRunnerAfterCancel(runner, fallback, consumer.Messages(), make(chan delivery, 1)); err != nil {
-		t.Fatalf("fetchRunnerAfterCancel() = %v", err)
+	second := runnerSettlementContext(runner, fallback)
+	if second == first {
+		t.Fatal("the runner handed out a settlement window that had already expired, so every settlement on it fails without reaching the driver")
 	}
-
-	runner.mu.Lock()
-	handedOut := runner.settleCtx
-	runner.mu.Unlock()
-	if handedOut == nil {
-		t.Fatal("drain setup installed no settlement context")
-	}
-	if handedOut == generationOne {
-		t.Fatal("drain setup kept the previous generation's expired settlement context")
-	}
-	if err := handedOut.Err(); err != nil {
-		t.Fatalf("STALE: drain settlement context already expired: %v", err)
+	if err := second.Err(); err != nil {
+		t.Fatalf("replacement settlement window = %v, want a live budget", err)
 	}
 }
 
-// TestGenerationStartDoesNotCancelCapturedSettlementContext pins the way the
-// per-generation reset retires the settlement context: it drops the field,
-// never calls the old cancel. A cleanup goroutine from the previous
-// generation captured the context value, not the field, and may still be
-// about to reach the driver on it; cancelling it there would reintroduce the
-// exact defect first-wins exists to prevent, one level up. The reset must
-// retire both fields together: a stale cancel left behind would be invoked
-// by finishRunner at teardown, cancelling a straggler's context there
-// instead.
-func TestGenerationStartDoesNotCancelCapturedSettlementContext(t *testing.T) {
+// TestReplacingALiveWindowDoesNotCancelIt pins how the replacement is made:
+// the window it replaces is dropped, never cancelled. A cleanup goroutine
+// captured the context value, not the field, and may still be about to reach
+// the driver on it; cancelling it there would turn that call into a context
+// failure the runner caused, one level up from the defect the window exists to
+// avoid. The window is live when the drain's own installation replaces it, so
+// the difference between dropping and cancelling is observable here: a
+// cancelled window reads Canceled at once, a dropped one keeps running to its
+// own deadline. Replacing must also retire the old cancel, so teardown releases
+// the live window rather than one nothing holds any more.
+func TestReplacingALiveWindowDoesNotCancelIt(t *testing.T) {
 	_, runner, _ := newSettlementOrderingRunner(t)
 
-	fallback, cancelFallback := context.WithCancel(context.Background())
-	cancelFallback()
+	runner.client.config.Lifecycle.DrainTimeout = time.Minute
 
-	installed := runnerSettlementContext(runner, fallback)
+	finished, cancelFinished := context.WithCancel(context.Background())
+	cancelFinished()
 
-	cancelNextGeneration := func() {}
-	beginRunnerGeneration(runner, fallback, cancelNextGeneration)
+	// A settlement whose own context has finished is rescued onto the runner's
+	// window, and that window is live.
+	retired := runnerSettlementContext(runner, finished)
+	if retired == finished {
+		t.Fatal("the rescue installed no settlement window")
+	}
+	if err := retired.Err(); err != nil {
+		t.Fatalf("rescued settlement window = %v, want a live budget", err)
+	}
 
-	if err := installed.Err(); err != nil {
-		t.Fatalf("captured settlement context from the previous generation ended with %v when the next generation started; starting a generation must drop the old context, not cancel it", err)
+	// The drain computes its own window when it starts, which replaces the
+	// rescued one.
+	runner.beginSettlementWindow(context.Background())
+	current := runnerSettlementContext(runner, finished)
+	if current == retired {
+		t.Fatal("the drain's window did not replace the rescued one")
+	}
+	if err := current.Err(); err != nil {
+		t.Fatalf("replacement settlement window = %v, want a live budget", err)
+	}
+	if err := retired.Err(); err != nil {
+		t.Fatalf("the retired settlement window ended with %v; replacing a live window must drop it, not cancel it", err)
 	}
 
 	finishRunner(runner)
+	if err := current.Err(); err == nil {
+		t.Fatal("teardown left the settlement window it installed live")
+	}
+	if err := retired.Err(); err != nil {
+		t.Fatalf("teardown ended a retired settlement window with %v; teardown releases only the window it installed", err)
+	}
+}
 
-	if err := installed.Err(); err != nil {
-		t.Fatalf("captured settlement context ended with %v at teardown; a generation start that retires the context must retire its cancel with it", err)
+// TestDrainWindowIsComputedWhenTheDrainStarts pins when the settlement budget
+// begins: at the drain, not at generation start. A runner that has been
+// healthy for longer than DrainTimeout still drains on a live window, so its
+// settlements reach the driver instead of failing on a budget that expired
+// while nothing was draining.
+func TestDrainWindowIsComputedWhenTheDrainStarts(t *testing.T) {
+	_, runner, _ := newSettlementOrderingRunner(t)
+
+	runner.client.config.Lifecycle.DrainTimeout = 30 * time.Millisecond
+	if err := clock.NewReal().Sleep(context.Background(), 50*time.Millisecond); err != nil {
+		t.Fatalf("sleep for longer than the drain budget = %v", err)
+	}
+
+	runner.beginSettlementWindow(context.Background())
+	window := runnerSettlementContext(runner, context.Background())
+	if err := window.Err(); err != nil {
+		t.Fatalf("the drain window was already done when the drain started: %v; the budget begins at the drain and not at the generation", err)
+	}
+	if _, ok := window.Deadline(); !ok {
+		t.Fatal("drain settlement window carries no deadline")
+	}
+}
+
+// TestGenerationStartLeavesTheDrainWindowAlone pins that neither a generation
+// boundary nor teardown retires the settlement window a drain installed. The
+// window is the drain's own value: starting the next generation neither
+// replaces it nor cancels it, and nothing the runner tears down is a context
+// the runner did not create.
+func TestGenerationStartLeavesTheDrainWindowAlone(t *testing.T) {
+	_, runner, _ := newSettlementOrderingRunner(t)
+
+	captured, cancelCaptured := context.WithCancel(context.Background())
+	defer cancelCaptured()
+
+	runner.beginSettlementWindow(captured)
+	window := runnerSettlementContext(runner, captured)
+	if window == captured {
+		t.Fatal("the drain installed no settlement window")
+	}
+
+	beginRunnerGeneration(runner, captured, func() {})
+	if got := runnerSettlementContext(runner, captured); got != window {
+		t.Fatal("starting a generation replaced the drain's settlement window")
+	}
+	if err := window.Err(); err != nil {
+		t.Fatalf("starting a generation ended the drain's settlement window: %v", err)
+	}
+
+	finishRunner(runner)
+	if err := captured.Err(); err != nil {
+		t.Fatalf("the context a settlement captured ended with %v; nothing the runner tears down may cancel a context it did not create", err)
 	}
 }
 

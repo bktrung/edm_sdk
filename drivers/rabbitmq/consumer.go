@@ -534,10 +534,7 @@ func (c *consumer) sendError(err error) {
 
 func inboundMessage(destination string, delivery amqp.Delivery, settler *settler, nativeCount bool) driver.InboundMessage {
 	headers := amqpHeaders(delivery)
-	receivedAt := delivery.Timestamp
-	if receivedAt.IsZero() {
-		receivedAt = time.Now() //nolint:forbidigo // the port requires receipt time and drivers have no clock dependency
-	}
+	receivedAt := time.Now() //nolint:forbidigo // the port requires receipt time and drivers have no clock dependency
 	return driver.InboundMessage{
 		Destination:   destination,
 		Key:           headerValue(delivery.Headers[partitionKeyHeader]),

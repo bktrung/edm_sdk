@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/clock"
+	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/lifecycle"
 )
 
 // newBudgetTestClient builds a client on a fake clock with a runner whose
@@ -187,15 +188,15 @@ func TestCloseConsumerDrainBudgetIsThePublicContract(t *testing.T) {
 	}
 
 	client.mu.Lock()
-	closing, finished, shutdownStarted := client.closing, client.closed, client.shutdownStarted
+	life := client.lifecycleLocked()
 	client.mu.Unlock()
-	if closing {
+	if life == lifecycle.Draining {
 		t.Fatal("the failed close left the concurrent close guard armed")
 	}
-	if finished {
+	if life == lifecycle.Closed {
 		t.Fatal("the failed close marked the client closed")
 	}
-	if !shutdownStarted {
+	if life == lifecycle.Ready {
 		t.Fatal("the failed clear dropped the shutdown admission guards")
 	}
 	if _, err := client.Subscribe(context.Background(), Subscription{Name: "late", Topics: []string{"orders.created"}, Priorities: []Priority{PriorityHigh}}); err == nil || !strings.Contains(err.Error(), "client is closing") {
@@ -229,7 +230,7 @@ func TestCloseConsumerDrainBudgetIsThePublicContract(t *testing.T) {
 		t.Fatalf("connection close calls = %d, want exactly one across both Close attempts", got)
 	}
 	client.mu.Lock()
-	finished = client.closed
+	finished := client.lifecycleLocked() == lifecycle.Closed
 	client.mu.Unlock()
 	if !finished {
 		t.Fatal("the completed retry left the client open")

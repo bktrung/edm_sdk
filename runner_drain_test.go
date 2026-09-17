@@ -207,25 +207,36 @@ func TestDrainAfterRunStillReleasesWhenTheWaitTimesOut(t *testing.T) {
 }
 
 // TestDrainAfterRunReleaseOutlivesACancelledParent pins the interleaving this
-// path exists for: the settlement context is cancelled while a delivery is
-// still in flight, so the wait fails, and the release still runs on a context
-// that is not already done. Running the release on the cancelled settlement
+// path exists for: the context the wait runs on is cancelled while a delivery
+// is still in flight, so the wait fails, and the release still runs on a
+// context that is not already done. Running the release on the cancelled
 // context instead turns this red, because the release inherits that
 // cancellation and gives the broker back nothing.
 func TestDrainAfterRunReleaseOutlivesACancelledParent(t *testing.T) {
 	consumer := newDrainProbeConsumer()
-	runner, client, _ := newDrainRunner(t, consumer, true)
+	runner, client, fake := newDrainRunner(t, consumer, true)
 	client.config.Lifecycle.DrainTimeout = time.Minute
 	client.config.Lifecycle.CloseTimeout = time.Minute
 	runner.inflight.Add(driver.InboundMessage{})
 
-	// The drain waits on the runner's own settlement context, which Run cancels
-	// when the runner is torn down.
-	settlementCtx, cancelSettlement := context.WithCancel(context.Background())
-	runner.settleCtx = settlementCtx
+	// The wait runs on the runner's settlement window, which is the context the
+	// runner's own teardown cancels. A caller's context that is already
+	// finished is what a settlement is rescued from, so this test cancels the
+	// window itself, while the delivery is still in flight.
+	dead, cancelDead := context.WithCancel(context.Background())
+	cancelDead()
+	window := runnerSettlementContext(runner, dead)
+	runner.mu.Lock()
+	cancelWindow := runner.settleCancel
+	runner.mu.Unlock()
+	if cancelWindow == nil {
+		t.Fatal("the runner installed no settlement window")
+	}
 	done := make(chan error, 1)
 	go func() { done <- runner.drainAfterRun(context.Background()) }()
-	cancelSettlement()
+	waitForFakeTimer(t, fake)
+
+	cancelWindow()
 
 	watchdog := clock.NewReal().Timer(2 * time.Second)
 	defer watchdog.Stop()
@@ -236,6 +247,9 @@ func TestDrainAfterRunReleaseOutlivesACancelledParent(t *testing.T) {
 		}
 	case <-watchdog.C:
 		t.Fatal("drainAfterRun did not return after the settlement context was cancelled")
+	}
+	if window.Err() != context.Canceled {
+		t.Fatalf("the context the wait ran on ended with %v, want it cancelled under the wait", window.Err())
 	}
 	stops, _, stopContext := consumer.probes()
 	if stops != 1 {
@@ -251,7 +265,7 @@ func TestDrainAfterRunReleaseOutlivesACancelledParent(t *testing.T) {
 
 // TestDrainAfterRunSuccessPathReleaseHonoursTheSettlementContext pins the other
 // half of the context rule. A release that follows a successful wait runs on
-// the settlement context itself, so the cancellation that tears the runner down
+// the context the wait ran on, so the cancellation that tears the runner down
 // also ends a release still in progress. Only the failure path detaches, and it
 // does so because its wait already ended on that same cancellation.
 func TestDrainAfterRunSuccessPathReleaseHonoursTheSettlementContext(t *testing.T) {
@@ -264,12 +278,15 @@ func TestDrainAfterRunSuccessPathReleaseHonoursTheSettlementContext(t *testing.T
 	client.config.Lifecycle.DrainTimeout = 0
 	client.config.Lifecycle.CloseTimeout = 0
 
-	settlementCtx, cancelSettlement := context.WithCancel(context.Background())
-	runner.settleCtx = settlementCtx
+	// The drain runs on the generation context, which this test cancels while
+	// the release is in progress. Zero budgets run the release on that context
+	// itself rather than on a timer-guarded copy of it, which is the shape this
+	// test needs to observe.
+	runCtx, cancelRun := context.WithCancel(context.Background())
 	done := make(chan error, 1)
-	go func() { done <- runner.drainAfterRun(context.Background()) }()
+	go func() { done <- runner.drainAfterRun(runCtx) }()
 	<-consumer.stopStarted
-	cancelSettlement()
+	cancelRun()
 
 	watchdog := clock.NewReal().Timer(2 * time.Second)
 	defer watchdog.Stop()

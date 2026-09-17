@@ -10,6 +10,7 @@ import (
 
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/driver"
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/clock"
+	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/lifecycle"
 )
 
 // flightCountingProducer counts publishes between admission and completion,
@@ -84,7 +85,7 @@ func waitClientClosing(t *testing.T, client *Client) {
 	defer timer.Stop()
 	for {
 		client.mu.Lock()
-		closing := client.closing
+		closing := client.lifecycleLocked() == lifecycle.Draining
 		client.mu.Unlock()
 		if closing {
 			return
@@ -276,14 +277,13 @@ func TestFailedCloseKeepsProducerTeardownBarrierSet(t *testing.T) {
 
 	client.mu.Lock()
 	barrier := client.producerTeardown
-	closing := client.closing
-	closed := client.closed
+	life := client.lifecycleLocked()
 	client.mu.Unlock()
 	if !barrier {
 		t.Fatal("producer teardown barrier not set although Close reached the publish-idle wait")
 	}
-	if closing || closed {
-		t.Fatalf("closing = %v, closed = %v, want a failed Close to leave the client retryable", closing, closed)
+	if life != lifecycle.Aborted {
+		t.Fatalf("lifecycle = %s, want a failed Close to leave the client retryable", life)
 	}
 
 	if err := publishMessages(client, context.Background(), driver.OutboundMessage{Destination: "orders.created"}); err == nil || !strings.Contains(err.Error(), "client is closed") {

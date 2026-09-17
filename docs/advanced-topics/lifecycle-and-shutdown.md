@@ -134,6 +134,42 @@ Calling `Drain` is idempotent for an already draining or closed runner. The
 caller still needs to observe the returned error and the `Run` result because a
 driver or settlement failure can be surfaced through either lifecycle boundary.
 
+## The client's own state
+
+A client reports its state in three independent parts, and no part takes
+precedence over another:
+
+- the lifecycle: `Ready` before `Close` is entered, `Draining` while a `Close`
+  is running, `Aborted` when a `Close` failed part way and may be retried, and
+  `Closed` once its resources are released;
+- the shared producer, which is built on first use and torn down by `Close`;
+  and
+- the connection: the live one, no connection at all, an attempt to rebuild it
+  in flight, or a connection that was given up carrying the error that ended
+  the attempts.
+
+Keeping the three apart is why the rules below read the way they do. A `Close`
+that timed out after the producer was torn down leaves the producer fact set
+with the lifecycle back in `Aborted`, and a reconnect that exhausted its budget
+records the terminal connection error while the lifecycle stays `Ready`. One
+derived state would have to pick a part as the truth and lose the other.
+
+What each operation is admitted against:
+
+| Operation | Admitted while |
+| --- | --- |
+| `Subscribe` | the lifecycle is `Ready` and a connection is live. Shutdown refuses it at once, because a subscription created while the client drains would create work that nothing drains. |
+| `Runner.Run` | the lifecycle is `Ready` and a connection is live. |
+| application `Publish` | the lifecycle is `Ready`, and later `Draining` or `Aborted` while the shared producer still stands, with a live and current connection. It is refused with the retained reconnect error once the connection was given up, and with the reconnecting error while an attempt is in flight or after the connection the call captured was replaced. |
+| core successor publish | the same rules as an application publish. The retry or dead-letter handoff of a delivery already being drained is admitted while the client is draining, so an accepted failed delivery is not lost merely because shutdown began. |
+| `Health` | the connection, and not the lifecycle. It reports the retained reconnect error when the connection was given up, `f1: client is closed` once the client is closed, `f1: client is not connected` when there is no connection, `f1: client is reconnecting` while an attempt is in flight, and `f1: client is closing` when the lifecycle is neither `Ready` nor `Closed` and the connection is still there. A non-nil result from the connection check is returned before the recorded runner failure is inspected. |
+| a request to rebuild the connection, from a runner | the connection, and the lifecycle only once there is no connection to keep. |
+
+A publish is therefore admitted while the client is draining, and a subscribe
+is not, which is the difference that lets a runner settle the delivery it holds
+while a new subscription is refused. A liveness probe that only needs the
+connection keeps reporting the connection's condition while shutdown runs.
+
 ## Close the client
 
 Use `Client.Close` at the process boundary. It drains all registered runners,
@@ -159,8 +195,9 @@ The close sequence is intentionally settle-last and publish-aware:
 2. the reconnect supervisor is stopped;
 3. registered runners drain concurrently, bounded by
    `Lifecycle.ConsumerDrainTimeout`;
-4. active application publishes reach quiescence, bounded by
-   `Lifecycle.DrainTimeout`;
+4. in-flight publishes reach quiescence, bounded by `Lifecycle.DrainTimeout`:
+   application publishes admitted before `Close` started, plus the successor
+   handoffs admitted while the client drains;
 5. the producer is closed; and
 6. the driver connection is closed.
 
@@ -168,10 +205,11 @@ The producer and connection close steps share `Lifecycle.CloseTimeout`, and a
 retried `Close` rejoins a step that is still running rather than starting a
 second driver call.
 
-Core-generated retry and dead-letter successors are allowed to complete during
-runner drain so an accepted failed delivery is not lost merely because
-shutdown has begun. Application code should stop publishing once shutdown
-starts. The publish-side ownership is described in
+Core-generated retry and dead-letter successors are admitted while the client
+drains, so an accepted failed delivery is not lost merely because shutdown has
+begun. Application code should stop publishing once shutdown starts; an
+application publish that is already in flight is waited for, and a new one is
+refused. The publish-side ownership is described in
 [Publish flow](/development/publish-flow), and the executable orchestration is in
 [`Client.Close`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/client.go).
 
@@ -294,11 +332,15 @@ runner has finished its bounded lifecycle.
 
 ## Reconnection is not shutdown
 
-Transient driver failures can move a runner from `Ready` to `Reconnecting`.
-F1 releases the old consumer, waits for in-flight publish quiescence, and asks
-the driver to create a replacement before returning the runner to `Ready`.
-While reconnecting, the service should keep its runner and avoid creating a
-duplicate subscription.
+Transient driver failures can move a runner from `Ready` to `Reconnecting`, and
+F1 first tries the cheaper repair: the runner opens a replacement consumer
+without touching the connection. When the connection itself has to be rebuilt,
+the client waits for in-flight publish quiescence, replaces the connection,
+retires what the swap replaced, and every runner that was waiting opens a fresh
+consumer on the replacement before returning to `Ready`. A runner holding a
+consumer that was opened across the swap releases it instead of using it. While
+reconnecting, the service should keep its runner and avoid creating a duplicate
+subscription.
 
 Once `Client.Close` begins, shutdown wins over reconnect: new reconnect work is
 not admitted and the supervisor is canceled. A reconnect failure should be
@@ -316,7 +358,9 @@ decisions that matter to the service:
 - a canceled handler settles or requeues instead of being acknowledged as
   successful;
 - `Client.Close` drains multiple runners before producer and connection close;
-- new publishes and subscriptions are refused once shutdown begins;
+- new subscriptions and new application publishes are refused once shutdown
+  begins, while a successor handoff for a delivery already being drained is
+  admitted;
 - a phase timeout returns an error without starting duplicate driver calls on a
   later `Close`; and
 - a fresh shutdown context can complete a retried close after an earlier

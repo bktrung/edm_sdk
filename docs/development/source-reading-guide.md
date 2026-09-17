@@ -219,7 +219,7 @@ Use this recipe for a broker delivery:
 
 ```text
 Runner.Run
-  -> openRunnerConsumer
+  -> openRunnerConsumerWith
   -> fetchRunner
   -> runDispatchPipeline
   -> processDelivery
@@ -228,8 +228,10 @@ Runner.Run
   -> retryAndSettle / deadLetterAndSettle / ackDelivery
 ```
 
-`Runner.Run` owns the generation and lifecycle. `fetchRunner` receives from the
-driver consumer and admits deliveries. `runDispatchPipeline` selects lanes and
+`Runner.Run` owns one owner loop, the generation, and the lifecycle.
+`openRunnerConsumerWith` reads the connection and its epoch and opens the
+generation's consumer on it. `fetchRunner` receives from that consumer and
+admits deliveries. `runDispatchPipeline` selects lanes and
 submits work to the dispatch pool. `processDelivery` owns per-delivery cleanup;
 `dispatchMessage` decodes and classifies the event; `invokeHandler` runs the
 handler under its lifecycle context. The final branch publishes a retry or

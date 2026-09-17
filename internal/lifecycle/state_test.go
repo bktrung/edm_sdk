@@ -90,6 +90,35 @@ func TestMachineAbortIsTerminal(t *testing.T) {
 	}
 }
 
+// TestMachineAbortedMayDrainAgain pins the one move out of Aborted: a shutdown
+// that failed part way is retried, and the retry runs the drain again. Every
+// other move stays refused, and Closed stays the state that does not move at
+// all.
+func TestMachineAbortedMayDrainAgain(t *testing.T) {
+	machine := New()
+	if err := machine.Transition(Ready); err != nil {
+		t.Fatal(err)
+	}
+	if err := machine.Transition(Draining); err != nil {
+		t.Fatal(err)
+	}
+	if err := machine.Transition(Aborted); err != nil {
+		t.Fatal(err)
+	}
+	if err := machine.Transition(Draining); err != nil {
+		t.Fatalf("Aborted -> Draining must be allowed for a retried shutdown: %v", err)
+	}
+	if got := machine.State(); got != Draining {
+		t.Fatalf("state after a retried drain = %s, want draining", got)
+	}
+	if err := machine.Transition(Closed); err != nil {
+		t.Fatal(err)
+	}
+	if err := machine.Transition(Draining); err == nil {
+		t.Fatal("Closed -> Draining must be rejected")
+	}
+}
+
 func TestMachineFailedIsTerminal(t *testing.T) {
 	machine := New()
 	if err := machine.Transition(Ready); err != nil {
