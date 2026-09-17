@@ -327,6 +327,27 @@ func TestPortHeldDeliveryDoesNotHoldRevoke(t *testing.T) {
 	revoke := clk.Since(joiningAt)
 	t.Logf("port-revoke test=held-revoke ms=%d", revoke.Milliseconds())
 
+	committed, err := fixture.committedOffsets()
+	if err != nil {
+		t.Fatalf("read committed offsets for group %q: %v", fixture.group, err)
+	}
+	maxOver := int64(0)
+	for _, message := range held {
+		response, ok := committed.Lookup(fixture.topic, message.Ref.Partition)
+		if !ok || response.At < 0 {
+			continue
+		}
+		over := response.At - message.Ref.Offset
+		if over > maxOver {
+			maxOver = over
+		}
+		if response.At > message.Ref.Offset {
+			t.Fatalf("partition %d committed offset %d past held offset %d",
+				message.Ref.Partition, response.At, message.Ref.Offset)
+		}
+	}
+	t.Logf("port-commit test=held-revoke partitions=%d max-over=%d", fixture.partitions, maxOver)
+
 	firstDeliveries := make(chan time.Time, 1)
 	pump := joiner.pump(func(message driver.InboundMessage) {
 		select {
@@ -851,6 +872,19 @@ func (f *portFixture) destinationState() (int, bool, error) {
 		}
 	}
 	return len(detail.Partitions), len(detail.Partitions) > 0, nil
+}
+
+// committedOffsets reads this fixture group's offsets for its topic through
+// Kafka. FetchOffsetsForTopics fills partitions without a commit with -1; a
+// missing group is the other no-commit result and is treated the same way.
+func (f *portFixture) committedOffsets() (kadm.OffsetResponses, error) {
+	callCtx, cancel := context.WithTimeout(f.ctx, portDestinationReadyTimeout)
+	defer cancel()
+	offsets, err := f.admin.FetchOffsetsForTopics(callCtx, f.group, f.topic)
+	if errors.Is(err, kerr.GroupIDNotFound) {
+		return nil, nil
+	}
+	return offsets, err
 }
 
 // consumerConfig fills in the consumer configuration every test in this file
