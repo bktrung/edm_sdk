@@ -30,10 +30,10 @@ import (
 )
 
 // The run is gated rather than skipped silently: make test-driver-flip sets
-// this variable and F1_REQUIRE_*, so a missing broker fails the target instead
-// of reporting success for a suite that never ran. The integration build tag
-// alone is not enough, because the other integration suites need one broker
-// where this one needs two.
+// F1_DRIVER_FLIP, F1_KAFKA_ENDPOINT, and F1_RABBITMQ_ENDPOINT, so a missing
+// broker fails the target instead of reporting success for a suite that never ran.
+// The integration build tag alone is not enough, because this suite needs two
+// brokers.
 const flipGateEnv = "F1_DRIVER_FLIP"
 
 const (

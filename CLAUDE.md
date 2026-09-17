@@ -99,10 +99,11 @@ path where it matters most.
 more than a second or two is doing I/O it should not, or waiting on real time.
 
 Broker-backed suites need the local fixtures: `make broker-up` for RabbitMQ on 5672,
-`make kafka-up` for Kafka on 19092. `make test-rabbitmq` and `make test-kafka` start what
-they need. Both set an `F1_REQUIRE_*` variable so an unreachable broker fails instead of
-skipping, because a suite that silently skipped is a suite that reported success without
-running.
+`make kafka-up` for Kafka on 19092. A test file that needs a broker carries
+`//go:build integration` and is named `_integration_test.go`. `make test-fast` compiles none
+of them; `make test-infra` compiles all of them and fails when a fixture is unreachable. Kafka
+conformance and the driver flip still need their own targets: `make test-kafka-conformance` and
+`make test-driver-flip`.
 
 The fixtures are shared. Delete every queue, topic and consumer group your test created,
 and never reset or reconfigure a fixture you did not start.
@@ -133,7 +134,9 @@ make test-fast
 Add `make test-rabbitmq` or `make test-kafka` when you touched that driver.
 
 `check-api-diff` failing on a breaking change is not a stale-baseline chore. Changing the
-public API is a release decision. Get it approved before recording a new baseline.
+public API is a release decision. Get it approved before recording a new baseline. The target
+also fails on an unrecorded compatible change; record it in the baseline with
+`make record-api-diff-baseline` in the same commit, with no approval.
 
 `verify-self-contained` fails on citations no reader of this repository can resolve. Design
 records live elsewhere. State the rule the citation stands for instead of the reference.
