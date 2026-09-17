@@ -231,9 +231,9 @@ func runSettle(group *groupContext) {
 	})
 
 	group.Check("out-of-order settlement accounts for every message", func(t *testing.T) {
-		producer := newProducer(t, group, profileDestination(group, "settle.out-of-order"), driver.ProducerConfig{Effective: group.effective})
+		producer := newPlacedProducer(t, group, "settle.out-of-order", driver.ProducerConfig{Effective: group.effective})
 		consumer := newConsumer(t, group, profileDestination(group, "settle.out-of-order"), 3)
-		publishCount(t, group, producer, "settle.out-of-order", 3)
+		publishPlacedCount(t, group, producer, "settle.out-of-order", 3)
 		messages := []driver.InboundMessage{
 			receiveMessage(t, group, consumer),
 			receiveMessage(t, group, consumer),
@@ -252,9 +252,9 @@ func runSettle(group *groupContext) {
 	})
 
 	group.Check("out-of-order requeue and ack lose nothing", func(t *testing.T) {
-		producer := newProducer(t, group, profileDestination(group, "settle.mixed-order"), driver.ProducerConfig{Effective: group.effective})
+		producer := newPlacedProducer(t, group, "settle.mixed-order", driver.ProducerConfig{Effective: group.effective})
 		consumer := newConsumer(t, group, profileDestination(group, "settle.mixed-order"), 3)
-		publishCount(t, group, producer, "settle.mixed-order", 3)
+		publishPlacedCount(t, group, producer, "settle.mixed-order", 3)
 		messages := []driver.InboundMessage{
 			receiveMessage(t, group, consumer),
 			receiveMessage(t, group, consumer),
@@ -313,9 +313,9 @@ func runSettle(group *groupContext) {
 	})
 
 	group.Check("distinct messages settle concurrently", func(t *testing.T) {
-		producer := newProducer(t, group, profileDestination(group, "settle.concurrent"), driver.ProducerConfig{Effective: group.effective})
+		producer := newPlacedProducer(t, group, "settle.concurrent", driver.ProducerConfig{Effective: group.effective})
 		consumer := newConsumer(t, group, profileDestination(group, "settle.concurrent"), 4)
-		publishCount(t, group, producer, "settle.concurrent", 4)
+		publishPlacedCount(t, group, producer, "settle.concurrent", 4)
 		messages := make([]driver.InboundMessage, 4)
 		for i := range messages {
 			messages[i] = receiveMessage(t, group, consumer)

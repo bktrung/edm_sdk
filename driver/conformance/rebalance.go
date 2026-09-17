@@ -489,7 +489,11 @@ func runRebalance(group *groupContext) {
 	})
 }
 
-const rebalancePartitionCount = 4
+// rebalancePartitionCount is the partition count every rebalance destination is
+// declared with. It is also the number of keys placementKey cycles over, and it
+// has to be: the checks publish one record per key and require several of them
+// outstanding at once, which one partition cannot give.
+const rebalancePartitionCount = placementPartitions
 
 func newRebalanceProducer(t *testing.T, group *groupContext, destination string, config driver.ProducerConfig) driver.Producer {
 	t.Helper()
@@ -517,13 +521,18 @@ func newRebalanceProducer(t *testing.T, group *groupContext, destination string,
 	return &profileProducer{group: group, producer: producer, scoped: true}
 }
 
+// publishRebalanceCount publishes count messages to destination, each keyed so
+// that a partition-bound driver places them on distinct partitions. A check that
+// requires several of them outstanding at once needs that: a destination's
+// partitions, not the sum of its consumers' prefetch budgets, decide how much a
+// partition-bound driver may hold unsettled.
 func publishRebalanceCount(t *testing.T, group *groupContext, producer driver.Producer, destination string, count int) {
 	t.Helper()
 	messages := make([]driver.OutboundMessage, count)
 	for i := range messages {
 		messages[i] = driver.OutboundMessage{
 			Destination: destination,
-			Key:         fmt.Appendf(nil, "rebalance-key-%d", i),
+			Key:         []byte(placementKey(i)),
 			Body:        fmt.Appendf(nil, "message-%d", i),
 		}
 	}

@@ -41,11 +41,11 @@ func runCapability(group *groupContext) {
 
 	group.Check("per-message settlement leaves sibling deliveries unsettled", func(t *testing.T) {
 		name := "capability.ack.independent"
-		producer := newProducer(t, group, profileDestination(group, name), driver.ProducerConfig{Effective: group.effective})
+		producer := newPlacedProducer(t, group, name, driver.ProducerConfig{Effective: group.effective})
 		consumer := newConsumer(t, group, profileDestination(group, name), 2)
 		if err := producer.Publish(group.ctx,
-			driver.OutboundMessage{Destination: name, Body: []byte("one")},
-			driver.OutboundMessage{Destination: name, Body: []byte("two")},
+			driver.OutboundMessage{Destination: name, Key: []byte(placementKey(0)), Body: []byte("one")},
+			driver.OutboundMessage{Destination: name, Key: []byte(placementKey(1)), Body: []byte("two")},
 		); err != nil {
 			t.Fatal(err)
 		}

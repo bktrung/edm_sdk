@@ -88,14 +88,14 @@ func runConsume(group *groupContext) {
 	})
 
 	group.Check("prefetch saturates at the subscription budget", func(t *testing.T) {
-		producerA := newProducer(t, group, profileDestination(group, "consume.prefetch-total-a"), driver.ProducerConfig{Effective: group.effective})
-		producerB := newProducer(t, group, profileDestination(group, "consume.prefetch-total-b"), driver.ProducerConfig{Effective: group.effective})
+		producerA := newPlacedProducer(t, group, "consume.prefetch-total-a", driver.ProducerConfig{Effective: group.effective})
+		producerB := newPlacedProducer(t, group, "consume.prefetch-total-b", driver.ProducerConfig{Effective: group.effective})
 		consumer := newConsumerFor(t, group, driver.ConsumerConfig{
 			Destinations: []string{"consume.prefetch-total-a", "consume.prefetch-total-b"}, Prefetch: 4,
 			PerDestination: map[string]int{"consume.prefetch-total-a": 2, "consume.prefetch-total-b": 2}, Effective: group.effective,
 		})
-		publishCount(t, group, producerA, "consume.prefetch-total-a", 4)
-		publishCount(t, group, producerB, "consume.prefetch-total-b", 4)
+		publishPlacedCount(t, group, producerA, "consume.prefetch-total-a", 4)
+		publishPlacedCount(t, group, producerB, "consume.prefetch-total-b", 4)
 		waitFor(t, group, "prefetch total to saturate", func() (bool, string) {
 			views := inspectDestinations(t, group, "consume.prefetch-total-a", "consume.prefetch-total-b")
 			total := views[0].Unsettled + views[1].Unsettled
@@ -115,14 +115,14 @@ func runConsume(group *groupContext) {
 	})
 
 	group.Check("prefetch applies each destination share", func(t *testing.T) {
-		producerA := newProducer(t, group, profileDestination(group, "consume.prefetch-share-a"), driver.ProducerConfig{Effective: group.effective})
-		producerB := newProducer(t, group, profileDestination(group, "consume.prefetch-share-b"), driver.ProducerConfig{Effective: group.effective})
+		producerA := newPlacedProducer(t, group, "consume.prefetch-share-a", driver.ProducerConfig{Effective: group.effective})
+		producerB := newPlacedProducer(t, group, "consume.prefetch-share-b", driver.ProducerConfig{Effective: group.effective})
 		consumer := newConsumerFor(t, group, driver.ConsumerConfig{
 			Destinations: []string{"consume.prefetch-share-a", "consume.prefetch-share-b"}, Prefetch: 4,
 			PerDestination: map[string]int{"consume.prefetch-share-a": 1, "consume.prefetch-share-b": 3}, Effective: group.effective,
 		})
-		publishCount(t, group, producerA, "consume.prefetch-share-a", 3)
-		publishCount(t, group, producerB, "consume.prefetch-share-b", 5)
+		publishPlacedCount(t, group, producerA, "consume.prefetch-share-a", 3)
+		publishPlacedCount(t, group, producerB, "consume.prefetch-share-b", 5)
 		waitFor(t, group, "prefetch destination shares to saturate", func() (bool, string) {
 			views := inspectDestinations(t, group, "consume.prefetch-share-a", "consume.prefetch-share-b")
 			return views[0].Unsettled == 1 && views[1].Unsettled == 3,
@@ -270,9 +270,9 @@ func runConsume(group *groupContext) {
 	})
 
 	group.Check("paused destination stays within its prefetch share", func(t *testing.T) {
-		producer := newProducer(t, group, profileDestination(group, "consume.pause-bound"), driver.ProducerConfig{Effective: group.effective})
+		producer := newPlacedProducer(t, group, "consume.pause-bound", driver.ProducerConfig{Effective: group.effective})
 		consumer := newConsumer(t, group, profileDestination(group, "consume.pause-bound"), 2)
-		publishCount(t, group, producer, "consume.pause-bound", 2)
+		publishPlacedCount(t, group, producer, "consume.pause-bound", 2)
 		first := receiveMessage(t, group, consumer)
 		second := receiveMessage(t, group, consumer)
 		waitFor(t, group, "prefetch saturation before pause", func() (bool, string) {
@@ -387,7 +387,7 @@ func runConsume(group *groupContext) {
 		destination := "consume.two-groups"
 		groupName := "consume-two-groups-" + group.runID + "-" + group.profile.String()
 		purgeAndCleanupTopologyDestinations(t, group.maintenance(t), group.ctx, destination)
-		producer := newProducer(t, group, profileDestination(group, destination), driver.ProducerConfig{Effective: group.effective})
+		producer := newPlacedProducer(t, group, destination, driver.ProducerConfig{Effective: group.effective})
 		consumers := []driver.Consumer{
 			newConsumerFor(t, group, driver.ConsumerConfig{
 				Group: groupName + "-a", Destinations: []string{destination}, Prefetch: 2,
@@ -399,8 +399,8 @@ func runConsume(group *groupContext) {
 			}),
 		}
 		if err := producer.Publish(group.ctx,
-			driver.OutboundMessage{Destination: destination, Body: []byte("shared")},
-			driver.OutboundMessage{Destination: destination, Key: []byte("order-1"), Body: []byte("keyed")},
+			driver.OutboundMessage{Destination: destination, Key: []byte(placementKey(0)), Body: []byte("shared")},
+			driver.OutboundMessage{Destination: destination, Key: []byte(placementKey(1)), Body: []byte("keyed")},
 		); err != nil {
 			t.Fatalf("Publish() error = %v", err)
 		}
@@ -410,9 +410,9 @@ func runConsume(group *groupContext) {
 		}
 		// Nothing is settled until every group has received every body. Settling
 		// in one group releases that group's claim on the key, and a driver that
-		// keeps one claim per key instead of one per group hands the keyed
-		// message to the other group only after that release, which is the
-		// defect this check exists for.
+		// keeps one claim per key instead of one per group hands a keyed message
+		// to the other group only after that release, which is the defect this
+		// check exists for.
 		for _, message := range held {
 			ackMessage(t, group, message)
 		}
@@ -591,6 +591,62 @@ func publishCount(t *testing.T, group *groupContext, producer driver.Producer, d
 	messages := make([]driver.OutboundMessage, count)
 	for i := range messages {
 		messages[i] = driver.OutboundMessage{Destination: destination, Body: fmt.Appendf(nil, "%s-%d", destination, i)}
+	}
+	if err := producer.Publish(group.ctx, messages...); err != nil {
+		t.Fatalf("Publish(%q, %d messages) error = %v", destination, count, err)
+	}
+}
+
+// placementPartitions is the partition count a check declares when it needs
+// several records of one destination outstanding at once. A driver that admits
+// one delivery per partition holds at most one unsettled record per partition,
+// so a check that requires n records in hand needs n partitions under the
+// records it publishes.
+const placementPartitions = 4
+
+// placementKey returns the key the index-th record of a placed publish carries.
+// The keys are load-bearing rather than decorative: a batch published with no
+// key is the partitioner's to place and reaches a single partition, so a check
+// that needs records apart has to say so with a key, and distinct keys only
+// reach distinct partitions if the partitioner hashes them apart. These do,
+// measured against the Kafka fixture through the driver's own producer: the
+// default murmur2 partitioner places key-0 to key-3 on four distinct partitions
+// of a placementPartitions destination, and their first two and first three on
+// distinct partitions of a two- and a three-partition destination as well. The
+// indexes cycle because a check may publish more records than a destination has
+// partitions to hold them.
+func placementKey(index int) string {
+	return fmt.Sprintf("key-%d", index%placementPartitions)
+}
+
+// newPlacedProducer returns a producer over destination, declared with
+// placementPartitions partitions first so that records keyed with placementKey
+// reach distinct partitions. The declaration has to come before anything else
+// creates the destination, where a check's consumer or its producer would: a
+// declaration that arrives afterwards finds the destination existing and leaves
+// its partition count alone.
+func newPlacedProducer(t *testing.T, group *groupContext, destination string, config driver.ProducerConfig) driver.Producer {
+	t.Helper()
+	warmTopology(t, group, driver.TopologySpec{
+		Destinations: []driver.DestinationSpec{{Name: destination, Partitions: placementPartitions}},
+		Effective:    group.effective,
+	})
+	return newProducer(t, group, profileDestination(group, destination), config)
+}
+
+// publishPlacedCount publishes count messages to destination, each keyed so that
+// a partition-bound driver places them on distinct partitions and admits them
+// together, with the bodies publishCount gives. The destination must have been
+// declared through newPlacedProducer.
+func publishPlacedCount(t *testing.T, group *groupContext, producer driver.Producer, destination string, count int) {
+	t.Helper()
+	messages := make([]driver.OutboundMessage, count)
+	for i := range messages {
+		messages[i] = driver.OutboundMessage{
+			Destination: destination,
+			Key:         []byte(placementKey(i)),
+			Body:        fmt.Appendf(nil, "%s-%d", destination, i),
+		}
 	}
 	if err := producer.Publish(group.ctx, messages...); err != nil {
 		t.Fatalf("Publish(%q, %d messages) error = %v", destination, count, err)

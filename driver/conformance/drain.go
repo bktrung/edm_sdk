@@ -289,15 +289,15 @@ func runDrain(group *groupContext) {
 		// a driver that commits contiguously cannot commit past the hole the
 		// earlier body leaves, and at-least-once delivery permits the repeat.
 		ordered := "drain.release-after-ack"
-		orderedProducer := newProducer(t, group, profileDestination(group, ordered), driver.ProducerConfig{Effective: group.effective})
+		orderedProducer := newPlacedProducer(t, group, ordered, driver.ProducerConfig{Effective: group.effective})
 		orderedGroup := "drain-release-after-ack-" + group.runID + "-" + group.profile.String()
 		holder := newConsumerFor(t, group, driver.ConsumerConfig{
 			Group: orderedGroup, Destinations: []string{ordered}, Prefetch: 2,
 			StartAt: driver.StartEarliest, Effective: group.effective,
 		})
 		if err := orderedProducer.Publish(group.ctx,
-			driver.OutboundMessage{Destination: ordered, Body: []byte("release-unsettled")},
-			driver.OutboundMessage{Destination: ordered, Body: []byte("release-acknowledged")},
+			driver.OutboundMessage{Destination: ordered, Key: []byte(placementKey(0)), Body: []byte("release-unsettled")},
+			driver.OutboundMessage{Destination: ordered, Key: []byte(placementKey(1)), Body: []byte("release-acknowledged")},
 		); err != nil {
 			t.Fatalf("Publish(release after a later ack) error = %v", err)
 		}
