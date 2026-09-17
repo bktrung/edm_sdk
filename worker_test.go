@@ -66,11 +66,8 @@ func TestUnknownLaneDoesNotWedgeRun(t *testing.T) {
 
 func TestPipelineErrorCancelsTheGeneration(t *testing.T) {
 	consumer := newDispatchConsumer()
-	client, err := New(context.Background(), testClientConfig(t), WithDriver(&dispatchDriver{conn: &dispatchConn{
-		producer: &dispatchProducer{},
-		consumer: consumer,
-		admin:    &dispatchAdmin{},
-	}}))
+	conn := &dispatchConn{producer: &dispatchProducer{}, consumer: consumer, admin: &dispatchAdmin{}}
+	client, err := New(context.Background(), testClientConfig(t), WithDriver(&dispatchDriver{conn: conn}))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -88,7 +85,10 @@ func TestPipelineErrorCancelsTheGeneration(t *testing.T) {
 	case <-oneSecondTimer(t).C:
 		t.Fatal("Run() did not return after the dispatch pipeline error")
 	}
-	if runner.runCtx == nil || runner.runCtx.Err() == nil {
+	conn.mu.Lock()
+	generationCtx := conn.generationCtx
+	conn.mu.Unlock()
+	if generationCtx == nil || generationCtx.Err() == nil {
 		t.Fatal("generation context was not canceled after pipeline error")
 	}
 	consumer.mu.Lock()

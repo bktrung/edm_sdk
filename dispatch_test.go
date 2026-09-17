@@ -441,6 +441,7 @@ type dispatchConn struct {
 	producer         *dispatchProducer
 	producerOverride driver.Producer
 	consumer         *dispatchConsumer
+	generationCtx    context.Context
 	admin            driver.Admin
 	closed           bool
 	closeCalls       int
@@ -457,10 +458,13 @@ func (c *dispatchConn) Producer(context.Context, driver.ProducerConfig) (driver.
 	return c.producer, nil
 }
 
-func (c *dispatchConn) Consumer(context.Context, driver.ConsumerConfig) (driver.Consumer, error) {
+func (c *dispatchConn) Consumer(ctx context.Context, _ driver.ConsumerConfig) (driver.Consumer, error) {
 	if c.consumer == nil {
 		return nil, errors.New("consumer not used by direct dispatch test")
 	}
+	c.mu.Lock()
+	c.generationCtx = ctx
+	c.mu.Unlock()
 	return c.consumer, nil
 }
 func (c *dispatchConn) Admin() driver.Admin      { return c.admin }

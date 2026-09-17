@@ -755,14 +755,12 @@ func (r *Runner) recordRunExit(ctx context.Context, err error) {
 
 var errRunnerDraining = errors.New("f1: runner is draining")
 
-// beginRunnerGeneration starts a generation: it records the context the
-// generation's sources run on, the cancel that stops them, and the group that
-// owns them. It resets nothing else. The settlement window is deliberately not
-// part of it: the window belongs to the drain, and starting a generation is
-// not the drain.
-func beginRunnerGeneration(r *Runner, runCtx context.Context, cancel context.CancelFunc) *errgroup.Group {
+// beginRunnerGeneration starts a generation: it records the cancel that stops
+// its sources and the group that owns them. It resets nothing else. The
+// settlement window is deliberately not part of it: the window belongs to the
+// drain, and starting a generation is not the drain.
+func beginRunnerGeneration(r *Runner, _ context.Context, cancel context.CancelFunc) *errgroup.Group {
 	r.mu.Lock()
-	r.runCtx = runCtx
 	r.cancel = cancel
 	group := new(errgroup.Group)
 	r.group = group
@@ -804,15 +802,7 @@ func runDispatchPipeline(r *Runner, ctx context.Context, deliveries <-chan deliv
 	if err != nil {
 		return err
 	}
-	r.mu.Lock()
-	r.dispatchPool = pool
-	r.mu.Unlock()
-	defer func() {
-		pool.Close()
-		r.mu.Lock()
-		r.dispatchPool = nil
-		r.mu.Unlock()
-	}()
+	defer pool.Close()
 
 	var pending *delivery
 	pendingLane := ""

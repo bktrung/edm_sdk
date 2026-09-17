@@ -125,8 +125,8 @@ func (f admitFlags) name() string {
 // in this combination.
 //
 //   - No connection: New refuses a nil connection and the swap refuses one too,
-//     and no code clears c.conn, so a client that came through New holds one for
-//     its whole life.
+//     and no code clears c.current.conn, so a client that came through New
+//     holds one for its whole life.
 //   - closing, or the producer teardown, without shutdownStarted: beginClose
 //     sets closing and shutdownStarted in one critical section, and the teardown
 //     is recorded only from the publish-idle wait, which Close runs after it.

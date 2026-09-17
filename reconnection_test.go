@@ -1471,8 +1471,8 @@ func TestRunnerStartedDuringReconnectOpensOnTheReplacementConnection(t *testing.
 		t.Fatal("supervisor reconnect sleep did not start")
 	}
 	// The supervisor is parked in its backoff. It has abandoned the runners it
-	// knew about and has not opened the replacement, so c.conn is still the
-	// connection it is going to retire.
+	// knew about and has not opened the replacement, so c.current.conn is still
+	// the connection it is going to retire.
 
 	runner, err := client.Subscribe(context.Background(), Subscription{
 		Name:           "orders",

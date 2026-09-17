@@ -13,7 +13,6 @@ import (
 	"golang.org/x/sync/errgroup"
 
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/driver"
-	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/dispatch"
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/lifecycle"
 )
 
@@ -74,8 +73,9 @@ func discardUnmatched(envelope Envelope, body []byte) Discarded {
 }
 
 // Runner owns a validated subscription. Construction and notifications live
-// in subscription.go; dispatch and settlement live in worker.go; abandon and
-// drain-after-run ownership lives in reconnect.go.
+// in subscription.go; dispatch and settlement live in worker.go; client-side
+// failure recording, abandon, and drain-after-run ownership live in client.go,
+// reconnect.go, and worker.go.
 type Runner struct {
 	client       *Client
 	subscription Subscription
@@ -91,7 +91,6 @@ type Runner struct {
 	// never waited by the runner, because a non-cooperative callback cannot be
 	// force-stopped without extending shutdown.
 	errorGroup            *errgroup.Group
-	runCtx                context.Context
 	handlerCtx            context.Context
 	handlerCancel         context.CancelFunc
 	handlerShutdownCtx    context.Context
@@ -112,14 +111,14 @@ type Runner struct {
 	runErr       error
 	// recordedFailure reports whether this runner has already recorded a
 	// failure against its subscription name. It is guarded by client.mu, not
-	// by mu: every record site and the clear already hold that lock, and the
-	// exit record reads it in the same critical section that decides whether
-	// the entry it would replace is still this runner's.
+	// by mu: every record site holds that lock, and Run refuses a second start,
+	// so a runner records at most once. The exit record reads it in the same
+	// critical section that decides whether the entry it would replace is still
+	// this runner's.
 	recordedFailure       bool
 	inflight              *inflightRegistry
 	retryDestinationTiers map[string]int
 	lifecycle             *lifecycle.Machine
-	dispatchPool          *dispatch.Pool
 
 	// prefetchConfigured records whether the caller named an in-flight budget
 	// on this subscription, as opposed to taking the broker default. A cap on
