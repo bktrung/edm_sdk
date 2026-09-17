@@ -747,7 +747,7 @@ func (r *Runner) recordRunExit(ctx context.Context, err error) {
 	c := r.client
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.shutdownStarted {
+	if c.lifecycleLocked() != lifecycle.Ready {
 		return
 	}
 	c.recordRunnerExitLocked(r, err)
@@ -1487,7 +1487,7 @@ func openRunnerConsumerWith(r *Runner, waitCtx, genCtx context.Context, prefetch
 	var source string
 	for {
 		r.client.mu.Lock()
-		if r.client.reconnecting {
+		if r.client.conn == connReconnecting {
 			r.client.mu.Unlock()
 			// The runner asks for nothing here: an attempt is already
 			// rebuilding the connection, and this runner waits for it before

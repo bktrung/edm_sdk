@@ -184,12 +184,12 @@ func (p *Publisher) PublishBatch(ctx context.Context, messages []Message) (Batch
 		return result, err
 	}
 	// The connection and its incarnation are one value, read in the section
-	// that records this publish as in flight: the producer this call builds and
-	// the admission it takes later both belong to the connection that was
-	// current when the publish was admitted. Reading the epoch anywhere else
-	// would compare a claim about one incarnation against another.
+	// that records this publish as in flight: the admission the producer build
+	// later takes belongs to the connection that was current when the publish
+	// was admitted, and the epoch travels with it as the claim the build is
+	// re-checked against. Reading the epoch anywhere else would compare a claim
+	// about one incarnation against another.
 	current := p.client.current
-	conn := current.conn
 	epoch := current.epoch
 	effective := p.client.effective
 	headerMaxBytes := effectiveHeaderLimit(p.client.config.Codec.MaxHeaderBytes, effective.MaxHeaderBytes)
@@ -225,56 +225,25 @@ func (p *Publisher) PublishBatch(ctx context.Context, messages []Message) (Batch
 		ids[i] = id
 	}
 
-	// This publish was already admitted above and is counted in Close's
-	// idle wait, so closing may legitimately be true here; only a fully
-	// closed client or a torn-down connection stop it from proceeding.
-	// The producer-teardown branch of admit cannot fire on this path:
-	// beginPublish above already counted this call as in flight, and
-	// producerTeardown is only set once the publish-idle wait observes zero
-	// in-flight publishes, which cannot happen while this call is one of
-	// them. Moving beginPublish to run after this check would break that.
-	p.client.mu.Lock()
-	if err := p.client.admit(workPublish, epoch); err != nil {
-		p.client.mu.Unlock()
-		return result, err
+	// This publish was already admitted by its entry gate above and is counted
+	// in Close's idle wait, so the lifecycle may legitimately have moved to
+	// Draining by now; only a closed client, a torn-down producer, or a failed
+	// or replaced connection stop it from proceeding. The producer-teardown
+	// refusal cannot fire on this path: beginPublish above already counted this
+	// call as in flight, and producerTeardown is only set once the publish-idle
+	// wait observes zero in-flight publishes, which cannot happen while this
+	// call is one of them. Moving beginPublish to run after this check would
+	// break that.
+	built := p.client.sharedProducer(ctx, workPublish, epoch, nil)
+	if built.refused != nil {
+		return result, built.refused
 	}
-	producer := p.client.producerHandle
-	if producer != nil {
-		p.client.mu.Unlock()
-	} else {
-		p.client.mu.Unlock()
-		builtProducer, err := conn.Producer(ctx, driver.ProducerConfig{RequireDurableAck: true, Effective: effective})
-		if err == nil && builtProducer == nil {
-			err = errors.New("driver returned a nil producer")
-		}
-		if err != nil {
-			warnUnclassified(p.client.options.logger, err)
-			requestReconnectOnTransient(p.client, err, epoch)
-			return result, fmt.Errorf("f1: create publisher: %w", err)
-		}
-
-		var loser driver.Producer
-		p.client.mu.Lock()
-		err = p.client.admit(workPublish, epoch)
-		if err == nil {
-			if p.client.producerHandle != nil {
-				producer = p.client.producerHandle
-				loser = builtProducer
-			} else {
-				producer = builtProducer
-				p.client.producerHandle = builtProducer
-			}
-		}
-		p.client.mu.Unlock()
-		if loser != nil {
-			closeDiscardedProducer(p.client, loser, ctx)
-		}
-		if err != nil {
-			closeDiscardedProducer(p.client, builtProducer, ctx)
-			return result, err
-		}
+	if built.buildErr != nil {
+		warnUnclassified(p.client.options.logger, built.buildErr)
+		requestReconnectOnTransient(p.client, built.buildErr, epoch)
+		return result, fmt.Errorf("f1: create publisher: %w", built.buildErr)
 	}
-	publishErr := producer.Publish(ctx, outbound...)
+	publishErr := built.producer.Publish(ctx, outbound...)
 	if publishErr == nil {
 		for i, id := range ids {
 			result.Results[i].ID = id

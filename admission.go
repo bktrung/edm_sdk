@@ -65,25 +65,17 @@ const (
 	connLive
 )
 
-// lifecycleLocked maps the Close flags onto the lifecycle state that admission
-// reads. The caller holds c.mu.
+// lifecycleLocked reports the client's lifecycle. The caller holds c.mu.
 //
-// The three flags are not one boolean. closed is terminal, closing lasts only
-// as long as the Close attempt that set it and is cleared when that attempt
-// fails, and shutdownStarted is set once when Close is entered and never
-// cleared. Aborted is the combination those rules produce: shutdown has begun,
-// no Close attempt is running, and Close may be retried.
+// It is a read of the stored state and not a derivation: the state is moved by
+// the transitions that Close makes, each in the critical section that used to
+// set the flag behind it. Ready is the state before Close is entered, Draining
+// is a Close attempt in flight, Aborted is one that gave up part way and may be
+// retried, and Closed is the state nothing moves out of. Aborted is not
+// Draining: admission stays shut in both while the difference is that Close
+// itself proceeds from Aborted and is refused from Draining.
 func (c *Client) lifecycleLocked() lifecycle.State {
-	switch {
-	case c.closed:
-		return lifecycle.Closed
-	case c.closing:
-		return lifecycle.Draining
-	case c.shutdownStarted:
-		return lifecycle.Aborted
-	default:
-		return lifecycle.Ready
-	}
+	return c.lifecycle.State()
 }
 
 // connStateLocked reports the connection the client is on. The caller holds
@@ -99,7 +91,7 @@ func (c *Client) connStateLocked() connState {
 		return connNone
 	case c.reconnectErr != nil:
 		return connFailed
-	case c.reconnecting:
+	case c.conn == connReconnecting:
 		return connReconnecting
 	default:
 		return connLive
@@ -211,13 +203,14 @@ func (c *Client) admit(kind workKind, epoch uint64) error {
 			return errors.New("f1: client is closing")
 		}
 	case workConsumerAdmission:
-		// The attempt flag is read here rather than the connection axis. The
-		// axis puts a retained reconnect decision before an attempt, which is
-		// the order a publish needs, and the attempt still owns the client
-		// while that decision is being recorded: reading the axis would admit a
+		// The stored connection axis is read here as the attempt flag it
+		// replaced, rather than the derived axis. The derived axis puts a
+		// retained reconnect decision before an attempt, which is the order a
+		// publish needs, and the attempt still owns the client while that
+		// decision is being recorded: reading the derived axis would admit a
 		// consumer in that window, and abandonRunners has already run by then,
 		// so nothing would release it at the swap.
-		if c.reconnecting {
+		if c.conn == connReconnecting {
 			return c.reconnectingError("consume")
 		}
 		if c.staleClaimLocked(epoch) {

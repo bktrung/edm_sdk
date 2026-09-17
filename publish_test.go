@@ -13,6 +13,7 @@ import (
 
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/driver"
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/clock"
+	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/lifecycle"
 )
 
 func TestClientCloseBoundsProducerClose(t *testing.T) {
@@ -189,9 +190,7 @@ func TestPublishRejectedWhenClientIsClosing(t *testing.T) {
 	t.Parallel()
 	producer := &recordingProducer{}
 	client := newPublishClient(t, producer)
-	client.mu.Lock()
-	client.shutdownStarted = true
-	client.mu.Unlock()
+	setClientLifecycle(client, lifecycle.Aborted)
 
 	_, err := client.Publisher().Publish(context.Background(), "orders.created", "payload")
 	if err == nil || !strings.Contains(err.Error(), "client is closed") {
@@ -200,9 +199,7 @@ func TestPublishRejectedWhenClientIsClosing(t *testing.T) {
 	if got := len(producer.messages); got != 0 {
 		t.Fatalf("producer received %d messages while client was closing", got)
 	}
-	client.mu.Lock()
-	client.shutdownStarted = false
-	client.mu.Unlock()
+	setClientLifecycle(client, lifecycle.Ready)
 }
 
 func TestPublishAttemptDuringCloseIsRefused(t *testing.T) {

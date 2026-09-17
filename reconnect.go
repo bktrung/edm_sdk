@@ -100,7 +100,7 @@ func (c *Client) requestReconnect(cause error, epoch uint64) error {
 		c.mu.Unlock()
 		return err
 	}
-	if c.reconnecting || c.staleClaimLocked(epoch) {
+	if c.conn == connReconnecting || c.staleClaimLocked(epoch) {
 		// An attempt already owns the client, or the swap has already replaced
 		// the connection the caller asked about. Either way a second request
 		// would start a second attempt for a change the caller is waiting on.
@@ -111,7 +111,7 @@ func (c *Client) requestReconnect(cause error, epoch uint64) error {
 	// supervisor's receive: the request is in flight from this point, and a
 	// runner that starts now must wait for it instead of opening a consumer on
 	// the connection this attempt is about to replace.
-	c.reconnecting = true
+	c.conn = connReconnecting
 	c.mu.Unlock()
 
 	select {
@@ -165,7 +165,7 @@ func (c *Client) finishReconnect(err error) {
 // release it: that is the window between a delivered request and the attempt
 // that would have served it.
 func (c *Client) finishReconnectLocked(err error) {
-	c.reconnecting = false
+	c.conn = connLive
 	// A waiter that parked during the attempt learns how the attempt ended
 	// here. One that failed leaves the epoch alone, and the waiter reads the
 	// connection state and this error rather than waiting for a connection that
@@ -203,7 +203,7 @@ func (c *Client) reconnectOnce(ctx context.Context, cause error) error {
 				err = c.ensurePublisherTopologyOn(ctx, connection, effective)
 				if err == nil {
 					c.mu.Lock()
-					if c.closed || c.shutdownStarted {
+					if c.lifecycleLocked() != lifecycle.Ready {
 						c.mu.Unlock()
 						_ = connection.Close(context.WithoutCancel(ctx))
 						return errors.New("f1: client is closing")
@@ -281,7 +281,7 @@ func (c *Client) awaitRebuild(ctx context.Context, cause error, epoch uint64, dr
 	}
 	c.mu.Lock()
 	ended := c.wakeLocked()
-	reconnecting := c.reconnecting
+	reconnecting := c.conn == connReconnecting
 	if epoch == 0 {
 		// A caller with no incarnation of its own holds the current one: the
 		// change it is waiting for is the next swap, which is what a caller
@@ -449,7 +449,7 @@ func (c *Client) reconnectingError(op string) error {
 func (c *Client) isReconnecting() bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	return c.reconnecting
+	return c.conn == connReconnecting
 }
 
 func (r *Runner) transitionToReconnecting() {

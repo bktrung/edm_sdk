@@ -65,15 +65,22 @@ type Client struct {
 	producer       string
 	producerHandle driver.Producer
 
-	mu     sync.Mutex
-	closed bool
-	// closing tracks only a Close attempt currently executing. It is cleared
-	// on failure so a retried Close can rejoin pending work.
-	closing bool
-	// shutdownStarted is guarded by mu, set once when Close is entered, and
-	// never cleared. closed is terminal. It is separate from closing because
-	// admission must stay closed after shutdown begins while Close remains retryable.
-	shutdownStarted bool
+	mu sync.Mutex
+	// lifecycle is the client's lifecycle, stored rather than derived from a
+	// set of Close flags: Ready until Close is entered, Draining while the
+	// Close attempt that entered it runs, Aborted when that attempt gave up
+	// part way, and Closed once its resources are released. Aborted is not
+	// terminal, because a failed Close may be retried and re-enters Draining,
+	// and Closed is: a Close that already finished succeeds again without
+	// moving anything.
+	lifecycle *lifecycle.Machine
+	// conn is the connection axis, stored rather than derived from a
+	// reconnecting flag: connReconnecting while an attempt is rebuilding the
+	// connection, connLive otherwise, which is the zero value. The other two
+	// axis values are not stored here. connNone is current.conn being nil, the
+	// one place that fact lives, and connFailed is the retained reconnectErr,
+	// which is the value a refused caller is returned.
+	conn            connState
 	activePublishes int
 	publishIdle     chan struct{}
 	// producerTeardown is guarded by mu, set once when the publish-idle wait
@@ -89,11 +96,10 @@ type Client struct {
 	// Its epoch is 1 for the connection New opened, and a nil conn means the
 	// client holds none.
 	current currentConnection
-	// reconnecting reports connection usability, independently of shutdownStarted.
-	reconnecting bool
 	// reconnectErr records a terminal reconnect decision for the current client
-	// state. It is guarded by mu and remains separate from shutdownStarted:
-	// reconnect exhaustion does not mean Close has been entered.
+	// state. It is guarded by mu and is the value the failed connection axis
+	// carries: reconnect exhaustion does not mean Close has been entered, and a
+	// swap clears it because the connection it describes is gone.
 	reconnectErr      error
 	reconnectRequests chan reconnectRequest
 	reconnectRandom   func() float64
@@ -171,6 +177,7 @@ func New(ctx context.Context, cfg Config, opts ...Option) (*Client, error) {
 	supervisorCtx, supervisorCancel := context.WithCancel(context.Background())
 	client := &Client{
 		current:           currentConnection{conn: connection, epoch: 1},
+		lifecycle:         lifecycle.New(),
 		effective:         effective,
 		options:           options,
 		driverName:        driverName,
@@ -186,6 +193,12 @@ func New(ctx context.Context, cfg Config, opts ...Option) (*Client, error) {
 		runners:           make(map[*Runner]struct{}),
 	}
 	client.limits = limitsFor(driverName, connection.BrokerInfo(), effective)
+	// The client owns a connection from here, so its lifecycle leaves the
+	// machine's Starting: everything admission reads is Ready until Close is
+	// entered. The client never visits Reconnecting or Failed, which are runner
+	// states; a connection being rebuilt is the connection axis, not the
+	// lifecycle.
+	_ = client.lifecycle.Transition(lifecycle.Ready)
 	logCapabilities(client)
 	if err := client.ensurePublisherTopology(ctx); err != nil {
 		supervisorCancel()
@@ -458,16 +471,16 @@ func (c *Client) beginClose() ([]*Runner, bool, error) {
 	// and one that is already running is refused so the caller keeps to one
 	// phase sequence at a time. Aborted proceeds: it is a Close that failed
 	// part way, either a bound expired or the connection close did not return,
-	// and a retried Close rejoins the phase that is still pending. That is why
-	// shutdownStarted stays set once it is set and closing does not.
+	// and a retried Close re-enters the drain. That is why the lifecycle keeps
+	// Aborted apart from Draining: a retried Close moves Aborted back to
+	// Draining, and only Closed is terminal.
 	switch c.lifecycleLocked() {
 	case lifecycle.Closed:
 		return nil, true, nil
 	case lifecycle.Draining:
 		return nil, false, fmt.Errorf("f1: client is closing")
 	}
-	c.closing = true
-	c.shutdownStarted = true
+	_ = c.lifecycle.Transition(lifecycle.Draining)
 	runners := make([]*Runner, 0, len(c.runners))
 	supervisorCancel := c.supervisorCancel
 	for runner := range c.runners {
@@ -481,7 +494,11 @@ func (c *Client) beginClose() ([]*Runner, bool, error) {
 
 func (c *Client) failClose(err error) error {
 	c.mu.Lock()
-	c.closing = false
+	// The attempt is over and its bound expired, so the lifecycle returns to
+	// the retryable state: admission stays shut and a later Close may enter the
+	// drain again. The resources this attempt did not release stay where they
+	// are, which is what makes the retry a continuation.
+	_ = c.lifecycle.Transition(lifecycle.Aborted)
 	c.mu.Unlock()
 	return err
 }
@@ -633,8 +650,7 @@ func (c *Client) closeConnection(ctx context.Context, conn driver.Conn, producer
 
 func (c *Client) finishClose(producerCloseErr error) error {
 	c.mu.Lock()
-	c.closed = true
-	c.closing = false
+	_ = c.lifecycle.Transition(lifecycle.Closed)
 	c.mu.Unlock()
 	return producerCloseErr
 }
@@ -649,18 +665,50 @@ func (c *Client) joinShutdownPhase(ctx context.Context, timeout time.Duration, p
 	return joinPhase(ctx, c.options.clock, timeout, phase, done)
 }
 
-// publishMessages sends core-generated successor messages through the client's
-// shared producer, on the admission every publish through that producer uses.
-func publishMessages(c *Client, ctx context.Context, messages ...driver.OutboundMessage) error {
-	if len(messages) == 0 {
-		return nil
-	}
+// errNilProducer is the refusal a driver that returned no producer gets. Each
+// publish path decides for itself how to report it, because one of them treats
+// it as a creation failure and the other does not, and a caller that compares
+// against it can keep that difference without a second build path.
+var errNilProducer = errors.New("driver returned a nil producer")
+
+// producerResult is what asking for the shared producer produced: the producer
+// to publish through, the connection incarnation it was admitted on, and at
+// most one failure. refused is the admission that turned the publish away,
+// which a caller returns unchanged because that is exactly what its own gate
+// returned before; buildErr is the driver's own failure or a nil producer,
+// which each caller reports in its own way. A result with neither failure
+// carries a producer, and one with either carries no producer.
+type producerResult struct {
+	producer driver.Producer
+	epoch    uint64
+	refused  error
+	buildErr error
+}
+
+// sharedProducer returns the client's shared producer for a publish of kind,
+// building it when the client holds none yet.
+//
+// claim is the incarnation the caller's own admission captured, or zero for a
+// caller that captured none. The build happens outside the lock, because it
+// reaches the broker, and the admission it must satisfy is taken again when it
+// is installed: a producer built across a swap, or one built while a Close
+// entered the drain, belongs to a client state that may no longer admit this
+// publish, so it is closed instead of installed. Two callers that build at the
+// same time install one winner and the loser is closed, which is why the
+// producer is installed at most once per client.
+//
+// onProducer, when set, runs under c.mu at the moment the producer is the
+// caller's to publish through, before the lock is released. publishMessages
+// passes beginPublish: its publish accounting has to start in the same critical
+// section as the admission of the producer it will publish through, or a Close
+// waiting for the publish-idle channel could observe zero in flight and tear
+// the producer down between the two.
+func (c *Client) sharedProducer(ctx context.Context, kind workKind, claim uint64, onProducer func(*Client)) producerResult {
 	c.mu.Lock()
-	if err := c.admit(workPublish, 0); err != nil {
+	if err := c.admit(kind, claim); err != nil {
 		c.mu.Unlock()
-		return err
+		return producerResult{refused: err}
 	}
-	producer := c.producerHandle
 	// The connection and its incarnation are one value, read in the section
 	// that decides whether this call builds a producer: the producer is built
 	// on that connection, and the admission after it compares the claim that
@@ -669,45 +717,71 @@ func publishMessages(c *Client, ctx context.Context, messages ...driver.Outbound
 	conn := current.conn
 	epoch := current.epoch
 	effective := c.effective
+	producer := c.producerHandle
 	if producer != nil {
-		beginPublish(c)
-		c.mu.Unlock()
-	} else {
-		c.mu.Unlock()
-		builtProducer, err := conn.Producer(ctx, driver.ProducerConfig{RequireDurableAck: true, Effective: effective})
-		if err != nil {
-			requestReconnectOnTransient(c, err, epoch)
-			return err
+		if onProducer != nil {
+			onProducer(c)
 		}
-		if builtProducer == nil {
-			return errors.New("driver returned a nil producer")
-		}
+		c.mu.Unlock()
+		return producerResult{producer: producer, epoch: epoch}
+	}
+	c.mu.Unlock()
 
-		var loser driver.Producer
-		c.mu.Lock()
-		err = c.admit(workPublish, epoch)
-		if err == nil {
-			if c.producerHandle != nil {
-				producer = c.producerHandle
-				loser = builtProducer
-			} else {
-				producer = builtProducer
-				c.producerHandle = builtProducer
-			}
-			beginPublish(c)
+	built, err := conn.Producer(ctx, driver.ProducerConfig{RequireDurableAck: true, Effective: effective})
+	if err == nil && built == nil {
+		err = errNilProducer
+	}
+	if err != nil {
+		return producerResult{epoch: epoch, buildErr: err}
+	}
+
+	var loser driver.Producer
+	c.mu.Lock()
+	err = c.admit(kind, epoch)
+	if err == nil {
+		if c.producerHandle != nil {
+			producer = c.producerHandle
+			loser = built
+		} else {
+			producer = built
+			c.producerHandle = built
 		}
-		c.mu.Unlock()
-		if loser != nil {
-			closeDiscardedProducer(c, loser, ctx)
-		}
-		if err != nil {
-			closeDiscardedProducer(c, builtProducer, ctx)
-			return err
+		if onProducer != nil {
+			onProducer(c)
 		}
 	}
+	c.mu.Unlock()
+	if loser != nil {
+		closeDiscardedProducer(c, loser, ctx)
+	}
+	if err != nil {
+		closeDiscardedProducer(c, built, ctx)
+		return producerResult{epoch: epoch, refused: err}
+	}
+	return producerResult{producer: producer, epoch: epoch}
+}
+
+// publishMessages sends core-generated successor messages through the client's
+// shared producer, on the admission every publish through that producer uses.
+func publishMessages(c *Client, ctx context.Context, messages ...driver.OutboundMessage) error {
+	if len(messages) == 0 {
+		return nil
+	}
+	result := c.sharedProducer(ctx, workPublish, 0, beginPublish)
+	if result.refused != nil {
+		return result.refused
+	}
+	if result.buildErr != nil {
+		// The driver's own failure is evidence about the connection; a driver
+		// that returned no producer at all said nothing about it.
+		if !errors.Is(result.buildErr, errNilProducer) {
+			requestReconnectOnTransient(c, result.buildErr, result.epoch)
+		}
+		return result.buildErr
+	}
 	defer endPublish(c)
-	err := producer.Publish(ctx, messages...)
-	requestReconnectOnTransient(c, err, epoch)
+	err := result.producer.Publish(ctx, messages...)
+	requestReconnectOnTransient(c, err, result.epoch)
 	return err
 }
 

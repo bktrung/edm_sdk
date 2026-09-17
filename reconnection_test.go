@@ -528,6 +528,10 @@ func newReconnectTestClientWithLogger(t *testing.T, d *reconnectTestDriver, c cl
 func newReconnectSupervisorTestClient() (*Client, context.CancelFunc) {
 	supervisorCtx, supervisorCancel := context.WithCancel(context.Background())
 	return &Client{
+		// A client that came through New is Ready with a live connection, and
+		// these two facts are what admission reads, so a hand-built client
+		// states them rather than relying on a zero value.
+		lifecycle:         lifecycleIn(lifecycle.Ready),
 		reconnectRequests: make(chan reconnectRequest, 1),
 		supervisorCtx:     supervisorCtx,
 		supervisorCancel:  supervisorCancel,
@@ -557,10 +561,10 @@ func TestRequestReconnectIsRefusedWhileShuttingDown(t *testing.T) {
 		t.Fatal("Close did not return after the consumer drain budget expired")
 	}
 	client.mu.Lock()
-	shutdownStarted, closedState := client.shutdownStarted, client.closed
+	life := client.lifecycleLocked()
 	client.mu.Unlock()
-	if !shutdownStarted || closedState {
-		t.Fatalf("shutdown state = shutdownStarted:%t closed:%t, want started and open", shutdownStarted, closedState)
+	if life != lifecycle.Aborted {
+		t.Fatalf("lifecycle after a failed Close = %s, want shutdown begun and the client open", life)
 	}
 
 	err := client.requestReconnect(errors.New("during shutdown"), 0)
@@ -569,7 +573,7 @@ func TestRequestReconnectIsRefusedWhileShuttingDown(t *testing.T) {
 	}
 	client.mu.Lock()
 	defer client.mu.Unlock()
-	if client.reconnecting {
+	if client.conn == connReconnecting {
 		t.Fatal("client remains reconnecting after rejected shutdown request")
 	}
 }
@@ -581,7 +585,11 @@ func TestRequestReconnectIsRefusedWhileShuttingDown(t *testing.T) {
 func TestRequestReconnectCancellationStillFinishesItsAttempt(t *testing.T) {
 	supervisorCtx, supervisorCancel := context.WithCancel(context.Background())
 	defer supervisorCancel()
-	client := &Client{supervisorCtx: supervisorCtx, reconnectRequests: make(chan reconnectRequest, 1)}
+	client := &Client{
+		lifecycle:         lifecycleIn(lifecycle.Ready),
+		supervisorCtx:     supervisorCtx,
+		reconnectRequests: make(chan reconnectRequest, 1),
+	}
 	supervisorCancel()
 
 	waitCtx, waitCancel := context.WithTimeout(context.Background(), time.Second)
@@ -765,7 +773,7 @@ func TestAwaitRebuildPrefersTheRequestError(t *testing.T) {
 	}
 	client.mu.Lock()
 	defer client.mu.Unlock()
-	if client.reconnecting {
+	if client.conn == connReconnecting {
 		t.Fatal("request error unexpectedly started a reconnect")
 	}
 }
@@ -1257,10 +1265,10 @@ func TestRunnerRepairsConsumerAndResumesDelivery(t *testing.T) {
 		t.Fatalf("runner Run() = %v", err)
 	}
 	client.mu.Lock()
-	shutdownStarted := client.shutdownStarted
+	life := client.lifecycleLocked()
 	client.mu.Unlock()
-	if !shutdownStarted {
-		t.Fatal("Close did not set shutdownStarted")
+	if life != lifecycle.Closed {
+		t.Fatalf("lifecycle after Close = %s, want closed", life)
 	}
 }
 
@@ -1938,10 +1946,10 @@ func TestPublishOnlyClientSurfacesReconnectExhaustion(t *testing.T) {
 		t.Fatalf("Publish() = %v, want stored exhaustion %v", publishErr, reconnectErr)
 	}
 	client.mu.Lock()
-	shutdownStarted := client.shutdownStarted
+	life := client.lifecycleLocked()
 	client.mu.Unlock()
-	if shutdownStarted {
-		t.Fatal("reconnect exhaustion set shutdownStarted")
+	if life != lifecycle.Ready {
+		t.Fatalf("lifecycle after reconnect exhaustion = %s, want ready: exhaustion is not shutdown", life)
 	}
 	if err := client.Close(context.Background()); err != nil {
 		t.Fatalf("Close() after reconnect exhaustion = %v", err)
@@ -2020,10 +2028,10 @@ func TestCloseDuringReconnectKeepsShutdownSeparate(t *testing.T) {
 	}
 	waitReconnectCondition(t, func() bool { return client.isReconnecting() && recorded.sleepCount() == 1 })
 	client.mu.Lock()
-	shutdownStarted := client.shutdownStarted
+	life := client.lifecycleLocked()
 	client.mu.Unlock()
-	if shutdownStarted {
-		t.Fatal("reconnect set shutdownStarted")
+	if life != lifecycle.Ready {
+		t.Fatalf("lifecycle during a reconnect = %s, want ready: a rebuild is the connection axis, not the lifecycle", life)
 	}
 	if err := client.Close(context.Background()); err != nil {
 		t.Fatal(err)
@@ -2035,6 +2043,29 @@ func TestCloseDuringReconnectKeepsShutdownSeparate(t *testing.T) {
 	case <-client.supervisorDone:
 	case <-clock.NewReal().Timer(time.Second).C:
 		t.Fatal("reconnect supervisor did not stop after Close")
+	}
+}
+
+// TestHealthReportsReconnectingWhileAnAttemptRebuildsTheConnection pins what a
+// liveness probe sees during a rebuild: the connection axis says an attempt is
+// in flight, so Health answers with the reconnecting error rather than
+// reporting ready against a connection that is not the client's to use. The
+// supervisor is parked in its backoff, so the attempt stays in flight for the
+// whole assertion.
+func TestHealthReportsReconnectingWhileAnAttemptRebuildsTheConnection(t *testing.T) {
+	fake := clock.NewFake(time.Unix(310, 0))
+	recorded := &recordingClock{Fake: fake}
+	d := &reconnectTestDriver{created: make(chan *reconnectTestConsumer, 8)}
+	client := newReconnectTestClient(t, d, recorded, 0)
+	client.reconnectRandom = func() float64 { return 1 }
+	if err := client.requestReconnect(errors.New("transient"), 0); err != nil {
+		t.Fatal(err)
+	}
+	waitReconnectCondition(t, func() bool { return client.isReconnecting() && recorded.sleepCount() == 1 })
+
+	healthErr := client.Health(context.Background())
+	if healthErr == nil || !strings.Contains(healthErr.Error(), "client is reconnecting") {
+		t.Fatalf("Health() during a rebuild = %v, want the reconnecting error", healthErr)
 	}
 }
 

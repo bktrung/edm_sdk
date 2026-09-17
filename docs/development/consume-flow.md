@@ -54,7 +54,7 @@ The main owners are:
   validation, middleware wrapping, and runner registration;
 - [`Runner.Run`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/worker.go) for generation lifecycle, consumer startup,
   fetch, dispatch, and reconnect decisions;
-- [`openRunnerConsumer`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/worker.go) for destinations, topology, and
+- [`openRunnerConsumerWith`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/worker.go) for destinations, topology, and
   `driver.Consumer` construction;
 - [`runDispatchPipeline`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/worker.go) for scheduler and pool coordination;
 - [`processDelivery`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/worker.go) and [`dispatchMessage`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/worker.go)
@@ -82,10 +82,24 @@ The runner is ready to start, but no subscription topology or driver consumer
 exists yet. The precedence and validation path is in
 [`subscription.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/subscription.go).
 
-`Runner.Run` performs the runtime work. It can only start once, initializes the
-generation contexts, lifecycle machine, in-flight registry,
-and notification groups, then enters its generation loop. A generation owns
-one consumer, fetcher, dispatch pipeline, and consumer-error watcher.
+`Runner.Run` performs the runtime work. It can only start once. It initializes
+the generation contexts, its lifecycle machine, the in-flight registry, and the
+notification groups, then runs one owner loop on the calling goroutine. Every
+other goroutine in the runner reports to that loop as an event, and the loop's
+only blocking read is its event channel, so the runner is never parked where it
+cannot be told to stop: opening a consumer, waiting for a connection rebuild,
+and releasing a consumer each run on a sibling goroutine and hand their result
+back as an event.
+
+A generation owns one consumer, fetcher, dispatch pipeline, and consumer-error
+watcher, plus the connection epoch its consumer was opened on. The epoch is the
+client's connection incarnation: the client installs a connection and its number
+as one value, so a number that has moved means the connection the runner opened
+on was replaced under it. The runner's reconnect work reads that one value
+instead of keeping its own copy of the connection: an open returns the epoch it
+read together with the consumer, admission of a new consumer compares that epoch
+under the client lock, and a generation that finds the epoch moved releases its
+consumer and opens again on the replacement.
 
 This separation lets an application construct subscriptions before deciding
 which goroutine owns their run loop, and lets reconnect rebuild a generation
@@ -93,8 +107,9 @@ without creating a second public subscription.
 
 ## Topology and consumer creation
 
-`openRunnerConsumer` reads the current connection and effective capability
-profile, then derives the physical destinations for:
+`openRunnerConsumerWith` reads the current connection, its epoch, the effective
+capability profile, and the source in one critical section, then derives the
+physical destinations for:
 
 - each configured logical topic;
 - each selected priority;
@@ -124,7 +139,9 @@ The runner then creates one `driver.Consumer` with:
 - the effective capability profile; and
 - the current core-selected starting position for a new group (`StartEarliest`).
 
-The executable owner is [`openRunnerConsumer`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/worker.go). The shared
+The executable owner is [`openRunnerConsumerWith`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/worker.go). It returns the
+epoch it read along with the consumer, so the caller admits what it built
+against the incarnation it was built on. The shared
 consumer and topology contracts are [`driver.Consumer`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/driver/driver.go),
 [`driver.Admin`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/driver/driver.go), and
 [`driver/topology.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/driver/topology.go). User-visible capability
@@ -137,6 +154,10 @@ After a consumer is ready, `Runner.Run` starts three coordinated activities:
 - `fetchRunner` reads `Consumer.Messages`;
 - `runDispatchPipeline` moves accepted deliveries through lanes and workers;
 - `consumeRunnerErrors` observes asynchronous driver errors.
+
+All three belong to one generation and are cancelled with it. The fetcher reads
+the consumer that generation admitted, so a repair cancels the fetch of the
+consumer it is replacing and never the fetch of a newer generation.
 
 The driver owns transport delivery. Each `driver.InboundMessage` carries the
 physical destination, key, headers, body, broker reference, delivery count,
@@ -403,24 +424,39 @@ User-visible shutdown behavior is documented in
   outstanding-delivery state.
 
 The runner may first repair a consumer generation. If the connection itself
-must be rebuilt, it transitions to reconnecting and asks the client supervisor
-to coordinate the handoff. [`Runner.abandonForReconnect`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/reconnect.go)
+must be rebuilt, it asks the client for one and waits on its own goroutine. The
+ask and the wait are one call, `awaitRebuild`: it sends the request when the
+caller's epoch is still current and no attempt is in flight, and otherwise only
+waits, which is what a runner that arrived during a rebuild does. A wait parks
+only where something will release it. An attempt in flight releases the wake
+captured with the epoch, and a request this call sends is served by the attempt
+it starts or dropped by the swap that answered it; with neither, nothing would
+ever release the park, so the state is read instead. That is the caller that
+arrived after the change it would have waited for had already happened.
+
+[`Runner.abandonForReconnect`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/reconnect.go)
+is how the attempt takes a runner that is still on the old connection: it
 cancels the generation and calls `Consumer.Release`, deliberately leaving
 unsettled deliveries for broker redelivery rather than classifying them as
-application retries.
+application retries, and reports the abandon to the owner loop as an event. The
+open that the abandon cancelled is not a failure of the runner's: it waits for
+the attempt, then opens again on what the attempt leaves behind.
 
 The client reconnect path then waits for publish quiescence, opens a replacement
 connection, derives its effective capabilities, re-establishes topology, swaps
-the live connection, and lets the runner create a fresh consumer generation.
-The complete connection path is in [`reconnect.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/reconnect.go).
-A runner that starts, or opens a new generation, while a reconnect is in
-progress waits for it and opens on the replacement connection. A consumer
-that was opened on the old connection as the reconnect began is released
-before its generation starts.
+the live connection under the next epoch, and retires the producer and the
+connection the swap replaced. Every runner waiting on the previous epoch is
+released by that one swap. The complete connection path is in
+[`reconnect.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/reconnect.go).
+A runner that starts, or opens a new generation, while an attempt is in flight
+waits for it inside `openRunnerConsumerWith` and opens on the replacement
+connection. A consumer that was opened on the old connection as the attempt
+began fails the admission that compares the epoch it was opened on, and the
+runner releases it and opens again.
 
-After a successful repair, lifecycle state returns to ready. If reconnect
-attempts are exhausted or a fatal consumer condition remains, the runner records
-the failure and stops rather than silently losing the subscription.
+After a successful repair, the runner's lifecycle state returns to ready. If the
+attempts are exhausted, or the connection was given up, the runner records the
+failure and stops rather than silently losing the subscription.
 
 ## Trace checklist for changes
 
