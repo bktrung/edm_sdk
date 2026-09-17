@@ -493,14 +493,18 @@ type windowConn struct {
 	configs chan driver.ConsumerConfig
 }
 
-// Consumer records cfg and then builds the consumer the wrapped driver would
-// have built without the wrapper.
+// Consumer builds the wrapped consumer and records cfg only after a successful
+// build, because the caller cancels its context as soon as it receives cfg.
 func (c *windowConn) Consumer(ctx context.Context, cfg driver.ConsumerConfig) (driver.Consumer, error) {
+	consumer, err := c.Conn.Consumer(ctx, cfg)
+	if err != nil {
+		return consumer, err
+	}
 	select {
 	case c.configs <- cfg:
 	default:
 	}
-	return c.Conn.Consumer(ctx, cfg)
+	return consumer, nil
 }
 
 // windowSubscription is the shipped shape with one priority and the shipped
