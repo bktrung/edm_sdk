@@ -107,6 +107,16 @@ type Config struct {
 	Publishers int
 	// Concurrency is the handler concurrency of the single lane.
 	Concurrency int
+	// Prefetch is the subscription's in-flight budget: how many messages the
+	// consumer may hold ahead of settlement across the destinations it reads.
+	// A zero value keeps the shipped default, which is the rule the harness
+	// follows for every shape a measurement does not need to state, so a
+	// measurement that configures nothing measures what a caller who
+	// configures nothing gets. The core refuses a budget below the
+	// subscription's lane count, and caps one above the total its lanes can
+	// hold, so a value here is a request and not always the budget the driver
+	// is given.
+	Prefetch int
 	// HandlerWork is how long the consume measurement's handler holds each
 	// delivery before returning. It applies to the consume measurement alone:
 	// the publish, latency and retry measurements keep the handler that returns
@@ -132,6 +142,22 @@ type Config struct {
 	// over a fixed key set, so the ordering has something to serialise. A
 	// measurement without it keeps the unordered default.
 	Ordered bool
+	// Backlog publishes the consume measurement's corpus before its measured
+	// window opens, holding every delivery back from the core until it does, so
+	// the window contains the backlog's drain and not the load that made it.
+	//
+	// Without it the window contains both, and a cell whose consumer settles
+	// faster than the corpus is published reports the publisher rather than the
+	// consumer: the window then ends no earlier than the last publish returns,
+	// whatever the consumer did. With it, the client's own publish rate does not
+	// bound what the consumer can be measured at, and the measured window is the
+	// consumer's alone. The CPU a measurement costs is not: it is read around
+	// the whole call, load included, which is why a sweep reads it beside a
+	// publish-only control.
+	//
+	// It applies to the consume measurement. Every other measurement keeps the
+	// shape it had, and so does a consume measurement without it.
+	Backlog bool
 	// CountDuplicates reports duplicate deliveries instead of failing the run
 	// on them. A measurement without it fails on any delivery its shape did not
 	// expect, which is what every measurement did before this field existed, and
@@ -158,6 +184,14 @@ type Result struct {
 	// Latencies is one publish-to-ack duration per message, in sequence order.
 	// It is populated only by the latency measurement.
 	Latencies []time.Duration
+	// SettleLatencies is one settle-latency duration per settlement the
+	// measured window recorded, in the order the settlements happened: the
+	// time from the pump offering the delivery to the core to the ack call the
+	// runtime made for it. It is populated by every measurement that settles a
+	// corpus, which is every one but the publish measurement, and it is the
+	// figure a rate cannot show: two shapes with the same rate settle a
+	// delivery in very different times.
+	SettleLatencies []time.Duration
 	// RetryTier is the retry delay the measurement configured, and zero when it
 	// kept the shipped ladder.
 	RetryTier time.Duration
@@ -195,10 +229,23 @@ func (r Result) Rate() float64 {
 // are at or below. A result without latencies has no percentile and returns
 // zero.
 func (r Result) Percentile(p float64) time.Duration {
-	if len(r.Latencies) == 0 {
+	return percentile(r.Latencies, p)
+}
+
+// SettlePercentile returns the p-th percentile of the recorded settle
+// latencies by nearest rank, with the same meaning and the same empty case as
+// Percentile.
+func (r Result) SettlePercentile(p float64) time.Duration {
+	return percentile(r.SettleLatencies, p)
+}
+
+// percentile returns the p-th percentile of one duration sample by nearest
+// rank.
+func percentile(durations []time.Duration, p float64) time.Duration {
+	if len(durations) == 0 {
 		return 0
 	}
-	ranked := slices.Clone(r.Latencies)
+	ranked := slices.Clone(durations)
 	slices.Sort(ranked)
 	rank := int(math.Ceil(p / 100 * float64(len(ranked))))
 	rank = min(max(rank, 1), len(ranked))
@@ -247,6 +294,9 @@ func New(drv driver.Driver, cfg Config) (*Harness, error) {
 	}
 	if cfg.Concurrency < 0 {
 		return nil, fmt.Errorf("bench: concurrency must not be negative, got %d", cfg.Concurrency)
+	}
+	if cfg.Prefetch < 0 {
+		return nil, fmt.Errorf("bench: prefetch must not be negative, got %d", cfg.Prefetch)
 	}
 	if cfg.RetryTier < 0 {
 		return nil, fmt.Errorf("bench: retry tier must not be negative, got %s", cfg.RetryTier)
@@ -526,6 +576,15 @@ type run struct {
 	runner    *f1.Runner
 	runDone   chan struct{}
 	runErr    error
+	// hold is true while a backlog measurement's pump must keep deliveries away
+	// from the core, and gate is closed to release them. The pump reads hold on
+	// every delivery and the measurement sets it once, before the corpus is
+	// published, so a delivery the driver hands over while the corpus is still
+	// going out waits at the gate, and one handed over after the window opened
+	// does not. The gate is what releases a parked pump, and a teardown releases
+	// it through the consumer's own stopped channel instead.
+	hold atomic.Bool
+	gate chan struct{}
 	// drained reports that the subscription's consumer has already been
 	// stopped, so stop does not drain a runner that is finished.
 	drained bool
@@ -542,6 +601,7 @@ func (h *Harness) measure(ctx context.Context, m mode) (Result, error) {
 		m:     m,
 		tr:    newTracker(h.clk, h.cfg.Messages, m.attempts()),
 		ready: make(chan struct{}),
+		gate:  make(chan struct{}),
 	}
 	r.wrapped = r.wrappedDriver()
 	// The baseline the goroutine delta is read against is taken before the
@@ -591,20 +651,41 @@ func (h *Harness) measure(ctx context.Context, m mode) (Result, error) {
 			return Result{}, errors.Join(err, r.stop(ctx))
 		}
 	}
+	start := h.clk.Now()
+	if m == modeConsume && h.cfg.Backlog {
+		// A backlog measurement makes its corpus before it opens the interval
+		// it measures. Its window is armed first, so the tracker sees every
+		// publish, and no delivery or settlement, of that corpus: the gate
+		// holds every delivery out of the core's reach until the load is done,
+		// and the interval the rate is computed over starts when the last
+		// publish call returns.
+		r.hold.Store(true)
+		r.tr.arm()
+		if err := r.publishBulk(ctx); err != nil {
+			return Result{}, errors.Join(err, r.stop(ctx))
+		}
+		start = h.clk.Now()
+	} else {
+		r.tr.arm()
+	}
 	// A consume measurement samples while its window is open: the backlog the
 	// consumer has not read and the live heap are both figures the run's rate
 	// cannot show, and both belong to the interval the clock covers. The
 	// sampler belongs to the run, so the teardown stops it before the teardown
 	// releases the consumer it queries, and its goroutine is gone before the
-	// delta counted below is read.
+	// delta counted below is read. A backlog measurement starts it after its
+	// corpus, so the heap and the backlog it reports are the drain's.
 	if m == modeConsume {
 		r.sample = newSampler(ctx, h.clk, r.wrapped.consumer(), h.drv.Capabilities().LagQueryable)
 	}
-	start := h.clk.Now()
-	r.tr.arm()
-	if m == modeLatency {
+	switch {
+	case m == modeConsume && h.cfg.Backlog:
+		// Every delivery this run has accepted so far is waiting at the gate;
+		// opening it starts the drain the measured interval covers.
+		close(r.gate)
+	case m == modeLatency:
 		err = r.publishSequential(ctx)
-	} else {
+	default:
 		err = r.publishBulk(ctx)
 	}
 	if err != nil {
@@ -659,17 +740,18 @@ func (h *Harness) measure(ctx context.Context, m mode) (Result, error) {
 		return Result{}, err
 	}
 	return Result{
-		Messages:       h.cfg.Messages,
-		Publishers:     h.cfg.Publishers,
-		Concurrency:    h.cfg.Concurrency,
-		HandlerWork:    h.cfg.HandlerWork,
-		Elapsed:        elapsed,
-		Latencies:      r.tr.latencies(),
-		RetryTier:      h.cfg.RetryTier,
-		Duplicates:     afterStop.duplicates,
-		LagMax:         lagMax,
-		HeapMax:        heapMax,
-		GoroutineDelta: runtime.NumGoroutine() - before,
+		Messages:        h.cfg.Messages,
+		Publishers:      h.cfg.Publishers,
+		Concurrency:     h.cfg.Concurrency,
+		HandlerWork:     h.cfg.HandlerWork,
+		Elapsed:         elapsed,
+		Latencies:       r.tr.latencies(),
+		SettleLatencies: r.tr.settledLatencies(),
+		RetryTier:       h.cfg.RetryTier,
+		Duplicates:      afterStop.duplicates,
+		LagMax:          lagMax,
+		HeapMax:         heapMax,
+		GoroutineDelta:  runtime.NumGoroutine() - before,
 	}, nil
 }
 
@@ -680,19 +762,28 @@ func (r *run) wrappedDriver() *countingDriver {
 		ready:     r.ready,
 		readyOnce: &r.readyOnce,
 		onSpec:    r.h.noteDeclared,
+		hold:      &r.hold,
+		gate:      r.gate,
 	}
 }
 
-// subscribe starts the measurement's subscription and blocks until its
-// topology has been declared. Every measurement needs the subscription: the
-// publish measurement for the destination its entry point routes to, and the
-// others for the consumer that settles the corpus.
-func (r *run) subscribe(ctx context.Context) error {
+// subscription is the shape every measurement subscribes with: one topic on
+// one priority, one handler, the configured handler concurrency and in-flight
+// budget, and the retry ladder the measurement needs. It is built here rather
+// than inside subscribe so the shape a measurement states is one thing to
+// read, and so a test can ask what a configuration resolves to without a
+// broker and without a client.
+//
+// A zero Concurrency or Prefetch travels as zero rather than as the value the
+// package ships with, which is what keeps the shipped defaults measured by the
+// measurements that say they measure them.
+func (r *run) subscription() f1.Subscription {
 	sub := f1.Subscription{
 		Name:           r.h.subscription,
 		Topics:         []string{r.h.topic},
 		Priorities:     []f1.Priority{lane},
 		Concurrency:    r.h.cfg.Concurrency,
+		Prefetch:       r.h.cfg.Prefetch,
 		HandlerTimeout: handlerTimeout,
 		Handlers:       map[string]f1.Handler{r.h.topic: f1.HandlerFunc(r.handle)},
 	}
@@ -704,7 +795,15 @@ func (r *run) subscribe(ctx context.Context) error {
 		// arrives after exactly the delay the measurement reports.
 		sub.Retry = f1.RetryConfig{MaxAttempts: 2, Tiers: []time.Duration{r.h.cfg.RetryTier}}
 	}
-	runner, err := r.client.Subscribe(ctx, sub)
+	return sub
+}
+
+// subscribe starts the measurement's subscription and blocks until its
+// topology has been declared. Every measurement needs the subscription: the
+// publish measurement for the destination its entry point routes to, and the
+// others for the consumer that settles the corpus.
+func (r *run) subscribe(ctx context.Context) error {
+	runner, err := r.client.Subscribe(ctx, r.subscription())
 	if err != nil {
 		return fmt.Errorf("bench: subscribe: %w", err)
 	}
@@ -1064,6 +1163,12 @@ type tracker struct {
 	settles     []int
 	publishedAt []time.Time
 	settledAt   []time.Time
+	// settleLatencies holds one delivery-to-ack-call duration per settlement
+	// recorded in the window, in the order the settlements happened. It is
+	// appended to rather than indexed by sequence: a redelivery of one
+	// sequence is a settlement of its own, and a p99 over an index would keep
+	// only one of them.
+	settleLatencies []time.Duration
 
 	// settled counts the settlements that advanced the corpus, and is what the
 	// measurement ends on. It is maintained as it happens rather than summed
@@ -1099,16 +1204,17 @@ func newTracker(clk clock.Clock, corpus, attempts int) *tracker {
 		seqByBody[corpusBody(seq)] = seq
 	}
 	return &tracker{
-		clk:         clk,
-		attempts:    attempts,
-		want:        corpus * attempts,
-		seqByBody:   seqByBody,
-		publishes:   make([]int, corpus),
-		deliveries:  make([]int, corpus),
-		settles:     make([]int, corpus),
-		publishedAt: make([]time.Time, corpus),
-		settledAt:   make([]time.Time, corpus),
-		change:      make(chan struct{}),
+		clk:             clk,
+		attempts:        attempts,
+		want:            corpus * attempts,
+		seqByBody:       seqByBody,
+		publishes:       make([]int, corpus),
+		deliveries:      make([]int, corpus),
+		settles:         make([]int, corpus),
+		publishedAt:     make([]time.Time, corpus),
+		settledAt:       make([]time.Time, corpus),
+		settleLatencies: make([]time.Duration, 0, corpus*attempts),
+		change:          make(chan struct{}),
 	}
 }
 
@@ -1123,6 +1229,7 @@ func (t *tracker) arm() {
 	clear(t.settles)
 	clear(t.publishedAt)
 	clear(t.settledAt)
+	t.settleLatencies = t.settleLatencies[:0]
 	t.prelude = 0
 	t.recording = true
 	t.signalLocked()
@@ -1209,12 +1316,17 @@ func (t *tracker) noteDelivery(body string) {
 // before settlement, and stopping there would report a rate for work that has
 // not finished.
 //
+// latency is how long that delivery spent between reaching the core and the
+// ack call, which is the interval the rate cannot show. A settlement of a body
+// that was never published has no latency to record: the harness did not see
+// the delivery it would have measured from.
+//
 // A settlement counts towards the total only while its sequence has fewer than
 // the shape's attempts recorded. A redelivery arrives after its sequence is
 // already complete, and counting it would reach the expected total while a
 // message was still unsettled, ending the window early and reporting a rate for
 // a corpus that had not finished.
-func (t *tracker) noteSettled(body string) {
+func (t *tracker) noteSettled(body string, latency time.Duration) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	if !t.recording {
@@ -1227,6 +1339,14 @@ func (t *tracker) noteSettled(body string) {
 		t.unknownSettlements++
 		t.signalLocked()
 		return
+	}
+	if !t.stopped {
+		// A settlement that arrives after the clock stopped is evidence that
+		// the corpus finished, and is counted as such, but it is not part of
+		// the interval the percentiles describe: a drain-time redelivery can
+		// take arbitrarily long, and one of them would move a p99 that is read
+		// as the shape of the measured window.
+		t.settleLatencies = append(t.settleLatencies, latency)
 	}
 	t.settles[seq]++
 	if t.settles[seq] <= t.attempts {
@@ -1280,6 +1400,14 @@ func (t *tracker) latencies() []time.Duration {
 		latencies = append(latencies, t.settledAt[seq].Sub(t.publishedAt[seq]))
 	}
 	return latencies
+}
+
+// settledLatencies returns a copy of the measured window's settle latencies,
+// in the order the settlements were recorded.
+func (t *tracker) settledLatencies() []time.Duration {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return slices.Clone(t.settleLatencies)
 }
 
 // snapshot is the tracker's state at one instant.
@@ -1381,6 +1509,11 @@ type countingDriver struct {
 	ready     chan struct{}
 	readyOnce *sync.Once
 	onSpec    func([]driver.DestinationSpec)
+	// hold and gate are the run's backlog gate, which the pump waits on before
+	// it hands a delivery to the core. They are nil for a run that holds
+	// nothing back.
+	hold *atomic.Bool
+	gate chan struct{}
 
 	// conn is the connection the client opened through this wrapper. The core
 	// keeps its connection to itself, so this is where the wrapper finds the
@@ -1409,7 +1542,10 @@ func (d *countingDriver) Open(ctx context.Context, cfg driver.Config) (driver.Co
 	if err != nil || conn == nil {
 		return conn, err
 	}
-	wrapped := &countingConn{Conn: conn, tr: d.tr, ready: d.ready, readyOnce: d.readyOnce, onSpec: d.onSpec}
+	wrapped := &countingConn{
+		Conn: conn, tr: d.tr, ready: d.ready, readyOnce: d.readyOnce, onSpec: d.onSpec,
+		hold: d.hold, gate: d.gate,
+	}
 	d.conn.Store(wrapped)
 	return wrapped, nil
 }
@@ -1420,6 +1556,8 @@ type countingConn struct {
 	ready     chan struct{}
 	readyOnce *sync.Once
 	onSpec    func([]driver.DestinationSpec)
+	hold      *atomic.Bool
+	gate      chan struct{}
 
 	// consumer is the last consumer this connection handed out, which is the one
 	// the subscription's runner reads. It is kept here rather than derived from
@@ -1455,6 +1593,8 @@ func (c *countingConn) Consumer(ctx context.Context, cfg driver.ConsumerConfig) 
 		out:      make(chan driver.InboundMessage),
 		stopped:  make(chan struct{}),
 		drained:  make(chan struct{}),
+		hold:     c.hold,
+		gate:     c.gate,
 	}
 	c.consumer.Store(wrapped)
 	go wrapped.pump()
@@ -1508,6 +1648,13 @@ type countingConsumer struct {
 	tr      *tracker
 	out     chan driver.InboundMessage
 	stopped chan struct{}
+	// hold and gate are the run's backlog gate: while hold is set the pump
+	// keeps the deliveries the driver handed it out of the core's reach, so a
+	// measurement that opens its window on a backlog it published first sees no
+	// delivery before that window opens. They are nil, or a gate that is never
+	// held, for a measurement that does not hold anything back.
+	hold *atomic.Bool
+	gate chan struct{}
 	// drained is closed when the pump goroutine has returned, which is how a
 	// caller knows the one goroutine this wrapper adds is gone. The goroutine
 	// delta is counted after it, so a wrapper cannot be mistaken for a leak.
@@ -1519,7 +1666,18 @@ func (c *countingConsumer) Messages() <-chan driver.InboundMessage { return c.ou
 
 // pump copies deliveries from the driver onto the channel the core reads, which
 // is the only place the harness can reach the Settle of a delivery it did not
-// create.
+// create. It stamps each one with the instant it hands it over, which is where
+// that delivery's settle latency starts: the port is the last place the harness
+// stands before the core takes the message over.
+//
+// It holds deliveries back while the run's gate is shut, which is how a
+// measurement publishes a corpus before it opens the window it measures. The
+// stamp is taken after that wait, so the interval a settle latency describes
+// excludes the wait the harness imposed on it.
+//
+// The stamp is taken before the send below, so the interval starts when this
+// pump offers the delivery to the core and not when the core takes it: the
+// unbuffered send's own wait is inside the interval.
 //
 // It stops when the driver closes its channel, and also when Stop or Release
 // has returned, so a core that has stopped reading cannot leave this goroutine
@@ -1534,8 +1692,16 @@ func (c *countingConsumer) pump() {
 			if !ok {
 				return
 			}
+			if !c.released() {
+				return
+			}
 			if message.Settle != nil {
-				message.Settle = countingSettler{inner: message.Settle, tr: c.tr, body: string(message.Body)}
+				message.Settle = countingSettler{
+					inner:       message.Settle,
+					tr:          c.tr,
+					body:        string(message.Body),
+					deliveredAt: c.tr.clk.Now(),
+				}
 			}
 			select {
 			case c.out <- message:
@@ -1545,6 +1711,22 @@ func (c *countingConsumer) pump() {
 		case <-c.stopped:
 			return
 		}
+	}
+}
+
+// released blocks while the run holds its deliveries back and reports whether
+// the pump should keep going. A run that holds nothing back passes straight
+// through, and a teardown releases a parked pump rather than waiting for a
+// window that may never open.
+func (c *countingConsumer) released() bool {
+	if c.hold == nil || !c.hold.Load() {
+		return true
+	}
+	select {
+	case <-c.gate:
+		return true
+	case <-c.stopped:
+		return false
 	}
 }
 
@@ -1568,19 +1750,29 @@ func (c *countingConsumer) Release(ctx context.Context) error {
 	return err
 }
 
-// countingSettler records a settlement when Ack returns nil. Nack is forwarded
-// untouched: a delivery the broker was told to take back was not settled, and
-// counting it would report a rate the settlement path never reached.
+// countingSettler records a settlement when Ack returns nil, and records the
+// settle latency beside it: the time from the pump offering this delivery to
+// the core to the ack call itself.
+//
+// The latency is taken at the call and not at its return, so the interval is
+// everything the delivery spent on its way through the core - the handover, the
+// queue, the handler and the decision - and the ack's own cost is not in it.
+// Nack is forwarded untouched: a delivery the broker was told to take back was
+// not settled, and counting it would report a rate the settlement path never
+// reached.
 type countingSettler struct {
 	inner driver.Settler
 	tr    *tracker
 	body  string
+	// deliveredAt is when the pump offered this delivery to the core.
+	deliveredAt time.Time
 }
 
 func (s countingSettler) Ack(ctx context.Context) error {
+	latency := s.tr.clk.Since(s.deliveredAt)
 	err := s.inner.Ack(ctx)
 	if err == nil {
-		s.tr.noteSettled(s.body)
+		s.tr.noteSettled(s.body, latency)
 	}
 	return err
 }
