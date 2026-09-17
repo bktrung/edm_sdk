@@ -78,7 +78,11 @@ func TestRunnerSchedulerAgesLowPriorityWork(t *testing.T) {
 	fake := clock.NewFake(time.Unix(0, 0))
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	client, err := f1.New(ctx, schedulingConfig(), f1.WithDriver(testhook.Driver(fake)), testhook.ClientOption(fake).(f1.Option))
+	lowQueued := make(chan struct{})
+	client, err := f1.New(ctx, schedulingConfig(), f1.WithDriver(&agingDriver{
+		Driver:    testhook.Driver(fake),
+		lowQueued: lowQueued,
+	}), testhook.ClientOption(fake).(f1.Option))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -87,6 +91,8 @@ func TestRunnerSchedulerAgesLowPriorityWork(t *testing.T) {
 	const highBacklog = 32
 	started := make(chan struct{})
 	release := make(chan struct{})
+	allHighHandled := make(chan struct{})
+	var allHighOnce sync.Once
 	dispatched := make(chan f1.Priority, schedulingAgeBound)
 	var highHandled atomic.Int64
 	var position atomic.Int64
@@ -100,20 +106,22 @@ func TestRunnerSchedulerAgesLowPriorityWork(t *testing.T) {
 	}, func(_ context.Context, event *f1.Event) error {
 		firstOnce.Do(func() {
 			close(started)
-			// Held until the backlog below is published, so the low item is
-			// already in a lane when the clock moves past its budget.
+			// Held until the low item is in the scheduler lane and the backlog
+			// below is published, so the clock move ages the queued low item.
 			<-release
 		})
 		if event.Priority() == f1.PriorityHigh {
-			highHandled.Add(1)
+			handled := highHandled.Add(1)
+			if handled >= highBacklog+1 {
+				allHighOnce.Do(func() { close(allHighHandled) })
+			}
 		}
 		if position.Add(1) <= schedulingAgeBound {
 			dispatched <- event.Priority()
 		}
 		// The runner stamps EnqueuedAt from this clock, and the pick for the
 		// next dispatch happens after this handler returns. Advancing here
-		// therefore ages whatever is already queued before that pick, whichever
-		// way the publish-to-lane race falls.
+		// therefore ages the low item after it is queued, before that pick.
 		fake.Advance(schedulingAgeMargin)
 		return nil
 	})
@@ -130,7 +138,9 @@ func TestRunnerSchedulerAgesLowPriorityWork(t *testing.T) {
 
 	publishPriorityBatch(t, client, ctx, []f1.Priority{f1.PriorityHigh})
 	waitSchedulingSignalOrRunner(t, started, runDone, "first high-priority handler did not start")
-	publishPriorityBatch(t, client, ctx, append([]f1.Priority{f1.PriorityLow}, repeatPriority(f1.PriorityHigh, highBacklog)...))
+	publishPriorityBatch(t, client, ctx, []f1.Priority{f1.PriorityLow})
+	publishPriorityBatch(t, client, ctx, repeatPriority(f1.PriorityHigh, highBacklog))
+	waitSchedulingSignalOrRunner(t, lowQueued, runDone, "low-priority item did not reach its scheduler lane")
 	close(release)
 
 	timer := clock.NewReal().Timer(5 * time.Second)
@@ -144,6 +154,7 @@ func TestRunnerSchedulerAgesLowPriorityWork(t *testing.T) {
 			if remaining := highBacklog - int(highHandled.Load()); remaining <= 0 {
 				t.Fatalf("high backlog had %d items unhandled when the aged low item ran, want the low item ahead of backlogged %d-item high work", remaining, highBacklog)
 			}
+			waitSchedulingSignal(t, allHighHandled, "high backlog did not drain after aged low item ran")
 			cancel()
 			waitRunnerDone(t, runDone)
 			return
@@ -154,6 +165,116 @@ func TestRunnerSchedulerAgesLowPriorityWork(t *testing.T) {
 		}
 	}
 	t.Fatalf("aged low item was not dispatched within the first %d dispatches, want it ahead of the %d-item high backlog", schedulingAgeBound, highBacklog)
+}
+
+type agingDriver struct {
+	driver.Driver
+	lowQueued chan struct{}
+}
+
+func (d *agingDriver) Open(ctx context.Context, cfg driver.Config) (driver.Conn, error) {
+	conn, err := d.Driver.Open(ctx, cfg)
+	if err != nil {
+		return nil, err
+	}
+	return &agingConn{Conn: conn, lowQueued: d.lowQueued}, nil
+}
+
+type agingConn struct {
+	driver.Conn
+	lowQueued chan struct{}
+}
+
+func (c *agingConn) Consumer(ctx context.Context, cfg driver.ConsumerConfig) (driver.Consumer, error) {
+	consumer, err := c.Conn.Consumer(ctx, cfg)
+	if err != nil {
+		return nil, err
+	}
+	return &agingConsumer{
+		Consumer:  consumer,
+		lowQueued: c.lowQueued,
+		stopRelay: make(chan struct{}),
+		relayDone: make(chan struct{}),
+	}, nil
+}
+
+type agingConsumer struct {
+	driver.Consumer
+	lowQueued     chan struct{}
+	lowSeen       atomic.Bool
+	highAfterLow  atomic.Int32
+	stopRelay     chan struct{}
+	relayDone     chan struct{}
+	stopRelayOnce sync.Once
+}
+
+func (c *agingConsumer) Messages() <-chan driver.InboundMessage {
+	messages := make(chan driver.InboundMessage)
+	go func() {
+		defer close(messages)
+		defer close(c.relayDone)
+		for {
+			select {
+			case <-c.stopRelay:
+				c.drainInner()
+				return
+			case message, ok := <-c.Consumer.Messages():
+				if !ok {
+					return
+				}
+				low := strings.HasSuffix(message.Destination, ".low")
+				high := strings.HasSuffix(message.Destination, ".high")
+				select {
+				case messages <- message:
+					if low {
+						c.lowSeen.Store(true)
+					}
+					// Three following handoffs force the pipeline to enqueue the low item before it can receive the second following high item.
+					if high && c.lowSeen.Load() && c.highAfterLow.Add(1) == 3 {
+						close(c.lowQueued)
+					}
+				case <-c.stopRelay:
+					if message.Settle != nil {
+						_ = message.Settle.Nack(context.Background(), driver.NackOptions{Requeue: true})
+					}
+					c.drainInner()
+					return
+				}
+			}
+		}
+	}()
+	return messages
+}
+
+func (c *agingConsumer) Stop(ctx context.Context) error {
+	if err := c.Drain(ctx); err != nil {
+		return err
+	}
+	c.stopRelayOnce.Do(func() { close(c.stopRelay) })
+	<-c.relayDone
+	return c.Consumer.Stop(ctx)
+}
+
+func (c *agingConsumer) Release(ctx context.Context) error {
+	c.stopRelayOnce.Do(func() { close(c.stopRelay) })
+	<-c.relayDone
+	return c.Consumer.Release(ctx)
+}
+
+func (c *agingConsumer) drainInner() {
+	for {
+		select {
+		case message, ok := <-c.Consumer.Messages():
+			if !ok {
+				return
+			}
+			if message.Settle != nil {
+				_ = message.Settle.Nack(context.Background(), driver.NackOptions{Requeue: true})
+			}
+		default:
+			return
+		}
+	}
 }
 
 func TestRunnerSchedulerPreservesOrderedKeys(t *testing.T) {
