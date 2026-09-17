@@ -1,14 +1,18 @@
 //go:build integration
 
-// This file measures what the stock sticky balancer costs the priority lanes:
-// what each balancer assigns two or more members, how long a backed-up high
-// lane takes to drain when slots are scarce, and what a join costs in first
+// This file measures the priority lanes on the balancer this driver ships: what
+// a group of two or more members assigns them, how long a backed-up high lane
+// takes to drain when slots are scarce, and what a join costs in first
 // deliveries and duplicates.
 //
+// There is one arm, and the balancer is written into the client configuration
+// rather than left unset so a printed line names the protocol its numbers came
+// from.
+//
 // Everything here reads the broker through the public SDK (the priority runs)
-// or through the driver port (the move runs). No package state is read, which
-// is what lets the two arms be compared on what a caller observes rather than
-// on what one implementation happens to do.
+// or through the driver port (the move runs). No package state is read, which is
+// what keeps these numbers a description of what a caller observes rather than
+// of what one implementation happens to do.
 package kafka_test
 
 import (
@@ -35,14 +39,13 @@ import (
 )
 
 const (
-	// measureBalancerLane is the eager custom protocol this branch ships today.
-	measureBalancerLane = "lane"
-	// measureBalancerSticky is the stock cooperative balancer the next phase
-	// would ship instead.
-	measureBalancerSticky = "cooperative-sticky"
+	// measureBalancer is the balancer every run in this file configures. It is
+	// the value the driver defaults to, and it is written out rather than left
+	// unset so the run's printed line says which protocol produced its numbers.
+	measureBalancer = "cooperative-sticky"
 
-	// measureRuns is how many times each arm runs. The ruling asks for three of
-	// each, in alternation.
+	// measureRuns is how many times a shape runs, so a reading has its own
+	// repeats beside it.
 	measureRuns = 3
 
 	// measureHandlerWork is the per-message handler cost, so slots are scarce
@@ -82,10 +85,6 @@ const (
 	measureMoveCorpus = 60
 )
 
-// measureArms is the alternation the ruling asks for: the shipped balancer
-// first, then the stock one, three times each.
-var measureArms = []string{measureBalancerLane, measureBalancerSticky}
-
 // measureLane is one lane a shape declares: the priority name the destination
 // carries and the priority the publisher stamps on its messages.
 type measureLane struct {
@@ -102,8 +101,7 @@ type measureShape struct {
 }
 
 // measureSpecifiedShape is the shape the ruling names: two members, a high and
-// a low lane, four partitions each, so every member holds a share of each lane
-// under either balancer.
+// a low lane, four partitions each, so every member holds a share of each lane.
 func measureSpecifiedShape() measureShape {
 	return measureShape{
 		name:              "specified",
@@ -113,75 +111,30 @@ func measureSpecifiedShape() measureShape {
 	}
 }
 
-// measureUnderpartitionedShape is the shape the no-broker comparison found
-// uncovered: a lane with fewer partitions than members cannot give every member
-// one, and the stock balancer leaves more pairs empty than the lane balancer
-// does. Three members and two partitions per lane is its cheapest form.
-func measureUnderpartitionedShape() measureShape {
-	return measureShape{
-		name:              "underpartitioned",
-		lanes:             []measureLane{{name: "high", priority: f1.PriorityHigh}, {name: "low", priority: f1.PriorityLow}},
-		partitionsPerLane: 2,
-		members:           3,
-	}
-}
-
-// TestBalancerPriorityCost measures the priority cost of each balancer on the
-// shape the next phase would ship: two members, two lanes, four partitions per
-// lane, a backlog on both lanes, and two workers per member.
+// TestBalancerPriorityCost measures the priority cost of the shipped balancer on
+// the shape a subscription ships with: two members, two lanes, four partitions
+// per lane, a backlog on both lanes, and two workers per member. It runs three
+// times, and each run asserts that every member holds a partition of every lane,
+// which is the property a lane is meant to buy.
 func TestBalancerPriorityCost(t *testing.T) {
-	measurePriorityShape(t, measureSpecifiedShape())
-}
-
-// TestBalancerPriorityCostUnderpartitioned measures the same thing on the shape
-// the no-broker comparison found uncovered, where the two balancers really do
-// disagree about which member holds which lane.
-func TestBalancerPriorityCostUnderpartitioned(t *testing.T) {
-	measurePriorityShape(t, measureUnderpartitionedShape())
-}
-
-// measureArmsDistinct reports when both arms name the same balancer, which
-// would make the alternation a comparison of a balancer with itself. It is the
-// live half of the check the no-broker comparison makes on its two columns, and
-// it is here rather than a comment because a comparison whose arms are the same
-// is a measurement of nothing.
-//
-// It reports rather than fails so a run with the wrong arms still prints the
-// assignments it measured, which is what says the two arms agreed.
-func measureArmsDistinct(t *testing.T) {
-	t.Helper()
-	seen := make(map[string]struct{}, len(measureArms))
-	for _, arm := range measureArms {
-		if _, duplicate := seen[arm]; duplicate {
-			t.Errorf("both comparison arms are %q; the run compares a balancer with itself", arm)
-		}
-		seen[arm] = struct{}{}
-	}
-}
-
-// measurePriorityShape runs both arms in alternation for one shape.
-func measurePriorityShape(t *testing.T, shape measureShape) {
-	measureArmsDistinct(t)
 	requirePortBroker(t)
 	for run := 1; run <= measureRuns; run++ {
-		for _, balancer := range measureArms {
-			measurePriorityRun(t, shape, balancer, run)
-		}
+		measurePriorityRun(t, measureSpecifiedShape(), run)
 	}
 }
 
-// measurePriorityRun is one weighted comparison run: a fresh topic, a fresh
-// group, a pre-published backlog on every lane, and one member per client.
+// measurePriorityRun is one weighted run: a fresh topic, a fresh group, a
+// pre-published backlog on every lane, and one member per client.
 //
 // The members start after the backlog is published, so no message is handled
 // before the group exists, and the measured window opens when every partition
 // is known to be held by a member that is delivering from it. A partition first
 // delivered more than measureLateAssignment after that is a rebalance landing
 // inside the measurement, and the run is marked void.
-func measurePriorityRun(t *testing.T, shape measureShape, balancer string, run int) {
+func measurePriorityRun(t *testing.T, shape measureShape, run int) {
 	t.Helper()
 	ctx := t.Context()
-	label := fmt.Sprintf("balancer=%s shape=%s members=%d partitions=%d run=%d", balancer, shape.name, shape.members, shape.partitionsPerLane, run)
+	label := fmt.Sprintf("balancer=%s shape=%s members=%d partitions=%d run=%d", measureBalancer, shape.name, shape.members, shape.partitionsPerLane, run)
 
 	topic := portUniqueName(t, "lane-priority")
 	group := portUniqueName(t, "lane-priority-group")
@@ -196,7 +149,7 @@ func measurePriorityRun(t *testing.T, shape measureShape, balancer string, run i
 	bookkeeping := newMeasureBookkeeping(2*measureBacklog, measureHandlerWork)
 	clients := make([]*measureClient, 0, len(members))
 	for _, member := range members {
-		client, err := f1.New(ctx, measurePriorityConfig(member, balancer, shape),
+		client, err := f1.New(ctx, measurePriorityConfig(member, shape),
 			f1.WithDriver(&measureDriver{Driver: kafka.Driver{}, member: member, assignments: assignments}),
 			f1.WithTopology(f1.TopologyDeclare),
 			f1.WithPublishTopics(topic),
@@ -249,11 +202,21 @@ func measurePriorityRun(t *testing.T, shape measureShape, balancer string, run i
 	}
 
 	report := bookkeeping.report(windowStart)
+	uncovered := assignments.uncovered(shape, windowStart)
 	t.Logf("%s window=%dms preWindow=%d zeroPairs=%d assignment=%s broker=%s highWaitP50=%dms highWaitP99=%dms highDrain=%dms lowDrain=%dms settle=%dms end=%dms highDone=%d lowDone=%d perSecond=%.0f unmatched=%d void=%s",
-		label, report.window.Milliseconds(), report.preWindow, assignments.zeroPairs(shape, windowStart), assignments.line(shape, windowStart), broker,
+		label, report.window.Milliseconds(), report.preWindow, len(uncovered), assignments.line(shape, windowStart), broker,
 		report.highP50.Milliseconds(), report.highP99.Milliseconds(),
 		report.highDrain.Milliseconds(), report.lowDrain.Milliseconds(), report.settle.Milliseconds(), report.end.Milliseconds(),
 		report.highDone, report.lowDone, report.perSecond, report.unmatched, voidOrNone(void))
+	// Every lane of this shape carries more partitions than there are members,
+	// so every member is entitled to one of each. A member that holds none of a
+	// lane is a member whose handlers never see that priority, which is the
+	// property a lane exists to buy and the one thing this run asserts about the
+	// assignment rather than printing.
+	if len(uncovered) > 0 {
+		t.Errorf("%s: %d (member, lane) pairs hold no partition at all: %v; every lane here has %d partitions and there are %d members, so each member is entitled to a partition of each lane",
+			label, len(uncovered), uncovered, shape.partitionsPerLane, shape.members)
+	}
 
 	for _, opened := range clients {
 		opened.close(t)
@@ -344,7 +307,7 @@ func measureLaneDestination(topic, lane string) string {
 // measurePriorityConfig is one member's client configuration: the same
 // subscription and the same broker, with an instance identity of its own, since
 // the kafka driver joins a classic group as a static member by default.
-func measurePriorityConfig(member, balancer string, shape measureShape) f1.Config {
+func measurePriorityConfig(member string, shape measureShape) f1.Config {
 	priorities := make([]f1.Priority, 0, len(shape.lanes))
 	for _, lane := range shape.lanes {
 		priorities = append(priorities, lane.priority)
@@ -358,7 +321,7 @@ func measurePriorityConfig(member, balancer string, shape measureShape) f1.Confi
 			Endpoints:       []string{portEndpoint()},
 			ConnectTimeout:  10 * time.Second,
 			DefaultPrefetch: 64,
-			DriverOptions:   map[string]string{"kafka.balancer": balancer},
+			DriverOptions:   map[string]string{"kafka.balancer": measureBalancer},
 		},
 		Topology: f1.TopologyConfig{Priorities: priorities},
 		Codec: f1.CodecConfig{
@@ -789,20 +752,21 @@ func (a *measureAssignments) line(shape measureShape, windowStart time.Time) str
 	return line
 }
 
-// zeroPairs counts the (member, lane) pairs a run left with no partition at
-// all, which is the coverage figure the plan comparison reports.
-func (a *measureAssignments) zeroPairs(shape measureShape, windowStart time.Time) int {
+// uncovered lists the (member, lane) pairs a run left with no partition at all,
+// as "member/lane", which is the coverage figure the plan comparison reports and
+// the one fact a run on a well-provisioned shape asserts.
+func (a *measureAssignments) uncovered(shape measureShape, windowStart time.Time) []string {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	empty := 0
+	var pairs []string
 	for _, member := range measureMemberNames(shape.members) {
 		for _, lane := range shape.lanes {
 			if len(a.partitionsLocked(member, lane.name, windowStart)) == 0 {
-				empty++
+				pairs = append(pairs, member+"/"+lane.name)
 			}
 		}
 	}
-	return empty
+	return pairs
 }
 
 // partitionsLocked lists the partitions of one lane a member delivered from at
@@ -936,16 +900,13 @@ func measureCleanup(t *testing.T, admin *kadm.Client, group, topic string, shape
 	}
 }
 
-// TestBalancerMoveCost measures what a join costs under each balancer: how long
-// after the joining member's assignment its first delivery arrives, and how many
-// records the group delivered twice while the membership changed.
+// TestBalancerMoveCost measures what a join costs the group: how long after the
+// joining member's assignment its first delivery arrives, and how many records
+// the group delivered twice while the membership changed.
 func TestBalancerMoveCost(t *testing.T) {
-	measureArmsDistinct(t)
 	requirePortBroker(t)
 	for run := 1; run <= measureRuns; run++ {
-		for _, balancer := range measureArms {
-			measureMoveRun(t, balancer, run)
-		}
+		measureMoveRun(t, run)
 	}
 }
 
@@ -955,11 +916,11 @@ func TestBalancerMoveCost(t *testing.T) {
 // member joins and the corpus is released. Whether a delivery is refused
 // because its ownership moved, and how many records come back, is then the
 // driver's own account of the rebalance rather than the test's.
-func measureMoveRun(t *testing.T, balancer string, run int) {
+func measureMoveRun(t *testing.T, run int) {
 	t.Helper()
 	ctx := t.Context()
 	clk := clock.NewReal()
-	label := fmt.Sprintf("move balancer=%s run=%d", balancer, run)
+	label := fmt.Sprintf("move balancer=%s run=%d", measureBalancer, run)
 
 	topic := portUniqueName(t, "lane-move")
 	group := portUniqueName(t, "lane-move-group")
@@ -967,8 +928,8 @@ func measureMoveRun(t *testing.T, balancer string, run int) {
 	t.Cleanup(func() { measureMoveCleanup(t, admin, group, topic) })
 	measureCreateTopic(t, admin, ctx, topic, portPartitions)
 
-	holderConnection := measureOpenConnection(t, ctx, balancer, "member-0")
-	joinerConnection := measureOpenConnection(t, ctx, balancer, "member-1")
+	holderConnection := measureOpenConnection(t, ctx, "member-0")
+	joinerConnection := measureOpenConnection(t, ctx, "member-1")
 	producer, err := holderConnection.Producer(ctx, driver.ProducerConfig{RequireDurableAck: true, Effective: holderConnection.Capabilities()})
 	if err != nil {
 		t.Fatalf("%s: Producer(): %v", label, err)
@@ -1043,17 +1004,17 @@ func measureSubscribe(t *testing.T, clk clock.Clock, connection driver.Conn, gro
 // measurement and an instance identity of its own, since static membership is
 // the kafka driver's default and two members sharing one identity evict each
 // other instead of sharing the group.
-func measureOpenConnection(t *testing.T, ctx context.Context, balancer, instance string) driver.Conn {
+func measureOpenConnection(t *testing.T, ctx context.Context, instance string) driver.Conn {
 	t.Helper()
 	connection, err := (kafka.Driver{}).Open(ctx, driver.Config{
 		Endpoints:             []string{portEndpoint()},
 		ClientID:              "f1-kafka-lane-move",
 		InstanceID:            instance,
 		RebalanceDrainTimeout: 2 * time.Second,
-		DriverOptions:         map[string]string{"kafka.balancer": balancer},
+		DriverOptions:         map[string]string{"kafka.balancer": measureBalancer},
 	})
 	if err != nil {
-		t.Fatalf("Open(%s, balancer=%s): %v", portEndpoint(), balancer, err)
+		t.Fatalf("Open(%s, balancer=%s): %v", portEndpoint(), measureBalancer, err)
 	}
 	t.Cleanup(func() { //nolint:contextcheck // cleanup runs after the test context is cancelled, so the close needs a context of its own.
 		closeCtx, cancel := context.WithTimeout(context.Background(), portCloseTimeout)

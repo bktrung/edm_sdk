@@ -123,6 +123,12 @@ type consumer struct {
 	// callbacks are its only writers and admission reads it under c.mu, so a
 	// revoke takes effect over the records the poll loop is already holding.
 	owned map[partitionKey]bool
+	// warned holds the destinations this consumer has already reported as
+	// underprovisioned. It is never cleared: the warning is about the shape of
+	// the subscription and its destination, which a later rebalance does not
+	// change, so a member that churns would otherwise repeat it on every
+	// membership change.
+	warned map[string]bool
 	// inHand holds the records the poll loop has taken from franz-go and not
 	// yet resolved. A fresh tracker for a partition takes its base from the
 	// lowest offset here rather than from the record that created it: the
@@ -350,16 +356,18 @@ func (s *settler) Nack(ctx context.Context, options driver.NackOptions) error {
 //
 // A delivery is admitted under the tracker of the ownership in force, and a
 // revoke detaches and revokes that tracker, so a settlement arriving after the
-// revoke fails. One case is not a partition that moved away: the lane balancer
-// is eager, so every membership change revokes every partition and reassigns
-// the ones this member keeps, and a delivery the caller still holds then
-// outlives the ownership it was made under while its partition never left this
-// consumer. The partition is owned here again, so the live settlement path is
-// the tracker of the current ownership. An ownership that has not admitted a
-// record yet has no tracker, and the delivery's own offset is where that
-// tracker starts, which is what builds one; the offset a settlement commits is
-// the base the new ownership owes, so a commit through it cannot pass a record
-// this consumer still has to deliver.
+// revoke fails. One case is not a partition that moved away, and both protocol
+// families reach it: an eager balancer ("sticky", "range") revokes every
+// partition on every membership change and reassigns the ones this member
+// keeps, and a cooperative one re-assigns a partition to this member out of
+// another member's hands and revokes it here first. A delivery the caller still
+// holds then outlives the ownership it was made under while its partition never
+// left this consumer. The partition is owned here again, so the live settlement
+// path is the tracker of the current ownership. An ownership that has not
+// admitted a record yet has no tracker, and the delivery's own offset is where
+// that tracker starts, which is what builds one; the offset a settlement
+// commits is the base the new ownership owes, so a commit through it cannot
+// pass a record this consumer still has to deliver.
 func (c *consumer) settlementTrackerLocked(s *settler) *ackTracker {
 	tracker := c.trackers[s.key]
 	if tracker != nil && tracker == s.tracker {
@@ -468,6 +476,7 @@ func newConsumer(ctx context.Context, connection *conn, cfg driver.ConsumerConfi
 		settlers:              make(map[*settler]struct{}),
 		trackers:              make(map[partitionKey]*ackTracker),
 		owned:                 make(map[partitionKey]bool),
+		warned:                make(map[string]bool),
 		inHand:                make(map[*kgo.Record]struct{}),
 		settlerCh:             make(chan struct{}, 1),
 		rebalanceDrainTimeout: drainTimeout,
@@ -2160,6 +2169,116 @@ func (c *consumer) settleBound() time.Duration {
 	return defaultKafkaRebalanceDrainTimeout
 }
 
+// partitionWarning is one destination this member cannot fill: it holds fewer
+// partitions of it than the subscription gives the destination delivery slots,
+// so the slots the partitions cannot back stay idle however much work is
+// waiting. The count is collected under c.mu and the warning is written after
+// c.mu is released.
+type partitionWarning struct {
+	destination string
+	held        int
+	budget      int
+}
+
+// assignmentWarningsLocked reports the destinations this assignment leaves this
+// member short of, once each, and records them as warned. The caller holds c.mu.
+//
+// The count compared is the partitions this member holds for the destination
+// rather than the partitions this callback carried. A cooperative rebalance
+// calls the callback once per round and names only the partitions that changed
+// hands, so a member's retained partitions are never named again and the
+// callback's own payload is a share of the assignment rather than the whole of
+// it. Accumulating in c.owned is what makes the count the member's real ceiling.
+//
+// The budget is the destination's resolved prefetch, which is the same number
+// the admission gate charges: a destination with a PerDestination entry uses it,
+// and every other destination uses the subscription's prefetch divided across
+// the destinations. A destination whose assignment meets its budget is not
+// recorded, so a member that grows into its budget on a later rebalance is
+// silent then.
+//
+// A destination named by an assignment that leaves this member short is warned
+// on that callback, and the warning is not retracted. For a cooperative
+// protocol the first callback of a rebalance can carry a part of the
+// destination's final assignment, the partitions no other member held, with the
+// rest arriving in a later callback of the same rebalance, so a member whose
+// first callback is short and whose second fills its budget is warned about a
+// shortfall it does not end up with. Nothing in the callback says whether
+// another round follows it, so the choice is between this false positive and
+// not warning at all until a round that may never come. It is accepted, and the
+// remedy is on the operator's side: a deployment that really did scale past its
+// partition count warns on every member on every rebalance, and one that
+// rebalanced a partition into place warns once.
+func (c *consumer) assignmentWarningsLocked(assigned map[string][]int32) []partitionWarning {
+	if c.warned == nil {
+		c.warned = make(map[string]bool)
+	}
+	var warnings []partitionWarning
+	for destination := range assigned {
+		if c.warned[destination] {
+			continue
+		}
+		budget := c.budgets[destination]
+		if budget <= 0 {
+			continue
+		}
+		// A retry-tier destination is fed by the retry ladder rather than by the
+		// partition count, and the records on it are ones a handler has to wait
+		// out: its slots describe a delay budget, so a short partition count
+		// there is not the throughput ceiling this warning is about.
+		if c.cfg.Delays[destination] > 0 {
+			continue
+		}
+		held := c.ownedPartitionsLocked(destination)
+		if held >= budget {
+			continue
+		}
+		c.warned[destination] = true
+		warnings = append(warnings, partitionWarning{destination: destination, held: held, budget: budget})
+	}
+	return warnings
+}
+
+// ownedPartitionsLocked counts the partitions of one destination this consumer
+// holds. The caller holds c.mu.
+func (c *consumer) ownedPartitionsLocked(destination string) int {
+	held := 0
+	for key := range c.owned {
+		if key.destination == destination {
+			held++
+		}
+	}
+	return held
+}
+
+// logPartitionWarnings writes one warning per destination this member cannot
+// fill. It is called with no lock held. The destination's partition count is the
+// ceiling, and the levers an operator has are that count, which re-maps the keys
+// already published to the destination, and the instance count the subscription
+// was sized for: the lever attribute names the configured one.
+func (c *consumer) logPartitionWarnings(warnings []partitionWarning) {
+	if c.conn == nil {
+		// Unit consumers that exercise assignment accounting without opening a
+		// connection have nowhere to send the diagnostic. A live consumer always
+		// has conn; keep the zero-value test harness from turning the accounting
+		// check into a nil dereference.
+		return
+	}
+	for _, warning := range warnings {
+		lever := "destination partition count"
+		if floor, err := resolveMaxExpectedInstances(c.conn.driverOptions); err == nil && floor > 0 {
+			lever = "broker.kafka.maxExpectedInstances"
+		}
+		c.conn.log().Warn(
+			"Kafka consumer holds fewer partitions than the subscription's slot budget; raising the destination's partition count gives this member more of them and re-maps the keys published to it",
+			"destination", warning.destination,
+			"assigned_partitions", warning.held,
+			"budget", warning.budget,
+			"lever", lever,
+		)
+	}
+}
+
 // onPartitionsAssigned marks the partitions this consumer now owns and resumes
 // their fetches, which the revoke that preceded them paused. Ownership is the
 // one fact the assignment and the revoke write, and a fresh assignment starts
@@ -2183,9 +2302,14 @@ func (c *consumer) onPartitionsAssigned(_ context.Context, _ *kgo.Client, partit
 			c.resumePartitionIfFreeLocked(key)
 		}
 	}
+	warnings := c.assignmentWarningsLocked(partitions)
 	c.syncHeadTimerLocked()
 	c.mu.Unlock()
 	c.assignmentMu.Unlock()
+	// The log is written with both locks released: the handler is the caller's,
+	// so it may block, and c.mu is the lock the poll loop and every settler of
+	// this consumer need.
+	c.logPartitionWarnings(warnings)
 	c.sendRebalanceError("assigned", partitions)
 }
 

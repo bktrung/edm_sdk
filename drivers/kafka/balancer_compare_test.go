@@ -15,7 +15,7 @@ import (
 // shape invented here. Two core helpers name the destinations, and their
 // formats are what this file reproduces:
 //
-//	publishEntryPoint   "f1.<env>.<topic>.<priority>"                          (publisher.go)
+//	publishEntryPoint   "f1.<env>.<topic>.<priority>"                             (publisher.go)
 //	retryDestinationFor "f1.<env>.<topic>.<subscription>.<priority>.retry.<tier>" (worker.go)
 //
 // The number of tiers comes from the default ladder rather than from a choice
@@ -39,11 +39,29 @@ var comparePriorities = []string{"high", "medium", "low"}
 // zero group generation minus one.
 const compareNewcomerGeneration = int32(-1)
 
+// compareGeneration is the generation a group is at when its members rebalance
+// while still holding the assignment of the previous generation.
+const compareGeneration = int32(5)
+
 // compareRoundBound is how many rebalance rounds a cooperative group is allowed
 // before this harness calls the plan unstable. A cooperative rebalance takes
 // two rounds, and the ceiling exists so a plan that oscillates fails the run
 // instead of looping.
 const compareRoundBound = 6
+
+// compareDefaultBalancer resolves the balancer the driver joins with when
+// kafka.balancer is unset. Every cell in this file measures that balancer and no
+// other: the question the file answers is what a group of this shape is assigned
+// by the protocol this driver ships, and a cell driven by a balancer the driver
+// would not choose answers a question nobody asked.
+func compareDefaultBalancer(t *testing.T) kgo.GroupBalancer {
+	t.Helper()
+	balancer, err := resolveBalancer(nil)
+	if err != nil {
+		t.Fatalf("resolveBalancer(nil) error = %v, want the shipped default", err)
+	}
+	return balancer
+}
 
 // compareLanes returns one lane topic per priority and per retry tier, each
 // with the given partition count, all of them in one subscription's group.
@@ -73,8 +91,8 @@ type compareMemberSpec struct {
 	owned      map[string][]int32
 }
 
-// compareMembers builds a member list through the stock balancer's own join
-// side, so the metadata it carries is the metadata a real rebalance carries.
+// compareMembers builds a member list through the balancer's own join side, so
+// the metadata it carries is the metadata a real rebalance carries.
 func compareMembers(t *testing.T, balancer kgo.GroupBalancer, lanes []string, specs []compareMemberSpec) []kmsg.JoinGroupResponseMember {
 	t.Helper()
 	members := make([]kmsg.JoinGroupResponseMember, 0, len(specs))
@@ -87,7 +105,7 @@ func compareMembers(t *testing.T, balancer kgo.GroupBalancer, lanes []string, sp
 	return members
 }
 
-// comparePlan drives one balancer through a member list and returns the plan it
+// comparePlan drives the balancer through a member list and returns the plan it
 // produces. A cooperative balancer has already applied its own final adjustment
 // by the time it returns: the client calls AdjustCooperative inside Balance, so
 // what arrives here is the assignment a leader would send, in-flight partitions
@@ -113,8 +131,9 @@ func comparePlan(t *testing.T, balancer kgo.GroupBalancer, members []kmsg.JoinGr
 	return plan.AsMemberIDMap()
 }
 
-// compareSteadyPlan plans one balancer for a member set that holds nothing:
-// the assignment a group settles into, for the coverage table.
+// compareSteadyPlan plans the balancer for a member set that holds nothing: the
+// assignment a group settles into, which is the state the coverage pin below is
+// about.
 func compareSteadyPlan(t *testing.T, balancer kgo.GroupBalancer, lanes map[string]int32, ids ...string) map[string]map[string][]int32 {
 	t.Helper()
 	specs := make([]compareMemberSpec, 0, len(ids))
@@ -143,7 +162,7 @@ func compareRebalance(t *testing.T, balancer kgo.GroupBalancer, lanes map[string
 	for round := 1; round <= compareRoundBound; round++ {
 		specs := make([]compareMemberSpec, 0, len(ids))
 		for _, id := range ids {
-			spec := compareMemberSpec{id: id, generation: laneGeneration, owned: claims[id]}
+			spec := compareMemberSpec{id: id, generation: compareGeneration, owned: claims[id]}
 			if id == newcomer {
 				spec.generation = compareNewcomerGeneration
 				spec.owned = nil
@@ -238,9 +257,8 @@ func compareMoved(before, after map[string]map[string][]int32, lanes map[string]
 }
 
 // compareTotals reports the smallest and largest number of partitions a member
-// holds across all lanes. The lane balancer decides each lane on its own, so its
-// per-lane counts are even while its totals need not be; the stock balancer
-// balances totals and lets a lane's counts differ.
+// holds across all lanes. The balancer balances totals, so a member's per-lane
+// counts may differ while its totals stay close.
 func compareTotals(lanes map[string]int32, assignment map[string]map[string][]int32, ids []string) (least, most int) {
 	totals := make([]int, 0, len(ids))
 	for _, id := range ids {
@@ -275,9 +293,10 @@ func compareCoverage(lanes map[string]int32, assignment map[string]map[string][]
 }
 
 // compareExactlyOnce fails unless every partition of every lane is held by
-// exactly one member. It is the one fact this file asserts, and it holds for
-// both balancers: a plan that drops a partition or hands it to two members is
-// wrong whatever the strategy.
+// exactly one member. It is the one fact this file asserts of every plan: a plan
+// that drops a partition or hands it to two members is wrong whatever the
+// strategy, and the coverage and spread figures beside it would be measuring a
+// plan that cannot be sent.
 func compareExactlyOnce(t *testing.T, label string, lanes map[string]int32, assignment map[string]map[string][]int32, ids []string) {
 	t.Helper()
 	owners := make(map[string]map[int32]int)
@@ -304,57 +323,59 @@ func compareExactlyOnce(t *testing.T, label string, lanes map[string]int32, assi
 	}
 }
 
-// TestLaneCoverageComparison drives both balancers through the same member sets
-// and the same lane shapes and prints what each one assigns.
+// TestDefaultBalancerLaneCoverage drives the shipped default balancer through
+// the member sets and lane shapes a subscription of this repository declares and
+// prints what it assigns.
 //
-// It is a measurement that prints rather than an assertion of an answer: the
-// properties it asserts are that a plan assigns every partition exactly once,
-// which both strategies owe, and that each column is driven by the balancer it
-// claims. The grid is the members 2, 3 and 4 crossed with 3, 4 and 16
-// partitions per lane, and every cell is measured for the settled plan, for one
-// member joining and for one member leaving. Two more cells answer a question
-// the grid cannot: the two lanes the live comparison declares, with two members
-// and with three. Two partitions per lane is in the grid because the live
-// three-member run at that count is where the lane balancer left a member with
-// no partition of any lane at all.
-func TestLaneCoverageComparison(t *testing.T) {
-	lane := kgo.GroupBalancer(&laneBalancer{})
-	sticky := kgo.CooperativeStickyBalancer()
+// It is a measurement that prints rather than an assertion of an answer, and it
+// pins two things. One is exactly-once assignment, which every plan owes. The
+// other is coverage: every member holds a partition of every lane of the settled
+// plan whenever a lane has at least as many partitions as there are members, so
+// no member is idle while another holds a lane to itself. A lane with fewer
+// partitions than members cannot meet that rule, and those cells are printed as
+// the observation they are rather than asserted.
+//
+// The grid is members 2, 3 and 4 crossed with 2, 3, 4 and 16 partitions per
+// lane. Two more cells are the lanes the live priority comparison declares, with
+// two members and with three, and a third is that comparison's underpartitioned
+// shape exactly: two lanes of two partitions and three members, which is the
+// smallest lane set on which a lane cannot seat every member.
+//
+// What the coverage pin protects is the spreading of whichever balancer the
+// option resolves to, which is why it holds for every sticky-family balancer and
+// not only for the cooperative default: a franz-go release that changed the
+// spreading would fail it. The default itself is pinned by the protocol names
+// TestResolveBalancerProtocols asserts, and by
+// TestPortCooperativeKeepsRetainedPartitionsDelivering, which the protocol the
+// driver joins a live group with cannot pass.
+func TestDefaultBalancerLaneCoverage(t *testing.T) {
+	balancer := compareDefaultBalancer(t)
+	t.Logf("balancer=default protocol=%s", balancer.ProtocolName())
 
 	for _, members := range []int{2, 3, 4} {
 		for _, partitions := range []int32{2, 3, 4, 16} {
-			compareCell(t, lane, sticky, compareLanes(partitions), members, partitions)
+			compareCell(t, balancer, compareLanes(partitions), members, partitions)
 		}
 	}
-	// The two priority lanes the live comparison declares, at the partition
-	// count it gives them, and the same shape with a third member.
-	compareCell(t, lane, sticky, compareLiveLanes(4), 2, 4)
-	compareCell(t, lane, sticky, compareLiveLanes(4), 3, 4)
-	// The underpartitioned live shape exactly: two lanes of two partitions and
-	// three members, where the three-member live run left one member with no
-	// partition of either lane.
-	compareCell(t, lane, sticky, compareLiveLanes(2), 3, 2)
-	// The columns are checked after the table rather than before it, so a run
-	// driven by the wrong balancer still prints the measurement its reader
-	// needs to see, next to the reason it does not count.
-	if got := lane.ProtocolName(); got != "lane" {
-		t.Errorf("the lane column is driven by protocol %q, want lane", got)
-	}
-	if got := sticky.ProtocolName(); got != "cooperative-sticky" {
-		t.Errorf("the stock column is driven by protocol %q, want cooperative-sticky", got)
-	}
+	compareCell(t, balancer, compareLiveLanes(4), 2, 4)
+	compareCell(t, balancer, compareLiveLanes(4), 3, 4)
+	compareCell(t, balancer, compareLiveLanes(2), 3, 2)
 }
 
-// TestWholeLaneOwnershipComparison measures the state StickyBalancer's own doc
+// TestWholeLaneOwnershipObservation measures the state StickyBalancer's own doc
 // comment starts from: two members that each hold a whole topic, a third topic
-// free, and a third member gone, which is also the state a generation skews
-// into when its members arrived one at a time against a live backlog. The
-// comment's answer leaves one member with none of the other's topic; this cell
-// asks whether the balancer still does that, and what the lane balancer does
-// with the same state.
-func TestWholeLaneOwnershipComparison(t *testing.T) {
-	lane := kgo.GroupBalancer(&laneBalancer{})
-	sticky := kgo.CooperativeStickyBalancer()
+// free, and a third member gone, which is also the state a generation skews into
+// when its members arrived one at a time against a live backlog.
+//
+// It is an observation only, printed rather than asserted beyond exactly-once:
+// the comment's answer leaves one member with none of the other's topic, and
+// whether the settled plan here does the same is the thing this cell records,
+// not a rule the balancer is held to. The three lanes all have three partitions,
+// which is more than the two members, so the coverage rule the other test pins
+// does not reach this cell: what it measures is whether a balancer that balances
+// totals keeps a member's whole topic together when nothing asks it to move.
+func TestWholeLaneOwnershipObservation(t *testing.T) {
+	balancer := compareDefaultBalancer(t)
 	lanes := map[string]int32{"t0": 3, "t1": 3, "t2": 3}
 	ids := []string{"member-0", "member-1"}
 	prior := map[string]map[string][]int32{
@@ -362,26 +383,12 @@ func TestWholeLaneOwnershipComparison(t *testing.T) {
 		"member-1": {"t1": {0, 1, 2}},
 	}
 
-	stockPlan, rounds, pending := compareRebalance(t, sticky, lanes, prior, "", ids)
-	compareExactlyOnce(t, "cooperative-sticky whole lanes", lanes, stockPlan, ids)
-	stockZero, stockSpread, stockLane := compareCoverage(lanes, stockPlan, ids)
-	stockLeast, stockMost := compareTotals(lanes, stockPlan, ids)
-	t.Logf("plan balancer=cooperative-sticky lanes=%d partitions=3 members=%d zeroPairs=%d maxSpread=%d spreadLane=%s totals=%d:%d rounds=%d pending=%d assignment=%s",
-		len(lanes), len(ids), stockZero, stockSpread, stockLane, stockLeast, stockMost, rounds, pending, comparePlanLine(lanes, stockPlan, ids))
-
-	lanePlan := laneAssignments(t, laneMembersClaiming(t, lanes, prior, ids...), lanes)
-	compareExactlyOnce(t, "lane whole lanes", lanes, lanePlan, ids)
-	laneZero, laneSpread, laneSpreadLane := compareCoverage(lanes, lanePlan, ids)
-	laneLeast, laneMost := compareTotals(lanes, lanePlan, ids)
-	t.Logf("plan balancer=lane lanes=%d partitions=3 members=%d zeroPairs=%d maxSpread=%d spreadLane=%s totals=%d:%d rounds=1 pending=0 assignment=%s",
-		len(lanes), len(ids), laneZero, laneSpread, laneSpreadLane, laneLeast, laneMost, comparePlanLine(lanes, lanePlan, ids))
-
-	if got := lane.ProtocolName(); got != "lane" {
-		t.Errorf("the lane column is driven by protocol %q, want lane", got)
-	}
-	if got := sticky.ProtocolName(); got != "cooperative-sticky" {
-		t.Errorf("the stock column is driven by protocol %q, want cooperative-sticky", got)
-	}
+	plan, rounds, pending := compareRebalance(t, balancer, lanes, prior, "", ids)
+	compareExactlyOnce(t, "whole lanes", lanes, plan, ids)
+	zeroPairs, maxSpread, spreadLane := compareCoverage(lanes, plan, ids)
+	least, most := compareTotals(lanes, plan, ids)
+	t.Logf("plan balancer=default protocol=%s lanes=%d partitions=3 members=%d zeroPairs=%d maxSpread=%d spreadLane=%s totals=%d:%d rounds=%d pending=%d assignment=%s",
+		balancer.ProtocolName(), len(lanes), len(ids), zeroPairs, maxSpread, spreadLane, least, most, rounds, pending, comparePlanLine(lanes, plan, ids))
 }
 
 // comparePlanLine renders an assignment as member, lane and partitions, so a
@@ -409,66 +416,42 @@ func compareLiveLanes(partitions int32) map[string]int32 {
 	}
 }
 
-// compareCell measures one (member set, lane set) cell for both balancers: the
-// settled plan each produces, and the partitions each moves when one member
-// joins the settled set and when one member leaves it.
-func compareCell(t *testing.T, lane kgo.GroupBalancer, sticky kgo.GroupBalancer, lanes map[string]int32, members int, partitions int32) {
+// compareCell measures one (member set, lane set) cell of the shipped balancer:
+// the settled plan it produces, and what one member joining the settled set and
+// one member leaving it move. The coverage pin is applied where a lane has at
+// least as many partitions as there are members.
+func compareCell(t *testing.T, balancer kgo.GroupBalancer, lanes map[string]int32, members int, partitions int32) {
 	t.Helper()
 	ids := compareMemberIDs(members)
+	label := fmt.Sprintf("lanes=%d partitions=%d members=%d", len(lanes), partitions, members)
 
-	laneSteady := laneAssignments(t, laneMembersFromSpecs(t, compareLaneSpecs(lanes, ids)), lanes)
-	stickySteady := compareSteadyPlan(t, sticky, lanes, ids...)
-
-	for _, measured := range []struct {
-		name       string
-		assignment map[string]map[string][]int32
-	}{
-		{"lane", laneSteady},
-		{"cooperative-sticky", stickySteady},
-	} {
-		label := fmt.Sprintf("%s lanes=%d partitions=%d members=%d", measured.name, len(lanes), partitions, members)
-		compareExactlyOnce(t, label, lanes, measured.assignment, ids)
-		zeroPairs, maxSpread, spreadLane := compareCoverage(lanes, measured.assignment, ids)
-		least, most := compareTotals(lanes, measured.assignment, ids)
-		t.Logf("plan balancer=%s lanes=%d partitions=%d members=%d zeroPairs=%d maxSpread=%d spreadLane=%s totals=%d:%d",
-			measured.name, len(lanes), partitions, members, zeroPairs, maxSpread, spreadLane, least, most)
+	steady := compareSteadyPlan(t, balancer, lanes, ids...)
+	compareExactlyOnce(t, label, lanes, steady, ids)
+	zeroPairs, maxSpread, spreadLane := compareCoverage(lanes, steady, ids)
+	least, most := compareTotals(lanes, steady, ids)
+	t.Logf("plan balancer=default protocol=%s %s zeroPairs=%d maxSpread=%d spreadLane=%s totals=%d:%d",
+		balancer.ProtocolName(), label, zeroPairs, maxSpread, spreadLane, least, most)
+	if int(partitions) >= members && zeroPairs != 0 {
+		t.Errorf("%s: %d uncovered (member, lane) pairs in the settled plan, want 0 while every lane has at least as many partitions as there are members",
+			label, zeroPairs)
 	}
 
 	// One member joins the settled set, then the first member leaves it. The
-	// stock balancer plans both changes itself, in as many rounds as it takes;
-	// the lane balancer plans them in the single eager round its own helpers
-	// give it.
+	// balancer plans both changes itself, in as many rounds as a cooperative
+	// rebalance takes.
 	joinIDs := compareMemberIDs(members + 1)
 	newcomer := joinIDs[len(joinIDs)-1]
 	survivors := ids[1:]
 
-	stockJoin, stockJoinRounds, stockJoinPending := compareRebalance(t, sticky, lanes, stickySteady, newcomer, joinIDs)
-	compareExactlyOnce(t, fmt.Sprintf("stock lanes=%d partitions=%d members=%d joined", len(lanes), partitions, members+1), lanes, stockJoin, joinIDs)
-	t.Logf("moves balancer=%s lanes=%d partitions=%d members=%d phase=join moved=%d rounds=%d pending=%d",
-		"cooperative-sticky", len(lanes), partitions, members, compareMoved(stickySteady, stockJoin, lanes), stockJoinRounds, stockJoinPending)
+	joined, joinRounds, joinPending := compareRebalance(t, balancer, lanes, steady, newcomer, joinIDs)
+	compareExactlyOnce(t, label+" joined", lanes, joined, joinIDs)
+	t.Logf("moves balancer=default protocol=%s %s phase=join moved=%d rounds=%d pending=%d",
+		balancer.ProtocolName(), label, compareMoved(steady, joined, lanes), joinRounds, joinPending)
 
-	stockLeave, stockLeaveRounds, stockLeavePending := compareRebalance(t, sticky, lanes, compareRestrict(stickySteady, survivors), "", survivors)
-	compareExactlyOnce(t, fmt.Sprintf("stock lanes=%d partitions=%d members=%d left", len(lanes), partitions, members-1), lanes, stockLeave, survivors)
-	t.Logf("moves balancer=%s lanes=%d partitions=%d members=%d phase=leave moved=%d rounds=%d pending=%d",
-		"cooperative-sticky", len(lanes), partitions, members, compareMoved(stickySteady, stockLeave, lanes), stockLeaveRounds, stockLeavePending)
-
-	laneJoinMembers := append(
-		laneMembersClaiming(t, lanes, laneSteady, ids...),
-		laneMembersFromSpecs(t, []laneMemberSpec{{
-			id:         newcomer,
-			generation: compareNewcomerGeneration,
-			topics:     slices.Sorted(maps.Keys(lanes)),
-		}})...,
-	)
-	laneJoin := laneAssignments(t, laneJoinMembers, lanes)
-	compareExactlyOnce(t, fmt.Sprintf("lane lanes=%d partitions=%d members=%d joined", len(lanes), partitions, members+1), lanes, laneJoin, joinIDs)
-	t.Logf("moves balancer=%s lanes=%d partitions=%d members=%d phase=join moved=%d rounds=1 pending=0",
-		"lane", len(lanes), partitions, members, compareMoved(laneSteady, laneJoin, lanes))
-
-	laneLeave := laneAssignments(t, laneMembersClaiming(t, lanes, laneSteady, survivors...), lanes)
-	compareExactlyOnce(t, fmt.Sprintf("lane lanes=%d partitions=%d members=%d left", len(lanes), partitions, members-1), lanes, laneLeave, survivors)
-	t.Logf("moves balancer=%s lanes=%d partitions=%d members=%d phase=leave moved=%d rounds=1 pending=0",
-		"lane", len(lanes), partitions, members, compareMoved(laneSteady, laneLeave, lanes))
+	left, leaveRounds, leavePending := compareRebalance(t, balancer, lanes, compareRestrict(steady, survivors), "", survivors)
+	compareExactlyOnce(t, label+" left", lanes, left, survivors)
+	t.Logf("moves balancer=default protocol=%s %s phase=leave moved=%d rounds=%d pending=%d",
+		balancer.ProtocolName(), label, compareMoved(steady, left, lanes), leaveRounds, leavePending)
 }
 
 // compareMemberIDs names the members of a group of the given size.
@@ -478,20 +461,6 @@ func compareMemberIDs(count int) []string {
 		ids = append(ids, fmt.Sprintf("member-%d", index))
 	}
 	return ids
-}
-
-// compareLaneSpecs builds the lane balancer's own member specs for members that
-// hold nothing, which is the state its next plan starts from.
-func compareLaneSpecs(lanes map[string]int32, ids []string) []laneMemberSpec {
-	specs := make([]laneMemberSpec, 0, len(ids))
-	for _, id := range ids {
-		specs = append(specs, laneMemberSpec{
-			id:         id,
-			generation: compareNewcomerGeneration,
-			topics:     slices.Sorted(maps.Keys(lanes)),
-		})
-	}
-	return specs
 }
 
 // compareRestrict keeps only the members of an assignment that are named, which

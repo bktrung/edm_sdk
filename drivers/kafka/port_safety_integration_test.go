@@ -16,9 +16,11 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net"
 	"os"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -180,6 +182,38 @@ const (
 	// the destination is ready. It is a bounded retry against a broker-side
 	// fact with no notification to wait on.
 	portDestinationReadyPoll = 25 * time.Millisecond
+
+	// portCooperativeWork is how long the first consumer holds a delivery in
+	// TestPortCooperativeKeepsRetainedPartitionsDelivering, and so the handler
+	// time that test measures a partition's gap against. Its deliveries are
+	// handled concurrently, as the SDK's handler pool handles them, so one
+	// partition's deliveries are spaced by this hold rather than by the whole
+	// destination's partition count.
+	portCooperativeWork = 150 * time.Millisecond
+	// portCooperativeClockJitter is the bounded scheduling allowance for a
+	// wall-clock trace around the callback event. The revoke-list assertion is
+	// the exact protocol discriminator; this allowance only avoids turning a
+	// handler-sized interval into a flaky failure on a loaded test host.
+	portCooperativeClockJitter = 25 * time.Millisecond
+	// portCooperativeWarmup is how many deliveries each partition of the
+	// destination has handed over before the test joins the second consumer. A
+	// partition needs two arrivals before the join to have a gap at all.
+	portCooperativeWarmup = 2
+
+	// portWarningPartitions is the partition count the warning tests create
+	// their destination with: fewer than the budget one case declares, and
+	// exactly the budget the other declares.
+	portWarningPartitions = 3
+	// portShortBudget is the slot budget the underpartitioned case declares for
+	// a destination with fewer partitions than that, which is the shape the
+	// warning exists for.
+	portShortBudget = 4
+	// portWarningQuiet is how long the budget-met case watches the logger before
+	// the absence of a warning counts as evidence. The warning is decided inside
+	// the assignment callback, so it is already written by the time the callback
+	// publishes its notification; the window is margin rather than the
+	// measurement.
+	portWarningQuiet = 2 * time.Second
 )
 
 // TestPortAtLeastOnceAcrossJoinAndLeave publishes a numbered corpus and settles
@@ -841,6 +875,430 @@ func TestPortTurnaroundAfterSettle(t *testing.T) {
 	consumer.notifications.assertNoFatal(t)
 }
 
+// TestPortCooperativeKeepsRetainedPartitionsDelivering holds a whole
+// destination on one consumer, joins a second consumer to the same group, and
+// measures what the join costs the partitions the first consumer keeps.
+//
+// The point is the protocol, not the balancer's arithmetic. A cooperative
+// rebalance moves only the partitions that must move, so a partition the first
+// consumer keeps is never revoked and never re-fetched from its committed
+// offset: its deliveries carry on across the rebalance. An eager one tells every
+// member to give up everything on every membership change, so the partitions
+// the first consumer gets back stop until the group has re-formed, which is the
+// gap this test measures. It asserts that no partition the first consumer
+// delivers from on both sides of the join waited longer than one handler time,
+// and reports keepers and max-gap-ms.
+//
+// It also checks the revoke list because a local broker's shared poll loop can
+// make the timing margin noisy: no partition the first consumer delivered from
+// on both sides of the join was named by a revoke notification. That list is
+// what the group took away from this member, and a cooperative rebalance takes
+// away only the partitions that moved. An eager balancer revokes the member's
+// whole assignment and then hands the same partitions back, so this assertion
+// fails first when the default reverts to one.
+func TestPortCooperativeKeepsRetainedPartitionsDelivering(t *testing.T) {
+	fixture := newPortFixture(t, "cooperative-kept", portPartitions)
+	clk, ctx := fixture.clock, fixture.ctx
+	keys := portKeysByPartition(t)
+	sequences := portSequences(portCorpus)
+	ledger := newPortLedger(clk)
+
+	fixture.publish(t, sequences, portKeyedSequences(sequences, keys))
+
+	trace := newPortPartitionTrace()
+	holder := fixture.subscribe(t, fixture.consumerConfig(fixture.group, fixture.partitions))
+	holder.notifications.awaitAssignment(t, portAssignmentTimeout, "the first consumer")
+
+	// Deliveries are handled concurrently, one goroutine each, and held for
+	// portCooperativeWork before they settle. Handling them one at a time would
+	// space a partition's deliveries by the whole destination's partition count,
+	// which is not the delivery cadence this test reports the join's cost against.
+	pace := newPortPace(portCooperativeWork)
+	var handlers sync.WaitGroup
+	settler := holder.pump(func(message driver.InboundMessage) {
+		ledger.received(portSequenceOf(message))
+		trace.record(message.Ref.Partition, clk.Now())
+		handlers.Add(1)
+		go func() {
+			defer handlers.Done()
+			if err := pace.wait(ctx, clk); err != nil {
+				return
+			}
+			ledger.acknowledge(ctx, message)
+		}()
+	})
+	defer settler.stop()
+
+	trace.awaitPartitions(t, clk, fixture.partitions, portCooperativeWarmup,
+		"the first consumer to take deliveries from every partition before the join")
+
+	// The join starts here. The joining member's assignment is only the wait
+	// that confirms the cooperative round completed; the holder's revoke
+	// notification is the driver's observable rebalance boundary for its kept
+	// partitions.
+	joiner := fixture.subscribe(t, fixture.consumerConfig(fixture.group, fixture.partitions))
+	joinerFirst := make(chan time.Time, 1)
+	joinerPump := joiner.pump(func(message driver.InboundMessage) {
+		select {
+		case joinerFirst <- clk.Now():
+		default:
+		}
+		ledger.received(portSequenceOf(message))
+		ledger.acknowledge(ctx, message)
+	})
+	defer joinerPump.stop()
+
+	boundary := joiner.notifications.awaitAssignment(t, portAssignmentTimeout, "the joining consumer")
+	rebalanceBoundary := holder.notifications.awaitRevocation(t, portAssignmentTimeout, "the first consumer's revoke")
+	// A partition this member keeps goes on delivering across the join, which is
+	// what makes its gap measurable rather than absent.
+	trace.awaitPartitionsAfter(t, clk, rebalanceBoundary, fixture.partitions/2,
+		"the first consumer to go on delivering after the join")
+	firstDelivery := portAwait(t, clk, joinerFirst, portDeliveryTimeout,
+		"the joining consumer to receive its first delivery").Sub(boundary)
+	pace.close()
+
+	portAwaitCorpus(t, ledger, len(sequences), sequences, portSettleQuietWindow, portSettleTimeout,
+		"the corpus to finish settling after the join")
+	settler.stop()
+	handlers.Wait()
+	ledger.assertNoFailures(t)
+	portAssertNoLoss(t, ledger, sequences)
+	// A partition that delivered on both sides of the holder's revoke event is
+	// retained only if the broker did not revoke it. The lifecycle event is the
+	// actual rebalance boundary, and the revoke list distinguishes the moved
+	// partitions from the ones this member kept.
+	givenUp := holder.notifications.revokedPartitions()
+	if len(givenUp) == 0 {
+		t.Fatalf("the first consumer was told to give up no partition at all, so the join moved nothing and this test measured nothing")
+	}
+	kept := make(map[int32]time.Duration)
+	for partition, gap := range trace.gapsAcross(rebalanceBoundary) {
+		if !givenUp[partition] {
+			kept[partition] = gap
+		}
+	}
+	if len(kept) == 0 {
+		t.Fatalf("the first consumer delivered from no retained partition on both sides of the join at %s: this test measures what a join did to the partitions a member keeps, and a member that kept none measured nothing",
+			rebalanceBoundary.Format(time.RFC3339Nano))
+	}
+	var worst time.Duration
+	for _, gap := range kept {
+		if gap > worst {
+			worst = gap
+		}
+	}
+	if bound := portCooperativeWork + portCooperativeClockJitter; worst > bound {
+		t.Fatalf("a kept partition waited %s between its last delivery before the join and its first one after it, want at most one %s handler time plus %s trace jitter (%s): the cooperative member must keep delivering across the rebalance",
+			worst, portCooperativeWork, portCooperativeClockJitter, bound)
+	}
+	t.Logf("port-metrics test=cooperative-kept kept=%d revoked=%d max-gap-ms=%d",
+		len(kept), len(givenUp), worst.Milliseconds())
+	ledger.metrics(t, "cooperative-kept", sequences, firstDelivery)
+	holder.notifications.assertNoFatal(t)
+	joiner.notifications.assertNoFatal(t)
+}
+
+// portPartitionTrace records the instants deliveries arrived at one consumer,
+// by the partition they came from. A rebalance's cost to a partition is the
+// interval between the last delivery before the membership change and the first
+// one after it, and this is where both come from.
+type portPartitionTrace struct {
+	mu     sync.Mutex
+	byPart map[int32][]time.Time
+	notify chan struct{}
+}
+
+func newPortPartitionTrace() *portPartitionTrace {
+	return &portPartitionTrace{byPart: make(map[int32][]time.Time), notify: make(chan struct{}, 1)}
+}
+
+func (p *portPartitionTrace) record(partition int32, at time.Time) {
+	p.mu.Lock()
+	p.byPart[partition] = append(p.byPart[partition], at)
+	p.mu.Unlock()
+	select {
+	case p.notify <- struct{}{}:
+	default:
+	}
+}
+
+// reaching counts the partitions that have delivered at least each times.
+func (p *portPartitionTrace) reaching(each int) int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	count := 0
+	for _, arrivals := range p.byPart {
+		if len(arrivals) >= each {
+			count++
+		}
+	}
+	return count
+}
+
+// after counts the partitions that have delivered at or after boundary.
+func (p *portPartitionTrace) after(boundary time.Time) int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	count := 0
+	for _, arrivals := range p.byPart {
+		if len(arrivals) > 0 && !arrivals[len(arrivals)-1].Before(boundary) {
+			count++
+		}
+	}
+	return count
+}
+
+// awaitPartitions blocks until count partitions have each delivered at least
+// each times.
+func (p *portPartitionTrace) awaitPartitions(t *testing.T, clk clock.Clock, count, each int, what string) {
+	t.Helper()
+	p.await(t, clk, count, what, func() int { return p.reaching(each) })
+}
+
+// awaitPartitionsAfter blocks until count partitions have delivered at or after
+// boundary.
+func (p *portPartitionTrace) awaitPartitionsAfter(t *testing.T, clk clock.Clock, boundary time.Time, count int, what string) {
+	t.Helper()
+	p.await(t, clk, count, what, func() int { return p.after(boundary) })
+}
+
+func (p *portPartitionTrace) await(t *testing.T, clk clock.Clock, count int, what string, progress func() int) {
+	t.Helper()
+	timer := clk.Timer(portAssignmentTimeout)
+	defer timer.Stop()
+	for {
+		if progress() >= count {
+			return
+		}
+		select {
+		case <-p.notify:
+		case <-timer.C:
+			t.Fatalf("%s: only %d of %d partitions did within %s",
+				what, progress(), count, portAssignmentTimeout)
+		}
+	}
+}
+
+// gapsAcross reports, for every partition delivered to on both sides of
+// boundary, the interval from its last delivery before the boundary to its first
+// one at or after it. A partition missing from either side is one the consumer
+// did not hold across the boundary, and its absence is not a gap.
+func (p *portPartitionTrace) gapsAcross(boundary time.Time) map[int32]time.Duration {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	gaps := make(map[int32]time.Duration, len(p.byPart))
+	for partition, arrivals := range p.byPart {
+		var before time.Time
+		var after time.Time
+		for _, at := range arrivals {
+			if at.Before(boundary) {
+				before = at
+				continue
+			}
+			if after.IsZero() {
+				after = at
+			}
+		}
+		if before.IsZero() || after.IsZero() {
+			continue
+		}
+		gaps[partition] = after.Sub(before)
+	}
+	return gaps
+}
+
+// TestPortUnderpartitionedSubscriptionWarnsOnce gives one consumer a slot budget
+// larger than the destination's partition count, so the subscription can use
+// more slots than the member's assignment can fill, and asserts that the driver
+// says so exactly once through the logger the connection was built with.
+//
+// The repeat is the second half of the assertion. The warned set is per
+// destination and is never cleared, so a peer joining the group and leaving
+// again, which reassigns the same destination to the same member, must not
+// produce a second line: the warning describes the subscription's shape, and a
+// deployment whose members churn would otherwise log it on every rebalance.
+func TestPortUnderpartitionedSubscriptionWarnsOnce(t *testing.T) {
+	logs := newPortLogCapture()
+	fixture := newPortFixtureWithLogger(t, "warn-short", portWarningPartitions, logs.logger())
+	clk := fixture.clock
+	ctx := fixture.ctx
+
+	consumer := fixture.subscribe(t, fixture.consumerConfig(fixture.group, portShortBudget))
+	consumer.notifications.awaitAssignment(t, portAssignmentTimeout, "the consumer")
+	portAwaitWarnings(t, clk, logs, 1, "the driver to warn that the member holds fewer partitions than its budget")
+	portAssertWarning(t, logs.warnings()[0], fixture.topic, portWarningPartitions, portShortBudget)
+
+	// The second rebalance: a peer joins the group, then leaves holding what it
+	// was given, and the destination comes back to the member this test watches.
+	// The peer is underprovisioned by the same arithmetic, so it is opened on a
+	// connection with a logger of its own: its warning is not the one this test
+	// counts.
+	peerConnection := fixture.secondConnection(t, newPortLogCapture().logger())
+	peer := fixture.subscribeWith(t, peerConnection, fixture.consumerConfig(fixture.group, portShortBudget))
+	peer.notifications.awaitAssignment(t, portAssignmentTimeout, "the peer")
+	if err := peer.Release(ctx); err != nil {
+		t.Fatalf("Release the peer: %v", err)
+	}
+	consumer.notifications.awaitAssignment(t, portAssignmentTimeout, "the consumer to be assigned the destination again")
+
+	// A warning written again by that reassignment would arrive with the
+	// assignment notification above; the window is margin on the recorder
+	// rather than the measurement.
+	timer := clk.Timer(portWarningQuiet)
+	defer timer.Stop()
+	select {
+	case <-logs.notify:
+	case <-timer.C:
+	}
+	if warnings := logs.warnings(); len(warnings) != 1 {
+		t.Fatalf("the driver warned %d times about %q, want once: %v",
+			len(warnings), fixture.topic, logs.messages(warnings))
+	}
+	consumer.notifications.assertNoFatal(t)
+	peer.notifications.assertNoFatal(t)
+}
+
+// TestPortBudgetMetByPartitionCountDoesNotWarn gives one consumer a slot budget
+// equal to the destination's partition count: every slot the subscription
+// declares can be filled by a partition of this member's assignment, so there is
+// nothing to warn about, and the driver must not.
+func TestPortBudgetMetByPartitionCountDoesNotWarn(t *testing.T) {
+	logs := newPortLogCapture()
+	fixture := newPortFixtureWithLogger(t, "warn-exact", portWarningPartitions, logs.logger())
+	clk := fixture.clock
+
+	consumer := fixture.subscribe(t, fixture.consumerConfig(fixture.group, portWarningPartitions))
+	consumer.notifications.awaitAssignment(t, portAssignmentTimeout, "the consumer")
+
+	timer := clk.Timer(portWarningQuiet)
+	defer timer.Stop()
+	select {
+	case <-logs.notify:
+	case <-timer.C:
+	}
+	if warnings := logs.warnings(); len(warnings) != 0 {
+		t.Fatalf("the driver warned %d times about a destination whose %d partitions fill its budget of %d: %v",
+			len(warnings), portWarningPartitions, portWarningPartitions, logs.messages(warnings))
+	}
+	consumer.notifications.assertNoFatal(t)
+}
+
+// portLogCapture is a slog handler that records what a driver logger receives.
+//
+// The underprovisioning warning is a diagnostic rather than a port error, so the
+// logger the connection was built with is the only place it can be observed.
+// The structured attributes are kept apart from the message: what the warning
+// has to name is read from them, and the message is only checked for the one
+// consequence an operator cannot see from the numbers.
+type portLogCapture struct {
+	mu      sync.Mutex
+	records []portLogRecord
+	notify  chan struct{}
+}
+
+// portLogRecord is one record the driver wrote.
+type portLogRecord struct {
+	level   slog.Level
+	message string
+	attrs   map[string]string
+}
+
+func newPortLogCapture() *portLogCapture {
+	return &portLogCapture{notify: make(chan struct{}, 1)}
+}
+
+// logger returns the logger a driver configuration takes.
+func (c *portLogCapture) logger() *slog.Logger { return slog.New(c) }
+
+// Enabled accepts every level. A capture that filtered by level would make the
+// test's subject disappear whenever a diagnostic moved between levels.
+func (c *portLogCapture) Enabled(context.Context, slog.Level) bool { return true }
+
+func (c *portLogCapture) Handle(_ context.Context, record slog.Record) error {
+	attrs := make(map[string]string, record.NumAttrs())
+	record.Attrs(func(attr slog.Attr) bool {
+		attrs[attr.Key] = attr.Value.String()
+		return true
+	})
+	c.mu.Lock()
+	c.records = append(c.records, portLogRecord{level: record.Level, message: record.Message, attrs: attrs})
+	c.mu.Unlock()
+	select {
+	case c.notify <- struct{}{}:
+	default:
+	}
+	return nil
+}
+
+func (c *portLogCapture) WithAttrs([]slog.Attr) slog.Handler { return c }
+func (c *portLogCapture) WithGroup(string) slog.Handler      { return c }
+
+// warnings returns the records written at warn level.
+func (c *portLogCapture) warnings() []portLogRecord {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	records := make([]portLogRecord, 0, len(c.records))
+	for _, record := range c.records {
+		if record.level >= slog.LevelWarn {
+			records = append(records, record)
+		}
+	}
+	return records
+}
+
+// messages renders records as their messages, so a count assertion says what it
+// counted.
+func (c *portLogCapture) messages(records []portLogRecord) []string {
+	messages := make([]string, 0, len(records))
+	for _, record := range records {
+		messages = append(messages, record.message)
+	}
+	return messages
+}
+
+// portAwaitWarnings blocks until the capture holds count warnings.
+func portAwaitWarnings(t *testing.T, clk clock.Clock, logs *portLogCapture, count int, what string) {
+	t.Helper()
+	timer := clk.Timer(portAssignmentTimeout)
+	defer timer.Stop()
+	for {
+		if len(logs.warnings()) >= count {
+			return
+		}
+		select {
+		case <-logs.notify:
+		case <-timer.C:
+			t.Fatalf("%s: %d of %d warnings within %s", what, len(logs.warnings()), count, portAssignmentTimeout)
+		}
+	}
+}
+
+// portAssertWarning checks one underprovisioning warning names the destination,
+// the partitions this member holds, the budget those partitions fall short of,
+// the lever that would change it, and the fact that raising the partition count
+// re-maps keys. The last one is the only part an operator cannot read off the
+// numbers, so it is the only part checked in the text.
+func portAssertWarning(t *testing.T, warning portLogRecord, destination string, assigned, budget int) {
+	t.Helper()
+	if got := warning.attrs["destination"]; got != destination {
+		t.Fatalf("warning names destination %q, want %q (attributes: %v)", got, destination, warning.attrs)
+	}
+	if got := warning.attrs["assigned_partitions"]; got != fmt.Sprint(assigned) {
+		t.Fatalf("warning names assigned_partitions %q, want %d (attributes: %v)", got, assigned, warning.attrs)
+	}
+	if got := warning.attrs["budget"]; got != fmt.Sprint(budget) {
+		t.Fatalf("warning names budget %q, want %d (attributes: %v)", got, budget, warning.attrs)
+	}
+	if warning.attrs["lever"] == "" {
+		t.Fatalf("warning names no lever to raise (attributes: %v)", warning.attrs)
+	}
+	text := strings.ToLower(warning.message)
+	if !strings.Contains(text, "partition count") || !strings.Contains(text, "re-map") {
+		t.Fatalf("warning message %q does not say that raising the partition count re-maps keys", warning.message)
+	}
+}
+
 // portTurnaroundPercentile returns the nearest-rank percentile of sorted
 // samples, in the percent the caller names.
 func portTurnaroundPercentile(sorted []time.Duration, percent int) time.Duration {
@@ -882,6 +1340,15 @@ type portFixture struct {
 // owns, and registers their teardown in the order they have to come down in.
 // partitions is the destination's partition count.
 func newPortFixture(t *testing.T, label string, partitions int) *portFixture {
+	t.Helper()
+	return newPortFixtureWithLogger(t, label, partitions, nil)
+}
+
+// newPortFixtureWithLogger is newPortFixture with a logger for the connection,
+// which a test that reads a driver diagnostic needs: the port carries failures
+// and routine lifecycle events on Errors(), and a condition the driver survives
+// is written to the logger the connection was built with instead.
+func newPortFixtureWithLogger(t *testing.T, label string, partitions int, logger *slog.Logger) *portFixture {
 	t.Helper()
 	requirePortBroker(t)
 
@@ -933,6 +1400,7 @@ func newPortFixture(t *testing.T, label string, partitions int) *portFixture {
 		Endpoints:             []string{portEndpoint()},
 		ClientID:              "f1-kafka-port-safety",
 		RebalanceDrainTimeout: portDrainTimeout,
+		Logger:                logger,
 	})
 	if err != nil {
 		t.Fatalf("Open(%s): %v", portEndpoint(), err)
@@ -1079,7 +1547,16 @@ func (f *portFixture) consumerConfig(group string, prefetch int) driver.Consumer
 // deliveries back instead of leaving them committed by a Stop.
 func (f *portFixture) subscribe(t *testing.T, config driver.ConsumerConfig) *portSubscriber {
 	t.Helper()
-	consumer, err := f.conn.Consumer(f.ctx, config)
+	return f.subscribeWith(t, f.conn, config)
+}
+
+// subscribeWith is subscribe on a connection of the caller's choosing. A second
+// member of the fixture's group has to come from a second connection when the
+// test reads driver diagnostics: the logger belongs to the connection, so
+// members sharing one would share one log.
+func (f *portFixture) subscribeWith(t *testing.T, connection driver.Conn, config driver.ConsumerConfig) *portSubscriber {
+	t.Helper()
+	consumer, err := connection.Consumer(f.ctx, config)
 	if err != nil {
 		t.Fatalf("Consumer(%q): %v", config.Group, err)
 	}
@@ -1096,6 +1573,31 @@ func (f *portFixture) subscribe(t *testing.T, config driver.ConsumerConfig) *por
 		}
 	})
 	return subscriber
+}
+
+// secondConnection opens another connection to the fixture's broker for a second
+// member of the same group, with a logger of its own. It carries no instance
+// identity, as the fixture's own connection does not, so the group sees two
+// dynamic members rather than one static member joining twice.
+func (f *portFixture) secondConnection(t *testing.T, logger *slog.Logger) driver.Conn {
+	t.Helper()
+	connection, err := (kafka.Driver{}).Open(f.ctx, driver.Config{
+		Endpoints:             []string{portEndpoint()},
+		ClientID:              "f1-kafka-port-safety",
+		RebalanceDrainTimeout: portDrainTimeout,
+		Logger:                logger,
+	})
+	if err != nil {
+		t.Fatalf("Open(%s): %v", portEndpoint(), err)
+	}
+	t.Cleanup(func() {
+		closeCtx, cancel := context.WithTimeout(context.Background(), portCloseTimeout)
+		defer cancel()
+		if err := connection.Close(closeCtx); err != nil {
+			t.Errorf("Close connection: %v", err)
+		}
+	})
+	return connection
 }
 
 // publish sends one numbered message per sequence. When keys is non-nil it
@@ -1266,15 +1768,19 @@ func portAwaitHoldings(t *testing.T, clk clock.Clock, holdings *portHoldings, co
 // no typed rebalance event, so an event is recognised by the classification the
 // port gives it and by the event name its text carries. That text is the only
 // port-level signal a rebalance produces; the tests below assert on deliveries
-// and settlements, never on the text.
+// and settlements, never on the text, with one exception: the partitions a
+// revoke names are the only observable of which partitions a rebalance took
+// away from a member, and revokedPartitions reads them out of it.
 type portNotifications struct {
-	clock   clock.Clock
-	stopC   chan struct{}
-	done    chan struct{}
-	once    sync.Once
-	mu      sync.Mutex
-	failed  []error
-	assigns chan time.Time
+	clock     clock.Clock
+	stopC     chan struct{}
+	done      chan struct{}
+	once      sync.Once
+	mu        sync.Mutex
+	failed    []error
+	givenUp   []error
+	revokedAt chan time.Time
+	assigns   chan time.Time
 }
 
 // The port carries no timestamp on a notification, so the instant the recorder
@@ -1286,10 +1792,11 @@ type portNotifications struct {
 // the test calls stop.
 func watchRebalanceNotifications(clk clock.Clock, consumer driver.Consumer) *portNotifications {
 	notifications := &portNotifications{
-		clock:   clk,
-		stopC:   make(chan struct{}),
-		done:    make(chan struct{}),
-		assigns: make(chan time.Time, 1),
+		clock:     clk,
+		stopC:     make(chan struct{}),
+		done:      make(chan struct{}),
+		revokedAt: make(chan time.Time, 1),
+		assigns:   make(chan time.Time, 1),
 	}
 	go func() {
 		defer close(notifications.done)
@@ -1318,7 +1825,16 @@ func (n *portNotifications) record(err error) {
 	case "revoked", "lost":
 		// Rebalance lifecycle the tests do not wait on. It is still a routine
 		// event rather than a failure: recording it as one would put it in
-		// every failureSummary this file prints.
+		// every failureSummary this file prints. It is kept, separately, because
+		// the partitions it names are what a revoke took away from this member.
+		at := n.clock.Now()
+		n.mu.Lock()
+		n.givenUp = append(n.givenUp, err)
+		n.mu.Unlock()
+		select {
+		case n.revokedAt <- at:
+		default:
+		}
 	default:
 		n.mu.Lock()
 		n.failed = append(n.failed, err)
@@ -1343,6 +1859,84 @@ func (n *portNotifications) awaitAssignment(t *testing.T, timeout time.Duration,
 	case <-timer.C:
 		t.Fatalf("%s: no partition assignment within %s%s", what, timeout, n.failureSummary())
 		return time.Time{}
+	}
+}
+
+// awaitRevocation waits for the first revoke or lost notification and returns
+// the instant the recorder observed it.
+func (n *portNotifications) awaitRevocation(t *testing.T, timeout time.Duration, what string) time.Time {
+	t.Helper()
+	timer := n.clock.Timer(timeout)
+	defer timer.Stop()
+	select {
+	case revoked := <-n.revokedAt:
+		return revoked
+	case <-timer.C:
+		t.Fatalf("%s: no revoke notification within %s%s", what, timeout, n.failureSummary())
+		return time.Time{}
+	}
+}
+
+// parseRevokedPartitions reads the partition lists in one lifecycle error.
+// The error formats a map whose outer brackets contain a topic and whose inner
+// brackets contain its partition slice, so searching for ":[", rather than the
+// first "[", is what keeps partition zero in the result.
+func parseRevokedPartitions(text string) map[int32]bool {
+	given := make(map[int32]bool)
+	for {
+		start := strings.Index(text, ":[")
+		if start < 0 {
+			break
+		}
+		rest := text[start+2:]
+		end := strings.Index(rest, "]")
+		if end < 0 {
+			break
+		}
+		for _, field := range strings.Fields(rest[:end]) {
+			partition, convErr := strconv.ParseInt(field, 10, 32)
+			if convErr != nil {
+				continue
+			}
+			given[int32(partition)] = true
+		}
+		text = rest[end+1:]
+	}
+	return given
+}
+
+// revokedPartitions lists the partitions the driver has told this consumer to
+// give up, read from the lifecycle notifications it published. Which partitions
+// a revoke names is the port-level fact a cooperative protocol turns on: it
+// names the partitions that moved, and a partition this member keeps is not
+// among them, because the group never took it away.
+func (n *portNotifications) revokedPartitions() map[int32]bool {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	given := make(map[int32]bool)
+	for _, err := range n.givenUp {
+		for partition := range parseRevokedPartitions(err.Error()) {
+			given[partition] = true
+		}
+	}
+	return given
+}
+
+// TestPortNotificationsRevokedPartitions pins the parser for the driver's
+// formatted lifecycle error, including partition zero and more than one topic.
+// This is deliberately broker-free: the port notification is a string, and the
+// parser must be proved against its nested map and slice brackets without
+// making a rebalance test carry a formatting regression.
+func TestPortNotificationsRevokedPartitions(t *testing.T) {
+	got := parseRevokedPartitions("kafka partitions revoked: map[topic-a:[0 1 2] topic-b:[3 4]]")
+	want := map[int32]bool{0: true, 1: true, 2: true, 3: true, 4: true}
+	if len(got) != len(want) {
+		t.Fatalf("parseRevokedPartitions() = %v, want %v", got, want)
+	}
+	for partition := range want {
+		if !got[partition] {
+			t.Fatalf("parseRevokedPartitions() = %v, missing partition %d", got, partition)
+		}
 	}
 }
 
@@ -1821,6 +2415,17 @@ func portDistinctPartitions(messages []driver.InboundMessage) int {
 		seen[message.Ref.Partition] = struct{}{}
 	}
 	return len(seen)
+}
+
+// sortedPartitions renders a partition set in a fixed order, so a failure that
+// quotes one reads the same on every run.
+func sortedPartitions(partitions map[int32]bool) []int32 {
+	sorted := make([]int32, 0, len(partitions))
+	for partition := range partitions {
+		sorted = append(sorted, partition)
+	}
+	sort.Slice(sorted, func(i, j int) bool { return sorted[i] < sorted[j] })
+	return sorted
 }
 
 // portUniqueName returns a destination or group name no other run shares, so a
