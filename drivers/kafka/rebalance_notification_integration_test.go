@@ -187,7 +187,7 @@ func TestPublicRunnerReconnectsAfterTransientConsumerError(t *testing.T) {
 	waitForKafkaConsumerState(t, first, "initial assignment", func() bool {
 		first.mu.Lock()
 		defer first.mu.Unlock()
-		return len(first.activeGenerations) > 0
+		return len(first.owned) > 0
 	})
 	stillRunningCtx, stillRunningCancel := context.WithTimeout(context.Background(), time.Second)
 	select {
@@ -206,7 +206,7 @@ func TestPublicRunnerReconnectsAfterTransientConsumerError(t *testing.T) {
 	waitForKafkaConsumerState(t, second, "reconnected assignment", func() bool {
 		second.mu.Lock()
 		defer second.mu.Unlock()
-		return len(second.activeGenerations) > 0
+		return len(second.owned) > 0
 	})
 
 	cancel()

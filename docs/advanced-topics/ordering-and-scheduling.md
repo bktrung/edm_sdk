@@ -101,7 +101,7 @@ slots do not help when most work hashes to one key.
 | Setting | Controls | Main trade-off |
 | --- | --- | --- |
 | `Concurrency` | Number of handler workers available to a subscription | More parallelism requires thread-safe, idempotent handler effects and more downstream capacity. |
-| `Prefetch` | How many deliveries the consumer may hold ahead of settlement; in ordered mode it is also the dispatch queue budget | More buffering can improve utilization but increases in-flight work, memory, and shutdown backlog. |
+| `Prefetch` | How many deliveries the consumer may hold ahead of settlement; in ordered mode it is also the dispatch queue budget. A partition-bound driver admits one delivery per partition whatever this is set to, so there the ceiling is the number of partitions assigned to the consumer | More buffering can improve utilization but increases in-flight work, memory, and shutdown backlog. Raising it above the partitions assigned to the consumer does not raise the ceiling, because each of those partitions is already carrying one delivery. |
 
 F1 keeps admission and scheduling bounded. A delivery passes through the
 driver's prefetch budget, the fetch-to-dispatch boundary, bounded scheduler
@@ -117,9 +117,21 @@ but not so high that a slow dependency creates an unnecessarily large
 in-flight backlog. Tune one setting at a time while observing handler
 latency, downstream saturation, redelivery, and drain time.
 
+A driver that is bounded by partitions, which is the Kafka driver, admits one
+delivery per partition no matter what `Prefetch` says: the effective ceiling is
+the number of partitions assigned to the consumer, and on Kafka that is the
+partition count of each destination the subscription consumes. A subscription
+whose traffic reaches fewer partitions than it has workers cannot keep all of
+those workers supplied, and no value of `Prefetch` changes that. Raise the
+partition count, or spread the workload over more keys, when that is the limit
+you have reached.
+
 `Prefetch` is not a substitute for capacity planning. A larger value cannot
 make a hot ordered key concurrent, and it cannot make a handler that is
-blocked on a dependency complete faster.
+blocked on a dependency complete faster. It also cannot raise a
+partition-bound driver's ceiling: that driver admits one delivery per
+partition, so on Kafka the effective ceiling is the number of partitions
+assigned to the consumer, and raising `Prefetch` past that does nothing.
 
 ## Priorities are fair scheduling lanes
 
@@ -209,7 +221,10 @@ needed before changing configuration:
    stable `WithKey`. Do not use `Concurrency: 1` unless the whole subscription
    truly needs global serialization.
 2. **Handlers are idle while work is available?** Check `Prefetch`, lane
-   capacity, and the number of distinct keys before increasing concurrency.
+   capacity, the number of distinct keys, and the partitions assigned to the
+   consumer before increasing concurrency. On a partition-bound driver a
+   `Prefetch` above that partition count is not what is holding the workers
+   back.
 3. **Fresh work is delayed by retries?** Keep retry lanes available but lower
    their relative weight with `RetryWeightDivisor`; do not discard retries that
    represent a real transient failure.
@@ -255,7 +270,8 @@ contract validated by the [driver conformance package](https://fgit.zapps.vn/zat
   downstream idempotency design.
 - Assuming `PriorityHigh` is strict priority and that medium or low work will
   stop while high work exists.
-- Increasing `Prefetch` to solve a slow dependency or a hot ordered key.
+- Increasing `Prefetch` to solve a slow dependency, a hot ordered key, or a
+  partition-bound driver's per-partition ceiling.
 - Letting retry volume consume all capacity by omitting retry fairness from
   load testing.
 - Assuming changing `Concurrency` is enough to scale an ordered subscription;

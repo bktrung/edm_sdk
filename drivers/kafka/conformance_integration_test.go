@@ -7,8 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"strconv"
-	"strings"
 	"testing"
 	"time"
 
@@ -18,6 +16,7 @@ import (
 
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/driver"
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/driver/conformance"
+	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/clock"
 )
 
 func TestConformance(t *testing.T) {
@@ -38,57 +37,10 @@ func TestConformance(t *testing.T) {
 			// retry.
 			RebalanceDrainTimeout: time.Second,
 		},
+		DeferralModel:    conformance.DeferralDestinationDelay,
 		NewInspector:     kafkaInspector,
 		NewFaultInjector: kafkaFaultInjector,
 	})
-}
-
-func TestInspectorReportsInvalidDeferralHeader(t *testing.T) {
-	ctx, connection, admin := openKafkaAdminTest(t)
-	destination := kafkaTestTopic(t, "inspector-invalid-deferral")
-	cleanupKafkaTopics(t, admin, destination)
-	const delay = time.Second
-	if _, err := connection.Admin().EnsureTopology(ctx, driver.TopologySpec{
-		Destinations: []driver.DestinationSpec{{Name: destination, Delay: delay}},
-		Effective:    connection.Capabilities(),
-	}); err != nil {
-		t.Fatalf("EnsureTopology(%q): %v", destination, err)
-	}
-
-	inspect, err := kafkaInspector(connection)
-	if err != nil {
-		t.Fatalf("kafkaInspector(): %v", err)
-	}
-	record := &kgo.Record{
-		Topic: destination,
-		Value: []byte("invalid-deferred-header"),
-		Headers: []kgo.RecordHeader{{
-			Key:   delayUntilHeader,
-			Value: []byte("not-a-time"),
-		}},
-	}
-	if err := connection.client.ProduceSync(ctx, record).FirstErr(); err != nil {
-		t.Fatalf("ProduceSync(%q): %v", destination, err)
-	}
-
-	_, err = inspect(ctx, destination)
-	if err == nil {
-		t.Fatal("Inspect() error = nil, want invalid deferred header error")
-	}
-	for _, want := range []string{
-		destination,
-		fmt.Sprintf("partition %d", record.Partition),
-		fmt.Sprintf("offset %d", record.Offset),
-		"invalid deferred due-time header",
-	} {
-		if !strings.Contains(err.Error(), want) {
-			t.Errorf("Inspect() error = %v, want %q", err, want)
-		}
-	}
-	var parseErr *strconv.NumError
-	if !errors.As(err, &parseErr) {
-		t.Fatalf("Inspect() error = %v, want wrapped strconv.NumError", err)
-	}
 }
 
 func kafkaInspector(raw driver.Conn) (conformance.Inspect, error) {
@@ -112,7 +64,6 @@ func kafkaInspector(raw driver.Conn) (conformance.Inspect, error) {
 		var (
 			sharedGroup string
 			unsettled   int64
-			discarded   int64
 		)
 		matches := 0
 		for _, consumer := range active {
@@ -127,11 +78,6 @@ func kafkaInspector(raw driver.Conn) (conformance.Inspect, error) {
 				}
 				matches++
 				unsettled += int64(consumer.unsettled[destination])
-				for key, offsets := range consumer.discarded {
-					if key.destination == destination {
-						discarded += int64(len(offsets))
-					}
-				}
 			}
 			consumer.mu.Unlock()
 		}
@@ -188,11 +134,10 @@ func kafkaInspector(raw driver.Conn) (conformance.Inspect, error) {
 			return conformance.BrokerView{}, err
 		}
 		// Kafka reports committed and retained offsets, not deliveries already
-		// handed to Messages. Keep those driver-held deliveries in Unsettled,
-		// subtract discarded holes that wait behind a requeued offset, and
-		// subtract not-yet-due records counted as Auxiliary.
+		// handed to Messages. Keep those driver-held deliveries in Unsettled and
+		// subtract the not-yet-due records counted as Auxiliary, so Ready is the
+		// count a caller can still ask for.
 		ready -= unsettled
-		ready -= discarded
 		ready -= auxiliary
 		if ready < 0 {
 			ready = 0
@@ -201,11 +146,37 @@ func kafkaInspector(raw driver.Conn) (conformance.Inspect, error) {
 	}, nil
 }
 
+// inspectorConsumerDelay returns the delay of a live consumer that subscribed to
+// the destination, for a record the connection has no declaration for at all.
+// The topology that declares a destination declares its delay with it, so this
+// is the exception rather than the rule.
+func inspectorConsumerDelay(connection *conn, destination string) (time.Duration, bool) {
+	connection.mu.RLock()
+	active := make([]*consumer, 0, len(connection.consumers))
+	for consumer := range connection.consumers {
+		active = append(active, consumer)
+	}
+	connection.mu.RUnlock()
+	for _, consumer := range active {
+		consumer.mu.Lock()
+		delay, known := consumer.cfg.Delays[destination]
+		subscribed := !consumer.stopped
+		if _, ok := consumer.budgets[destination]; !ok {
+			subscribed = false
+		}
+		consumer.mu.Unlock()
+		if subscribed && known {
+			return delay, true
+		}
+	}
+	return 0, false
+}
+
 func countDeferredRecords(ctx context.Context, connection *conn, destination string, offsets map[int32]int64) (int64, error) {
-	delay, known := connection.destinationDelay(destination)
-	if !known || delay <= 0 || len(offsets) == 0 {
+	if len(offsets) == 0 {
 		return 0, nil
 	}
+	fallback, hasFallback := inspectorConsumerDelay(connection, destination)
 	partitions := map[string]map[int32]kgo.Offset{destination: {}}
 	var expected int64
 	for partition, offset := range offsets {
@@ -258,17 +229,24 @@ func countDeferredRecords(ctx context.Context, connection *conn, destination str
 			continue
 		}
 		for _, record := range records {
-			decision := evaluateDeferral(record, delay, kafkaNow())
-			if decision.err != nil {
-				if !decision.present {
-					continue
-				}
-				return 0, fmt.Errorf(
-					"kafka inspector: destination %q partition %d offset %d: %w",
-					record.Topic, record.Partition, record.Offset, decision.err,
-				)
+			// A record's own publish instant decides which delay deferred it:
+			// the port's destination-delay model defers a record by the delay
+			// its destination declares, and a destination that declared none
+			// until after this record was published did not defer it. A record
+			// the connection has no declaration for falls back to a live
+			// consumer's config, and one with neither is ready as it stands.
+			delay, known := connection.destinationDelayAt(destination, record.Timestamp)
+			if !known {
+				delay, known = fallback, hasFallback
 			}
-			if decision.wait {
+			if !known || delay <= 0 || record.Timestamp.IsZero() {
+				continue
+			}
+			// The same due time the consumer derives, including the rounding to
+			// the resolution the broker stores a timestamp at: a record this
+			// count calls ready is one the consumer would admit now.
+			due := record.Timestamp.Truncate(kafkaTimestampPrecision).Add(kafkaTimestampPrecision).Add(delay)
+			if due.After(clock.NewReal().Now()) {
 				auxiliary++
 			}
 		}

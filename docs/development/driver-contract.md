@@ -230,8 +230,8 @@ delivery. An empty destination list applies the operation to all destinations
 owned by the consumer.
 
 Pause must respect the per-destination prefetch budget passed in
-`ConsumerConfig`; it must not allow an outage or paused lane to accumulate an
-unbounded local buffer.
+`ConsumerConfig` as a ceiling it may not exceed; it must not allow an outage or
+paused lane to accumulate an unbounded local buffer.
 
 ### Drain
 
@@ -341,14 +341,24 @@ interpreted only by that driver.
   that defers on the consumer side. The core fills it from the same topology it
   passes to `EnsureTopology`, and a destination absent from the map has no
   delay, which is how a driver is told a destination defers nothing;
-- total prefetch and the core-calculated `PerDestination` allocation;
+- total prefetch and the core-calculated `PerDestination` allocation, which
+  bound the deliveries the consumer may hold unsettled in total and per
+  destination;
 - exclusive mode;
 - start position for a new group only; and
 - the same effective capability profile.
 
-Drivers must honor the effective configuration they receive. They may retain
-internal connection facts, but must not replace core-selected behavior with a
-different capability view.
+Drivers must honor the effective configuration they receive as a ceiling they
+may not exceed. They may retain internal connection facts, but must not replace
+core-selected behavior with a different capability view, and must not hold more
+unsettled work than the prefetch budget allows.
+
+A ceiling is not a floor. A driver may hold fewer deliveries than the
+configuration allows when its own transport bounds it lower. The Kafka driver
+is the shipped case: it admits one delivery per partition, so the ceiling that
+binds a destination is the number of partitions assigned to the consumer, which
+can be below the `PerDestination` allocation even though the driver never
+exceeds it.
 
 ## Capability reporting
 

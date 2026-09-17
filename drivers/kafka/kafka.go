@@ -58,6 +58,13 @@ const (
 	kafkaV2RecordBatchBaseBytes = 65
 )
 
+// delayDeclaration is one delay a destination declared to EnsureTopology and
+// the instant it declared it.
+type delayDeclaration struct {
+	at    time.Time
+	delay time.Duration
+}
+
 // conn owns the single client used for connection, producer, and metadata
 // operations. Consumer instances use cloned options so each can own its group.
 type conn struct {
@@ -69,7 +76,6 @@ type conn struct {
 	rebalanceDrainTimeout time.Duration
 	staticMembership      bool
 	balancer              kgo.GroupBalancer
-	delays                map[string]time.Duration // producer-only; a consumer reads its own config
 	caps                  driver.Capabilities
 	info                  driver.BrokerInfo
 	consumers             map[*consumer]struct{}
@@ -82,6 +88,14 @@ type conn struct {
 	closeFault            atomic.Bool
 	closing               bool
 	closed                bool
+	// delays is the delay history of each destination, appended to by
+	// EnsureTopology. The consume path never reads it: a consumer takes its due
+	// times from the delay its own config carries, which is the core's resolved
+	// subscription. Its one reader is the conformance inspector, which reports
+	// how many of a destination's records are not yet due, and a destination
+	// whose records are all still waiting can have no consumer and therefore no
+	// config to read the delay from.
+	delays map[string][]delayDeclaration
 }
 
 // Name returns the stable Kafka driver key.
@@ -269,7 +283,7 @@ func (Driver) Open(ctx context.Context, cfg driver.Config) (driver.Conn, error) 
 		rebalanceDrainTimeout: rebalanceDrainTimeout,
 		staticMembership:      staticMembership,
 		balancer:              balancer,
-		delays:                make(map[string]time.Duration),
+		delays:                make(map[string][]delayDeclaration),
 		caps:                  caps,
 		info:                  info,
 		consumers:             make(map[*consumer]struct{}),
@@ -482,11 +496,30 @@ func (c *conn) log() *slog.Logger {
 	return c.logger
 }
 
-func (c *conn) destinationDelay(destination string) (time.Duration, bool) {
+// destinationDelayAt reports the delay the destination had declared for a record
+// published at instant at, and whether it had declared one at all. A record
+// published before the destination's first declaration was not deferred by it,
+// which the caller reads as a zero delay and reports as ready.
+//
+// A record's timestamp is the publish instant rounded down to the millisecond
+// the broker stores, so a declaration anywhere inside that millisecond is in
+// force for the record. The conformance inspector is the only caller, as the
+// delay history's own comment says.
+func (c *conn) destinationDelayAt(destination string, at time.Time) (time.Duration, bool) {
+	latest := at.Truncate(kafkaTimestampPrecision).Add(kafkaTimestampPrecision)
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	delay, ok := c.delays[destination]
-	return delay, ok
+	var (
+		delay time.Duration
+		known bool
+	)
+	for _, declared := range c.delays[destination] {
+		if declared.at.After(latest) {
+			break
+		}
+		delay, known = declared.delay, true
+	}
+	return delay, known
 }
 
 func (c *conn) Ping(ctx context.Context) error {

@@ -220,9 +220,13 @@ second backpressure boundary after driver prefetch.
 - different keys may execute concurrently when they map to different workers.
 
 `Subscription.Concurrency` controls the worker count and the dispatch budget.
-`Subscription.Prefetch` controls the amount of transport work admitted across
-the destination set. The core passes a per-destination allocation to the
-driver, while the scheduler and pool enforce their own bounded queues.
+`Subscription.Prefetch` caps the amount of transport work admitted across the
+destination set. The core passes a per-destination allocation to the driver,
+while the scheduler and pool enforce their own bounded queues. A driver may
+admit less than that allocation when its own transport bounds it lower, which
+is what the Kafka driver does: it admits one delivery per partition, so the
+admitted amount for a destination is capped by the number of partitions
+assigned to the consumer, which can be lower than the allocation it was given.
 
 Ordered mode is a portability contract, not a broker hint. `Subscribe` checks
 the effective capability before accepting it, and `ConsumerConfig.Exclusive`
