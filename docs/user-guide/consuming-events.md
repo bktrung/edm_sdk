@@ -67,6 +67,29 @@ does not shrink them: each destination keeps the window its lanes need, and the
 lanes, not the total, are what stop the driver fetching ahead of the work the
 subscription can run.
 
+Measured on one machine, against a single local RabbitMQ node with quorum queues
+(the default), a handler that returns at once and a pre-published backlog, that
+shape settles about 1000 messages a second with one handler slot, and about
+200-250 messages a second per slot from four slots up, falling as slots are
+added:
+
+| `Concurrency` | Settled messages/s | Per slot |
+| --- | --- | --- |
+| 1 | about 1050 | about 1050 |
+| 4 | about 1040 | about 260 |
+| 16 | about 3800 | about 240 |
+| 32 | about 6700 | about 210 |
+| 64 | about 12000 | about 190 |
+
+Those are sizing figures for that machine, not a guarantee and not a threshold.
+A few slots buy little over one, so size `Concurrency` from the rate the
+subscription has to sustain: divide the target by the per-slot band above. A
+handler that takes time settles at most one message per slot per handler
+duration, so the per-slot rate is capped by the lower of that and the band:
+measure the real handler before relying on either figure. Raising `Prefetch`
+above the effective window described above does not raise the rate. The figures
+come from `BenchmarkRabbitMQConsumeSweep` in `examples/bench`.
+
 ## Read event metadata
 
 Handlers can inspect the event ID, type, subject, attempt number, priority,
