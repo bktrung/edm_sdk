@@ -87,6 +87,329 @@ type poisonDropReport struct {
 
 // --- Public runner API and generation lifecycle ---
 
+// runnerEvent is one report a runner's other goroutines make to the goroutine
+// calling Run. Exactly one goroutine reads the channel, and every source sends
+// its report from a deferred function, so a source that panics still reports
+// instead of leaving the owner waiting for an event that never comes.
+type runnerEvent struct {
+	kind runnerEventKind
+	err  error
+	// transient marks a consumer error a replacement consumer may fix, as
+	// opposed to one the runner has to stop for.
+	transient bool
+	// consumer and epoch carry what an open reported: the consumer itself, and
+	// the connection incarnation it was opened on.
+	consumer driver.Consumer
+	epoch    uint64
+}
+
+// runnerEventKind identifies what a runner event reports.
+type runnerEventKind uint8
+
+const (
+	// runnerEventSourceDone reports that one of a generation's source
+	// goroutines has finished, carrying the error it finished with.
+	runnerEventSourceDone runnerEventKind = iota
+	// runnerEventHandledDelivery reports that a handled delivery was
+	// acknowledged. It is what lets the next transient consumer failure reset
+	// the repair budget instead of counting against it.
+	runnerEventHandledDelivery
+	// runnerEventConsumerError reports an error the consumer-error source read.
+	// transient marks the failure a replacement consumer may fix; the error is
+	// the cause this runner asks a rebuild for, and the failure it reports if
+	// the rebuild hands one back.
+	runnerEventConsumerError
+	// runnerEventConsumerOpened reports the result of opening a generation's
+	// consumer. The open runs on its own goroutine, so the owner can answer a
+	// drain or an abandon while a broker call is in flight.
+	runnerEventConsumerOpened
+	// runnerEventRebuilt reports the result of waiting for a connection
+	// rebuild. That wait runs on its own goroutine for the same reason: an
+	// attempt replacing the connection abandons this runner first, and an owner
+	// parked in the wait could not receive the abandon that ends it.
+	runnerEventRebuilt
+	// runnerEventAbandon reports that a reconnect attempt is replacing the
+	// connection and has released this runner's consumer.
+	runnerEventAbandon
+	// runnerEventDrain reports that a caller asked the runner to drain.
+	runnerEventDrain
+	// runnerEventReleased reports the result of releasing the generation's
+	// consumer. The release runs on its own goroutine, so a broker call does
+	// not hold the owner.
+	runnerEventReleased
+	// runnerEventDrainDone reports that the runner's one terminal drain has
+	// finished.
+	runnerEventDrainDone
+	// runnerEventError reports a failure one of the runner's own goroutines
+	// saw. The owner keeps the first one, and it is what the runner reports
+	// through Drain.
+	runnerEventError
+)
+
+// sourcePanicError converts a recovered panic from a source goroutine into the
+// error its report carries. A source runs the fetcher, the dispatch pipeline
+// or the consumer-error reader, so its panic is the generation's failure and
+// not something a caller can tell apart from an ordinary one.
+func sourcePanicError(recovered any) error {
+	return fmt.Errorf("f1: runner source panic: %v\n%s", recovered, debug.Stack())
+}
+
+// report hands one report to the runner's owner. A runner with no owner has
+// nowhere to send: this package's tests call the delivery path directly on a
+// runner they built by hand, and Run is the only thing that creates the owner.
+// Dropping the report there loses nothing, because the owner is the only
+// reader of what it carries.
+func (r *Runner) report(event runnerEvent) {
+	if r.events != nil {
+		r.events <- event
+	}
+}
+
+// runnerOwner is the one goroutine that owns a runner's state. A runner
+// creates one per Run call, and every other goroutine of the runner reports
+// through its event channel instead of writing what the owner keeps.
+type runnerOwner struct {
+	runner *Runner
+	events chan runnerEvent
+
+	// outstanding counts the generation's sources that have not reported yet.
+	outstanding int
+	// sourceErr is the first failure a source of this generation reported.
+	sourceErr error
+	// successfulDelivery records that this generation completed at least one
+	// handled delivery, which is what resets a repair budget.
+	successfulDelivery bool
+	// consumerError records that the consumer's error stream produced a
+	// transient failure in this generation.
+	consumerError bool
+	// failureCause is this runner's own failure: the transient consumer or
+	// open error that a rebuild is asked for, and the failure the runner
+	// reports when a rebuild hands one back. It is a plain error with no
+	// attempt attached, and the supervisor never writes it, so a cause another
+	// runner's reconnect produces cannot replace it.
+	failureCause error
+	// abandoned records that an attempt replacing the connection released this
+	// runner's consumer. It is what tells a generation that ended without a
+	// failure of its own apart from one that simply finished.
+	abandoned bool
+	// runErr is the first failure a source of this run reported. It is never
+	// cleared, so it is the error the runner reports through Drain.
+	runErr error
+	// repairCycleActive means a replacement consumer has been built and the next
+	// transient consumer failure can complete a failed repair cycle.
+	repairCycleActive bool
+	// failedRepairCycles counts consecutive replacement consumers that fail before
+	// any handled delivery; a handled delivery resets it.
+	failedRepairCycles int
+
+	// base is the context the terminal drain runs on: the current generation's
+	// run context, whose values a settlement context has to carry.
+	base context.Context
+	// cancel stops the current generation's sources. The owner holds it so a
+	// drain request stops the generation itself rather than reaching for a
+	// cancel function another goroutine set.
+	cancel context.CancelFunc
+	// openPending is true while an open is in flight.
+	openPending bool
+	// opened records that the opener has reported.
+	opened bool
+	// openConsumer, openEpoch and openErr are what the opener reported.
+	openConsumer driver.Consumer
+	openEpoch    uint64
+	openErr      error
+	// rebuilt records that the rebuild wait has reported.
+	rebuilt    bool
+	rebuiltErr error
+	// released records that an owner-started release has reported.
+	released   bool
+	releaseErr error
+
+	// draining records that a drain was requested. Every caller's wait ends
+	// when the runner reaches terminal, which the one drain below is what
+	// reaches it.
+	draining bool
+	// drained records that the one terminal drain has started, so a second
+	// request joins it instead of releasing the consumer again.
+	drained   bool
+	drainDone bool
+	drainErr  error
+}
+
+// beginGeneration resets what describes one generation. It is the owner's own
+// reset, so no other goroutine has to reach into state it does not own to
+// start the next one.
+func (o *runnerOwner) beginGeneration() {
+	o.outstanding = 0
+	o.sourceErr = nil
+	o.successfulDelivery = false
+	o.consumerError = false
+	o.failureCause = nil
+	o.abandoned = false
+}
+
+// pumpUntil reads and handles events until ready reports true. It is the
+// owner's only blocking read: everything the runner's other goroutines want
+// the owner to know arrives here, and a report this wait is not itself
+// waiting for is handled rather than left for later.
+func (o *runnerOwner) pumpUntil(ready func() bool) {
+	for !ready() {
+		o.handle(<-o.events)
+	}
+}
+
+// handle applies one report to the owner's state.
+func (o *runnerOwner) handle(event runnerEvent) {
+	switch event.kind {
+	case runnerEventSourceDone:
+		o.outstanding--
+		if event.err != nil && o.sourceErr == nil {
+			o.sourceErr = event.err
+		}
+	case runnerEventHandledDelivery:
+		o.successfulDelivery = true
+	case runnerEventConsumerError:
+		if event.transient {
+			o.consumerError = true
+		}
+		if o.failureCause == nil {
+			o.failureCause = event.err
+		}
+	case runnerEventError:
+		if o.runErr == nil {
+			o.runErr = event.err
+		}
+	case runnerEventAbandon:
+		o.abandoned = true
+	case runnerEventConsumerOpened:
+		o.openPending = false
+		o.opened = true
+		o.openConsumer, o.openEpoch, o.openErr = event.consumer, event.epoch, event.err
+	case runnerEventRebuilt:
+		o.rebuilt = true
+		o.rebuiltErr = event.err
+	case runnerEventReleased:
+		o.released = true
+		o.releaseErr = event.err
+	case runnerEventDrain:
+		o.requestDrain()
+	case runnerEventDrainDone:
+		o.drainDone = true
+		o.drainErr = event.err
+	}
+}
+
+// startOpen opens the generation's consumer on the owner's own goroutine pool.
+// A broker call must not hold the owner: an attempt that replaces the
+// connection abandons this runner first, and an owner parked inside the open
+// could not receive the abandon that ends it.
+func (o *runnerOwner) startOpen(waitCtx context.Context, prefetch int) {
+	o.openPending = true
+	o.opened = false
+	o.openConsumer, o.openEpoch, o.openErr = nil, 0, nil
+	runCtx := o.base
+	o.runner.asyncGroup.Go(func() error {
+		consumer, epoch, err := openRunnerConsumerWith(o.runner, waitCtx, runCtx, prefetch)
+		o.events <- runnerEvent{kind: runnerEventConsumerOpened, consumer: consumer, epoch: epoch, err: err}
+		return nil
+	})
+}
+
+// startRebuild waits for the connection rebuild a generation needs on its own
+// goroutine, for the same reason the open runs on one. cause is the failure
+// the runner asks a rebuild for, and nil for a runner that only has a change
+// to wait for.
+func (o *runnerOwner) startRebuild(ctx context.Context, cause error, epoch uint64) {
+	o.rebuilt = false
+	o.rebuiltErr = nil
+	o.runner.asyncGroup.Go(func() error {
+		err := o.runner.client.awaitRebuild(ctx, cause, epoch, o.runner.drainStarted)
+		o.events <- runnerEvent{kind: runnerEventRebuilt, err: err}
+		return nil
+	})
+}
+
+// releaseConsumer releases the generation's consumer on its own goroutine. The
+// caller waits for the result, because what it decides next depends on whether
+// the consumer went back to the broker.
+func (o *runnerOwner) releaseConsumer(ctx context.Context) error {
+	o.released = false
+	o.releaseErr = nil
+	o.runner.asyncGroup.Go(func() error {
+		o.events <- runnerEvent{kind: runnerEventReleased, err: releaseRunnerConsumer(o.runner, ctx)}
+		return nil
+	})
+	o.pumpUntil(func() bool { return o.released })
+	return o.releaseErr
+}
+
+// requestDrain records that the runner must end and stops the generation. A
+// request that arrives while the generation is still running is recorded, and
+// the loop reaches its drain when the generation stops; one that arrives after
+// the generation stopped is the drain, taken here. startDrain makes a later
+// request join the first.
+//
+// The settlement window is computed here and nowhere else: this is the moment
+// drain starts, so this is the moment a settlement budget begins. The window
+// is installed before the generation is cancelled, so a settlement the
+// cancellation triggers already runs on the drain's deadline rather than on a
+// context the cancellation ends.
+func (o *runnerOwner) requestDrain() {
+	if !o.draining {
+		o.draining = true
+		o.runner.beginSettlementWindow(o.base)
+		if o.cancel != nil {
+			o.cancel()
+		}
+	}
+	if o.generationEnded() {
+		o.startDrain()
+	}
+}
+
+// generationEnded reports that no source and no opener of the current
+// generation is left to report.
+func (o *runnerOwner) generationEnded() bool {
+	return o.outstanding == 0 && !o.openPending
+}
+
+// startDrain begins the runner's one terminal drain. It is idempotent, and
+// that is what makes drain one event: the first caller starts it and every
+// later request joins it, so this teardown runs once however many of Close,
+// the supervisor's abandon and the end of Run arrive at once. An abandon that
+// overlaps the drain still calls Release itself, because the supervisor gives
+// the consumer back to the connection it is leaving before the runner reopens
+// on the replacement: ending the runner and handing a consumer back are not
+// the same operation, and the drain is only the first of them.
+func (o *runnerOwner) startDrain() {
+	if o.drained {
+		return
+	}
+	o.drained = true
+	o.runner.asyncGroup.Go(func() error {
+		o.events <- runnerEvent{kind: runnerEventDrainDone, err: o.runner.drainAfterRun(o.base)}
+		return nil
+	})
+}
+
+// drain starts the runner's one terminal drain and waits for it to finish.
+// startDrain is what joins this call to a drain a request already began: the
+// request path leaves a mid-generation drain recorded but unstarted, and the
+// loop reaches this call exactly when the generation has ended.
+func (o *runnerOwner) drain(base context.Context) error {
+	o.base = base
+	o.requestDrain()
+	o.startDrain()
+	o.pumpUntil(func() bool { return o.drainDone })
+	return o.drainErr
+}
+
+// waitSources pumps events until every source of the generation has reported,
+// and returns the first error any of them reported.
+func (o *runnerOwner) waitSources() error {
+	o.pumpUntil(func() bool { return o.outstanding == 0 })
+	return o.sourceErr
+}
+
 // Run starts the consumer, owns its fetcher and workers, and returns when the
 // consumer stops, the caller cancels ctx, or a driver error requests shutdown.
 // Cancelling ctx stops the runner immediately: in-flight handlers see their
@@ -124,6 +447,7 @@ func (r *Runner) Run(ctx context.Context) (runErr error) {
 	r.handlerShutdownCtx, r.handlerShutdownCancel = handlerShutdownCtx, handlerShutdownCancel
 	r.asyncGroup = new(errgroup.Group)
 	r.errorGroup = newErrorHandlerGroup(r.subscription.Concurrency)
+	r.events = make(chan runnerEvent)
 	r.mu.Unlock()
 	r.client.mu.Unlock()
 
@@ -133,6 +457,17 @@ func (r *Runner) Run(ctx context.Context) (runErr error) {
 	// after finishRunner so it runs first and reads the result Run is about to
 	// hand back, including an error joined in by drainAfterRun.
 	defer func() { r.recordRunExit(ctx, runErr) }()
+	owner := &runnerOwner{runner: r, events: r.events, base: ctx}
+	// The owner's error is published to the runner before the runner's done
+	// channel closes, so a Drain that returns because the runner ended reads
+	// the same failure the run ended with.
+	defer func() {
+		if owner.runErr != nil {
+			r.mu.Lock()
+			r.runErr = owner.runErr
+			r.mu.Unlock()
+		}
+	}()
 	var runCtx context.Context
 	var cancel context.CancelFunc
 	generation := 0
@@ -140,20 +475,16 @@ func (r *Runner) Run(ctx context.Context) (runErr error) {
 	for {
 		r.mu.Lock()
 		failed := r.lifecycle != nil && r.lifecycle.State() == lifecycle.Failed
-		draining := r.draining
 		r.mu.Unlock()
-		if failed {
+		if failed || owner.draining {
 			break
 		}
-		if draining {
-			return nil
-		}
 		runCtx, cancel = context.WithCancel(ctx)
+		owner.base = runCtx
+		owner.cancel = cancel
 		group := beginRunnerGeneration(r, runCtx, cancel)
-		r.mu.Lock()
-		draining = r.draining
-		r.mu.Unlock()
-		if draining {
+		owner.beginGeneration()
+		if owner.draining {
 			cancel()
 			return nil
 		}
@@ -163,11 +494,14 @@ func (r *Runner) Run(ctx context.Context) (runErr error) {
 		// sizes the ordered worker queues from it, so both read the same number
 		// instead of deriving it again from a formula that could drift.
 		prefetch := runnerConsumerPrefetch(r, r.config.Prefetch, runnerLanePlan(r))
-		consumer, openedEpoch, err := openRunnerConsumerWith(r, ctx, runCtx, prefetch)
-		r.mu.Lock()
-		draining = r.draining
-		r.mu.Unlock()
-		if draining {
+		owner.startOpen(ctx, prefetch)
+		owner.pumpUntil(func() bool { return owner.opened })
+		consumer, openedEpoch, err := owner.openConsumer, owner.openEpoch, owner.openErr
+		if owner.draining {
+			// The runner began draining while the consumer was opening, so the
+			// consumer belongs to no generation: it is released here rather
+			// than becoming the drain's work, and the drain itself waits for
+			// nothing because this generation never delivered anything.
 			if consumer != nil {
 				if closeErr := runWithClockTimeout(context.WithoutCancel(runCtx), r.client.options.clock, r.client.config.Lifecycle.CloseTimeout, "consumer release", func(closeCtx context.Context) error {
 					return consumer.Release(closeCtx)
@@ -182,14 +516,13 @@ func (r *Runner) Run(ctx context.Context) (runErr error) {
 			if errors.Is(err, errRunnerDraining) {
 				return nil
 			}
-			r.mu.Lock()
-			abandoned := r.abandoned
-			r.mu.Unlock()
-			if abandoned {
+			if owner.abandoned {
 				// An attempt in flight released this consumer, and the open it
 				// cancelled is not a failure of the runner's: it waits for the
 				// attempt and opens again on what it leaves behind.
-				if reconnectErr := r.client.awaitRebuild(ctx, nil, 0, nil); reconnectErr != nil {
+				owner.startRebuild(ctx, nil, 0)
+				owner.pumpUntil(func() bool { return owner.rebuilt })
+				if reconnectErr := owner.rebuiltErr; reconnectErr != nil {
 					if errors.Is(reconnectErr, errRunnerDraining) {
 						return nil
 					}
@@ -210,7 +543,9 @@ func (r *Runner) Run(ctx context.Context) (runErr error) {
 			// rebuild is asked for, and it is what this runner reports if the
 			// rebuild hands one back.
 			r.transitionToReconnecting()
-			if reconnectErr := r.client.awaitRebuild(ctx, err, 0, nil); reconnectErr != nil {
+			owner.startRebuild(ctx, err, 0)
+			owner.pumpUntil(func() bool { return owner.rebuilt })
+			if reconnectErr := owner.rebuiltErr; reconnectErr != nil {
 				if errors.Is(reconnectErr, errRunnerDraining) {
 					return nil
 				}
@@ -260,10 +595,8 @@ func (r *Runner) Run(ctx context.Context) (runErr error) {
 		state := r.lifecycle.State()
 		switch state {
 		case lifecycle.Starting, lifecycle.Reconnecting:
-			r.mu.Lock()
-			r.repairCycleActive = false
-			r.failedRepairCycles = 0
-			r.mu.Unlock()
+			owner.repairCycleActive = false
+			owner.failedRepairCycles = 0
 			if err := r.lifecycle.Transition(lifecycle.Ready); err != nil {
 				runErr = err
 			} else if state == lifecycle.Starting {
@@ -288,33 +621,44 @@ func (r *Runner) Run(ctx context.Context) (runErr error) {
 			}
 			return nil
 		}
-		group.Go(func() error {
-			return runPipeline(func() error { return fetchRunner(r, runCtx, deliveries) })
-		})
-		group.Go(func() error {
-			return runPipeline(func() error { return runDispatchPipeline(r, runCtx, deliveries, prefetch) })
-		})
-		group.Go(func() error {
-			return runPipeline(func() error { return consumeRunnerErrors(r, runCtx) })
-		})
-
-		generationErr := group.Wait()
-		if generationErr == nil {
-			generationErr = runnerError(r)
+		// Each source reports its own end from a deferred function, which runs
+		// on the way out of a panic too. The report is what the owner waits
+		// for, so a source that dies abnormally still ends the generation
+		// instead of stranding the owner on an event that never arrives.
+		startSource := func(run func() error) {
+			owner.outstanding++
+			group.Go(func() (err error) {
+				defer func() {
+					if recovered := recover(); recovered != nil {
+						// The generation is shared: the sources hand each other
+						// the channels they read, so the one that panicked is
+						// the one that would have closed what the others are
+						// waiting on. Cancel the generation the way an error
+						// return does, or the surviving sources wait for a
+						// close that is never coming and the report below ends
+						// only this goroutine.
+						cancel()
+						err = errors.Join(err, sourcePanicError(recovered))
+					}
+					r.report(runnerEvent{kind: runnerEventSourceDone, err: err})
+				}()
+				return runPipeline(run)
+			})
 		}
-		// After group.Wait, this snapshot is the only reader window for the
-		// generation result. The later repair write-back remains a separate lock.
-		r.mu.Lock()
-		failureCause := r.failureCause
-		abandoned := r.abandoned
-		consumerError := r.consumerError
-		successfulDelivery := r.successfulDelivery
-		repairCycleActive := r.repairCycleActive
-		failedRepairCycles := r.failedRepairCycles
-		draining = r.draining
-		failedLifecycle := r.lifecycle != nil && r.lifecycle.State() == lifecycle.Failed
-		r.mu.Unlock()
-		if failedLifecycle {
+		startSource(func() error { return fetchRunner(r, runCtx, deliveries) })
+		startSource(func() error { return runDispatchPipeline(r, runCtx, deliveries, prefetch) })
+		startSource(func() error { return consumeRunnerErrors(r, runCtx) })
+
+		generationErr := owner.waitSources()
+		if generationErr == nil {
+			generationErr = owner.runErr
+		}
+		// The lifecycle is the one piece of the generation result that lives
+		// outside the owner: a fatal consumer error transitions it from the
+		// goroutine that saw the error, so it keeps its own lock and this reads
+		// it directly. Everything else the generation decided is on the owner
+		// and is read as a field, with no reader window to arrange.
+		if r.lifecycle != nil && r.lifecycle.State() == lifecycle.Failed {
 			runErr = generationErr
 			break
 		}
@@ -323,7 +667,7 @@ func (r *Runner) Run(ctx context.Context) (runErr error) {
 		// the cancellation an attempt abandoning this runner produces - is not
 		// a cause, and the runner stops for that error instead of asking for a
 		// rebuild on its behalf.
-		cause := failureCause
+		cause := owner.failureCause
 		clientReconnecting := r.client.isReconnecting()
 		// Three things keep a stopped generation alive. A generation whose
 		// connection has already been replaced reopens on the replacement,
@@ -331,26 +675,22 @@ func (r *Runner) Run(ctx context.Context) (runErr error) {
 		// attempt in flight waits that attempt out and reports its outcome,
 		// which is how a fatal rebuild stops every runner it abandoned. And one
 		// that failed for its own reason asks for a rebuild.
-		if ctx.Err() != nil || draining ||
-			(!clientReconnecting && cause == nil && !abandoned && !r.client.claimReplaced(openedEpoch)) {
+		if ctx.Err() != nil || owner.draining ||
+			(!clientReconnecting && cause == nil && !owner.abandoned && !r.client.claimReplaced(openedEpoch)) {
 			runErr = generationErr
 			break
 		}
-		if consumerError && !clientReconnecting {
-			if successfulDelivery {
-				failedRepairCycles = 0
-				repairCycleActive = false
+		if owner.consumerError && !clientReconnecting {
+			if owner.successfulDelivery {
+				owner.failedRepairCycles = 0
+				owner.repairCycleActive = false
 			}
-			if repairCycleActive {
-				failedRepairCycles++
+			if owner.repairCycleActive {
+				owner.failedRepairCycles++
 			}
-			repairCycleActive = true
-			r.mu.Lock()
-			r.repairCycleActive = repairCycleActive
-			r.failedRepairCycles = failedRepairCycles
-			r.mu.Unlock()
-			if failedRepairCycles < 2 {
-				if releaseErr := releaseRunnerConsumer(r, context.WithoutCancel(runCtx)); releaseErr == nil {
+			owner.repairCycleActive = true
+			if owner.failedRepairCycles < 2 {
+				if releaseErr := owner.releaseConsumer(context.WithoutCancel(runCtx)); releaseErr == nil {
 					repairCause = cause
 					continue
 				} else {
@@ -359,7 +699,9 @@ func (r *Runner) Run(ctx context.Context) (runErr error) {
 			}
 		}
 		r.transitionToReconnecting()
-		if reconnectErr := r.client.awaitRebuild(ctx, cause, openedEpoch, nil); reconnectErr != nil {
+		owner.startRebuild(ctx, cause, openedEpoch)
+		owner.pumpUntil(func() bool { return owner.rebuilt })
+		if reconnectErr := owner.rebuiltErr; reconnectErr != nil {
 			if errors.Is(reconnectErr, errRunnerDraining) {
 				return nil
 			}
@@ -368,7 +710,7 @@ func (r *Runner) Run(ctx context.Context) (runErr error) {
 		}
 	}
 
-	shutdownErr := r.drainAfterRun(runCtx)
+	shutdownErr := owner.drain(runCtx)
 	if runErr == nil {
 		runErr = shutdownErr
 	} else if shutdownErr != nil {
@@ -413,33 +755,15 @@ func (r *Runner) recordRunExit(ctx context.Context, err error) {
 
 var errRunnerDraining = errors.New("f1: runner is draining")
 
-// beginRunnerGeneration resets the per-generation runner state at the top of
-// Run's loop, where the generation's run context is created. The settlement
-// context belongs to this reset: first-wins installation is correct within
-// one drain, but a context installed during a previous generation's
-// abandonment carries a drain budget that started back then, so every later
-// generation would inherit an already-expired budget and fail every drain
-// settlement at once. The field is cleared without calling the old cancel: a
-// cleanup from the previous generation captured the context value, not the
-// field, and cancelling it under such a caller is the defect first-wins
-// exists to prevent. The dropped cancel function is safe to lose because the
-// context was built over an uncancelable base: with a nil Done channel there
-// is nothing for cancellation to propagate through, no goroutine watching
-// the parent, and the context becomes unreachable once no caller references
-// it. When DrainTimeout is positive the context also carries its own
-// deadline, so its timer fires within one budget period and releases
-// whatever the deadline still holds; that timer is an additional guarantee,
-// not the protection, and it does not exist when the budget is zero.
+// beginRunnerGeneration starts a generation: it records the context the
+// generation's sources run on, the cancel that stops them, and the group that
+// owns them. It resets nothing else. The settlement window is deliberately not
+// part of it: the window belongs to the drain, and starting a generation is
+// not the drain.
 func beginRunnerGeneration(r *Runner, runCtx context.Context, cancel context.CancelFunc) *errgroup.Group {
 	r.mu.Lock()
 	r.runCtx = runCtx
 	r.cancel = cancel
-	r.settleCtx = nil
-	r.settleCancel = nil
-	r.abandoned = false
-	r.failureCause = nil
-	r.consumerError = false
-	r.successfulDelivery = false
 	group := new(errgroup.Group)
 	r.group = group
 	r.mu.Unlock()
@@ -815,10 +1139,10 @@ func (r *Runner) Drain(ctx context.Context) error {
 		r.mu.Unlock()
 		return nil
 	}
-	cancel := r.cancel
 	handlerCancel := r.handlerCancel
 	handlerShutdownCancel := r.handlerShutdownCancel
 	done := r.done
+	cancel := r.cancel
 	if r.lifecycle != nil {
 		switch r.lifecycle.State() {
 		case lifecycle.Ready:
@@ -855,7 +1179,30 @@ func (r *Runner) Drain(ctx context.Context) error {
 			close(r.drainStarted)
 		}
 	}
+	events := r.events
 	r.mu.Unlock()
+	// Tell the owner the runner is ending. The field above is what handler
+	// admission reads immediately; this report is what makes the owner compute
+	// the settlement window, stop the generation, and run its one drain. The
+	// report waits only for the owner to read it, and the owner reads its
+	// events between reports rather than inside a broker call, so a request
+	// cannot be waiting for an attempt or a consumer operation this call is
+	// supposed to end. A request that arrives once the runner is past the point
+	// of answering it has nothing to ask for, and the runner's own end releases
+	// this wait.
+	if events != nil {
+		select {
+		case events <- runnerEvent{kind: runnerEventDrain}:
+		case <-done:
+		}
+	}
+	// The generation is stopped here as well as by the owner, and cancelling
+	// twice is what makes the request work for a runner whose owner is not
+	// running the loop: a request that arrives at the end of a run has no
+	// generation left to stop, and a runner built by a test has no owner at
+	// all. The cancel is idempotent, so the second call is free, and a
+	// settlement the cancellation unblocks runs on the runner's own window
+	// whether the owner has computed the drain's yet or not.
 	if cancel != nil {
 		cancel()
 	}
@@ -952,15 +1299,14 @@ func runnerError(r *Runner) error {
 	return r.runErr
 }
 
-func setRunnerError(r *Runner, err error) {
+// reportRunnerError hands the owner the first failure a source saw. The owner
+// keeps the first one it is handed and never clears it, so the error a runner
+// reports through Drain is the first failure of the run and not the last.
+func reportRunnerError(r *Runner, err error) {
 	if err == nil {
 		return
 	}
-	r.mu.Lock()
-	if r.runErr == nil {
-		r.runErr = err
-	}
-	r.mu.Unlock()
+	r.report(runnerEvent{kind: runnerEventError, err: err})
 }
 
 //nolint:contextcheck // helper derives the phase context from the caller.
@@ -1055,19 +1401,67 @@ func contextWithOptionalTimeout(parent context.Context, timeout time.Duration) (
 	return context.WithTimeout(parent, timeout)
 }
 
+// runnerSettlementContext returns the context a settlement call runs on.
+//
+// A live settlement window governs: once the runner has one, every call runs on
+// it, and nothing replaces it while it is live. Before that the caller's own
+// context governs, which keeps a settlement on a healthy generation bounded by
+// the delivery it belongs to.
+//
+// A call whose own context is already finished is the case that needs the
+// runner's window: settling on a context that is already done fails as a
+// cancellation the runner caused rather than as a bounded budget doing its job,
+// so the call is given the runner's own window instead. That rescue happens
+// while the runner is still running, because there is a generation left to
+// keep working; a drain does not do it, because a settlement that starts after
+// the drain's deadline is refused with that deadline rather than moved onto a
+// fresh budget every time it is attempted.
 func runnerSettlementContext(r *Runner, fallback context.Context) context.Context {
 	r.mu.Lock()
-	defer r.mu.Unlock()
-	if r.settleCtx != nil {
-		return r.settleCtx
+	window := r.settleCtx
+	draining := r.draining
+	r.mu.Unlock()
+	switch {
+	case window != nil && window.Err() == nil:
+		return window
+	case fallback != nil && fallback.Err() == nil:
+		return fallback
 	}
-	if fallback != nil && fallback.Err() != nil {
-		drainTimeout := r.client.config.Lifecycle.DrainTimeout
-		base := context.WithoutCancel(fallback)
-		r.settleCtx, r.settleCancel = contextWithOptionalTimeout(base, drainTimeout)
-		return r.settleCtx
+	if draining && window != nil {
+		return window
 	}
-	return fallback
+	r.beginSettlementWindow(fallback)
+	r.mu.Lock()
+	window = r.settleCtx
+	r.mu.Unlock()
+	return window
+}
+
+// beginSettlementWindow installs a fresh settlement window for the runner.
+//
+// The window is built over a base whose cancellation has been removed and
+// bounded by DrainTimeout, so its own timer is the only thing that ends it and
+// the cancellation of whatever context it was derived from cannot reach a
+// settlement it is bounding.
+//
+// A window it replaces is retired, never cancelled: a settlement may be holding
+// it, and cancelling it there would turn a call that is about to reach the
+// driver into a context failure the runner caused. The retired window keeps its
+// own timer, so within one budget period it fires and releases what is left of
+// it.
+//
+// The owner installs the drain's window when the drain starts, so from the
+// drain on every settlement runs on the deadline the drain computed once.
+// Installations before that are the rescue of a settlement whose own context
+// finished first. finishRunner releases the last window's timer at teardown.
+func (r *Runner) beginSettlementWindow(base context.Context) { //nolint:contextcheck // the window is deliberately built with WithoutCancel: the base's cancellation must not reach a settlement the window bounds.
+	if base == nil {
+		base = context.Background()
+	}
+	drainTimeout := r.client.config.Lifecycle.DrainTimeout
+	r.mu.Lock()
+	r.settleCtx, r.settleCancel = contextWithOptionalTimeout(context.WithoutCancel(base), drainTimeout)
+	r.mu.Unlock()
 }
 
 func configuredRunnerLogger(r *Runner) *slog.Logger {
@@ -1234,17 +1628,16 @@ func consumeRunnerErrors(r *Runner, ctx context.Context) error {
 			}
 			var cancel context.CancelFunc
 			if !classified || kind == driver.KindTransient {
+				r.report(runnerEvent{
+					kind:      runnerEventConsumerError,
+					err:       err,
+					transient: kind == driver.KindTransient,
+				})
 				r.mu.Lock()
-				if kind == driver.KindTransient {
-					r.consumerError = true
-				}
-				if r.failureCause == nil {
-					r.failureCause = err
-				}
 				cancel = r.cancel
 				r.mu.Unlock()
 			} else {
-				setRunnerError(r, err)
+				reportRunnerError(r, err)
 				if kind == driver.KindFatal {
 					recordFatalConsumerError(r, err)
 					r.mu.Lock()
@@ -1266,10 +1659,10 @@ func consumeRunnerErrors(r *Runner, ctx context.Context) error {
 }
 
 func recordFatalConsumerError(r *Runner, err error) {
-	setRunnerError(r, err)
+	reportRunnerError(r, err)
 	if r.lifecycle != nil {
 		if transitionErr := r.lifecycle.Transition(lifecycle.Failed); transitionErr != nil {
-			setRunnerError(r, errors.Join(err, transitionErr))
+			reportRunnerError(r, errors.Join(err, transitionErr))
 		}
 	}
 	r.client.recordFailedSubscription(r.subscription.Name, err, r)
@@ -1277,7 +1670,14 @@ func recordFatalConsumerError(r *Runner, err error) {
 
 // --- Intake and cancellation ---
 
+// fetchRunner reads the consumer and hands deliveries to the pipeline. It is
+// also the only closer of the channel it hands them over on, and it closes
+// that channel from a deferred function so every way out closes it, a panic
+// included: the pipeline reads the channel until it is closed, so a fetch
+// source that died without closing would leave the pipeline waiting on a
+// channel no one owns any more, and the generation would never end.
 func fetchRunner(r *Runner, ctx context.Context, dispatch chan<- delivery) error {
+	defer close(dispatch)
 	r.mu.Lock()
 	consumer := r.consumer
 	r.mu.Unlock()
@@ -1293,7 +1693,6 @@ func fetchRunner(r *Runner, ctx context.Context, dispatch chan<- delivery) error
 				if r.cancel != nil {
 					r.cancel()
 				}
-				close(dispatch)
 				return nil
 			}
 			if !enqueueDelivery(r, ctx, dispatch, message) {
@@ -1311,35 +1710,26 @@ func fetchRunnerAfterCancel(r *Runner, parent context.Context, messages <-chan d
 	drainBase := context.WithoutCancel(parent)
 	drainCtx, cancel := contextWithOptionalTimeout(drainBase, drainTimeout)
 	defer cancel()
-	r.mu.Lock()
-	// First installation wins. A settlement context installed earlier was
-	// built from an uncancelable base with its own drain budget, so it is
-	// already fit for use; cancelling and replacing it would pull the ground
-	// out from under a settlement call that captured the old context and is
-	// about to reach the driver on it.
-	if r.settleCtx == nil {
-		r.settleCtx, r.settleCancel = contextWithOptionalTimeout(drainBase, drainTimeout)
-	}
-	r.mu.Unlock()
+	// This source installs no settlement context. The drain's settlement window
+	// is the owner's, computed when the drain starts, and installing one here
+	// would put a second deadline under settlements the owner is already
+	// bounding.
 	r.mu.Lock()
 	consumer := r.consumer
 	r.mu.Unlock()
 	if err := consumer.Drain(drainCtx); err != nil {
-		setRunnerError(r, err)
+		reportRunnerError(r, err)
 	}
 	for {
 		select {
 		case message, ok := <-messages:
 			if !ok {
-				close(dispatch)
 				return nil
 			}
 			if !enqueueDelivery(r, drainCtx, dispatch, message) {
-				close(dispatch)
 				return nil
 			}
 		default:
-			close(dispatch)
 			return nil
 		}
 	}
@@ -1687,9 +2077,7 @@ func ackDeliveryAs(r *Runner, ctx context.Context, message driver.InboundMessage
 	state.attempted = true
 	state.settled = err == nil
 	if r != nil && state.settled && handled {
-		r.mu.Lock()
-		r.successfulDelivery = true
-		r.mu.Unlock()
+		r.report(runnerEvent{kind: runnerEventHandledDelivery})
 	}
 	return state.settled
 }
@@ -1945,7 +2333,7 @@ func eventFromDelivery(r *Runner, message driver.InboundMessage, envelope Envelo
 func failSuccessorHandoff(r *Runner, ctx context.Context, op string, event *Event, cause error) {
 	kind, _ := driver.Classify(cause)
 	classified := &driver.Error{Driver: r.client.options.driver.Name(), Op: op, K: kind, Err: cause}
-	setRunnerError(r, classified)
+	reportRunnerError(r, classified)
 	runnerNotifyError(r, ctx, event, classified)
 	if err := releaseRunnerConsumer(r, ctx); err != nil {
 		if r.client.options.errorHandler == nil {

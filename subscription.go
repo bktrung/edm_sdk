@@ -100,42 +100,22 @@ type Runner struct {
 	settleCancel          context.CancelFunc
 	cancel                context.CancelFunc
 	done                  chan struct{}
-	started               bool
-	draining              bool
-	drainStarted          chan struct{}
-	finished              bool
-	runErr                error
-	// abandoned reports whether an attempt replacing the connection has
-	// released this runner's consumer. It is what tells a generation that ended
-	// without a failure of its own apart from one that simply finished: an
-	// abandoned runner waits the attempt out and reopens, or stops for the
-	// attempt's own outcome, and never treats the abandonment as its cause.
-	// beginRunnerGeneration clears it, so it describes the generation that just
-	// ended.
-	abandoned bool
-	// failureCause is this runner's own failure: the transient consumer or
-	// open error that a rebuild is asked for, and the failure the runner
-	// reports when a rebuild hands one back. It is a plain error with no
-	// attempt attached, and it is written only by this runner's own
-	// goroutines, never by the supervisor, so a cause another runner's
-	// reconnect produces cannot replace it. beginRunnerGeneration clears it.
-	failureCause error
+	// events carries every report the runner's other goroutines make to the
+	// one goroutine that owns its state. Run creates it before any source
+	// starts and never replaces it, so a source always has somewhere to report
+	// and the owner always has exactly one thing to read.
+	events       chan runnerEvent
+	started      bool
+	draining     bool
+	drainStarted chan struct{}
+	finished     bool
+	runErr       error
 	// recordedFailure reports whether this runner has already recorded a
 	// failure against its subscription name. It is guarded by client.mu, not
 	// by mu: every record site and the clear already hold that lock, and the
 	// exit record reads it in the same critical section that decides whether
 	// the entry it would replace is still this runner's.
-	recordedFailure bool
-	// consumerError identifies a transient failure from Consumer.Errors in this generation.
-	consumerError bool
-	// successfulDelivery means this generation completed at least one handled delivery.
-	successfulDelivery bool
-	// repairCycleActive means a replacement consumer has been built and the next
-	// transient consumer failure can complete a failed repair cycle.
-	repairCycleActive bool
-	// failedRepairCycles counts consecutive replacement consumers that fail before
-	// any handled delivery; a handled delivery resets it.
-	failedRepairCycles    int
+	recordedFailure       bool
 	inflight              *inflightRegistry
 	retryDestinationTiers map[string]int
 	lifecycle             *lifecycle.Machine

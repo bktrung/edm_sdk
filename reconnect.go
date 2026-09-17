@@ -418,14 +418,21 @@ func (r *Runner) abandonForReconnect(ctx context.Context) error {
 	if r.lifecycle != nil && r.lifecycle.State() == lifecycle.Ready {
 		_ = r.lifecycle.Transition(lifecycle.Reconnecting)
 	}
-	// The runner is told it was abandoned before the consumer is released and
-	// before its generation is cancelled: the generation ends because of this
-	// call, so the record has to exist by the time its goroutine reads it at
-	// the end of Run's loop.
-	r.abandoned = true
+	// The owner is told before the generation is cancelled and before the
+	// consumer is released: the generation ends because of this call, so the
+	// record has to exist by the time its owner reads it. The owner reads its
+	// events and never blocks on a broker call, so this report cannot be
+	// waiting on an attempt the supervisor has not started yet.
+	events, done := r.events, r.done
 	cancel := r.cancel
 	consumer := r.consumer
 	r.mu.Unlock()
+	if events != nil {
+		select {
+		case events <- runnerEvent{kind: runnerEventAbandon}:
+		case <-done:
+		}
+	}
 	if cancel != nil {
 		cancel()
 	}
