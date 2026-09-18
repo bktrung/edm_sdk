@@ -249,9 +249,8 @@ default gate and they stay runnable with nothing listening.
 
 `make test-infra` compiles the integration half, `go test -count=1 -p 1 -tags integration
 ./...`, with Kafka and RabbitMQ started first. An unreachable fixture fails the run.
-It leaves Kafka conformance, gated by `F1_KAFKA_CONFORMANCE`, and the driver flip, gated by
-`F1_DRIVER_FLIP`, out; run them with `make test-kafka-conformance` and
-`make test-driver-flip`. Packages run one at a time because the broker-backed suites share both
+It includes Kafka conformance, which runs under the integration tag and takes about 7 minutes.
+It leaves the driver flip, gated by `F1_DRIVER_FLIP`, out; run it with `make test-driver-flip`. Packages run one at a time because the broker-backed suites share both
 fixtures and the machine.
 
 The per-driver targets are the same tag with a narrower package list:

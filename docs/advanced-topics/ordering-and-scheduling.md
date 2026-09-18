@@ -117,14 +117,19 @@ but not so high that a slow dependency creates an unnecessarily large
 in-flight backlog. Tune one setting at a time while observing handler
 latency, downstream saturation, redelivery, and drain time.
 
-A driver that is bounded by partitions, which is the Kafka driver, admits one
-delivery per partition no matter what `Prefetch` says: the effective ceiling is
-the number of partitions assigned to the consumer, and on Kafka that is the
-partition count of each destination the subscription consumes. A subscription
-whose traffic reaches fewer partitions than it has workers cannot keep all of
-those workers supplied, and no value of `Prefetch` changes that. Raise the
-partition count, or spread the workload over more keys, when that is the limit
-you have reached.
+A partition-bound driver, which is Kafka, admits one delivery per partition
+owned by a member. The effective handler parallelism for a destination is the
+smaller of `Concurrency` and that member's assigned partition count. Priority
+weights above the assigned partition count do nothing, and `Prefetch` cannot
+raise the ceiling.
+
+When the assigned count is below the destination's resolved slot budget, Kafka
+logs one warning with `assigned_partitions`, `budget`, and `lever`. Increase
+the destination's partition count, or set `broker.kafka.maxExpectedInstances`
+to require a floor during topology setup. Raising the partition count re-maps
+keys already published to the destination, and Kafka cannot lower the count, so
+the change is a one-way capacity decision. See [Consuming events](/user-guide/consuming-events)
+for the operator-facing sizing rule.
 
 `Prefetch` is not a substitute for capacity planning. A larger value cannot
 make a hot ordered key concurrent, and it cannot make a handler that is
@@ -180,14 +185,14 @@ capacity policy rather than copying defaults into application code:
 The fields have distinct jobs:
 
 - `Weights` controls the relative share of ready lanes;
-- `Budgets` defines how long a lane may wait before aging can promote it;
+- `Budgets` defines how long a lane may wait before deadline promotion can promote it;
 - `RetryWeightDivisor` reduces retry pressure relative to fresh work;
 - `PrefetchFactor` scales each scheduler lane's bounded capacity; and
-- `DisableAging` turns off age-based promotion for lanes that exceed their
+- `DisableDeadlinePromotion` turns off deadline promotion for lanes that exceed their
   budget. Its zero value leaves promotion on, which is the default.
 
-The scheduler uses weighted round-robin when no lane has exceeded its aging
-budget. When aging is enabled, the lane with the greatest budget overrun may
+The scheduler uses weighted round-robin when no lane has exceeded its
+budget. When deadline promotion is enabled, the lane with the greatest budget overrun may
 be selected first. This gives latency-sensitive work a way to recover from
 temporary contention without turning the whole policy into strict priority.
 The implementation is [`internal/sched`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/tree/main/internal/sched), and its lane
@@ -204,7 +209,7 @@ Retry timing and ready-work scheduling are separate:
 
 F1 gives retry lanes their own scheduler groups and normally reduces their
 weight with `RetryWeightDivisor`. This prevents a retry storm from consuming
-all handler capacity and starving new events. Aging can still promote a retry
+all handler capacity and starving new events. Deadline promotion can still promote a retry
 lane that has waited beyond its configured budget.
 
 Returning `f1.RetryAfter` changes the event's next eligible time; it does not
@@ -228,7 +233,7 @@ needed before changing configuration:
 3. **Fresh work is delayed by retries?** Keep retry lanes available but lower
    their relative weight with `RetryWeightDivisor`; do not discard retries that
    represent a real transient failure.
-4. **A lane waits too long?** Enable aging or adjust its budget after checking
+4. **A lane waits too long?** Enable deadline promotion or adjust its budget after checking
    the weight and downstream capacity. A budget is a scheduling escape hatch,
    not a latency guarantee.
 5. **A high-priority lane dominates?** Reduce its weight or split the workload
@@ -249,13 +254,13 @@ Use [`f1test`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-
 - publish explicit priorities and verify the selected lanes receive service;
 - fill fresh and retry lanes and verify retry pressure does not starve fresh
   work; and
-- advance the fake clock when testing retry eligibility or aging instead of
+- advance the fake clock when testing retry eligibility or deadline promotion instead of
   sleeping in the test.
 
 The repository's [`ordered_test.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/f1test/ordered_test.go) covers equal
 key serialization and different-key concurrency. The scheduler unit tests in
 [`internal/sched/scheduler_test.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/internal/sched/scheduler_test.go)
-cover weighted selection, bounded lanes, and aging; the retry-storm test in
+cover weighted selection, bounded lanes, and deadline promotion; the retry-storm test in
 [`retry_storm_test.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/retry_storm_test.go) guards fresh-work share under
 retry pressure. A driver implementation must also preserve the capability
 contract validated by the [driver conformance package](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/tree/main/driver/conformance).

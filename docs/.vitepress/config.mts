@@ -93,7 +93,7 @@ export default defineConfig({
         collapsed: false,
         items: [
           { text: 'Kafka ack tracker', link: '/deep-dives/kafka-ack-tracker' },
-          { text: 'Kafka lane balancer', link: '/deep-dives/kafka-lane-balancer' },
+          { text: 'Kafka partition assignment', link: '/deep-dives/kafka-lane-balancer' },
           { text: 'RabbitMQ delay ladder', link: '/deep-dives/rabbitmq-delay-ladder' },
           { text: 'Scheduler and worker', link: '/deep-dives/scheduler-and-worker' },
         ],

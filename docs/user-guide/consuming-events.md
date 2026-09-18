@@ -90,12 +90,19 @@ measure the real handler before relying on either figure. Raising `Prefetch`
 above the effective window described above does not raise the rate. The figures
 come from `BenchmarkRabbitMQConsumeSweep` in `examples/bench`.
 
-On a partition-bound driver, which is Kafka, the window is a ceiling the driver
-may fall short of: that driver admits one delivery per partition, so a
-destination whose traffic reaches fewer partitions than its window allows
-leaves handlers idle, and there the ceiling is the number of partitions
-assigned to the consumer rather than the window the lanes asked for. A larger
-`Prefetch` cannot raise it; more partitions, or a wider spread of keys, can.
+On Kafka, the driver admits at most one delivery from each partition a member
+holds. The effective handler parallelism for a destination is the smaller of
+`Concurrency` and the number of partitions assigned to that member. Priority
+weights above that partition count do nothing, and a larger `Prefetch` cannot
+raise the ceiling.
+
+When a member is assigned fewer partitions than the destination's resolved slot
+budget, Kafka logs one warning with `assigned_partitions`, `budget`, and
+`lever`. Increase the destination's partition count, or set
+`broker.kafka.maxExpectedInstances` so topology setup requires that floor. A
+partition-count increase re-maps keys already published to the destination,
+and Kafka cannot lower the count, so treat the change as a one-way capacity
+decision.
 
 ## Read event metadata
 

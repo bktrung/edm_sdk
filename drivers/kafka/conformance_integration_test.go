@@ -6,7 +6,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"os"
 	"testing"
 	"time"
 
@@ -20,9 +19,6 @@ import (
 )
 
 func TestConformance(t *testing.T) {
-	if os.Getenv("F1_KAFKA_CONFORMANCE") == "" {
-		t.Skip("Kafka conformance is gated until consume and settle are complete; the settler is provisional")
-	}
 	requireBroker(t)
 	conformance.Run(t, conformance.Suite{
 		Driver: Driver{},
