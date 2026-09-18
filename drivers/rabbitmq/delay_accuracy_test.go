@@ -3,6 +3,8 @@ package rabbitmq
 import (
 	"testing"
 	"time"
+
+	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/driver"
 )
 
 // TestDelayAccuracyMatchesTheParkLadder holds the accuracy the driver declares
@@ -59,5 +61,77 @@ func TestDelayAccuracyMatchesTheParkLadder(t *testing.T) {
 	// the delay belongs on the per-message expiration path, which has no rung.
 	if parked := parkRung(last + 1); parked != 0 {
 		t.Errorf("parkRung(%s) = %s, want 0: the declared bound ends at %s", last+1, parked, last)
+	}
+}
+
+func TestFixedParkQueueName(t *testing.T) {
+	if got := fixedParkQueueName("orders.retry.2", 5*time.Second); got != "orders.retry.2.park.fixed-5000ms" {
+		t.Fatalf("fixedParkQueueName(5s) = %q, want %q", got, "orders.retry.2.park.fixed-5000ms")
+	}
+	if got := fixedParkQueueName("orders.retry.2", 1500*time.Microsecond); got != "orders.retry.2.park.fixed-2ms" {
+		t.Fatalf("fixedParkQueueName(1500us) = %q, want %q", got, "orders.retry.2.park.fixed-2ms")
+	}
+}
+
+func TestFixedParkQueuePartsRoundTrip(t *testing.T) {
+	name := fixedParkQueueName("orders.retry.2", 5*time.Second)
+	destination, delay, ok := parkQueueParts(name)
+	if !ok || destination != "orders.retry.2" || delay != 5*time.Second {
+		t.Fatalf("parkQueueParts(%q) = (%q, %s, %t), want (%q, %s, %t)", name, destination, delay, ok, "orders.retry.2", 5*time.Second, true)
+	}
+}
+
+func TestFixedParkQueuePartsRejectsNonParkingNames(t *testing.T) {
+	cases := []string{
+		"topology.prune.park.eligible",
+		"x.park.fixed-",
+		"x.park.fixed-0ms",
+		"x.park.fixed-05000ms",
+		"x.park.fixed-5000",
+		"x.park.fixed-abcms",
+	}
+	for _, name := range cases {
+		if destination, delay, ok := parkQueueParts(name); ok {
+			t.Errorf("parkQueueParts(%q) = (%q, %s, true), want ok=false", name, destination, delay)
+		}
+	}
+}
+
+func TestParkQueueNamesForFixedAndLadder(t *testing.T) {
+	fixed := driver.DestinationSpec{Name: "orders.retry.2", Delay: 5 * time.Second, FixedDelay: true}
+	names := parkQueueNamesFor(fixed)
+	if len(names) != 2 {
+		t.Fatalf("parkQueueNamesFor(fixed) = %v, want 2 names", names)
+	}
+	if names[0] != "orders.retry.2.park.fixed-5000ms" || names[1] != "orders.retry.2.park" {
+		t.Fatalf("parkQueueNamesFor(fixed) = %v, want [fixed-5000ms park]", names)
+	}
+	ladder := driver.DestinationSpec{Name: "orders.retry.2", Delay: 5 * time.Second}
+	ladderNames := parkQueueNamesFor(ladder)
+	if len(ladderNames) != 9 {
+		t.Fatalf("parkQueueNamesFor(ladder) = %v, want 9 names", ladderNames)
+	}
+}
+
+func TestFixedParkTargetRouting(t *testing.T) {
+	p := &producer{conn: &conn{
+		deferred: map[string]time.Duration{"d": 5 * time.Second},
+		fixed:    map[string]time.Duration{"d": 5 * time.Second},
+	}}
+	due := time.Now().Add(5 * time.Second) //nolint:forbidigo // remaining delay is measured at publish time
+	_, routingKey, expiration := p.target(driver.OutboundMessage{Destination: "d", DelayUntil: due})
+	if routingKey != "d.park.fixed-5000ms" {
+		t.Fatalf("target() routingKey = %q, want %q", routingKey, "d.park.fixed-5000ms")
+	}
+	if expiration != "" {
+		t.Fatalf("target() expiration = %q, want empty in the fixed queue", expiration)
+	}
+	farDue := time.Now().Add(10 * time.Second) //nolint:forbidigo // remaining delay is measured at publish time
+	_, farKey, farExpiration := p.target(driver.OutboundMessage{Destination: "d", DelayUntil: farDue})
+	if farKey != "d.park" {
+		t.Fatalf("target() routingKey = %q, want %q", farKey, "d.park")
+	}
+	if farExpiration == "" {
+		t.Fatal("target() expiration is empty above the fixed delay, want a per-message TTL")
 	}
 }

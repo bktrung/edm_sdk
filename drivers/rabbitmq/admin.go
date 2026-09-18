@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sort"
 
 	amqp "github.com/rabbitmq/amqp091-go"
 
@@ -76,12 +77,6 @@ func (a *adminOperations) DescribeTopology(ctx context.Context, names []string) 
 	if err := a.admission(ctx, "describe_topology"); err != nil {
 		return driver.TopologyState{}, err
 	}
-	a.conn.mu.RLock()
-	deferred := make(map[string]struct{}, len(a.conn.deferred))
-	for name := range a.conn.deferred {
-		deferred[name] = struct{}{}
-	}
-	a.conn.mu.RUnlock()
 	depth := make(map[string]int64, len(names))
 	for _, name := range names {
 		ready, err := a.inspectQueue(ctx, name)
@@ -92,17 +87,15 @@ func (a *adminOperations) DescribeTopology(ctx context.Context, names []string) 
 			return driver.TopologyState{}, classifyAMQP("describe_topology", driver.KindTransient, err)
 		}
 		depth[name] = int64(ready)
-		if _, ok := deferred[name]; ok {
-			for _, parkName := range parkQueueNames(name) {
-				parked, parkErr := a.inspectQueue(ctx, parkName)
-				if parkErr != nil {
-					if isNotFound(parkErr) {
-						continue
-					}
-					return driver.TopologyState{}, classifyAMQP("describe_topology", driver.KindTransient, parkErr)
+		for _, parkName := range a.conn.parkingOf(name) {
+			parked, parkErr := a.inspectQueue(ctx, parkName)
+			if parkErr != nil {
+				if isNotFound(parkErr) {
+					continue
 				}
-				depth[name] += int64(parked)
+				return driver.TopologyState{}, classifyAMQP("describe_topology", driver.KindTransient, parkErr)
 			}
+			depth[name] += int64(parked)
 		}
 	}
 	return driver.TopologyState{Depth: depth}, nil
@@ -124,20 +117,26 @@ func (a *adminOperations) Purge(ctx context.Context, destination string) (int64,
 		}
 		return 0, classifyAMQP("purge", driver.KindTransient, err)
 	}
-	a.conn.mu.RLock()
-	_, hasParking := a.conn.deferred[destination]
-	a.conn.mu.RUnlock()
-	if !hasParking {
+	parking := a.conn.parkingOf(destination)
+	if len(parking) == 0 {
 		return int64(count), nil
 	}
 	total := int64(count)
-	for _, parkName := range parkQueueNames(destination) {
-		purged, err := channel.QueuePurge(parkName, false)
+	for _, parkName := range parking {
+		parkChannel, openErr := a.openChannel(ctx)
+		if openErr != nil {
+			return total, openErr
+		}
+		purged, err := parkChannel.QueuePurge(parkName, false)
+		_ = parkChannel.Close()
 		if err != nil {
 			// A parking queue that is not there holds nothing, which is the
 			// state an upgraded deployment starts in: the rung queues are
 			// created by the topology pass, and Purge of the destination is
-			// still the operation an application calls to empty it.
+			// still the operation an application calls to empty it. Each park
+			// is purged on its own channel because a 404 closes the AMQP
+			// channel it arrives on, and a reused channel would fail the next
+			// queue with 504.
 			if isNotFound(err) {
 				continue
 			}
@@ -321,7 +320,8 @@ func (a *adminOperations) pruneReason(name string, mainConsumers, mainReady int6
 }
 
 // existingParkQueues lists the parking queues of a destination that the broker
-// has right now, in the order parkQueueNames declares them. A parking queue
+// has right now: ladder queues in declare order, then any other parking
+// queue of the destination (fixed queues of any delay) sorted by name. A parking queue
 // that is not there holds nothing and needs no guard; a deployment that
 // predates the ladder simply has fewer of them, and one whose rung queue an
 // application drained by hand needs no refusal either.
@@ -332,7 +332,21 @@ func existingParkQueues(queues []managementQueue, destination string) []string {
 			present = append(present, parkName)
 		}
 	}
-	return present
+	seen := make(map[string]struct{}, len(present))
+	for _, name := range present {
+		seen[name] = struct{}{}
+	}
+	var extra []string
+	for _, queue := range queues {
+		if _, ok := seen[queue.Name]; ok {
+			continue
+		}
+		if parent, _, ok := parkQueueParts(queue.Name); ok && parent == destination {
+			extra = append(extra, queue.Name)
+		}
+	}
+	sort.Strings(extra)
+	return append(present, extra...)
 }
 
 func (a *adminOperations) consumerCount(destination string) int64 {
@@ -415,6 +429,7 @@ func (a *adminOperations) deleteQueue(ctx context.Context, name string, auxiliar
 
 	a.conn.mu.Lock()
 	delete(a.conn.deferred, name)
+	delete(a.conn.fixed, name)
 	a.conn.mu.Unlock()
 	return true, nil
 }

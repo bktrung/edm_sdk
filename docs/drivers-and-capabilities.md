@@ -85,8 +85,10 @@ which credentials, so check it before deploying.
 RabbitMQ has no native delayed delivery, so the adapter emulates it with
 queue-level TTLs and a dead-letter route back to the destination.
 
-A delay of at most 64s is parked in the queue of the smallest rung of a fixed
-ladder that is at least the delay:
+A delay of at most 64s on the ladder path is parked in the queue of the smallest rung of a fixed
+ladder that is at least the delay. Fixed-delay destinations are the exception: core retry tiers
+park in one queue whose TTL is the tier's delay (see Fixed-delay retry tiers in the delay-ladder
+deep-dive; the per-spec set lives in `parkQueueNamesFor` in `drivers/rabbitmq/topology.go`):
 
 | Rung | 500ms | 1s | 2s | 4s | 8s | 16s | 32s | 64s |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
@@ -99,7 +101,8 @@ it and the delay can overrun by the distance between the two due times. With the
 TTL on the queue, every message in it expires in FIFO order, and a rung queue
 cannot construct that case at all. Rounding the delay up is what keeps a message
 from being released before its due time; the cost is lateness below one rung, so
-a 5s delay is released at about 8s.
+on the ladder path a 5s delay is released at about 8s. A fixed-delay tier is late
+only by the time its publish took.
 
 That cost is reported rather than left to folklore. `Limits()` renders
 `native_delay` for this driver as `late by at most the requested delay, or
@@ -119,9 +122,10 @@ bounded by configuration, and it is reachable by an application passing
 `DelayUntil` more than a minute out.
 
 The names are reserved: a destination name may not end in `.park`, and it may
-not end in `.park.` followed by one of the rung tags above. Both shapes belong
-to parking queues, and the adapter reads a queue name back to find the
-destination it parks for.
+not end in `.park.` followed by one of the rung tags above or by
+`fixed-<ms>ms`. All three shapes belong to parking queues, and the adapter reads
+a queue name back to find the destination it parks for (`parkQueueParts` in
+`drivers/rabbitmq/topology.go`).
 
 The rung queues and the queue above the ladder are declared from the
 destination's delay, and which policy makes them exist is the same split as any
@@ -154,7 +158,9 @@ deployment omits them, and its delay path is at-most-once.
 Upgrading from a release without the ladder needs no drain. The existing
 `<destination>.park` queue keeps dead-lettering to its destination and the
 messages parked in it leave on their own schedule, and the rung queues are
-declared by the topology pass. An application that empties a destination
+declared by the topology pass. A fixed-delay destination declares its fixed
+queue plus `<destination>.park`; rung queues left by an earlier version report
+as orphans and drain on their own TTLs. An application that empties a destination
 (`Purge`) empties every parking queue of it, and one that deletes a destination
 (`Prune`) is refused while any of them still holds a message.
 

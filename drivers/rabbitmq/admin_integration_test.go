@@ -29,6 +29,7 @@ func setupPruneTest(t *testing.T, kind queueKind, specs ...driver.DestinationSpe
 		names = append(names, spec.Name)
 		if spec.Delay > 0 {
 			names = append(names, parkQueueNames(spec.Name)...)
+			names = append(names, parkQueueNamesFor(spec)...)
 		}
 	}
 	for _, name := range names {
@@ -724,5 +725,90 @@ func TestRabbitMQAdminPruneRefusesNonEmptyParking(t *testing.T) {
 	}
 	if err := conn.Close(ctx); err != nil {
 		t.Fatalf("Close: %v", err)
+	}
+}
+
+func TestPruneRefusesFixedParkingQueue(t *testing.T) {
+	const destination = "rabbitmq-driver-prune-fixed-queue"
+	spec := driver.DestinationSpec{Name: destination, Durable: true, Delay: 5 * time.Second, FixedDelay: true}
+	fixedQueue := fixedParkQueueName(destination, 5*time.Second)
+	ctx, rabbitConn, facade := setupPruneTest(t, queueKindQuorum, spec)
+	producer, err := rabbitConn.Producer(ctx, driver.ProducerConfig{RequireDurableAck: true})
+	if err != nil {
+		t.Fatalf("Producer: %v", err)
+	}
+	defer func() { _ = producer.Close(context.Background()) }()
+	due := time.Now().Add(5 * time.Second) //nolint:forbidigo // a live delayed publish needs a future due time
+	if err := producer.Publish(ctx, driver.OutboundMessage{
+		Destination: destination,
+		DelayUntil:  due,
+		Body:        []byte("parked"),
+	}); err != nil {
+		t.Fatalf("Publish: %v", err)
+	}
+	ready, err := facade.operations.inspectQueue(ctx, fixedQueue)
+	if err != nil {
+		t.Fatalf("inspectQueue(%q): %v", fixedQueue, err)
+	}
+	if ready != 1 {
+		t.Fatalf("fixed queue %q ready = %d, want 1", fixedQueue, ready)
+	}
+	results, err := facade.Prune(ctx, []string{destination})
+	if err != nil {
+		t.Fatalf("Prune: %v", err)
+	}
+	wantReason := fmt.Sprintf("auxiliary %q holds 1 ready message(s)", fixedQueue)
+	if len(results) != 1 || results[0].Deleted || results[0].Reason != wantReason {
+		t.Fatalf("Prune result = %+v, want a refusal with reason %q", results, wantReason)
+	}
+	assertPruneQueuePresent(t, ctx, facade, destination, true)
+	assertPruneQueuePresent(t, ctx, facade, fixedQueue, true)
+}
+
+func TestFixedParkingQueueCountsInDescribeAndPurge(t *testing.T) {
+	const destination = "rabbitmq-driver-fixed-describe-purge"
+	spec := driver.DestinationSpec{Name: destination, Durable: true, Delay: 5 * time.Second, FixedDelay: true}
+	fixedQueue := fixedParkQueueName(destination, 5*time.Second)
+	ctx, rabbitConn, facade := setupPruneTest(t, queueKindQuorum, spec)
+	producer, err := rabbitConn.Producer(ctx, driver.ProducerConfig{RequireDurableAck: true})
+	if err != nil {
+		t.Fatalf("Producer: %v", err)
+	}
+	defer func() { _ = producer.Close(context.Background()) }()
+	due := time.Now().Add(5 * time.Second) //nolint:forbidigo // a live delayed publish needs a future due time
+	if err := producer.Publish(ctx, driver.OutboundMessage{
+		Destination: destination,
+		DelayUntil:  due,
+		Body:        []byte("parked"),
+	}); err != nil {
+		t.Fatalf("Publish: %v", err)
+	}
+	ready, err := facade.operations.inspectQueue(ctx, fixedQueue)
+	if err != nil {
+		t.Fatalf("inspectQueue(%q): %v", fixedQueue, err)
+	}
+	if ready != 1 {
+		t.Fatalf("fixed queue %q ready = %d, want 1", fixedQueue, ready)
+	}
+	state, err := facade.DescribeTopology(ctx, []string{destination})
+	if err != nil {
+		t.Fatalf("DescribeTopology: %v", err)
+	}
+	if state.Depth[destination] != 1 {
+		t.Fatalf("Depth[%q] = %d, want 1", destination, state.Depth[destination])
+	}
+	purged, err := facade.Purge(ctx, destination)
+	if err != nil {
+		t.Fatalf("Purge: %v", err)
+	}
+	if purged != 1 {
+		t.Fatalf("Purge count = %d, want 1", purged)
+	}
+	after, err := facade.operations.inspectQueue(ctx, fixedQueue)
+	if err != nil {
+		t.Fatalf("inspectQueue(%q): %v", fixedQueue, err)
+	}
+	if after != 0 {
+		t.Fatalf("fixed queue %q ready = %d, want 0 after Purge", fixedQueue, after)
 	}
 }

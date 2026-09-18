@@ -528,6 +528,7 @@ func (p *producer) target(message driver.OutboundMessage) (exchange, routingKey,
 	destination := message.Destination
 	p.conn.mu.RLock()
 	delay, isDeferred := p.conn.deferred[destination]
+	fixedDelay, isFixed := p.conn.fixed[destination]
 	p.conn.mu.RUnlock()
 	if isDeferred || !message.DelayUntil.IsZero() {
 		now := time.Now() //nolint:forbidigo // the driver computes remaining delay at publish time
@@ -536,6 +537,12 @@ func (p *producer) target(message driver.OutboundMessage) (exchange, routingKey,
 			due = now.Add(delay)
 		}
 		if remaining := due.Sub(now); remaining > 0 {
+			if isFixed {
+				if remaining <= fixedDelay {
+					return "", fixedParkQueueName(destination, fixedDelay), ""
+				}
+				return "", destination + parkingSuffix, expirationMillis(remaining)
+			}
 			// On the ladder, the rung queue's own x-message-ttl does the
 			// delaying and the message carries no expiration: that is what
 			// makes expiry order FIFO order and keeps a message from waiting

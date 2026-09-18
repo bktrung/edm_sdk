@@ -30,6 +30,7 @@ type DestinationSpec struct {
 	Durable       bool          // whether the destination survives restart
 	Partitions    int           // Kafka; ignored elsewhere
 	Delay         time.Duration // non-zero marks a deferred destination
+	FixedDelay    bool          // every message is due exactly Delay after its publish, so a driver may park all of them in one queue
 	DeadLetter    *Route        // explicit broker-side backstop route
 	DeliveryLimit int           // broker backstop counter; <= 0 means none
 }

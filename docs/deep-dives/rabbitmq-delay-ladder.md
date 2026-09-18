@@ -31,7 +31,7 @@ The first version, commit `2546ff5`, had one parking queue per destination. For 
 
 The defect is in how RabbitMQ handles that kind of expiry. It expires a per-message TTL only when the message reaches the head of its queue. A message with a short TTL that sits behind one with a long TTL cannot leave until the one in front of it has.
 
-Commit `8e080c1` replaced the single queue with a ladder. Each deferred destination now has eight parking queues, called rungs, one per fixed delay:
+Commit `8e080c1` replaced the single queue with a ladder. A deferred destination on the ladder path has eight parking queues, called rungs, one per fixed delay:
 
 | Rung | 500ms | 1s | 2s | 4s | 8s | 16s | 32s | 64s |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
@@ -44,9 +44,9 @@ That removes the unbounded head-of-line defect. Every message in a rung queue ha
 
 Back to the running example. "far", 3 s away, goes to `orders.park.4s`, and "near", 0.5 s away, goes to `orders.park.500ms`. They are in different queues now, so "near" leaves at about 0.5 s and "far" at about 4 s.
 
-The cost is lateness of less than one rung. A 5 s delay parks in the 8 s rung and comes out at about 8 s, 3 s late. A 25 s delay parks in the 32 s rung and comes out about 7 s late.
+The cost on the ladder path is lateness of less than one rung. A 5 s delay parks in the 8 s rung and comes out at about 8 s, 3 s late. A 25 s delay parks in the 32 s rung and comes out about 7 s late. Fixed-delay retry tiers skip this cost; see Fixed-delay retry tiers below.
 
-Eight rungs are enough for the retry path at the shipped defaults. The retry delays there are 1 s, 5 s, and 25 s, so no retry delay exceeds the 30 s `MaxInterval`, and the top rung of 64 s covers it with a rung to spare.
+The ladder covers arbitrary-delay destinations up to 64 s with a rung to spare. Core retry tiers take the fixed-queue path below instead.
 
 ## Measured
 
@@ -81,7 +81,7 @@ A rung queue's name is the destination, then `.park`, then a tag from a closed s
 
 Reading a name back, in [`parkQueueParts`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/drivers/rabbitmq/topology.go), is a lookup in that set. A name that merely has something after `.park.` is not a parking queue, so `orders.park.eligible` stays an ordinary destination. The conformance suite declares a destination called `topology.prune.park.eligible`, and a parser that split on `.park.` would take it for a rung queue of `topology.prune`.
 
-F1 reserves destination names ending in `.park` or in `.park.<rung tag>`.
+F1 reserves destination names ending in `.park`, in `.park.<rung tag>`, or in `.park.fixed-<ms>ms`. The exact shapes live in [`parkQueueParts`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/drivers/rabbitmq/topology.go).
 
 ## Losing a retry quietly
 
@@ -111,17 +111,21 @@ The new message names the queue, says who creates it under each topology policy,
 
 Topology policy decides who creates the parking queues. Under `TopologyDeclare` the driver declares them when the subscription starts. Under `TopologyVerify` they must already exist with matching arguments, checked at subscription start. Under `TopologyNone` an operator provisions them and the driver checks nothing.
 
+## Fixed-delay retry tiers
+
+Core retry tiers are fixed-delay destinations: every message published to one is due exactly its delay after publish. The driver parks such a destination in one queue whose TTL is the tier's delay, named `.park.fixed-<ms>ms`, plus the per-message queue above the ladder. So a 5s tier fires at 5s, not 8s. The ladder remains for destinations that take arbitrary due times. Old rung queues left from an earlier version show up as orphans and empty themselves within 64s.
+
 ## Limits and trade-offs
 
-- A delayed message can be late by up to its own delay, or by up to 500 ms when the delay is shorter than that.
+- A message on the ladder can be late by up to its own delay, or by up to 500 ms when the delay is shorter than that; a fixed-delay tier is late only by the time its publish took.
 - Messages published at different times can arrive out of absolute due-time order, even though the ladder prevents the unbounded head-of-line delay of the single per-message-TTL queue.
-- Each deferred destination needs nine parking queues: eight rungs and one for delays above the ladder.
+- A deferred destination on the ladder path needs nine parking queues: eight rungs and one for delays above the ladder. A fixed-delay tier needs two parking queues (its fixed queue plus the above-ladder queue), so three queues with its tier queue. The per-spec set lives in `parkQueueNamesFor` in `drivers/rabbitmq/topology.go`.
 - Above 64 s, a message can still wait behind one due later.
 - On classic queues a dead-lettered message can be lost, so the delay path is at-most-once.
 
 ## Read the code
 
-- [`drivers/rabbitmq/topology.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/drivers/rabbitmq/topology.go) - `parkRungs` and its comment on why the ladder exists, then `parkRung`, `parkQueueParts`, `parkingArguments`, and `rungParkingArguments`.
+- [`drivers/rabbitmq/topology.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/drivers/rabbitmq/topology.go) - `parkRungs` and its comment on why the ladder exists, then `parkRung`, `parkQueueParts`, `parkQueueNamesFor`, `parkingOf`, `existingParkQueues`, `parkingArguments`, and `rungParkingArguments`.
 - [`drivers/rabbitmq/producer.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/drivers/rabbitmq/producer.go) - `target` routes by remaining delay; `parkingFailure` rewrites the missing-queue error.
 - [`drivers/rabbitmq/rabbitmq.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/drivers/rabbitmq/rabbitmq.go) - `delayAccuracyForLadder` turns the rung table into the declared bound.
 - [`drivers/rabbitmq/deferred_integration_test.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/drivers/rabbitmq/deferred_integration_test.go) - the reversed-publish-order regression test.

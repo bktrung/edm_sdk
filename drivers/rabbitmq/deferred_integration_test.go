@@ -218,3 +218,77 @@ func TestDeferredPublishUsesRemainingDelay(t *testing.T) {
 		t.Fatalf("delivery did not arrive by %s: %v", due.Add(500*time.Millisecond), deadlineCtx.Err())
 	}
 }
+
+func TestFixedDelayDestinationFiresAtItsDelay(t *testing.T) {
+	requireBroker(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	const destination = "rabbitmq-driver-fixed-delay-fire"
+	fixedQueue := destination + ".park.fixed-5000ms"
+
+	raw, err := amqp.Dial(defaultEndpoint)
+	if err != nil {
+		t.Fatalf("Dial: %v", err)
+	}
+	t.Cleanup(func() { _ = raw.Close() })
+	rawChannel, err := raw.Channel()
+	if err != nil {
+		t.Fatalf("Channel: %v", err)
+	}
+	deleteParkQueues(rawChannel, destination)
+	_, _ = rawChannel.QueueDelete(fixedQueue, false, false, false)
+	t.Cleanup(func() {
+		deleteParkQueues(rawChannel, destination)
+		_, _ = rawChannel.QueueDelete(fixedQueue, false, false, false)
+		_ = rawChannel.Close()
+	})
+
+	conn, err := (Driver{}).Open(ctx, driver.Config{Endpoints: []string{defaultEndpoint}})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	t.Cleanup(func() { _ = conn.Close(ctx) })
+	if _, err := conn.Admin().EnsureTopology(ctx, driver.TopologySpec{
+		Destinations: []driver.DestinationSpec{{Name: destination, Durable: true, Delay: 5 * time.Second, FixedDelay: true}},
+	}); err != nil {
+		t.Fatalf("EnsureTopology: %v", err)
+	}
+	deliveries, err := rawChannel.Consume(destination, "fixed-delay-fire", false, false, false, false, nil)
+	if err != nil {
+		t.Fatalf("Consume: %v", err)
+	}
+	producer, err := conn.Producer(ctx, driver.ProducerConfig{})
+	if err != nil {
+		t.Fatalf("Producer: %v", err)
+	}
+	t.Cleanup(func() { _ = producer.Close(ctx) })
+
+	publishedAt := time.Now() //nolint:forbidigo // the timing assertion uses the real broker clock
+	due := publishedAt.Add(5 * time.Second)
+	if err := producer.Publish(ctx, driver.OutboundMessage{
+		Destination: destination,
+		DelayUntil:  due,
+		Body:        []byte("fixed"),
+	}); err != nil {
+		t.Fatalf("Publish: %v", err)
+	}
+	deadlineCtx, deadlineCancel := context.WithDeadline(ctx, publishedAt.Add(6500*time.Millisecond))
+	defer deadlineCancel()
+	select {
+	case delivery := <-deliveries:
+		receivedAt := time.Now() //nolint:forbidigo // the timing assertion uses the real broker clock
+		elapsed := receivedAt.Sub(publishedAt)
+		t.Logf("publish-to-receive = %s", elapsed)
+		if elapsed < 5*time.Second || elapsed >= 6500*time.Millisecond {
+			t.Fatalf("publish-to-receive = %s, want at least 5s and below 6.5s", elapsed)
+		}
+		if string(delivery.Body) != "fixed" {
+			t.Fatalf("body = %q, want fixed", delivery.Body)
+		}
+		if err := delivery.Ack(false); err != nil {
+			t.Fatalf("Ack: %v", err)
+		}
+	case <-deadlineCtx.Done():
+		t.Fatalf("delivery did not arrive by %s: %v", publishedAt.Add(6500*time.Millisecond), deadlineCtx.Err())
+	}
+}

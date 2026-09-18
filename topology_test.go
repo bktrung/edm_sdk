@@ -185,6 +185,37 @@ func destinationNames(destinations []driver.DestinationSpec) []string {
 	return result
 }
 
+func TestSubscriptionTopologyRetryTiersAreFixedDelay(t *testing.T) {
+	source := "/prod/orders"
+	sub := Subscription{
+		Name:       "order-worker",
+		Topics:     []string{"order.created"},
+		Priorities: []Priority{PriorityHigh},
+		Retry: RetryConfig{
+			MaxAttempts: 4,
+			Tiers:       []time.Duration{time.Second, 5 * time.Second, 25 * time.Second},
+		},
+	}
+	effective := driver.Capabilities{Fanout: driver.FanoutAtPublish, NativeDLQ: true}
+	spec := subscriptionTopologySpecs(effective, source, sub)
+	retryCount := 0
+	for _, destination := range spec.Destinations {
+		if destination.Kind == driver.DestRetry {
+			retryCount++
+			if !destination.FixedDelay {
+				t.Errorf("retry destination %q FixedDelay = false, want true", destination.Name)
+			}
+			continue
+		}
+		if destination.FixedDelay {
+			t.Errorf("destination %q kind %v FixedDelay = true, want false", destination.Name, destination.Kind)
+		}
+	}
+	if retryCount != 3 {
+		t.Fatalf("retry destinations = %d, want 3", retryCount)
+	}
+}
+
 func exchangeNames(exchanges []driver.ExchangeSpec) []string {
 	result := make([]string, 0, len(exchanges))
 	for _, exchange := range exchanges {

@@ -174,6 +174,7 @@ type conn struct {
 	publishFault    atomic.Int32 // 0 = unset; otherwise driver.Kind + 1
 	closeFault      atomic.Bool
 	deferred        map[string]time.Duration
+	fixed           map[string]time.Duration
 	// Publishing-block state, deliberately outside mu: Ping reads it on every
 	// health probe and the publish path reads it before every write, so neither
 	// may queue behind topology or consumer-admission work that wants a write
@@ -369,6 +370,7 @@ func newConn(amqpConn *amqp.Connection, caps driver.Capabilities, endpoint strin
 		active:          make(map[*consumer]struct{}),
 		producers:       make(map[*producer]struct{}),
 		deferred:        make(map[string]time.Duration),
+		fixed:           make(map[string]time.Duration),
 	}
 	// One subscription per connection is the whole of the block handling:
 	// c.amqp is set here and never replaced, so this connection's notifications
