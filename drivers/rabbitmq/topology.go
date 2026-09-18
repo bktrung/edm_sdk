@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -73,6 +74,11 @@ func (a *adminOperations) ensureTopology(ctx context.Context, spec driver.Topolo
 		} else {
 			delete(a.conn.deferred, destination.Name)
 		}
+		if fixedDelay, isFixed := fixedParkDelay(destination); isFixed {
+			a.conn.fixed[destination.Name] = fixedDelay
+		} else {
+			delete(a.conn.fixed, destination.Name)
+		}
 		a.conn.mu.Unlock()
 		args := queueArguments(destination, a.conn.queueKind, a.conn.consumerTimeout)
 		exists, err := a.queueExists(ctx, destination.Name, destination.Durable, args)
@@ -88,7 +94,7 @@ func (a *adminOperations) ensureTopology(ctx context.Context, spec driver.Topolo
 			diff.CreatedDestinations = append(diff.CreatedDestinations, destination.Name)
 		}
 		if destination.Delay > 0 {
-			for _, parkName := range parkQueueNames(destination.Name) {
+			for _, parkName := range parkQueueNamesFor(destination) {
 				parkArgs := parkArguments(destination.Name, a.conn.queueKind, parkName)
 				parkExists, err := a.queueExists(ctx, parkName, true, parkArgs)
 				if err != nil {
@@ -184,9 +190,14 @@ func (a *adminOperations) verifyTopology(ctx context.Context, spec driver.Topolo
 		if destination.Delay > 0 {
 			a.conn.deferred[destination.Name] = destination.Delay
 		}
+		if fixedDelay, isFixed := fixedParkDelay(destination); isFixed {
+			a.conn.fixed[destination.Name] = fixedDelay
+		} else {
+			delete(a.conn.fixed, destination.Name)
+		}
 		a.conn.mu.Unlock()
 		if destination.Delay > 0 {
-			for _, parkName := range parkQueueNames(destination.Name) {
+			for _, parkName := range parkQueueNamesFor(destination) {
 				parkArgs := parkArguments(destination.Name, a.conn.queueKind, parkName)
 				exists, err := a.queueExists(ctx, parkName, true, parkArgs)
 				if err != nil {
@@ -370,6 +381,14 @@ func (a *adminOperations) scanOrphans(ctx context.Context, spec driver.TopologyS
 	for _, destination := range spec.Destinations {
 		known[destination.Name] = struct{}{}
 	}
+	expectedPark := make(map[string]struct{})
+	for _, destination := range spec.Destinations {
+		if destination.Delay > 0 {
+			for _, parkName := range parkQueueNamesFor(destination) {
+				expectedPark[parkName] = struct{}{}
+			}
+		}
+	}
 	for _, queue := range queues {
 		byName[queue.Name] = queue
 	}
@@ -389,6 +408,12 @@ func (a *adminOperations) scanOrphans(ctx context.Context, spec driver.TopologyS
 			continue
 		}
 		if parent, _, ok := parkQueueParts(queue.Name); ok {
+			if _, parentKnown := known[parent]; parentKnown {
+				if _, expected := expectedPark[queue.Name]; !expected {
+					add(queue.Name, queue.totalMessages())
+					continue
+				}
+			}
 			if _, parentExists := byName[parent]; parentExists {
 				if _, parentKnown := known[parent]; !parentKnown {
 					add(parent, queue.totalMessages())
@@ -583,6 +608,72 @@ func parkRung(delay time.Duration) time.Duration {
 	return 0
 }
 
+// fixedParkDelay reports whether a destination parks every message in one
+// queue with the destination's own delay. It is true only when the spec asks
+// for a fixed delay, the delay is positive, and the delay rounded up to whole
+// milliseconds fits the broker's per-message expiration limit.
+func fixedParkDelay(spec driver.DestinationSpec) (time.Duration, bool) {
+	if !spec.FixedDelay {
+		return 0, false
+	}
+	if spec.Delay <= 0 {
+		return 0, false
+	}
+	millis := int64(spec.Delay / time.Millisecond)
+	if spec.Delay%time.Millisecond != 0 {
+		millis++
+	}
+	if millis < 1 || millis > maxExpirationMillis {
+		return 0, false
+	}
+	return spec.Delay, true
+}
+
+// fixedParkQueueName names the single parking queue of a fixed-delay
+// destination. The delay goes into the name in whole milliseconds, rounded
+// up, so a changed delay declares a new queue instead of conflicting on the
+// old one's TTL.
+func fixedParkQueueName(destination string, delay time.Duration) string {
+	millis := int64(delay / time.Millisecond)
+	if delay%time.Millisecond != 0 {
+		millis++
+	}
+	return destination + parkingSuffix + ".fixed-" + strconv.FormatInt(millis, 10) + "ms"
+}
+
+// parseFixedParkTag parses the tag after ".park." of a fixed-delay parking
+// queue. It accepts only "fixed-<ms>ms" where <ms> is decimal, at least 1,
+// has no leading zero, and is at most the broker's expiration limit.
+func parseFixedParkTag(tag string) (time.Duration, bool) {
+	const prefix = "fixed-"
+	if !strings.HasPrefix(tag, prefix) {
+		return 0, false
+	}
+	if !strings.HasSuffix(tag, "ms") {
+		return 0, false
+	}
+	digits := tag[len(prefix) : len(tag)-len("ms")]
+	if len(digits) == 0 {
+		return 0, false
+	}
+	if digits[0] < '1' || digits[0] > '9' {
+		return 0, false
+	}
+	for i := 1; i < len(digits); i++ {
+		if digits[i] < '0' || digits[i] > '9' {
+			return 0, false
+		}
+	}
+	millis, err := strconv.ParseInt(digits, 10, 64)
+	if err != nil {
+		return 0, false
+	}
+	if millis < 1 || millis > maxExpirationMillis {
+		return 0, false
+	}
+	return time.Duration(millis) * time.Millisecond, true
+}
+
 // parkQueueName is the queue one rung of one destination parks in.
 func parkQueueName(destination string, rung time.Duration) string {
 	return destination + parkingSuffix + "." + parkRungTags[rung]
@@ -611,7 +702,11 @@ func parkQueueParts(name string) (destination string, rung time.Duration, ok boo
 	if index := strings.LastIndex(name, parkingSuffix+"."); index >= 0 {
 		known, isRung := parkRungByTag[name[index+len(parkingSuffix)+1:]]
 		if !isRung {
-			return "", 0, false
+			fixed, isFixed := parseFixedParkTag(name[index+len(parkingSuffix)+1:])
+			if !isFixed {
+				return "", 0, false
+			}
+			return name[:index], fixed, true
 		}
 		return name[:index], known, true
 	}
@@ -619,6 +714,37 @@ func parkQueueParts(name string) (destination string, rung time.Duration, ok boo
 		return before, 0, true
 	}
 	return "", 0, false
+}
+
+// parkQueueNamesFor lists the parking queues of one destination spec: the
+// single fixed queue plus the per-message queue for a fixed-delay
+// destination, and the ladder plus the per-message queue otherwise.
+func parkQueueNamesFor(spec driver.DestinationSpec) []string {
+	if delay, isFixed := fixedParkDelay(spec); isFixed {
+		return []string{fixedParkQueueName(spec.Name, delay), spec.Name + parkingSuffix}
+	}
+	return parkQueueNames(spec.Name)
+}
+
+// parkingOf lists the parking queues this connection knows a destination's
+// messages may sit in: none for a destination without a delay, the ladder and
+// the per-message queue for a deferred one, and also the single fixed queue
+// for a fixed-delay one. The ladder stays listed for a fixed-delay destination
+// because rung queues left by an earlier version still drain into it. It takes
+// the read lock itself, so a caller must not hold c.mu.
+func (c *conn) parkingOf(destination string) []string {
+	c.mu.RLock()
+	_, isDeferred := c.deferred[destination]
+	fixedDelay, isFixed := c.fixed[destination]
+	c.mu.RUnlock()
+	if !isDeferred {
+		return nil
+	}
+	names := parkQueueNames(destination)
+	if isFixed {
+		names = append(names, fixedParkQueueName(destination, fixedDelay))
+	}
+	return names
 }
 
 // parkingArguments builds the declare-time arguments for a destination's

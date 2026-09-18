@@ -8,15 +8,14 @@ import (
 )
 
 // Scheduler selects queued items using deficit weighted round robin and
-// optional age-based promotion. All methods are intended for one goroutine.
+// optional deadline promotion. All methods are intended for one goroutine.
 type Scheduler struct {
-	clock   clock.Clock
-	aging   bool
-	slots   []*slot
-	byID    map[string]*lane
-	byGroup map[string]*slot
-	cursor  int
-	quantum int
+	clock          clock.Clock
+	promoteOverdue bool
+	slots          []*slot
+	byID           map[string]*lane
+	byGroup        map[string]*slot
+	cursor         int
 }
 
 type slot struct {
@@ -28,14 +27,14 @@ type slot struct {
 }
 
 // New creates a scheduler from lane specifications.
-func New(specs []LaneSpec, clk clock.Clock, aging bool) (*Scheduler, error) {
+func New(specs []LaneSpec, clk clock.Clock, promoteOverdue bool) (*Scheduler, error) {
 	if len(specs) == 0 {
 		return nil, errors.New("sched: at least one lane is required")
 	}
 	if clk == nil {
 		return nil, errors.New("sched: clock is required")
 	}
-	s := &Scheduler{clock: clk, aging: aging, byID: make(map[string]*lane), byGroup: make(map[string]*slot), quantum: 1}
+	s := &Scheduler{clock: clk, promoteOverdue: promoteOverdue, byID: make(map[string]*lane), byGroup: make(map[string]*slot)}
 	for _, spec := range specs {
 		if _, exists := s.byID[spec.ID]; exists {
 			return nil, errors.New("sched: duplicate lane id")
@@ -101,8 +100,8 @@ func (s *Scheduler) Next() (Item, bool) {
 	if len(s.slots) == 0 {
 		return Item{}, false
 	}
-	if s.aging {
-		if promoted := s.promoted(); promoted != nil {
+	if s.promoteOverdue {
+		if promoted := s.mostOverdue(); promoted != nil {
 			return promoted.pop(), true
 		}
 	}
@@ -114,7 +113,7 @@ func (s *Scheduler) Next() (Item, bool) {
 			continue
 		}
 		if group.deficit == 0 {
-			group.deficit += group.weight * s.quantum
+			group.deficit += group.weight
 		}
 		group.deficit--
 		if group.deficit == 0 {
@@ -127,7 +126,7 @@ func (s *Scheduler) Next() (Item, bool) {
 	return Item{}, false
 }
 
-func (s *Scheduler) promoted() *lane {
+func (s *Scheduler) mostOverdue() *lane {
 	now := s.clock.Now()
 	var selected *lane
 	var selectedOverrun time.Duration
@@ -162,21 +161,6 @@ func (s *slot) empty() bool {
 		}
 	}
 	return true
-}
-
-func (s *slot) head() Item {
-	var head Item
-	set := false
-	for _, lane := range s.lanes {
-		if len(lane.items) == 0 {
-			continue
-		}
-		if !set || lane.items[0].EnqueuedAt.Before(head.EnqueuedAt) {
-			head = lane.items[0]
-			set = true
-		}
-	}
-	return head
 }
 
 func (s *slot) pop() Item {

@@ -1036,7 +1036,7 @@ func newRunnerScheduler(r *Runner) (*sched.Scheduler, error) {
 			Budget: lane.budget, Capacity: lane.capacity,
 		})
 	}
-	return sched.New(specs, r.client.options.clock, !r.subscription.Fairness.DisableAging)
+	return sched.New(specs, r.client.options.clock, !r.subscription.Fairness.DisableDeadlinePromotion)
 }
 
 func schedulerLaneID(topic string, priority Priority, tier int) string {
@@ -2612,7 +2612,7 @@ func subscriptionTopologySpecs(effective driver.Capabilities, source string, sub
 				result.Bindings = append(result.Bindings, driver.BindingSpec{Source: entryPoint, Destination: main})
 			}
 			for tier := 1; tier <= retryTiers(sub.Retry); tier++ {
-				add(driver.DestinationSpec{Name: retryDestinationFor(source, logical, priority, tier, sub.Name), Kind: driver.DestRetry, Durable: true, Delay: sub.Retry.DelayFor(tier), DeadLetter: route, DeliveryLimit: limit})
+				add(driver.DestinationSpec{Name: retryDestinationFor(source, logical, priority, tier, sub.Name), Kind: driver.DestRetry, Durable: true, Delay: sub.Retry.DelayFor(tier), FixedDelay: true, DeadLetter: route, DeliveryLimit: limit})
 			}
 		}
 		add(driver.DestinationSpec{Name: deadLetterDestinationFor(source, logical, sub.Name), Kind: driver.DestDLQ, Durable: true})

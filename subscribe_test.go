@@ -258,11 +258,41 @@ func TestApplySubscriptionEnvironmentNamesReplacementForKeyRenamedSinceConfig(t 
 	if err == nil {
 		t.Fatal("applySubscriptionEnvironment() error = nil, want the renamed key rejected")
 	}
-	if !strings.Contains(err.Error(), prefix+"FAIRNESS_AGING_ENABLED") || !strings.Contains(err.Error(), "FAIRNESS_DISABLE_AGING=false") {
+	if !strings.Contains(err.Error(), prefix+"FAIRNESS_AGING_ENABLED") || !strings.Contains(err.Error(), "FAIRNESS_DISABLE_DEADLINE_PROMOTION=false") {
 		t.Fatalf("applySubscriptionEnvironment() error = %v, want the variable and the value that replaces it named", err)
 	}
-	if cfg.Fairness.DisableAging {
-		t.Fatal("DisableAging = true, want the rejected variable to leave the configuration alone")
+	if cfg.Fairness.DisableDeadlinePromotion {
+		t.Fatal("DisableDeadlinePromotion = true, want the rejected variable to leave the configuration alone")
+	}
+}
+
+func TestApplySubscriptionEnvironmentRejectsOldDeadlinePromotionKey(t *testing.T) {
+	name := t.Name()
+	clearSubscriptionEnvironment(t, name)
+	prefix := subscriptionEnvPrefix(name)
+	t.Setenv(prefix+"FAIRNESS_DISABLE_AGING", "true")
+
+	err := applySubscriptionEnvironment(name, &SubscriptionConfig{})
+	if err == nil {
+		t.Fatal("applySubscriptionEnvironment() error = nil, want the old key rejected")
+	}
+	if !strings.Contains(err.Error(), prefix+"FAIRNESS_DISABLE_AGING") || !strings.Contains(err.Error(), "FAIRNESS_DISABLE_DEADLINE_PROMOTION") {
+		t.Fatalf("applySubscriptionEnvironment() error = %v, want the old and replacement keys named", err)
+	}
+}
+
+func TestApplySubscriptionEnvironmentAcceptsDeadlinePromotion(t *testing.T) {
+	name := t.Name()
+	clearSubscriptionEnvironment(t, name)
+	prefix := subscriptionEnvPrefix(name)
+	t.Setenv(prefix+"FAIRNESS_DISABLE_DEADLINE_PROMOTION", "true")
+
+	cfg := SubscriptionConfig{}
+	if err := applySubscriptionEnvironment(name, &cfg); err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.Fairness.DisableDeadlinePromotion {
+		t.Fatal("DisableDeadlinePromotion = false, want true from the new environment key")
 	}
 }
 
@@ -349,7 +379,7 @@ func clearSubscriptionEnvironment(t *testing.T, name string) {
 	keys := []string{
 		"topics", "mode", "concurrency", "prefetch", "priorities",
 		"handlerTimeout", "unmatchedPolicy", "fairness.retryWeightDivisor",
-		"fairness.prefetchFactor", "fairness.disableAging",
+		"fairness.prefetchFactor", "fairness.disableDeadlinePromotion",
 		"fairness.weights.high", "fairness.weights.medium", "fairness.weights.low",
 		"fairness.budgets.high", "fairness.budgets.medium", "fairness.budgets.low",
 		"retry.maxAttempts", "retry.initialInterval", "retry.multiplier",
@@ -400,7 +430,7 @@ f1:
 	}
 }
 
-func TestSubscribePreservesExplicitYAMLDisableAging(t *testing.T) {
+func TestSubscribePreservesExplicitYAMLDisableDeadlinePromotion(t *testing.T) {
 	t.Parallel()
 	cfg, err := LoadConfig(writeConfig(t, `
 f1:
@@ -412,7 +442,7 @@ f1:
     orders:
       topics: [orders.created]
       fairness:
-        disableAging: true
+        disableDeadlinePromotion: true
 `))
 	if err != nil {
 		t.Fatal(err)
@@ -426,8 +456,8 @@ f1:
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !runner.config.Fairness.DisableAging {
-		t.Fatal("explicit YAML disableAging: true was replaced by the default")
+	if !runner.config.Fairness.DisableDeadlinePromotion {
+		t.Fatal("explicit YAML disableDeadlinePromotion: true was replaced by the default")
 	}
 }
 

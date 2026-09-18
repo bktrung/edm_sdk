@@ -670,3 +670,120 @@ func containsString(values []string, want string) bool {
 func containsBinding(values []driver.BindingSpec, want driver.BindingSpec) bool {
 	return slices.Contains(values, want)
 }
+
+func TestEnsureTopologyFixedDelayDeclaresOneQueue(t *testing.T) {
+	requireBroker(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	const destination = "rabbitmq-driver-fixed-park-queue"
+	fixedQueue := destination + ".park.fixed-5000ms"
+	aboveLadder := destination + ".park"
+	rungQueue := destination + ".park.8s"
+	raw, err := amqp.Dial(defaultEndpoint)
+	if err != nil {
+		t.Fatalf("Dial: %v", err)
+	}
+	t.Cleanup(func() { _ = raw.Close() })
+	rawChannel, err := raw.Channel()
+	if err != nil {
+		t.Fatalf("Channel: %v", err)
+	}
+	t.Cleanup(func() { _ = rawChannel.Close() })
+	deleteParkQueues(rawChannel, destination)
+	_, _ = rawChannel.QueueDelete(fixedQueue, false, false, false)
+	t.Cleanup(func() {
+		deleteParkQueues(rawChannel, destination)
+		_, _ = rawChannel.QueueDelete(fixedQueue, false, false, false)
+	})
+
+	conn, err := (Driver{}).Open(ctx, driver.Config{Endpoints: []string{defaultEndpoint}})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	t.Cleanup(func() { _ = conn.Close(ctx) })
+
+	if _, err := conn.Admin().EnsureTopology(ctx, driver.TopologySpec{
+		Destinations: []driver.DestinationSpec{{Name: destination, Durable: true, Delay: 5 * time.Second, FixedDelay: true}},
+	}); err != nil {
+		t.Fatalf("EnsureTopology: %v", err)
+	}
+
+	mgmt, err := newManagementClient(defaultEndpoint, driver.Config{})
+	if err != nil {
+		t.Fatalf("newManagementClient: %v", err)
+	}
+	fixed, err := mgmt.getQueue(ctx, fixedQueue)
+	if err != nil {
+		t.Fatalf("getQueue(%q): %v", fixedQueue, err)
+	}
+	if got := fmt.Sprint(fixed.Arguments["x-message-ttl"]); got != "5000" {
+		t.Fatalf("fixed queue x-message-ttl = %v, want 5000", got)
+	}
+	if _, err := mgmt.getQueue(ctx, aboveLadder); err != nil {
+		t.Fatalf("getQueue(%q): %v", aboveLadder, err)
+	}
+	if _, err := mgmt.getQueue(ctx, rungQueue); err == nil {
+		t.Fatalf("getQueue(%q) succeeded, want no such queue", rungQueue)
+	}
+}
+
+func TestEnsureTopologyFixedDelayReportsOldRungsAsOrphans(t *testing.T) {
+	requireBroker(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	const destination = "rabbitmq-driver-fixed-park-orphan"
+	fixedQueue := destination + ".park.fixed-5000ms"
+	raw, err := amqp.Dial(defaultEndpoint)
+	if err != nil {
+		t.Fatalf("Dial: %v", err)
+	}
+	t.Cleanup(func() { _ = raw.Close() })
+	rawChannel, err := raw.Channel()
+	if err != nil {
+		t.Fatalf("Channel: %v", err)
+	}
+	t.Cleanup(func() { _ = rawChannel.Close() })
+	deleteParkQueues(rawChannel, destination)
+	_, _ = rawChannel.QueueDelete(fixedQueue, false, false, false)
+	t.Cleanup(func() {
+		deleteParkQueues(rawChannel, destination)
+		_, _ = rawChannel.QueueDelete(fixedQueue, false, false, false)
+	})
+
+	conn, err := (Driver{}).Open(ctx, driver.Config{Endpoints: []string{defaultEndpoint}})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	t.Cleanup(func() { _ = conn.Close(ctx) })
+
+	if _, err := conn.Admin().EnsureTopology(ctx, driver.TopologySpec{
+		Destinations: []driver.DestinationSpec{{Name: destination, Durable: true, Delay: 5 * time.Second}},
+	}); err != nil {
+		t.Fatalf("EnsureTopology(ladder): %v", err)
+	}
+	diff, err := conn.Admin().EnsureTopology(ctx, driver.TopologySpec{
+		Destinations: []driver.DestinationSpec{{Name: destination, Durable: true, Delay: 5 * time.Second, FixedDelay: true}},
+		Scope:        []string{destination},
+	})
+	if err != nil {
+		t.Fatalf("EnsureTopology(fixed): %v", err)
+	}
+	want := make(map[string]struct{}, len(parkRungs))
+	for _, rung := range parkRungs {
+		want[parkQueueName(destination, rung)] = struct{}{}
+	}
+	got := make(map[string]struct{}, len(diff.Orphaned))
+	for _, orphan := range diff.Orphaned {
+		got[orphan.Name] = struct{}{}
+	}
+	for name := range want {
+		if _, found := got[name]; !found {
+			t.Fatalf("Orphaned = %v, want old rung queue %q", diff.Orphaned, name)
+		}
+	}
+	if len(diff.Orphaned) != len(want) {
+		t.Fatalf("Orphaned = %v, want exactly the 8 old rung queues", diff.Orphaned)
+	}
+}

@@ -97,9 +97,10 @@ type FairnessConfig struct {
 	Budgets            map[Priority]time.Duration
 	RetryWeightDivisor int
 	PrefetchFactor     int
-	// DisableAging turns off age-based promotion for lanes that exceed their
-	// budget. The zero value leaves aging on, which is the default.
-	DisableAging bool
+	// DisableDeadlinePromotion turns off serving a lane first once its oldest
+	// item has waited past its budget. The zero value leaves deadline promotion
+	// on, which is the default.
+	DisableDeadlinePromotion bool
 }
 
 // RetryConfig configures a Subscription's retry ladder.
@@ -712,7 +713,7 @@ func rawSubscriptionFromConfig(subscription SubscriptionConfig) rawSubscription 
 	for priority, budget := range subscription.Fairness.Budgets {
 		budgets[priority.String()] = budget
 	}
-	return rawSubscription{Topics: subscription.Topics, Mode: rawMode(subscription.Mode), Concurrency: subscription.Concurrency, Prefetch: subscription.Prefetch, Priorities: priorities, Fairness: rawFairness{Weights: weights, Budgets: budgets, RetryWeightDivisor: subscription.Fairness.RetryWeightDivisor, PrefetchFactor: subscription.Fairness.PrefetchFactor, DisableAging: subscription.Fairness.DisableAging}, Retry: rawRetry(subscription.Retry), HandlerTimeout: subscription.HandlerTimeout, UnmatchedPolicy: rawPolicy(subscription.UnmatchedPolicy), presence: subscription.presence}
+	return rawSubscription{Topics: subscription.Topics, Mode: rawMode(subscription.Mode), Concurrency: subscription.Concurrency, Prefetch: subscription.Prefetch, Priorities: priorities, Fairness: rawFairness{Weights: weights, Budgets: budgets, RetryWeightDivisor: subscription.Fairness.RetryWeightDivisor, PrefetchFactor: subscription.Fairness.PrefetchFactor, DisableDeadlinePromotion: subscription.Fairness.DisableDeadlinePromotion}, Retry: rawRetry(subscription.Retry), HandlerTimeout: subscription.HandlerTimeout, UnmatchedPolicy: rawPolicy(subscription.UnmatchedPolicy), presence: subscription.presence}
 }
 
 func subscriptionPresenceFromNode(node *yaml.Node) subscriptionPresence {
@@ -746,24 +747,24 @@ func subscriptionPresenceFromNode(node *yaml.Node) subscriptionPresence {
 }
 
 type rawFairness struct {
-	Weights            map[string]int           `yaml:"weights"`
-	Budgets            map[string]time.Duration `yaml:"budgets"`
-	RetryWeightDivisor int                      `yaml:"retryWeightDivisor"`
-	PrefetchFactor     int                      `yaml:"prefetchFactor"`
-	DisableAging       bool                     `yaml:"disableAging"`
+	Weights                  map[string]int           `yaml:"weights"`
+	Budgets                  map[string]time.Duration `yaml:"budgets"`
+	RetryWeightDivisor       int                      `yaml:"retryWeightDivisor"`
+	PrefetchFactor           int                      `yaml:"prefetchFactor"`
+	DisableDeadlinePromotion bool                     `yaml:"disableDeadlinePromotion"`
 }
 
 func (r *rawFairness) UnmarshalYAML(value *yaml.Node) error {
-	if err := requireKnownKeys(value, "weights", "budgets", "retryWeightDivisor", "prefetchFactor", "disableAging"); err != nil {
+	if err := requireKnownKeys(value, "weights", "budgets", "retryWeightDivisor", "prefetchFactor", "disableDeadlinePromotion"); err != nil {
 		return err
 	}
 	input := struct {
-		Weights            map[string]int           `yaml:"weights"`
-		Budgets            map[string]time.Duration `yaml:"budgets"`
-		RetryWeightDivisor int                      `yaml:"retryWeightDivisor"`
-		PrefetchFactor     int                      `yaml:"prefetchFactor"`
-		DisableAging       bool                     `yaml:"disableAging"`
-	}{RetryWeightDivisor: r.RetryWeightDivisor, PrefetchFactor: r.PrefetchFactor, DisableAging: r.DisableAging}
+		Weights                  map[string]int           `yaml:"weights"`
+		Budgets                  map[string]time.Duration `yaml:"budgets"`
+		RetryWeightDivisor       int                      `yaml:"retryWeightDivisor"`
+		PrefetchFactor           int                      `yaml:"prefetchFactor"`
+		DisableDeadlinePromotion bool                     `yaml:"disableDeadlinePromotion"`
+	}{RetryWeightDivisor: r.RetryWeightDivisor, PrefetchFactor: r.PrefetchFactor, DisableDeadlinePromotion: r.DisableDeadlinePromotion}
 	if err := value.Decode(&input); err != nil {
 		return err
 	}
@@ -794,7 +795,7 @@ func (r rawFairness) config() (FairnessConfig, error) {
 		}
 		budgets[priority] = budget
 	}
-	return FairnessConfig{Weights: weights, Budgets: budgets, RetryWeightDivisor: r.RetryWeightDivisor, PrefetchFactor: r.PrefetchFactor, DisableAging: r.DisableAging}, nil
+	return FairnessConfig{Weights: weights, Budgets: budgets, RetryWeightDivisor: r.RetryWeightDivisor, PrefetchFactor: r.PrefetchFactor, DisableDeadlinePromotion: r.DisableDeadlinePromotion}, nil
 }
 
 func requireKnownKeys(node *yaml.Node, keys ...string) error {

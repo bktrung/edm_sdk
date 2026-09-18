@@ -10,22 +10,22 @@ import (
 
 func BenchmarkSchedulerNext(b *testing.B) {
 	for _, test := range []struct {
-		name    string
-		aging   bool
-		overdue bool
+		name           string
+		promoteOverdue bool
+		overdue        bool
 	}{
-		{name: "aging-disabled"},
-		{name: "aging-enabled-no-overdue", aging: true},
-		{name: "aging-enabled-all-overdue", aging: true, overdue: true},
+		{name: "deadline-promotion-disabled"},
+		{name: "deadline-promotion-enabled-no-overdue", promoteOverdue: true},
+		{name: "deadline-promotion-enabled-all-overdue", promoteOverdue: true, overdue: true},
 	} {
 		b.Run(test.name, func(b *testing.B) {
-			scheduler, remaining := newBenchmarkScheduler(test.aging, test.overdue)
+			scheduler, remaining := newBenchmarkScheduler(test.promoteOverdue, test.overdue)
 			b.ReportAllocs()
 			b.ResetTimer()
 			for range b.N {
 				if remaining == 0 {
 					b.StopTimer()
-					scheduler, remaining = newBenchmarkScheduler(test.aging, test.overdue)
+					scheduler, remaining = newBenchmarkScheduler(test.promoteOverdue, test.overdue)
 					b.StartTimer()
 				}
 				if _, ok := scheduler.Next(); !ok {
@@ -37,7 +37,7 @@ func BenchmarkSchedulerNext(b *testing.B) {
 	}
 }
 
-func newBenchmarkScheduler(aging, overdue bool) (*Scheduler, int) {
+func newBenchmarkScheduler(promoteOverdue, overdue bool) (*Scheduler, int) {
 	const (
 		slotCount    = 60
 		lanesPerSlot = 2
@@ -57,7 +57,7 @@ func newBenchmarkScheduler(aging, overdue bool) (*Scheduler, int) {
 			})
 		}
 	}
-	scheduler, err := New(specs, fake, aging)
+	scheduler, err := New(specs, fake, promoteOverdue)
 	if err != nil {
 		panic(err)
 	}

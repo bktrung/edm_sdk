@@ -122,6 +122,12 @@ f1:
 	if got := cfg.Lifecycle.ConsumerDrainTimeout; got != 0 {
 		t.Fatalf("default consumerDrainTimeout = %s, want zero (disabled): a default here would bound Close for callers who never set it", got)
 	}
+	if cfg.Env != "test" || cfg.Service != "orders" || cfg.Broker.Driver != "kafka" {
+		t.Fatalf("LoadConfig() = %#v, want the file's environment, service, and broker", cfg)
+	}
+	if got := cfg.Broker.Endpoints; !reflect.DeepEqual(got, []string{"kafka://broker:9092"}) {
+		t.Fatalf("Broker.Endpoints = %#v, want the configured endpoint", got)
+	}
 }
 
 func TestLoadConfigAcceptsRabbitMQManagementPort(t *testing.T) {
@@ -351,8 +357,8 @@ func TestLoadConfigRejectsUnknownFairnessPriority(t *testing.T) {
 
 func TestLoadConfigRejectsUnknownFairnessKey(t *testing.T) {
 	t.Parallel()
-	path := writeConfig(t, "f1:\n  env: test\n  service: orders\n  broker:\n    driver: inmem\n  subscriptions:\n    orders:\n      topics: [orders]\n      fairness:\n        agingEnbaled: false\n")
-	if _, err := LoadConfig(path); err == nil || !strings.Contains(err.Error(), "agingEnbaled") {
+	path := writeConfig(t, "f1:\n  env: test\n  service: orders\n  broker:\n    driver: inmem\n  subscriptions:\n    orders:\n      topics: [orders]\n      fairness:\n        deadlinePromotionEnbaled: false\n")
+	if _, err := LoadConfig(path); err == nil || !strings.Contains(err.Error(), "deadlinePromotionEnbaled") {
 		t.Fatalf("LoadConfig() error = %v, want unknown fairness key error", err)
 	}
 }
@@ -527,6 +533,11 @@ func TestValidateConfigAcceptsTLSWithAmqpsEndpoint(t *testing.T) {
 
 	if err := validateConfiguredConfig(cfg); err != nil {
 		t.Fatalf("validateConfig() error = %v, want amqps TLS endpoint to validate", err)
+	}
+	rejected := cfg
+	rejected.Broker.Endpoints = []string{"amqp://broker:5672/"}
+	if err := validateConfiguredConfig(rejected); err == nil || !strings.Contains(err.Error(), "amqps://") {
+		t.Fatalf("validateConfig() error = %v, want non-amqps TLS endpoint error", err)
 	}
 }
 
@@ -858,6 +869,7 @@ func TestLoadConfigRejectsRemovedKeys(t *testing.T) {
 		{name: "cost model", key: "costModel", body: subscription + "      fairness:\n        costModel: count\n"},
 		{name: "retry jitter", key: "jitter", body: subscription + "      retry:\n        jitter: 0.2\n"},
 		{name: "aging enabled", key: "agingEnabled", body: subscription + "      fairness:\n        agingEnabled: false\n"},
+		{name: "deadline promotion", key: "disableAging", body: subscription + "      fairness:\n        disableAging: false\n"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			t.Parallel()
@@ -975,6 +987,12 @@ func TestNormalizeConfigPreservesVerifyOnStartFalse(t *testing.T) {
 	cfg := normalizeConfig(Config{Topology: TopologyConfig{VerifyOnStart: false}})
 	if cfg.Topology.VerifyOnStart {
 		t.Fatal("VerifyOnStart = true after normalization, want false")
+	}
+	if got, want := cfg.Codec.Default, "json"; got != want {
+		t.Fatalf("Codec.Default = %q, want %q", got, want)
+	}
+	if got, want := cfg.Lifecycle.DrainTimeout, time.Minute; got != want {
+		t.Fatalf("DrainTimeout = %s, want %s", got, want)
 	}
 }
 

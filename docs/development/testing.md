@@ -50,7 +50,7 @@ The main pure areas are:
 - [`internal/clock/`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/tree/main/internal/clock) for real and fake time;
 - [`internal/retry/`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/tree/main/internal/retry) for backoff ladders and
   retry sanity checks;
-- [`internal/sched/`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/tree/main/internal/sched) for weighted lanes, aging, and
+- [`internal/sched/`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/tree/main/internal/sched) for weighted lanes, deadline promotion, and
   fairness;
 - [`internal/dispatch/`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/tree/main/internal/dispatch) for worker routing,
   ordered keys, and the in-flight registry; and
@@ -342,7 +342,7 @@ state or error.
 
 Use [`internal/clock`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/tree/main/internal/clock) and its fake implementation when
 time is part of the behavior: retry delays, deferred delivery, acknowledgement
-deadlines, drain budgets, backoff, or scheduler aging. `f1test.Client.Advance`
+deadlines, drain budgets, backoff, or deadline promotion. `f1test.Client.Advance`
 advances the same fake clock used by the core and in-memory driver, so a test
 can release due work without waiting for wall time.
 
@@ -408,6 +408,20 @@ make those tests meaningful:
 These are repository contract checks, not substitutes for a handler or broker
 test. Run them when changing exported symbols, package boundaries, driver
 interfaces, or maintainer documentation.
+
+## Test deletion probe
+
+The test deletion probe asks whether one test fails when a covered production
+function or method is replaced by a zero-value body. Run the repeatable sample
+with `make probe-tests`; use `PROBE_SAMPLE=path/to/sample.txt make probe-tests`
+for another package-and-test list.
+
+Read `red` as evidence that the test defends the mutated subject. A `green`
+row means the test still passes, so it does not defend that subject. A
+`nosubject` means no covered production function or method matched the test
+name under the probe's word rule; review that name and its assertion together.
+Other rows identify `nocompile`, `timeout`, `skip`, or a baseline `notgreen`.
+TSV rows go to stdout; summaries and cap counts go to stderr.
 
 ## Choosing a test before changing code
 

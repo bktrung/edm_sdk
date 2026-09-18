@@ -192,11 +192,15 @@ below fresh traffic without losing per-tier visibility.
   concurrency, and the total prefetch the driver may hold is capped by the sum
   of those capacities;
 - deficit weighted round-robin selection across groups; and
-- optional age-based promotion when a lane exceeds its configured budget.
+- optional deadline promotion when a lane exceeds its configured budget.
 
-Retry lanes normally receive a reduced weight and a larger aging budget. This
-keeps a retry storm from consuming all handler capacity while still preventing
-an eligible lane from starving indefinitely.
+The scheduler applies earliest-deadline-first over overdue lanes. A budget
+starts when a delivery enters its lane (`worker.go:878`), so it measures wait
+inside the SDK; backlog still in the broker is invisible.
+
+Retry lanes normally receive a reduced weight and a larger budget. Weights, not
+deadline promotion, ensure the lowest-weight group still receives at least one
+pick per round, while the larger budget keeps retry pressure below fresh traffic.
 
 The scheduler implementation is in
 [`internal/sched/scheduler.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/internal/sched/scheduler.go) and the
@@ -469,7 +473,7 @@ When changing consume behavior, follow this order:
 3. Ordered dispatch and in-flight registry behavior in
    [`internal/dispatch/pool.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/internal/dispatch/pool.go) and
    [`internal/dispatch/registry.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/internal/dispatch/registry.go).
-4. Fairness, retry-lane weighting, and aging in
+4. Fairness, retry-lane weighting, and deadline promotion in
    [`internal/sched/scheduler.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/internal/sched/scheduler.go).
 5. Retry classification and destination construction in
    [`worker.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/worker.go) and
