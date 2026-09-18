@@ -185,14 +185,14 @@ capacity policy rather than copying defaults into application code:
 The fields have distinct jobs:
 
 - `Weights` controls the relative share of ready lanes;
-- `Budgets` defines how long a lane may wait before aging can promote it;
+- `Budgets` defines how long a lane may wait before deadline promotion can promote it;
 - `RetryWeightDivisor` reduces retry pressure relative to fresh work;
 - `PrefetchFactor` scales each scheduler lane's bounded capacity; and
-- `DisableAging` turns off age-based promotion for lanes that exceed their
+- `DisableDeadlinePromotion` turns off deadline promotion for lanes that exceed their
   budget. Its zero value leaves promotion on, which is the default.
 
-The scheduler uses weighted round-robin when no lane has exceeded its aging
-budget. When aging is enabled, the lane with the greatest budget overrun may
+The scheduler uses weighted round-robin when no lane has exceeded its
+budget. When deadline promotion is enabled, the lane with the greatest budget overrun may
 be selected first. This gives latency-sensitive work a way to recover from
 temporary contention without turning the whole policy into strict priority.
 The implementation is [`internal/sched`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/tree/main/internal/sched), and its lane
@@ -209,7 +209,7 @@ Retry timing and ready-work scheduling are separate:
 
 F1 gives retry lanes their own scheduler groups and normally reduces their
 weight with `RetryWeightDivisor`. This prevents a retry storm from consuming
-all handler capacity and starving new events. Aging can still promote a retry
+all handler capacity and starving new events. Deadline promotion can still promote a retry
 lane that has waited beyond its configured budget.
 
 Returning `f1.RetryAfter` changes the event's next eligible time; it does not
@@ -233,7 +233,7 @@ needed before changing configuration:
 3. **Fresh work is delayed by retries?** Keep retry lanes available but lower
    their relative weight with `RetryWeightDivisor`; do not discard retries that
    represent a real transient failure.
-4. **A lane waits too long?** Enable aging or adjust its budget after checking
+4. **A lane waits too long?** Enable deadline promotion or adjust its budget after checking
    the weight and downstream capacity. A budget is a scheduling escape hatch,
    not a latency guarantee.
 5. **A high-priority lane dominates?** Reduce its weight or split the workload
@@ -254,13 +254,13 @@ Use [`f1test`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-
 - publish explicit priorities and verify the selected lanes receive service;
 - fill fresh and retry lanes and verify retry pressure does not starve fresh
   work; and
-- advance the fake clock when testing retry eligibility or aging instead of
+- advance the fake clock when testing retry eligibility or deadline promotion instead of
   sleeping in the test.
 
 The repository's [`ordered_test.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/f1test/ordered_test.go) covers equal
 key serialization and different-key concurrency. The scheduler unit tests in
 [`internal/sched/scheduler_test.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/internal/sched/scheduler_test.go)
-cover weighted selection, bounded lanes, and aging; the retry-storm test in
+cover weighted selection, bounded lanes, and deadline promotion; the retry-storm test in
 [`retry_storm_test.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/retry_storm_test.go) guards fresh-work share under
 retry pressure. A driver implementation must also preserve the capability
 contract validated by the [driver conformance package](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/tree/main/driver/conformance).
