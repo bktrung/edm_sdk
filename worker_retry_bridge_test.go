@@ -886,6 +886,9 @@ func TestRetryAfterClampCarriesTier(t *testing.T) {
 		t.Fatal("retry successor was not published and settled")
 	}
 	retryDestination := producer.messages[0].Destination
+	if want := "f1.test.orders.retry.created.orders.high.retry.2"; retryDestination != want {
+		t.Fatalf("retry destination = %q, want the clamped tier-2 destination %q", retryDestination, want)
+	}
 	runner.retryDestinationTiers = map[string]int{retryDestination: 2}
 	inbound := driver.InboundMessage{
 		Destination: retryDestination,
@@ -1010,7 +1013,7 @@ func TestOpenRunnerConsumerBuildsRetryDestinationTiers(t *testing.T) {
 	if _, err := openRunnerConsumerForTest(runner, context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	wantDestination := retryDestinationFor(client.source, "orders.created", PriorityHigh, 2, "orders")
+	wantDestination := "f1.test.orders.created.orders.high.retry.2"
 	if got := runner.retryDestinationTiers[wantDestination]; got != 2 {
 		t.Fatalf("retry tier for %q = %d, want 2", wantDestination, got)
 	}
@@ -1026,21 +1029,15 @@ func TestRetryDestinationTierMapMatchesSubscriptionDestinations(t *testing.T) {
 			Tiers: []time.Duration{time.Second, 2 * time.Second},
 		},
 	}
-	effective := driver.Capabilities{Fanout: driver.FanoutAtConsume}
-	destinations := subscriptionDestinations(effective, source, sub)
-
-	mainDestinations := make(map[string]struct{})
-	for _, topic := range sub.Topics {
-		logical := topicFor(topic)
-		for _, priority := range sub.Priorities {
-			mainDestinations[consumeDestination(effective, source, logical, priority, sub.Name)] = struct{}{}
-		}
-	}
-	wantRetry := make(map[string]struct{})
-	for _, destination := range destinations {
-		if _, ok := mainDestinations[destination]; !ok {
-			wantRetry[destination] = struct{}{}
-		}
+	wantRetry := map[string]struct{}{
+		"f1.test.orders.created.orders.high.retry.1":     {},
+		"f1.test.orders.created.orders.high.retry.2":     {},
+		"f1.test.orders.created.orders.medium.retry.1":   {},
+		"f1.test.orders.created.orders.medium.retry.2":   {},
+		"f1.test.payments.created.orders.high.retry.1":   {},
+		"f1.test.payments.created.orders.high.retry.2":   {},
+		"f1.test.payments.created.orders.medium.retry.1": {},
+		"f1.test.payments.created.orders.medium.retry.2": {},
 	}
 
 	gotRetry := retryDestinationTierMap(source, sub)

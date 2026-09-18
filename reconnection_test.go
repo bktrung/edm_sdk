@@ -1202,7 +1202,7 @@ func TestDrainCancelsInFlightHandlerIntoRetryLane(t *testing.T) {
 	if len(producer.messages) != 1 {
 		t.Fatalf("retry successors = %d, want 1", len(producer.messages))
 	}
-	wantDestination := retryDestinationFor(client.source, "orders.created", PriorityHigh, 1, runner.subscription.Name)
+	wantDestination := "f1.test.orders.created.orders.high.retry.1"
 	if got := producer.messages[0].Destination; got != wantDestination {
 		t.Fatalf("retry destination = %q, want %q", got, wantDestination)
 	}
