@@ -238,8 +238,7 @@ test-rabbitmq-conformance: broker-up broker-smoke
 
 ## test-kafka: run the Kafka driver suite against the fixture, starting it first.
 ## The integration tag selects the broker-backed files; an unreachable broker
-## fails the run. Kafka conformance stays behind F1_KAFKA_CONFORMANCE, which is a
-## feature-completeness switch, not an infrastructure one.
+## fails the run. Kafka conformance is part of the ordinary integration suite.
 test-kafka: kafka-up
 	F1_KAFKA_ENDPOINT=$${F1_KAFKA_ENDPOINT:-localhost:$(KAFKA_PORT)} go test -race -count=1 -tags integration ./drivers/kafka/...
 
@@ -265,10 +264,10 @@ test-driver-flip: kafka-up broker-up broker-smoke
 	go test -v -count=1 -tags integration -run TestDriverFlipAcceptance -timeout 45m ./examples/acceptance/
 
 ## test-kafka-conformance: run both Kafka conformance profiles against the fixture.
-## This takes about 250s and requires a live Kafka broker. F1_KAFKA_CONFORMANCE
-## keeps the run explicit; the integration tag makes it required.
+## This takes about 250s and requires a live Kafka broker; the integration tag
+## makes it required.
 test-kafka-conformance: kafka-up
-	F1_KAFKA_ENDPOINT=$${F1_KAFKA_ENDPOINT:-localhost:$(KAFKA_PORT)} F1_KAFKA_CONFORMANCE=1 go test -v -count=1 -tags integration -run TestConformance -timeout 20m ./drivers/kafka/...
+	F1_KAFKA_ENDPOINT=$${F1_KAFKA_ENDPOINT:-localhost:$(KAFKA_PORT)} go test -v -count=1 -tags integration -run TestConformance -timeout 20m ./drivers/kafka/...
 
 ## bench: measure publish, consume, latency and retry throughput through the
 ## public API against both brokers, starting the fixtures first. Consume runs

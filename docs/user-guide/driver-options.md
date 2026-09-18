@@ -29,8 +29,8 @@ Two of the columns below need a word of explanation.
   are in [Validation before the driver](#validation-before-the-driver).
 - **Read at** says when the option takes effect. *Open* means it is resolved
   once, when the driver opens. *Per consumer* means it is resolved again for
-  each consumer the driver creates. *Topology* means it is read on the path that
-  declares or verifies destinations rather than at connection time.
+  each consumer the driver creates. *Topology* means it is read on the path
+  that declares or verifies destinations rather than at connection time.
 
 ## Kafka options
 
@@ -40,10 +40,9 @@ Two of the columns below need a word of explanation.
 | `broker.kafka.batchLinger` | How long the producer waits for a batch to fill before sending it. `0` sends as soon as there is something to send. | Go duration, zero or positive. A negative duration fails `Open`. | `10ms` | Open |
 | `broker.kafka.fetchMaxBytes` | Byte ceiling a consumer asks each broker for in one fetch. | Integer from 1 to 2147483647. Any other value fails `Open`. | `52428800` (50 MiB) | Open |
 | `broker.kafka.sessionTimeout` | Session timeout the member carries in its join request; the group coordinator expires the member after that much silence. | Positive Go duration, and at least as long as `lifecycle.rebalanceDrainTimeout` divided by 0.6. | `45s` | Open |
-| `broker.kafka.rebalanceTimeout` | Window the coordinator allows a member to complete a rebalance before removing it from the group. | Positive Go duration. | `60s` | Open |
+| `broker.kafka.rebalanceTimeout` | Window the coordinator allows a member to complete a rebalance before removing it from the group. It must be greater than the configured `lifecycle.rebalanceDrainTimeout`. | Positive Go duration, and above the revoke wait bound. | `60s` | Open |
 | `broker.kafka.staticMembership` | Adds the configured instance ID to the join request, so a member that restarts inside its session timeout rejoins without a rebalance. It changes nothing when no instance ID is configured. | Boolean, in the spellings `1`, `t`, `T`, `TRUE`, `true`, `True` and their `0`, `f`, `F`, `FALSE`, `false`, `False` counterparts. Any other value fails `Open`. | `true` | Open, and per consumer |
-| `broker.kafka.maxAckGap` | How far the committed offset may fall behind the highest acknowledged offset of one destination before the driver pauses that destination's partitions to let the commit catch up. | Positive integer. | `10000` | Per consumer |
-| `broker.kafka.balancer` | Group balancer protocol the consumer clients join with. | `lane`, `cooperative-sticky`, `sticky`, or `range`. | `lane` | Open |
+| `broker.kafka.balancer` | Group balancer protocol the consumer clients join with. | `cooperative-sticky`, `sticky`, or `range`. `lane` is refused. | `cooperative-sticky` | Open |
 | `broker.kafka.maxExpectedInstances` | Partition floor: a destination with fewer partitions than this is refused, and a declaration that names no partition count gets this many instead. `0` leaves both decisions to the destination. | Non-negative integer. | `0`, no floor | Topology |
 
 `broker.kafka.maxExpectedInstances` is a guard against a topic that was created
@@ -53,6 +52,52 @@ declares and checks nothing. Under `TopologyVerify` an existing topic below the
 floor is a startup failure rather than a deployment that silently scales less
 than expected, and under `TopologyDeclare` a request for fewer partitions than
 the floor is refused before a topic is created.
+
+### Kafka parallelism and partitions
+
+Kafka admits at most one delivery from each partition owned by a consumer. A
+subscription's effective handler parallelism is therefore the smaller of its
+`Concurrency` and the number of partitions each member holds for a destination.
+Fairness weights can divide the available slots, but a weight above the assigned
+partition count cannot create another delivery.
+
+When a member is assigned fewer partitions than the destination's resolved slot
+budget, the driver emits one warning with the fields `assigned_partitions`,
+`budget`, and `lever`. The operator should increase the destination's partition
+count, or use `broker.kafka.maxExpectedInstances` to require that floor during
+topology setup. Raising a partition count re-maps keys that are already
+published, and the partition count cannot be lowered, so treat that change as a
+one-way capacity decision.
+
+### Kafka retry timing
+
+Kafka retry records are due at their record timestamp plus the retry tier's
+delay. `RetryDelay` and other custom per-delivery delays are not honoured by
+this driver; the configured retry ladder supplies the destination delay. The
+record timestamp is the producer's `CreateTime` when the topic uses the default
+`message.timestamp.type=CreateTime`. A topic configured with
+`message.timestamp.type=LogAppendTime` uses the broker append time instead.
+Publisher clock skew and append lag can make a retry late, never early.
+
+### Kafka rebalancing
+
+The default group protocol is cooperative-sticky. The old `lane` protocol is
+refused. A cooperative group must not be changed back to an eager protocol
+without planning for duplicates: a revoke waits at most
+`lifecycle.rebalanceDrainTimeout` for the one delivery in flight, and the next
+owner can redeliver that record after the wait. `broker.kafka.rebalanceTimeout`
+must be above that drain bound; the driver refuses a value at or below it.
+
+### Kafka message-size limit
+
+When the driver opens, it reads the broker's `message.max.bytes` and derives the
+producer batch cap and the maximum body size it declares through
+`Client.Limits()`. A topic-level `max.message.bytes` override below the driver's
+produce batch cap is a misconfiguration: the driver's size checks assume the
+broker limit, so the topic can reject records that the driver considers valid.
+Set the topic limit at or above the driver's cap and verify the effective broker
+configuration before publishing large events.
+
 
 A subscription's `Prefetch` is also the deferred hold limit for its
 destinations, so it is the knob behind the ordering guarantee for a delayed
@@ -79,7 +124,7 @@ which is the floor. Bounded memory is what the lateness buys.
 | `broker.rabbitmq.vhost` | Vhost the management API inspects when it reads queue arguments and bindings. It does not change the AMQP connection: the endpoint URI still selects the vhost that messages are published to. | Any string, used as the vhost name. Empty falls back to the endpoint URI. | The endpoint URI's vhost as the AMQP client parses it: `/` when the URI has no path, and `orders` for `amqp://host/orders`. | Open |
 | `broker.rabbitmq.queueType` | Queue type every destination and its parking queue is declared with. `classic` also clears the delivery-count and dead-letter capabilities, both of which are quorum arguments. | `quorum` or `classic`, case-insensitive, with surrounding whitespace ignored. Any other value fails `Open`, and `env: prod` requires the exact string `quorum`. | `quorum` | Open |
 | `broker.rabbitmq.consumerTimeout` | `x-consumer-timeout` declared on quorum destination queues. The broker cancels a consumer that has held one delivery this long. | Go duration of at least `1ms`, and at least three times every subscription's `handlerTimeout`. Shorter, zero, negative, or unparsable fails `Open`. | None: nothing is declared and the broker's own default stays in force. | Open |
-| `broker.rabbitmq.managementPort` | Port the management HTTP API listens on. | Integer from 1 to 65535. Any other value fails `Open`. | The AMQP port plus 10000, so 15672 for the usual 5672. | Open |
+| `broker.rabbitmq.managementPort` | Port the RabbitMQ management HTTP API listens on. | Integer from 1 to 65535. Any other value fails `Open`. | The AMQP port plus 10000, so 15672 for the usual 5672. | Open |
 
 `broker.rabbitmq.vhost` deserves the extra sentences, because the management
 client and the AMQP connection must read the same vhost from the endpoint.

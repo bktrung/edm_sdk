@@ -117,14 +117,19 @@ but not so high that a slow dependency creates an unnecessarily large
 in-flight backlog. Tune one setting at a time while observing handler
 latency, downstream saturation, redelivery, and drain time.
 
-A driver that is bounded by partitions, which is the Kafka driver, admits one
-delivery per partition no matter what `Prefetch` says: the effective ceiling is
-the number of partitions assigned to the consumer, and on Kafka that is the
-partition count of each destination the subscription consumes. A subscription
-whose traffic reaches fewer partitions than it has workers cannot keep all of
-those workers supplied, and no value of `Prefetch` changes that. Raise the
-partition count, or spread the workload over more keys, when that is the limit
-you have reached.
+A partition-bound driver, which is Kafka, admits one delivery per partition
+owned by a member. The effective handler parallelism for a destination is the
+smaller of `Concurrency` and that member's assigned partition count. Priority
+weights above the assigned partition count do nothing, and `Prefetch` cannot
+raise the ceiling.
+
+When the assigned count is below the destination's resolved slot budget, Kafka
+logs one warning with `assigned_partitions`, `budget`, and `lever`. Increase
+the destination's partition count, or set `broker.kafka.maxExpectedInstances`
+to require a floor during topology setup. Raising the partition count re-maps
+keys already published to the destination, and Kafka cannot lower the count, so
+the change is a one-way capacity decision. See [Consuming events](/user-guide/consuming-events)
+for the operator-facing sizing rule.
 
 `Prefetch` is not a substitute for capacity planning. A larger value cannot
 make a hot ordered key concurrent, and it cannot make a handler that is
