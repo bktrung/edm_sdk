@@ -36,16 +36,16 @@ const (
 	// which lane fills first. The pre-change pipeline measured 64:36 here, which
 	// stays outside the band.
 	schedulingShareTolerance = 5
-	// schedulingAgeMargin is the clock step the ageing test applies per handled
-	// message: larger than the low priority's budget and far smaller than the
-	// high priority's, so exactly the low item can be promoted.
-	schedulingAgeMargin = 200 * time.Millisecond
-	// schedulingAgeBound is how many dispatches the aged low item may sit
-	// behind: the pick after the advance that ages it is the dispatch after
-	// next, and the feed can take up to two dispatches to place it in a lane.
+	// schedulingPromotionAdvance is the clock step the deadline promotion test
+	// applies per handled message: larger than the low priority's budget and far
+	// smaller than the high priority's, so exactly the low item can be promoted.
+	schedulingPromotionAdvance = 200 * time.Millisecond
+	// schedulingPromotionBound is how many dispatches the overdue low item may sit
+	// behind: the pick after the advance that makes it overdue is the dispatch
+	// after next, and the feed can take up to two dispatches to place it in a lane.
 	// Measured 3-4 over 40 runs with promotion, against 9-10 without it, where
 	// the item waits for the high slot's 8-pick deficit round instead.
-	schedulingAgeBound = 6
+	schedulingPromotionBound = 6
 )
 
 func TestRunnerSchedulerWeightedShare(t *testing.T) {
@@ -74,12 +74,12 @@ func TestRunnerSchedulerWeightedShareReversed(t *testing.T) {
 	}
 }
 
-func TestRunnerSchedulerAgesLowPriorityWork(t *testing.T) {
+func TestRunnerSchedulerPromotesOverdueLowPriorityWork(t *testing.T) {
 	fake := clock.NewFake(time.Unix(0, 0))
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	lowQueued := make(chan struct{})
-	client, err := f1.New(ctx, schedulingConfig(), f1.WithDriver(&agingDriver{
+	client, err := f1.New(ctx, schedulingConfig(), f1.WithDriver(&promotionDriver{
 		Driver:    testhook.Driver(fake),
 		lowQueued: lowQueued,
 	}), testhook.ClientOption(fake).(f1.Option))
@@ -93,7 +93,7 @@ func TestRunnerSchedulerAgesLowPriorityWork(t *testing.T) {
 	release := make(chan struct{})
 	allHighHandled := make(chan struct{})
 	var allHighOnce sync.Once
-	dispatched := make(chan f1.Priority, schedulingAgeBound)
+	dispatched := make(chan f1.Priority, schedulingPromotionBound)
 	var highHandled atomic.Int64
 	var position atomic.Int64
 	var firstOnce sync.Once
@@ -102,7 +102,7 @@ func TestRunnerSchedulerAgesLowPriorityWork(t *testing.T) {
 		f1.PriorityLow:  1,
 	}, map[f1.Priority]time.Duration{
 		f1.PriorityHigh: time.Hour,
-		f1.PriorityLow:  schedulingAgeMargin / 2,
+		f1.PriorityLow:  schedulingPromotionAdvance / 2,
 	}, func(_ context.Context, event *f1.Event) error {
 		firstOnce.Do(func() {
 			close(started)
@@ -116,13 +116,13 @@ func TestRunnerSchedulerAgesLowPriorityWork(t *testing.T) {
 				allHighOnce.Do(func() { close(allHighHandled) })
 			}
 		}
-		if position.Add(1) <= schedulingAgeBound {
+		if position.Add(1) <= schedulingPromotionBound {
 			dispatched <- event.Priority()
 		}
 		// The runner stamps EnqueuedAt from this clock, and the pick for the
 		// next dispatch happens after this handler returns. Advancing here
-		// therefore ages the low item after it is queued, before that pick.
-		fake.Advance(schedulingAgeMargin)
+		// therefore makes the low item overdue after it is queued, before that pick.
+		fake.Advance(schedulingPromotionAdvance)
 		return nil
 	})
 	// Lane capacity 8 covers the high slot's whole deficit round, so an
@@ -145,52 +145,52 @@ func TestRunnerSchedulerAgesLowPriorityWork(t *testing.T) {
 
 	timer := clock.NewReal().Timer(5 * time.Second)
 	defer timer.Stop()
-	for range schedulingAgeBound {
+	for range schedulingPromotionBound {
 		select {
 		case got := <-dispatched:
 			if got != f1.PriorityLow {
 				continue
 			}
 			if remaining := highBacklog - int(highHandled.Load()); remaining <= 0 {
-				t.Fatalf("high backlog had %d items unhandled when the aged low item ran, want the low item ahead of backlogged %d-item high work", remaining, highBacklog)
+				t.Fatalf("high backlog had %d items unhandled when the overdue low item ran, want the low item ahead of backlogged %d-item high work", remaining, highBacklog)
 			}
-			waitSchedulingSignal(t, allHighHandled, "high backlog did not drain after aged low item ran")
+			waitSchedulingSignal(t, allHighHandled, "high backlog did not drain after overdue low item ran")
 			cancel()
 			waitRunnerDone(t, runDone)
 			return
 		case err := <-runDone:
-			t.Fatalf("aged low item: Runner.Run() error = %v", err)
+			t.Fatalf("overdue low item: Runner.Run() error = %v", err)
 		case <-timer.C:
-			t.Fatal("aged item was not dispatched")
+			t.Fatal("overdue item was not dispatched")
 		}
 	}
-	t.Fatalf("aged low item was not dispatched within the first %d dispatches, want it ahead of the %d-item high backlog", schedulingAgeBound, highBacklog)
+	t.Fatalf("overdue low item was not dispatched within the first %d dispatches, want it ahead of the %d-item high backlog", schedulingPromotionBound, highBacklog)
 }
 
-type agingDriver struct {
+type promotionDriver struct {
 	driver.Driver
 	lowQueued chan struct{}
 }
 
-func (d *agingDriver) Open(ctx context.Context, cfg driver.Config) (driver.Conn, error) {
+func (d *promotionDriver) Open(ctx context.Context, cfg driver.Config) (driver.Conn, error) {
 	conn, err := d.Driver.Open(ctx, cfg)
 	if err != nil {
 		return nil, err
 	}
-	return &agingConn{Conn: conn, lowQueued: d.lowQueued}, nil
+	return &promotionConn{Conn: conn, lowQueued: d.lowQueued}, nil
 }
 
-type agingConn struct {
+type promotionConn struct {
 	driver.Conn
 	lowQueued chan struct{}
 }
 
-func (c *agingConn) Consumer(ctx context.Context, cfg driver.ConsumerConfig) (driver.Consumer, error) {
+func (c *promotionConn) Consumer(ctx context.Context, cfg driver.ConsumerConfig) (driver.Consumer, error) {
 	consumer, err := c.Conn.Consumer(ctx, cfg)
 	if err != nil {
 		return nil, err
 	}
-	return &agingConsumer{
+	return &promotionConsumer{
 		Consumer:  consumer,
 		lowQueued: c.lowQueued,
 		stopRelay: make(chan struct{}),
@@ -198,7 +198,7 @@ func (c *agingConn) Consumer(ctx context.Context, cfg driver.ConsumerConfig) (dr
 	}, nil
 }
 
-type agingConsumer struct {
+type promotionConsumer struct {
 	driver.Consumer
 	lowQueued     chan struct{}
 	lowSeen       atomic.Bool
@@ -208,7 +208,7 @@ type agingConsumer struct {
 	stopRelayOnce sync.Once
 }
 
-func (c *agingConsumer) Messages() <-chan driver.InboundMessage {
+func (c *promotionConsumer) Messages() <-chan driver.InboundMessage {
 	messages := make(chan driver.InboundMessage)
 	go func() {
 		defer close(messages)
@@ -246,7 +246,7 @@ func (c *agingConsumer) Messages() <-chan driver.InboundMessage {
 	return messages
 }
 
-func (c *agingConsumer) Stop(ctx context.Context) error {
+func (c *promotionConsumer) Stop(ctx context.Context) error {
 	if err := c.Drain(ctx); err != nil {
 		return err
 	}
@@ -255,13 +255,13 @@ func (c *agingConsumer) Stop(ctx context.Context) error {
 	return c.Consumer.Stop(ctx)
 }
 
-func (c *agingConsumer) Release(ctx context.Context) error {
+func (c *promotionConsumer) Release(ctx context.Context) error {
 	c.stopRelayOnce.Do(func() { close(c.stopRelay) })
 	<-c.relayDone
 	return c.Consumer.Release(ctx)
 }
 
-func (c *agingConsumer) drainInner() {
+func (c *promotionConsumer) drainInner() {
 	for {
 		select {
 		case message, ok := <-c.Consumer.Messages():
@@ -452,7 +452,7 @@ func schedulingSubscriptionWithMode(mode f1.Mode, weights map[f1.Priority]int, b
 		Concurrency:    1,
 		Prefetch:       64,
 		Priorities:     []f1.Priority{f1.PriorityHigh, f1.PriorityLow},
-		Fairness:       f1.FairnessConfig{Weights: weights, Budgets: budgets, DisableAging: budgets == nil, PrefetchFactor: 2},
+		Fairness:       f1.FairnessConfig{Weights: weights, Budgets: budgets, DisableDeadlinePromotion: budgets == nil, PrefetchFactor: 2},
 		Retry:          f1.RetryConfig{MaxAttempts: 1},
 		HandlerTimeout: time.Second,
 		Handlers:       map[string]f1.Handler{"orders.created": handler},

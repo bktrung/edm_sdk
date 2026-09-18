@@ -1036,7 +1036,7 @@ func newRunnerScheduler(r *Runner) (*sched.Scheduler, error) {
 			Budget: lane.budget, Capacity: lane.capacity,
 		})
 	}
-	return sched.New(specs, r.client.options.clock, !r.subscription.Fairness.DisableAging)
+	return sched.New(specs, r.client.options.clock, !r.subscription.Fairness.DisableDeadlinePromotion)
 }
 
 func schedulerLaneID(topic string, priority Priority, tier int) string {

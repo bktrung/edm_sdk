@@ -50,7 +50,7 @@ The main pure areas are:
 - [`internal/clock/`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/tree/main/internal/clock) for real and fake time;
 - [`internal/retry/`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/tree/main/internal/retry) for backoff ladders and
   retry sanity checks;
-- [`internal/sched/`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/tree/main/internal/sched) for weighted lanes, aging, and
+- [`internal/sched/`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/tree/main/internal/sched) for weighted lanes, deadline promotion, and
   fairness;
 - [`internal/dispatch/`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/tree/main/internal/dispatch) for worker routing,
   ordered keys, and the in-flight registry; and
@@ -342,7 +342,7 @@ state or error.
 
 Use [`internal/clock`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/tree/main/internal/clock) and its fake implementation when
 time is part of the behavior: retry delays, deferred delivery, acknowledgement
-deadlines, drain budgets, backoff, or scheduler aging. `f1test.Client.Advance`
+deadlines, drain budgets, backoff, or deadline promotion. `f1test.Client.Advance`
 advances the same fake clock used by the core and in-memory driver, so a test
 can release due work without waiting for wall time.
 

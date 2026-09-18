@@ -80,12 +80,12 @@ func applySubscriptionEnvironment(name string, cfg *SubscriptionConfig) error {
 		}
 		cfg.Fairness.PrefetchFactor = parsed
 	}
-	if value, ok := reads.get("fairness.disableAging"); ok {
+	if value, ok := reads.get("fairness.disableDeadlinePromotion"); ok {
 		parsed, err := strconv.ParseBool(value)
 		if err != nil {
-			return fmt.Errorf("f1: %s: %w", envKey(reads.prefix, "fairness.disableAging"), err)
+			return fmt.Errorf("f1: %s: %w", envKey(reads.prefix, "fairness.disableDeadlinePromotion"), err)
 		}
-		cfg.Fairness.DisableAging = parsed
+		cfg.Fairness.DisableDeadlinePromotion = parsed
 	}
 	for _, priority := range []Priority{PriorityHigh, PriorityMedium, PriorityLow} {
 		if value, ok := reads.get("fairness.weights." + priority.String()); ok {
@@ -205,7 +205,8 @@ func subscriptionEnvOwned(name string, tokens []string) bool {
 // replacement and a dropped key says so, because the alternative is a service
 // that keeps setting it long after it stopped doing anything.
 var subscriptionEnvRemovedKeys = []struct{ token, hint string }{
-	{"FAIRNESS_AGING_ENABLED", "fairness.agingEnabled is now fairness.disableAging and the sense is inverted: FAIRNESS_AGING_ENABLED=true is FAIRNESS_DISABLE_AGING=false"},
+	{"FAIRNESS_AGING_ENABLED", "fairness.agingEnabled is now fairness.disableDeadlinePromotion and the sense is inverted: FAIRNESS_AGING_ENABLED=true is FAIRNESS_DISABLE_DEADLINE_PROMOTION=false"},
+	{"FAIRNESS_DISABLE_AGING", "FAIRNESS_DISABLE_AGING is now FAIRNESS_DISABLE_DEADLINE_PROMOTION"},
 	{"FAIRNESS_COST_MODEL", "fairness.costModel was removed; no key replaces it"},
 	{"RETRY_JITTER", "retry.jitter was removed; no key replaces it"},
 }

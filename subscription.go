@@ -510,8 +510,8 @@ func mergeFairness(base, override FairnessConfig) FairnessConfig {
 	if override.PrefetchFactor != 0 {
 		base.PrefetchFactor = override.PrefetchFactor
 	}
-	if override.DisableAging {
-		base.DisableAging = true
+	if override.DisableDeadlinePromotion {
+		base.DisableDeadlinePromotion = true
 	}
 	return base
 }
@@ -536,7 +536,7 @@ func mergeRetry(base, override RetryConfig) RetryConfig {
 }
 
 func fairnessZero(value FairnessConfig) bool {
-	return value.Weights == nil && value.Budgets == nil && value.RetryWeightDivisor == 0 && value.PrefetchFactor == 0 && !value.DisableAging
+	return value.Weights == nil && value.Budgets == nil && value.RetryWeightDivisor == 0 && value.PrefetchFactor == 0 && !value.DisableDeadlinePromotion
 }
 
 func retryZero(value RetryConfig) bool {

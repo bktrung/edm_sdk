@@ -107,7 +107,7 @@ Read the small, portable mechanisms before the worker that composes them:
 2. [`internal/retry/`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/tree/main/internal/retry) - backoff tiers and delay
    resolution.
 3. [`internal/sched/`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/tree/main/internal/sched) - bounded weighted lanes,
-   priority, aging, and fairness.
+   priority, deadline promotion, and fairness.
 4. [`internal/dispatch/`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/tree/main/internal/dispatch) - worker pool,
    ordered-key routing, and in-flight registry behavior.
 5. [`internal/lifecycle/`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/tree/main/internal/lifecycle) - runner state and

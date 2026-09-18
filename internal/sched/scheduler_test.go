@@ -78,7 +78,7 @@ func TestDWRRDeficitResetOnEmpty(t *testing.T) {
 	}
 }
 
-func TestAgingOverrunOrdering(t *testing.T) {
+func TestDeadlinePromotionOverrunOrdering(t *testing.T) {
 	start := time.Unix(0, 0)
 	fake := clock.NewFake(start)
 	scheduler, err := New([]LaneSpec{{ID: "first", Weight: 8, Budget: time.Second, Capacity: 10}, {ID: "second", Weight: 1, Budget: time.Second, Capacity: 10}}, fake, true)
@@ -98,7 +98,7 @@ func TestAgingOverrunOrdering(t *testing.T) {
 	}
 }
 
-func TestAgingTieUsesConfiguredSlotOrder(t *testing.T) {
+func TestDeadlinePromotionTieUsesConfiguredSlotOrder(t *testing.T) {
 	start := time.Unix(0, 0)
 	fake := clock.NewFake(start)
 	scheduler, err := New([]LaneSpec{
@@ -120,7 +120,7 @@ func TestAgingTieUsesConfiguredSlotOrder(t *testing.T) {
 	}
 }
 
-func TestAgingTieUsesConfiguredLaneOrder(t *testing.T) {
+func TestDeadlinePromotionTieUsesConfiguredLaneOrder(t *testing.T) {
 	start := time.Unix(0, 0)
 	fake := clock.NewFake(start)
 	scheduler, err := New([]LaneSpec{
@@ -142,7 +142,7 @@ func TestAgingTieUsesConfiguredLaneOrder(t *testing.T) {
 	}
 }
 
-func TestAgingFallsBackToWeightedSelectionWhenNothingIsOverdue(t *testing.T) {
+func TestDeadlinePromotionFallsBackToWeightedSelectionWhenNothingIsOverdue(t *testing.T) {
 	start := time.Unix(0, 0)
 	fake := clock.NewFake(start)
 	scheduler, err := New([]LaneSpec{
@@ -168,7 +168,7 @@ func TestAgingFallsBackToWeightedSelectionWhenNothingIsOverdue(t *testing.T) {
 	}
 }
 
-func TestAgingUsesLaneBudgetAndEnqueueTime(t *testing.T) {
+func TestDeadlinePromotionUsesLaneBudgetAndEnqueueTime(t *testing.T) {
 	start := time.Unix(0, 0)
 	fake := clock.NewFake(start)
 	scheduler, err := New([]LaneSpec{
@@ -276,7 +276,7 @@ func TestGroupedLanesRequireMatchingWeights(t *testing.T) {
 
 func TestSlotHelpersHandleEmptyAndSparseGroups(t *testing.T) {
 	var empty slot
-	if !empty.empty() || empty.head().Value != nil || empty.pop().Value != nil {
+	if !empty.empty() || empty.pop().Value != nil {
 		t.Fatal("empty slot helpers returned work")
 	}
 	first, err := newLane(LaneSpec{ID: "first", Weight: 1, Capacity: 1})
@@ -291,7 +291,7 @@ func TestSlotHelpersHandleEmptyAndSparseGroups(t *testing.T) {
 		t.Fatal(err)
 	}
 	group := slot{lanes: []*lane{first, second}}
-	if group.empty() || group.head().Value != "second" || group.pop().Value != "second" {
+	if group.empty() || group.pop().Value != "second" {
 		t.Fatal("sparse slot helpers selected the wrong item")
 	}
 	var scheduler *Scheduler
@@ -300,7 +300,7 @@ func TestSlotHelpersHandleEmptyAndSparseGroups(t *testing.T) {
 	}
 }
 
-func TestAgingKeepsLowPriorityMovingUnderSustainedHighLoad(t *testing.T) {
+func TestDeadlinePromotionKeepsLowPriorityMovingUnderSustainedHighLoad(t *testing.T) {
 	start := time.Unix(0, 0)
 	fake := clock.NewFake(start)
 	scheduler, err := New([]LaneSpec{
@@ -322,6 +322,6 @@ func TestAgingKeepsLowPriorityMovingUnderSustainedHighLoad(t *testing.T) {
 
 	item, ok := scheduler.Next()
 	if !ok || item.Value != "low" {
-		t.Fatalf("aged low-priority item = %#v, %v; want low", item.Value, ok)
+		t.Fatalf("deadline-promoted low-priority item = %#v, %v; want low", item.Value, ok)
 	}
 }

@@ -357,8 +357,8 @@ func TestLoadConfigRejectsUnknownFairnessPriority(t *testing.T) {
 
 func TestLoadConfigRejectsUnknownFairnessKey(t *testing.T) {
 	t.Parallel()
-	path := writeConfig(t, "f1:\n  env: test\n  service: orders\n  broker:\n    driver: inmem\n  subscriptions:\n    orders:\n      topics: [orders]\n      fairness:\n        agingEnbaled: false\n")
-	if _, err := LoadConfig(path); err == nil || !strings.Contains(err.Error(), "agingEnbaled") {
+	path := writeConfig(t, "f1:\n  env: test\n  service: orders\n  broker:\n    driver: inmem\n  subscriptions:\n    orders:\n      topics: [orders]\n      fairness:\n        deadlinePromotionEnbaled: false\n")
+	if _, err := LoadConfig(path); err == nil || !strings.Contains(err.Error(), "deadlinePromotionEnbaled") {
 		t.Fatalf("LoadConfig() error = %v, want unknown fairness key error", err)
 	}
 }
@@ -869,6 +869,7 @@ func TestLoadConfigRejectsRemovedKeys(t *testing.T) {
 		{name: "cost model", key: "costModel", body: subscription + "      fairness:\n        costModel: count\n"},
 		{name: "retry jitter", key: "jitter", body: subscription + "      retry:\n        jitter: 0.2\n"},
 		{name: "aging enabled", key: "agingEnabled", body: subscription + "      fairness:\n        agingEnabled: false\n"},
+		{name: "deadline promotion", key: "disableAging", body: subscription + "      fairness:\n        disableAging: false\n"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			t.Parallel()
