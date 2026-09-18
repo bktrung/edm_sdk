@@ -95,7 +95,7 @@ func TestRetrySuccessorStaysInTheConsumingTopicFamily(t *testing.T) {
 	if len(producer.messages) != 1 {
 		t.Fatalf("retry copies = %d, want 1", len(producer.messages))
 	}
-	want := retryDestinationFor(client.source, "orders.created", PriorityHigh, 1, runner.subscription.Name)
+	want := "f1.test.orders.created.orders.high.retry.1"
 	foreign := retryDestinationFor(client.source, topicFor(envelope.Type), PriorityHigh, 1, runner.subscription.Name)
 	if got := producer.messages[0].Destination; got != want {
 		t.Fatalf("retry successor destination = %q, want %q; deriving from event type would have produced %q", got, want, foreign)
@@ -115,7 +115,7 @@ func TestDeadLetterSuccessorStaysInTheConsumingTopicFamily(t *testing.T) {
 	if len(producer.messages) != 1 {
 		t.Fatalf("dead-letter copies = %d, want 1", len(producer.messages))
 	}
-	want := deadLetterDestinationFor(client.source, "orders.created", runner.subscription.Name)
+	want := "f1.test.orders.created.dlq.orders"
 	foreign := deadLetterDestinationFor(client.source, topicFor(envelope.Type), runner.subscription.Name)
 	if got := producer.messages[0].Destination; got != want {
 		t.Fatalf("dead-letter successor destination = %q, want %q; deriving from event type would have produced %q", got, want, foreign)
@@ -152,7 +152,7 @@ func TestSuccessorNamesAreUnchangedWhenTopicMatchesDerivedType(t *testing.T) {
 	if !retryAndSettle(runner, context.Background(), message, envelope, errors.New("temporary")) {
 		t.Fatal("retry successor was not published and settled")
 	}
-	want := retryDestinationFor(client.source, topicFor(envelope.Type), PriorityHigh, 1, runner.subscription.Name)
+	want := "f1.test.orders.created.orders.high.retry.1"
 	if got := producer.messages[0].Destination; got != want {
 		t.Fatalf("retry successor destination = %q, want byte-identical %q", got, want)
 	}
@@ -164,7 +164,7 @@ func TestSuccessorNamesAreUnchangedWhenTopicMatchesDerivedType(t *testing.T) {
 	if !deadLetterAndSettle(deathRunner, context.Background(), message, envelope, ReasonTerminal, errors.New("terminal")) {
 		t.Fatal("dead-letter successor was not published and settled")
 	}
-	want = deadLetterDestinationFor(deathClient.source, topicFor(envelope.Type), deathRunner.subscription.Name)
+	want = "f1.test.orders.created.dlq.orders"
 	if got := deathProducer.messages[0].Destination; got != want {
 		t.Fatalf("dead-letter successor destination = %q, want byte-identical %q", got, want)
 	}
@@ -214,7 +214,7 @@ func TestSuccessorFamilyHoldsUnderPublishTimeFanout(t *testing.T) {
 	if len(producer.messages) != 1 {
 		t.Fatalf("retry copies = %d, want 1", len(producer.messages))
 	}
-	want := retryDestinationFor(client.source, "orders.created", PriorityHigh, 1, runner.subscription.Name)
+	want := "f1.test.orders.created.orders.high.retry.1"
 	foreign := retryDestinationFor(client.source, topicFor(envelope.Type), PriorityHigh, 1, runner.subscription.Name)
 	if got := producer.messages[0].Destination; got != want {
 		t.Fatalf("retry successor destination = %q, want %q; deriving from event type would have produced %q", got, want, foreign)
@@ -230,7 +230,7 @@ func TestSuccessorFamilyHoldsUnderPublishTimeFanout(t *testing.T) {
 	if len(deathProducer.messages) != 1 {
 		t.Fatalf("dead-letter copies = %d, want 1", len(deathProducer.messages))
 	}
-	want = deadLetterDestinationFor(deathClient.source, "orders.created", deathRunner.subscription.Name)
+	want = "f1.test.orders.created.dlq.orders"
 	foreign = deadLetterDestinationFor(deathClient.source, topicFor(envelope.Type), deathRunner.subscription.Name)
 	if got := deathProducer.messages[0].Destination; got != want {
 		t.Fatalf("dead-letter successor destination = %q, want %q; deriving from event type would have produced %q", got, want, foreign)
