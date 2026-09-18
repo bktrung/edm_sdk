@@ -248,12 +248,13 @@ func TestNewRefusesUnknownDriverOptions(t *testing.T) {
 		}
 	})
 }
+
 // TestRemovedKafkaOptionsFailToLoad pins the Kafka whitelist after the
 // per-consumer acknowledgement gap option was removed. A config naming it is
 // refused rather than accepted and silently ignored.
 func TestRemovedKafkaOptionsFailToLoad(t *testing.T) {
 	t.Parallel()
-	removedKey := "max" + "Ack" + "Gap"
+	removedKey := "maxAckGap"
 	path := writeConfig(t, "f1:\n  env: test\n  service: orders\n  broker:\n    driver: kafka\n    endpoints: [localhost:19092]\n    kafka:\n      "+removedKey+": 10000\n")
 	_, err := LoadConfig(path)
 	want := "f1: unknown broker.kafka." + removedKey

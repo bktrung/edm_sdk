@@ -264,7 +264,7 @@ test-driver-flip: kafka-up broker-up broker-smoke
 	go test -v -count=1 -tags integration -run TestDriverFlipAcceptance -timeout 45m ./examples/acceptance/
 
 ## test-kafka-conformance: run both Kafka conformance profiles against the fixture.
-## This takes about 250s and requires a live Kafka broker; the integration tag
+## This takes about 7 minutes and requires a live Kafka broker; the integration tag
 ## makes it required.
 test-kafka-conformance: kafka-up
 	F1_KAFKA_ENDPOINT=$${F1_KAFKA_ENDPOINT:-localhost:$(KAFKA_PORT)} go test -v -count=1 -tags integration -run TestConformance -timeout 20m ./drivers/kafka/...

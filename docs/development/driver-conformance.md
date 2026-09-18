@@ -91,8 +91,7 @@ the port alone:
   [`drivers/rabbitmq/fault_injector_test.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/drivers/rabbitmq/fault_injector_test.go).
 - `drivers/kafka/conformance_integration_test.go` adapts Kafka offsets, consumer-group
   state, deferred records, and the Kafka fault injector. Its `TestConformance`
-  is gated by `F1_KAFKA_CONFORMANCE` because the live suite is intentionally
-  explicit and long-running.
+  runs under the integration tag, like RabbitMQ's.
 
 Provider-specific tests remain necessary for broker APIs, reconnect details,
 partition or queue behavior, management-client limitations, and any adapter
