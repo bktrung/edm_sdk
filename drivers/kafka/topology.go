@@ -32,10 +32,17 @@ type kafkaTopologyPlan struct {
 type topicVisibility uint8
 
 const (
-	kafkaTopologyVisibilityTimeout                 = 5 * time.Second
-	kafkaTopologyVisibilityPoll                    = 10 * time.Millisecond
-	topicMustExist                 topicVisibility = iota
+	kafkaTopologyVisibilityPoll                 = 10 * time.Millisecond
+	topicMustExist              topicVisibility = iota
 	topicMustBeAbsent
+)
+
+var (
+	kafkaTopologyVisibilityTimeout             = 60 * time.Second
+	kafkaTopologyClock             clock.Clock = clock.NewReal()
+	kafkaTopologyListTopics                    = func(a *admin, ctx context.Context, operation string, names ...string) (kadm.TopicDetails, error) {
+		return a.listTopics(ctx, operation, names...)
+	}
 )
 
 func translateTopology(spec driver.TopologySpec) kafkaTopologyPlan {
@@ -183,17 +190,42 @@ func (a *admin) waitForTopicState(ctx context.Context, operation string, names [
 	if len(names) == 0 {
 		return nil
 	}
-	waitCtx, cancel := context.WithTimeout(ctx, kafkaTopologyVisibilityTimeout)
-	defer cancel()
-	ticker := clock.NewReal().Ticker(kafkaTopologyVisibilityPoll)
+	waitCtx, cancel := context.WithCancelCause(ctx)
+	defer cancel(nil)
+	timer := kafkaTopologyClock.Timer(kafkaTopologyVisibilityTimeout)
+	defer timer.Stop()
+	go func() {
+		select {
+		case <-timer.C:
+			cancel(context.DeadlineExceeded)
+		case <-waitCtx.Done():
+		}
+	}()
+	ticker := kafkaTopologyClock.Ticker(kafkaTopologyVisibilityPoll)
 	defer ticker.Stop()
 	state := "present"
 	if visibility == topicMustBeAbsent {
 		state = "absent"
 	}
+	waitError := func() error {
+		cause := context.Cause(waitCtx)
+		if callerErr := ctx.Err(); callerErr != nil {
+			cause = callerErr
+		}
+		if cause == nil {
+			cause = waitCtx.Err()
+		}
+		return classify(operation, driver.KindTransient, fmt.Errorf("kafka: topics %q did not become %s: %w", names, state, cause))
+	}
 	for {
-		topics, err := a.listTopics(waitCtx, operation, names...)
+		if waitCtx.Err() != nil {
+			return waitError()
+		}
+		topics, err := kafkaTopologyListTopics(a, waitCtx, operation, names...)
 		if err != nil {
+			if waitCtx.Err() != nil {
+				return waitError()
+			}
 			return err
 		}
 		visible := true
@@ -224,7 +256,7 @@ func (a *admin) waitForTopicState(ctx context.Context, operation string, names [
 		}
 		select {
 		case <-waitCtx.Done():
-			return classify(operation, driver.KindTransient, fmt.Errorf("kafka: topics did not become %s: %w", state, waitCtx.Err()))
+			return waitError()
 		case <-ticker.C:
 		}
 	}

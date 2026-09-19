@@ -240,7 +240,7 @@ test-rabbitmq-conformance: broker-up broker-smoke
 ## The integration tag selects the broker-backed files; an unreachable broker
 ## fails the run. Kafka conformance is part of the ordinary integration suite.
 test-kafka: kafka-up
-	F1_KAFKA_ENDPOINT=$${F1_KAFKA_ENDPOINT:-localhost:$(KAFKA_PORT)} go test -race -count=1 -tags integration ./drivers/kafka/...
+	F1_KAFKA_ENDPOINT=$${F1_KAFKA_ENDPOINT:-localhost:$(KAFKA_PORT)} go test -race -count=1 -tags integration -timeout 20m ./drivers/kafka/...
 
 ## test-infra: run every test that needs a broker, across both drivers, with the
 ## fixtures started first. A missing fixture fails the run rather than skipping.
@@ -250,7 +250,7 @@ test-infra: kafka-up broker-up broker-smoke
 	F1_KAFKA_ENDPOINT=$${F1_KAFKA_ENDPOINT:-localhost:$(KAFKA_PORT)} \
 	F1_ACCEPTANCE_ENDPOINT=$${F1_ACCEPTANCE_ENDPOINT:-localhost:$(KAFKA_PORT)} \
 	$(RABBITMQ_TEST_ENV) \
-	go test -count=1 -p 1 -tags integration ./...
+	go test -count=1 -p 1 -tags integration -timeout 20m ./...
 
 ## test-driver-flip: run the acceptance services against each driver with one
 ## corpus and diff the two runs. This is the driver-flip acceptance: the same
