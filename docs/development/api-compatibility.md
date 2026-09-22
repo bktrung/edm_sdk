@@ -13,8 +13,8 @@ The public compatibility surface consists of the exported API in these packages:
 The driver-specific configuration keys are also public compatibility surface:
 
 - `drivers/inmem`: no driver-specific keys.
-- `drivers/kafka`: `broker.kafka.compression`, `broker.kafka.batchLinger`, `broker.kafka.fetchMaxBytes`, `broker.kafka.sessionTimeout`, `broker.kafka.rebalanceTimeout`, `broker.kafka.staticMembership`, `broker.kafka.balancer`, and `broker.kafka.maxExpectedInstances`.
-- `drivers/rabbitmq`: `broker.rabbitmq.vhost`, `broker.rabbitmq.queueType`, `broker.rabbitmq.consumerTimeout`, `broker.rabbitmq.managementPort`, and `broker.rabbitmq.trustBrokerTimestamp`.
+- `drivers/kafka`: `broker.kafka.compression`, `broker.kafka.batchLinger`, `broker.kafka.fetchMaxBytes`, `broker.kafka.fetchMaxWait`, `broker.kafka.sessionTimeout`, `broker.kafka.rebalanceTimeout`, `broker.kafka.staticMembership`, `broker.kafka.balancer`, and `broker.kafka.maxExpectedInstances`.
+- `drivers/rabbitmq`: `broker.rabbitmq.vhost`, `broker.rabbitmq.queueType`, `broker.rabbitmq.consumerTimeout`, `broker.rabbitmq.brokerPrefetch`, `broker.rabbitmq.managementPort`, and `broker.rabbitmq.trustBrokerTimestamp`.
 
 Everything under `internal/` is private implementation detail and is not covered by this promise.
 

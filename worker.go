@@ -1863,6 +1863,15 @@ func enqueueDelivery(r *Runner, ctx context.Context, dispatch chan<- delivery, m
 	id := r.inflight.Add(message)
 	item := delivery{id: id, message: message}
 	if r.client != nil && r.client.observer != nil {
+		var messageID, correlationID string
+		for _, header := range message.Headers {
+			switch header.Key {
+			case "id":
+				messageID = string(header.Value)
+			case "f1correlationid":
+				correlationID = string(header.Value)
+			}
+		}
 		enqueuedAt, enqueuedAtSource := observerEnqueueFields(message)
 		topic, priority := runnerDestinationObservation(r, message.Destination, nil)
 		r.client.observeRecord(PointEvent{
@@ -1873,6 +1882,8 @@ func enqueueDelivery(r *Runner, ctx context.Context, dispatch chan<- delivery, m
 			ConsumerGroup:    r.subscription.Name,
 			Priority:         priority,
 			Destination:      message.Destination,
+			MessageID:        messageID,
+			CorrelationID:    correlationID,
 			DeliveryCount:    message.DeliveryCount,
 			EnqueuedAt:       enqueuedAt,
 			EnqueuedAtSource: enqueuedAtSource,

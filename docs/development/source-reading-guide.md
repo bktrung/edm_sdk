@@ -86,13 +86,14 @@ message:
 1. [`config.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/config.go) - user configuration and resolved defaults.
 2. [`broker_config.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/broker_config.go) - broker connection and driver
    configuration.
-3. [`options.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/options.go) - functional options and runtime option
+3. [`internal/kafka/drain.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/internal/kafka/drain.go) - the standard-library-only Kafka timeout rule shared by core validation and Kafka consumer admission.
+4. [`options.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/options.go) - functional options and runtime option
    resolution.
-4. [`client.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/client.go) - driver opening, topology initialization,
+5. [`client.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/client.go) - driver opening, topology initialization,
    shared producer admission, reconnect ownership, and client close.
-5. [`publisher.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/publisher.go) - publish validation, codec selection,
+6. [`publisher.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/publisher.go) - publish validation, codec selection,
    envelope construction, topic routing, and durable publication.
-6. [`envelope.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/envelope.go) again at `EncodeHeaders` - the wire
+7. [`envelope.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/envelope.go) again at `EncodeHeaders` - the wire
    boundary between core metadata and driver headers.
 
 The goal is to understand which work happens before driver publication and

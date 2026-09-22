@@ -61,14 +61,21 @@ the test covering it slow or flaky, usually both, and usually somewhere else.
 Output is the same rule: no `fmt.Print*`, no `log.*`. Structured logging goes through the
 logger the client was built with.
 
-## The core does not know about brokers
+## The core does not import broker clients
 
-`depguard` denies `drivers/**`, `franz-go` and `amqp091-go` to every package outside
-`driver/`, `drivers/`, `f1test/` and `examples/`. `make verify-agnostic` is that check on
-its own.
+`depguard` keeps `drivers/**`, `franz-go`, `amqp091-go`, and OpenTelemetry imports out
+of core packages. The core rule excludes `driver/`, `drivers/`, `f1test/`, `cmd/`,
+`examples/`, and `f1otel/`. `make verify-agnostic` is that check on its own.
 
-If a change seems to need broker knowledge in the core, the port is wrong. Widen the port.
-Do not import the broker.
+Core configuration may share a narrow, standard-library-only rule with the matching
+adapter when both sides must enforce the same scalar invariant. `internal/kafka` is
+the current example: it owns the Kafka drain-timeout bound used by core validation
+and Kafka consumer admission. It must not import a broker client or expose broker
+client types.
+
+If a change needs a broker client, a concrete driver, or broker runtime behavior in
+the core, the port is probably wrong. Widen the port or keep the behavior in the
+driver. Do not import the broker.
 
 ## Errors that cross the port
 
@@ -178,6 +185,7 @@ Say what you did not do. A gap you name is cheap. The same gap found in review i
 | `driver/driver.go` | the port: Driver, Conn, Producer, Consumer, Admin, Maintenance |
 | `driver/topology.go` | topology specs, state, diffs, prune results |
 | `driver/errors.go` | classification and the standard driver error |
+| `driver/enqueue.go` | enqueue timestamp sources and backlog sample port types |
 | `driver/conformance/` | the suite every adapter must pass |
 | `drivers/inmem/` | the reference adapter. Read it before writing a new one |
 | `f1test/` | test helpers for users of the SDK |
@@ -185,4 +193,4 @@ Say what you did not do. A gap you name is cheap. The same gap found in review i
 | `backlog_poll.go` | backlog polling and observer backlog samples |
 | `deadline_promotion.go` | deadline promotion observer events and per-lane suppression |
 | `f1otel/` | OpenTelemetry observer adapter for metrics, spans, and propagation |
-| `internal/` | clock, retry, sched, dispatch, lifecycle |
+| `internal/` | clock, retry, sched, dispatch, lifecycle, and the stdlib-only Kafka rule helper |

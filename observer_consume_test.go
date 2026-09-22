@@ -278,6 +278,77 @@ func TestObserverConsumeHandledDelivery(t *testing.T) {
 	}
 }
 
+func TestObserverDeliveryReceivedIDs(t *testing.T) {
+	rec := &consumeRecordingObserver{}
+	client := newConsumeObserverClient(t, rec)
+	sub := consumeTestSubscription("orders", func(context.Context, *Event) error {
+		return nil
+	})
+	ctx, _, _, _ := startConsumeRunner(t, client, sub)
+
+	rootID := publishConsumeOne(t, client, ctx, "root")
+	correlatedID := publishConsumeOne(t, client, ctx, "correlated", WithCorrelationID("corr-explicit"))
+
+	waitConsumeCondition(t, "delivery_received events did not arrive", func() bool {
+		records, _, _, _ := rec.snapshot()
+		count := 0
+		for _, record := range records {
+			if record.Kind == ObserverDeliveryReceived {
+				count++
+			}
+		}
+		return count >= 2
+	})
+
+	records, _, _, _ := rec.snapshot()
+	received := 0
+	for _, record := range records {
+		if record.Kind != ObserverDeliveryReceived {
+			continue
+		}
+		received++
+		switch record.MessageID {
+		case rootID:
+			if record.CorrelationID != rootID {
+				t.Fatalf("root delivery correlation = %q, want %q", record.CorrelationID, rootID)
+			}
+		case correlatedID:
+			if record.CorrelationID != "corr-explicit" {
+				t.Fatalf("explicit delivery correlation = %q, want corr-explicit", record.CorrelationID)
+			}
+		default:
+			t.Fatalf("delivery_received MessageID = %q, want %q or %q", record.MessageID, rootID, correlatedID)
+		}
+	}
+	if received != 2 {
+		t.Fatalf("delivery_received count = %d, want 2", received)
+	}
+}
+
+func TestObserverDeliveryReceivedIDsMissingHeaders(t *testing.T) {
+	rec := &consumeRecordingObserver{}
+	_, runner, _ := successorObserverRunner(t, nil, rec, nil)
+	runner.inflight = newInflightRegistry()
+	dispatch := make(chan delivery, 1)
+	if !enqueueDelivery(runner, context.Background(), dispatch, driver.InboundMessage{}) {
+		t.Fatal("enqueueDelivery returned false")
+	}
+	item := <-dispatch
+	runner.inflight.Remove(item.id)
+
+	records, _, _, _ := rec.snapshot()
+	for _, record := range records {
+		if record.Kind != ObserverDeliveryReceived {
+			continue
+		}
+		if record.MessageID != "" || record.CorrelationID != "" {
+			t.Fatalf("delivery_received identity = %q/%q, want empty fields", record.MessageID, record.CorrelationID)
+		}
+		return
+	}
+	t.Fatal("no delivery_received event")
+}
+
 type ctxValueConsumeObserver struct {
 	consumeRecordingObserver
 	key   any
