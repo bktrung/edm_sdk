@@ -28,7 +28,7 @@ func BenchmarkSchedulerNext(b *testing.B) {
 					scheduler, remaining = newBenchmarkScheduler(test.promoteOverdue, test.overdue)
 					b.StartTimer()
 				}
-				if _, ok := scheduler.Next(); !ok {
+				if _, _, ok := scheduler.Next(); !ok {
 					b.Fatal("scheduler unexpectedly empty")
 				}
 				remaining--
