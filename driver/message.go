@@ -48,8 +48,14 @@ type InboundMessage struct {
 	// the broker does not provide this information.
 	DeliveryCount int
 	ReceivedAt    time.Time // time received by the driver
-	Ref           BrokerRef // broker reference for this delivery
-	Settle        Settler   // finishes this delivery exactly once
+	// EnqueuedAt is the time the broker or producer enqueued the event. Its zero
+	// value means the enqueue time is unknown.
+	EnqueuedAt time.Time
+	// EnqueuedAtSource identifies the source of EnqueuedAt. Its zero value means
+	// the source is unknown. source=producer is the event's creation time; on a retry or DLQ copy it includes all earlier attempts.
+	EnqueuedAtSource EnqueueSource
+	Ref              BrokerRef // broker reference for this delivery
+	Settle           Settler   // finishes this delivery exactly once
 }
 
 // Header is one key/value metadata item sent with a broker message.

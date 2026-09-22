@@ -118,6 +118,7 @@ type Runner struct {
 	recordedFailure       bool
 	inflight              *inflightRegistry
 	retryDestinationTiers map[string]int
+	destinationMetadata   map[string]destinationMetadata
 	lifecycle             *lifecycle.Machine
 
 	// prefetchConfigured records whether the caller named an in-flight budget
@@ -180,7 +181,8 @@ func runnerNotifyError(r *Runner, parent context.Context, event *Event, cause er
 	if !group.TryGo(func() (err error) {
 		defer func() {
 			if recovered := recover(); recovered != nil {
-				logger.Warn("f1 error handler panicked", "panic", recovered)
+				logger.LogAttrs(parent, slog.LevelWarn, "f1 error handler panicked",
+					slog.Any("panic", recovered))
 			}
 		}()
 		ctx, cancel := context.WithTimeout(parent, terminalNotificationTimeout)
@@ -188,7 +190,9 @@ func runnerNotifyError(r *Runner, parent context.Context, event *Event, cause er
 		handler(ctx, event, cause)
 		return nil
 	}) {
-		logger.Error("f1 error handler notification dropped", "subscription", r.subscription.Name, "cause", cause)
+		logger.LogAttrs(parent, slog.LevelError, "f1 error handler notification dropped",
+			slog.String("subscription", r.subscription.Name),
+			slog.Any("cause", cause))
 	}
 }
 
@@ -219,7 +223,9 @@ func notifyOwned(parent context.Context, callback func(context.Context), group *
 		defer close(done)
 		defer func() {
 			if recovered := recover(); recovered != nil {
-				logger.Warn("f1 terminal notification panicked", "kind", kind, "panic", recovered)
+				logger.LogAttrs(parent, slog.LevelWarn, "f1 terminal notification panicked",
+					slog.String("kind", kind),
+					slog.Any("panic", recovered))
 			}
 		}()
 		callback(ctx)
@@ -229,7 +235,9 @@ func notifyOwned(parent context.Context, callback func(context.Context), group *
 		select {
 		case <-done:
 		case <-ctx.Done():
-			logger.Warn("f1 terminal notification timed out", "kind", kind, "timeout", terminalNotificationTimeout)
+			logger.LogAttrs(parent, slog.LevelWarn, "f1 terminal notification timed out",
+				slog.String("kind", kind),
+				slog.Duration("timeout", terminalNotificationTimeout))
 		}
 		cancel()
 		return nil
@@ -320,15 +328,19 @@ func resolveSubscription(c *Client, sub Subscription) (resolved SubscriptionConf
 		prefetchConfigured = prefetchConfigured || loaded.presence.Prefetch
 		overlayLoadedSubscription(&resolved, loaded)
 	}
-	if _, ok := lookupSubscriptionEnv(subscriptionEnvPrefix(sub.Name), "prefetch"); ok {
-		prefetchConfigured = true
-	}
 	if err = applySubscriptionEnvironment(sub.Name, &resolved); err != nil {
 		return SubscriptionConfig{}, false, err
 	}
 	overlayExplicitSubscription(&resolved, sub)
+	if _, ok := lookupSubscriptionEnv(subscriptionEnvPrefix(sub.Name), "prefetch"); ok {
+		prefetchConfigured = prefetchConfigured || resolved.Prefetch != 0
+	}
 	if resolved.Prefetch == 0 {
 		resolved.Prefetch = resolvePrefetch(resolved.Prefetch, c.config.Broker.DefaultPrefetch)
+	}
+	if !prefetchConfigured {
+		lanes := subscriptionLaneCount(len(resolved.Topics), len(resolved.Priorities), resolved.Retry)
+		resolved.Prefetch = max(resolved.Prefetch, lanes)
 	}
 	return resolved, prefetchConfigured, nil
 }
@@ -443,8 +455,7 @@ func validateSubscription(cfg Config, driverName, name string, sub SubscriptionC
 	if err := validateRetryConfig("subscriptions."+name+".retry", sub.Retry); err != nil {
 		return err
 	}
-	tiers := retryTiers(sub.Retry)
-	lanes := len(sub.Topics) * len(sub.Priorities) * (1 + tiers)
+	lanes := subscriptionLaneCount(len(sub.Topics), len(sub.Priorities), sub.Retry)
 	if err := validatePrefetch(name, sub.Prefetch, lanes); err != nil {
 		return err
 	}

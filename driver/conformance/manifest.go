@@ -25,6 +25,7 @@ var groupManifest = []manifestEntry{
 	{name: "topology", declared: 19},
 	{name: "capability", declared: 27},
 	{name: "lag", declared: 5},
+	{name: "enqueue", declared: 6},
 }
 
 // pendingGroups lists groups without registered runners.

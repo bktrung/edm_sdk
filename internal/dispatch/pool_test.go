@@ -53,6 +53,31 @@ func TestOrderedPoolKeepsEqualKeysOnOneWorker(t *testing.T) {
 	}
 }
 
+func TestPoolBoundsOrderedBuffer(t *testing.T) {
+	const concurrency = 2
+	queueSize := MaxOrderedBufferEntries / concurrency
+	if queueSize*concurrency != MaxOrderedBufferEntries {
+		t.Fatalf("MaxOrderedBufferEntries = %d, want an even value", MaxOrderedBufferEntries)
+	}
+
+	if pool, err := NewPool(context.Background(), concurrency, true, queueSize+1); err == nil {
+		pool.Close()
+		t.Fatal("ordered pool above the buffer bound must fail")
+	}
+
+	ordered, err := NewPool(context.Background(), concurrency, true, queueSize)
+	if err != nil {
+		t.Fatalf("ordered pool at the buffer bound failed: %v", err)
+	}
+	ordered.Close()
+
+	unordered, err := NewPool(context.Background(), concurrency, false, queueSize)
+	if err != nil {
+		t.Fatalf("unordered pool at the ordered buffer bound failed: %v", err)
+	}
+	unordered.Close()
+}
+
 func TestQueueIndexKeepsHighBitHashInRange(t *testing.T) {
 	const (
 		queueCount    uint32 = 4

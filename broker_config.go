@@ -44,7 +44,7 @@ func (b *rawBroker) UnmarshalYAML(value *yaml.Node) error {
 	}{
 		Driver: b.Driver, Endpoints: b.Endpoints, ConnectTimeout: b.ConnectTimeout,
 		MaxReconnectAttempts: b.MaxReconnectAttempts, DefaultPrefetch: b.DefaultPrefetch,
-		TLS:   rawTLS{Enabled: b.TLS.Enabled, CAFile: b.TLS.CAFile, CertFile: b.TLS.CertFile, KeyFile: b.TLS.KeyFile, InsecureSkipVerify: b.TLS.InsecureSkipVerify},
+		TLS:   rawTLS{Enabled: b.TLS.Enabled, CAFile: b.TLS.CAFile, CertFile: b.TLS.CertFile, KeyFile: b.TLS.KeyFile, ServerName: b.TLS.ServerName, InsecureSkipVerify: b.TLS.InsecureSkipVerify},
 		SASL:  rawSASL{Mechanism: b.SASL.Mechanism, Username: b.SASL.Username, Password: b.SASL.Password},
 		Kafka: optionSubset(b.DriverOptions, "kafka."), RabbitMQ: optionSubset(b.DriverOptions, "rabbitmq."),
 	}
@@ -124,11 +124,12 @@ type rawTLS struct {
 	CAFile             string `yaml:"caFile"`
 	CertFile           string `yaml:"certFile"`
 	KeyFile            string `yaml:"keyFile"`
+	ServerName         string `yaml:"serverName"`
 	InsecureSkipVerify bool   `yaml:"insecureSkipVerify"`
 }
 
 func (r rawTLS) config() driver.TLSConfig {
-	return driver.TLSConfig{Enabled: r.Enabled, CAFile: r.CAFile, CertFile: r.CertFile, KeyFile: r.KeyFile, InsecureSkipVerify: r.InsecureSkipVerify}
+	return driver.TLSConfig{Enabled: r.Enabled, CAFile: r.CAFile, CertFile: r.CertFile, KeyFile: r.KeyFile, ServerName: r.ServerName, InsecureSkipVerify: r.InsecureSkipVerify}
 }
 
 type rawSASL struct {
@@ -143,7 +144,7 @@ func (r rawSASL) config() driver.SASLConfig {
 
 func validKafkaOption(key string) bool {
 	switch key {
-	case "compression", "batchLinger", "fetchMaxBytes", "sessionTimeout", "rebalanceTimeout", "staticMembership", "balancer", "maxExpectedInstances":
+	case "compression", "batchLinger", "fetchMaxBytes", "fetchMaxWait", "sessionTimeout", "rebalanceTimeout", "staticMembership", "balancer", "maxExpectedInstances":
 		return true
 	}
 	return false
@@ -151,7 +152,7 @@ func validKafkaOption(key string) bool {
 
 func validRabbitMQOption(key string) bool {
 	switch key {
-	case "vhost", "queueType", "consumerTimeout", "managementPort":
+	case "vhost", "queueType", "consumerTimeout", "managementPort", "trustBrokerTimestamp", "brokerPrefetch":
 		return true
 	}
 	return false

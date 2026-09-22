@@ -20,6 +20,21 @@ func (f HandlerFunc) Handle(ctx context.Context, event *Event) error {
 	return f(ctx, event)
 }
 
+// Typed adapts a typed payload function to a Handler. On success, it decodes
+// the payload into T and calls fn with the same *Event a plain Handler would
+// receive, so the event ID, attempt and idempotency key remain reachable. On a
+// decode failure, Typed returns a terminal error so the delivery reaches the
+// dead-letter destination on the first attempt instead of being retried.
+func Typed[T any](fn func(context.Context, *Event, T) error) Handler {
+	return HandlerFunc(func(ctx context.Context, event *Event) error {
+		var payload T
+		if err := event.Decode(&payload); err != nil {
+			return Terminal(err)
+		}
+		return fn(ctx, event, payload)
+	})
+}
+
 // Middleware wraps a Handler in the Client's dispatch chain.
 type Middleware func(Handler) Handler
 

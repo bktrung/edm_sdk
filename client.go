@@ -59,11 +59,19 @@ type Client struct {
 	limits         Limits
 	effective      driver.Capabilities
 	options        clientOptions
-	driverName     string
-	config         Config
-	source         string
-	producer       string
-	producerHandle driver.Producer
+	observer       Observer
+	traceInjector  TraceInjector
+	observerPanics map[ObserverKind]struct{}
+	// backlogPollInterval is the resolved poll interval. Zero never survives
+	// New: zero becomes 15s and a negative value disables the loop.
+	backlogPollInterval time.Duration
+	driverName          string
+	serverAddress       string
+	serverPort          int
+	config              Config
+	source              string
+	producer            string
+	producerHandle      driver.Producer
 
 	mu sync.Mutex
 	// lifecycle is the client's lifecycle, stored rather than derived from a
@@ -146,6 +154,13 @@ func New(ctx context.Context, cfg Config, opts ...Option) (*Client, error) {
 			return nil, err
 		}
 	}
+	backlogPollInterval := options.backlogPollInterval
+	if backlogPollInterval == 0 {
+		backlogPollInterval = 15 * time.Second
+	} else if backlogPollInterval > 0 && backlogPollInterval < time.Second {
+		return nil, fmt.Errorf("f1: WithBacklogPollInterval requires at least 1s, got %v", backlogPollInterval)
+	}
+	options.backlogPollInterval = backlogPollInterval
 	if options.driver == nil {
 		return nil, fmt.Errorf("f1: New requires WithDriver")
 	}
@@ -176,21 +191,34 @@ func New(ctx context.Context, cfg Config, opts ...Option) (*Client, error) {
 	}
 	supervisorCtx, supervisorCancel := context.WithCancel(context.Background())
 	client := &Client{
-		current:           currentConnection{conn: connection, epoch: 1},
-		lifecycle:         lifecycle.New(),
-		effective:         effective,
-		options:           options,
-		driverName:        driverName,
-		config:            cfg,
-		source:            fmt.Sprintf("/%s/%s", cfg.Env, cfg.Service),
-		producer:          fmt.Sprintf("%s/unknown/%s", cfg.Service, cfg.InstanceID),
-		reconnectRequests: make(chan reconnectRequest, 1),
-		reconnectRandom:   rand.Float64,
-		supervisorCtx:     supervisorCtx,
-		supervisorCancel:  supervisorCancel,
-		supervisorDone:    make(chan struct{}),
-		attemptEnded:      make(chan struct{}),
-		runners:           make(map[*Runner]struct{}),
+		current:             currentConnection{conn: connection, epoch: 1},
+		lifecycle:           lifecycle.New(),
+		effective:           effective,
+		options:             options,
+		observer:            options.observer,
+		backlogPollInterval: backlogPollInterval,
+		driverName:          driverName,
+		config:              cfg,
+		source:              fmt.Sprintf("/%s/%s", cfg.Env, cfg.Service),
+		producer:            fmt.Sprintf("%s/unknown/%s", cfg.Service, cfg.InstanceID),
+		reconnectRequests:   make(chan reconnectRequest, 1),
+		reconnectRandom:     rand.Float64,
+		supervisorCtx:       supervisorCtx,
+		supervisorCancel:    supervisorCancel,
+		supervisorDone:      make(chan struct{}),
+		attemptEnded:        make(chan struct{}),
+		runners:             make(map[*Runner]struct{}),
+	}
+	if client.observer != nil {
+		client.observerPanics = make(map[ObserverKind]struct{})
+		if injector, ok := client.observer.(TraceInjector); ok {
+			client.traceInjector = injector
+		}
+		if len(cfg.Broker.Endpoints) > 0 {
+			host, port := endpointAddress(cfg.Broker.Endpoints[0])
+			client.serverAddress = host
+			client.serverPort = port
+		}
 	}
 	client.limits = limitsFor(driverName, connection.BrokerInfo(), effective)
 	// The client owns a connection from here, so its lifecycle leaves the
@@ -204,6 +232,15 @@ func New(ctx context.Context, cfg Config, opts ...Option) (*Client, error) {
 		supervisorCancel()
 		closeErr := connection.Close(ctx)
 		return nil, errors.Join(err, closeErr)
+	}
+	if client.observer != nil {
+		client.observeRecord(PointEvent{
+			Kind:          ObserverDriverSelected,
+			At:            client.options.clock.Now(),
+			DriverName:    driverName,
+			ServerAddress: client.serverAddress,
+			ServerPort:    client.serverPort,
+		})
 	}
 	go client.reconnectSupervisor()
 	return client, nil

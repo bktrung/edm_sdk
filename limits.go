@@ -121,13 +121,36 @@ func limitsFor(driverName string, info driver.BrokerInfo, caps driver.Capabiliti
 	// against the folklore that a delay is roughly honoured.
 	nativeDelay := feature("native_delay", caps.NativeDelay, FeatureEmulated)
 	nativeDelay.Detail = delayAccuracyDetail(caps.DelayAccuracy)
+	perMessageAck := feature("per_message_ack", caps.PerMessageAck, FeatureEmulated)
+	if caps.PerMessageAck {
+		perMessageAck.Detail = "the broker settles each message independently, so a slow message does not hold its lane's in-flight budget"
+	} else {
+		perMessageAck.Detail = "the core settles each message itself; settlement order is the core's, so a slow message holds its lane's in-flight budget"
+	}
+	priorityFairness := FeatureStatus{
+		Feature: "priority_fairness",
+		Mode:    FeatureEmulated,
+		Detail:  "the core's scheduler substitutes weighted lanes, so fairness is per lane and not per broker",
+	}
+	deliveryCount := feature("delivery_count", caps.NativeDeliveryCount, FeatureEmulated)
+	if caps.NativeDeliveryCount {
+		deliveryCount.Detail = "the broker supplies a redelivery count to observer events, but handler code reads the core's one-based attempt count instead"
+	} else {
+		deliveryCount.Detail = "the core counts handler attempts in the envelope; retry copies increment that count, broker redeliveries do not, and a new publish resets it to one"
+	}
+	dlqBackstop := feature("dlq_backstop", caps.NativeDLQ, FeatureUnavailable)
+	if caps.NativeDLQ {
+		dlqBackstop.Detail = "the broker routes an exhausted message to its dead-letter destination; the core also has a successor publish path, but this feature reports only broker-native dead-letter routing"
+	} else {
+		dlqBackstop.Detail = "the core's dead-letter path publishes a successor and settles the source after publication; this feature reports only broker-native dead-letter routing"
+	}
 	return Limits{Driver: driverName, Broker: info.Display(), Features: []FeatureStatus{
-		feature("per_message_ack", caps.PerMessageAck, FeatureEmulated),
+		perMessageAck,
 		feature("ordered_by_key", caps.OrderedByKey, FeatureUnavailable),
-		{Feature: "priority_fairness", Mode: FeatureEmulated},
+		priorityFairness,
 		nativeDelay,
-		feature("delivery_count", caps.NativeDeliveryCount, FeatureEmulated),
-		feature("dlq_backstop", caps.NativeDLQ, FeatureUnavailable),
+		deliveryCount,
+		dlqBackstop,
 		feature("lag_metrics", caps.LagQueryable, FeatureUnavailable),
 		{Feature: "consumer_scaling", Mode: FeatureNative, Detail: caps.ConsumerScaling.String()},
 	}}
