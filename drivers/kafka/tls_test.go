@@ -50,3 +50,23 @@ func TestOpenRefusesInsecureTLSOffLoopback(t *testing.T) {
 	})
 	assertFatalOpenError(t, err, "insecure TLS is only allowed for a test endpoint")
 }
+
+func TestMakeTLSConfigUsesConfiguredServerName(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		serverName string
+	}{
+		{name: "configured", serverName: "broker.alias.example"},
+		{name: "empty"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			config, err := makeTLSConfig(&driver.TLSConfig{ServerName: test.serverName})
+			if err != nil {
+				t.Fatalf("makeTLSConfig() error = %v", err)
+			}
+			if config.ServerName != test.serverName {
+				t.Fatalf("tls.Config.ServerName = %q, want %q", config.ServerName, test.serverName)
+			}
+		})
+	}
+}

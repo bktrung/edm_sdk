@@ -222,37 +222,38 @@ func (a *admin) waitForTopicState(ctx context.Context, operation string, names [
 			return waitError()
 		}
 		topics, err := kafkaTopologyListTopics(a, waitCtx, operation, names...)
-		if err != nil {
-			if waitCtx.Err() != nil {
-				return waitError()
-			}
-			return err
+		if err != nil && waitCtx.Err() != nil {
+			return waitError()
 		}
-		visible := true
-		for _, name := range names {
-			detail, ok := topics[name]
-			present, known := false, true
-			if ok && detail.Err == nil {
-				present = visibility == topicMustBeAbsent || len(detail.Partitions) > 0
-			} else if ok && detail.Err != nil {
-				switch {
-				case errors.Is(detail.Err, kerr.UnknownTopicOrPartition),
-					errors.Is(detail.Err, kerr.UnknownTopicID):
-					present = false
-				case kafkaErrorKind(detail.Err) == driver.KindTransient:
-					known = false
-				default:
-					return classifyAdminError(operation, detail.Err)
+		if err == nil {
+			visible := true
+			for _, name := range names {
+				detail, ok := topics[name]
+				present, known := false, true
+				if ok && detail.Err == nil {
+					present = visibility == topicMustBeAbsent || len(detail.Partitions) > 0
+				} else if ok && detail.Err != nil {
+					switch {
+					case errors.Is(detail.Err, kerr.UnknownTopicOrPartition),
+						errors.Is(detail.Err, kerr.UnknownTopicID):
+						present = false
+					case kafkaErrorKind(detail.Err) == driver.KindTransient:
+						known = false
+					default:
+						return classifyAdminError(operation, detail.Err)
+					}
+				}
+				wantPresent := visibility == topicMustExist
+				if !known || present != wantPresent {
+					visible = false
+					break
 				}
 			}
-			wantPresent := visibility == topicMustExist
-			if !known || present != wantPresent {
-				visible = false
-				break
+			if visible {
+				return nil
 			}
-		}
-		if visible {
-			return nil
+		} else if kind, _ := driver.Classify(err); kind != driver.KindTransient {
+			return err
 		}
 		select {
 		case <-waitCtx.Done():

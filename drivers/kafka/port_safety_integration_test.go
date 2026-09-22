@@ -190,11 +190,11 @@ const (
 	// partition's deliveries are spaced by this hold rather than by the whole
 	// destination's partition count.
 	portCooperativeWork = 150 * time.Millisecond
-	// portCooperativeClockJitter is the bounded scheduling allowance for a
-	// wall-clock trace around the callback event. The revoke-list assertion is
-	// the exact protocol discriminator; this allowance only avoids turning a
-	// handler-sized interval into a flaky failure on a loaded test host.
-	portCooperativeClockJitter = 25 * time.Millisecond
+	// portCooperativeClockJitter is the scheduling allowance for a wall-clock
+	// trace around the callback event. Ten runs observed a maximum kept gap of
+	// 157ms and join durations from 843ms to 848ms; 100ms puts the bound above
+	// that scheduling tail while keeping it below the measured join duration.
+	portCooperativeClockJitter = 100 * time.Millisecond
 	// portCooperativeWarmup is how many deliveries each partition of the
 	// destination has handed over before the test joins the second consumer. A
 	// partition needs two arrivals before the join to have a gap at all.
@@ -936,6 +936,7 @@ func TestPortCooperativeKeepsRetainedPartitionsDelivering(t *testing.T) {
 	// that confirms the cooperative round completed; the holder's revoke
 	// notification is the driver's observable rebalance boundary for its kept
 	// partitions.
+	joiningAt := clk.Now()
 	joiner := fixture.subscribe(t, fixture.consumerConfig(fixture.group, fixture.partitions))
 	joinerFirst := make(chan time.Time, 1)
 	joinerPump := joiner.pump(func(message driver.InboundMessage) {
@@ -988,12 +989,13 @@ func TestPortCooperativeKeepsRetainedPartitionsDelivering(t *testing.T) {
 			worst = gap
 		}
 	}
+	joinDuration := boundary.Sub(joiningAt)
+	t.Logf("port-metrics test=cooperative-kept kept=%d revoked=%d max-gap-ms=%d join-ms=%d",
+		len(kept), len(givenUp), worst.Milliseconds(), joinDuration.Milliseconds())
 	if bound := portCooperativeWork + portCooperativeClockJitter; worst > bound {
 		t.Fatalf("a kept partition waited %s between its last delivery before the join and its first one after it, want at most one %s handler time plus %s trace jitter (%s): the cooperative member must keep delivering across the rebalance",
 			worst, portCooperativeWork, portCooperativeClockJitter, bound)
 	}
-	t.Logf("port-metrics test=cooperative-kept kept=%d revoked=%d max-gap-ms=%d",
-		len(kept), len(givenUp), worst.Milliseconds())
 	ledger.metrics(t, "cooperative-kept", sequences, firstDelivery)
 	holder.notifications.assertNoFatal(t)
 	joiner.notifications.assertNoFatal(t)

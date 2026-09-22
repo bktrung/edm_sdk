@@ -1769,6 +1769,7 @@ func TestConsumerLostDropsImmediatelyWithoutWaiting(t *testing.T) {
 		client:                newRevokeTestConsumerClient(t),
 		errors:                make(chan error, 2),
 		rebalanceDrainTimeout: 5 * time.Second,
+		clock:                 clock.NewReal(),
 		trackers:              map[partitionKey]*ackTracker{key: tracker},
 		owned:                 map[partitionKey]bool{key: true},
 		settlers:              make(map[*settler]struct{}),
@@ -1957,6 +1958,7 @@ func TestConsumerOnePartitionChangeDoesNotResetDestinationAccounting(t *testing.
 		unsettled:    map[string]int{"topic": 7},
 		budgets:      map[string]int{"topic": 10},
 		pauseReasons: make(map[string]pauseReasonSet),
+		clock:        clock.NewReal(),
 	}
 
 	// Drop only partition 0.
@@ -1980,7 +1982,7 @@ func TestConsumerOnePartitionChangeDoesNotResetDestinationAccounting(t *testing.
 func TestConsumerNotificationDoesNotDisplaceQueuedFailure(t *testing.T) {
 	fatalCause := errors.New("fatal consumer failure")
 	const errorCapacity = 8
-	c := &consumer{errors: make(chan error, errorCapacity)}
+	c := &consumer{errors: make(chan error, errorCapacity), clock: clock.NewReal()}
 	c.sendError(classify("consumer", driver.KindFatal, fatalCause))
 	for sequence := range errorCapacity - 1 {
 		c.sendError(classify("consumer", driver.KindTransient, fmt.Errorf("transient consumer failure %d", sequence)))
@@ -2373,6 +2375,7 @@ func TestConsumerLeaveSelectsMembershipPath(t *testing.T) {
 				staticMembership: tc.static,
 				instanceID:       tc.instanceID,
 				errors:           make(chan error, 1),
+				clock:            clock.NewReal(),
 				leaveRequestC:    make(chan struct{}, 1),
 				leaveStopC:       make(chan struct{}),
 				leaveFinished:    make(chan struct{}),
@@ -2439,6 +2442,7 @@ func TestConsumerLeaveTeardownCancelsBoundedOperation(t *testing.T) {
 		conn:                  connection,
 		client:                client,
 		group:                 "group",
+		clock:                 clock.NewReal(),
 		destinations:          []string{"topic"},
 		budgets:               map[string]int{"topic": 1},
 		errors:                make(chan error, 1),
