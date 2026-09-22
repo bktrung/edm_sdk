@@ -140,7 +140,10 @@ type GroupResult struct {
 	Skipped  []CheckSkip
 }
 
-// CheckSkip records an explicitly fixture-gated check that did not run.
+// CheckSkip records a check the harness's declared conditions gate before marking its
+// subtest skipped. It distinguishes an intentional result, such as an absent
+// fixture or a deferral model the check does not apply to, from t.Skip used to
+// pad a group while still satisfying its manifest count.
 type CheckSkip struct {
 	Name   string
 	Reason string

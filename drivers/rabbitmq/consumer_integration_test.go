@@ -580,7 +580,15 @@ func TestNewConsumerRollsBackAfterLateFailure(t *testing.T) {
 		t.Fatalf("Purge: %v", err)
 	}
 	missing := queue + ".missing"
-	_, _ = maintenance.Prune(context.Background(), []string{missing})
+	results, err := maintenance.Prune(context.Background(), []string{missing})
+	if err != nil {
+		t.Logf("cleanup %q: prune: %v", missing, err)
+	}
+	for _, result := range results {
+		if !result.Deleted {
+			t.Logf("cleanup %q: prune kept %q: %s", missing, result.Name, result.Reason)
+		}
+	}
 
 	laneReady := make(chan struct{})
 	builtC := make(chan *consumer, 1)

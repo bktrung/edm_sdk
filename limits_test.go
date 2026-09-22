@@ -120,6 +120,86 @@ func TestLimitsRendersUndeclaredDelayAccuracy(t *testing.T) {
 	}
 }
 
+func TestLimitsReportsCoreFeatureDetails(t *testing.T) {
+	t.Parallel()
+
+	const (
+		emulatedPerMessageAck  = "the core settles each message itself; settlement order is the core's, so a slow message holds its lane's in-flight budget"
+		nativePerMessageAck    = "the broker settles each message independently, so a slow message does not hold its lane's in-flight budget"
+		emulatedDeliveryCount  = "the core counts handler attempts in the envelope; retry copies increment that count, broker redeliveries do not, and a new publish resets it to one"
+		nativeDeliveryCount    = "the broker supplies a redelivery count to observer events, but handler code reads the core's one-based attempt count instead"
+		emulatedDLQBackstop    = "the core's dead-letter path publishes a successor and settles the source after publication; this feature reports only broker-native dead-letter routing"
+		nativeDLQBackstop      = "the broker routes an exhausted message to its dead-letter destination; the core also has a successor publish path, but this feature reports only broker-native dead-letter routing"
+		priorityFairnessDetail = "the core's scheduler substitutes weighted lanes, so fairness is per lane and not per broker"
+	)
+	tests := []struct {
+		name       string
+		feature    string
+		caps       driver.Capabilities
+		wantMode   FeatureMode
+		wantDetail string
+	}{
+		{
+			name:       "per message ack emulated",
+			feature:    "per_message_ack",
+			wantMode:   FeatureEmulated,
+			wantDetail: emulatedPerMessageAck,
+		},
+		{
+			name:       "per message ack native",
+			feature:    "per_message_ack",
+			caps:       driver.Capabilities{PerMessageAck: true},
+			wantMode:   FeatureNative,
+			wantDetail: nativePerMessageAck,
+		},
+		{
+			name:       "delivery count emulated",
+			feature:    "delivery_count",
+			wantMode:   FeatureEmulated,
+			wantDetail: emulatedDeliveryCount,
+		},
+		{
+			name:       "delivery count native",
+			feature:    "delivery_count",
+			caps:       driver.Capabilities{NativeDeliveryCount: true},
+			wantMode:   FeatureNative,
+			wantDetail: nativeDeliveryCount,
+		},
+		{
+			name:       "dead letter backstop unavailable",
+			feature:    "dlq_backstop",
+			wantMode:   FeatureUnavailable,
+			wantDetail: emulatedDLQBackstop,
+		},
+		{
+			name:       "dead letter backstop native",
+			feature:    "dlq_backstop",
+			caps:       driver.Capabilities{NativeDLQ: true},
+			wantMode:   FeatureNative,
+			wantDetail: nativeDLQBackstop,
+		},
+		{
+			name:       "priority fairness always emulated",
+			feature:    "priority_fairness",
+			caps:       driver.Capabilities{PerMessageAck: true, NativeDeliveryCount: true, NativeDLQ: true},
+			wantMode:   FeatureEmulated,
+			wantDetail: priorityFairnessDetail,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			status := featureStatus(reportedLimits(t, test.caps), test.feature)
+			if status.Mode != test.wantMode {
+				t.Errorf("%s mode = %v, want %v", test.feature, status.Mode, test.wantMode)
+			}
+			if status.Detail != test.wantDetail {
+				t.Errorf("%s detail = %q, want %q", test.feature, status.Detail, test.wantDetail)
+			}
+		})
+	}
+}
+
 func TestStrictPortabilityWithdrawsDelayAccuracy(t *testing.T) {
 	t.Parallel()
 

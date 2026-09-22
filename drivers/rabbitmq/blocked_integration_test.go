@@ -125,12 +125,24 @@ func memoryWatermark(t *testing.T, container string) string {
 }
 
 // raiseMemoryAlarm puts the fixture under a memory alarm and returns a function
-// that lifts it again by restoring the watermark it replaced. The restore is
-// idempotent because the test's cleanup and its stuck-publish guard both call
-// it, and only one of them may act.
+// that lifts it again by restoring the configured watermark it replaces. The
+// restore is idempotent because the test's cleanup and its stuck-publish guard
+// both call it, and only one of them may act.
 func raiseMemoryAlarm(t *testing.T, container string) func() {
 	t.Helper()
 	original := memoryWatermark(t, container)
+	// A killed run can leave the fixture at alarmWatermark; restoring that value
+	// would leave every later test blocked under the same alarm.
+	if original == alarmWatermark {
+		var err error
+		original, err = configuredMemoryWatermark(container)
+		if err != nil {
+			t.Fatalf("reading configured RabbitMQ memory watermark: %v", err)
+		}
+		if original == alarmWatermark {
+			t.Fatal("configured RabbitMQ memory watermark is the alarm watermark")
+		}
+	}
 	var once sync.Once
 	restore := func() {
 		once.Do(func() {

@@ -18,6 +18,7 @@ import (
 
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/driver"
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/clock"
+	kafkarules "fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/kafka"
 )
 
 type pauseReason string
@@ -153,7 +154,11 @@ type consumer struct {
 	headTimerChanged      chan struct{}
 	// offsetMu serializes CommitOffsetsSync with SetOffsets because franz-go
 	// forbids those operations from running concurrently.
-	offsetMu sync.Mutex
+	offsetMu          sync.Mutex
+	backlogMu         sync.Mutex
+	backlogProbeMu    sync.Mutex
+	backlogClient     *kgo.Client
+	backlogPartitions map[string][]int32
 	// assignmentMu keeps a rebalance callback indivisible against the rest of
 	// the consumer. A multi-partition revoke holds it so no admission or
 	// settlement can land between two partitions of the same revocation and
@@ -441,6 +446,9 @@ func newConsumer(ctx context.Context, connection *conn, cfg driver.ConsumerConfi
 	// The revoke wait holds the whole rebalance open, so the pair is refused
 	// here, where the bound in force is known, rather than surfacing as a lost
 	// assignment on the first rebalance.
+	if err := validateKafkaDrainTimeout(connection.driverOptions, drainTimeout); err != nil {
+		return nil, classify("consumer", driver.KindFatal, err)
+	}
 	if _, err := resolveRebalanceTimeout(connection.driverOptions, drainTimeout); err != nil {
 		return nil, classify("consumer", driver.KindFatal, err)
 	}
@@ -538,6 +546,10 @@ func newConsumer(ctx context.Context, connection *conn, cfg driver.ConsumerConfi
 }
 
 func consumerClientOpts(connection *conn, cfg driver.ConsumerConfig, group string, consumer *consumer) ([]kgo.Opt, error) {
+	fetchMaxWait, err := resolveFetchMaxWait(connection.driverOptions)
+	if err != nil {
+		return nil, err
+	}
 	staticMembership := connection.staticMembership
 	if connection.driverOptions != nil {
 		if resolved, err := resolveStaticMembership(connection.driverOptions); err == nil {
@@ -561,15 +573,11 @@ func consumerClientOpts(connection *conn, cfg driver.ConsumerConfig, group strin
 		kgo.DisableAutoCommit(),
 		consumerStartOffset(cfg.StartAt),
 		kgo.Balancers(balancer),
-		// Franz-go defaults FetchMaxWait to 5000ms. When a
-		// multi-destination consumer settles a message on a destination whose
-		// broker partition is currently exhausted, franz-go issues a Fetch
-		// request for that destination which the broker holds for up to
-		// MaxWaitMillis. While that single-broker request is held, other unpaused
-		// destinations on the same broker cannot be fetched, stalling refill
-		// deliveries for up to 5 seconds. Bounding FetchMaxWait prevents an
-		// exhausted destination from starving ready destinations.
-		kgo.FetchMaxWait(50*time.Millisecond),
+		// An exhausted destination cannot block a sibling destination on the same
+		// broker for longer than this value. franz-go defaults FetchMaxWait to
+		// 5000ms; this driver's 50ms default is deliberately below Kafka's own
+		// 500ms default because it multiplexes destinations over one client.
+		kgo.FetchMaxWait(fetchMaxWait),
 		kgo.BlockRebalanceOnPoll(),
 		kgo.OnPartitionsAssigned(func(ctx context.Context, cl *kgo.Client, partitions map[string][]int32) {
 			consumer.onPartitionsAssigned(ctx, cl, partitions)
@@ -587,20 +595,23 @@ func consumerClientOpts(connection *conn, cfg driver.ConsumerConfig, group strin
 	return opts, nil
 }
 
-// Consume-path knob defaults. They are franz-go's own defaults, passed
-// explicitly so an unset key still has a value the driver chose and a test can
-// observe.
+// Consume-path knob defaults. Values are passed explicitly so an unset key
+// still has a value the driver chose and tests can observe.
 //
 // defaultKafkaSessionTimeout matches the fallback that config validation uses
 // to bound lifecycle.rebalanceDrainTimeout. That bound is only meaningful if
 // the session timeout the broker enforces is the one validation measured, so
 // the two values must move together.
 const (
+	defaultKafkaFetchMaxWait                = 50 * time.Millisecond
+	maxKafkaFetchMaxWait                    = time.Duration(math.MaxInt32) * time.Millisecond
 	defaultKafkaFetchMaxBytes         int32 = 50 << 20
 	defaultKafkaSessionTimeout              = 45 * time.Second
 	defaultKafkaRebalanceTimeout            = 60 * time.Second
 	defaultKafkaRebalanceDrainTimeout       = 25 * time.Second
 )
+
+const fetchMaxWaitOption = "kafka.fetchMaxWait"
 
 // resolveConsumerOptions translates the broker.kafka.* keys that govern the
 // consume path into franz-go options. It returns an option for every knob,
@@ -642,6 +653,27 @@ func resolveFetchMaxBytes(options map[string]string) (int32, error) {
 	return int32(bytes), nil
 }
 
+// resolveFetchMaxWait maps kafka.fetchMaxWait onto the maximum time Kafka
+// holds an empty fetch. The value must be a whole number of milliseconds in
+// franz-go's int32 wire range, so an invalid operator value cannot silently
+// become zero or wrap around.
+func resolveFetchMaxWait(options map[string]string) (time.Duration, error) {
+	value, ok := options[fetchMaxWaitOption]
+	if !ok {
+		return defaultKafkaFetchMaxWait, nil
+	}
+	wait, err := time.ParseDuration(value)
+	if err != nil || wait < time.Millisecond || wait > maxKafkaFetchMaxWait || wait%time.Millisecond != 0 {
+		return 0, fmt.Errorf(
+			"kafka: invalid %s %q; must be a whole-millisecond duration from 1ms to %s",
+			fetchMaxWaitOption,
+			value,
+			maxKafkaFetchMaxWait,
+		)
+	}
+	return wait, nil
+}
+
 // resolveSessionTimeout maps kafka.sessionTimeout onto the group member session
 // timeout. The member carries the value in its join request, so it is the
 // timeout the coordinator expires the member on rather than a local
@@ -656,6 +688,37 @@ func resolveSessionTimeout(options map[string]string) (time.Duration, error) {
 		return 0, fmt.Errorf("kafka: invalid kafka.sessionTimeout %q; must be a positive duration", value)
 	}
 	return timeout, nil
+}
+
+// validateKafkaDrainTimeout rejects a revoke wait that can outlive either
+// broker group timeout. Direct driver callers need the same protection as the
+// root configuration path.
+func validateKafkaDrainTimeout(options map[string]string, drainTimeout time.Duration) error {
+	sessionTimeout, err := resolveSessionTimeout(options)
+	if err != nil {
+		return err
+	}
+	rebalanceTimeout, err := resolveRebalanceTimeoutOption(options)
+	if err != nil {
+		return err
+	}
+	if kafkarules.ExceedsKafkaDrainBound(drainTimeout, sessionTimeout) {
+		return fmt.Errorf(
+			"kafka: revoke wait bound %s exceeds 0.6 x kafka.sessionTimeout %s (kafka.rebalanceTimeout=%s)",
+			drainTimeout,
+			sessionTimeout,
+			rebalanceTimeout,
+		)
+	}
+	if kafkarules.ExceedsKafkaDrainBound(drainTimeout, rebalanceTimeout) {
+		return fmt.Errorf(
+			"kafka: revoke wait bound %s exceeds 0.6 x kafka.rebalanceTimeout %s (kafka.sessionTimeout=%s)",
+			drainTimeout,
+			rebalanceTimeout,
+			sessionTimeout,
+		)
+	}
+	return nil
 }
 
 // resolveRebalanceTimeout maps kafka.rebalanceTimeout onto the group member
@@ -1429,18 +1492,35 @@ func retainedRecord(record *kgo.Record) *kgo.Record {
 	return retained
 }
 
+func kafkaEnqueueFields(timestamp time.Time, timestampType int8) (time.Time, driver.EnqueueSource) {
+	if timestamp.IsZero() {
+		return time.Time{}, driver.EnqueueSourceUnknown
+	}
+	switch timestampType {
+	case 0:
+		return timestamp, driver.EnqueueSourceProducer
+	case 1:
+		return timestamp, driver.EnqueueSourceBroker
+	default:
+		return time.Time{}, driver.EnqueueSourceUnknown
+	}
+}
+
 func inboundMessage(record *kgo.Record, settler *settler, receivedAt time.Time) driver.InboundMessage {
 	headers := make([]driver.Header, 0, len(record.Headers))
 	for _, header := range record.Headers {
 		headers = append(headers, driver.Header{Key: header.Key, Value: append([]byte(nil), header.Value...)})
 	}
+	enqueuedAt, enqueuedAtSource := kafkaEnqueueFields(record.Timestamp, record.Attrs.TimestampType())
 	return driver.InboundMessage{
-		Destination:   record.Topic,
-		Key:           append([]byte(nil), record.Key...),
-		Headers:       headers,
-		Body:          append([]byte(nil), record.Value...),
-		DeliveryCount: -1,
-		ReceivedAt:    receivedAt,
+		Destination:      record.Topic,
+		Key:              append([]byte(nil), record.Key...),
+		Headers:          headers,
+		Body:             append([]byte(nil), record.Value...),
+		DeliveryCount:    -1,
+		ReceivedAt:       receivedAt,
+		EnqueuedAt:       enqueuedAt,
+		EnqueuedAtSource: enqueuedAtSource,
 		Ref: driver.BrokerRef{
 			Partition: record.Partition,
 			Offset:    record.Offset,
@@ -1671,6 +1751,7 @@ func (c *consumer) closeTeardown(ctx context.Context) {
 	if c.client != nil {
 		c.client.Close()
 	}
+	c.closeBacklogClient()
 	c.conn.removeConsumer(c)
 	if c.synthesizedGroup {
 		if err := c.deleteGroup(ctx); err != nil {
@@ -1793,55 +1874,13 @@ func (c *consumer) Lag(ctx context.Context) (map[string]int64, error) {
 	if !c.effectiveCapabilities().LagQueryable {
 		return nil, classify("lag", driver.KindFatal, driver.ErrUnsupported)
 	}
-	c.mu.Lock()
-	destinations := append([]string(nil), c.destinations...)
-	group := c.group
-	c.mu.Unlock()
-
-	admin := kadm.NewClient(c.conn.client)
-	starts, err := listKafkaOffsets(ctx, func(listCtx context.Context) (kadm.ListedOffsets, error) {
-		return admin.ListStartOffsets(listCtx, destinations...)
-	})
+	snapshot, err := c.readKafkaOffsetSnapshot(ctx, "lag")
 	if err != nil {
-		return nil, classifyLagError(err)
+		return nil, err
 	}
-	ends, err := listKafkaOffsets(ctx, func(listCtx context.Context) (kadm.ListedOffsets, error) {
-		return admin.ListEndOffsets(listCtx, destinations...)
-	})
+	lag, _, err := snapshot.lagAndProbes("lag")
 	if err != nil {
-		return nil, classifyLagError(err)
-	}
-	committed, err := admin.FetchOffsets(ctx, group)
-	if err != nil && !errors.Is(err, kerr.GroupIDNotFound) {
-		return nil, classify("lag", kafkaErrorKind(err), err)
-	}
-
-	lag := make(map[string]int64, len(destinations))
-	for _, destination := range destinations {
-		partitions, ok := ends[destination]
-		if !ok {
-			return nil, classify("lag", driver.KindNotFound, fmt.Errorf("destination %q is missing: %w", destination, driver.ErrDestinationMissing))
-		}
-		var total int64
-		for partition, end := range partitions {
-			start, ok := starts.Lookup(destination, partition)
-			if !ok {
-				return nil, classify("lag", driver.KindNotFound, fmt.Errorf("destination %q partition %d has no start offset", destination, partition))
-			}
-			committedOffset := start.Offset
-			if response, exists := committed.Lookup(destination, partition); exists {
-				if response.Err != nil {
-					return nil, classifyKafkaOffsetError("lag", response.Err)
-				}
-				if response.At >= 0 {
-					committedOffset = response.At
-				}
-			}
-			if end.Offset > committedOffset {
-				total += end.Offset - committedOffset
-			}
-		}
-		lag[destination] = total
+		return nil, err
 	}
 	return lag, nil
 }

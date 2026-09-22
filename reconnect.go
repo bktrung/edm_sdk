@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"math/rand/v2"
+	"time"
 
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/driver"
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/lifecycle"
@@ -44,8 +45,31 @@ func (c *Client) reconnectSupervisor() {
 				c.finishReconnect(nil)
 				continue
 			}
+			observer := c.observer
+			var lostAt time.Time
+			if observer != nil {
+				lostAt = c.options.clock.Now()
+				c.observeRecord(PointEvent{
+					Kind:          ObserverConnectionLost,
+					At:            lostAt,
+					ErrorClass:    errorClassOf(request.cause),
+					ServerAddress: c.serverAddress,
+					ServerPort:    c.serverPort,
+				})
+			}
 			lastResortClientLogger(c).Warn("f1 reconnect started", "error", request.cause)
-			c.finishReconnect(c.reconnectOnce(c.supervisorCtx, request.cause))
+			reconnectErr := c.reconnectOnce(c.supervisorCtx, request.cause)
+			if reconnectErr == nil && observer != nil {
+				restoredAt := c.options.clock.Now()
+				c.observeRecord(PointEvent{
+					Kind:          ObserverConnectionRestored,
+					At:            restoredAt,
+					Downtime:      restoredAt.Sub(lostAt),
+					ServerAddress: c.serverAddress,
+					ServerPort:    c.serverPort,
+				})
+			}
+			c.finishReconnect(reconnectErr)
 		case <-c.supervisorCtx.Done():
 			c.mu.Lock()
 			c.finishReconnectLocked(c.supervisorCtx.Err())

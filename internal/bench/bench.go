@@ -166,6 +166,16 @@ type Config struct {
 	// driver that documents it. It is ignored on a driver whose queues have no
 	// kind.
 	QueueType string
+	// Fairness overrides the subscription fairness shape for a measurement.
+	// The zero value keeps the SDK defaults; a sweep can use a smaller
+	// prefetch factor to keep every core destination window below a tested
+	// broker-prefetch value without changing production defaults.
+	Fairness f1.FairnessConfig
+	// BrokerPrefetch is the RabbitMQ per-destination broker credit. Zero leaves
+	// the driver coupled to the core window, while a positive value raises only
+	// the broker credit and leaves the core in-flight budget unchanged.
+	// It is ignored by drivers other than RabbitMQ.
+	BrokerPrefetch int
 	// Ordered makes the subscription an ordered one, so deliveries sharing a
 	// key are handled one at a time, and makes the publishers spread the corpus
 	// over a fixed key set, so the ordering has something to serialise. A
@@ -238,6 +248,10 @@ type Result struct {
 	// figure a rate cannot show: two shapes with the same rate settle a
 	// delivery in very different times.
 	SettleLatencies []time.Duration
+	// SettleSequences is the corpus sequence that produced each settle latency.
+	// It is parallel to SettleLatencies and lets a caller split the samples by
+	// priority without changing the aggregate percentile accessors.
+	SettleSequences []int
 	// RetryTier is the retry delay the measurement configured, and zero when it
 	// kept the shipped ladder.
 	RetryTier time.Duration
@@ -285,6 +299,26 @@ func (r Result) SettlePercentile(p float64) time.Duration {
 	return percentile(r.SettleLatencies, p)
 }
 
+// SettlePercentileForPriority returns the p-th percentile of settle latencies
+// produced by priority. Sequence numbers select priorities by the same modulo
+// mapping the harness uses when publishing. A result without labelled samples
+// or priorities returns zero.
+func (r Result) SettlePercentileForPriority(priority f1.Priority, priorities []f1.Priority, p float64) time.Duration {
+	if len(priorities) == 0 {
+		return 0
+	}
+	durations := make([]time.Duration, 0, len(r.SettleLatencies))
+	for index, seq := range r.SettleSequences {
+		if index >= len(r.SettleLatencies) {
+			break
+		}
+		if priorities[seq%len(priorities)] == priority {
+			durations = append(durations, r.SettleLatencies[index])
+		}
+	}
+	return percentile(durations, p)
+}
+
 // percentile returns the p-th percentile of one duration sample by nearest
 // rank.
 func percentile(durations []time.Duration, p float64) time.Duration {
@@ -316,12 +350,13 @@ type Harness struct {
 	// key.
 	keys []string
 
-	// declared holds every destination the core asked the driver to create, so
+	// declared holds every broker name the core asked the driver to create, so
 	// cleanup deletes exactly what this run made. Reading the names back from
 	// the topology specs keeps the harness from restating the core's naming
 	// rules, which is what a hand-written name list would drift from.
-	mu       sync.Mutex
-	declared map[string]struct{}
+	mu        sync.Mutex
+	declared  map[string]struct{}
+	exchanges map[string]struct{}
 }
 
 // New returns a harness for one driver and one measurement shape.
@@ -343,6 +378,9 @@ func New(drv driver.Driver, cfg Config) (*Harness, error) {
 	}
 	if cfg.Prefetch < 0 {
 		return nil, fmt.Errorf("bench: prefetch must not be negative, got %d", cfg.Prefetch)
+	}
+	if cfg.BrokerPrefetch < 0 {
+		return nil, fmt.Errorf("bench: broker prefetch must not be negative, got %d", cfg.BrokerPrefetch)
 	}
 	if cfg.RetryTier < 0 {
 		return nil, fmt.Errorf("bench: retry tier must not be negative, got %s", cfg.RetryTier)
@@ -379,6 +417,7 @@ func New(drv driver.Driver, cfg Config) (*Harness, error) {
 		topic:        name,
 		subscription: name,
 		declared:     make(map[string]struct{}),
+		exchanges:    make(map[string]struct{}),
 	}
 	if cfg.Ordered {
 		harness.keys = make([]string, orderedKeys)
@@ -432,12 +471,12 @@ func (h *Harness) Retry(ctx context.Context) (Result, error) {
 	return h.measure(ctx, modeRetry)
 }
 
-// Close deletes the destinations this harness's runs created, so a later run
-// never reads this run's messages or offsets. A destination that was never
-// created is skipped: the run did not make it.
+// Close deletes the broker names this harness's runs created, so a later run
+// never reads this run's messages or offsets. A name that was never created is
+// skipped: the run did not make it.
 func (h *Harness) Close(ctx context.Context) error {
-	names := h.declaredNames()
-	if len(names) == 0 {
+	destinations, exchanges := h.cleanupNames()
+	if len(destinations) == 0 && len(exchanges) == 0 {
 		return nil
 	}
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), cleanupTimeout)
@@ -451,7 +490,7 @@ func (h *Harness) Close(ctx context.Context) error {
 		return fmt.Errorf("bench: cleanup open %s: %w", h.drv.Name(), err)
 	}
 	defer func() {
-		// A connection that will not close still leaves the destinations
+		// A connection that will not close still leaves the broker names
 		// deleted on the broker, which is what cleanup owes.
 		_ = conn.Close(context.WithoutCancel(ctx))
 	}()
@@ -459,21 +498,34 @@ func (h *Harness) Close(ctx context.Context) error {
 	if !ok {
 		return fmt.Errorf("bench: %s admin does not implement driver.Maintenance", h.drv.Name())
 	}
-	remaining := purge(ctx, maintenance, names)
-	for attempt := 0; attempt < pruneAttempts && len(remaining) > 0; attempt++ {
-		remaining = prune(ctx, maintenance, remaining)
-		if len(remaining) == 0 {
+	exchangeSet := make(map[string]struct{}, len(exchanges))
+	for _, name := range exchanges {
+		exchangeSet[name] = struct{}{}
+	}
+	remainingDestinations := purge(ctx, maintenance, destinations)
+	remainingExchanges := exchanges
+	for attempt := 0; attempt < pruneAttempts && (len(remainingDestinations) > 0 || len(remainingExchanges) > 0); attempt++ {
+		names := make([]string, 0, len(remainingDestinations)+len(remainingExchanges))
+		names = append(names, remainingDestinations...)
+		names = append(names, remainingExchanges...)
+		remaining := prune(ctx, maintenance, names)
+		remainingDestinations, remainingExchanges = splitCleanupNames(remaining, exchangeSet)
+		if len(remainingDestinations) == 0 && len(remainingExchanges) == 0 {
 			return nil
 		}
 		if err := h.clk.Sleep(ctx, pruneWait); err != nil {
 			break
 		}
 	}
-	if len(remaining) == 0 {
+	for _, name := range remainingExchanges {
+		benchmarkLogger().Warn("benchmark cleanup could not delete exchange",
+			"exchange", name, "reason", "driver maintenance port could not delete it")
+	}
+	if len(remainingDestinations) == 0 {
 		return nil
 	}
 	return fmt.Errorf("bench: %d destinations still present after %d prune attempts: %s",
-		len(remaining), pruneAttempts, strings.Join(remaining, ", "))
+		len(remainingDestinations), pruneAttempts, strings.Join(remainingDestinations, ", "))
 }
 
 // purge empties the named destinations and returns the ones that may still be
@@ -511,25 +563,52 @@ func prune(ctx context.Context, maintenance driver.Maintenance, names []string) 
 	return remaining
 }
 
-func (h *Harness) declaredNames() []string {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	names := make([]string, 0, len(h.declared))
-	for name := range h.declared {
-		names = append(names, name)
+func splitCleanupNames(names []string, exchanges map[string]struct{}) (destinations, exchangeNames []string) {
+	destinations = make([]string, 0, len(names))
+	exchangeNames = make([]string, 0, len(names))
+	for _, name := range names {
+		if _, isExchange := exchanges[name]; isExchange {
+			exchangeNames = append(exchangeNames, name)
+			continue
+		}
+		destinations = append(destinations, name)
 	}
-	slices.Sort(names)
-	return names
+	return destinations, exchangeNames
 }
 
-func (h *Harness) noteDeclared(destinations []driver.DestinationSpec) {
-	if len(destinations) == 0 {
+func (h *Harness) cleanupNames() (destinations, exchanges []string) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	destinations = make([]string, 0, len(h.declared))
+	exchanges = make([]string, 0, len(h.exchanges))
+	for name := range h.declared {
+		if _, isExchange := h.exchanges[name]; isExchange {
+			exchanges = append(exchanges, name)
+			continue
+		}
+		destinations = append(destinations, name)
+	}
+	slices.Sort(destinations)
+	slices.Sort(exchanges)
+	return destinations, exchanges
+}
+
+func (h *Harness) noteDeclared(spec driver.TopologySpec) {
+	if len(spec.Exchanges) == 0 && len(spec.Destinations) == 0 {
 		return
 	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	for _, destination := range destinations {
-		h.declared[destination.Name] = struct{}{}
+	for _, exchange := range spec.Exchanges {
+		if strings.HasPrefix(exchange.Name, "f1.bench.") {
+			h.declared[exchange.Name] = struct{}{}
+			h.exchanges[exchange.Name] = struct{}{}
+		}
+	}
+	for _, destination := range spec.Destinations {
+		if strings.HasPrefix(destination.Name, "f1.bench.") {
+			h.declared[destination.Name] = struct{}{}
+		}
 	}
 }
 
@@ -594,7 +673,7 @@ func (h *Harness) clientConfig() f1.Config {
 // one of these applies; a setting this harness does not expose is absent rather
 // than set to a value the harness guessed.
 func (h *Harness) driverOptions() map[string]string {
-	options := make(map[string]string, 1)
+	options := make(map[string]string, 2)
 	if h.drv.Name() == kafkaDriverName && h.cfg.Partitions > 0 {
 		// The count travels as the driver option a deployment would set. Its
 		// floor half is a guard rather than a measurement: the topics a run
@@ -602,11 +681,17 @@ func (h *Harness) driverOptions() map[string]string {
 		// than it asks for.
 		options["kafka.maxExpectedInstances"] = strconv.Itoa(h.cfg.Partitions)
 	}
-	if h.drv.Name() == rabbitMQDriverName && h.cfg.QueueType != "" {
-		// The kind travels the same way, and the driver refuses a value it does
-		// not support, so an option this harness carries and the driver does not
-		// document fails the run instead of measuring a shape nobody asked for.
-		options["rabbitmq.queueType"] = h.cfg.QueueType
+	if h.drv.Name() == rabbitMQDriverName {
+		if h.cfg.QueueType != "" {
+			// The kind travels the same way, and the driver refuses a value it
+			// does not support, so an option this harness carries and the driver
+			// does not document fails the run instead of measuring a shape nobody
+			// asked for.
+			options["rabbitmq.queueType"] = h.cfg.QueueType
+		}
+		if h.cfg.BrokerPrefetch > 0 {
+			options["rabbitmq.brokerPrefetch"] = strconv.Itoa(h.cfg.BrokerPrefetch)
+		}
 	}
 	if len(options) == 0 {
 		return nil
@@ -830,6 +915,7 @@ func (h *Harness) measure(ctx context.Context, m mode) (Result, error) {
 	if err := afterStop.verify(h.cfg.Messages, m.attempts(), h.cfg.CountDuplicates, "after the run stopped"); err != nil {
 		return Result{}, err
 	}
+	settleLatencies, settleSequences := r.tr.settledLatencies()
 	return Result{
 		Messages:        h.cfg.Messages,
 		Publishers:      h.cfg.Publishers,
@@ -837,7 +923,8 @@ func (h *Harness) measure(ctx context.Context, m mode) (Result, error) {
 		HandlerWork:     h.cfg.HandlerWork,
 		Elapsed:         elapsed,
 		Latencies:       r.tr.latencies(),
-		SettleLatencies: r.tr.settledLatencies(),
+		SettleLatencies: settleLatencies,
+		SettleSequences: settleSequences,
 		RetryTier:       h.cfg.RetryTier,
 		Duplicates:      afterStop.duplicates,
 		LagMax:          lagMax,
@@ -875,6 +962,7 @@ func (r *run) subscription() f1.Subscription {
 		Priorities:     r.h.priorities(),
 		Concurrency:    r.h.cfg.Concurrency,
 		Prefetch:       r.h.cfg.Prefetch,
+		Fairness:       r.h.cfg.Fairness,
 		HandlerTimeout: handlerTimeout,
 		Handlers:       map[string]f1.Handler{r.h.topic: f1.HandlerFunc(r.handle)},
 	}
@@ -1325,6 +1413,9 @@ type tracker struct {
 	// sequence is a settlement of its own, and a p99 over an index would keep
 	// only one of them.
 	settleLatencies []time.Duration
+	// settleSequences is parallel to settleLatencies and carries the corpus
+	// sequence that produced each sample.
+	settleSequences []int
 
 	// settled counts the settlements that advanced the corpus, and is what the
 	// measurement ends on. It is maintained as it happens rather than summed
@@ -1370,6 +1461,7 @@ func newTracker(clk clock.Clock, corpus, attempts int) *tracker {
 		publishedAt:     make([]time.Time, corpus),
 		settledAt:       make([]time.Time, corpus),
 		settleLatencies: make([]time.Duration, 0, corpus*attempts),
+		settleSequences: make([]int, 0, corpus*attempts),
 		change:          make(chan struct{}),
 	}
 }
@@ -1386,6 +1478,7 @@ func (t *tracker) arm() {
 	clear(t.publishedAt)
 	clear(t.settledAt)
 	t.settleLatencies = t.settleLatencies[:0]
+	t.settleSequences = t.settleSequences[:0]
 	t.prelude = 0
 	t.recording = true
 	t.signalLocked()
@@ -1503,6 +1596,7 @@ func (t *tracker) noteSettled(body string, latency time.Duration) {
 		// take arbitrarily long, and one of them would move a p99 that is read
 		// as the shape of the measured window.
 		t.settleLatencies = append(t.settleLatencies, latency)
+		t.settleSequences = append(t.settleSequences, seq)
 	}
 	t.settles[seq]++
 	if t.settles[seq] <= t.attempts {
@@ -1558,12 +1652,12 @@ func (t *tracker) latencies() []time.Duration {
 	return latencies
 }
 
-// settledLatencies returns a copy of the measured window's settle latencies,
-// in the order the settlements were recorded.
-func (t *tracker) settledLatencies() []time.Duration {
+// settledLatencies returns copies of the measured window's settle latencies
+// and their corpus sequences, in the order the settlements were recorded.
+func (t *tracker) settledLatencies() ([]time.Duration, []int) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	return slices.Clone(t.settleLatencies)
+	return slices.Clone(t.settleLatencies), slices.Clone(t.settleSequences)
 }
 
 // snapshot is the tracker's state at one instant.
@@ -1664,7 +1758,7 @@ type countingDriver struct {
 	tr        *tracker
 	ready     chan struct{}
 	readyOnce *sync.Once
-	onSpec    func([]driver.DestinationSpec)
+	onSpec    func(driver.TopologySpec)
 	// hold and gate are the run's backlog gate, which the pump waits on before
 	// it hands a delivery to the core. They are nil for a run that holds
 	// nothing back.
@@ -1711,7 +1805,7 @@ type countingConn struct {
 	tr        *tracker
 	ready     chan struct{}
 	readyOnce *sync.Once
-	onSpec    func([]driver.DestinationSpec)
+	onSpec    func(driver.TopologySpec)
 	hold      *atomic.Bool
 	gate      chan struct{}
 
@@ -1768,7 +1862,7 @@ func (p *countingProducer) Publish(ctx context.Context, messages ...driver.Outbo
 	return err
 }
 
-// countingAdmin records the destinations the core asks for, which is what
+// countingAdmin records the broker names the core asks for, which is what
 // cleanup later deletes, and signals readiness when the subscription's own
 // topology has been declared.
 //
@@ -1780,7 +1874,7 @@ type countingAdmin struct {
 	driver.Admin
 	ready     chan struct{}
 	readyOnce *sync.Once
-	onSpec    func([]driver.DestinationSpec)
+	onSpec    func(driver.TopologySpec)
 }
 
 func (a *countingAdmin) EnsureTopology(ctx context.Context, spec driver.TopologySpec) (driver.TopologyDiff, error) {
@@ -1789,7 +1883,7 @@ func (a *countingAdmin) EnsureTopology(ctx context.Context, spec driver.Topology
 		return diff, err
 	}
 	if a.onSpec != nil {
-		a.onSpec(spec.Destinations)
+		a.onSpec(spec)
 	}
 	if a.ready != nil && len(spec.Scope) > 0 {
 		a.readyOnce.Do(func() { close(a.ready) })

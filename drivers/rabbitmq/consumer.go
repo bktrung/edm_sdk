@@ -14,6 +14,7 @@ import (
 	amqp "github.com/rabbitmq/amqp091-go"
 
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/driver"
+	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/clock"
 )
 
 // partitionKeyHeader carries OutboundMessage.Key across the wire. A fanout
@@ -25,13 +26,15 @@ const partitionKeyHeader = "x-f1-partition-key"
 var consumerSequence atomic.Uint64
 
 type consumer struct {
-	conn     *conn
-	cfg      driver.ConsumerConfig
-	lanes    []*lane
-	byName   map[string]*lane
-	messages chan driver.InboundMessage
-	errors   chan error
-	stoppedC chan struct{}
+	conn                 *conn
+	cfg                  driver.ConsumerConfig
+	clock                clock.Clock
+	trustBrokerTimestamp bool
+	lanes                []*lane
+	byName               map[string]*lane
+	messages             chan driver.InboundMessage
+	errors               chan error
+	stoppedC             chan struct{}
 	// Drain releases local forwarders; stoppedC remains the completed-teardown signal.
 	forwarderStopC chan struct{}
 	// forwarderExitHook is a test-only synchronization seam. It remains nil in
@@ -93,6 +96,8 @@ type lane struct {
 
 var _ driver.Consumer = (*consumer)(nil)
 
+var _ driver.BacklogReader = (*consumer)(nil)
+
 type consumerConstructionPhase uint8
 
 const (
@@ -113,16 +118,21 @@ func newConsumer(conn *conn, cfg driver.ConsumerConfig) (*consumer, error) {
 		}
 		seen[destination] = struct{}{}
 	}
+	if err := validateBrokerPrefetch(cfg, conn.brokerPrefetch); err != nil {
+		return nil, classify("consumer", driver.KindFatal, err)
+	}
 
 	c := &consumer{
-		conn:           conn,
-		cfg:            cfg,
-		byName:         make(map[string]*lane, len(cfg.Destinations)),
-		messages:       make(chan driver.InboundMessage, totalPrefetch(cfg)),
-		errors:         make(chan error, 8),
-		stoppedC:       make(chan struct{}),
-		forwarderStopC: make(chan struct{}),
-		settlers:       make(map[*settler]struct{}),
+		conn:                 conn,
+		cfg:                  cfg,
+		clock:                clock.NewReal(),
+		trustBrokerTimestamp: conn.trustBrokerTimestamp,
+		byName:               make(map[string]*lane, len(cfg.Destinations)),
+		messages:             make(chan driver.InboundMessage, totalPrefetch(cfg, conn.brokerPrefetch)),
+		errors:               make(chan error, 8),
+		stoppedC:             make(chan struct{}),
+		forwarderStopC:       make(chan struct{}),
+		settlers:             make(map[*settler]struct{}),
 	}
 	rollback := func(err error) (*consumer, error) {
 		_ = c.rollbackConstruction()
@@ -132,7 +142,7 @@ func newConsumer(conn *conn, cfg driver.ConsumerConfig) (*consumer, error) {
 		hook(c, consumerConstructionStarted)
 	}
 	for index, destination := range cfg.Destinations {
-		prefetch := destinationPrefetch(cfg, destination, index)
+		prefetch := effectivePrefetch(cfg, destination, index, conn.brokerPrefetch)
 		channel, err := conn.amqp.Channel()
 		if err != nil {
 			return rollback(classifyAMQP("consumer", driver.KindTransient, err))
@@ -179,18 +189,49 @@ func newConsumer(conn *conn, cfg driver.ConsumerConfig) (*consumer, error) {
 			hook(c, consumerConstructionLaneReady)
 		}
 	}
+	if conn.brokerPrefetch > 0 {
+		conn.log().Info(
+			"RabbitMQ consumer opened with broker prefetch",
+			"option", brokerPrefetchOption,
+			"value", conn.brokerPrefetch,
+			"destinations", len(cfg.Destinations),
+		)
+	}
 	return c, nil
 }
 
-func totalPrefetch(cfg driver.ConsumerConfig) int {
+func totalPrefetch(cfg driver.ConsumerConfig, brokerPrefetch int) int {
 	total := 0
 	for index, destination := range cfg.Destinations {
-		total += destinationPrefetch(cfg, destination, index)
+		total += effectivePrefetch(cfg, destination, index, brokerPrefetch)
 	}
 	if total < 1 {
 		return 1
 	}
 	return total
+}
+
+func validateBrokerPrefetch(cfg driver.ConsumerConfig, brokerPrefetch int) error {
+	if brokerPrefetch == 0 {
+		return nil
+	}
+	for index, destination := range cfg.Destinations {
+		coreWindow := destinationPrefetch(cfg, destination, index)
+		if brokerPrefetch < coreWindow {
+			return fmt.Errorf(
+				"rabbitmq: invalid %s %d for destination %q: must be at least core window %d",
+				brokerPrefetchOption, brokerPrefetch, destination, coreWindow,
+			)
+		}
+	}
+	return nil
+}
+
+func effectivePrefetch(cfg driver.ConsumerConfig, destination string, index, brokerPrefetch int) int {
+	if brokerPrefetch > 0 {
+		return brokerPrefetch
+	}
+	return destinationPrefetch(cfg, destination, index)
 }
 
 func destinationPrefetch(cfg driver.ConsumerConfig, destination string, index int) int {
@@ -415,7 +456,7 @@ func (c *consumer) emitMessages(lane *lane) {
 		lane.mu.Lock()
 		lane.emitting--
 		lane.mu.Unlock()
-		message := inboundMessage(lane.destination, delivery, settler, c.nativeDeliveryCount())
+		message := c.inboundMessage(lane.destination, delivery, settler, c.nativeDeliveryCount(), c.trustBrokerTimestamp)
 		select {
 		case c.messages <- message:
 		case <-c.forwarderStopC:
@@ -532,19 +573,141 @@ func (c *consumer) sendError(err error) {
 	}
 }
 
-func inboundMessage(destination string, delivery amqp.Delivery, settler *settler, nativeCount bool) driver.InboundMessage {
+// inboundMessage builds a portable delivery using the consumer's receipt clock.
+func (c *consumer) inboundMessage(destination string, delivery amqp.Delivery, settler *settler, nativeCount bool, trustBrokerTimestamp bool) driver.InboundMessage {
+	return inboundMessageAt(destination, delivery, settler, nativeCount, trustBrokerTimestamp, c.clock.Now())
+}
+
+func inboundMessageAt(destination string, delivery amqp.Delivery, settler *settler, nativeCount bool, trustBrokerTimestamp bool, receivedAt time.Time) driver.InboundMessage {
 	headers := amqpHeaders(delivery)
-	receivedAt := time.Now() //nolint:forbidigo // the port requires receipt time and drivers have no clock dependency
+	enqueuedAt, enqueuedAtSource := inboundEnqueueTime(delivery, trustBrokerTimestamp)
 	return driver.InboundMessage{
-		Destination:   destination,
-		Key:           headerValue(delivery.Headers[partitionKeyHeader]),
-		Headers:       headers,
-		Body:          append([]byte(nil), delivery.Body...),
-		DeliveryCount: deliveryCount(delivery, nativeCount),
-		ReceivedAt:    receivedAt,
-		Ref:           driver.BrokerRef{Tag: delivery.DeliveryTag},
-		Settle:        settler,
+		Destination:      destination,
+		Key:              headerValue(delivery.Headers[partitionKeyHeader]),
+		Headers:          headers,
+		Body:             append([]byte(nil), delivery.Body...),
+		DeliveryCount:    deliveryCount(delivery, nativeCount),
+		ReceivedAt:       receivedAt,
+		EnqueuedAt:       enqueuedAt,
+		EnqueuedAtSource: enqueuedAtSource,
+		Ref:              driver.BrokerRef{Tag: delivery.DeliveryTag},
+		Settle:           settler,
 	}
+}
+
+// inboundEnqueueTime applies the approved precedence without using receipt
+// time. timestamp_in_ms is broker-supplied only when the operator has enabled
+// the trust assertion.
+// RabbitMQ's AMQP Timestamp property has whole-second precision, so it is used
+// as a producer timestamp only after the higher-precision CloudEvents header
+// has been checked.
+func inboundEnqueueTime(delivery amqp.Delivery, trustBrokerTimestamp bool) (time.Time, driver.EnqueueSource) {
+	if trustBrokerTimestamp {
+		if timestamp, ok := timestampInMilliseconds(delivery.Headers["timestamp_in_ms"]); ok {
+			return time.UnixMilli(timestamp), driver.EnqueueSourceBroker
+		}
+	}
+	if value, ok := delivery.Headers["cloudEvents:time"]; ok {
+		if timestamp, err := time.Parse(time.RFC3339Nano, string(headerValue(value))); err == nil {
+			return timestamp, driver.EnqueueSourceProducer
+		}
+	}
+	if !delivery.Timestamp.IsZero() {
+		return time.Unix(delivery.Timestamp.Unix(), 0), driver.EnqueueSourceProducer
+	}
+	return time.Time{}, driver.EnqueueSourceUnknown
+}
+
+func timestampInMilliseconds(value any) (int64, bool) {
+	switch value := value.(type) {
+	case int:
+		return int64(value), true
+	case int8:
+		return int64(value), true
+	case int16:
+		return int64(value), true
+	case int32:
+		return int64(value), true
+	case int64:
+		return value, true
+	case uint:
+		if uint64(value) > uint64(^uint64(0)>>1) {
+			return 0, false
+		}
+		return int64(value), true
+	case uint8:
+		return int64(value), true
+	case uint16:
+		return int64(value), true
+	case uint32:
+		return int64(value), true
+	case uint64:
+		if value > uint64(^uint64(0)>>1) {
+			return 0, false
+		}
+		return int64(value), true
+	case string:
+		timestamp, err := strconv.ParseInt(strings.TrimSpace(value), 10, 64)
+		return timestamp, err == nil
+	case []byte:
+		timestamp, err := strconv.ParseInt(strings.TrimSpace(string(value)), 10, 64)
+		return timestamp, err == nil
+	default:
+		return 0, false
+	}
+}
+
+func (c *consumer) Lag(ctx context.Context) (map[string]int64, error) {
+	return c.readLag(ctx, "lag")
+}
+
+func (c *consumer) Backlog(ctx context.Context) (map[string]driver.BacklogSample, error) {
+	lag, err := c.readLag(ctx, "backlog")
+	if err != nil {
+		return nil, err
+	}
+	out := make(map[string]driver.BacklogSample, len(c.lanes))
+	for _, lane := range c.lanes {
+		sample := driver.BacklogSample{Lag: lag[lane.destination]}
+		if c.conn.queueKind == queueKindClassic {
+			if err := ctx.Err(); err != nil {
+				return nil, classify("backlog", driver.KindTransient, err)
+			}
+			queue, err := c.conn.management.getQueue(ctx, lane.destination)
+			if err == nil {
+				sample.HeadEnqueuedAt, sample.HeadSource = queue.headEnqueuedAt()
+			} else if ctx.Err() != nil {
+				return nil, classify("backlog", driver.KindTransient, ctx.Err())
+			}
+		}
+		out[lane.destination] = sample
+	}
+	return out, nil
+}
+
+func (c *consumer) readLag(ctx context.Context, operation string) (map[string]int64, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, classify(operation, driver.KindTransient, err)
+	}
+	if !c.cfg.Effective.LagQueryable {
+		return nil, classify(operation, driver.KindFatal, driver.ErrUnsupported)
+	}
+	admin := &adminOperations{conn: c.conn}
+	lag := make(map[string]int64, len(c.lanes))
+	for _, lane := range c.lanes {
+		if err := ctx.Err(); err != nil {
+			return nil, classify(operation, driver.KindTransient, err)
+		}
+		ready, err := admin.inspectQueue(ctx, lane.destination)
+		if err != nil {
+			if isNotFound(err) {
+				return nil, classify(operation, driver.KindNotFound, errors.Join(driver.ErrDestinationMissing, fmt.Errorf("destination %q is missing", lane.destination)))
+			}
+			return nil, classifyAMQP(operation, driver.KindTransient, err)
+		}
+		lag[lane.destination] = ready
+	}
+	return lag, nil
 }
 
 // deliveryCount reports the broker's redelivery counter. RabbitMQ 4.x names it
@@ -855,31 +1018,6 @@ func (c *consumer) Release(ctx context.Context) error {
 	close(c.messages)
 	close(c.errors)
 	return nil
-}
-
-func (c *consumer) Lag(ctx context.Context) (map[string]int64, error) {
-	if err := ctx.Err(); err != nil {
-		return nil, classify("lag", driver.KindTransient, err)
-	}
-	if !c.cfg.Effective.LagQueryable {
-		return nil, classify("lag", driver.KindFatal, driver.ErrUnsupported)
-	}
-	admin := &adminOperations{conn: c.conn}
-	lag := make(map[string]int64, len(c.lanes))
-	for _, lane := range c.lanes {
-		if err := ctx.Err(); err != nil {
-			return nil, classify("lag", driver.KindTransient, err)
-		}
-		ready, err := admin.inspectQueue(ctx, lane.destination)
-		if err != nil {
-			if isNotFound(err) {
-				return nil, classify("lag", driver.KindNotFound, errors.Join(driver.ErrDestinationMissing, fmt.Errorf("destination %q is missing", lane.destination)))
-			}
-			return nil, classifyAMQP("lag", driver.KindTransient, err)
-		}
-		lag[lane.destination] = ready
-	}
-	return lag, nil
 }
 
 func (c *consumer) release(settler *settler) {

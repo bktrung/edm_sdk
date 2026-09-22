@@ -14,6 +14,15 @@ The practical default is:
 - use the repository gates in the [Makefile](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/Makefile) before handing off
   a change.
 
+## Formatting
+
+Use `make format` to format Go source with the repository-pinned `gofumpt`
+`v0.9.2`, and `make format-check` to verify that the tree is clean. The
+repository pins `golangci-lint` `v2.12.2`; its bundled `gofumpt` is also
+`v0.9.2`, so the standalone formatter target and `make lint` apply the same
+formatting rules. A `gofumpt` installed on `PATH` is not the repository's
+formatter.
+
 ```mermaid
 flowchart TB
     PURE[Pure package and internal tests]
@@ -107,6 +116,49 @@ providing deterministic helpers for publishing and observing accepted output.
 It is backed by the in-memory driver and a manually advanced clock; the client
 is cleaned up through `t.Cleanup`.
 
+### Minimal handler test
+
+A handler test can use the normal subscription and runner APIs while the
+in-memory client supplies deterministic delivery:
+
+```go
+func TestOrderHandler(t *testing.T) {
+	client := f1test.NewClient(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	handled := make(chan struct{})
+	runner, err := client.Subscribe(ctx, f1.Subscription{
+		Name:   "orders-worker",
+		Topics: []string{"orders.created"},
+		Handlers: map[string]f1.Handler{
+			"orders.created.v1": f1.HandlerFunc(func(context.Context, *f1.Event) error {
+				close(handled)
+				return nil
+			}),
+		},
+	})
+	require.NoError(t, err)
+
+	runDone := make(chan error, 1)
+	go func() { runDone <- runner.Run(ctx) }()
+	defer func() {
+		cancel()
+		require.NoError(t, <-runDone)
+	}()
+
+	client.Deliver(t, "orders.created.v1", map[string]string{"id": "order-1"})
+	select {
+	case <-handled:
+	case <-time.After(time.Second):
+		t.Fatal("handler did not run")
+	}
+}
+```
+
+The timeout is only a failure bound. For retry tests, wait for the helper's
+publication signal before calling `Advance`, rather than sleeping.
+
 Use it to prove decisions such as:
 
 - a handler succeeds and produces the expected application-visible effect;
@@ -117,18 +169,102 @@ Use it to prove decisions such as:
 - ordered keys, fanout, and handler concurrency have the expected public
   behavior.
 
-The helper's [`Deliver`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/f1test/f1test.go),
-[`Published`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/f1test/f1test.go), [`DLQ`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/f1test/f1test.go), and
-[`Advance`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/f1test/f1test.go) methods are observation and timing tools,
-not alternate production APIs. The examples in
-[`f1test/f1test_test.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/f1test/f1test_test.go),
-[`f1test/fanout_test.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/f1test/fanout_test.go), and
-[`f1test/ordered_test.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/f1test/ordered_test.go) show the intended
-test shape.
+`Deliver`, `Published`, `DLQ`, and `Advance` are observation and timing tools,
+not alternate production APIs; they live in
+[`f1test/f1test.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/f1test/f1test.go).
+
+For the intended test shape, read the package's own tests: `f1test_test.go` for
+the basics, `fanout_test.go` for fanout, and `ordered_test.go` for ordered keys.
 
 When testing a retry path, wait until the retry publication is observable
 before advancing the fake clock. The helper's capture signal and explicit
 channels are preferable to a real-time sleep.
+
+### Recording observer events
+
+When a test needs to inspect observer traffic, use
+[`f1test.NewRecorder`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/f1test/observer_recorder.go)
+rather than writing a collector observer. It implements `f1.Observer` and keeps
+every call:
+
+```go
+recorder := f1test.NewRecorder()
+client := f1test.NewClient(t, f1.WithObserver(recorder))
+
+// ... run the scenario ...
+
+waitCtx, cancel := context.WithTimeout(context.Background(), time.Second)
+defer cancel()
+
+err := recorder.Wait(waitCtx, func(calls []f1test.ObserverCall) bool {
+	for _, call := range calls {
+		if call.Op == f1test.ObserverOpRecord && call.Kind == f1.ObserverRetryScheduled {
+			return true
+		}
+	}
+	return false
+})
+require.NoError(t, err)
+```
+
+`Wait` snapshots the recorded calls, runs the predicate outside the recorder
+lock, and re-runs it when another call arrives. It returns `nil` once the
+predicate accepts, or `ctx.Err()` when the context ends. Give it a bounded
+context so a missing event fails with a clear timeout instead of hanging.
+
+Each recorded call is an `ObserverCall` with an `Op` of `start`, `finish`, or
+`record`, the `Kind`, and a `Token` where one applies. Exactly one of its
+`Start`, `Finish`, or `Point` fields carries the event; the other two are zero.
+Which event fields are populated for a given kind is a property of the SDK, not
+the recorder: see [Observer events](/development/observer-events).
+
+Three properties matter when writing assertions:
+
+- **Concurrency safe.** The observer methods, `Calls`, and `Wait` can all be
+  used concurrently.
+- **Copied on read.** `Calls` returns a copy of the slice and copies
+  `Finish.Results`, so mutating what you get back cannot corrupt the recorder.
+- **Capture order, not SDK order.** Calls appear in the order the recorder
+  serialized them. F1 guarantees only that one message's `Start` precedes its
+  own `Finish`; calls for different messages interleave freely, so do not assert
+  on the relative order of unrelated events.
+
+Always build one with `NewRecorder`; the zero value cannot wait.
+
+Reach for a custom observer only when the test needs behavior beyond capture,
+such as forwarding events onward or triggering a side effect. A wrapper can
+delegate to both, as
+[`observer_contract_test.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/observer_contract_test.go)
+shows. A hand-rolled observer that only stores calls is reimplementing the
+recorder's locking and copying.
+
+## OTLP metric export boundary tests
+
+Use the OTLP boundary test when a change crosses from observer events, through
+`f1otel`, into the exported metric wire format. Everything below that boundary
+is covered by ordinary unit tests; this one exists because exporter setup can
+look correct while the bytes on the wire are wrong.
+
+[`tools/otlpboundary/otlp_boundary_test.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/tools/otlpboundary/otlp_boundary_test.go)
+runs an in-process `httptest` collector, points the OTLP HTTP exporter at it
+with gzip compression, and captures the request. It then decompresses the body,
+unmarshals the protobuf `ExportMetricsServiceRequest`, and asserts on metric
+count, metric names, data-point attribute keys, and resource attribute keys.
+The assertions run against the decoded payload, so the test covers the real
+compressed request rather than the exporter configuration.
+
+The scenarios drive an in-memory client on a fake clock through deadline
+promotion, backlog sampling with a known head age, retry scheduling, and
+dead-letter publication. A forwarding observer feeds both `f1otel.Observer` and
+a recorder, and the recorder waits synchronize on the observer events before
+the provider is flushed.
+
+The tool is its own Go module, so it does not run under the root `go test
+./...`. Run it with:
+
+```sh
+make otlp-boundary
+```
 
 ## In-memory integration tests
 
@@ -204,24 +340,37 @@ at one, four and sixteen concurrent publishers, consume-and-settle throughput
 on one lane at several handler concurrencies and handler hold times, and also
 on an ordered subscription, end-to-end latency, and retry-path throughput
 beside its tier delay. The comment on the `bench` entry in the
-[Makefile](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/Makefile)
-names the cells and says what each shape measures, and it is the enumeration to
-read rather than a copy here that a moved cell leaves silently wrong. Every
-cell prints `dups`, the deliveries it saw beyond what its shape expects, and
-`goroutines-delta`, the goroutines the run left behind; a bench cell fails on a
-duplicate rather than absorb one into its rate, so `dups` prints zero on a
-passing run. The consume cells add `lag-max` and `heap-max`, the largest
-backlog the consumer reported and the largest live heap the process held, and
-`-benchmem` adds the allocations and the bytes each corpus cost, so a cell can
-show pending work as well as a rate. A Kafka run creates its destinations with
-`F1_KAFKA_PARTITIONS` partitions through the driver's partition-count option,
-so the count its output reports is the one the run asked for rather than one
-the broker chose, and the fixture's own count stands in when the variable is
-unset or unusable. It starts both fixtures, creates only its own namespaced
-destinations and deletes them afterwards, and joins no gate, because a
-throughput number describes the machine it ran on and a gate that fails on a
-busy one is a gate people learn to ignore. Run it on a quiet machine and read
-its output as a comparison between the two drivers, never as a threshold.
+[Makefile](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-
+sdk/-/blob/main/Makefile) names the cells and says what each shape measures,
+and it is the enumeration to read rather than a copy here that a moved cell
+leaves silently wrong.
+
+Every cell prints `dups`, the deliveries it saw beyond what its shape expects,
+and `goroutines-delta`, the goroutines the run left behind; a bench cell fails
+on a duplicate rather than absorb one into its rate, so `dups` prints zero on
+a passing run.
+
+The consume cells add `lag-max` and `heap-max`, the largest backlog the
+consumer reported and the largest live heap the process held, and `-benchmem`
+adds the allocations and the bytes each corpus cost, so a cell can show
+pending work as well as a rate.
+
+A Kafka run creates its destinations with `F1_KAFKA_PARTITIONS` partitions
+through the driver's partition-count option, so the count its output reports
+is the one the run asked for rather than one the broker chose, and the
+fixture's own count stands in when the variable is unset or unusable.
+
+It starts both fixtures, creates only its own namespaced destinations, and
+asks each driver's maintenance port to delete them afterwards. RabbitMQ's
+maintenance port deletes queues only, so a bench run against a long-lived
+RabbitMQ fixture leaves one `f1.bench.*` exchange behind per harness. `Close`
+reports the exchange without failing, and deleting it needs a change to the
+RabbitMQ driver's maintenance adapter.
+
+The run joins no gate, because a throughput number describes the machine it
+ran on and a gate that fails on a busy one is a gate people learn to ignore.
+Run it on a quiet machine and read its output as a comparison between the two
+drivers, never as a threshold.
 
 `test-driver-flip` is the driver-flip acceptance: it builds the two
 `examples/acceptance` services once, runs the identical binaries against Kafka
@@ -296,12 +445,13 @@ error was returned. A useful failure sequence is:
    or lost message.
 
 The shared fault contract is implemented in
-[`driver/conformance/failure.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/driver/conformance/failure.go). Core
-reconnect and lane-repair behavior is covered by
-[`reconnection_test.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/reconnection_test.go) and
-[`lane_repair_test.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/lane_repair_test.go). Provider-specific recovery
-belongs in [`drivers/rabbitmq/reconnect_integration_test.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/drivers/rabbitmq/reconnect_integration_test.go),
-the RabbitMQ fault injector, and the corresponding Kafka or in-memory tests.
+[`driver/conformance/failure.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/driver/conformance/failure.go). Coverage
+splits by layer:
+
+- **Core reconnect and lane repair:** [`reconnection_test.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/reconnection_test.go)
+  and [`lane_repair_test.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/lane_repair_test.go).
+- **Provider-specific recovery:** [`drivers/rabbitmq/reconnect_integration_test.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/drivers/rabbitmq/reconnect_integration_test.go),
+  the RabbitMQ fault injector, and the matching Kafka or in-memory tests.
 
 Delivery is at least once. Duplicate delivery, uncertain acknowledgement, and
 redelivery after a connection or process failure are expected contract paths.
@@ -323,15 +473,17 @@ returns. Assert the public lifecycle result:
 - release abandons outstanding deliveries for redelivery; and
 - successful stop closes the driver message channel at the documented point.
 
-Core lifecycle coverage starts with
-[`client_close_sequencing_test.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/client_close_sequencing_test.go),
-[`client_drain_budget_test.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/client_drain_budget_test.go),
-[`client_producer_admission_test.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/client_producer_admission_test.go),
-[`publish_close_barrier_test.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/publish_close_barrier_test.go),
-[`worker_abort_teardown_test.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/worker_abort_teardown_test.go), and
-the settlement tests linked in the root-package section. Driver-level drain,
-stop, release, and reconnect behavior is covered by the adapter suites and
-the conformance drain group.
+Core lifecycle coverage starts with:
+
+- [`client_close_sequencing_test.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/client_close_sequencing_test.go)
+- [`client_drain_budget_test.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/client_drain_budget_test.go)
+- [`client_producer_admission_test.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/client_producer_admission_test.go)
+- [`publish_close_barrier_test.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/publish_close_barrier_test.go)
+- [`worker_abort_teardown_test.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/worker_abort_teardown_test.go)
+
+plus the settlement tests linked in the root-package section. Driver-level
+drain, stop, release, and reconnect behavior is covered by the adapter suites
+and the conformance drain group.
 
 Do not make shutdown tests pass by adding a longer sleep. Arrange an explicit
 settlement signal, use the lifecycle API under test, and assert the resulting
@@ -403,6 +555,10 @@ make those tests meaningful:
 - `verify-self-contained` checks that repository documentation does not rely on
   unresolved design-record identifiers or paths. Its implementation and
   rationale are in the [Makefile](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/Makefile).
+- `vulncheck` runs the pinned `govulncheck` scanner against the root module and
+  every `tools/*` module. Run it as a release and dependency-change gate with
+  `make vulncheck`; it is network-dependent and is not part of `test-fast` or
+  `check-fixture`.
 
 These are repository contract checks, not substitutes for a handler or broker
 test. Run them when changing exported symbols, package boundaries, driver

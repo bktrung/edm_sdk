@@ -8,9 +8,68 @@ import (
 	"time"
 
 	"github.com/twmb/franz-go/pkg/kadm"
+	"github.com/twmb/franz-go/pkg/kerr"
 
+	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/driver"
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/clock"
 )
+
+func TestWaitForTopicStateRetriesTransientListingError(t *testing.T) {
+	fakeClock := clock.NewFake(time.Unix(0, 0))
+	const simulatedPoll = 2 * time.Second
+	const expectedCalls = 2
+	transientCause := errors.New("temporary metadata listing failure")
+	transientErr := classify("list_topics", kafkaErrorKind(transientCause), transientCause)
+	kind, classified := driver.Classify(transientErr)
+	if !classified || kind != driver.KindTransient {
+		t.Fatalf("driver.Classify(transientErr) = (%v, %t), want (%v, true)", kind, classified, driver.KindTransient)
+	}
+	calls := 0
+	installTopicWaitTestState(t, fakeClock, 0, func(_ *admin, _ context.Context, _ string, names ...string) (kadm.TopicDetails, error) {
+		calls++
+		if calls == 1 {
+			fakeClock.Advance(simulatedPoll)
+			return kadm.TopicDetails{}, transientErr
+		}
+		return visibleTopicDetails(names...), nil
+	})
+
+	if err := (&admin{}).waitForTopicState(context.Background(), "ensure_topology", []string{"transient"}, topicMustExist); err != nil {
+		t.Fatalf("waitForTopicState returned error: %v", err)
+	}
+	if calls != expectedCalls {
+		t.Fatalf("listTopics calls=%d, want %d", calls, expectedCalls)
+	}
+}
+
+func TestWaitForTopicStateReturnsNonTransientListingError(t *testing.T) {
+	fakeClock := clock.NewFake(time.Unix(0, 0))
+	nonTransientErr := classify("list_topics", kafkaErrorKind(kerr.TopicAuthorizationFailed), kerr.TopicAuthorizationFailed)
+	kind, classified := driver.Classify(nonTransientErr)
+	if !classified || kind == driver.KindTransient {
+		t.Fatalf("driver.Classify(nonTransientErr) = (%v, %t), want a classified non-transient error", kind, classified)
+	}
+	calls := 0
+	installTopicWaitTestState(t, fakeClock, 0, func(_ *admin, _ context.Context, _ string, names ...string) (kadm.TopicDetails, error) {
+		calls++
+		if calls == 1 {
+			defer fakeClock.Advance(kafkaTopologyVisibilityPoll)
+			return kadm.TopicDetails{}, nonTransientErr
+		}
+		return visibleTopicDetails(names...), nil
+	})
+
+	err := (&admin{}).waitForTopicState(context.Background(), "ensure_topology", []string{"forbidden"}, topicMustExist)
+	if !errors.Is(err, nonTransientErr) {
+		t.Fatalf("waitForTopicState error=%v, want original listing error %v", err, nonTransientErr)
+	}
+	if err != nonTransientErr { //nolint:errorlint // identity is the assertion: the wait must return the listing error unchanged
+		t.Fatalf("waitForTopicState error=%T(%v), want exact listing error %T(%v)", err, err, nonTransientErr, nonTransientErr)
+	}
+	if calls != 1 {
+		t.Fatalf("listTopics calls=%d, want 1", calls)
+	}
+}
 
 func TestWaitForTopicStateWaitsPastPreviousFiveSecondBound(t *testing.T) {
 	fakeClock := clock.NewFake(time.Unix(0, 0))

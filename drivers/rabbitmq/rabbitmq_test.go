@@ -123,6 +123,19 @@ func TestOpenRejectsEmptyEndpoints(t *testing.T) {
 	}
 }
 
+func TestValidateEndpointRejectsHostlessEndpoint(t *testing.T) {
+	err := validateEndpoint("amqp:///orders")
+	if err == nil {
+		t.Fatal("validateEndpoint() error = nil, want unsupported host-less endpoint error")
+	}
+	if !strings.Contains(err.Error(), "without a host is unsupported") {
+		t.Fatalf("validateEndpoint() error = %v, want unsupported-spelling detail", err)
+	}
+	if !strings.Contains(err.Error(), "amqp://localhost/orders") {
+		t.Fatalf("validateEndpoint() error = %v, want explicit-host example", err)
+	}
+}
+
 func TestOpenRefusesPlaintextRemoteBeforeDialing(t *testing.T) {
 	listener, accepted := listenerForOpenAttempt(t)
 	endpoint := fmt.Sprintf("amqp://0.0.0.0:%d/", listener.Addr().(*net.TCPAddr).Port)

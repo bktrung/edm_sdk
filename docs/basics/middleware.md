@@ -163,8 +163,8 @@ return fmt.Errorf("record handler metrics: %w", err)
 ```
 
 Do not implement a second retry or dead-letter loop by calling the handler
-again from middleware. Configure retry on the [`Subscription`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/subscription.go)
-and use the classification helpers in [`errors.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/errors.go).
+again from middleware. Configure retry on the `Subscription`
+and use the classification helpers in `errors.go`.
 
 ## Middleware is not an error callback
 
@@ -182,11 +182,11 @@ F1 has callback surfaces for events that are not part of the handler pipeline:
 those errors already flow through retry and dead-letter classification. Its
 callback may receive a nil event for a connection-level error, and it must not
 block delivery or shutdown. The option's contract is documented in
-[`options.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/options.go).
+`options.go`.
 
 Keep dead-letter and discarded callbacks short. They are notification surfaces,
 not replacement handler pipelines. Use the subscription's
-[`DeadLettered`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/subscription.go) and [`Discarded`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/subscription.go)
+`DeadLettered` and `Discarded`
 payloads to inspect the event and failure reason.
 
 ## Testing middleware
@@ -195,7 +195,7 @@ Test middleware at two levels:
 
 1. Unit-test the wrapper with a small fake handler to prove ordering, context
    propagation, and error preservation.
-2. Use [`f1test`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/f1test/f1test.go) to verify the wrapped handler's
+2. Use `f1test` to verify the wrapped handler's
    observable behavior through a real `Client`, `Subscription`, and `Runner`.
 
 Include cases for success, a wrapped retryable error, a wrapped terminal error,
@@ -208,7 +208,7 @@ implementation.
 - [Message](/basics/message) - event data, metadata, context, and identity;
 - [Publisher and subscriber](/basics/pubsub) - publish, subscribe, runner, and
   lifecycle boundaries;
-- [`Terminal`, `Drop`, and `RetryAfter`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/errors.go) - failure
+- `Terminal`, `Drop`, and `RetryAfter` - failure
   classification helpers;
 - [Consume flow](/development/consume-flow) - dispatch, classification, and
   settlement internals; and

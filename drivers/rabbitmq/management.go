@@ -36,11 +36,15 @@ type managementClient struct {
 }
 
 type managementQueue struct {
-	Name          string         `json:"name"`
-	Messages      int64          `json:"messages"`
-	MessagesReady int64          `json:"messages_ready"`
-	Consumers     int64          `json:"consumers"`
-	Arguments     map[string]any `json:"arguments"` // broker-reported argument values are heterogeneous JSON scalars
+	Name                 string         `json:"name"`
+	Messages             int64          `json:"messages"`
+	MessagesReady        int64          `json:"messages_ready"`
+	Consumers            int64          `json:"consumers"`
+	Arguments            map[string]any `json:"arguments"` // broker-reported argument values are heterogeneous JSON scalars
+	HeadMessageTimestamp int64          `json:"head_message_timestamp"`
+}
+type managementExchange struct {
+	Name string `json:"name"`
 }
 
 type managementBinding struct {
@@ -69,7 +73,7 @@ func newManagementClient(endpoint string, cfg driver.Config) (*managementClient,
 	if parsed.Hostname() == "" {
 		// Opaque and path fields can retain raw credential-looking input; keep only the scheme.
 		redacted := url.URL{Scheme: parsed.Scheme}
-		return nil, fmt.Errorf("rabbitmq: invalid management endpoint %q: %w", redacted.String(), errors.New("missing host"))
+		return nil, fmt.Errorf("rabbitmq: invalid management endpoint %q: %w", redacted.String(), errUnsupportedHostlessEndpoint)
 	}
 	scheme := "http"
 	if parsed.Scheme == "amqps" || (cfg.TLS != nil && cfg.TLS.Enabled) {
@@ -92,15 +96,15 @@ func newManagementClient(endpoint string, cfg driver.Config) (*managementClient,
 		username = cfg.SASL.Username
 		password = cfg.SASL.Password
 	}
+	amqpURI, uriErr := amqp.ParseURI(endpoint)
+	if uriErr != nil {
+		return nil, invalidEndpointError(uriErr)
+	}
 	vhost := cfg.DriverOptions["rabbitmq.vhost"]
 	if vhost == "" {
 		// The AMQP connection reads its vhost from this same endpoint through
 		// this parse, so re-deriving it here is how the two readers drifted
 		// apart. One parse, one answer.
-		amqpURI, uriErr := amqp.ParseURI(endpoint)
-		if uriErr != nil {
-			return nil, invalidEndpointError(uriErr)
-		}
 		vhost = amqpURI.Vhost
 	}
 	timeout := cfg.ConnectTimeout
@@ -162,6 +166,14 @@ func (m *managementClient) queuesPath() string {
 	return m.baseURL + "/api/queues/" + url.PathEscape(m.vhost)
 }
 
+func (m *managementClient) exchangePath(name string) string {
+	return m.baseURL + "/api/exchanges/" + url.PathEscape(m.vhost) + "/" + url.PathEscape(name)
+}
+
+func (m *managementClient) exchangesPath() string {
+	return m.baseURL + "/api/exchanges/" + url.PathEscape(m.vhost)
+}
+
 func (m *managementClient) bindingsPath() string {
 	return m.baseURL + "/api/bindings/" + url.PathEscape(m.vhost)
 }
@@ -186,6 +198,28 @@ func (m *managementClient) listQueues(ctx context.Context) ([]managementQueue, e
 		return nil, fmt.Errorf("management API decode queues: %w", err)
 	}
 	return queues, nil
+}
+
+func (m *managementClient) listExchanges(ctx context.Context) ([]managementExchange, error) {
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, m.exchangesPath(), nil)
+	if err != nil {
+		return nil, err
+	}
+	request.SetBasicAuth(m.username, m.password)
+	response, err := m.client.Do(request)
+	if err != nil {
+		return nil, err
+	}
+	defer response.Body.Close()
+	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
+		body, _ := io.ReadAll(io.LimitReader(response.Body, 4096))
+		return nil, fmt.Errorf("management API GET exchanges: %s: %s", response.Status, strings.TrimSpace(string(body)))
+	}
+	var exchanges []managementExchange
+	if err := json.NewDecoder(response.Body).Decode(&exchanges); err != nil {
+		return nil, fmt.Errorf("management API decode exchanges: %w", err)
+	}
+	return exchanges, nil
 }
 
 // getQueue fetches one queue's current state, including its broker-recorded
@@ -259,9 +293,37 @@ func (m *managementClient) deleteQueue(ctx context.Context, name string) (bool, 
 	return true, nil
 }
 
+func (m *managementClient) deleteExchange(ctx context.Context, name string) (bool, error) {
+	request, err := http.NewRequestWithContext(ctx, http.MethodDelete, m.exchangePath(name), nil)
+	if err != nil {
+		return false, err
+	}
+	request.SetBasicAuth(m.username, m.password)
+	response, err := m.client.Do(request)
+	if err != nil {
+		return false, err
+	}
+	defer response.Body.Close()
+	if response.StatusCode == http.StatusNotFound {
+		return false, nil
+	}
+	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
+		body, _ := io.ReadAll(io.LimitReader(response.Body, 4096))
+		return false, fmt.Errorf("management API DELETE exchange %q: %s: %s", name, response.Status, strings.TrimSpace(string(body)))
+	}
+	return true, nil
+}
+
 func (queue managementQueue) totalMessages() int64 {
 	if queue.Messages > 0 {
 		return queue.Messages
 	}
 	return queue.MessagesReady
+}
+
+func (queue managementQueue) headEnqueuedAt() (time.Time, driver.EnqueueSource) {
+	if queue.HeadMessageTimestamp <= 0 {
+		return time.Time{}, driver.EnqueueSourceUnknown
+	}
+	return time.Unix(queue.HeadMessageTimestamp, 0), driver.EnqueueSourceProducer
 }

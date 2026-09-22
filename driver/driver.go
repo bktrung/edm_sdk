@@ -165,6 +165,11 @@ type Maintenance interface {
 	// Prune is the only deletion operation in the port and reports the result
 	// for each requested name.
 	//
+	// A nil error means the batch was processed, not that every requested
+	// destination was deleted. A refused destination is reported in its own
+	// PruneResult with Deleted false and a non-empty Reason. Callers must
+	// inspect every result.
+	//
 	// A destination is prunable only when it is empty, its driver-managed
 	// auxiliary destinations are empty, and no consumer is attached. Drivers
 	// must recheck these guards before each delete and delete auxiliaries first.
@@ -195,6 +200,7 @@ type TLSConfig struct {
 	CAFile             string // trusted CA file
 	CertFile           string // client certificate file
 	KeyFile            string // client key file
+	ServerName         string // overrides the host name used to verify the broker certificate; empty derives it from the endpoint
 	InsecureSkipVerify bool   // never true outside a test fixture
 }
 
@@ -220,10 +226,11 @@ type ConsumerConfig struct {
 	Group        string   // consumer group or queue-set identity
 	Destinations []string // main and retry lanes for this subscription
 
-	// Prefetch is the subscription-wide in-flight budget. The core divides it
-	// across destinations with a minimum of one per lane and passes each lane's
-	// result in PerDestination. Prefetch below the lane count is rejected by
-	// the core rather than silently changing the budget.
+	// Prefetch is the subscription-wide in-flight budget. The core caps it by
+	// the sum of lane capacities and passes those capacities in PerDestination.
+	// In ordered mode, the effective prefetch is also the worker queue depth.
+	// Prefetch below the lane count is rejected by the core rather than silently
+	// changing the budget.
 	Prefetch       int
 	PerDestination map[string]int
 

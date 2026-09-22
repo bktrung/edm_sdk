@@ -3,8 +3,10 @@ package dispatch
 import (
 	"context"
 	"errors"
+	"fmt"
 	"hash/fnv"
 	"sync"
+	"unsafe"
 
 	"golang.org/x/sync/errgroup"
 )
@@ -15,6 +17,11 @@ type Work struct {
 	Key []byte
 	Run func(context.Context)
 }
+
+// MaxOrderedBufferEntries is the largest total ordered buffer in Work entries.
+// It is computed as 64 MiB / unsafe.Sizeof(Work{}), which is 67,108,864 / 32
+// = 2,097,152 on 64-bit platforms.
+const MaxOrderedBufferEntries = int((64 << 20) / unsafe.Sizeof(Work{}))
 
 // Pool owns worker goroutines and optionally assigns equal keys to one worker.
 type Pool struct {
@@ -67,6 +74,9 @@ func NewPool(parent context.Context, concurrency int, ordered bool, queueSize in
 	}
 	if queueSize < concurrency {
 		queueSize = concurrency
+	}
+	if ordered && concurrency > MaxOrderedBufferEntries/queueSize {
+		return nil, fmt.Errorf("dispatch: ordered buffer %d x %d exceeds %d Work entries", concurrency, queueSize, MaxOrderedBufferEntries)
 	}
 	if parent == nil {
 		parent = context.Background()

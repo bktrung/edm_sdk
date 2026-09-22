@@ -101,7 +101,7 @@ the delays directly. `RetryAfter` replaces the current retry's delay with the
 nominal delay of the tier nearest the requested value, so it rounds a handler's
 request onto the configured ladder instead of parking the event for an
 arbitrary interval, and it does not bypass the configured attempt cap. The
-validation and delay calculation live in [`config.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/config.go); keep service
+validation and delay calculation live in `config.go`; keep service
 policy in configuration rather than implementing a second retry loop in a
 handler or middleware.
 
@@ -140,11 +140,12 @@ subscription := f1.Subscription{
 }
 ```
 
-`OnDeadLetter` is a notification surface. Its `Body` and `Envelope` are
-independent copies, but the callback must not be the only place where a
-correctness-critical action happens. F1 invokes the callback asynchronously
-with a bounded notification context; a slow or panicking callback must not
-stall delivery or shutdown.
+Register `OnDeadLetter` and `OnDiscarded` for service-level logging, metrics,
+or alert handoff. They are notification surfaces, not correctness-critical
+workflow steps. `OnDeadLetter`'s `Body` and `Envelope` are independent copies,
+but the callback must not be the only place where a correctness-critical action
+happens. F1 invokes both callbacks asynchronously with a bounded notification
+context; a slow or panicking callback must not stall delivery or shutdown.
 
 The dead-letter publication is confirmed before F1 acknowledges the original
 delivery. If the successor cannot be published within the bounded successor
@@ -201,7 +202,7 @@ completes. The original or successor may therefore be observed more than once.
 Use [`Event.IdempotencyKey()`](/basics/message#delivery-identity-and-redelivery)
 as the input to application-owned deduplication when an effect must be safe to
 repeat. A producer can set the key with
-[`WithIdempotencyKey`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/publisher.go); otherwise F1 falls back to the
+`WithIdempotencyKey`; otherwise F1 falls back to the
 event ID. The key is an input to the application's idempotency store, not a
 deduplication database managed by F1.
 
@@ -227,7 +228,7 @@ or dead-letter policy and are not sent to this callback a second time.
 
 ## Test the policy, not a driver
 
-Failure behavior is easiest to verify with [`f1test`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/f1test/f1test.go),
+Failure behavior is easiest to verify with `f1test`,
 which uses the in-memory driver and a manually advanced clock:
 
 ```go
@@ -260,7 +261,7 @@ Cover at least:
 
 The in-memory driver and test helper are useful for policy tests, but driver
 compatibility still belongs to the driver's conformance suite. See
-[`f1test`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/f1test/f1test.go) and the [driver conformance package](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/tree/main/driver/conformance)
+`f1test` and the driver conformance package
 for the two boundaries.
 
 ## Common mistakes
@@ -288,5 +289,5 @@ for the two boundaries.
   runs and where classification remains outside the chain;
 - [Lifecycle and shutdown](/advanced-topics/lifecycle-and-shutdown) - successor
   handoff, acknowledgement, release, and drain behavior; and
-- [`errors.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/errors.go), [`worker.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/worker.go), and
-  [`subscription.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/subscription.go) - executable failure contracts.
+- `errors.go`, `worker.go`, and
+  `subscription.go` - executable failure contracts.

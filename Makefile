@@ -3,9 +3,12 @@ MODULE := fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk
 
 VERSION := $(shell git describe --tags --dirty --always 2>/dev/null || echo dev)
 
-# Keep the linter version aligned with CI.
+# Keep the linter and formatter versions aligned with CI.
 GOLANGCI_LINT_VERSION := v2.12.2
+GOFUMPT_VERSION := v0.9.2
+GOVULNCHECK_VERSION ?= v1.8.0
 GOLANGCI_LINT := $(CURDIR)/.tools/bin/golangci-lint
+GOFUMPT := $(CURDIR)/.tools/bin/gofumpt
 export GOLANGCI_LINT_CACHE := $(CURDIR)/.cache/golangci-lint
 
 export GOPRIVATE := fgit.zapps.vn
@@ -33,7 +36,7 @@ KAFKA_PORT ?= 19092
 KAFKA_PROJECT ?= docker
 KAFKA_COMPOSE := KAFKA_PORT=$(KAFKA_PORT) docker compose --project-name "$(KAFKA_PROJECT)" -f docker/docker-compose.yml
 
-.PHONY: build test-fast test lint probe-tests verify-agnostic verify-self-contained check-fixture check-api-surface check-api-surface-codec check-api-surface-driver check-api-surface-f1test check-api-diff record-api-diff-baseline
+.PHONY: build format format-check test-fast test lint vulncheck probe-tests otlp-boundary verify-agnostic verify-self-contained check-fixture check-doc-source-links check-observer-events check-api-surface check-api-surface-codec check-api-surface-driver check-api-surface-f1test check-api-surface-f1otel check-api-diff record-api-diff-baseline
 
 ## build: compile all packages with reproducible build flags.
 build:
@@ -51,6 +54,19 @@ test-fast:
 test:
 	go test -count=1 ./...
 
+## otlp-boundary: run the OTLP metric export boundary test in its isolated tool module.
+otlp-boundary:
+	cd tools/otlpboundary && go test -count=1 -v ./...
+
+## vulncheck: scan the root and tools modules for known vulnerabilities.
+vulncheck:
+	go run golang.org/x/vuln/cmd/govulncheck@$(GOVULNCHECK_VERSION) ./...
+	@for module in tools/*; do \
+		if [ -f "$$module/go.mod" ]; then \
+			(cd "$$module" && go run golang.org/x/vuln/cmd/govulncheck@$(GOVULNCHECK_VERSION) ./...) || exit 1; \
+		fi; \
+	done
+
 ## probe-tests: run the sampled test-deletion probe. Set PROBE_SAMPLE to use a
 ## different package-and-test list.
 probe-tests: $(TESTPROBE)
@@ -58,12 +74,30 @@ probe-tests: $(TESTPROBE)
 
 
 
-## lint: run the pinned golangci-lint configuration.
-$(GOLANGCI_LINT):
-	GOBIN=$(CURDIR)/.tools/bin go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@$(GOLANGCI_LINT_VERSION)
+## format: format Go source with the repository-pinned gofumpt.
+format: $(GOFUMPT)
+	$(GOFUMPT) -w .
 
+## format-check: fail when Go source is not formatted by the pinned gofumpt.
+format-check: $(GOFUMPT)
+	@$(GOFUMPT) -version
+	@files=$$($(GOFUMPT) -l .); \
+	if [ -n "$$files" ]; then \
+		printf '%s\n' "$$files"; \
+		exit 1; \
+	fi
+
+## lint: run the pinned golangci-lint configuration.
 lint: $(GOLANGCI_LINT)
 	$(GOLANGCI_LINT) run --build-tags integration ./...
+
+## format-check and format use the same pinned gofumpt version as the
+## formatter bundled by the pinned golangci-lint release.
+$(GOFUMPT):
+	GOBIN=$(CURDIR)/.tools/bin go install mvdan.cc/gofumpt@$(GOFUMPT_VERSION)
+
+$(GOLANGCI_LINT):
+	GOBIN=$(CURDIR)/.tools/bin go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@$(GOLANGCI_LINT_VERSION)
 
 ## verify-agnostic: check broker import boundaries with depguard.
 verify-agnostic: $(GOLANGCI_LINT)
@@ -109,7 +143,38 @@ verify-self-contained:
 ## docs/development/testing.md.
 check-fixture:
 	go test -count=1 ./...
-	$(MAKE) check-api-surface check-api-surface-codec check-api-surface-driver check-api-surface-f1test check-api-diff
+	$(MAKE) check-api-surface check-api-surface-codec check-api-surface-driver check-api-surface-f1test check-api-surface-f1otel check-api-diff check-doc-source-links check-observer-events
+
+## check-doc-source-links: reject source line references in published docs and simulators.
+check-doc-source-links:
+	@set -o pipefail; \
+	pattern='([[:alnum:]_-]+\.go:[0-9]+|#L[0-9]+)'; \
+	docs_matches=$$(git grep --no-index -nIE "$$pattern" -- 'docs' ':!docs/.vitepress/**'); \
+	docs_status=$$?; \
+	simulator_matches=$$(git grep --no-index -nIE "$$pattern" -- 'plans/agy-work/*.html'); \
+	simulator_status=$$?; \
+	if [ "$$docs_status" -gt 1 ] || [ "$$simulator_status" -gt 1 ]; then \
+		exit 1; \
+	fi; \
+	if [ "$$docs_status" -eq 0 ] || [ "$$simulator_status" -eq 0 ]; then \
+		printf '%s\n' "$$docs_matches" "$$simulator_matches"; \
+		echo "check-doc-source-links: source line reference above is not stable"; \
+		exit 1; \
+	fi; \
+	echo "check-doc-source-links: 0 issues."
+
+## check-observer-events: fail when the generated observer reference differs from observer.go.
+check-observer-events:
+	@set -e; \
+	tmp=$$(mktemp); \
+	trap 'rm -f "$$tmp"' EXIT; \
+	(cd tools/observerevents && go run . -source ../../observer.go -output "$$tmp"); \
+	if ! cmp -s "$$tmp" docs/development/observer-events.md; then \
+		echo "check-observer-events: generated reference is out of date" >&2; \
+		diff -u docs/development/observer-events.md "$$tmp" || true; \
+		exit 1; \
+	fi; \
+	echo "check-observer-events: 0 issues."
 
 ## check-api-surface: verify exported symbols against the f1 public API fixture.
 check-api-surface: $(APISURFACE)
@@ -127,6 +192,10 @@ check-api-surface-driver: $(APISURFACE)
 check-api-surface-f1test: $(APISURFACE)
 	$(APISURFACE) -package f1test -fixture testdata/public-api-f1test.json
 
+## check-api-surface-f1otel: verify exported f1otel symbols against its fixture.
+check-api-surface-f1otel: $(APISURFACE)
+	$(APISURFACE) -package f1otel -fixture testdata/public-api-f1otel.json
+
 ## check-api-diff: report API changes; fail on incompatible changes unless
 ## API_DIFF_ENFORCE=0, and on unrecorded compatible changes unless
 ## API_DIFF_ADDITIONS_ENFORCE=0. Both are enforced by default.
@@ -142,7 +211,8 @@ check-api-diff: $(APIDIFF) $(APIDIFF_NORMALIZE)
 	for spec in \
 		"f1:$(MODULE):f1.export" \
 		"driver:$(MODULE)/driver:driver.export" \
-		"codec:$(MODULE)/codec:codec.export"; do \
+		"codec:$(MODULE)/codec:codec.export" \
+		"f1otel:$(MODULE)/f1otel:f1otel.export"; do \
 		package=$${spec%%:*}; rest=$${spec#*:}; import_path=$${rest%%:*}; baseline=$${rest#*:}; \
 		report=$$(mktemp); current=$$(mktemp); normalized_old=$$(mktemp); normalized_new=$$(mktemp); \
 		trap 'rm -f "$$report" "$$current" "$$normalized_old" "$$normalized_new"' EXIT; \
@@ -193,7 +263,8 @@ record-api-diff-baseline: $(APIDIFF) $(APIDIFF_NORMALIZE)
 	for spec in \
 		"$(MODULE):f1.export" \
 		"$(MODULE)/driver:driver.export" \
-		"$(MODULE)/codec:codec.export"; do \
+		"$(MODULE)/codec:codec.export" \
+		"$(MODULE)/f1otel:f1otel.export"; do \
 		import_path=$${spec%%:*}; baseline=$${spec#*:}; \
 		raw=$$(mktemp); \
 		$(APIDIFF) -w "$$raw" "$$import_path"; \
@@ -218,17 +289,22 @@ $(APIDIFF_NORMALIZE): tools/apidiff/normalize.go tools/apidiff/go.mod tools/apid
 ## test-rabbitmq: run the RabbitMQ driver suite and its conformance suite
 ## against the selected fixture, starting it first. The integration tag selects
 ## the broker-backed files and there is no skip branch left, so an unreachable
-## broker fails this target instead of quietly reporting success. The broker is
-## left running for repeat runs; stop it with broker-down.
+## broker fails this target instead of quietly reporting success. An explicit
+## timeout keeps a stalled broker wait from reaching Go's default deadline and
+## emitting a misleading goroutine dump; broker-free tests do not wait on a broker.
+## The broker is left running for repeat runs; stop it with broker-down.
 test-rabbitmq: broker-up broker-smoke
-	$(RABBITMQ_TEST_ENV) go test -race -count=1 -tags integration ./drivers/rabbitmq/...
+	$(RABBITMQ_TEST_ENV) go test -race -count=1 -tags integration -timeout 20m ./drivers/rabbitmq/...
 
 ## test-rabbitmq-driver: run the RabbitMQ driver suite without the conformance
 ## suite, which test-rabbitmq-conformance runs separately. The conformance suite
 ## is not behind its own switch the way the Kafka one is, so CI selects the two
-## halves with -skip and -run rather than with an environment variable.
+## halves with -skip and -run rather than with an environment variable. An
+## explicit timeout keeps a stalled broker wait from reaching Go's default
+## deadline and emitting a misleading goroutine dump; broker-free tests do not
+## wait on a broker.
 test-rabbitmq-driver: broker-up broker-smoke
-	$(RABBITMQ_TEST_ENV) go test -race -count=1 -tags integration -skip '^TestConformance$$' ./drivers/rabbitmq/...
+	$(RABBITMQ_TEST_ENV) go test -race -count=1 -tags integration -skip '^TestConformance$$' -timeout 20m ./drivers/rabbitmq/...
 
 ## test-rabbitmq-conformance: run the RabbitMQ conformance suite against the
 ## fixture. It requires a live RabbitMQ broker with the management API enabled,

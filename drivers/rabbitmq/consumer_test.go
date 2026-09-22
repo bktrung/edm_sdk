@@ -5,10 +5,13 @@ import (
 	"time"
 
 	amqp "github.com/rabbitmq/amqp091-go"
+
+	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/clock"
 )
 
 func TestInboundMessageReceivedAtIsReceiptTime(t *testing.T) {
-	timestamp := time.Now().Add(-time.Hour) //nolint:forbidigo // the test compares receipt time with the real clock around the call
+	receiptAt := time.Date(2030, time.January, 2, 3, 4, 5, 6, time.UTC)
+	timestamp := receiptAt.Add(-time.Hour)
 	delivery := amqp.Delivery{
 		Timestamp: timestamp,
 		Headers: amqp.Table{
@@ -19,11 +22,10 @@ func TestInboundMessageReceivedAtIsReceiptTime(t *testing.T) {
 		},
 	}
 
-	before := time.Now() //nolint:forbidigo // the test compares receipt time with the real clock around the call
-	message := inboundMessage("orders", delivery, nil, false)
-	after := time.Now() //nolint:forbidigo // the test compares receipt time with the real clock around the call
-	if message.ReceivedAt.Before(before) || message.ReceivedAt.After(after) {
-		t.Fatalf("ReceivedAt = %s, want between %s and %s", message.ReceivedAt, before, after)
+	consumer := &consumer{clock: clock.NewFake(receiptAt)}
+	message := consumer.inboundMessage("orders", delivery, nil, false, false)
+	if !message.ReceivedAt.Equal(receiptAt) {
+		t.Fatalf("ReceivedAt = %s, want fake receipt time %s", message.ReceivedAt, receiptAt)
 	}
 
 	var timeHeader string
@@ -41,10 +43,8 @@ func TestInboundMessageReceivedAtIsReceiptTime(t *testing.T) {
 		t.Fatalf("time header = %s, want %s", gotTimestamp, timestamp)
 	}
 
-	before = time.Now() //nolint:forbidigo // the test compares receipt time with the real clock around the call
-	message = inboundMessage("orders", amqp.Delivery{}, nil, false)
-	after = time.Now() //nolint:forbidigo // the test compares receipt time with the real clock around the call
-	if message.ReceivedAt.Before(before) || message.ReceivedAt.After(after) {
-		t.Fatalf("zero-timestamp ReceivedAt = %s, want between %s and %s", message.ReceivedAt, before, after)
+	message = consumer.inboundMessage("orders", amqp.Delivery{}, nil, false, false)
+	if !message.ReceivedAt.Equal(receiptAt) {
+		t.Fatalf("zero-timestamp ReceivedAt = %s, want fake receipt time %s", message.ReceivedAt, receiptAt)
 	}
 }

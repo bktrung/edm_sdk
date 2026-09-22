@@ -7,12 +7,37 @@ import (
 	"io"
 	"log/slog"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/stretchr/testify/require"
 
 	f1 "fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk"
+	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/driver"
 )
+
+func TestCaptureStoreWaitPublishedSurvivesInterveningDrain(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		s := &captureStore{signal: make(chan struct{})}
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		done := make(chan error, 1)
+		go func() {
+			done <- s.waitPublished(ctx)
+		}()
+
+		synctest.Wait()
+		s.take(true)
+		s.add([]driver.OutboundMessage{{Destination: "orders.created.v1"}}, nil)
+
+		select {
+		case err := <-done:
+			require.NoError(t, err)
+		case <-ctx.Done():
+			t.Fatal("waitPublished did not wake after publication")
+		}
+	})
+}
 
 func TestClientDeliverAndCapture(t *testing.T) {
 	c := NewClient(t, quietLogger())

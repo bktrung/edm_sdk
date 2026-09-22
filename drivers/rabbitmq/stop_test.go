@@ -9,6 +9,7 @@ import (
 	amqp "github.com/rabbitmq/amqp091-go"
 
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/driver"
+	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/clock"
 )
 
 func TestConsumerStopReleasesParkedForwarder(t *testing.T) {
@@ -125,6 +126,7 @@ func TestConsumerPausedForwarderDecrementsEmission(t *testing.T) {
 func newForwarderTestConsumer() *consumer {
 	return &consumer{
 		conn:           &conn{},
+		clock:          clock.NewReal(),
 		messages:       make(chan driver.InboundMessage, 1),
 		errors:         make(chan error, 1),
 		stoppedC:       make(chan struct{}),

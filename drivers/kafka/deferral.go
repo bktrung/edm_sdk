@@ -34,9 +34,6 @@ func (s partitionPauseSet) remove(reason partitionPauseReason) bool {
 func (s partitionPauseSet) empty() bool { return len(s) == 0 }
 
 func (c *consumer) currentTime() time.Time {
-	if c.clock == nil {
-		return time.Time{}
-	}
 	return c.clock.Now()
 }
 

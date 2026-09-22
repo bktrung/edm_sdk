@@ -601,10 +601,35 @@ func (c *trackedConn) reclaim(ctx context.Context, consumers []*trackedConsumer,
 			errs = append(errs, err)
 		}
 	}
-	for _, destination := range destinations {
-		if err := purgeAndPruneIfSupported(ctx, c.Conn, destination); err != nil {
-			errs = append(errs, err)
+	// Destinations follow Prune's dependency order: a destination that other
+	// destinations are bound to must be pruned after them, so retry refusals
+	// after each pass that deletes something.
+	pending := slices.Clone(destinations)
+	for len(pending) > 0 {
+		next := make([]string, 0, len(pending))
+		var refused []error
+		progressed := false
+		for _, destination := range pending {
+			if err := purgeAndPruneIfSupported(ctx, c.Conn, destination); err != nil {
+				var refusal *pruneRefusalError
+				if errors.As(err, &refusal) {
+					next = append(next, destination)
+					refused = append(refused, err)
+					continue
+				}
+				errs = append(errs, err)
+				continue
+			}
+			progressed = true
 		}
+		if len(next) == 0 {
+			break
+		}
+		if !progressed {
+			errs = append(errs, refused...)
+			break
+		}
+		pending = next
 	}
 	for _, producer := range producers {
 		if err := producer.Close(ctx); err != nil {
@@ -1104,6 +1129,15 @@ func cleanupProfileErrors(ctx context.Context, conn driver.Conn, producer driver
 	return errs
 }
 
+type pruneRefusalError struct {
+	destination string
+	reason      string
+}
+
+func (e *pruneRefusalError) Error() string {
+	return fmt.Sprintf("prune profile destination %q refused: %s", e.destination, e.reason)
+}
+
 func pruneProfileDestination(ctx context.Context, maintenance driver.Maintenance, destination string) error {
 	retryCtx, cancel := context.WithTimeout(ctx, pruneRetryBudget)
 	defer cancel()
@@ -1151,7 +1185,7 @@ func pruneProfileDestination(ctx context.Context, maintenance driver.Maintenance
 			return fmt.Errorf("prune profile destination %q reported not deleted without a reason", destination)
 		}
 		if !transientPruneReason(last.Reason) {
-			return fmt.Errorf("prune profile destination %q refused: %s", destination, last.Reason)
+			return &pruneRefusalError{destination: destination, reason: last.Reason}
 		}
 		if attempt == pruneRetryAttempts {
 			break

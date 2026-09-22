@@ -22,26 +22,6 @@ var (
 	_ driver.Maintenance = (*admin)(nil)
 )
 
-// maintenanceGate serializes destructive metadata sequences. Conn.Admin
-// creates a fresh facade for each call, so a receiver mutex would not
-// coordinate two Purge calls sharing the same broker client: without
-// serialization, both can read the same low watermark and both report the
-// same records as removed. Channel acquisition remains context-aware.
-var maintenanceGate = make(chan struct{}, 1)
-
-func acquireMaintenance(ctx context.Context) error {
-	select {
-	case maintenanceGate <- struct{}{}:
-		return nil
-	case <-ctx.Done():
-		return ctx.Err()
-	}
-}
-
-func releaseMaintenance() {
-	<-maintenanceGate
-}
-
 func (a *admin) admission(ctx context.Context, operation string) (func(), error) {
 	if err := ctx.Err(); err != nil {
 		return nil, classify(operation, driver.KindTransient, err)
@@ -49,12 +29,14 @@ func (a *admin) admission(ctx context.Context, operation string) (func(), error)
 	if a.conn == nil {
 		return func() {}, nil
 	}
-	a.conn.lifecycleMu.RLock()
+	if err := a.conn.acquireLifecycle(ctx); err != nil {
+		return nil, classify(operation, driver.KindTransient, err)
+	}
 	if err := a.conn.admissionError(operation); err != nil {
-		a.conn.lifecycleMu.RUnlock()
+		a.conn.releaseLifecycle()
 		return nil, err
 	}
-	return a.conn.lifecycleMu.RUnlock, nil
+	return a.conn.releaseLifecycle, nil
 }
 
 func missingPurgeDestinationError(destination string, cause error) error {
@@ -74,10 +56,10 @@ func (a *admin) Purge(ctx context.Context, destination string) (int64, error) {
 		return 0, err
 	}
 	release()
-	if err := acquireMaintenance(ctx); err != nil {
+	if err := a.conn.acquireMaintenance(ctx); err != nil {
 		return 0, classify("purge", driver.KindTransient, err)
 	}
-	defer releaseMaintenance()
+	defer a.conn.releaseMaintenance()
 	release, err = a.admission(ctx, "purge")
 	if err != nil {
 		return 0, err
@@ -146,10 +128,10 @@ func (a *admin) Prune(ctx context.Context, names []string) ([]driver.PruneResult
 		return nil, err
 	}
 	release()
-	if err := acquireMaintenance(ctx); err != nil {
+	if err := a.conn.acquireMaintenance(ctx); err != nil {
 		return nil, classify("prune", driver.KindTransient, err)
 	}
-	defer releaseMaintenance()
+	defer a.conn.releaseMaintenance()
 	release, err = a.admission(ctx, "prune")
 	if err != nil {
 		return nil, err
@@ -157,16 +139,19 @@ func (a *admin) Prune(ctx context.Context, names []string) ([]driver.PruneResult
 	defer release()
 	results := make([]driver.PruneResult, 0, len(names))
 	deleted := make([]string, 0, len(names))
+	recordRefusal := func(name, reason string) {
+		if reason == "destination does not exist" {
+			a.clearDestinationDelay(name)
+		}
+		results = append(results, driver.PruneResult{Name: name, Reason: reason})
+	}
 	for _, name := range names {
 		reason, err := a.pruneGuard(ctx, name)
 		if err != nil {
 			return nil, err
 		}
 		if reason != "" {
-			if reason == "destination does not exist" {
-				a.clearDestinationDelay(name)
-			}
-			results = append(results, driver.PruneResult{Name: name, Reason: reason})
+			recordRefusal(name, reason)
 			continue
 		}
 
@@ -174,17 +159,6 @@ func (a *admin) Prune(ctx context.Context, names []string) ([]driver.PruneResult
 		// guard and before DeleteTopics, so this check-then-delete window can
 		// still destroy a newly attached destination; the port has no atomic
 		// compare-and-delete operation with which to close it.
-		reason, err = a.pruneGuard(ctx, name)
-		if err != nil {
-			return nil, err
-		}
-		if reason != "" {
-			if reason == "destination does not exist" {
-				a.clearDestinationDelay(name)
-			}
-			results = append(results, driver.PruneResult{Name: name, Reason: reason})
-			continue
-		}
 		responses, err := a.client.DeleteTopics(ctx, name)
 		if err != nil {
 			return nil, classifyAdminError("prune", err)
@@ -195,8 +169,7 @@ func (a *admin) Prune(ctx context.Context, names []string) ([]driver.PruneResult
 		}
 		if response.Err != nil {
 			if errors.Is(response.Err, kerr.UnknownTopicOrPartition) {
-				a.clearDestinationDelay(name)
-				results = append(results, driver.PruneResult{Name: name, Reason: "destination does not exist"})
+				recordRefusal(name, "destination does not exist")
 				continue
 			}
 			return nil, classifyAdminError("prune", response.Err)

@@ -12,6 +12,8 @@ import (
 
 	"gopkg.in/yaml.v3"
 
+	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/dispatch"
+	kafkarules "fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/kafka"
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/retry"
 )
 
@@ -239,14 +241,18 @@ func normalizeConfig(cfg Config) Config {
 		if subscription.Concurrency == 0 {
 			subscription.Concurrency = subDefaults.Concurrency
 		}
-		if !subscription.presence.Prefetch {
-			subscription.Prefetch = resolvePrefetch(subscription.Prefetch, cfg.Broker.DefaultPrefetch)
-		}
 		if len(subscription.Priorities) == 0 {
 			subscription.Priorities = append([]Priority(nil), subDefaults.Priorities...)
 		}
 		if subscription.Retry.MaxAttempts == 0 {
 			subscription.Retry.MaxAttempts = subDefaults.Retry.MaxAttempts
+		}
+		if !subscription.presence.Prefetch {
+			named := subscription.Prefetch != 0
+			subscription.Prefetch = resolvePrefetch(subscription.Prefetch, cfg.Broker.DefaultPrefetch)
+			if !named {
+				subscription.Prefetch = max(subscription.Prefetch, subscriptionLaneCount(len(subscription.Topics), len(subscription.Priorities), subscription.Retry))
+			}
 		}
 		if subscription.HandlerTimeout == 0 {
 			subscription.HandlerTimeout = subDefaults.HandlerTimeout
@@ -392,9 +398,12 @@ func validateConfig(cfg Config, driverName string) error {
 		if err := validateRetryConfig("subscriptions."+name+".retry", subscription.Retry); err != nil {
 			return err
 		}
-		lanes := len(subscription.Topics) * len(subscription.Priorities) * (1 + retryTiers(subscription.Retry))
+		lanes := subscriptionLaneCount(len(subscription.Topics), len(subscription.Priorities), subscription.Retry)
 		if err := validatePrefetch(name, subscription.Prefetch, lanes); err != nil {
 			return err
+		}
+		if subscription.Mode == OrderedByKey && subscription.Concurrency > dispatch.MaxOrderedBufferEntries/subscription.Prefetch {
+			return fmt.Errorf("f1: subscriptions.%s: ordered mode needs concurrency x prefetch at most %d, got %d x %d", name, dispatch.MaxOrderedBufferEntries, subscription.Concurrency, subscription.Prefetch)
 		}
 		for priority, weight := range subscription.Fairness.Weights {
 			if !priority.Valid() || weight < 1 {
@@ -406,13 +415,30 @@ func validateConfig(cfg Config, driverName string) error {
 		}
 	}
 	if driverName == "kafka" {
-		// Keep these fallback values synchronized with the Kafka driver when it lands.
+		// Keep these fallback values synchronized with the Kafka driver.
 		sessionTimeout, err := durationOption(cfg.Broker.DriverOptions, "kafka.sessionTimeout", 45*time.Second)
 		if err != nil {
 			return err
 		}
-		if cfg.Lifecycle.RebalanceDrainTimeout > sessionTimeout*3/5 {
-			return fmt.Errorf("f1: lifecycle.rebalanceDrainTimeout must be at most 0.6 x broker.kafka.sessionTimeout")
+		rebalanceTimeout, err := durationOption(cfg.Broker.DriverOptions, "kafka.rebalanceTimeout", 60*time.Second)
+		if err != nil {
+			return err
+		}
+		if kafkarules.ExceedsKafkaDrainBound(cfg.Lifecycle.RebalanceDrainTimeout, sessionTimeout) {
+			return fmt.Errorf(
+				"f1: lifecycle.rebalanceDrainTimeout %s exceeds 0.6 x broker.kafka.sessionTimeout %s (broker.kafka.rebalanceTimeout=%s)",
+				cfg.Lifecycle.RebalanceDrainTimeout,
+				sessionTimeout,
+				rebalanceTimeout,
+			)
+		}
+		if kafkarules.ExceedsKafkaDrainBound(cfg.Lifecycle.RebalanceDrainTimeout, rebalanceTimeout) {
+			return fmt.Errorf(
+				"f1: lifecycle.rebalanceDrainTimeout %s exceeds 0.6 x broker.kafka.rebalanceTimeout %s (broker.kafka.sessionTimeout=%s)",
+				cfg.Lifecycle.RebalanceDrainTimeout,
+				rebalanceTimeout,
+				sessionTimeout,
+			)
 		}
 	}
 	if driverName == "rabbitmq" {
@@ -527,6 +553,13 @@ func retryTiers(retry RetryConfig) int {
 		return len(retry.Tiers)
 	}
 	return retry.MaxAttempts - 1
+}
+
+// subscriptionLaneCount is the number of delivery lanes a subscription feeds:
+// one per topic, priority and retry tier. The default prefetch and both
+// prefetch validations derive from it, so the three cannot drift.
+func subscriptionLaneCount(topics, priorities int, retry RetryConfig) int {
+	return topics * priorities * (1 + retryTiers(retry))
 }
 
 type rawConfig struct {

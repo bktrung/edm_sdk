@@ -32,8 +32,8 @@ The effective policy is selected in this order:
 3. `topology.verifyOnStart: true` in configuration; or
 4. `TopologyNone` when neither configuration setting is enabled.
 
-The policy selection is implemented by [`topologyPolicy`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/client.go) and
-validated in [`config.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/config.go). In the current validation,
+The policy selection is implemented by `topologyPolicy` and
+validated in `config.go`. In the current validation,
 `topology.autoCreate` is rejected when `Config.Env` is `prod`; production
 provisioning should therefore be explicit rather than an accidental side
 effect of starting a service.
@@ -93,8 +93,8 @@ client, err := f1.New(
 Use this option when startup should fail before the first publish if the
 publisher topology is unavailable. Omit it when publishing topics are managed
 outside this client and the service intentionally relies on an existing
-topology. The option contract is owned by [`WithPublishTopics`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/options.go)
-and topic validation by [`validatePublishTopic`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/publisher.go).
+topology. The option contract is owned by `WithPublishTopics`
+and topic validation by `validatePublishTopic`.
 
 ## What F1 generates
 
@@ -119,8 +119,8 @@ was selected.
 Do not construct physical destination names in application code. Use logical
 event types, `WithTopic`, `WithPublishTopics`, and `Subscription.Topics`; the
 core naming functions keep publish, consume, retry, and dead-letter families
-consistent. The topology builders are [`publisherTopologySpec`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/publisher.go)
-and [`subscriptionTopologySpecs`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/worker.go).
+consistent. The topology builders are `publisherTopologySpec`
+and `subscriptionTopologySpecs`.
 
 ## Admin operations are non-destructive by default
 
@@ -132,7 +132,7 @@ The driver's [`Admin`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messagi
 
 `EnsureTopology` does not delete destinations. An orphan in a topology diff is
 an observation that requires an operational decision, not permission to remove
-data. Destructive operations are an optional [`Maintenance`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/driver/driver.go)
+data. Destructive operations are an optional `Maintenance`
 capability; `Prune` must recheck that a destination and its auxiliary retry or
 dead-letter resources are empty and unused before deleting them.
 
@@ -210,10 +210,10 @@ has not become an application dependency. It does not remove physical limits,
 make an unavailable semantic available, or authorize a driver to branch on its
 own capability view instead of the effective set passed by F1.
 
-The transformation is defined by [`Capabilities.Strict`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/driver/capability.go).
+The transformation is defined by `Capabilities.Strict`.
 The core and driver conformance suite compare full-capability and strict
 profiles for equivalent observable behavior; see
-[`driver/conformance`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/tree/main/driver/conformance).
+`driver/conformance`.
 
 ## Driver implementation boundary
 
@@ -230,8 +230,8 @@ When adding or maintaining a driver, keep these ownership rules:
 - driver-specific topology syntax, names, and administration errors stay
   behind the driver interfaces.
 
-The complete interface contract is in [`driver/driver.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/driver/driver.go),
-and the topology data model is in [`driver/topology.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/driver/topology.go).
+The complete interface contract is in `driver/driver.go`,
+and the topology data model is in `driver/topology.go`.
 Run the conformance package in both normal and strict profiles before treating
 a driver change as portable.
 
@@ -248,10 +248,10 @@ Keep application tests focused on logical behavior:
 - use the in-memory driver for deterministic topology and capability tests
   without importing transport types into handlers.
 
-The policy matrix is covered by [`topology_policy_test.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/topology_policy_test.go),
-publisher and consumer specs by [`publisher_topology_test.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/publisher_topology_test.go)
-and [`topology_test.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/topology_test.go), and capability equivalence by
-the [driver conformance package](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/tree/main/driver/conformance).
+The policy matrix is covered by `topology_policy_test.go`,
+publisher and consumer specs by `publisher_topology_test.go`
+and `topology_test.go`, and capability equivalence by
+the driver conformance package.
 
 ## Common mistakes
 

@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"reflect"
 	"strings"
+	"time"
 
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/codec"
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/driver"
@@ -44,6 +45,8 @@ type clientOptions struct {
 	publishTopicsSet    bool
 	topologyPolicy      driver.TopologyPolicy
 	topologyPolicySet   bool
+	observer            Observer
+	backlogPollInterval time.Duration
 }
 
 // WithDriver supplies the broker driver New opens eagerly.
@@ -198,6 +201,25 @@ func WithTopology(p TopologyPolicy) Option {
 		}
 		options.topologyPolicy = p
 		options.topologyPolicySet = true
+		return nil
+	}
+}
+
+// WithObserver records the observer New installs on the Client. A nil value
+// means no observer and costs one compare at the call site.
+func WithObserver(observer Observer) Option {
+	return func(options *clientOptions) error {
+		options.observer = observer
+		return nil
+	}
+}
+
+// WithBacklogPollInterval sets how often the backlog poll loop samples one
+// destination. Zero selects the default. A negative value disables the loop.
+// Values in (0, 1s) are rejected by New.
+func WithBacklogPollInterval(interval time.Duration) Option {
+	return func(options *clientOptions) error {
+		options.backlogPollInterval = interval
 		return nil
 	}
 }

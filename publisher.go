@@ -201,12 +201,37 @@ func (p *Publisher) PublishBatch(ctx context.Context, messages []Message) (Batch
 	p.client.mu.Unlock()
 	defer endPublish(p.client)
 
+	// The observer is read once after the admission section releases c.mu.
+	// recordObserverPanic takes c.mu, so the publish start must come after
+	// the Unlock above. Values only; nothing escapes on the nil path.
+	observer := p.client.observer
+	var publishGuard observerFinishGuard
+	observed := false
+	if observer != nil {
+		start := StartEvent{
+			Kind:      ObserverPublish,
+			At:        options.clock.Now(),
+			Route:     PublishRoutePrimary,
+			BatchSize: len(messages),
+		}
+		nextCtx, token := p.client.observeStart(ctx, start)
+		ctx = nextCtx
+		publishGuard = p.client.newObserverGuard(ObserverPublish, token)
+		observed = true
+		defer publishGuard.abandon()
+	}
+
 	outbound := make([]driver.OutboundMessage, len(messages))
 	ids := make([]string, len(messages))
+	var publishFields primaryPublishFields
 	for i, message := range messages {
-		outboundMessage, id, err := buildOutbound(ctx, options, effective, headerMaxBytes, source, producerIdentity, message)
+		outboundMessage, id, err := buildOutbound(ctx, p.client, options, effective, headerMaxBytes, source, producerIdentity, message, &publishFields)
 		if err != nil {
-			return result, fmt.Errorf("f1: message %d: %w", i, err)
+			methodErr := fmt.Errorf("f1: message %d: %w", i, err)
+			if observed {
+				publishGuard.finishWith(FinishEvent{Outcome: ObserverOutcomeError, ErrorClass: errorClassOf(methodErr), Results: result.Results})
+			}
+			return result, methodErr
 		}
 		// codec.maxBodyBytes is a caller-facing guardrail: it exists so an
 		// application publish with an oversized payload fails fast and
@@ -219,10 +244,20 @@ func (p *Publisher) PublishBatch(ctx context.Context, messages []Message) (Batch
 		// silent message-loss path, which is exactly the class of bug the
 		// SDK's own retry and DLQ handling exists to prevent.
 		if maxBodyBytes > 0 && len(outboundMessage.Body) > maxBodyBytes {
-			return result, fmt.Errorf("f1: message %d: body exceeds codec.maxBodyBytes (%d)", i, maxBodyBytes)
+			methodErr := fmt.Errorf("f1: message %d: body exceeds codec.maxBodyBytes (%d)", i, maxBodyBytes)
+			if observed {
+				publishGuard.finishWith(FinishEvent{Outcome: ObserverOutcomeError, ErrorClass: errorClassOf(methodErr), Results: result.Results})
+			}
+			return result, methodErr
 		}
 		outbound[i] = outboundMessage
 		ids[i] = id
+	}
+	var publishTopic string
+	var publishPriority Priority
+	if publishFields.set && !publishFields.mixed {
+		publishTopic = publishFields.topic
+		publishPriority = publishFields.priority
 	}
 
 	// This publish was already admitted by its entry gate above and is counted
@@ -236,22 +271,32 @@ func (p *Publisher) PublishBatch(ctx context.Context, messages []Message) (Batch
 	// break that.
 	built := p.client.sharedProducer(ctx, workPublish, epoch, nil)
 	if built.refused != nil {
+		if observed {
+			publishGuard.finishWith(FinishEvent{Topic: publishTopic, Priority: publishPriority, Outcome: ObserverOutcomeError, ErrorClass: errorClassOf(built.refused), Results: result.Results})
+		}
 		return result, built.refused
 	}
 	if built.buildErr != nil {
-		warnUnclassified(p.client.options.logger, built.buildErr)
+		warnUnclassifiedWithContext(p.client.options.logger, ctx, built.buildErr)
 		requestReconnectOnTransient(p.client, built.buildErr, epoch)
-		return result, fmt.Errorf("f1: create publisher: %w", built.buildErr)
+		methodErr := fmt.Errorf("f1: create publisher: %w", built.buildErr)
+		if observed {
+			publishGuard.finishWith(FinishEvent{Topic: publishTopic, Priority: publishPriority, Outcome: ObserverOutcomeError, ErrorClass: errorClassOf(methodErr), Results: result.Results})
+		}
+		return result, methodErr
 	}
 	publishErr := built.producer.Publish(ctx, outbound...)
 	if publishErr == nil {
 		for i, id := range ids {
 			result.Results[i].ID = id
 		}
+		if observed {
+			publishGuard.finishWith(FinishEvent{Topic: publishTopic, Priority: publishPriority, Outcome: ObserverOutcomeOK, Results: result.Results})
+		}
 		return result, nil
 	}
 
-	warnPublishError(p.client.options.logger, publishErr)
+	warnPublishError(p.client.options.logger, ctx, publishErr)
 	requestReconnectOnTransient(p.client, publishErr, epoch)
 	var partial *driver.PublishError
 	if errors.As(publishErr, &partial) && len(partial.Failed) > 0 {
@@ -269,15 +314,28 @@ func (p *Publisher) PublishBatch(ctx context.Context, messages []Message) (Batch
 				result.Results[index].Err = partial.Failed[index]
 			}
 		}
+		if observed {
+			var firstErr error
+			for _, r := range result.Results {
+				if r.Err != nil {
+					firstErr = r.Err
+					break
+				}
+			}
+			publishGuard.finishWith(FinishEvent{Topic: publishTopic, Priority: publishPriority, Outcome: ObserverOutcomeError, ErrorClass: errorClassOf(firstErr), Results: result.Results})
+		}
 		return result, nil
 	}
 	for i := range result.Results {
 		result.Results[i].Err = publishErr
 	}
+	if observed {
+		publishGuard.finishWith(FinishEvent{Topic: publishTopic, Priority: publishPriority, Outcome: ObserverOutcomeError, ErrorClass: errorClassOf(publishErr), Results: result.Results})
+	}
 	return result, publishErr
 }
 
-func warnPublishError(logger *slog.Logger, err error) {
+func warnPublishError(logger *slog.Logger, ctx context.Context, err error) {
 	if logger == nil {
 		return
 	}
@@ -288,23 +346,45 @@ func warnPublishError(logger *slog.Logger, err error) {
 		}
 		sort.Ints(indexes)
 		for _, index := range indexes {
-			warnUnclassified(logger, partial.Failed[index])
+			warnUnclassifiedWithContext(logger, ctx, partial.Failed[index])
 		}
 		return
 	}
-	warnUnclassified(logger, err)
+	warnUnclassifiedWithContext(logger, ctx, err)
 }
 
-func warnUnclassified(logger *slog.Logger, err error) {
+func warnUnclassifiedWithContext(logger *slog.Logger, ctx context.Context, err error) {
 	if logger == nil || err == nil {
 		return
 	}
 	if _, classified := driver.Classify(err); !classified {
-		logger.Warn("f1 unclassified publish error", "error", err)
+		logger.LogAttrs(ctx, slog.LevelWarn, "f1 unclassified publish error", slog.Any("error", err))
 	}
 }
 
-func buildOutbound(ctx context.Context, options clientOptions, effective driver.Capabilities, headerMaxBytes int, source, producerIdentity string, message Message) (driver.OutboundMessage, string, error) {
+type primaryPublishFields struct {
+	topic    string
+	priority Priority
+	set      bool
+	mixed    bool
+}
+
+func (f *primaryPublishFields) record(topic string, priority Priority) {
+	if f == nil {
+		return
+	}
+	if !f.set {
+		f.topic = topic
+		f.priority = priority
+		f.set = true
+		return
+	}
+	if f.topic != topic || f.priority != priority {
+		f.mixed = true
+	}
+}
+
+func buildOutbound(ctx context.Context, c *Client, options clientOptions, effective driver.Capabilities, headerMaxBytes int, source, producerIdentity string, message Message, fields *primaryPublishFields) (driver.OutboundMessage, string, error) {
 	if err := ctx.Err(); err != nil {
 		return driver.OutboundMessage{}, "", err
 	}
@@ -342,6 +422,7 @@ func buildOutbound(ctx context.Context, options clientOptions, effective driver.
 	if err := validatePublishTopic(options, topic, topicInput); err != nil {
 		return driver.OutboundMessage{}, "", err
 	}
+	fields.record(topic, publish.priority)
 	partitionKey := publish.key
 	if partitionKey == "" {
 		partitionKey = publish.subject
@@ -381,9 +462,70 @@ func buildOutbound(ctx context.Context, options clientOptions, effective driver.
 		envelope.TraceParent = publish.causedBy.envelope.TraceParent
 		envelope.TraceState = publish.causedBy.envelope.TraceState
 	}
+	// The message_built stage starts after the ID and the envelope identity
+	// are known and before EncodeHeaders. The observer and the injector are
+	// read once from the client; options stays the by-value snapshot the
+	// publish uses. The guard is a value, and nothing escapes when the
+	// observer is nil.
+	observer := c.observer
+	injector := c.traceInjector
+	var guard observerFinishGuard
+	var base FinishEvent
+	observed := false
+	entryPoint := publishEntryPoint(source, topic, publish.priority)
+	if observer != nil {
+		correlationID := envelope.CorrelationID
+		if correlationID == "" {
+			correlationID = id
+		}
+		destination := entryPoint
+		start := StartEvent{
+			Kind:          ObserverMessageBuilt,
+			At:            options.clock.Now(),
+			Topic:         topic,
+			Destination:   destination,
+			MessageID:     id,
+			EventType:     message.EventType,
+			Priority:      publish.priority,
+			Attempt:       1,
+			CorrelationID: correlationID,
+		}
+		nextCtx, token := c.observeStart(ctx, start)
+		ctx = nextCtx
+		base = FinishEvent{
+			Topic:         topic,
+			Destination:   destination,
+			MessageID:     id,
+			EventType:     message.EventType,
+			Priority:      publish.priority,
+			Attempt:       1,
+			CorrelationID: correlationID,
+		}
+		guard = c.newObserverGuard(ObserverMessageBuilt, token)
+		observed = true
+		defer guard.abandon()
+	}
+	if injector != nil {
+		traceParent, traceState := c.injectTrace(ctx)
+		if traceParent != "" {
+			envelope.TraceParent = traceParent
+			envelope.TraceState = traceState
+		}
+	}
 	headerMap, err := envelope.EncodeHeaders(headerMaxBytes)
 	if err != nil {
+		if observed {
+			finish := base
+			finish.Outcome = ObserverOutcomeError
+			finish.ErrorClass = errorClassOf(err)
+			guard.finishWith(finish)
+		}
 		return driver.OutboundMessage{}, "", err
+	}
+	if observed {
+		finish := base
+		finish.Outcome = ObserverOutcomeOK
+		guard.finishWith(finish)
 	}
 	headers := make([]driver.Header, 0, len(headerMap))
 	keys := make([]string, 0, len(headerMap))
@@ -395,7 +537,7 @@ func buildOutbound(ctx context.Context, options clientOptions, effective driver.
 		headers = append(headers, driver.Header{Key: key, Value: []byte(headerMap[key])})
 	}
 	return driver.OutboundMessage{
-		Destination: publishEntryPoint(source, topic, publish.priority),
+		Destination: entryPoint,
 		EntryPoint:  isFanoutEntryPoint(effective),
 		Key:         []byte(partitionKey),
 		Headers:     headers,
@@ -447,7 +589,7 @@ func sourceEnvironment(source string) string {
 }
 
 func publishEntryPoint(source, topic string, priority Priority) string {
-	return fmt.Sprintf("f1.%s.%s.%s", sourceEnvironment(source), topic, priority.String())
+	return "f1." + sourceEnvironment(source) + "." + topic + "." + priority.String()
 }
 
 // isFanoutEntryPoint reports whether a publish entry point is declared as a

@@ -12,8 +12,18 @@ boundaries, runtime responsibilities, and invariants:
 - [Consume flow](docs/development/consume-flow.md)
 - [Driver contract](docs/development/driver-contract.md)
 - [Driver conformance](docs/development/driver-conformance.md)
+- [Observer guide](docs/basics/observer.md)
+- [Observer event reference](docs/development/observer-events.md)
 - [Source-reading guide](docs/development/source-reading-guide.md)
 
 The source and tests remain authoritative for implementation behavior. Start at
 the architecture map, then follow the source links for the boundary you are
 changing.
+
+Observability crosses the core at `f1.Observer`: the core emits typed lifecycle
+events and optional `TraceInjector` values, but imports no OpenTelemetry package.
+The built-in `f1otel` adapter translates those events in its own package for
+application-owned OpenTelemetry providers. The [architecture map](docs/development/architecture.md)
+shows this boundary; the [Observer guide](docs/basics/observer.md) owns the
+adapter contract and the [event reference](docs/development/observer-events.md)
+owns the generated event vocabulary.

@@ -418,12 +418,12 @@ func runTopology(group *groupContext) {
 			return view.Ready == 1, fmt.Sprintf("view=%+v", view)
 		})
 		results, err := maintenance.Prune(group.ctx, []string{nonEmpty, eligible})
-		if err != nil {
-			t.Fatalf("Prune(): %v", err)
-		}
 		refused, deleted := findPruneResult(results, nonEmpty), findPruneResult(results, eligible)
 		if refused.Deleted || refused.Reason == "" {
 			t.Fatalf("Prune(%q)=%+v, want refused with a reason", nonEmpty, refused)
+		}
+		if err != nil {
+			t.Fatalf("refused Prune returned error = %v, want nil", err)
 		}
 		// Positive control: the eligible destination deletes in the same call,
 		// corroborating that the refusal above is genuine and not a Prune

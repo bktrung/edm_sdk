@@ -37,6 +37,25 @@ The main executable path is split across:
 - [`driver.Producer`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/driver/driver.go) for the broker-independent
   publication contract.
 
+## Observer call sites
+
+When a client has an observer, the publish path emits events at these
+boundaries:
+
+- `PublishBatch` pairs `ObserverPublish` around one admitted call, from
+  admission through the producer result.
+- `buildOutbound` pairs `ObserverMessageBuilt` around each outbound message
+  build.
+- Core-generated retry and dead-letter successors use `ObserverPublish` with
+  their route, then record the corresponding retry or dead-letter point after
+  the successor result is known.
+
+Observer methods run synchronously on these paths, without a client or runner
+lock held. A slow or panicking adapter must not be allowed to turn
+instrumentation into a publish failure.
+
+`publisher.go:Publisher.PublishBatch` calls `observer_call.go:Client.observeStart` for the publish stage, and `observer_call.go:observerFinishGuard.finishWith` invokes `Observer.Finish` after the producer result. `publisher.go:buildOutbound` starts the message-built stage, calls `observer_call.go:Client.injectTrace` with the returned context, and finishes after `Envelope.EncodeHeaders`; successor sends use `worker.go:startSuccessorPublish` and inject in `worker.go:retryAndSettle` or `worker.go:deadLetter`.
+
 ## Public entry points
 
 `Publisher.Publish` does not have a separate transport path. It creates a

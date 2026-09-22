@@ -152,4 +152,3 @@ partitions without promising duplicate-free handoff.
 - [`acktracker_test.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/drivers/kafka/acktracker_test.go) - cursor, commit, revoke, and timing behavior.
 - [`settler.Ack` and `settler.Nack`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/drivers/kafka/consumer.go) - settlement, discard, and requeue paths.
 - [`trackerForLocked` and `trackerBaseLocked`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/drivers/kafka/consumer.go) - generation ownership and the starting cursor.
-- [`driver-options`](/user-guide/driver-options) - Kafka options and partition-bound limits.

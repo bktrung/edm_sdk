@@ -5,6 +5,8 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -649,11 +651,16 @@ func windowSubscription(concurrency, prefetch int) f1.Subscription {
 // log output.
 func runWindowSubscription(t *testing.T, sub f1.Subscription) (driver.ConsumerConfig, *lockedLogSink) {
 	t.Helper()
+	return runWindowSubscriptionWithConfig(t, schedulingConfig(), sub)
+}
+
+func runWindowSubscriptionWithConfig(t *testing.T, cfg f1.Config, sub f1.Subscription) (driver.ConsumerConfig, *lockedLogSink) {
+	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	var logs lockedLogSink
 	configs := make(chan driver.ConsumerConfig, 1)
-	client, err := f1.New(ctx, schedulingConfig(),
+	client, err := f1.New(ctx, cfg,
 		f1.WithDriver(&windowDriver{Driver: inmem.New(), configs: configs}),
 		f1.WithLogger(slog.New(slog.NewTextHandler(&logs, nil))),
 	)
@@ -681,6 +688,34 @@ func runWindowSubscription(t *testing.T, sub f1.Subscription) (driver.ConsumerCo
 		t.Fatal("consumer was not created")
 	}
 	return driver.ConsumerConfig{}, nil
+}
+
+func loadWindowConfig(t *testing.T) f1.Config {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	const content = `f1:
+  env: test
+  service: scheduler
+  broker:
+    driver: inmem
+    defaultPrefetch: 64
+  topology:
+    autoCreate: true
+  subscriptions:
+    scheduler-window-test:
+      topics: [orders.created]
+      concurrency: 1
+      prefetch: 64
+      priorities: [medium]
+`
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := f1.LoadConfig(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return cfg
 }
 
 // TestRunnerSchedulerSizesDestinationWindows pins the window each destination
@@ -789,6 +824,9 @@ func TestRunnerSchedulerReportsOnlyAPrefetchTheCallerSet(t *testing.T) {
 	const laneTotal = 24
 	for _, tc := range []struct {
 		name       string
+		loadYAML   bool
+		setEnv     bool
+		envValue   string
 		prefetch   int
 		wantBudget int
 		wantReport bool
@@ -796,11 +834,21 @@ func TestRunnerSchedulerReportsOnlyAPrefetchTheCallerSet(t *testing.T) {
 		{name: "unset-takes-the-broker-default", prefetch: 0, wantBudget: laneTotal},
 		{name: "named-below-the-lane-total", prefetch: 8, wantBudget: 8},
 		{name: "named-at-the-broker-default", prefetch: 64, wantBudget: laneTotal, wantReport: true},
+		{name: "named-yaml-block", loadYAML: true, wantBudget: laneTotal, wantReport: true},
+		{name: "named-environment", setEnv: true, envValue: "64", wantBudget: laneTotal, wantReport: true},
+		{name: "environment-zero-is-unset", setEnv: true, envValue: "0", wantBudget: laneTotal},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			cfg, logs := runWindowSubscription(t, windowSubscription(1, tc.prefetch))
-			if cfg.Prefetch != tc.wantBudget {
-				t.Fatalf("consumer prefetch = %d, want %d", cfg.Prefetch, tc.wantBudget)
+			if tc.setEnv {
+				t.Setenv("F1_SUBSCRIPTIONS_SCHEDULER_WINDOW_TEST_PREFETCH", tc.envValue)
+			}
+			cfg := schedulingConfig()
+			if tc.loadYAML {
+				cfg = loadWindowConfig(t)
+			}
+			consumerCfg, logs := runWindowSubscriptionWithConfig(t, cfg, windowSubscription(1, tc.prefetch))
+			if consumerCfg.Prefetch != tc.wantBudget {
+				t.Fatalf("consumer prefetch = %d, want %d", consumerCfg.Prefetch, tc.wantBudget)
 			}
 			output := logs.String()
 			reported := strings.Contains(output, "configured prefetch exceeds the destination windows")

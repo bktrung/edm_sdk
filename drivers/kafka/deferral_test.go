@@ -65,6 +65,7 @@ func TestPartitionPauseReasonsReleaseIndependently(t *testing.T) {
 		partitionPauses: make(map[partitionKey]partitionPauseSet),
 		owned:           map[partitionKey]bool{key: true},
 		pollWakePending: false,
+		clock:           clock.NewReal(),
 	}
 	consumer.mu.Lock()
 	consumer.setPartitionPauseReasonLocked(key, partitionPauseReadAhead, true)

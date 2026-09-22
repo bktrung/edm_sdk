@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"strings"
 
 	amqp "github.com/rabbitmq/amqp091-go"
 
@@ -156,14 +157,66 @@ func (a *adminOperations) Prune(ctx context.Context, names []string) ([]driver.P
 		return nil, classify("prune", driver.KindTransient, err)
 	}
 	results := make([]driver.PruneResult, 0, len(names))
+	exchangeListLoaded := false
+	var exchanges []managementExchange
+	bindingsLoaded := false
+	var bindings []managementBinding
+
 	for _, name := range names {
 		result := driver.PruneResult{Name: name}
 		_, exists := findQueue(queues, name)
 		if !exists {
-			result.Reason = "destination does not exist"
+			if !exchangeListLoaded {
+				exchanges, err = a.conn.management.listExchanges(ctx)
+				if err != nil {
+					return nil, classify("prune", driver.KindTransient, err)
+				}
+				exchangeListLoaded = true
+			}
+			if _, exists = findExchange(exchanges, name); !exists {
+				result.Reason = "destination does not exist"
+				results = append(results, result)
+				continue
+			}
+			if isBuiltInExchange(name) {
+				result.Reason = fmt.Sprintf("exchange %q is built-in and cannot be deleted", name)
+				results = append(results, result)
+				continue
+			}
+
+			if !bindingsLoaded {
+				bindings, err = a.conn.management.listBindings(ctx)
+				if err != nil {
+					return nil, classify("prune", driver.KindTransient, err)
+				}
+				bindingsLoaded = true
+			}
+
+			for _, binding := range bindings {
+				if binding.Source != name {
+					continue
+				}
+				result.Reason = fmt.Sprintf("exchange %q has binding to destination %q", name, binding.Destination)
+				break
+			}
+			if result.Reason != "" {
+				results = append(results, result)
+				continue
+			}
+			deleted, deleteErr := a.conn.management.deleteExchange(ctx, name)
+			if deleteErr != nil {
+				return nil, classify("prune", driver.KindTransient, deleteErr)
+			}
+			if !deleted {
+				result.Reason = "exchange disappeared before deletion"
+				results = append(results, result)
+				continue
+			}
+			result.Deleted = true
 			results = append(results, result)
 			continue
 		}
+
 		parking := existingParkQueues(queues, name)
 		mainReady, mainConsumers, inspectErr := a.inspectQueueWithConsumers(ctx, name)
 		if inspectErr != nil {
@@ -300,6 +353,19 @@ func findQueue(queues []managementQueue, name string) (managementQueue, bool) {
 		}
 	}
 	return managementQueue{}, false
+}
+
+func findExchange(exchanges []managementExchange, name string) (managementExchange, bool) {
+	for _, exchange := range exchanges {
+		if exchange.Name == name {
+			return exchange, true
+		}
+	}
+	return managementExchange{}, false
+}
+
+func isBuiltInExchange(name string) bool {
+	return name == "" || strings.HasPrefix(name, "amq.")
 }
 
 // pruneReason reports why a destination may not be deleted yet, or an empty

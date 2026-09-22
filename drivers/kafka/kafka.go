@@ -81,13 +81,18 @@ type conn struct {
 	consumers             map[*consumer]struct{}
 	producers             map[*producer]struct{}
 	mu                    sync.RWMutex
-	lifecycleMu           sync.RWMutex
+	lifecycleMu           chan struct{}
+	lifecycleOnce         sync.Once
 	closeOnce             sync.Once
-	closeAttempt          bool
 	publishFault          atomic.Int32
 	closeFault            atomic.Bool
 	closing               bool
 	closed                bool
+	// maintenanceGate serializes destructive metadata sequences for this
+	// connection. Conn.Admin creates a fresh facade for each call, so a
+	// receiver mutex on admin would not coordinate facades sharing this
+	// client; a package-level gate would serialize unrelated brokers.
+	maintenanceGate chan struct{}
 	// delays is the delay history of each destination, appended to by
 	// EnsureTopology. The consume path never reads it: a consumer takes its due
 	// times from the delay its own config carries, which is the core's resolved
@@ -151,6 +156,13 @@ func (Driver) Open(ctx context.Context, cfg driver.Config) (driver.Conn, error) 
 		return nil, classify("open", driver.KindFatal, err)
 	}
 	consumerOpts, err := resolveConsumerOptions(cfg.DriverOptions)
+	if err != nil {
+		return nil, classify("open", driver.KindFatal, err)
+	}
+	if _, err := resolveFetchMaxWait(cfg.DriverOptions); err != nil {
+		return nil, classify("open", driver.KindFatal, err)
+	}
+	sessionTimeout, err := resolveSessionTimeout(cfg.DriverOptions)
 	if err != nil {
 		return nil, classify("open", driver.KindFatal, err)
 	}
@@ -221,7 +233,7 @@ func (Driver) Open(ctx context.Context, cfg driver.Config) (driver.Conn, error) 
 	admin := kadm.NewClient(client)
 	var (
 		metadata        kadm.Metadata
-		messageMaxBytes int
+		brokerSettings  brokerConfig
 		versionResponse *kmsg.ApiVersionsResponse
 	)
 	for {
@@ -238,12 +250,15 @@ func (Driver) Open(ctx context.Context, cfg driver.Config) (driver.Conn, error) 
 			}
 			continue
 		}
-		messageMaxBytes, err = readMessageMaxBytes(openCtx, admin, metadata.Controller)
+		brokerSettings, err = readBrokerConfig(openCtx, admin, metadata.Controller)
 		if err != nil {
 			if retryErr := retryOpen(openCtx, err); retryErr != nil {
 				return nil, retryErr
 			}
 			continue
+		}
+		if err := validateKafkaSessionTimeout(sessionTimeout, brokerSettings); err != nil {
+			return nil, classify("open", driver.KindFatal, err)
 		}
 		versionResponse, err = apiVersions(openCtx, client)
 		if err != nil {
@@ -255,7 +270,7 @@ func (Driver) Open(ctx context.Context, cfg driver.Config) (driver.Conn, error) 
 		break
 	}
 
-	effectiveBatchBytes, err := effectiveProducerBatchBytes(messageMaxBytes)
+	effectiveBatchBytes, err := effectiveProducerBatchBytes(brokerSettings.messageMaxBytes)
 	if err != nil {
 		return nil, classify("open", driver.KindFatal, err)
 	}
@@ -288,6 +303,7 @@ func (Driver) Open(ctx context.Context, cfg driver.Config) (driver.Conn, error) 
 		info:                  info,
 		consumers:             make(map[*consumer]struct{}),
 		producers:             make(map[*producer]struct{}),
+		maintenanceGate:       make(chan struct{}, 1),
 	}, nil
 }
 
@@ -371,7 +387,15 @@ func brokerCapabilities(maxMessageBytes int) driver.Capabilities {
 	return caps
 }
 
-func readMessageMaxBytes(ctx context.Context, admin *kadm.Client, controller int32) (int, error) {
+type brokerConfig struct {
+	messageMaxBytes           int
+	groupMinSessionTimeout    time.Duration
+	groupMaxSessionTimeout    time.Duration
+	hasGroupMinSessionTimeout bool
+	hasGroupMaxSessionTimeout bool
+}
+
+func readBrokerConfig(ctx context.Context, admin *kadm.Client, controller int32) (brokerConfig, error) {
 	var (
 		configs kadm.ResourceConfigs
 		err     error
@@ -382,25 +406,77 @@ func readMessageMaxBytes(ctx context.Context, admin *kadm.Client, controller int
 		configs, err = admin.DescribeBrokerConfigs(ctx)
 	}
 	if err != nil {
-		return 0, err
+		return brokerConfig{}, err
 	}
+
+	var settings brokerConfig
+	messageMaxBytesFound := false
 	for _, resource := range configs {
 		if resource.Err != nil {
-			return 0, resource.Err
+			return brokerConfig{}, resource.Err
 		}
 		for _, config := range resource.Configs {
-			if config.Key != "message.max.bytes" {
-				continue
+			switch config.Key {
+			case "message.max.bytes":
+				if messageMaxBytesFound {
+					continue
+				}
+				value := config.MaybeValue()
+				limit, err := strconv.Atoi(value)
+				if err != nil {
+					return brokerConfig{}, fmt.Errorf("%w: invalid message.max.bytes %q", errBrokerConfig, value)
+				}
+				settings.messageMaxBytes = limit
+				messageMaxBytesFound = true
+			case "group.min.session.timeout.ms":
+				timeout, err := parseKafkaSessionTimeoutConfig(config.Key, config.MaybeValue())
+				if err != nil {
+					return brokerConfig{}, err
+				}
+				settings.groupMinSessionTimeout = timeout
+				settings.hasGroupMinSessionTimeout = true
+			case "group.max.session.timeout.ms":
+				timeout, err := parseKafkaSessionTimeoutConfig(config.Key, config.MaybeValue())
+				if err != nil {
+					return brokerConfig{}, err
+				}
+				settings.groupMaxSessionTimeout = timeout
+				settings.hasGroupMaxSessionTimeout = true
 			}
-			value := config.MaybeValue()
-			limit, err := strconv.Atoi(value)
-			if err != nil {
-				return 0, fmt.Errorf("%w: invalid message.max.bytes %q", errBrokerConfig, value)
-			}
-			return limit, nil
 		}
 	}
-	return 0, fmt.Errorf("%w: broker did not return message.max.bytes", errBrokerConfig)
+	if !messageMaxBytesFound {
+		return brokerConfig{}, fmt.Errorf("%w: broker did not return message.max.bytes", errBrokerConfig)
+	}
+	return settings, nil
+}
+
+func parseKafkaSessionTimeoutConfig(key, value string) (time.Duration, error) {
+	millis, err := strconv.ParseInt(value, 10, 64)
+	if err != nil || millis < 0 || millis > int64((1<<63-1)/int64(time.Millisecond)) {
+		return 0, fmt.Errorf("%w: invalid %s %q", errBrokerConfig, key, value)
+	}
+	return time.Duration(millis) * time.Millisecond, nil
+}
+
+func validateKafkaSessionTimeout(timeout time.Duration, settings brokerConfig) error {
+	if settings.hasGroupMinSessionTimeout && timeout < settings.groupMinSessionTimeout {
+		return fmt.Errorf(
+			"%w: kafka.sessionTimeout %s is below broker group.min.session.timeout.ms %s",
+			errBrokerConfig,
+			timeout,
+			settings.groupMinSessionTimeout,
+		)
+	}
+	if settings.hasGroupMaxSessionTimeout && timeout > settings.groupMaxSessionTimeout {
+		return fmt.Errorf(
+			"%w: kafka.sessionTimeout %s is above broker group.max.session.timeout.ms %s",
+			errBrokerConfig,
+			timeout,
+			settings.groupMaxSessionTimeout,
+		)
+	}
+	return nil
 }
 
 func apiVersions(ctx context.Context, client *kgo.Client) (*kmsg.ApiVersionsResponse, error) {
@@ -485,6 +561,35 @@ func (c *conn) Consumer(ctx context.Context, cfg driver.ConsumerConfig) (driver.
 
 func (c *conn) Admin() driver.Admin { return &admin{client: kadm.NewClient(c.client), conn: c} }
 
+func (c *conn) acquireLifecycle(ctx context.Context) error {
+	c.lifecycleOnce.Do(func() {
+		c.lifecycleMu = make(chan struct{}, 1)
+	})
+	select {
+	case c.lifecycleMu <- struct{}{}:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (c *conn) releaseLifecycle() {
+	<-c.lifecycleMu
+}
+
+func (c *conn) acquireMaintenance(ctx context.Context) error {
+	select {
+	case c.maintenanceGate <- struct{}{}:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (c *conn) releaseMaintenance() {
+	<-c.maintenanceGate
+}
+
 // log returns the connection's logger, falling back to the process default.
 // Open resolves a nil Config.Logger when it builds the connection; this keeps
 // the zero conn no worse than a nil Config, so a driver diagnostic never panics
@@ -536,43 +641,36 @@ func (c *conn) Close(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
 		return classify("close", driver.KindTransient, err)
 	}
-	c.lifecycleMu.Lock()
-	defer c.lifecycleMu.Unlock()
+	if err := c.acquireLifecycle(ctx); err != nil {
+		return classify("close", driver.KindTransient, err)
+	}
+	defer c.releaseLifecycle()
+	if err := ctx.Err(); err != nil {
+		return classify("close", driver.KindTransient, err)
+	}
 	c.mu.Lock()
 	if c.closed {
 		c.mu.Unlock()
 		return nil
-	}
-	if c.closeAttempt {
-		c.mu.Unlock()
-		return classify("close", driver.KindTransient, errConnClosing)
 	}
 	if !c.closing && (len(c.consumers) != 0 || len(c.producers) != 0) {
 		c.mu.Unlock()
 		return classify("close", driver.KindFatal, driver.ErrResourcesOutstanding)
 	}
 	c.closing = true
-	c.closeAttempt = true
 	injected := c.closeFault.Swap(false)
 	c.mu.Unlock()
 
 	if injected {
 		if _, hasDeadline := ctx.Deadline(); hasDeadline {
 			<-ctx.Done()
-			c.mu.Lock()
-			c.closeAttempt = false
-			c.mu.Unlock()
 			return classify("close", driver.KindTransient, ctx.Err())
 		}
-		c.mu.Lock()
-		c.closeAttempt = false
-		c.mu.Unlock()
 		return classify("close", driver.KindTransient, errors.New("injected close failure"))
 	}
 
 	c.closeOnce.Do(c.client.Close)
 	c.mu.Lock()
-	c.closeAttempt = false
 	c.closed = true
 	c.mu.Unlock()
 	return nil
@@ -626,7 +724,7 @@ func validateTLSConfig(endpoints []string, settings *driver.TLSConfig) error {
 }
 
 func makeTLSConfig(settings *driver.TLSConfig) (*tls.Config, error) {
-	config := &tls.Config{InsecureSkipVerify: settings.InsecureSkipVerify} //nolint:gosec // explicitly controlled by the driver config
+	config := &tls.Config{InsecureSkipVerify: settings.InsecureSkipVerify, ServerName: settings.ServerName} //nolint:gosec // explicitly controlled by the driver config
 	if settings.CAFile != "" {
 		pem, err := os.ReadFile(settings.CAFile)
 		if err != nil {

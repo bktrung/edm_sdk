@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/driver"
+	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/clock"
 )
 
 // TestDelayAccuracyMatchesTheParkLadder holds the accuracy the driver declares
@@ -114,10 +115,13 @@ func TestParkQueueNamesForFixedAndLadder(t *testing.T) {
 }
 
 func TestFixedParkTargetRouting(t *testing.T) {
-	p := &producer{conn: &conn{
-		deferred: map[string]time.Duration{"d": 5 * time.Second},
-		fixed:    map[string]time.Duration{"d": 5 * time.Second},
-	}}
+	p := &producer{
+		clock: clock.NewReal(),
+		conn: &conn{
+			deferred: map[string]time.Duration{"d": 5 * time.Second},
+			fixed:    map[string]time.Duration{"d": 5 * time.Second},
+		},
+	}
 	due := time.Now().Add(5 * time.Second) //nolint:forbidigo // remaining delay is measured at publish time
 	_, routingKey, expiration := p.target(driver.OutboundMessage{Destination: "d", DelayUntil: due})
 	if routingKey != "d.park.fixed-5000ms" {

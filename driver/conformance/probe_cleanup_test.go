@@ -418,6 +418,7 @@ type recordingProbeProducer struct {
 }
 
 func (*recordingProbeProducer) Publish(context.Context, ...driver.OutboundMessage) error { return nil }
+
 func (p *recordingProbeProducer) Close(context.Context) error {
 	*p.events = append(*p.events, "producer-close")
 	return nil

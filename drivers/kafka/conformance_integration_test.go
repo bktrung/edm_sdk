@@ -33,9 +33,10 @@ func TestConformance(t *testing.T) {
 			// retry.
 			RebalanceDrainTimeout: time.Second,
 		},
-		DeferralModel:    conformance.DeferralDestinationDelay,
-		NewInspector:     kafkaInspector,
-		NewFaultInjector: kafkaFaultInjector,
+		DeferralModel:      conformance.DeferralDestinationDelay,
+		NewInspector:       kafkaInspector,
+		NewFaultInjector:   kafkaFaultInjector,
+		NewDeadlineFixture: newDeadlineFixture,
 	})
 }
 

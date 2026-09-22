@@ -14,6 +14,7 @@ import (
 	amqp "github.com/rabbitmq/amqp091-go"
 
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/driver"
+	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/clock"
 )
 
 func TestProducerConfirmAndReturn(t *testing.T) {
@@ -1289,7 +1290,7 @@ func TestProducerTargetRoutesEntryPointToExchange(t *testing.T) {
 	for name, policy := range policies {
 		t.Run(name, func(t *testing.T) {
 			t.Logf("target() takes no policy argument; asserting under policy %d (%s) for documentation", policy, name)
-			p := &producer{conn: &conn{}}
+			p := &producer{clock: clock.NewReal(), conn: &conn{}}
 			exchange, routingKey, expiration := p.target(driver.OutboundMessage{Destination: "orders.fanout", EntryPoint: true})
 			if exchange != "orders.fanout" {
 				t.Fatalf("target() exchange = %q, want %q", exchange, "orders.fanout")
@@ -1313,7 +1314,7 @@ func TestProducerTargetRetryAndDLQStayConcreteDestinations(t *testing.T) {
 		"f1.prod.orders.created.worker.high.retry.1",
 		"f1.prod.orders.created.dlq.worker",
 	}
-	p := &producer{conn: &conn{}}
+	p := &producer{clock: clock.NewReal(), conn: &conn{}}
 	for _, destination := range cases {
 		t.Run(destination, func(t *testing.T) {
 			exchange, routingKey, expiration := p.target(driver.OutboundMessage{Destination: destination})
@@ -1357,7 +1358,7 @@ func TestProducerTargetRungsAndFallThrough(t *testing.T) {
 	}
 	for _, test := range cases {
 		t.Run(test.delay.String(), func(t *testing.T) {
-			p := &producer{conn: &conn{deferred: map[string]time.Duration{"orders.deferred": test.delay}}}
+			p := &producer{clock: clock.NewReal(), conn: &conn{deferred: map[string]time.Duration{"orders.deferred": test.delay}}}
 			exchange, routingKey, expiration := p.target(driver.OutboundMessage{Destination: "orders.deferred"})
 			if exchange != "" {
 				t.Fatalf("target() exchange = %q, want empty for a parked publish", exchange)
@@ -1414,7 +1415,7 @@ func TestParkingSuffixParsingIsStrict(t *testing.T) {
 // queues are declared once in EnsureTopology, and the publish path only
 // ever asks for one that should already exist.
 func TestProducerTargetDeferredDestinationParks(t *testing.T) {
-	p := &producer{conn: &conn{}}
+	p := &producer{clock: clock.NewReal(), conn: &conn{}}
 	due := time.Now().Add(time.Hour) //nolint:forbidigo // building a fixed future DelayUntil for the test
 	exchange, routingKey, expiration := p.target(driver.OutboundMessage{Destination: "orders.deferred", DelayUntil: due})
 	if exchange != "" {
@@ -1436,7 +1437,7 @@ func TestProducerTargetDeferredDestinationParks(t *testing.T) {
 // recorded for this one purpose, even though the exchange-routing cache
 // read next to it was removed.
 func TestProducerTargetDestinationDelayFallsBackWhenDelayUntilIsZero(t *testing.T) {
-	p := &producer{conn: &conn{deferred: map[string]time.Duration{"orders.deferred": time.Hour}}}
+	p := &producer{clock: clock.NewReal(), conn: &conn{deferred: map[string]time.Duration{"orders.deferred": time.Hour}}}
 	exchange, routingKey, expiration := p.target(driver.OutboundMessage{Destination: "orders.deferred"})
 	if exchange != "" {
 		t.Fatalf("target() exchange = %q, want empty for a parked publish", exchange)

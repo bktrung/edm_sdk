@@ -7,6 +7,7 @@ import (
 	"strings"
 	"testing"
 
+	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/codec"
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/driver"
 )
 
@@ -23,6 +24,100 @@ func TestBuildHandlerChainRecoversPanicDirectly(t *testing.T) {
 	}
 	if !strings.Contains(panicErr.Error(), "direct chain panic") {
 		t.Fatalf("panic error = %q, want panic value", panicErr)
+	}
+}
+
+func TestTypedPassesDecodedPayloadAndEvent(t *testing.T) {
+	type payload struct {
+		Name string `json:"name"`
+	}
+	event := &Event{
+		envelope: Envelope{ID: "evt-typed", Attempt: 2},
+		raw:      []byte(`{"name":"Ada"}`),
+		codec:    codec.JSON{},
+	}
+	var gotEvent *Event
+	var gotPayload payload
+	err := Typed(func(_ context.Context, receivedEvent *Event, receivedPayload payload) error {
+		gotEvent = receivedEvent
+		gotPayload = receivedPayload
+		return nil
+	}).Handle(context.Background(), event)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotEvent != event {
+		t.Fatalf("event pointer = %p, want %p", gotEvent, event)
+	}
+	if gotPayload.Name != "Ada" {
+		t.Fatalf("decoded payload = %#v, want name Ada", gotPayload)
+	}
+}
+
+func TestTypedDecodeFailureIsTerminalOnFirstAttempt(t *testing.T) {
+	producer := &dispatchProducer{}
+	client, err := New(context.Background(), testClientConfig(t),
+		WithDriver(&dispatchDriver{conn: &dispatchConn{producer: producer}}),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = client.Close(context.Background()) }()
+
+	handled := false
+	runner, err := client.Subscribe(context.Background(), Subscription{
+		Name:   "orders",
+		Topics: []string{"orders.created"},
+		Handlers: map[string]Handler{
+			"orders.created": Typed(func(context.Context, *Event, struct {
+				Name string `json:"name"`
+			},
+			) error {
+				handled = true
+				return nil
+			}),
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	envelope := Envelope{
+		SpecVersion: "1.0",
+		ID:          "evt-invalid-payload",
+		Source:      "/test/orders",
+		Type:        "orders.created",
+		Attempt:     1,
+	}
+	headers, err := envelope.EncodeHeaders(CoreMaxHeaderBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	settler := &dispatchSettler{}
+	if !dispatchMessage(runner, context.Background(), driver.InboundMessage{
+		Destination: "orders",
+		Headers:     headerSlice(headers),
+		Body:        []byte(`{"name":`),
+		Settle:      settler,
+	}, &Envelope{}, new(bool)) {
+		t.Fatal("typed decode failure was not settled")
+	}
+	if handled {
+		t.Fatal("handler ran after typed decode failure")
+	}
+	if !settler.acked {
+		t.Fatal("typed decode failure was not acked after dead-letter publish")
+	}
+	if settler.nacked {
+		t.Fatal("typed decode failure was retried")
+	}
+	if len(producer.messages) != 1 {
+		t.Fatalf("successor messages = %d, want one dead-letter message", len(producer.messages))
+	}
+	if got, want := headerValue(producer.messages[0].Headers, "f1deathreason"), ReasonTerminal.String(); got != want {
+		t.Fatalf("typed decode failure death reason = %q, want %q", got, want)
+	}
+	if got, want := headerValue(producer.messages[0].Headers, "f1attempt"), "1"; got != want {
+		t.Fatalf("dead-letter attempt = %q, want %q", got, want)
 	}
 }
 

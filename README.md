@@ -44,6 +44,17 @@ Broker-backed jobs remain available there and run when `RUN_BROKER_TESTS=1` is s
   are selected by the application and import-boundary linting is enforced by `make verify-agnostic`.
 <!-- #endregion guarantees -->
 
+## Observability
+
+Attach `f1otel` with one `f1.WithObserver` option for standard OpenTelemetry
+metrics without adding instrumentation to handlers. The adapter uses an
+application-owned `MeterProvider` and records publish, receive, process,
+settlement, retry, dead-letter, backlog, and scheduler metrics. It is safe for
+concurrent calls and uses F1 event timestamps. See the [observability
+guide](docs/advanced-topics/observability.md) for the adapter contract, metric
+attributes, enqueue-time sources, and broker settings.
+
+
 ## Non-goals for v1
 
 <!-- #region non-goals -->
@@ -167,5 +178,6 @@ Start with these local documents:
 
 - [`docs/index.md`](docs/index.md) - documentation home: guarantees at a glance and a path for service authors, runtime readers, and driver authors.
 - [`docs/learn/getting-started.md`](docs/learn/getting-started.md) - install and connect the SDK in a Go service.
+- [`docs/advanced-topics/running-in-production.md`](docs/advanced-topics/running-in-production.md) - production configuration, probes, shutdown, observability, and launch checklist.
 - [`docs/development/architecture.md`](docs/development/architecture.md) - current package boundaries and invariants.
 - This README - product guarantees, non-goals, installation, and quickstart.

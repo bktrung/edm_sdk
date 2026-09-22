@@ -1,132 +1,76 @@
 # Getting started
 
-F1 is a generic event-messaging SDK for Go. It gives an application a stable
-way to publish and consume events while a driver adapts that application to the
-messaging system selected at deployment time.
+F1 is the Go SDK every service in the estate uses to publish and consume events. A service author
+writes handlers and event structs. F1 owns envelope construction, delivery guarantees,
+acknowledgement, retry ladders, dead-letter routing, poison-message containment, priority
+scheduling, zero-loss shutdown, and observability.
 
-This guide walks through the smallest useful F1 flow:
+The message broker is a pluggable driver chosen by the application at its composition root.
+Business code talks to F1, never to a broker client, so moving between brokers changes
+configuration rather than handlers.
 
-1. create a client with an application-selected driver;
-2. publish a versioned event;
-3. subscribe to its topic and decode it in a handler; and
-4. drain the subscription and close the client safely.
+The repository contains the core SDK, the public codec and driver ports, the deterministic
+in-memory driver, the RabbitMQ driver, and a connected Kafka driver. Kafka consumes with consumer
+groups. Each driver reports its transport limits through `Client.Limits()`, and the core emulates
+F1 retry, delay, and dead-letter behavior where a broker has no native equivalent.
 
-The examples deliberately do not choose a broker. F1's application-facing code
-should not need to change when the driver changes. Select and configure a
-concrete driver in your application's composition root, then pass it to F1 as
-an implementation of [`driver.Driver`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/driver/driver.go).
+## Install
 
-## The mental model
-
-An event has two identities:
-
-- Its **event type** describes the contract being handled, such as
-  `orders.placed.v1`.
-- Its **topic** is the logical destination that carries related events. By
-  default, F1 derives `orders.placed` from `orders.placed.v1` by removing the
-  trailing version segment.
-
-The publisher sends an encoded payload with an envelope containing the event
-type, ID, subject, routing metadata, and delivery metadata. A subscription
-consumes one or more topics and routes each event to the handler registered for
-its event type.
-
-Delivery is at least once. A handler can see the same event again after a
-redelivery, so the side effect performed by a handler should be idempotent.
-`Event.IdempotencyKey()` gives the stable application key when the publisher
-provided one, and otherwise falls back to the event ID.
-
-## Install F1
-
-The module is hosted on the project's private Go module host. Set `GOPRIVATE`
-before downloading it so the Go tool does not query the public proxy or
-checksum database, which cannot see that host, then add F1 to the application:
+The module lives on the project's private Go module host. Set `GOPRIVATE` before the first
+download so the Go tool does not query the public proxy or checksum database, which cannot see that
+host:
 
 ```sh
 go env -w GOPRIVATE=fgit.zapps.vn
 go get fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk
 ```
 
-Use the Go version declared in [`go.mod`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/go.mod). Keep connection
-endpoints, credentials, and driver-specific settings in your application's
-configuration; do not put them in handler code.
+Use the Go version declared in [`go.mod`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/go.mod),
+and keep endpoints, credentials, and driver settings in the application's configuration rather than
+in handler code. [Quickstart](/learn/quickstart) runs a complete program with no broker at all.
 
-## Choose a driver
+## The one-minute background
 
-The application selects the concrete driver at the composition boundary. The
-service-facing code uses the root `f1` package; it does not use a broker client
-directly. The repository currently includes:
+An event has two names. Its **event type** is the contract being handled, such as
+`orders.placed.v1`. Its **topic** is the logical destination carrying related events: F1 derives
+`orders.placed` from `orders.placed.v1` by removing the trailing version segment. The publisher
+encodes the payload and attaches an **envelope** carrying the event type, ID, subject, routing
+metadata, and delivery metadata. A subscription reads topics and routes each event to the handler
+registered for its type.
 
-- `drivers/kafka` for Kafka consumer groups and partition-bound scaling.
-- `drivers/rabbitmq` for RabbitMQ.
-- `drivers/inmem` for deterministic tests and local in-process use.
-
-Every broker-specific setting a driver accepts, what it does, and what it
-defaults to is listed in [Driver options](/user-guide/driver-options). The local
-Kafka fixture is defined in [`docker/docker-compose.yml`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/docker/docker-compose.yml), and
-`make test-kafka` / `make test-kafka-conformance` own its broker-backed verification.
-
-Start the configuration from [`examples/config.yaml`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/examples/config.yaml), then provide the
-service's broker endpoint, topology policy, and subscription settings.
+Delivery is at least once. A handler can see the same event again after a redelivery, so the side
+effect it performs must be idempotent. `Event.IdempotencyKey()` returns the stable application key
+when the publisher set one, and the event ID otherwise; an attempt number is not a deduplication
+key, because attempts change on redelivery. Version the event type when the payload contract
+changes, and keep the old handler until its events are retired.
 
 ## Connect the client
 
-F1 requires two pieces at startup:
-
-- a resolved [`f1.Config`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/config.go), normally loaded with
-  `f1.LoadConfig`; and
-- the concrete `driver.Driver` selected by the application.
-
-Keeping driver selection outside the service logic is the important portability
-boundary. The following helper is intentionally generic: `selectedDriver` is
-created by your application's adapter/configuration layer.
+F1 needs a resolved [`f1.Config`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/config.go),
+normally loaded with `f1.LoadConfig`, and the concrete
+[`driver.Driver`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/driver/driver.go)
+your composition layer selected:
 
 ```go
-package orders
-
-import (
-	"context"
-	"errors"
-	"fmt"
-	"time"
-
-	f1 "fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk"
-	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/driver"
-)
-
+// selectedDriver is built by the application's composition layer.
 func connect(ctx context.Context, configPath string, selectedDriver driver.Driver) (*f1.Client, error) {
 	cfg, err := f1.LoadConfig(configPath)
 	if err != nil {
 		return nil, fmt.Errorf("load F1 config: %w", err)
 	}
-
-	client, err := f1.New(ctx, cfg, f1.WithDriver(selectedDriver))
-	if err != nil {
-		return nil, fmt.Errorf("connect F1: %w", err)
-	}
-	return client, nil
+	return f1.New(ctx, cfg, f1.WithDriver(selectedDriver))
 }
 ```
 
-`f1.New` opens the supplied driver before it returns. Startup failures are
-therefore returned at the connection boundary, before the application begins
-publishing or consuming. Keep the `broker.driver` value in the loaded config
-aligned with the selected driver's `Name()`; F1 logs a driver-identity mismatch
-so an accidental configuration split is visible.
-
-Pass `f1.WithPublishTopics(...)` as well when F1 should ensure the publisher's
-topology at startup. Production topology should normally be provisioned
-separately and verified rather than auto-created. See [`config.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/config.go) and
-[`options.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/options.go) for the owning definitions.
-
-The exact configuration belongs to the selected driver and deployment. This
-guide leaves that choice open on purpose; the rest of the application can use
-the same F1 APIs regardless of which adapter is injected.
+`f1.New` opens the driver before it returns, so a startup failure surfaces at the connection
+boundary. Keep `broker.driver` aligned with `selectedDriver.Name()`: F1 logs a driver-identity
+mismatch so a configuration split is visible. Add `f1.WithPublishTopics(...)` when F1 should ensure
+the publisher's topology at startup; production topology is normally provisioned separately. Every
+driver setting is in [Drivers and capabilities](/drivers-and-capabilities).
 
 ## Publish an event
 
-Define a payload type that represents the event contract. Version the event
-type when the contract changes:
+Define a payload type for the event contract, then publish it:
 
 ```go
 type OrderPlaced struct {
@@ -139,7 +83,6 @@ func publishOrder(ctx context.Context, client *f1.Client, orderID string) error 
 		"orders.placed.v1",
 		OrderPlaced{OrderID: orderID},
 		f1.WithKey(orderID),
-		f1.WithSubject("order:"+orderID),
 		f1.WithIdempotencyKey("order-placed:"+orderID),
 	)
 	if err != nil {
@@ -149,24 +92,19 @@ func publishOrder(ctx context.Context, client *f1.Client, orderID string) error 
 }
 ```
 
-`Publish` returns only after the selected driver reports durable broker
-acknowledgement. The returned event ID is useful for logs and tracing. The
-event type determines the default logical topic; use `f1.WithTopic` only when
-the application needs an explicit topic that differs from that convention.
-
-`WithKey` carries the business routing key. It is also the default key used by
-the driver when no other routing key is supplied, so a stable value such as an
-order ID is usually preferable to a random value.
+`Publish` returns only after the selected driver reports durable broker acknowledgement, and it
+returns the generated event ID, which is useful in logs and traces. `WithKey` carries the business
+routing key and is also the key the driver uses when nothing else is supplied, so a stable value
+such as an order ID beats a random one. Use `f1.WithTopic` only to override the derived topic.
 
 ## Subscribe and handle events
 
-A subscription names its consumer group, declares the logical topics it reads,
-and maps event types to handlers. The subscription below uses the same topic
-derived from `orders.placed.v1`:
+A subscription names its consumer group, declares the logical topics it reads, and maps event types
+to handlers:
 
 ```go
 func subscribeOrders(ctx context.Context, client *f1.Client) (*f1.Runner, error) {
-	runner, err := client.Subscribe(ctx, f1.Subscription{
+	return client.Subscribe(ctx, f1.Subscription{
 		Name:   "order-projector",
 		Topics: []string{"orders.placed"},
 		Handlers: map[string]f1.Handler{
@@ -175,138 +113,95 @@ func subscribeOrders(ctx context.Context, client *f1.Client) (*f1.Runner, error)
 				if err := event.Decode(&placed); err != nil {
 					return f1.Terminal(fmt.Errorf("decode %s: %w", event.Type(), err))
 				}
-
 				// Replace this with the application's idempotent side effect.
-				if err := applyOrder(ctx, event.IdempotencyKey(), placed); err != nil {
-					return err
-				}
-				return nil
+				return applyOrder(ctx, event.IdempotencyKey(), placed)
 			}),
 		},
 	})
-	if err != nil {
-		return nil, fmt.Errorf("create order subscription: %w", err)
-	}
-	return runner, nil
 }
 ```
 
-The handler result controls delivery:
+The handler's result settles the delivery:
 
-- return `nil` after the side effect succeeds; F1 settles the event as handled;
-- return a normal error for a transient failure; F1 applies the configured
-  retry policy; and
+- return `nil` after the side effect succeeds, and F1 settles the event as handled;
+- return an ordinary error for a transient failure, and F1 applies the configured retry policy; and
 - wrap an unrecoverable error with `f1.Terminal` when retrying cannot help.
 
-The handler should use the event's idempotency key when writing its side effect.
-Do not use the delivery attempt as a deduplication key: attempts can change
-when the same event is redelivered.
-
-The `applyOrder` call in the example stands for the application's own side
-effect. It should record or update state using the idempotency key so a
-redelivery cannot apply the same business operation twice.
-
-If a handler is not registered for an event type, the subscription's
-`UnmatchedPolicy` determines whether F1 ignores or dead-letters that event. Set
-the policy explicitly when that distinction matters to the application.
+The `applyOrder` call stands for the application's side effect, which should record or update state
+under the idempotency key so a redelivery cannot apply the same operation twice. With no handler
+registered for an event type, the subscription's `UnmatchedPolicy` decides whether F1 ignores or
+dead-letters the event.
 
 ## Run and shut down
 
-`Subscribe` validates the subscription and returns a runner. `Run` owns the
-delivery loop; it blocks until the context is canceled or the runner stops with
-an error. Shutdown is `client.Close`: it stops delivery, lets in-flight handlers
-finish within the drain budget, and then releases the client. In the example
-below, `ctx` is only the shutdown trigger, and the runner gets a context that
-the trigger's cancel cannot reach:
+`Subscribe` validates the subscription and returns a runner but does not start fetching. `Run` owns
+the delivery loop and blocks until its context is cancelled or the runner stops with an error:
 
 ```go
 func runOrders(ctx context.Context, client *f1.Client, runner *f1.Runner) error {
 	runDone := make(chan error, 1)
-	go func() {
-		// Run keeps the values ctx carries, but not its cancellation: the
-		// shutdown trigger must not cut in-flight handlers off.
-		runDone <- runner.Run(context.WithoutCancel(ctx))
-	}()
+	// Run keeps the values ctx carries, but not its cancellation: the shutdown
+	// trigger must not cut in-flight handlers off.
+	go func() { runDone <- runner.Run(context.WithoutCancel(ctx)) }()
 
-	var runErr error
-	runReturned := false
-	select {
-	case runErr = <-runDone:
-		runReturned = true
-	case <-ctx.Done():
-	}
+	<-ctx.Done()
 
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
-
 	if err := client.Close(shutdownCtx); err != nil {
 		return fmt.Errorf("close F1 client: %w", err)
 	}
 
-	// Close drains the runner, so Run returns even though its context was
-	// never cancelled.
-	if !runReturned {
-		runErr = <-runDone
-	}
-	if runErr != nil && !errors.Is(runErr, context.Canceled) {
+	// Close drains the runner, so Run returns even though its context was never cancelled.
+	if runErr := <-runDone; runErr != nil && !errors.Is(runErr, context.Canceled) {
 		return fmt.Errorf("order subscription stopped: %w", runErr)
 	}
 	return nil
 }
 ```
 
-In a real service, watch the process's termination signals and shut down by
-calling `client.Close` with a fresh timeout context, or `runner.Drain` for a
-single subscription, instead of cancelling `Run`'s context: cancelling `Run`
-skips the grace period and abandons the handler that is already in flight. The
-[independent shutdown contexts](/advanced-topics/lifecycle-and-shutdown#use-independent-shutdown-contexts)
-section shows the pattern and the budgets it uses. Give shutdown a separate
-timeout so a stalled handler or driver cannot keep the process alive forever.
-For a whole-process shutdown, `client.Close` drains every registered runner,
-waits until no publish is in flight, and releases the driver's producer and
-connection resources. Call `runner.Drain` directly when you need to stop one
-subscription while keeping the client alive for other work.
+Here `ctx` is only the shutdown trigger. A real service watches termination signals and calls
+`client.Close` with a fresh timeout context, or `runner.Drain` for one subscription, rather than
+cancelling `Run`'s context: cancelling `Run` skips the grace period and abandons the handler in
+flight. Give shutdown its own deadline so a stalled handler cannot keep the process alive, and note
+that the process creating the client owns its runners and must drain them. [Lifecycle and
+shutdown](/advanced-topics/lifecycle-and-shutdown) shows the signal-driven pattern.
 
-## Run the local example
+## Observe it
 
-The root [README](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/README.md) contains the complete RabbitMQ fixture quickstart. It
-builds separate publisher and consumer services from
-[`examples/`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/tree/main/examples) so you can see the composition boundary in a
-runnable form.
+One `f1.WithObserver` option is all the instrumentation a service needs. The `f1otel` adapter turns
+F1's lifecycle events into standard OpenTelemetry metrics and spans:
 
-## Design around these guarantees
+```go
+observer, err := f1otel.New(f1otel.WithMeterProvider(meterProvider))
+if err != nil {
+	return err
+}
+client, err := f1.New(ctx, cfg, f1.WithDriver(selectedDriver), f1.WithObserver(observer))
+```
 
-Before moving beyond the first example, make these choices explicit in the
-service design:
+For the adapter setup, the metric names, and the broker timestamp settings, see
+[Observability](/advanced-topics/observability); [Observer](/basics/observer) explains the model.
 
-- **At-least-once handling:** handlers may receive a redelivery.
-- **Idempotent effects:** deduplicate using a stable business key, not an
-  attempt number.
-- **Versioned contracts:** add a new event type version when the payload
-  contract changes; keep old handlers until their events are retired.
-- **Failure classification:** ordinary errors are retryable, terminal errors
-  bypass retries, and successful handlers return `nil`.
-- **Lifecycle ownership:** the process that creates the client owns its
-  runners and must drain and close them.
-- **Driver portability:** application composition chooses the adapter; business
-  handlers should depend on F1 events, not driver packages.
+## What F1 guarantees
 
-## Next steps
+Each guarantee below is tested, and the repository gates exercise them.
 
-- [Publishing events](/user-guide/publishing-events) - routing metadata and batches.
-- [Consuming events](/user-guide/consuming-events) - handlers, metadata, and ordering.
-- [Handling failures](/user-guide/handling-failures) - retry, terminal, drop, and dead-letter.
+<!--@include: ../../README.md#guarantees-->
 
-## Continue from the source contracts
+## What F1 does not do
 
-When you need more detail, read the symbols that own the behavior:
+These are out of scope for v1. Plan for them in the application or the platform rather than
+expecting the SDK to cover them.
 
-- [`Publisher`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/publisher.go) - event construction, routing metadata, and
-  durable publish behavior;
-- [`Subscription`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/subscription.go) - topics, handlers, retry, and
-  delivery policy;
-- [`Event`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/event.go) - envelope access, decoding, and idempotency;
-- [`HandlerFunc`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/handler.go) and [`Terminal`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/errors.go) - handler
-  adaptation and failure classification; and
-- [`driver.Driver`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/driver/driver.go) - the adapter boundary used by the
-  application composition layer.
+<!--@include: ../../README.md#non-goals-->
+
+## What next
+
+- [Message](/basics/message) and [Publisher and subscriber](/basics/pubsub) - the event, envelope,
+  and subscription model.
+- [Failure handling](/advanced-topics/failure-handling) - retry, terminal, drop, and dead-letter.
+- [Observability](/advanced-topics/observability) and [Alerts](/advanced-topics/alerts) - metrics,
+  spans, and the runbook built on them.
+- [Drivers and capabilities](/drivers-and-capabilities) - configuration for each adapter, and the
+  rest of Basics and Advanced in the sidebar.

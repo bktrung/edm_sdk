@@ -65,7 +65,7 @@ func newClient(opts ...f1.Option) (*Client, error) {
 	fake := clock.NewFake(time.Unix(0, 0))
 	timer20ms := make(chan struct{})
 	observedClock := &observedClock{Fake: fake, delay: 20 * time.Millisecond, armed: timer20ms}
-	captures := &captureStore{publishedSignal: make(chan struct{}, 1)}
+	captures := &captureStore{signal: make(chan struct{})}
 	state := &captureState{
 		destinations: make(map[string]chan struct{}),
 		ready:        make(map[string]bool),
@@ -230,10 +230,14 @@ func (s *captureState) waitDestination(ctx context.Context, name string) error {
 }
 
 type captureStore struct {
-	mu              sync.Mutex
-	published       []Captured
-	dlq             []Captured
-	publishedSignal chan struct{}
+	mu        sync.Mutex
+	published []Captured
+	dlq       []Captured
+	// signal is closed by add while published is non-empty. take can be called
+	// for a DLQ drain while a waiter has already selected on this open channel;
+	// it must not replace that channel unless add closed it, or that waiter
+	// would wait forever for a close on a channel no future add can close.
+	signal chan struct{}
 }
 
 func (s *captureStore) add(messages []driver.OutboundMessage, err error) {
@@ -263,27 +267,29 @@ func (s *captureStore) add(messages []driver.OutboundMessage, err error) {
 			published = true
 		}
 	}
-	s.mu.Unlock()
-	if published && s.publishedSignal != nil {
+	if published && s.signal != nil {
 		select {
-		case s.publishedSignal <- struct{}{}:
+		case <-s.signal:
 		default:
+			close(s.signal)
 		}
 	}
+	s.mu.Unlock()
 }
 
 func (s *captureStore) waitPublished(ctx context.Context) error {
 	for {
 		s.mu.Lock()
 		published := len(s.published) > 0
+		signal := s.signal
 		s.mu.Unlock()
-		if published {
-			return nil
-		}
 		select {
-		case <-s.publishedSignal:
+		case <-signal:
 		case <-ctx.Done():
 			return ctx.Err()
+		}
+		if published {
+			return nil
 		}
 	}
 }
@@ -299,6 +305,13 @@ func (s *captureStore) take(dlq bool) []Captured {
 	}
 	result := append([]Captured(nil), (*source)...)
 	*source = nil
+	if len(s.published) == 0 {
+		select {
+		case <-s.signal:
+			s.signal = make(chan struct{})
+		default:
+		}
+	}
 	return result
 }
 

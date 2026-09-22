@@ -6,10 +6,12 @@ import (
 	"crypto/x509"
 	"errors"
 	"fmt"
+	"log/slog"
 	"maps"
 	"net"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -21,6 +23,8 @@ import (
 )
 
 var errMissingEndpoints = errors.New("rabbitmq: broker endpoints must not be empty")
+
+var errUnsupportedHostlessEndpoint = errors.New("rabbitmq: endpoint without a host is unsupported; use an explicit host, for example amqp://localhost/orders")
 
 var _ driver.Driver = Driver{}
 
@@ -37,6 +41,25 @@ const (
 	queueKindClassic queueKind = "classic"
 )
 
+const (
+	brokerPrefetchOption = "rabbitmq.brokerPrefetch"
+	maxBrokerPrefetch    = 1<<16 - 1
+)
+
+const trustBrokerTimestampOption = "rabbitmq.trustBrokerTimestamp"
+
+func resolveTrustBrokerTimestamp(options map[string]string) (bool, error) {
+	configured := strings.TrimSpace(options[trustBrokerTimestampOption])
+	if configured == "" {
+		return false, nil
+	}
+	trusted, err := strconv.ParseBool(configured)
+	if err != nil {
+		return false, fmt.Errorf("rabbitmq: invalid %s %q: want a boolean", trustBrokerTimestampOption, options[trustBrokerTimestampOption])
+	}
+	return trusted, nil
+}
+
 func configuredQueueKind(options map[string]string) (queueKind, error) {
 	switch strings.ToLower(strings.TrimSpace(options["rabbitmq.queueType"])) {
 	case "", string(queueKindQuorum):
@@ -46,6 +69,21 @@ func configuredQueueKind(options map[string]string) (queueKind, error) {
 	default:
 		return "", fmt.Errorf("rabbitmq: unsupported queueType %q; supported values: quorum, classic, or empty", options["rabbitmq.queueType"])
 	}
+}
+
+func resolveBrokerPrefetch(options map[string]string) (int, error) {
+	configured, present := options[brokerPrefetchOption]
+	if !present {
+		return 0, nil
+	}
+	prefetch, err := strconv.Atoi(configured)
+	if err != nil || prefetch < 1 || prefetch > maxBrokerPrefetch {
+		return 0, fmt.Errorf(
+			"rabbitmq: invalid %s %q; want an integer from 1 to %d",
+			brokerPrefetchOption, configured, maxBrokerPrefetch,
+		)
+	}
+	return prefetch, nil
 }
 
 func capabilitiesForQueueKind(kind queueKind) driver.Capabilities {
@@ -109,6 +147,14 @@ func (Driver) Open(ctx context.Context, cfg driver.Config) (driver.Conn, error) 
 	if err != nil {
 		return nil, classify("open", driver.KindFatal, err)
 	}
+	trustBrokerTimestamp, err := resolveTrustBrokerTimestamp(cfg.DriverOptions)
+	if err != nil {
+		return nil, classify("open", driver.KindFatal, err)
+	}
+	brokerPrefetch, err := resolveBrokerPrefetch(cfg.DriverOptions)
+	if err != nil {
+		return nil, classify("open", driver.KindFatal, err)
+	}
 	openCtx := ctx
 	if cfg.ConnectTimeout > 0 {
 		var cancel context.CancelFunc
@@ -131,7 +177,7 @@ func (Driver) Open(ctx context.Context, cfg driver.Config) (driver.Conn, error) 
 			}
 			conn, err := dial(openCtx, endpoint, cfg)
 			if err == nil {
-				managedConn, connErr := newConn(conn, capabilitiesForQueueKind(queueKind), endpoint, cfg, queueKind)
+				managedConn, connErr := newConn(conn, capabilitiesForQueueKind(queueKind), endpoint, cfg, queueKind, trustBrokerTimestamp, brokerPrefetch)
 				if connErr != nil {
 					_ = conn.Close()
 					return nil, classify("open", driver.KindFatal, connErr)
@@ -154,12 +200,17 @@ func (Driver) Open(ctx context.Context, cfg driver.Config) (driver.Conn, error) 
 }
 
 type conn struct {
-	mu         sync.RWMutex
-	topologyMu sync.Mutex
-	amqp       *amqp.Connection
-	caps       driver.Capabilities
-	info       driver.BrokerInfo
-	queueKind  queueKind
+	mu                   sync.RWMutex
+	topologyMu           sync.Mutex
+	amqp                 *amqp.Connection
+	caps                 driver.Capabilities
+	info                 driver.BrokerInfo
+	queueKind            queueKind
+	trustBrokerTimestamp bool
+	logger               *slog.Logger
+	// brokerPrefetch is resolved once at Open and applies to every consumer
+	// created from this connection. Zero preserves the core window.
+	brokerPrefetch int
 	// consumerTimeout is the x-consumer-timeout this connection declares on
 	// quorum destination queues. It is resolved at Open because a queue
 	// argument is fixed at declare time, and the topology and admin paths have
@@ -351,7 +402,7 @@ func (c *conn) awaitUnblocked(ctx context.Context) error {
 
 var _ driver.Conn = (*conn)(nil)
 
-func newConn(amqpConn *amqp.Connection, caps driver.Capabilities, endpoint string, cfg driver.Config, kind queueKind) (*conn, error) {
+func newConn(amqpConn *amqp.Connection, caps driver.Capabilities, endpoint string, cfg driver.Config, kind queueKind, trustBrokerTimestamp bool, brokerPrefetch int) (*conn, error) {
 	management, err := newManagementClient(endpoint, cfg)
 	if err != nil {
 		return nil, err
@@ -360,17 +411,24 @@ func newConn(amqpConn *amqp.Connection, caps driver.Capabilities, endpoint strin
 	if err != nil {
 		return nil, err
 	}
+	logger := cfg.Logger
+	if logger == nil {
+		logger = slog.Default()
+	}
 	connection := &conn{
-		amqp:            amqpConn,
-		caps:            caps,
-		info:            brokerInfo(amqpConn),
-		queueKind:       kind,
-		consumerTimeout: consumerTimeout,
-		management:      management,
-		active:          make(map[*consumer]struct{}),
-		producers:       make(map[*producer]struct{}),
-		deferred:        make(map[string]time.Duration),
-		fixed:           make(map[string]time.Duration),
+		amqp:                 amqpConn,
+		caps:                 caps,
+		info:                 brokerInfo(amqpConn),
+		queueKind:            kind,
+		trustBrokerTimestamp: trustBrokerTimestamp,
+		logger:               logger,
+		brokerPrefetch:       brokerPrefetch,
+		consumerTimeout:      consumerTimeout,
+		management:           management,
+		active:               make(map[*consumer]struct{}),
+		producers:            make(map[*producer]struct{}),
+		deferred:             make(map[string]time.Duration),
+		fixed:                make(map[string]time.Duration),
 	}
 	// One subscription per connection is the whole of the block handling:
 	// c.amqp is set here and never replaced, so this connection's notifications
@@ -380,6 +438,13 @@ func newConn(amqpConn *amqp.Connection, caps driver.Capabilities, endpoint strin
 	connection.blockWatch.Add(1)
 	go connection.watchBlocks(blocked)
 	return connection, nil
+}
+
+func (c *conn) log() *slog.Logger {
+	if c.logger == nil {
+		return slog.Default()
+	}
+	return c.logger
 }
 
 func (c *conn) Capabilities() driver.Capabilities { return c.caps }
@@ -652,6 +717,9 @@ func validateEndpoint(endpoint string) error {
 	if err != nil {
 		return errors.New("rabbitmq: invalid endpoint")
 	}
+	if parsed.Hostname() == "" {
+		return errUnsupportedHostlessEndpoint
+	}
 	if parsed.Scheme != "amqps" && !isLoopbackEndpoint(endpoint) {
 		return errors.New("rabbitmq: plaintext connection to non-loopback host requires an amqps:// endpoint")
 	}
@@ -707,7 +775,7 @@ func validateSASL(settings *driver.SASLConfig) error {
 }
 
 func tlsConfig(settings *driver.TLSConfig) (*tls.Config, error) {
-	config := &tls.Config{InsecureSkipVerify: settings.InsecureSkipVerify} //nolint:gosec // explicitly controlled by the driver config
+	config := &tls.Config{InsecureSkipVerify: settings.InsecureSkipVerify, ServerName: settings.ServerName} //nolint:gosec // explicitly controlled by the driver config
 	if settings.CAFile != "" {
 		pem, err := os.ReadFile(settings.CAFile)
 		if err != nil {
@@ -769,7 +837,7 @@ func isLoopbackEndpoint(endpoint string) bool {
 }
 
 func waitRetry(ctx context.Context) error {
-	timer := time.NewTimer(250 * time.Millisecond) //nolint:forbidigo // connection retries need a wall-clock wait and drivers have no clock port
+	timer := time.NewTimer(250 * time.Millisecond) //nolint:forbidigo // connection retries wait for broker recovery and require a wall-clock delay
 	defer timer.Stop()
 	select {
 	case <-ctx.Done():

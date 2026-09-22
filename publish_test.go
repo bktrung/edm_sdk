@@ -508,9 +508,43 @@ func TestNewLogsNonNativeCapabilities(t *testing.T) {
 	}
 }
 
-func TestWarnUnclassifiedAcceptsNilLogger(t *testing.T) {
+func TestWarnUnclassifiedWithContextAcceptsNilLogger(t *testing.T) {
 	t.Parallel()
-	warnUnclassified(nil, errors.New("unclassified"))
+	warnUnclassifiedWithContext(nil, context.Background(), errors.New("unclassified"))
+}
+
+func TestInvokeHandlerMessageSkipsTopicLookupForPlainDelivery(t *testing.T) {
+	client := newPublishClient(t, &recordingProducer{})
+	runner := &Runner{
+		client: client,
+		subscription: Subscription{
+			Name:           "orders",
+			HandlerTimeout: time.Second,
+		},
+	}
+	event := &Event{envelope: Envelope{Type: "orders.created", Priority: PriorityMedium}}
+	message := driver.InboundMessage{Destination: "missing.destination"}
+	done := make(chan handlerResult, 1)
+
+	client.mu.Lock()
+	go func() {
+		done <- invokeHandlerMessage(runner, context.Background(), HandlerFunc(func(context.Context, *Event) error {
+			return nil
+		}), event, message)
+	}()
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	select {
+	case result := <-done:
+		client.mu.Unlock()
+		if result.stuck {
+			t.Fatal("plain delivery became stuck")
+		}
+	case <-ctx.Done():
+		client.mu.Unlock()
+		<-done
+		t.Fatal("plain delivery waited for the client lock during topic lookup")
+	}
 }
 
 func TestTopicForOnlyStripsTrailingVersion(t *testing.T) {

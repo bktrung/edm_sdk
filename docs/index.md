@@ -9,8 +9,8 @@ hero:
       text: Get started
       link: /learn/getting-started
     - theme: alt
-      text: What is F1
-      link: /learn/what-is-f1
+      text: Quickstart
+      link: /learn/quickstart
     - theme: alt
       text: Architecture
       link: /development/architecture
@@ -25,8 +25,8 @@ features:
     linkText: Lifecycle and shutdown
   - title: Retry ladder to a dead-letter queue
     details: Retryable failures move through tiered backoff. Exhausted or terminal failures dead-letter with a recorded death reason and error.
-    link: /user-guide/handling-failures
-    linkText: Handling failures
+    link: /advanced-topics/failure-handling
+    linkText: Failure handling
   - title: Starvation-free priority, ordering by key
     details: Low-priority work has a bounded wait under sustained high-priority load. Per-key order is preserved when a subscription asks for it.
     link: /advanced-topics/ordering-and-scheduling
@@ -88,14 +88,14 @@ return runner.Run(ctx)
   <a class="f1-path" href="/learn/getting-started">
     <span class="f1-path__eyebrow">Build a service</span>
     <strong class="f1-path__title">Publish and consume events</strong>
-    <span class="f1-path__body">Install the module, connect a driver, then follow the guides for publishing, consuming, failures, shutdown and testing.</span>
+    <span class="f1-path__body">Install the module, connect a driver, then follow Basics for the message and subscription model and Advanced for failures, ordering and shutdown.</span>
     <span class="f1-path__cta">Getting started -&gt;</span>
   </a>
-  <a class="f1-path" href="/runtime-overview">
+  <a class="f1-path" href="/development/architecture">
     <span class="f1-path__eyebrow">Understand the runtime</span>
     <strong class="f1-path__title">Follow a message end to end</strong>
     <span class="f1-path__body">How a message travels from Publish to settlement, and which package owns each step of the way.</span>
-    <span class="f1-path__cta">Runtime overview -&gt;</span>
+    <span class="f1-path__cta">Architecture map -&gt;</span>
   </a>
   <a class="f1-path" href="/development/driver-contract">
     <span class="f1-path__eyebrow">Write or review a driver</span>

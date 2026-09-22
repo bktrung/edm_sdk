@@ -122,6 +122,8 @@ func TestTrackedAdminRecordsMaintenanceDestinations(t *testing.T) {
 		queues:    make(map[string][]driver.OutboundMessage),
 		unsettled: make(map[string]int),
 	}
+	raw.queues["tracked.prune.a"] = nil
+	raw.queues["tracked.prune.b"] = nil
 	tracked := newTrackedConn(raw)
 	admin, ok := tracked.Admin().(driver.Maintenance)
 	if !ok {
@@ -130,8 +132,14 @@ func TestTrackedAdminRecordsMaintenanceDestinations(t *testing.T) {
 	if _, err := admin.Purge(context.Background(), "tracked.purge"); err != nil {
 		t.Fatalf("Purge: %v", err)
 	}
-	if _, err := admin.Prune(context.Background(), []string{"tracked.prune.a", "tracked.prune.b"}); err != nil {
+	results, err := admin.Prune(context.Background(), []string{"tracked.prune.a", "tracked.prune.b"})
+	if err != nil {
 		t.Fatalf("Prune: %v", err)
+	}
+	for _, result := range results {
+		if !result.Deleted {
+			t.Fatalf("Prune(%q) = %+v, want deleted", result.Name, result)
+		}
 	}
 	tracked.mu.Lock()
 	defer tracked.mu.Unlock()
@@ -607,7 +615,16 @@ func (a runTestAdmin) EnsureTopology(_ context.Context, spec driver.TopologySpec
 func (a runTestAdmin) DescribeTopology(_ context.Context, names []string) (driver.TopologyState, error) {
 	depth := make(map[string]int64, len(names))
 	for _, name := range names {
-		depth[name] = int64(len(a.conn.queues[name]))
+		queue, exists := a.conn.queues[name]
+		if !exists {
+			return driver.TopologyState{}, &driver.Error{
+				Driver: "run-test",
+				Op:     "describe",
+				K:      driver.KindNotFound,
+				Err:    driver.ErrDestinationMissing,
+			}
+		}
+		depth[name] = int64(len(queue))
 	}
 	return driver.TopologyState{Depth: depth}, nil
 }

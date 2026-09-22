@@ -6,6 +6,12 @@ export default defineConfig({
   title: 'F1 Event-Driven Messaging SDK',
   description: 'Reliable event-driven messaging for Go services.',
   cleanUrls: true,
+  srcExclude: [
+    'deep-dives/kafka-ack-tracker.md',
+    'deep-dives/kafka-lane-balancer.md',
+    'deep-dives/rabbitmq-delay-ladder.md',
+    'deep-dives/scheduler-and-worker.md',
+  ],
   markdown: {
     lineNumbers: false,
     config: (md) => {
@@ -24,66 +30,80 @@ export default defineConfig({
     search: {
       provider: 'local',
     },
-    // Three reader areas over one directory layout. Paths stay where they are
-    // because README, ARCHITECTURE.md and CLAUDE.md link into them; grouping
-    // happens here instead of by moving files.
+    // The same five areas as the sidebar, in reading order. The nav item for an
+    // area points at its first page. Learn is a task-first path from install to
+    // a running service; Basics and Advanced split the application-facing model
+    // from the decisions that need a capacity or failure plan; Drivers holds the
+    // adapter configuration; Development is the reference for maintainers and
+    // driver authors.
     nav: [
-      { text: 'Guide', link: '/learn/what-is-f1', activeMatch: '^/(learn|user-guide)/' },
-      { text: 'Concepts', link: '/basics/message', activeMatch: '^/(basics|advanced-topics)/' },
+      { text: 'Learn', link: '/learn/getting-started', activeMatch: '^/learn/' },
+      { text: 'Basics', link: '/basics/message', activeMatch: '^/basics/' },
       {
-        text: 'Internals',
-        link: '/development/architecture',
-        activeMatch: '^/(development/|runtime-overview|drivers-and-capabilities)',
+        text: 'Advanced',
+        link: '/advanced-topics/failure-handling',
+        activeMatch: '^/advanced-topics/',
       },
-      { text: 'Deep dives', link: '/deep-dives/kafka-ack-tracker', activeMatch: '^/deep-dives/' },
+      {
+        text: 'Drivers',
+        link: '/drivers-and-capabilities',
+        activeMatch: '^/drivers-and-capabilities',
+      },
+      { text: 'Development', link: '/development/architecture', activeMatch: '^/development/' },
     ],
-    // One sidebar for every page, in reading order, so a reader always sees
-    // where the current page sits in the whole site.
+    // One sidebar for every page, so a reader always sees where the current
+    // page sits in the whole site.
     sidebar: [
       {
-        text: 'Introduction',
+        text: 'Learn',
         items: [
-          { text: 'What is F1', link: '/learn/what-is-f1' },
           { text: 'Getting started', link: '/learn/getting-started' },
+          { text: 'Quickstart', link: '/learn/quickstart' },
         ],
       },
       {
-        text: 'Guides',
-        collapsed: false,
-        items: [
-          { text: 'Publishing events', link: '/user-guide/publishing-events' },
-          { text: 'Consuming events', link: '/user-guide/consuming-events' },
-          { text: 'Handling failures', link: '/user-guide/handling-failures' },
-          { text: 'Graceful shutdown', link: '/user-guide/graceful-shutdown' },
-          { text: 'Testing handlers', link: '/user-guide/testing' },
-          { text: 'Driver options', link: '/user-guide/driver-options' },
-        ],
-      },
-      {
-        text: 'Concepts',
+        text: 'Basics',
         collapsed: false,
         items: [
           { text: 'Message', link: '/basics/message' },
           { text: 'Publisher and subscriber', link: '/basics/pubsub' },
           { text: 'Middleware', link: '/basics/middleware' },
-          { text: 'Failure handling', link: '/advanced-topics/failure-handling' },
-          { text: 'Lifecycle and shutdown', link: '/advanced-topics/lifecycle-and-shutdown' },
-          { text: 'Ordering and scheduling', link: '/advanced-topics/ordering-and-scheduling' },
-          { text: 'Topology and capabilities', link: '/advanced-topics/topology-and-capabilities' },
+          { text: 'Observer', link: '/basics/observer' },
         ],
       },
       {
-        text: 'Internals',
+        text: 'Advanced',
         collapsed: false,
         items: [
-          { text: 'Runtime overview', link: '/runtime-overview' },
+          { text: 'Failure handling', link: '/advanced-topics/failure-handling' },
+          { text: 'Ordering and scheduling', link: '/advanced-topics/ordering-and-scheduling' },
+          { text: 'Lifecycle and shutdown', link: '/advanced-topics/lifecycle-and-shutdown' },
+          { text: 'Topology and capabilities', link: '/advanced-topics/topology-and-capabilities' },
+          { text: 'Observability', link: '/advanced-topics/observability' },
+          { text: 'Alerts', link: '/advanced-topics/alerts' },
+          { text: 'Running in production', link: '/advanced-topics/running-in-production' },
+        ],
+      },
+      {
+        text: 'Drivers',
+        collapsed: false,
+        items: [
+          { text: 'Drivers and capabilities', link: '/drivers-and-capabilities' },
+        ],
+      },
+      {
+        text: 'Development',
+        collapsed: false,
+        items: [
           { text: 'Architecture', link: '/development/architecture' },
           { text: 'Publish flow', link: '/development/publish-flow' },
           { text: 'Consume flow', link: '/development/consume-flow' },
           { text: 'Driver contract', link: '/development/driver-contract' },
           { text: 'Driver conformance', link: '/development/driver-conformance' },
-          { text: 'Drivers and capabilities', link: '/drivers-and-capabilities' },
+          { text: 'Observer events', link: '/development/observer-events' },
           { text: 'Testing strategy', link: '/development/testing' },
+          { text: 'Benchmarks', link: '/development/benchmarks' },
+          { text: 'API compatibility', link: '/development/api-compatibility' },
           { text: 'Source-reading guide', link: '/development/source-reading-guide' },
           { text: 'Writing style', link: '/development/writing-style' },
         ],
@@ -92,10 +112,8 @@ export default defineConfig({
         text: 'Deep dives',
         collapsed: false,
         items: [
-          { text: 'Kafka ack tracker', link: '/deep-dives/kafka-ack-tracker' },
-          { text: 'Kafka partition assignment', link: '/deep-dives/kafka-lane-balancer' },
-          { text: 'RabbitMQ delay ladder', link: '/deep-dives/rabbitmq-delay-ladder' },
-          { text: 'Scheduler and worker', link: '/deep-dives/scheduler-and-worker' },
+          { text: 'Life of a delivery', link: '/deep-dives/life-of-a-delivery' },
+          { text: 'How F1 picks the next message', link: '/deep-dives/scheduler' },
         ],
       },
     ],

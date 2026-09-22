@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -229,7 +230,8 @@ func TestFailedAckIsNotASettlement(t *testing.T) {
 			t.Error("the refused ack reported no error")
 		}
 		afterRefused = tr.settledTotal()
-		samplesRefused = len(tr.settledLatencies())
+		settleLatencies, _ := tr.settledLatencies()
+		samplesRefused = len(settleLatencies)
 		messages <- driver.InboundMessage{Body: []byte(corpusBody(1)), Settle: stubSettler{}}
 		synctest.Wait()
 		accepted := <-consumer.Messages()
@@ -237,7 +239,8 @@ func TestFailedAckIsNotASettlement(t *testing.T) {
 			t.Errorf("the accepted ack reported %v", err)
 		}
 		afterAccepted = tr.settledTotal()
-		samplesAccepted = len(tr.settledLatencies())
+		settleLatencies, _ = tr.settledLatencies()
+		samplesAccepted = len(settleLatencies)
 		close(messages)
 		<-consumer.drained
 	})
@@ -255,11 +258,11 @@ func TestFailedAckIsNotASettlement(t *testing.T) {
 	}
 }
 
-// recordingDriver is a driver that records the connection config the client
-// opened it with and then refuses to open, so a test can read what a
-// measurement handed the driver with no broker behind either of them.
+// recordingDriver records the connection config the client opened it with and
+// returns an injected connection when one is set; otherwise it refuses to open.
 type recordingDriver struct {
 	name string
+	conn driver.Conn
 
 	mu     sync.Mutex
 	opened []driver.Config
@@ -273,6 +276,9 @@ func (d *recordingDriver) Open(_ context.Context, cfg driver.Config) (driver.Con
 	d.mu.Lock()
 	d.opened = append(d.opened, cfg)
 	d.mu.Unlock()
+	if d.conn != nil {
+		return d.conn, nil
+	}
 	return nil, errors.New("bench: recording driver does not open")
 }
 
@@ -284,6 +290,146 @@ func (d *recordingDriver) lastOpened() (driver.Config, bool) {
 		return driver.Config{}, false
 	}
 	return d.opened[len(d.opened)-1], true
+}
+
+type cleanupConn struct {
+	driver.Conn
+	admin driver.Admin
+}
+
+func (c cleanupConn) Admin() driver.Admin { return c.admin }
+
+func (c cleanupConn) Close(context.Context) error { return nil }
+
+type cleanupAdmin struct {
+	driver.Admin
+
+	mu     sync.Mutex
+	purges []string
+	prunes [][]string
+	refuse map[string]bool
+}
+
+func (a *cleanupAdmin) EnsureTopology(context.Context, driver.TopologySpec) (driver.TopologyDiff, error) {
+	return driver.TopologyDiff{}, nil
+}
+
+func (a *cleanupAdmin) Purge(_ context.Context, name string) (int64, error) {
+	a.mu.Lock()
+	a.purges = append(a.purges, name)
+	a.mu.Unlock()
+	return 0, nil
+}
+
+func (a *cleanupAdmin) Prune(_ context.Context, names []string) ([]driver.PruneResult, error) {
+	a.mu.Lock()
+	a.prunes = append(a.prunes, append([]string(nil), names...))
+	a.mu.Unlock()
+	results := make([]driver.PruneResult, len(names))
+	for index, name := range names {
+		results[index] = driver.PruneResult{Name: name, Deleted: !a.refuse[name]}
+	}
+	return results, nil
+}
+
+func (a *cleanupAdmin) calls() (purges []string, prunes [][]string) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	purges = append([]string(nil), a.purges...)
+	prunes = make([][]string, len(a.prunes))
+	for index := range a.prunes {
+		prunes[index] = append([]string(nil), a.prunes[index]...)
+	}
+	return purges, prunes
+}
+
+type immediateCleanupClock struct{}
+
+func (immediateCleanupClock) Now() time.Time { return time.Time{} }
+
+func (immediateCleanupClock) Since(time.Time) time.Duration { return 0 }
+
+func (immediateCleanupClock) Timer(time.Duration) clock.Timer { return clock.Timer{} }
+
+func (immediateCleanupClock) Ticker(time.Duration) clock.Ticker { return clock.Ticker{} }
+
+func (immediateCleanupClock) Sleep(context.Context, time.Duration) error { return nil }
+
+func newCleanupHarness(t *testing.T, refuse map[string]bool) (*Harness, *cleanupAdmin) {
+	t.Helper()
+	admin := &cleanupAdmin{refuse: refuse}
+	driverValue := &recordingDriver{
+		name: "rabbitmq",
+		conn: cleanupConn{admin: admin},
+	}
+	harness, err := New(driverValue, Config{
+		Namespace:  "bench-cleanup-test",
+		Messages:   1,
+		Publishers: 1,
+		Timeout:    time.Second,
+	})
+	if err != nil {
+		t.Fatalf("bench.New: %v", err)
+	}
+	harness.clk = immediateCleanupClock{}
+	wrapped := &countingAdmin{Admin: admin, onSpec: harness.noteDeclared}
+	_, err = wrapped.EnsureTopology(context.Background(), driver.TopologySpec{
+		Exchanges: []driver.ExchangeSpec{
+			{Name: "f1.bench.exchange"},
+			{Name: "outside.exchange"},
+		},
+		Destinations: []driver.DestinationSpec{
+			{Name: "f1.bench.queue"},
+			{Name: "outside.queue"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("EnsureTopology: %v", err)
+	}
+	return harness, admin
+}
+
+// TestHarnessCloseRoutesDeclaredNames proves exchanges bypass Purge, destinations
+// are purged before Prune, names outside the benchmark namespace are ignored,
+// and an undeletable exchange is reported without failing Close while an
+// undeletable destination remains an error.
+func TestHarnessCloseRoutesDeclaredNames(t *testing.T) {
+	const (
+		exchange    = "f1.bench.exchange"
+		destination = "f1.bench.queue"
+	)
+
+	t.Run("deletes both declared names", func(t *testing.T) {
+		harness, admin := newCleanupHarness(t, nil)
+		if err := harness.Close(context.Background()); err != nil {
+			t.Fatalf("Harness.Close: %v", err)
+		}
+		purges, prunes := admin.calls()
+		if want := []string{destination}; !slices.Equal(purges, want) {
+			t.Fatalf("Purge names = %v, want %v", purges, want)
+		}
+		if len(prunes) != 1 {
+			t.Fatalf("Prune calls = %d, want 1", len(prunes))
+		}
+		if want := []string{destination, exchange}; !slices.Equal(prunes[0], want) {
+			t.Fatalf("Prune names = %v, want %v", prunes[0], want)
+		}
+	})
+
+	t.Run("exchange refusal is reported", func(t *testing.T) {
+		harness, _ := newCleanupHarness(t, map[string]bool{exchange: true})
+		if err := harness.Close(context.Background()); err != nil {
+			t.Fatalf("Harness.Close: %v, want nil for an undeletable exchange", err)
+		}
+	})
+
+	t.Run("destination refusal is an error", func(t *testing.T) {
+		harness, _ := newCleanupHarness(t, map[string]bool{destination: true})
+		err := harness.Close(context.Background())
+		if err == nil || !strings.Contains(err.Error(), destination) {
+			t.Fatalf("Harness.Close error = %v, want an error naming %q", err, destination)
+		}
+	})
 }
 
 // TestQueueTypeReachesTheDriver proves the queue kind a measurement configures
@@ -466,14 +612,40 @@ func TestTrackerSettleLatencyWindow(t *testing.T) {
 	if !tr.hasStopped() {
 		t.Fatal("the tracker did not stop when the corpus settled")
 	}
-	got := tr.settledLatencies()
+	got, gotSequences := tr.settledLatencies()
 	want := []time.Duration{3 * time.Millisecond, 5 * time.Millisecond}
-	if len(got) != len(want) {
-		t.Fatalf("settle latencies = %v, want %v", got, want)
+	wantSequences := []int{0, 1}
+	if len(got) != len(want) || len(gotSequences) != len(wantSequences) {
+		t.Fatalf("settle latencies = %v with sequences %v, want %v with sequences %v", got, gotSequences, want, wantSequences)
 	}
 	for index := range want {
-		if got[index] != want[index] {
-			t.Fatalf("settle latencies = %v, want %v", got, want)
+		if got[index] != want[index] || gotSequences[index] != wantSequences[index] {
+			t.Fatalf("settle latencies = %v with sequences %v, want %v with sequences %v", got, gotSequences, want, wantSequences)
 		}
+	}
+}
+
+// TestResultSettlePercentileForPriority proves the accessor selects samples by
+// the publish sequence's modulo priority mapping while the aggregate accessor
+// continues to see every settle latency.
+func TestResultSettlePercentileForPriority(t *testing.T) {
+	t.Parallel()
+	priorities := []f1.Priority{f1.PriorityHigh, f1.PriorityLow}
+	result := Result{
+		SettleLatencies: []time.Duration{
+			time.Millisecond, 9 * time.Millisecond,
+			2 * time.Millisecond, 10 * time.Millisecond,
+			3 * time.Millisecond, 11 * time.Millisecond,
+		},
+		SettleSequences: []int{0, 1, 2, 3, 4, 5},
+	}
+	if got, want := result.SettlePercentileForPriority(f1.PriorityHigh, priorities, 50), 2*time.Millisecond; got != want {
+		t.Fatalf("high settle p50 = %s, want %s", got, want)
+	}
+	if got, want := result.SettlePercentileForPriority(f1.PriorityLow, priorities, 50), 10*time.Millisecond; got != want {
+		t.Fatalf("low settle p50 = %s, want %s", got, want)
+	}
+	if got, want := result.SettlePercentile(50), 3*time.Millisecond; got != want {
+		t.Fatalf("aggregate settle p50 = %s, want %s", got, want)
 	}
 }

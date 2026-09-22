@@ -8,6 +8,18 @@ f1:
       # Change this URI for the real broker host, port, credentials, and vhost.
       - amqp://guest:guest@localhost:5672/
     connectTimeout: 10s
+    # TLS and SASL are disabled in this example. Uncomment and set placeholders
+    # for a broker that requires them; do not commit real credentials here.
+    # tls:
+    #   enabled: true
+    #   caFile: /etc/f1/tls/ca.pem
+    #   certFile: /etc/f1/tls/client.crt
+    #   keyFile: /etc/f1/tls/client.key
+    #   insecureSkipVerify: false
+    # sasl:
+    #   mechanism: plain
+    #   username: <broker-username>
+    #   password: <broker-password>
     defaultPrefetch: 1
   topology:
     # Development creates entry points and queues; production should provision them instead.
