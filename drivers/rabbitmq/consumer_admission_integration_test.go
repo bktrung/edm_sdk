@@ -48,11 +48,11 @@ func openConsumerAdmissionConn(t *testing.T, queue string) *conn {
 		_ = connection.Close(context.Background())
 		t.Fatalf("EnsureTopology: %v", err)
 	}
-	t.Cleanup(func() { cleanupConsumerAdmissionConn(connection, queue) })
+	t.Cleanup(func() { cleanupConsumerAdmissionConn(t, connection, queue) })
 	return connection
 }
 
-func cleanupConsumerAdmissionConn(connection *conn, queue string) {
+func cleanupConsumerAdmissionConn(t *testing.T, connection *conn, queue string) {
 	connection.mu.RLock()
 	closed := connection.closed
 	connection.mu.RUnlock()
@@ -63,14 +63,30 @@ func cleanupConsumerAdmissionConn(connection *conn, queue string) {
 			fresh := public.(*conn)
 			freshAdmin, ok := fresh.Admin().(driver.Maintenance)
 			if ok {
-				_, _ = freshAdmin.Prune(ctx, []string{queue})
+				results, err := freshAdmin.Prune(ctx, []string{queue})
+				if err != nil {
+					t.Logf("cleanup %q: prune: %v", queue, err)
+				}
+				for _, result := range results {
+					if !result.Deleted {
+						t.Logf("cleanup %q: prune kept %q: %s", queue, result.Name, result.Reason)
+					}
+				}
 			}
 			_ = fresh.Close(context.Background())
 		}
 		cancel()
 	}
 	if maintenance, ok := connection.Admin().(driver.Maintenance); ok {
-		_, _ = maintenance.Prune(context.Background(), []string{queue})
+		results, err := maintenance.Prune(context.Background(), []string{queue})
+		if err != nil {
+			t.Logf("cleanup %q: prune: %v", queue, err)
+		}
+		for _, result := range results {
+			if !result.Deleted {
+				t.Logf("cleanup %q: prune kept %q: %s", queue, result.Name, result.Reason)
+			}
+		}
 	}
 	_ = connection.Close(context.Background())
 }
@@ -138,7 +154,7 @@ func TestConsumerConstructionDoesNotHoldConnectionLock(t *testing.T) {
 		releaseFirst()
 		stopIfPresent(firstDone)
 		stopIfPresent(secondDone)
-		cleanupConsumerAdmissionConn(connection, queue)
+		cleanupConsumerAdmissionConn(t, connection, queue)
 	})
 
 	go func() {
@@ -228,7 +244,7 @@ func runConsumerConflictTest(t *testing.T, firstExclusive, secondExclusive bool,
 		releaseFirst()
 		stopIfPresent(firstDone)
 		stopIfPresent(secondDone)
-		cleanupConsumerAdmissionConn(connection, queue)
+		cleanupConsumerAdmissionConn(t, connection, queue)
 	})
 
 	go func() {
@@ -310,7 +326,7 @@ func TestConsumerCloseWinsBeforeInstallAndCleansBuiltLanes(t *testing.T) {
 	t.Cleanup(func() {
 		releaseInstall()
 		stopIfPresent(consumerDone)
-		cleanupConsumerAdmissionConn(connection, queue)
+		cleanupConsumerAdmissionConn(t, connection, queue)
 	})
 
 	go func() {

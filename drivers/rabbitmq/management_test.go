@@ -1,8 +1,10 @@
 package rabbitmq
 
 import (
+	"encoding/json"
 	"errors"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
@@ -11,6 +13,72 @@ import (
 
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/driver"
 )
+
+func TestManagementClientListsAndDeletesExchanges(t *testing.T) {
+	const username = "management-user"
+	const password = "management-password"
+	const exchange = "orders/fanout"
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if usernameFromRequest, requestPassword, ok := r.BasicAuth(); !ok || usernameFromRequest != username || requestPassword != password {
+			t.Errorf("BasicAuth() = %q, %q, %t; want %q, %q, true", usernameFromRequest, requestPassword, ok, username, password)
+		}
+		switch {
+		case r.Method == http.MethodGet && r.URL.EscapedPath() == "/api/exchanges/%2F":
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode([]managementExchange{{Name: exchange}})
+		case r.Method == http.MethodDelete && r.URL.EscapedPath() == "/api/exchanges/%2F/orders%2Ffanout":
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	client := &managementClient{
+		baseURL:  server.URL,
+		username: username,
+		password: password,
+		vhost:    "/",
+		client:   *server.Client(),
+	}
+	exchanges, err := client.listExchanges(t.Context())
+	if err != nil {
+		t.Fatalf("listExchanges: %v", err)
+	}
+	if len(exchanges) != 1 || exchanges[0].Name != exchange {
+		t.Fatalf("listExchanges() = %+v, want one exchange named %q", exchanges, exchange)
+	}
+	deleted, err := client.deleteExchange(t.Context(), exchange)
+	if err != nil {
+		t.Fatalf("deleteExchange: %v", err)
+	}
+	if !deleted {
+		t.Fatal("deleteExchange() = false, want true")
+	}
+}
+
+func TestManagementClientDeleteExchangeTreatsNotFoundAsAbsent(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodDelete {
+			t.Errorf("request method = %s, want DELETE", r.Method)
+		}
+		http.NotFound(w, r)
+	}))
+	defer server.Close()
+	client := &managementClient{
+		baseURL: server.URL,
+		vhost:   "/",
+		client:  *server.Client(),
+	}
+
+	deleted, err := client.deleteExchange(t.Context(), "missing")
+	if err != nil {
+		t.Fatalf("deleteExchange: %v", err)
+	}
+	if deleted {
+		t.Fatal("deleteExchange() = true, want false for 404")
+	}
+}
 
 func TestManagementClientHasExplicitTimeout(t *testing.T) {
 	cfg := driver.Config{ConnectTimeout: 7 * time.Second}
@@ -58,10 +126,8 @@ type managementVhostCase struct {
 // reading fails here and names the spelling that moved.
 //
 // An endpoint with no authority is the one spelling whose vhost the management
-// client never derives: the AMQP library reads "orders" from amqp://///orders
-// through its triple-slash branch and would connect to the default host, but
-// the constructor refuses any endpoint without a host long before that, so the
-// row pins the refusal instead.
+// client refuses before derivation: the driver does not support endpoints
+// without an explicit host, so the row pins that refusal instead.
 func managementVhostCases() []managementVhostCase {
 	return []managementVhostCase{
 		{
@@ -97,8 +163,8 @@ func managementVhostCases() []managementVhostCase {
 		},
 		{
 			name:     "authority-less endpoint is refused before any derivation",
-			endpoint: "amqp://///orders",
-			wantErr:  "missing host",
+			endpoint: "amqp:///orders",
+			wantErr:  "without a host is unsupported",
 		},
 	}
 }
@@ -174,6 +240,38 @@ func TestManagementClientRejectsEndpointTheAMQPParserRefuses(t *testing.T) {
 	}
 	if strings.Contains(err.Error(), username) || strings.Contains(err.Error(), password) {
 		t.Fatalf("newManagementClient() error = %v, contains endpoint credentials", err)
+	}
+}
+
+// TestManagementClientEndpointValidityDoesNotDependOnConfiguredVhost keeps the
+// AMQP parser as the authority for endpoint validity regardless of whether the
+// management vhost comes from the endpoint or a driver option.
+func TestManagementClientEndpointValidityDoesNotDependOnConfiguredVhost(t *testing.T) {
+	tests := []struct {
+		name     string
+		endpoint string
+		accepted bool
+	}{
+		{name: "valid endpoint with host", endpoint: "amqp://localhost:5672/orders", accepted: true},
+		{name: "AMQP-invalid whitespace", endpoint: "amqp://localhost:5672/order s"},
+		{name: "host-less endpoint", endpoint: "amqp:///orders"},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			for _, configured := range []bool{false, true} {
+				t.Run(map[bool]string{false: "vhost from endpoint", true: "configured vhost"}[configured], func(t *testing.T) {
+					options := map[string]string{}
+					if configured {
+						options["rabbitmq.vhost"] = "configured-vhost"
+					}
+					client, err := newManagementClient(test.endpoint, driver.Config{DriverOptions: options})
+					if (err == nil) != test.accepted {
+						t.Fatalf("newManagementClient(%q) with configured=%t = client %v, error %v; accepted=%t", test.endpoint, configured, client, err, test.accepted)
+					}
+				})
+			}
+		})
 	}
 }
 
@@ -330,6 +428,23 @@ func TestManagementClientUsesResolvedVhostCredentialsAndTLS(t *testing.T) {
 	transport, ok := client.client.Transport.(*http.Transport)
 	if !ok || transport.TLSClientConfig == nil || !transport.TLSClientConfig.InsecureSkipVerify {
 		t.Fatalf("management TLS transport = %#v, want configured TLS client", client.client.Transport)
+	}
+}
+
+func TestManagementClientUsesConfiguredTLSServerName(t *testing.T) {
+	cfg := driver.Config{
+		TLS: &driver.TLSConfig{Enabled: true, InsecureSkipVerify: true, ServerName: "broker.alias.example"},
+	}
+	client, err := newManagementClient("amqps://broker.example:5671/", cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	transport, ok := client.client.Transport.(*http.Transport)
+	if !ok || transport.TLSClientConfig == nil {
+		t.Fatalf("management TLS transport = %#v, want configured TLS client", client.client.Transport)
+	}
+	if transport.TLSClientConfig.ServerName != "broker.alias.example" {
+		t.Fatalf("management tls.Config.ServerName = %q, want %q", transport.TLSClientConfig.ServerName, "broker.alias.example")
 	}
 }
 

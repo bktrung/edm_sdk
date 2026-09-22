@@ -14,6 +14,7 @@ import (
 	amqp "github.com/rabbitmq/amqp091-go"
 
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/driver"
+	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/clock"
 )
 
 // publishChannelPoolSize is the number of confirm-mode channels one producer
@@ -51,7 +52,8 @@ type publishChannel struct {
 }
 
 type producer struct {
-	conn *conn
+	conn  *conn
+	clock clock.Clock
 	// slots holds one token per publish this producer runs at once. A publish
 	// takes a token before it takes a channel and gives it back once it has
 	// given the channel back, so holding every token is holding the pool
@@ -102,6 +104,7 @@ func newProducer(ctx context.Context, conn *conn, cfg driver.ProducerConfig) (*p
 	_ = cfg
 	p := &producer{
 		conn:  conn,
+		clock: clock.NewReal(),
 		slots: make(chan struct{}, publishChannelPoolSize),
 		open:  make(map[*publishChannel]struct{}),
 	}
@@ -531,7 +534,7 @@ func (p *producer) target(message driver.OutboundMessage) (exchange, routingKey,
 	fixedDelay, isFixed := p.conn.fixed[destination]
 	p.conn.mu.RUnlock()
 	if isDeferred || !message.DelayUntil.IsZero() {
-		now := time.Now() //nolint:forbidigo // the driver computes remaining delay at publish time
+		now := p.clock.Now()
 		due := message.DelayUntil
 		if due.IsZero() {
 			due = now.Add(delay)
