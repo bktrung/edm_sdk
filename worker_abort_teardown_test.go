@@ -97,6 +97,7 @@ type abortTeardownConn struct {
 
 func (*abortTeardownConn) Capabilities() driver.Capabilities { return driver.Capabilities{} }
 func (*abortTeardownConn) BrokerInfo() driver.BrokerInfo     { return driver.BrokerInfo{Kind: "test"} }
+
 func (*abortTeardownConn) Producer(context.Context, driver.ProducerConfig) (driver.Producer, error) {
 	return abortTeardownProducer{}, nil
 }
@@ -112,7 +113,8 @@ func (*abortTeardownConn) Close(context.Context) error { return nil }
 type abortTeardownProducer struct{}
 
 func (abortTeardownProducer) Publish(context.Context, ...driver.OutboundMessage) error { return nil }
-func (abortTeardownProducer) Close(context.Context) error                              { return nil }
+
+func (abortTeardownProducer) Close(context.Context) error { return nil }
 
 type abortTeardownAdmin struct{}
 

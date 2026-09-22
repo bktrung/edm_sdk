@@ -175,6 +175,40 @@ func BenchmarkRabbitMQConsumeSweep(b *testing.B) {
 	runSweep(b, rabbitmq.Driver{}, rabbitMQEndpoint(), benchNamespace(b), shapes)
 }
 
+// BenchmarkRabbitMQBrokerPrefetchSweep measures the opt-in broker credit on
+// quorum queues at the two concurrency values the option targets. The unset
+// cell keeps the shipped fairness factor; positive broker-prefetch cells use a
+// factor of one so the c=16, broker-prefetch=16 cell meets the core-window
+// precondition. The final cell adds handler work to show that broker credit
+// does not replace handler capacity.
+func BenchmarkRabbitMQBrokerPrefetchSweep(b *testing.B) {
+	var shapes []sweepCell
+	for _, concurrency := range []int{4, 16} {
+		for _, brokerPrefetch := range []int{0, 16, 32, 64, 128} {
+			fairness := f1.FairnessConfig{}
+			if brokerPrefetch > 0 {
+				fairness.PrefetchFactor = 1
+			}
+			shapes = append(shapes, sweepCell{
+				concurrency:         concurrency,
+				queueType:           "quorum",
+				brokerPrefetch:      brokerPrefetch,
+				brokerPrefetchSweep: true,
+				fairness:            fairness,
+			})
+		}
+	}
+	shapes = append(shapes, sweepCell{
+		concurrency:         4,
+		queueType:           "quorum",
+		brokerPrefetch:      128,
+		brokerPrefetchSweep: true,
+		handlerWork:         5 * time.Millisecond,
+		fairness:            f1.FairnessConfig{PrefetchFactor: 1},
+	})
+	runSweep(b, rabbitmq.Driver{}, rabbitMQEndpoint(), benchNamespace(b), shapes)
+}
+
 // BenchmarkRabbitMQIntakeSplit compares one subscription over one main
 // destination with one subscription over two, at the same handler concurrency.
 //
@@ -255,10 +289,14 @@ var sweepPublisherCounts = []int{16, 32, 64}
 // the shape is measured rather than being part of it, so the repeats of one
 // shape share a corpus and two shapes with the same name are the same cell.
 type sweepCell struct {
-	concurrency int
-	queueType   string
-	priorities  []f1.Priority
-	corpus      int
+	concurrency         int
+	queueType           string
+	priorities          []f1.Priority
+	brokerPrefetch      int
+	brokerPrefetchSweep bool
+	handlerWork         time.Duration
+	fairness            f1.FairnessConfig
+	corpus              int
 }
 
 // name identifies a cell in a log line and in a sub-benchmark name.
@@ -267,7 +305,17 @@ func (c sweepCell) name() string {
 	if len(c.priorities) > 1 {
 		destinations = fmt.Sprintf("destinations-%d", len(c.priorities))
 	}
-	return fmt.Sprintf("queue-%s/concurrency-%d/%s", c.queueType, c.concurrency, destinations)
+	if !c.brokerPrefetchSweep && c.brokerPrefetch == 0 && c.handlerWork == 0 && c.fairness.PrefetchFactor == 0 {
+		return fmt.Sprintf("queue-%s/concurrency-%d/%s", c.queueType, c.concurrency, destinations)
+	}
+	brokerPrefetch := "unset"
+	if c.brokerPrefetch > 0 {
+		brokerPrefetch = strconv.Itoa(c.brokerPrefetch)
+	}
+	return fmt.Sprintf(
+		"queue-%s/concurrency-%d/%s/broker-prefetch-%s/handler-%s",
+		c.queueType, c.concurrency, destinations, brokerPrefetch, c.handlerWork,
+	)
 }
 
 // runSweep sizes every shape once and then measures each of them repeat times,
@@ -375,16 +423,19 @@ type cellMeasurement struct {
 func measureCell(b *testing.B, drv driver.Driver, endpoint, namespace string, cell sweepCell) (cellMeasurement, error) {
 	b.Helper()
 	h := newBench(b, drv, bench.Config{
-		Namespace:    namespace,
-		Endpoint:     endpoint,
-		Messages:     cell.corpus,
-		Publishers:   sweepPublishers,
-		PublishBatch: sweepPublishBatch,
-		Concurrency:  cell.concurrency,
-		Priorities:   cell.priorities,
-		QueueType:    cell.queueType,
-		Backlog:      true,
-		Timeout:      measurementTimeout,
+		Namespace:      namespace,
+		Endpoint:       endpoint,
+		Messages:       cell.corpus,
+		Publishers:     sweepPublishers,
+		PublishBatch:   sweepPublishBatch,
+		Concurrency:    cell.concurrency,
+		HandlerWork:    cell.handlerWork,
+		BrokerPrefetch: cell.brokerPrefetch,
+		Fairness:       cell.fairness,
+		Priorities:     cell.priorities,
+		QueueType:      cell.queueType,
+		Backlog:        true,
+		Timeout:        measurementTimeout,
 	})
 	defer closeBench(b, h)
 	ctx, cancel := context.WithTimeout(context.Background(), measurementTimeout)

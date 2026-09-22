@@ -52,7 +52,7 @@ func TestRunnerSchedulerPreservesRetryStormFairness(t *testing.T) {
 	retrySeen := make(map[string]int)
 	freshCount := 0
 	for i := range retryStormWindow {
-		item, ok := scheduler.Next()
+		item, _, ok := scheduler.Next()
 		if !ok {
 			t.Fatalf("scheduler emptied during saturation window at %d", i)
 		}

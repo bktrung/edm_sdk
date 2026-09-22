@@ -14,7 +14,7 @@ import (
 )
 
 // driverOptionsPage is the document the accepted key lists must agree with.
-const driverOptionsPage = "docs/user-guide/driver-options.md"
+const driverOptionsPage = "docs/drivers-and-capabilities.md"
 
 // documentedOptionKey matches the key cell of a row in that page's tables. The
 // page writes a key the way an operator writes it, under the broker section it
@@ -123,7 +123,7 @@ func TestDriverOptionsDocumented(t *testing.T) {
 // TestRemovedRabbitMQOptionsFailToLoad pins the trimmed RabbitMQ whitelist. A
 // key that no resolver reads is refused when the configuration loads rather
 // than accepted and silently ignored, so a config naming one never starts. The
-// four keys that are read still load, which is what separates a trimmed list
+// six keys that are read still load, which is what separates a trimmed list
 // from an emptied one.
 func TestRemovedRabbitMQOptionsFailToLoad(t *testing.T) {
 	t.Parallel()
@@ -149,9 +149,9 @@ func TestRemovedRabbitMQOptionsFailToLoad(t *testing.T) {
 	}
 	t.Run("the keys that are read still load", func(t *testing.T) {
 		t.Parallel()
-		path := writeConfig(t, "f1:\n  env: test\n  service: orders\n  broker:\n    driver: rabbitmq\n    endpoints: [amqp://broker:5672/]\n    rabbitmq:\n      vhost: /orders\n      queueType: quorum\n      consumerTimeout: 90s\n      managementPort: 15672\n")
+		path := writeConfig(t, "f1:\n  env: test\n  service: orders\n  broker:\n    driver: rabbitmq\n    endpoints: [amqp://broker:5672/]\n    rabbitmq:\n      vhost: /orders\n      queueType: quorum\n      consumerTimeout: 90s\n      trustBrokerTimestamp: true\n      brokerPrefetch: 64\n      managementPort: 15672\n")
 		if _, err := LoadConfig(path); err != nil {
-			t.Fatalf("LoadConfig() with the four live RabbitMQ keys error = %v", err)
+			t.Fatalf("LoadConfig() with the live RabbitMQ keys error = %v", err)
 		}
 	})
 }
@@ -182,6 +182,28 @@ func TestUnknownKafkaOptionsFailToLoad(t *testing.T) {
 	}
 }
 
+// TestKafkaFetchMaxWaitLoadsIntoDriverOptions proves that an operator's YAML
+// value survives configuration loading in the map passed to the driver.
+func TestKafkaFetchMaxWaitLoadsIntoDriverOptions(t *testing.T) {
+	const key = "kafka.fetchMaxWait"
+	path := writeConfig(t, `f1:
+  env: test
+  service: orders
+  broker:
+    driver: kafka
+    endpoints: [localhost:1]
+    kafka:
+      fetchMaxWait: 200ms
+`)
+	cfg, err := LoadConfig(path)
+	if err != nil {
+		t.Fatalf("LoadConfig() error = %v, want the configured Kafka option to load", err)
+	}
+	if got, want := cfg.Broker.DriverOptions[key], "200ms"; got != want {
+		t.Fatalf("DriverOptions[%q] = %q, want %q", key, got, want)
+	}
+}
+
 // TestNewRefusesUnknownDriverOptions loads no file: it builds the configuration
 // in Go and opens it, which is the other way an option arrives and the path the
 // refusal used to miss. Nothing between New and the driver reads a key - the map
@@ -203,7 +225,7 @@ func TestNewRefusesUnknownDriverOptions(t *testing.T) {
 		key       string
 	}{
 		{name: "name the driver has no reader for", driver: "kafka", endpoints: []string{"localhost:19092"}, key: "kafka.maxExpectedInstancesX"},
-		{name: "key of the other broker", driver: "kafka", endpoints: []string{"localhost:19092"}, key: "rabbitmq.queueType"},
+		{name: "key of the other broker", driver: "kafka", endpoints: []string{"localhost:19092"}, key: "rabbitmq.brokerPrefetch"},
 		{name: "key naming no driver", driver: "kafka", endpoints: []string{"localhost:19092"}, key: "queueType"},
 		{name: "key on a driver that reads no option", driver: "inmem", key: "inmem.maxQueueDepth"},
 	} {
@@ -247,6 +269,25 @@ func TestNewRefusesUnknownDriverOptions(t *testing.T) {
 			t.Fatalf("Close() error = %v", err)
 		}
 	})
+	t.Run("RabbitMQ broker prefetch is accepted", func(t *testing.T) {
+		t.Parallel()
+		cfg := Config{
+			Env:     "test",
+			Service: "orders",
+			Broker: BrokerConfig{
+				Driver:        "rabbitmq",
+				Endpoints:     []string{"amqp://localhost:5672/"},
+				DriverOptions: map[string]string{"rabbitmq.brokerPrefetch": "64"},
+			},
+		}
+		client, err := New(context.Background(), cfg, WithDriver(&testDriver{name: "rabbitmq", conn: &testConn{}}))
+		if err != nil {
+			t.Fatalf("New() with rabbitmq.brokerPrefetch error = %v", err)
+		}
+		if err := client.Close(context.Background()); err != nil {
+			t.Fatalf("Close() error = %v", err)
+		}
+	})
 }
 
 // TestRemovedKafkaOptionsFailToLoad pins the Kafka whitelist after the
@@ -260,5 +301,26 @@ func TestRemovedKafkaOptionsFailToLoad(t *testing.T) {
 	want := "f1: unknown broker.kafka." + removedKey
 	if err == nil || !strings.Contains(err.Error(), want) {
 		t.Fatalf("LoadConfig() with removed Kafka key set error = %v, want %s", err, want)
+	}
+}
+
+func TestLoadConfigMapsTLSServerName(t *testing.T) {
+	t.Parallel()
+	path := writeConfig(t, `
+f1:
+  env: test
+  service: orders
+  broker:
+    driver: kafka
+    endpoints: [kafka://broker:9092]
+    tls:
+      serverName: broker.alias.example
+`)
+	cfg, err := LoadConfig(path)
+	if err != nil {
+		t.Fatalf("LoadConfig() error = %v", err)
+	}
+	if got, want := cfg.Broker.TLS.ServerName, "broker.alias.example"; got != want {
+		t.Fatalf("TLS server name = %q, want %q", got, want)
 	}
 }

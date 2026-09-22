@@ -1,6 +1,7 @@
 package f1
 
 import (
+	"fmt"
 	"math"
 	"os"
 	"path/filepath"
@@ -9,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/dispatch"
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/retry"
 )
 
@@ -313,6 +315,56 @@ f1:
 	}
 }
 
+func TestLoadConfigRejectsOrderedBufferAboveBound(t *testing.T) {
+	t.Parallel()
+	const concurrency = 1024
+	prefetch := dispatch.MaxOrderedBufferEntries/concurrency + 1
+	path := writeConfig(t, fmt.Sprintf(`
+f1:
+  env: test
+  service: orders
+  broker:
+    driver: inmem
+  subscriptions:
+    orders:
+      topics: [orders]
+      mode: orderedByKey
+      concurrency: %d
+      prefetch: %d
+`, concurrency, prefetch))
+	_, err := LoadConfig(path)
+	want := fmt.Sprintf("f1: subscriptions.orders: ordered mode needs concurrency x prefetch at most %d, got %d x %d", dispatch.MaxOrderedBufferEntries, concurrency, prefetch)
+	if err == nil || err.Error() != want {
+		t.Fatalf("LoadConfig() error = %v, want %q", err, want)
+	}
+}
+
+func TestLoadConfigAcceptsOrderedBufferAtBound(t *testing.T) {
+	t.Parallel()
+	const concurrency = 1024
+	prefetch := dispatch.MaxOrderedBufferEntries / concurrency
+	path := writeConfig(t, fmt.Sprintf(`
+f1:
+  env: test
+  service: orders
+  broker:
+    driver: inmem
+  subscriptions:
+    orders:
+      topics: [orders]
+      mode: orderedByKey
+      concurrency: %d
+      prefetch: %d
+`, concurrency, prefetch))
+	cfg, err := LoadConfig(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := cfg.Subscriptions["orders"].Prefetch, prefetch; got != want {
+		t.Fatalf("Prefetch = %d, want %d", got, want)
+	}
+}
+
 func TestLoadConfigAcceptsPrefetchAtCeiling(t *testing.T) {
 	t.Parallel()
 	path := writeConfig(t, `
@@ -565,6 +617,37 @@ func TestLoadConfigValidatesBrokerTimeoutRelationships(t *testing.T) {
 				t.Fatalf("LoadConfig() error = %v, want %s", err, test.want)
 			}
 		})
+	}
+}
+
+func TestValidateConfigRejectsDrainBeyondKafkaRebalanceTimeout(t *testing.T) {
+	t.Parallel()
+	cfg := validValidationConfig()
+	cfg.Broker.Driver = "kafka"
+	cfg.Broker.Endpoints = []string{"kafka://broker:9092"}
+	cfg.Broker.DriverOptions = map[string]string{"kafka.rebalanceTimeout": "10s"}
+	cfg.Lifecycle.RebalanceDrainTimeout = 25 * time.Second
+
+	err := validateConfiguredConfig(cfg)
+	if err == nil {
+		t.Fatal("validateConfiguredConfig() error = nil, want kafka.rebalanceTimeout validation")
+	}
+	for _, want := range []string{"kafka.rebalanceTimeout", "10s", "45s", "25s"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("validateConfiguredConfig() error = %v, want %q", err, want)
+		}
+	}
+}
+
+func TestValidateConfigAcceptsKafkaDefaultTimeoutBounds(t *testing.T) {
+	t.Parallel()
+	cfg := validValidationConfig()
+	cfg.Broker.Driver = "kafka"
+	cfg.Broker.Endpoints = []string{"kafka://broker:9092"}
+	cfg.Lifecycle.RebalanceDrainTimeout = 27 * time.Second
+
+	if err := validateConfiguredConfig(cfg); err != nil {
+		t.Fatalf("validateConfiguredConfig() error = %v, want default Kafka timeout bounds to validate", err)
 	}
 }
 

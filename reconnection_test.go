@@ -28,6 +28,7 @@ type reconnectTestDriver struct {
 	consumerOpenHook func(context.Context, string) error
 	connections      []*reconnectTestConn
 	created          chan *reconnectTestConsumer
+	prefetches       []int
 }
 
 func (d *reconnectTestDriver) Name() string { return "reconnect-test" }
@@ -56,6 +57,12 @@ func (d *reconnectTestDriver) OpenCount() int {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	return d.opens
+}
+
+func (d *reconnectTestDriver) prefetchesSnapshot() []int {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return append([]int(nil), d.prefetches...)
 }
 
 func (d *reconnectTestDriver) setFailOpens(n int) {
@@ -130,6 +137,7 @@ func (c *reconnectTestConn) Producer(context.Context, driver.ProducerConfig) (dr
 
 func (c *reconnectTestConn) Consumer(ctx context.Context, cfg driver.ConsumerConfig) (driver.Consumer, error) {
 	c.driver.mu.Lock()
+	c.driver.prefetches = append(c.driver.prefetches, cfg.Prefetch)
 	if c.driver.failConsumers > 0 {
 		c.driver.failConsumers--
 		err := c.driver.consumerErr
@@ -921,6 +929,9 @@ func TestRunnerPostRunDrainUsesGenerationContext(t *testing.T) {
 	}
 	if _, ok := settleCtx.Deadline(); !ok {
 		t.Fatal("post-run drain settlement context has no deadline")
+	}
+	if got := runnerSettlementContext(runner, context.Background()); got == nil {
+		t.Fatal("runnerSettlementContext() returned nil")
 	}
 }
 
@@ -1908,9 +1919,10 @@ func TestReconnectBackoffBudgetAndJitter(t *testing.T) {
 		t.Fatal(err)
 	}
 	for i, nominal := range []time.Duration{500 * time.Millisecond, time.Second, 2 * time.Second} {
-		advanceReconnect(t, recorded, time.Duration(float64(nominal)*samples[i]), i+1)
-		if got := recorded.sleepAt(i); got < 0 || got > nominal {
-			t.Fatalf("backoff[%d] = %s, want range [0,%s]", i, got, nominal)
+		want := time.Duration(float64(nominal) * samples[i])
+		advanceReconnect(t, recorded, want, i+1)
+		if got := recorded.sleepAt(i); got != want {
+			t.Fatalf("backoff[%d] = %s, want %s", i, got, want)
 		}
 	}
 	if err := client.awaitRebuild(context.Background(), nil, 0, nil); err == nil {
@@ -3152,6 +3164,11 @@ func TestRetiredConnectionClosesOnlyAfterTheAbandonedRunnerReleases(t *testing.T
 	causing := namedRunner(t, client, "causing", &causingHandled)
 	victim := namedRunner(t, client, "victim", &victimHandled)
 	consumers, _ := startRunners(t, d, map[string]*Runner{"causing": causing, "victim": victim})
+	for i, prefetch := range d.prefetchesSnapshot() {
+		if prefetch < 1 {
+			t.Fatalf("consumer %d prefetch = %d, want positive", i, prefetch)
+		}
+	}
 	waitReconnectCondition(t, func() bool {
 		return runnerState(causing) == lifecycle.Ready && runnerState(victim) == lifecycle.Ready
 	})

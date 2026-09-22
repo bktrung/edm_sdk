@@ -214,7 +214,7 @@ func TestNonCooperativeHandlerIsReportedAsStuck(t *testing.T) {
 	result := invokeHandler(runner, context.Background(), HandlerFunc(func(context.Context, *Event) error {
 		<-release
 		return nil
-	}), &Event{})
+	}), &Event{}, "", 0)
 	close(release)
 	if !result.stuck {
 		t.Fatalf("invokeHandler() = %#v, want stuck result", result)
@@ -239,7 +239,7 @@ func TestInvokeHandlerReturnsStuckForCancelledParent(t *testing.T) {
 	result := invokeHandler(runner, parent, HandlerFunc(func(ctx context.Context, _ *Event) error {
 		handled = true
 		return ctx.Err()
-	}), &Event{})
+	}), &Event{}, "", 0)
 	if err := runner.group.Wait(); err != nil {
 		t.Fatalf("handler group wait = %v", err)
 	}
@@ -291,7 +291,7 @@ func TestInvokeHandlerReportsSequentialStuckThresholds(t *testing.T) {
 			defer close(exited)
 			<-release
 			return nil
-		}), &Event{})
+		}), &Event{}, "", 0)
 	}()
 
 	fake.BlockUntil(1)
