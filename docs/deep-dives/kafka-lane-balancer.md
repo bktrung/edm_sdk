@@ -119,4 +119,3 @@ same key-remapping and irreversible partition-count rules apply.
 - [`consumerClientOpts`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/drivers/kafka/consumer.go) - group options, callbacks, and the one-delivery admission path.
 - [`resolveRebalanceTimeout`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/drivers/kafka/consumer.go) - the timeout refusal that protects the revoke wait.
 - [`assignmentWarningsLocked`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/drivers/kafka/consumer.go) - the assigned partition and budget warning.
-- [Driver options](/user-guide/driver-options) - Kafka configuration values and operator limits.

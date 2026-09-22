@@ -14,8 +14,8 @@ surface is split into a client, a publisher, a subscription, and a runner:
 
 | Responsibility | F1 entry point | What it owns |
 | --- | --- | --- |
-| Connect to the selected transport | [`f1.New`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/client.go) with [`f1.WithDriver`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/options.go) | Driver connection and client resources |
-| Publish events | [`Client.Publisher`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/client.go) | Encoding, envelope construction, and durable publish acknowledgement |
+| Connect to the selected transport | [`f1.New`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/client.go) with `f1.WithDriver` | Driver connection and client resources |
+| Publish events | `Client.Publisher` | Encoding, envelope construction, and durable publish acknowledgement |
 | Declare consumption | [`Client.Subscribe`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/subscription.go) | Subscription validation, topics, handlers, and delivery policy |
 | Run consumption | [`Runner.Run`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/worker.go) | Fetching, dispatch, retries, settlement, and reconnect behavior |
 | Stop consumption | [`Runner.Drain`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/worker.go) or [`Client.Close`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/client.go) | Stop fetching, settle in-flight work, and release resources |
@@ -52,7 +52,7 @@ removing a trailing version segment such as `.v1`; use `WithTopic` only when an
 explicit topic is part of the application contract. Routing and workflow
 metadata are added with `PublishOption` constructors such as `WithKey`,
 `WithSubject`, `WithIdempotencyKey`, and `WithCorrelationID`. The complete
-option contract lives in [`publisher.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/publisher.go).
+option contract lives in `publisher.go`.
 
 ### Batch publishing
 
@@ -91,10 +91,15 @@ not start fetching messages. The runner starts only when `Run` is called:
 
 ```go
 runner, err := client.Subscribe(ctx, f1.Subscription{
-	Name:   "order-projector",
-	Topics: []string{"orders.placed"},
+	Name:           "order-projector",
+	Topics:         []string{"orders.placed"},
+	Concurrency:    4,
+	Prefetch:       16,
+	Retry:          f1.RetryConfig{MaxAttempts: 3},
+	HandlerTimeout: 10 * time.Second,
 	Handlers: map[string]f1.Handler{
-		"orders.placed.v1": f1.HandlerFunc(handleOrderPlaced),
+		"orders.placed.v1":  f1.HandlerFunc(handleOrderPlaced),
+		"orders.shipped.v1": f1.Typed(handleOrderShipped),
 	},
 })
 if err != nil {
@@ -112,11 +117,38 @@ ownership scope. Topics select the logical destinations to consume. The
 handler map selects a handler by the exact event type emitted by the publisher.
 Retry, concurrency, prefetch, ordering, and unmatched-event behavior are
 subscription policy; their owning fields are documented in
-[`Subscription`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/subscription.go).
+`Subscription`,
+and [Ordering and scheduling](/advanced-topics/ordering-and-scheduling) explains how the
+concurrency, prefetch, and fairness fields interact.
 
-The handler receives an [`f1.Event`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/event.go), not a driver message. It
-can decode the payload and inspect F1 metadata while remaining independent of
-transport-specific delivery references.
+The handler receives an `*f1.Event`, not a driver message. Decode the payload into a service-owned
+type and return an error when the effect was not completed:
+
+```go
+func handleOrderCreated(ctx context.Context, event *f1.Event) error {
+	var payload OrderCreated
+	if err := event.Decode(&payload); err != nil {
+		return f1.Terminal(fmt.Errorf("decode order event: %w", err))
+	}
+	if err := processOrder(ctx, payload); err != nil {
+		return err
+	}
+	return nil
+}
+```
+
+For a known payload type, `f1.Typed` performs the decode and makes a decode failure terminal on the
+first attempt:
+
+```go
+func handleOrderShipped(ctx context.Context, event *f1.Event, payload OrderShipped) error {
+	return processOrder(ctx, payload)
+}
+```
+
+A handler can read the event ID, type, subject, attempt number, priority, headers, correlation and
+causation identifiers, the raw payload, and the stable idempotency key. Use the idempotency key when
+applying an effect that must be safe across redelivery.
 
 ## Handler results settle deliveries
 
@@ -137,8 +169,8 @@ Transient downstream failures should return their ordinary error so the retry
 policy can decide when to try again. Return `nil` only after the application
 effect has completed.
 
-The classification helpers are defined in [`errors.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/errors.go), and
-the dispatch path that applies them is owned by [`worker.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/worker.go).
+The classification helpers are defined in `errors.go`, and
+the dispatch path that applies them is owned by `worker.go`.
 
 ## At-least-once delivery
 
@@ -177,13 +209,13 @@ if err := client.Close(shutdownCtx); err != nil {
 ```
 
 For a complete signal-driven shutdown sequence, see [Getting started](/learn/getting-started)
-and the [graceful shutdown guide](/user-guide/graceful-shutdown). The
-client lifecycle contract is implemented in [`client.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/client.go) and
-the runner drain contract in [`worker.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/worker.go).
+and [Lifecycle and shutdown](/advanced-topics/lifecycle-and-shutdown). The
+client lifecycle contract is implemented in `client.go` and
+the runner drain contract in `worker.go`.
 
 ## Driver portability
 
-The [`driver.Driver`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/driver/driver.go) interface is the transport
+The `driver.Driver` interface is the transport
 boundary. F1 opens the selected driver, creates producer and consumer resources,
 and keeps envelope, routing, retry, and handler semantics in the core.
 
@@ -194,13 +226,13 @@ capabilities, not assumptions. The [driver and capabilities guide](/drivers-and-
 explains that boundary and its portability rules.
 
 When implementing a new driver, use the public driver interfaces and the
-[conformance package](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/tree/main/driver/conformance) as the executable contract.
+conformance package as the executable contract.
 Do not make application handlers depend on driver transport types merely to
 access broker-specific behavior.
 
 ## Testing the pub/sub boundary
 
-Use [`f1test`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/f1test/f1test.go) for deterministic handler tests. It
+Use `f1test` for deterministic handler tests. It
 provides the normal client and runner APIs backed by an in-memory driver, plus
 helpers for delivering events, observing accepted messages, advancing deferred
 delivery time, and inspecting dead-letter output.
@@ -211,12 +243,10 @@ idempotency, and shutdown rather than on broker-specific delivery references.
 
 ## Continue from here
 
-- [Message](/basics/message) - event payloads, envelopes, headers, metadata, and
-  delivery identity;
-- [Publishing events](/user-guide/publishing-events) - publish options,
-  routing metadata, and batches;
-- [Consuming events](/user-guide/consuming-events) - handler registration,
-  event decoding, ordering, and capabilities;
+- [Message](/basics/message) - publish options, routing metadata, and batches;
+- [Failure handling](/advanced-topics/failure-handling) - retry, terminal, drop, and dead-letter;
+- [Ordering and scheduling](/advanced-topics/ordering-and-scheduling) - ordered mode and the
+  concurrency and prefetch knobs;
 - [Publish flow](/development/publish-flow) - publisher internals and acknowledgement
   timing; and
 - [Consume flow](/development/consume-flow) - runner startup, dispatch, settlement,

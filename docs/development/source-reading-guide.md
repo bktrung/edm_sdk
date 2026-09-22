@@ -44,6 +44,7 @@ Read the public nouns and guarantees before reading orchestration:
    classification.
 5. [`priority.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/priority.go) - priority values and their public
    ordering meaning.
+6. [`observer.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/observer.go) - observer lifecycle events, pairing, ordering, and trace injection.
 
 Then read the public package comments and the nearest focused tests. The goal
 is to understand what a service author can observe: event identity, headers,
@@ -127,6 +128,8 @@ Only after the contracts and primitives are clear, read the orchestration:
    handler invocation, retry/dead-letter routing, settlement, and drain.
 3. [`reconnect.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/reconnect.go) - connection replacement and runner
    re-entry after transient driver failure.
+4. [`observer_call.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/observer_call.go) - synchronous observer calls, panic containment, finish guards, and trace injection.
+5. [`backlog_poll.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/backlog_poll.go) - backlog sampling and observer backlog point events.
 
 Use the function map in [Consume flow](/development/consume-flow) while reading
 `worker.go`. Start at `Runner.Run`, then jump to the fetch, dispatch,

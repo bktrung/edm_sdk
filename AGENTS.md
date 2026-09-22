@@ -1,4 +1,4 @@
-# CLAUDE.md
+# AGENTS.md
 
 Guidance for anyone changing this repository, human or agent.
 
@@ -123,11 +123,17 @@ Run all of these before proposing a change:
 make build
 go vet ./...
 gofmt -l .
+make format-check
 make lint
+make vulncheck
 make verify-agnostic
 make verify-self-contained
+make check-doc-source-links
+make check-observer-events
 make check-api-surface
+make check-api-surface-f1otel
 make check-api-diff
+make otlp-boundary
 make test-fast
 ```
 
@@ -175,4 +181,8 @@ Say what you did not do. A gap you name is cheap. The same gap found in review i
 | `driver/conformance/` | the suite every adapter must pass |
 | `drivers/inmem/` | the reference adapter. Read it before writing a new one |
 | `f1test/` | test helpers for users of the SDK |
+| `observer.go` | public observer event types, lifecycle contract, and trace injection |
+| `backlog_poll.go` | backlog polling and observer backlog samples |
+| `deadline_promotion.go` | deadline promotion observer events and per-lane suppression |
+| `f1otel/` | OpenTelemetry observer adapter for metrics, spans, and propagation |
 | `internal/` | clock, retry, sched, dispatch, lifecycle |

@@ -27,7 +27,7 @@ stateDiagram-v2
 ```
 
 The public runner lifecycle is implemented by [`Runner.Run`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/worker.go)
-and [`Runner.Drain`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/worker.go). The state machine and phase transitions
+and `Runner.Drain`. The state machine and phase transitions
 are owned by [`internal/lifecycle`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/tree/main/internal/lifecycle). A runner that
 has not started is already drained; `Drain` returns without starting it.
 
@@ -72,6 +72,16 @@ ends intake and lets accepted work finish within the lifecycle budgets. Use a
 separate shutdown context for cleanup so an already-canceled run context does
 not immediately cancel the cleanup operation.
 
+The runnable consumer uses application-owned deployment budgets of 5 seconds for
+readiness-server shutdown, 15 seconds for `Runner.Drain`, 5 seconds for
+`Client.Close`, and 2 seconds for telemetry-provider shutdown. Close is short
+there because drain already ran on its own budget; a `Close` that has to drain
+for itself needs the drain budget too. See
+`examples/consumer/main.go`
+for that composition. These values are deployment choices, not SDK defaults:
+[`LifecycleConfig`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/config.go)
+owns SDK default resolution and validation.
+
 When a signal should stop the subscription without abandoning in-flight work,
 drain first and cancel the run context afterwards:
 
@@ -88,7 +98,7 @@ defer stop()
 
 <-signalCtx.Done()
 
-drainCtx, cancelDrain := context.WithTimeout(context.Background(), 20*time.Second)
+drainCtx, cancelDrain := context.WithTimeout(context.Background(), 15*time.Second)
 defer cancelDrain()
 if err := runner.Drain(drainCtx); err != nil {
 	return fmt.Errorf("drain orders worker: %w", err)
@@ -105,7 +115,7 @@ Use `Runner.Drain` when the client or its publisher must stay available for
 other subscriptions:
 
 ```go
-drainCtx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+drainCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 defer cancel()
 
 if err := runner.Drain(drainCtx); err != nil {
@@ -276,7 +286,7 @@ remain usable between those operations.
 
 ## Configure shutdown budgets
 
-Lifecycle budgets live in [`LifecycleConfig`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/config.go). Configure them
+Lifecycle budgets live in `LifecycleConfig`. Configure them
 from the service's work and dependency behavior rather than selecting values
 only to make a shutdown test pass:
 
@@ -294,7 +304,7 @@ the collection of runner drains. The caller's `Close` context can end the
 current wait earlier; a producer or connection phase that was started for
 rejoining may continue in the background.
 
-The config defaults and validation are executable in [`config.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/config.go).
+The config defaults and validation are executable in `config.go`.
 Do not duplicate the numeric defaults in service documentation; link to the
 config owner and set explicit values when the deployment needs a documented
 policy.
@@ -350,7 +360,7 @@ skip the close path. The reconnect ownership lives in
 
 ## Test lifecycle behavior
 
-Use [`f1test`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/f1test/f1test.go) for handler and settlement tests, then
+Use `f1test` for handler and settlement tests, then
 use driver conformance tests for driver-specific lifecycle behavior. Cover the
 decisions that matter to the service:
 
@@ -367,13 +377,13 @@ decisions that matter to the service:
   caller deadline.
 
 The lifecycle state machine is tested in
-[`internal/lifecycle/state_test.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/internal/lifecycle/state_test.go).
+`internal/lifecycle/state_test.go`.
 Client-level timeout and retry behavior is covered by
-[`client_drain_budget_test.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/client_drain_budget_test.go) and
-[`client_close_sequencing_test.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/client_close_sequencing_test.go).
+`client_drain_budget_test.go` and
+`client_close_sequencing_test.go`.
 The runnable consumer example demonstrates signal handling, but the service
 code should still keep the driver selection outside its business handlers; see
-[`examples/consumer/main.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/examples/consumer/main.go) for the complete
+`examples/consumer/main.go` for the complete
 composition pattern.
 
 ## Common mistakes
@@ -402,5 +412,5 @@ composition pattern.
 - [Message](/basics/message) - context, identity, and idempotent effects;
 - [Consume flow](/development/consume-flow) - settle-last
   ordering and in-flight accounting; and
-- [Runtime overview](/runtime-overview) - client, runner, and driver
+- [Architecture](/development/architecture) - client, runner, and driver
   boundaries.

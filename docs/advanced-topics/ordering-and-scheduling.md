@@ -54,7 +54,7 @@ rejects an ordered subscription when that capability is unavailable. Check
 `client.Limits()` during startup when deployment portability matters; the
 capability report is the authority for the connected driver. The capability
 contract is defined by [`driver.Capabilities`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/driver/capability.go) and
-the subscription check is in [`Subscribe`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/subscription.go).
+the subscription check is in `Subscribe`.
 
 ### Make the key stable
 
@@ -90,6 +90,11 @@ all messages use one key, increasing `Concurrency` cannot make that key run in
 parallel. If the service needs more throughput, use a key that matches the
 business serialization boundary rather than enabling global ordering.
 
+An ordered subscription's dispatch queue is bounded: it holds at most 2,097,152
+queued entries, which is 64 MiB of work items on a 64-bit platform, and F1
+checks the bound as `Concurrency` times `Prefetch`. Reduce either value when
+their product exceeds it.
+
 An ordered subscription also needs enough distinct keys to use its workers.
 Measure the active key distribution before increasing concurrency; more worker
 slots do not help when most work hashes to one key.
@@ -101,7 +106,7 @@ slots do not help when most work hashes to one key.
 | Setting | Controls | Main trade-off |
 | --- | --- | --- |
 | `Concurrency` | Number of handler workers available to a subscription | More parallelism requires thread-safe, idempotent handler effects and more downstream capacity. |
-| `Prefetch` | How many deliveries the consumer may hold ahead of settlement; in ordered mode it is also the dispatch queue budget. A partition-bound driver admits one delivery per partition whatever this is set to, so there the ceiling is the number of partitions assigned to the consumer | More buffering can improve utilization but increases in-flight work, memory, and shutdown backlog. Raising it above the partitions assigned to the consumer does not raise the ceiling, because each of those partitions is already carrying one delivery. |
+| `Prefetch` | How many deliveries the consumer may hold ahead of settlement; in ordered mode the effective prefetch is also the dispatch queue budget. A partition-bound driver admits one delivery per partition whatever this is set to, so there the ceiling is the number of partitions assigned to the consumer | More buffering can improve utilization but increases in-flight work, memory, and shutdown backlog. Raising it above the partitions assigned to the consumer does not raise the ceiling, because each of those partitions is already carrying one delivery. |
 
 F1 keeps admission and scheduling bounded. A delivery passes through the
 driver's prefetch budget, the fetch-to-dispatch boundary, bounded scheduler
@@ -123,13 +128,44 @@ smaller of `Concurrency` and that member's assigned partition count. Priority
 weights above the assigned partition count do nothing, and `Prefetch` cannot
 raise the ceiling.
 
-When the assigned count is below the destination's resolved slot budget, Kafka
-logs one warning with `assigned_partitions`, `budget`, and `lever`. Increase
-the destination's partition count, or set `broker.kafka.maxExpectedInstances`
-to require a floor during topology setup. Raising the partition count re-maps
-keys already published to the destination, and Kafka cannot lower the count, so
-the change is a one-way capacity decision. See [Consuming events](/user-guide/consuming-events)
-for the operator-facing sizing rule.
+When the assigned count is below the destination's resolved slot budget, Kafka logs one warning
+naming the gap and the lever. [Drivers and
+capabilities](/drivers-and-capabilities#kafka-parallelism-and-partitions) owns that warning and the
+`broker.kafka.maxExpectedInstances` floor.
+
+`Prefetch` is not the amount the broker is asked to hand over at a time. It is
+the ceiling on the subscription's in-flight budget, and each destination gets a
+window derived from the handler concurrency and the fairness weights. That
+window, not the configured value, is what lets a handler that takes time find
+the next delivery already waiting instead of waiting on the broker round trip
+that follows its own acknowledgement.
+
+A configured `Prefetch` larger than those windows add up to does not raise that
+budget: the consumer is capped at the lower total, and F1 logs a warning naming
+the configured value and the effective one. The warning is about a budget the
+caller named, so a subscription that names no `Prefetch` takes the default
+silently. The default is the broker's `DefaultPrefetch` (64) or the
+subscription's lane count, whichever is larger, where the lane count is topics
+times priorities times one plus the retry tiers. A named `Prefetch` below the
+lane count is refused, and a `Prefetch` below the windows' total does not shrink
+them: each destination keeps the window its lanes need, because the lanes, not
+the total, are what stop the driver fetching ahead of the work the subscription
+can run.
+
+Naming the budget explicitly makes the relationship visible. With one topic,
+three priority lanes, and the default retry ladder, the lane count is 12, so a
+named `Prefetch` below that is refused:
+
+```go
+runner, err := client.Subscribe(ctx, f1.Subscription{
+	Name:        "order-projector",
+	Topics:      []string{"orders.placed"},
+	Priorities:  []f1.Priority{f1.PriorityHigh, f1.PriorityMedium, f1.PriorityLow},
+	Concurrency: 4,
+	Prefetch:    32,
+	Handlers:    orderHandlers,
+})
+```
 
 `Prefetch` is not a substitute for capacity planning. A larger value cannot
 make a hot ordered key concurrent, and it cannot make a handler that is
@@ -137,6 +173,12 @@ blocked on a dependency complete faster. It also cannot raise a
 partition-bound driver's ceiling: that driver admits one delivery per
 partition, so on Kafka the effective ceiling is the number of partitions
 assigned to the consumer, and raising `Prefetch` past that does nothing.
+
+Raising the broker's own credit on top of the core budget, through
+`broker.rabbitmq.brokerPrefetch`, has costs: memory grows with message size
+times the broker window per destination; a close or revoke can return a
+redelivery burst; held deliveries age toward `consumer_timeout`; and priorities
+weaken because more messages are already held.
 
 ## Priorities are fair scheduling lanes
 
@@ -162,7 +204,7 @@ This is intentional: strict priority could starve medium work during a
 sustained high-priority load.
 
 The default fairness policy is defined by `defaultSubscription` in
-[`config.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/config.go). Override it when the service has a measured
+`config.go`. Override it when the service has a measured
 capacity policy rather than copying defaults into application code:
 
 ```go
@@ -195,7 +237,7 @@ The scheduler uses weighted round-robin when no lane has exceeded its
 budget. When deadline promotion is enabled, the lane with the greatest budget overrun may
 be selected first. This gives latency-sensitive work a way to recover from
 temporary contention without turning the whole policy into strict priority.
-The implementation is [`internal/sched`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/tree/main/internal/sched), and its lane
+The implementation is `internal/sched`, and its lane
 construction is [`newRunnerScheduler`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/worker.go).
 
 ## Keep retry work from taking all capacity
@@ -250,20 +292,19 @@ Use [`f1test`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-
 
 - configure `Mode: f1.OrderedByKey` and verify equal keys never overlap;
 - publish different keys and verify the subscription can use its configured
-  concurrency;
+  concurrency within the lane buffer;
 - publish explicit priorities and verify the selected lanes receive service;
 - fill fresh and retry lanes and verify retry pressure does not starve fresh
   work; and
 - advance the fake clock when testing retry eligibility or deadline promotion instead of
   sleeping in the test.
 
-The repository's [`ordered_test.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/f1test/ordered_test.go) covers equal
-key serialization and different-key concurrency. The scheduler unit tests in
-[`internal/sched/scheduler_test.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/internal/sched/scheduler_test.go)
+The repository's `ordered_test.go` covers equal-key serialization and different-key concurrency: one test names `PrefetchFactor: 3` to extend the lane buffer, and a second runs different keys within the default buffer.
+The scheduler unit tests in `internal/sched/scheduler_test.go`
 cover weighted selection, bounded lanes, and deadline promotion; the retry-storm test in
-[`retry_storm_test.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/retry_storm_test.go) guards fresh-work share under
+`retry_storm_test.go` guards fresh-work share under
 retry pressure. A driver implementation must also preserve the capability
-contract validated by the [driver conformance package](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/tree/main/driver/conformance).
+contract validated by the driver conformance package.
 
 ## Common mistakes
 

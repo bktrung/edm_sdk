@@ -292,7 +292,7 @@ When a new adapter is ready to implement the port, use this sequence:
    and uses `driver.Maintenance` when available, but the adapter must still
    release consumers, close producers, and tolerate the cleanup context rules.
 6. Run both profiles. If a behavior is truly not available, make the
-   capability declaration or explicit fixture skip explain that fact; do not
+   capability declaration, deferral model, or explicit fixture skip explain that fact; do not
    hide a failed contract behind a provider-only test.
 7. Add provider-specific tests for behavior not represented by the port, then
    run the shared package's own harness tests and the adapter suite.
@@ -339,9 +339,9 @@ make test-kafka-conformance
 
 The target and its environment contract are defined in
 [`Makefile`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/Makefile). Running `make test-kafka` exercises the regular
-Kafka driver suite, but does not opt into the gated conformance run. The
-Kafka test itself also documents why the gate exists in
-[`drivers/kafka/conformance_integration_test.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/drivers/kafka/conformance_integration_test.go).
+Kafka driver suite, including its integration-tagged conformance test. The
+dedicated `make test-kafka-conformance` target reruns only `TestConformance`
+with verbose output.
 
 When changing a port contract or adapter lifecycle, run the shared harness,
 the in-memory conformance, and the affected broker-backed suite. The repository

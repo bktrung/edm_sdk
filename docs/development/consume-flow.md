@@ -133,8 +133,8 @@ The runner then creates one `driver.Consumer` with:
 
 - the subscription name as the consumer group or queue-set identity;
 - all main and retry destinations owned by the subscription;
-- the total prefetch budget;
-- a calculated per-destination prefetch allocation;
+- the effective total prefetch budget, capped by the sum of lane capacities;
+- the per-destination lane capacities;
 - exclusive/ordered mode when ordered-by-key is requested;
 - the effective capability profile; and
 - the current core-selected starting position for a new group (`StartEarliest`).
@@ -180,6 +180,30 @@ transient failures are reported through `Errors`. The core therefore treats a
 closed message channel, a transient error, and a fatal error as different
 generation outcomes.
 
+## Observer call sites
+
+When a client has an observer, the consume path emits events at these
+boundaries:
+
+- `Client.New` records `ObserverDriverSelected` after the driver opens.
+- `fetchRunner` records `ObserverDeliveryReceived` when a delivery is admitted
+  to dispatch.
+- `processDelivery` pairs `ObserverProcess` around the handler invocation and
+  carries the returned context to the handler.
+- Settlement pairs `ObserverSettle` around acknowledgement or negative
+  acknowledgement.
+- Retry and dead-letter decisions record their point events. A retry point is
+  emitted after the successor is confirmed; a dead-letter publication point is
+  emitted after its successor is confirmed.
+- The backlog poll loop records `ObserverBacklogSampled` per sampled
+  destination, and deadline promotion records `ObserverDeadlinePromoted`.
+- Drain and reconnect paths emit their paired or point lifecycle events.
+
+Observer methods run synchronously on these paths, without a client or runner
+lock held. The adapter must therefore be concurrent-safe and non-blocking.
+
+`worker.go:invokeHandlerMessage` calls `observer_call.go:Client.observeStart` for `process`, passes its returned context to the handler, and finishes through `worker.go:finishProcessResult` or guard abandonment. `worker.go:startSettleObservation` and `worker.go:finishSettleObservation` bracket Ack or Nack. `worker.go:startSuccessorPublish` starts retry and DLQ sends; `worker.go:retryAndSettle` and `worker.go:deadLetter` call `observer_call.go:Client.injectTrace`, then `worker.go:finishSuccessorPublish` finishes the send.
+
 ## Dispatch lanes and scheduler
 
 The runtime separates transport admission, lane selection, and handler
@@ -191,16 +215,18 @@ below fresh traffic without losing per-tier visibility.
   and the prefetch factor: each lane holds at least its weighted share of the
   concurrency, and the total prefetch the driver may hold is capped by the sum
   of those capacities;
-- deficit weighted round-robin selection across groups; and
+- smooth weighted round-robin selection across groups; every weighted pick scans all slots to accrue weights and choose the highest deficit; and
 - optional deadline promotion when a lane exceeds its configured budget.
 
 The scheduler applies earliest-deadline-first over overdue lanes. A budget
-starts when a delivery enters its lane (`worker.go:878`), so it measures wait
-inside the SDK; backlog still in the broker is invisible.
+starts when `enqueuePendingDelivery` constructs the `sched.Item` with
+`EnqueuedAt: r.client.options.clock.Now()`, so it measures wait inside the SDK;
+backlog still in the broker is invisible.
 
 Retry lanes normally receive a reduced weight and a larger budget. Weights, not
-deadline promotion, ensure the lowest-weight group still receives at least one
-pick per round, while the larger budget keeps retry pressure below fresh traffic.
+deadline promotion, ensure the lowest-weight group continues to receive its
+configured share, while the larger budget keeps retry pressure below fresh
+traffic.
 
 The scheduler implementation is in
 [`internal/sched/scheduler.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/internal/sched/scheduler.go) and the

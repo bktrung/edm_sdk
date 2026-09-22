@@ -17,3 +17,8 @@ boundaries, runtime responsibilities, and invariants:
 The source and tests remain authoritative for implementation behavior. Start at
 the architecture map, then follow the source links for the boundary you are
 changing.
+
+Observability crosses the core at `f1.Observer`: the core emits typed lifecycle
+events and optional `TraceInjector` values, but imports no OpenTelemetry package.
+The built-in `f1otel` adapter translates those events in its own package for
+application-owned OpenTelemetry providers.

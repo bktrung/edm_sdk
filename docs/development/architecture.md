@@ -33,6 +33,69 @@ flowchart TB
     KAFKA --> BROKER
 ```
 
+## Runtime paths at a glance
+
+The public path is the same regardless of the connected driver: the root
+package builds the message or handler-facing event, and the driver translates
+the port operation into broker work.
+
+### Publish path
+
+```mermaid
+sequenceDiagram
+    participant App
+    participant P as f1.Publisher
+    participant C as codec.Codec
+    participant E as Envelope
+    participant D as driver.Producer
+    participant B as Broker
+
+    App->>P: Publish(eventType, payload, options)
+    P->>C: Encode(payload)
+    P->>E: Build ID, routing, metadata
+    E-->>P: Canonical headers
+    P->>D: Publish(OutboundMessage)
+    D->>B: Broker write + durable confirmation
+    B-->>D: Confirm or failure
+    D-->>P: Result
+    P-->>App: Event ID or error
+```
+
+See [Publish flow](/development/publish-flow) for the complete path,
+including topology, producer admission, and close interaction.
+
+### Consume path
+
+```mermaid
+sequenceDiagram
+    participant B as Broker
+    participant D as driver.Consumer
+    participant R as Runner
+    participant S as Scheduler
+    participant W as Dispatch pool
+    participant H as Handler
+    participant P as Shared producer
+
+    B->>D: Delivery
+    D->>R: InboundMessage + Settler
+    R->>S: Enqueue bounded lane
+    S->>W: Select next delivery
+    W->>H: Decode Event and invoke handler
+    alt success or Drop
+        W->>D: Ack original
+    else retryable failure
+        W->>P: Publish retry successor durably
+        W->>D: Ack original
+    else terminal failure, panic, decode, expiry, or unmatched DLQ policy
+        W->>P: Publish DLQ successor durably
+        W->>D: Ack original
+    end
+```
+
+See [Consume flow](/development/consume-flow) and
+[Lifecycle and shutdown](/advanced-topics/lifecycle-and-shutdown) for
+dispatch, settlement, reconnect, and drain behavior.
+
 The verification packages sit beside the runtime and point at what they exercise:
 
 ```mermaid
@@ -60,6 +123,10 @@ The in-memory driver is both a deterministic reference implementation and the
 foundation of `f1test`. RabbitMQ and Kafka provide connected broker adapters;
 their broker clients stay inside their respective packages.
 
+Observability follows the same boundary. The core emits lifecycle events through
+`f1.Observer` and the optional `TraceInjector`, but never imports OpenTelemetry.
+`f1otel` is the built-in adapter in its own package, outside the core.
+
 ## Package ownership
 
 The following map records the real responsibility boundaries. It is intentionally
@@ -84,6 +151,19 @@ own the details.
 | `tools/` | API-surface and API-diff checks for public packages | [`tools/apisurface/main.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/tools/apisurface/main.go), [`tools/apidiff/normalize.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/tools/apidiff/normalize.go) |
 
 ## Ownership of the runtime
+
+The runtime objects have distinct owners:
+
+| Object | Owns |
+| --- | --- |
+| `Client` | one live connection, shared producer, runners, lifecycle admission |
+| `Publisher` | application publish calls; delegates state to `Client` |
+| `Subscription` | handler-facing policy and callbacks |
+| `Runner` | one subscription's consumer, fetcher, scheduler, workers, and drain |
+| `driver.Conn` | live broker resources |
+| `driver.Producer` | durable publish acknowledgement |
+| `driver.Consumer` | broker delivery and transport lifecycle |
+| `driver.Settler` | broker-specific ack/nack operation for one delivery |
 
 The public root package coordinates the runtime, but each concern has one
 primary owner:
@@ -116,10 +196,9 @@ primary owner:
   translates that specification into broker objects through `driver.Admin`.
   See [Topology and capabilities](/advanced-topics/topology-and-capabilities).
 
-The canonical implementation walkthroughs are [publish flow](/development/publish-flow)
-and [consume flow](/development/consume-flow). The [runtime overview](/runtime-overview)
-and provider guide remain useful companion pages: the runtime overview explains
-the system at a glance, while the provider guide retains adapter-specific notes.
+The canonical implementation walkthroughs are [Publish flow](/development/publish-flow)
+and [Consume flow](/development/consume-flow). The provider guide remains a
+useful companion page for adapter-specific notes and broker operations.
 
 ## Dependency and import boundaries
 
@@ -227,7 +306,7 @@ behavioral tests before modifying a boundary.
 
 The maintainer route is:
 
-1. [Runtime overview](/runtime-overview) for object ownership and flow.
+1. [Architecture](/development/architecture) for object ownership and flow.
 2. [Publish flow](/development/publish-flow) or [Consume flow](/development/consume-flow)
    for the message path.
 3. [Driver contract](/development/driver-contract) for port behavior and extension rules.
