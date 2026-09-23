@@ -866,3 +866,42 @@ func waitConsumerWaitGroupDone(t *testing.T, group *sync.WaitGroup, what string)
 		t.Fatalf("%s did not finish", what)
 	}
 }
+
+// TestReleaseRacingDrainCancellationAlwaysReturns proves that a Release whose
+// channel close overlaps a Drain's basic.cancel on the same channel returns.
+// AMQP does not correlate replies, so an unserialized Close could have its
+// close-ok taken by the Cancel and then wait forever.
+func TestReleaseRacingDrainCancellationAlwaysReturns(t *testing.T) {
+	queue := consumerAdmissionQueue(t)
+	connection := openConsumerAdmissionConn(t, queue)
+	const rounds = 100
+	for round := range rounds {
+		sdkConsumer, err := connection.Consumer(context.Background(), driver.ConsumerConfig{
+			Destinations: []string{queue},
+			Prefetch:     1,
+		})
+		if err != nil {
+			t.Fatalf("round %d: Consumer: %v", round, err)
+		}
+		drainDone := make(chan struct{})
+		go func() {
+			defer close(drainDone)
+			_ = sdkConsumer.Drain(context.Background())
+		}()
+		releaseDone := make(chan error, 1)
+		go func() { releaseDone <- sdkConsumer.Release(context.Background()) }()
+		select {
+		case err := <-releaseDone:
+			if err != nil {
+				t.Fatalf("round %d: Release: %v", round, err)
+			}
+		case <-time.After(5 * time.Second): //nolint:forbidigo // bound Release racing a drain cancellation
+			t.Fatalf("round %d: Release did not return while a drain cancellation raced its channel close", round)
+		}
+		select {
+		case <-drainDone:
+		case <-time.After(5 * time.Second): //nolint:forbidigo // bound Drain after Release
+			t.Fatalf("round %d: Drain did not return after Release", round)
+		}
+	}
+}

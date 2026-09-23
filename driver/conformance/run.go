@@ -67,7 +67,10 @@ func deliveryCeiling(capabilities driver.Capabilities, partitions, want int) int
 	return want
 }
 
-// Run opens one connection, executes both profiles, and compares their vectors.
+// Run opens one connection and runs the registered checks under the full and
+// strict profiles described by suite. Suite.Driver and Suite.NewInspector are
+// required. It returns the collected report, compares behavior vectors when
+// both profiles complete, and reports check failures through t.
 func Run(t *testing.T, suite Suite) Report {
 	t.Helper()
 	if suite.Driver == nil {
@@ -202,8 +205,7 @@ func runProfile(
 		t.Fatalf("ensure topology: %v", err)
 	}
 	producer, err = conn.Producer(ctx, driver.ProducerConfig{
-		RequireDurableAck: true,
-		Effective:         effective,
+		Effective: effective,
 	})
 	if err != nil {
 		t.Fatalf("create producer: %v", err)
@@ -1018,8 +1020,7 @@ func validateDeadlineFixture(t *testing.T, ctx context.Context, conn driver.Conn
 		t.Fatalf("conformance: deadline fixture topology: %v", err)
 	}
 	producer, err := conn.Producer(ctx, driver.ProducerConfig{
-		RequireDurableAck: true,
-		Effective:         conn.Capabilities(),
+		Effective: conn.Capabilities(),
 	})
 	if err != nil {
 		_ = purgeAndPruneIfSupported(ctx, conn, destination)
@@ -1234,14 +1235,16 @@ func transientPruneReason(reason string) bool {
 		strings.Contains(reason, "no longer prunable")
 }
 
-// WriteJSON writes an indented JSON report.
+// WriteJSON writes the report as indented JSON followed by a newline and
+// returns any encoding or writer error.
 func (r Report) WriteJSON(w io.Writer) error {
 	encoder := json.NewEncoder(w)
 	encoder.SetIndent("", "  ")
 	return encoder.Encode(r)
 }
 
-// WriteMarkdown writes a Markdown report.
+// WriteMarkdown writes the driver name, capability results, and pending groups
+// as Markdown, and returns any writer error.
 func (r Report) WriteMarkdown(w io.Writer) error {
 	if _, err := fmt.Fprintf(w, "# Conformance report: %s\n\n", r.Driver); err != nil {
 		return err

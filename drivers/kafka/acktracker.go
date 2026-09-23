@@ -26,10 +26,29 @@ func newAckTracker(base int64) *ackTracker {
 	return &ackTracker{base: base}
 }
 
-// Ack advances the cursor through offset and commits the next offset. A failed
-// commit restores the old cursor unless Drop won the race while the broker call
-// was in flight.
+// Ack commits offset+1 only when offset is the next unsettled cursor.
+// A failed commit restores the old cursor unless Drop won the race while the
+// broker call was in flight.
 func (t *ackTracker) Ack(offset int64, commit func(int64) error) error {
+	return t.ack(offset, ackModeContiguous, commit)
+}
+
+// AckOwn lets the admitted delivery skip offsets franz-go did not deliver.
+// It rejects offsets below the cursor and commits offset+1, restoring the old
+// cursor after failure unless Drop revoked it. Callers must use it only on the
+// tracker that admitted the delivery.
+func (t *ackTracker) AckOwn(offset int64, commit func(int64) error) error {
+	return t.ack(offset, ackModeOwn, commit)
+}
+
+type ackMode uint8
+
+const (
+	ackModeContiguous ackMode = iota
+	ackModeOwn
+)
+
+func (t *ackTracker) ack(offset int64, mode ackMode, commit func(int64) error) error {
 	t.commitMu.Lock()
 	defer t.commitMu.Unlock()
 
@@ -38,7 +57,7 @@ func (t *ackTracker) Ack(offset int64, commit func(int64) error) error {
 		t.mu.Unlock()
 		return ErrRevoked
 	}
-	if offset != t.base {
+	if offset < t.base || (mode == ackModeContiguous && offset != t.base) {
 		t.mu.Unlock()
 		return errAckTrackerAlreadySettled
 	}

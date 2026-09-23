@@ -2,53 +2,38 @@ package driver
 
 import "time"
 
-// DelayAccuracy bounds how late a deferred delivery can be.
+// DelayAccuracy describes how late a driver's deferred-message release may be.
 //
-// Lateness is at most max(Floor, Relative * requested delay), for a requested
-// delay of at most MaxDelay. Above MaxDelay the driver declares no bound.
-//
-// The bound is relative because a driver that bucketed delays into fixed steps
-// cannot state one worst case that is both true and useful: a bound wide enough
-// for the longest delay the driver accepts would tell an application deferring
-// one second that the delay path is unusable for that case, which is not what
-// it is.
-//
-// The bound covers the driver's own release of a deferred message. Time a
-// consumer spends not reading is backpressure, and no driver declares a bound
-// on it.
-//
-// The zero value declares no accuracy, and is rendered as undeclared rather
-// than as a zero duration, because zero reads as a promise to deliver at the
-// due time exactly. A driver declaring a bound must set MaxDelay: it is the
-// largest requested delay the bound holds for, and the largest duration the
-// port can carry when no delay a caller can request is above the bound.
-//
-// DelayAccuracy is a comparable value type, so Capabilities stays comparable
-// with ==.
+// For a requested delay no greater than [MaxDelay], lateness is bounded by
+// max([Floor], [Relative] times the requested delay). A driver declaring a
+// bound must set MaxDelay; requests above it have no declared bound. The zero
+// value declares no accuracy bound. This bound covers the driver's release of
+// a message, not time spent waiting for a consumer to read. DelayAccuracy is
+// comparable, so [Capabilities] remains comparable with ==.
 type DelayAccuracy struct {
-	Floor    time.Duration
-	Relative float64
-	MaxDelay time.Duration
+	Floor    time.Duration // Floor is the minimum value used for the lateness upper bound.
+	Relative float64       // Relative is the lateness bound as a fraction of the requested delay.
+	MaxDelay time.Duration // MaxDelay is the largest requested delay covered by the bound.
 }
 
-// Capabilities describes what a driver can do natively.
+// Capabilities describes a driver's native features and physical limits.
 //
-// Capabilities describe optimisations, never semantics. The core must produce
-// identical observable results when each capability is forced false.
+// Capabilities describe optimizations, not semantics. The core must produce
+// identical observable results when any capability is disabled.
 type Capabilities struct {
-	PerMessageAck        bool          // native per-message settlement
-	OrderedByKey         bool          // ordering guaranteed for equal keys
-	Fanout               FanoutMode    // when one message becomes one copy per subscription
-	NativePriority       PriorityMode  // None | Relative | Strict
-	NativePriorityLevels int           // native priority depth
-	NativeDelay          bool          // broker-level delayed delivery support
-	DelayAccuracy        DelayAccuracy // zero value declares no bound on lateness
-	NativeDeliveryCount  bool          // broker reports redelivery count
-	NativeDLQ            bool          // broker routes to a DLQ on limit
-	ConsumerScaling      Scaling       // PartitionBound | Free
-	MaxMessageBytes      int           // physical broker limit
-	MaxHeaderBytes       int           // physical broker limit
-	LagQueryable         bool          // broker exposes backlog
+	PerMessageAck        bool          // PerMessageAck reports whether individual deliveries can be settled.
+	OrderedByKey         bool          // OrderedByKey reports whether messages with the same key retain publish order.
+	Fanout               FanoutMode    // Fanout describes when a published message is copied for each subscription.
+	NativePriority       PriorityMode  // NativePriority describes broker-side message priority support.
+	NativePriorityLevels int           // NativePriorityLevels is the number of broker-side priority levels.
+	NativeDelay          bool          // NativeDelay reports whether the broker supports delayed delivery.
+	DelayAccuracy        DelayAccuracy // DelayAccuracy bounds lateness of native deferred-message release; zero means no declared bound.
+	NativeDeliveryCount  bool          // NativeDeliveryCount reports whether the broker supplies redelivery counts.
+	NativeDLQ            bool          // NativeDLQ reports whether the broker routes messages to a dead-letter destination at its delivery limit.
+	ConsumerScaling      Scaling       // ConsumerScaling describes how consumer count relates to broker parallelism.
+	MaxMessageBytes      int           // MaxMessageBytes is the physical broker message-size limit.
+	MaxHeaderBytes       int           // MaxHeaderBytes is the physical broker header-size limit.
+	LagQueryable         bool          // LagQueryable reports whether consumers can query broker backlog.
 }
 
 // FanoutMode describes when a published message becomes one copy per subscription.
@@ -73,7 +58,8 @@ const (
 	PriorityStrict
 )
 
-// String returns the wire name of the priority mode.
+// String returns the wire name of the priority mode. Unknown values return
+// "none".
 func (p PriorityMode) String() string {
 	switch p {
 	case PriorityRelative:
@@ -95,7 +81,8 @@ const (
 	ScalingFree
 )
 
-// String returns the wire name of the scaling mode.
+// String returns the wire name of the scaling mode. Unknown values return
+// "partition-bound".
 func (s Scaling) String() string {
 	if s == ScalingFree {
 		return "free"
@@ -103,23 +90,11 @@ func (s Scaling) String() string {
 	return "partition-bound"
 }
 
-// Strict returns c with native capabilities disabled and physical constraints
-// kept.
+// Strict returns c with native optimizations disabled while retaining fanout,
+// key ordering, consumer scaling, and physical message and header limits.
 //
-// The strict profile withdraws capabilities: things one broker offers that
-// another may not, where the core can fall back to a portable path. It does not
-// withdraw constraints, which are facts about the broker that hold whichever
-// profile the core selects. MaxMessageBytes and MaxHeaderBytes are constraints,
-// and so is ConsumerScaling: a broker whose consumers are bounded by partition
-// count stays bounded, and no core may declare otherwise. OrderedByKey is
-// preserved because ordering is a semantic the core must keep in either
-// profile; strict selects the portable implementation, not an unordered one.
-//
-// ConsumerScaling is preserved rather than zeroed for a second reason. Its zero
-// value is ScalingPartitionBound, so zeroing it would not withdraw the
-// declaration but replace ScalingFree with a different parallelism model -
-// handing a driver that has no partitions a partition-bound declaration with no
-// partition count, which read literally says no consumer may ever receive.
+// The returned value preserves Fanout, OrderedByKey, ConsumerScaling,
+// MaxMessageBytes, and MaxHeaderBytes from c. Every other field is zero.
 func (c Capabilities) Strict() Capabilities {
 	// DelayAccuracy is withdrawn with the capability it describes: the number
 	// is a property of the driver's own delay path, and this profile declares

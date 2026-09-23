@@ -1,6 +1,8 @@
 package rabbitmq
 
 import (
+	"context"
+	"slices"
 	"testing"
 	"time"
 
@@ -114,6 +116,30 @@ func TestParkQueueNamesForFixedAndLadder(t *testing.T) {
 	}
 }
 
+// TestParkingOfFixedDelayDestinationListsNoRung proves a fixed-delay
+// destination's parking queues are its own fixed queue and the per-message
+// queue: the ladder is the parking shape of a generic deferred destination
+// only, and no rung queue of a fixed-delay destination can hold a message.
+func TestParkingOfFixedDelayDestinationListsNoRung(t *testing.T) {
+	fixed := &conn{
+		deferred: map[string]time.Duration{"orders.retry.2": 5 * time.Second},
+		fixed:    map[string]time.Duration{"orders.retry.2": 5 * time.Second},
+	}
+	want := []string{"orders.retry.2.park.fixed-5000ms", "orders.retry.2.park"}
+	if got := fixed.parkingOf("orders.retry.2"); !slices.Equal(got, want) {
+		t.Fatalf("parkingOf(fixed destination) = %v, want %v", got, want)
+	}
+
+	deferred := &conn{deferred: map[string]time.Duration{"orders.retry.2": 5 * time.Second}}
+	ladder := parkQueueNames("orders.retry.2")
+	if got := deferred.parkingOf("orders.retry.2"); !slices.Equal(got, ladder) {
+		t.Fatalf("parkingOf(deferred destination) = %v, want the ladder %v", got, ladder)
+	}
+	if got := deferred.parkingOf("orders.other"); got != nil {
+		t.Fatalf("parkingOf(undeclared destination) = %v, want no parking queues", got)
+	}
+}
+
 func TestFixedParkTargetRouting(t *testing.T) {
 	p := &producer{
 		clock: clock.NewReal(),
@@ -137,5 +163,25 @@ func TestFixedParkTargetRouting(t *testing.T) {
 	}
 	if farExpiration == "" {
 		t.Fatal("target() expiration is empty above the fixed delay, want a per-message TTL")
+	}
+}
+
+func TestTopologyNoneRoutesRetryCopiesToTheFixedQueue(t *testing.T) {
+	c := &conn{deferred: map[string]time.Duration{}, fixed: map[string]time.Duration{}}
+	admin := &adminOperations{conn: c}
+	spec := driver.TopologySpec{
+		Policy:       driver.TopologyNone,
+		Destinations: []driver.DestinationSpec{{Name: "d", Kind: driver.DestRetry, Durable: true, Delay: 5 * time.Second, FixedDelay: true}},
+	}
+	if _, err := admin.ensureTopology(context.Background(), spec); err != nil {
+		t.Fatal(err)
+	}
+	p := &producer{clock: clock.NewReal(), conn: c}
+	due := time.Now().Add(5 * time.Second) //nolint:forbidigo // remaining delay is measured at publish time
+	if _, routingKey, _ := p.target(driver.OutboundMessage{Destination: "d", DelayUntil: due}); routingKey != "d.park.fixed-5000ms" {
+		t.Fatalf("target() routingKey = %q, want the fixed queue the operator provisions for this spec", routingKey)
+	}
+	if got, want := c.parkingOf("d"), []string{"d.park.fixed-5000ms", "d.park"}; !slices.Equal(got, want) {
+		t.Fatalf("parkingOf() = %v, want %v", got, want)
 	}
 }

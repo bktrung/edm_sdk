@@ -157,8 +157,7 @@ func runOrdering(group *groupContext) {
 	group.Check("zero-value producer configuration preserves ordered receipt", func(t *testing.T) {
 		const destination = "ordering.zero"
 		producer := newProducer(t, group, profileDestination(group, destination), driver.ProducerConfig{
-			RequireDurableAck: true,
-			Effective:         group.effective,
+			Effective: group.effective,
 		})
 		consumer := orderingConsumer(t, group, destination, 1, true)
 		publishKeyed(t, group, producer, destination, "k", "one", "two")
@@ -279,5 +278,5 @@ func waitForSaturation(t *testing.T, group *groupContext, destination string, un
 }
 
 func addOrderingEvent(group *groupContext, id, outcome, destination string) {
-	group.vector.Add(BehaviorEvent{ID: id, Outcome: outcome, FinalDestination: destination})
+	group.vector.add(BehaviorEvent{ID: id, Outcome: outcome, FinalDestination: destination})
 }

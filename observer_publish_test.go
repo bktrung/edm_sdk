@@ -178,7 +178,7 @@ func TestObserverPublishBatchPartialFailure(t *testing.T) {
 	if err != nil {
 		t.Fatalf("PublishBatch() error = %v, want nil for partial failure", err)
 	}
-	if got := result.Failed(); len(got) != 1 || got[0] != 1 {
+	if got := failedIndexes(result); len(got) != 1 || got[0] != 1 {
 		t.Fatalf("failed = %v, want [1]", got)
 	}
 	starts, finishes, order := rec.snapshot()
@@ -422,6 +422,42 @@ func TestErrorClassOfTable(t *testing.T) {
 			t.Parallel()
 			if got := errorClassOf(test.err); got != test.want {
 				t.Fatalf("errorClassOf = %q, want %q", got, test.want)
+			}
+		})
+	}
+}
+
+// TestTerminalAndDroppedOutrankDriverKind proves the two mappers that class one
+// error for paired events agree: an error carrying both a driver kind and the
+// terminal or dropped marker reports the marker on the settle and successor
+// finishes exactly as it does on the process finish, so one error never
+// carries two classes across those events.
+func TestTerminalAndDroppedOutrankDriverKind(t *testing.T) {
+	t.Parallel()
+	for _, test := range []struct {
+		name string
+		err  error
+		want ErrorClass
+	}{
+		{
+			name: "terminal driver error is terminal",
+			err:  Terminal(&driver.Error{Driver: "test", Op: "publish", K: driver.KindFatal, Err: errors.New("x")}),
+			want: ErrorClassTerminal,
+		},
+		{
+			name: "dropped driver error is dropped",
+			err:  Drop(&driver.Error{Driver: "test", Op: "publish", K: driver.KindFatal, Err: errors.New("x")}),
+			want: ErrorClassDropped,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			if got := errorClassOf(test.err); got != test.want {
+				t.Fatalf("errorClassOf = %q, want %q", got, test.want)
+			}
+			outcome, class, terminal := processOutcome(handlerResult{err: test.err}, nil)
+			if outcome != ObserverOutcomeError || class != test.want || !terminal {
+				t.Fatalf("processOutcome = %q, %q, %v; want %q, %q, true", outcome, class, terminal, ObserverOutcomeError, test.want)
 			}
 		})
 	}

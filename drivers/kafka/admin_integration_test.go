@@ -18,7 +18,6 @@ import (
 	"github.com/twmb/franz-go/pkg/kerr"
 	"github.com/twmb/franz-go/pkg/kgo"
 
-	//nolint:depguard // this test must exercise the public f1 API against Kafka.
 	f1 "fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk"
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/driver"
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/clock"

@@ -112,7 +112,9 @@ func run() (runErr error) {
 	signals := make(chan os.Signal, 1)
 	signal.Notify(signals, os.Interrupt, syscall.SIGTERM)
 	defer signal.Stop(signals)
-	fmt.Println("consumer ready; waiting for messages")
+	// Run declares topology and attaches the consumer after this point, so the
+	// subscription is starting here, not yet ready to receive.
+	fmt.Println("consumer starting; press Ctrl+C to stop")
 	select {
 	case err := <-runDone:
 		return err

@@ -146,21 +146,26 @@ func TestEnsureTopologyPartitionFloorAppliesToUnsetAndExistingTopics(t *testing.
 	}
 }
 
+// TestBindingsAndExchangesAreIgnored pins that the routing fields of a topology
+// spec change nothing about the plan Kafka translates it to. Kafka routes at
+// consume time, so exchanges and bindings have no plan of their own and a spec
+// that carries them translates to the plan of the same spec without them.
 func TestBindingsAndExchangesAreIgnored(t *testing.T) {
-	plan := translateTopology(driver.TopologySpec{
+	withRouting := translateTopology(driver.TopologySpec{
 		Exchanges:    []driver.ExchangeSpec{{Name: "events", Kind: "fanout", Durable: true}},
 		Destinations: []driver.DestinationSpec{{Name: "orders"}},
 		Bindings:     []driver.BindingSpec{{Source: "events", Destination: "orders"}},
 		Effective:    driver.Capabilities{Fanout: driver.FanoutAtConsume},
 	})
-	if len(plan.exchanges) != 0 {
-		t.Fatalf("translated exchanges = %v, want empty", plan.exchanges)
+	withoutRouting := translateTopology(driver.TopologySpec{
+		Destinations: []driver.DestinationSpec{{Name: "orders"}},
+		Effective:    driver.Capabilities{Fanout: driver.FanoutAtConsume},
+	})
+	if !slices.Equal(withRouting.destinations, withoutRouting.destinations) {
+		t.Fatalf("translated destinations = %#v, want the plan without routing fields %#v", withRouting.destinations, withoutRouting.destinations)
 	}
-	if len(plan.bindings) != 0 {
-		t.Fatalf("translated bindings = %v, want empty", plan.bindings)
-	}
-	if len(plan.destinations) != 1 || plan.destinations[0].name != "orders" {
-		t.Fatalf("translated destinations = %#v, want orders", plan.destinations)
+	if len(withRouting.destinations) != 1 || withRouting.destinations[0].name != "orders" {
+		t.Fatalf("translated destinations = %#v, want orders", withRouting.destinations)
 	}
 }
 

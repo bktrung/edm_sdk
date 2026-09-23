@@ -29,7 +29,7 @@ func runSettle(group *groupContext) {
 			view := inspectDestination(t, group, "settle.ack")
 			return view.Ready == 0 && view.Unsettled == 0, fmt.Sprintf("view=%+v", view)
 		})
-		group.vector.Add(BehaviorEvent{ID: "ack-visible", Outcome: "ack", FinalDestination: "settle.ack"})
+		group.vector.add(BehaviorEvent{ID: "ack-visible", Outcome: "ack", FinalDestination: "settle.ack"})
 	})
 
 	group.Check("requeue nack returns the message for redelivery", func(t *testing.T) {
@@ -66,7 +66,7 @@ func runSettle(group *groupContext) {
 			view := inspectDestination(t, group, "settle.requeue")
 			return view.Ready == 0 && view.Unsettled == 0, fmt.Sprintf("view=%+v", view)
 		})
-		group.vector.Add(BehaviorEvent{ID: "nack-requeue", Outcome: "redelivered", AttemptCount: 2, FinalDestination: "settle.requeue"})
+		group.vector.add(BehaviorEvent{ID: "nack-requeue", Outcome: "redelivered", AttemptCount: 2, FinalDestination: "settle.requeue"})
 	})
 
 	group.Check("zero-value nack does not requeue", func(t *testing.T) {
@@ -93,7 +93,7 @@ func runSettle(group *groupContext) {
 		if err := control.Settle.Ack(group.ctx); err != nil {
 			t.Fatal(err)
 		}
-		group.vector.Add(BehaviorEvent{ID: "nack-discard", Outcome: "discarded", FinalDestination: "settle.discard"})
+		group.vector.add(BehaviorEvent{ID: "nack-discard", Outcome: "discarded", FinalDestination: "settle.discard"})
 	})
 
 	group.Check("discard nack does not deliver after settlement", func(t *testing.T) {
@@ -127,7 +127,7 @@ func runSettle(group *groupContext) {
 				return true, "no redelivery"
 			}
 		})
-		group.vector.Add(BehaviorEvent{ID: "no-redelivery", Outcome: "discarded", FinalDestination: "settle.no-redelivery"})
+		group.vector.add(BehaviorEvent{ID: "no-redelivery", Outcome: "discarded", FinalDestination: "settle.no-redelivery"})
 	})
 
 	group.Check("acked message is never redelivered", func(t *testing.T) {
@@ -160,7 +160,7 @@ func runSettle(group *groupContext) {
 		if err := control.Settle.Ack(group.ctx); err != nil {
 			t.Fatal(err)
 		}
-		group.vector.Add(BehaviorEvent{ID: "ack-no-redelivery", Outcome: "ack", FinalDestination: "settle.ack-no-redelivery"})
+		group.vector.add(BehaviorEvent{ID: "ack-no-redelivery", Outcome: "ack", FinalDestination: "settle.ack-no-redelivery"})
 	})
 
 	group.Check("settling an already-acked message stays safe after a clean stop", func(t *testing.T) {
@@ -186,7 +186,7 @@ func runSettle(group *groupContext) {
 		if kind, ok := driver.Classify(err); !ok || kind != driver.KindFatal {
 			t.Fatalf("settle after stop classification=(%v,%t), want fatal", kind, ok)
 		}
-		group.vector.Add(BehaviorEvent{ID: "settle-after-stop", Outcome: "already-settled", FinalDestination: "settle.after-stop"})
+		group.vector.add(BehaviorEvent{ID: "settle-after-stop", Outcome: "already-settled", FinalDestination: "settle.after-stop"})
 	})
 
 	group.Check("ack then ack is already settled", func(t *testing.T) {
@@ -194,7 +194,7 @@ func runSettle(group *groupContext) {
 			func(message driver.InboundMessage) error { return message.Settle.Ack(group.ctx) },
 			func(message driver.InboundMessage) error { return message.Settle.Ack(group.ctx) },
 			BrokerView{Ready: 0, Unsettled: 0})
-		group.vector.Add(BehaviorEvent{ID: "double-ack", Outcome: "already-settled", FinalDestination: "settle.double-ack"})
+		group.vector.add(BehaviorEvent{ID: "double-ack", Outcome: "already-settled", FinalDestination: "settle.double-ack"})
 	})
 
 	group.Check("ack then nack is already settled", func(t *testing.T) {
@@ -204,7 +204,7 @@ func runSettle(group *groupContext) {
 				return message.Settle.Nack(group.ctx, driver.NackOptions{Requeue: true})
 			},
 			BrokerView{Ready: 0, Unsettled: 0})
-		group.vector.Add(BehaviorEvent{ID: "ack-nack", Outcome: "already-settled", FinalDestination: "settle.ack-nack"})
+		group.vector.add(BehaviorEvent{ID: "ack-nack", Outcome: "already-settled", FinalDestination: "settle.ack-nack"})
 	})
 
 	group.Check("nack then ack is already settled", func(t *testing.T) {
@@ -212,7 +212,7 @@ func runSettle(group *groupContext) {
 			func(message driver.InboundMessage) error { return message.Settle.Nack(group.ctx, driver.NackOptions{}) },
 			func(message driver.InboundMessage) error { return message.Settle.Ack(group.ctx) },
 			BrokerView{Ready: 0, Unsettled: 0})
-		group.vector.Add(BehaviorEvent{ID: "nack-ack", Outcome: "already-settled", FinalDestination: "settle.nack-ack"})
+		group.vector.add(BehaviorEvent{ID: "nack-ack", Outcome: "already-settled", FinalDestination: "settle.nack-ack"})
 	})
 
 	group.Check("nack then nack is already settled", func(t *testing.T) {
@@ -227,7 +227,7 @@ func runSettle(group *groupContext) {
 				return message.Settle.Nack(group.ctx, driver.NackOptions{Requeue: true})
 			},
 			BrokerView{Ready: 0, Unsettled: 1})
-		group.vector.Add(BehaviorEvent{ID: "double-nack", Outcome: "already-settled", FinalDestination: "settle.double-nack"})
+		group.vector.add(BehaviorEvent{ID: "double-nack", Outcome: "already-settled", FinalDestination: "settle.double-nack"})
 	})
 
 	group.Check("out-of-order settlement accounts for every message", func(t *testing.T) {
@@ -248,7 +248,7 @@ func runSettle(group *groupContext) {
 			view := inspectDestination(t, group, "settle.out-of-order")
 			return view.Ready == 0 && view.Unsettled == 0, fmt.Sprintf("view=%+v", view)
 		})
-		group.vector.Add(BehaviorEvent{ID: "out-of-order", Outcome: "ack", FinalDestination: "settle.out-of-order"})
+		group.vector.add(BehaviorEvent{ID: "out-of-order", Outcome: "ack", FinalDestination: "settle.out-of-order"})
 	})
 
 	group.Check("out-of-order requeue and ack lose nothing", func(t *testing.T) {
@@ -290,7 +290,7 @@ func runSettle(group *groupContext) {
 			view := inspectDestination(t, group, "settle.mixed-order")
 			return view.Ready == 0 && view.Unsettled == 0, fmt.Sprintf("view=%+v", view)
 		})
-		group.vector.Add(BehaviorEvent{ID: "mixed-order", Outcome: "redelivered", AttemptCount: 2, FinalDestination: "settle.mixed-order"})
+		group.vector.add(BehaviorEvent{ID: "mixed-order", Outcome: "redelivered", AttemptCount: 2, FinalDestination: "settle.mixed-order"})
 	})
 
 	group.Check("settlement after failed stop is safe", func(t *testing.T) {
@@ -309,7 +309,7 @@ func runSettle(group *groupContext) {
 		if err := consumer.Stop(group.ctx); err != nil {
 			t.Fatal(err)
 		}
-		group.vector.Add(BehaviorEvent{ID: "stop-after-settlement", Outcome: "ack", FinalDestination: "settle.stop"})
+		group.vector.add(BehaviorEvent{ID: "stop-after-settlement", Outcome: "ack", FinalDestination: "settle.stop"})
 	})
 
 	group.Check("distinct messages settle concurrently", func(t *testing.T) {
@@ -338,7 +338,7 @@ func runSettle(group *groupContext) {
 			view := inspectDestination(t, group, "settle.concurrent")
 			return view.Ready == 0 && view.Unsettled == 0, fmt.Sprintf("view=%+v", view)
 		})
-		group.vector.Add(BehaviorEvent{ID: "concurrent", Outcome: "ack", FinalDestination: "settle.concurrent"})
+		group.vector.add(BehaviorEvent{ID: "concurrent", Outcome: "ack", FinalDestination: "settle.concurrent"})
 	})
 
 	group.Check("cancelled ack leaves the message unsettled", func(t *testing.T) {
@@ -360,7 +360,7 @@ func runSettle(group *groupContext) {
 		if err := message.Settle.Ack(group.ctx); err != nil {
 			t.Fatal(err)
 		}
-		group.vector.Add(BehaviorEvent{ID: "cancel-ack", Outcome: "cancelled", FinalDestination: "settle.cancel-ack"})
+		group.vector.add(BehaviorEvent{ID: "cancel-ack", Outcome: "cancelled", FinalDestination: "settle.cancel-ack"})
 	})
 
 	group.Check("cancelled nack leaves the message unsettled", func(t *testing.T) {
@@ -386,7 +386,7 @@ func runSettle(group *groupContext) {
 		if err := redelivery.Settle.Ack(group.ctx); err != nil {
 			t.Fatal(err)
 		}
-		group.vector.Add(BehaviorEvent{ID: "cancel-nack", Outcome: "cancelled", AttemptCount: 2, FinalDestination: "settle.cancel-nack"})
+		group.vector.add(BehaviorEvent{ID: "cancel-nack", Outcome: "cancelled", AttemptCount: 2, FinalDestination: "settle.cancel-nack"})
 	})
 }
 

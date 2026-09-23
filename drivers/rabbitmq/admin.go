@@ -33,22 +33,28 @@ type queuePruneGuardError struct {
 	reason string
 }
 
+// Error returns the reason the requested queue cannot be pruned.
 func (e *queuePruneGuardError) Error() string { return e.reason }
 
+// Unwrap returns the error identifying a queue that no longer meets the prune conditions.
 func (e *queuePruneGuardError) Unwrap() error { return errQueueNotPrunable }
 
+// EnsureTopology applies the requested topology policy and returns the resulting diff.
 func (a *admin) EnsureTopology(ctx context.Context, spec driver.TopologySpec) (driver.TopologyDiff, error) {
 	return a.operations.EnsureTopology(ctx, spec)
 }
 
+// DescribeTopology returns the current topology state for the requested names.
 func (a *admin) DescribeTopology(ctx context.Context, names []string) (driver.TopologyState, error) {
 	return a.operations.DescribeTopology(ctx, names)
 }
 
+// Purge removes messages from a destination and its parking queues, and returns the number removed.
 func (a *admin) Purge(ctx context.Context, destination string) (int64, error) {
 	return a.operations.Purge(ctx, destination)
 }
 
+// Prune processes each requested name and reports whether it was deleted or why it was retained.
 func (a *admin) Prune(ctx context.Context, names []string) ([]driver.PruneResult, error) {
 	return a.operations.Prune(ctx, names)
 }
@@ -67,6 +73,7 @@ func (a *adminOperations) admission(ctx context.Context, operation string) error
 	return nil
 }
 
+// EnsureTopology applies the requested topology policy and returns the resulting diff.
 func (a *adminOperations) EnsureTopology(ctx context.Context, spec driver.TopologySpec) (driver.TopologyDiff, error) {
 	if err := a.admission(ctx, "ensure_topology"); err != nil {
 		return driver.TopologyDiff{}, err
@@ -74,6 +81,7 @@ func (a *adminOperations) EnsureTopology(ctx context.Context, spec driver.Topolo
 	return a.ensureTopology(ctx, spec)
 }
 
+// DescribeTopology returns the current topology state for the requested names.
 func (a *adminOperations) DescribeTopology(ctx context.Context, names []string) (driver.TopologyState, error) {
 	if err := a.admission(ctx, "describe_topology"); err != nil {
 		return driver.TopologyState{}, err
@@ -102,6 +110,7 @@ func (a *adminOperations) DescribeTopology(ctx context.Context, names []string) 
 	return driver.TopologyState{Depth: depth}, nil
 }
 
+// Purge removes messages from a destination and its parking queues, and returns the number removed.
 func (a *adminOperations) Purge(ctx context.Context, destination string) (int64, error) {
 	if err := a.admission(ctx, "purge"); err != nil {
 		return 0, err
@@ -148,6 +157,7 @@ func (a *adminOperations) Purge(ctx context.Context, destination string) (int64,
 	return total, nil
 }
 
+// Prune processes each requested name and reports whether it was deleted or why it was retained.
 func (a *adminOperations) Prune(ctx context.Context, names []string) ([]driver.PruneResult, error) {
 	if err := a.admission(ctx, "prune"); err != nil {
 		return nil, err
@@ -217,28 +227,9 @@ func (a *adminOperations) Prune(ctx context.Context, names []string) ([]driver.P
 			continue
 		}
 
-		parking := existingParkQueues(queues, name)
-		mainReady, mainConsumers, inspectErr := a.inspectQueueWithConsumers(ctx, name)
-		if inspectErr != nil {
-			result.Reason = "destination disappeared before deletion"
-			results = append(results, result)
-			continue
-		}
-		refused := false
-		for _, parkName := range parking {
-			parkReady, parkErr := a.inspectQueue(ctx, parkName)
-			if parkErr != nil {
-				result.Reason = "parking destination disappeared before deletion"
-				refused = true
-				break
-			}
-			if reason := a.pruneReason(name, mainConsumers, mainReady, parkName, parkReady); reason != "" {
-				result.Reason = reason
-				refused = true
-				break
-			}
-		}
-		if refused {
+		parking := a.existingParkQueues(queues, name)
+		if reason := a.pruneGuard(ctx, name, parking); reason != "" {
+			result.Reason = reason
 			results = append(results, result)
 			continue
 		}
@@ -252,33 +243,13 @@ func (a *adminOperations) Prune(ctx context.Context, names []string) ([]driver.P
 				results = append(results, result)
 				continue
 			}
-			mainReady, mainConsumers, inspectErr = a.inspectQueueWithConsumers(ctx, name)
-			if inspectErr != nil {
-				result.Reason = "destination disappeared before deletion"
-				results = append(results, result)
-				continue
-			}
-			survivors := make([]string, 0, len(parking))
-			for _, parkName := range parking {
-				parkReady, parkErr := a.inspectQueue(ctx, parkName)
-				if parkErr != nil {
-					result.Reason = "parking destination disappeared before deletion"
-					refused = true
-					break
-				}
-				if reason := a.pruneReason(name, mainConsumers, mainReady, parkName, parkReady); reason != "" {
-					result.Reason = reason
-					refused = true
-					break
-				}
-				survivors = append(survivors, parkName)
-			}
-			if refused {
+			if reason := a.pruneGuard(ctx, name, parking); reason != "" {
+				result.Reason = reason
 				results = append(results, result)
 				continue
 			}
 			deletedAll := true
-			for _, parkName := range survivors {
+			for _, parkName := range parking {
 				if a.pruneBeforeDeleteHook != nil {
 					a.pruneBeforeDeleteHook(parkName)
 				}
@@ -312,13 +283,7 @@ func (a *adminOperations) Prune(ctx context.Context, names []string) ([]driver.P
 			results = append(results, result)
 			continue
 		}
-		mainReady, mainConsumers, inspectErr = a.inspectQueueWithConsumers(ctx, name)
-		if inspectErr != nil {
-			result.Reason = "destination disappeared before deletion"
-			results = append(results, result)
-			continue
-		}
-		if reason := a.pruneReason(name, mainConsumers, mainReady, "", 0); reason != "" {
+		if reason := a.pruneGuard(ctx, name, nil); reason != "" {
 			result.Reason = reason
 			results = append(results, result)
 			continue
@@ -385,15 +350,49 @@ func (a *adminOperations) pruneReason(name string, mainConsumers, mainReady int6
 	return ""
 }
 
+// pruneGuard inspects a destination and the parking queues given and returns
+// the first reason the destination may not be deleted, or an empty string when
+// every inspected queue is there, empty and unattached. An auxiliary list that
+// is empty checks the destination alone, which is the check that runs once the
+// parking queues are gone, and a destination that has disappeared is reported
+// as such rather than as a queue that failed its guard.
+func (a *adminOperations) pruneGuard(ctx context.Context, destination string, auxiliary []string) string {
+	mainReady, mainConsumers, err := a.inspectQueueWithConsumers(ctx, destination)
+	if err != nil {
+		return "destination disappeared before deletion"
+	}
+	if reason := a.pruneReason(destination, mainConsumers, mainReady, "", 0); reason != "" {
+		return reason
+	}
+	for _, parkName := range auxiliary {
+		parkReady, parkErr := a.inspectQueue(ctx, parkName)
+		if parkErr != nil {
+			return "parking destination disappeared before deletion"
+		}
+		if reason := a.pruneReason(destination, mainConsumers, mainReady, parkName, parkReady); reason != "" {
+			return reason
+		}
+	}
+	return ""
+}
+
 // existingParkQueues lists the parking queues of a destination that the broker
-// has right now: ladder queues in declare order, then any other parking
-// queue of the destination (fixed queues of any delay) sorted by name. A parking queue
-// that is not there holds nothing and needs no guard; a deployment that
-// predates the ladder simply has fewer of them, and one whose rung queue an
-// application drained by hand needs no refusal either.
-func existingParkQueues(queues []managementQueue, destination string) []string {
-	present := make([]string, 0, len(parkRungs)+1)
-	for _, parkName := range parkQueueNames(destination) {
+// has right now: the destination's own parking shape in declare order, then any
+// other parking queue of the destination sorted by name, which is where a fixed
+// queue of another delay and a rung queue of a destination that no longer
+// declares a delay are found. A parking queue that is not there holds nothing
+// and needs no guard; one whose rung queue an application drained by hand needs
+// no refusal either.
+func (a *adminOperations) existingParkQueues(queues []managementQueue, destination string) []string {
+	known := a.conn.parkingOf(destination)
+	if len(known) == 0 {
+		// Nothing this connection declared describes the destination, so its
+		// shape is unknown: every parking queue name the broker has is checked
+		// against it by name rather than against a shape.
+		known = parkQueueNames(destination)
+	}
+	present := make([]string, 0, len(known)+1)
+	for _, parkName := range known {
 		if _, found := findQueue(queues, parkName); found {
 			present = append(present, parkName)
 		}
@@ -453,9 +452,10 @@ func queuePruneReason(name string, ready, consumers int64, auxiliary bool) strin
 
 // deleteQueue uses broker preconditions for classic queues. Quorum queues
 // support no conditional delete, so their final passive-declare recheck leaves
-// a window where a newly arrived message can still be destroyed. The recheck
-// runs on the channel that performs the delete, so no other channel's traffic
-// can be interleaved between them.
+// a window where a message published or a consumer attached on another
+// channel between the recheck and the delete is destroyed with the queue.
+// Running both on one channel orders them against each other, not against
+// other channels' traffic.
 func (a *adminOperations) deleteQueue(ctx context.Context, name string, auxiliary bool) (bool, error) {
 	if err := ctx.Err(); err != nil {
 		return false, err

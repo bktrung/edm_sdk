@@ -2,7 +2,6 @@
   "package": "f1",
   "symbols": [
     "BatchResult",
-    "BatchResult.Failed",
     "BrokerConfig",
     "Client",
     "Client.Close",
@@ -17,7 +16,6 @@
     "DeadLettered",
     "DeathReason",
     "DeathReason.String",
-    "DeathReason.Valid",
     "DecodeHeaders",
     "DiscardDropped",
     "DiscardReason",
@@ -112,7 +110,6 @@
     "Option",
     "OrderedByKey",
     "ParsePriority",
-    "PartitionKeyOf",
     "PointEvent",
     "Priority",
     "Priority.String",

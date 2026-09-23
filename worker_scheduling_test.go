@@ -51,28 +51,24 @@ const (
 )
 
 func TestRunnerSchedulerWeightedShare(t *testing.T) {
-	first := runPriorityShare(t, map[f1.Priority]int{
-		f1.PriorityHigh: 8,
-		f1.PriorityLow:  1,
-	})
-	high := countPriority(first, f1.PriorityHigh)
-	low := countPriority(first, f1.PriorityLow)
-	const wantHigh = 89
-	if high < wantHigh-schedulingShareTolerance || high > wantHigh+schedulingShareTolerance || high+low != schedulingWindow {
-		t.Fatalf("first %d priorities = high:%d low:%d, want high:%d +/- %d", schedulingWindow, high, low, wantHigh, schedulingShareTolerance)
-	}
-}
-
-func TestRunnerSchedulerWeightedShareReversed(t *testing.T) {
-	first := runPriorityShare(t, map[f1.Priority]int{
-		f1.PriorityHigh: 1,
-		f1.PriorityLow:  8,
-	})
-	high := countPriority(first, f1.PriorityHigh)
-	low := countPriority(first, f1.PriorityLow)
-	const wantLow = 89
-	if low < wantLow-schedulingShareTolerance || low > wantLow+schedulingShareTolerance || high+low != schedulingWindow {
-		t.Fatalf("first %d priorities = high:%d low:%d, want low:%d +/- %d", schedulingWindow, high, low, wantLow, schedulingShareTolerance)
+	for _, test := range []struct {
+		name     string
+		weights  map[f1.Priority]int
+		favoured f1.Priority
+	}{
+		{name: "high 8 low 1", weights: map[f1.Priority]int{f1.PriorityHigh: 8, f1.PriorityLow: 1}, favoured: f1.PriorityHigh},
+		{name: "high 1 low 8", weights: map[f1.Priority]int{f1.PriorityHigh: 1, f1.PriorityLow: 8}, favoured: f1.PriorityLow},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			first := runPriorityShare(t, test.weights)
+			high := countPriority(first, f1.PriorityHigh)
+			low := countPriority(first, f1.PriorityLow)
+			favoured := countPriority(first, test.favoured)
+			const want = 89
+			if favoured < want-schedulingShareTolerance || favoured > want+schedulingShareTolerance || high+low != schedulingWindow {
+				t.Fatalf("first %d priorities = high:%d low:%d, want %s:%d +/- %d", schedulingWindow, high, low, test.favoured, want, schedulingShareTolerance)
+			}
+		})
 	}
 }
 
@@ -473,7 +469,7 @@ func schedulingConfig() f1.Config {
 		Env: "test", Service: "scheduler", InstanceID: "worker-scheduling",
 		Broker:    f1.BrokerConfig{Driver: "inmem", DefaultPrefetch: 64},
 		Topology:  f1.TopologyConfig{AutoCreate: true, VerifyOnStart: true, Priorities: []f1.Priority{f1.PriorityHigh, f1.PriorityLow}},
-		Codec:     f1.CodecConfig{Default: "json", ContentMode: "binary", MaxHeaderBytes: f1.CoreMaxHeaderBytes, MaxBodyBytes: 1 << 20},
+		Codec:     f1.CodecConfig{Default: "json", MaxHeaderBytes: f1.CoreMaxHeaderBytes, MaxBodyBytes: 1 << 20},
 		Lifecycle: f1.LifecycleConfig{DrainTimeout: 10 * time.Second, HandlerGrace: time.Second, CloseTimeout: time.Second},
 	}
 }
@@ -505,7 +501,12 @@ func publishMessages(t *testing.T, client *f1.Client, ctx context.Context, messa
 		if err != nil {
 			t.Fatalf("publish batch: %v", err)
 		}
-		failed := result.Failed()
+		failed := make([]int, 0)
+		for index, message := range result.Results {
+			if message.Err != nil {
+				failed = append(failed, index)
+			}
+		}
 		if len(failed) == 0 {
 			return
 		}

@@ -15,7 +15,9 @@ import (
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/driver"
 )
 
-// Publisher publishes encoded events through a Client's connected driver.
+// Publisher publishes encoded events through a Client's connected driver. A
+// publisher returned by Client.Publisher may be shared by concurrent goroutines;
+// its zero value is not connected.
 type Publisher struct {
 	client *Client
 }
@@ -33,67 +35,59 @@ type publishOptions struct {
 	maxAttempts    int
 }
 
-// PublishOption configures one Publish or PublishBatch call. Construct values
-// with the With* functions; the concrete operation is intentionally private.
+// PublishOption configures one Publish or PublishBatch call. Construct options
+// with the With* functions; the zero value is invalid.
 type PublishOption struct {
 	apply func(*publishOptions) error
 }
 
-// Message is one item in a PublishBatch call, carrying the event type, payload,
-// and options that apply only to that item.
+// Message is one item in PublishBatch, with a required event type, payload, and
+// options that apply only to that item. Its zero value cannot be published.
 type Message struct {
 	EventType string
 	Payload   any
 	Opts      []PublishOption
 }
 
-// BatchResult reports each message's publish outcome in input order. A partial
-// failure is represented by the corresponding MessageResult entries rather
-// than by an atomicity claim.
+// BatchResult reports each message's outcome in input order. Partial failures
+// appear in the corresponding MessageResult entries; the batch is not atomic.
 type BatchResult struct {
 	Results []MessageResult
 }
 
-// MessageResult is one message's publish outcome; ID is empty when Err is set.
+// MessageResult contains one publish outcome. ID is empty when Err is set.
 type MessageResult struct {
 	ID  string
 	Err error
 }
 
-// Failed returns indexes of messages that did not publish.
-func (r BatchResult) Failed() []int {
-	failed := make([]int, 0)
-	for i, result := range r.Results {
-		if result.Err != nil {
-			failed = append(failed, i)
-		}
-	}
-	return failed
-}
-
-// WithTopic overrides what the topic is derived from. The value goes through
-// the same derivation as an event type.
+// WithTopic overrides the topic derived from the event type. A non-empty value
+// is normalized the same way as an event type; an empty value leaves the
+// original event type in use.
 func WithTopic(topic string) PublishOption {
 	return publishOption(func(options *publishOptions) error { options.topic = topic; return nil })
 }
 
-// WithKey sets the partition key; the same envelope value is used to derive
-// the broker routing key. It defaults to the subject and then the event ID.
+// WithKey sets the partition key. An empty key falls back to the subject and
+// then the event ID.
 func WithKey(key string) PublishOption {
 	return publishOption(func(options *publishOptions) error { options.key = key; return nil })
 }
 
-// WithSubject sets the business subject and default partition key.
+// WithSubject sets the business subject and uses it as the default partition
+// key when no key is set.
 func WithSubject(subject string) PublishOption {
 	return publishOption(func(options *publishOptions) error { options.subject = subject; return nil })
 }
 
-// WithPriority selects the delivery lane.
+// WithPriority selects the delivery lane. An undeclared priority returns an
+// error when the message is published.
 func WithPriority(priority Priority) PublishOption {
 	return publishOption(func(options *publishOptions) error { options.priority = priority; return nil })
 }
 
-// WithIdempotencyKey sets the application's stable deduplication key.
+// WithIdempotencyKey sets the application's stable deduplication key. An empty
+// key falls back to the generated event ID.
 func WithIdempotencyKey(key string) PublishOption {
 	return publishOption(func(options *publishOptions) error { options.idempotencyKey = key; return nil })
 }
@@ -109,7 +103,8 @@ func WithCausedBy(event *Event) PublishOption {
 	return publishOption(func(options *publishOptions) error { options.causedBy = event; return nil })
 }
 
-// WithHeader adds a user extension header.
+// WithHeader sets a user extension header. Reserved keys are rejected when the
+// message is published.
 func WithHeader(key, value string) PublishOption {
 	return publishOption(func(options *publishOptions) error {
 		if options.headers == nil {
@@ -120,7 +115,7 @@ func WithHeader(key, value string) PublishOption {
 	})
 }
 
-// WithExpiry sets the event expiration time.
+// WithExpiry sets the event's expiration time.
 func WithExpiry(expiry time.Time) PublishOption {
 	return publishOption(func(options *publishOptions) error { options.expiry = &expiry; return nil })
 }
@@ -278,7 +273,7 @@ func (p *Publisher) PublishBatch(ctx context.Context, messages []Message) (Batch
 	}
 	if built.buildErr != nil {
 		warnUnclassifiedWithContext(p.client.options.logger, ctx, built.buildErr)
-		requestReconnectOnTransient(p.client, built.buildErr, epoch)
+		requestReconnectOnTransient(ctx, p.client, built.buildErr, epoch)
 		methodErr := fmt.Errorf("f1: create publisher: %w", built.buildErr)
 		if observed {
 			publishGuard.finishWith(FinishEvent{Topic: publishTopic, Priority: publishPriority, Outcome: ObserverOutcomeError, ErrorClass: errorClassOf(methodErr), Results: result.Results})
@@ -297,9 +292,15 @@ func (p *Publisher) PublishBatch(ctx context.Context, messages []Message) (Batch
 	}
 
 	warnPublishError(p.client.options.logger, ctx, publishErr)
-	requestReconnectOnTransient(p.client, publishErr, epoch)
+	requestReconnectOnTransient(ctx, p.client, publishErr, epoch)
 	var partial *driver.PublishError
-	if errors.As(publishErr, &partial) && len(partial.Failed) > 0 {
+	if errors.As(publishErr, &partial) && len(partial.Failed) > 0 && !failedIndexesInRange(partial.Failed, len(ids)) {
+		// A failure the report cannot place on a message leaves no way to tell
+		// which messages were published, so the whole batch reads as failed.
+		publishErr = fmt.Errorf("f1: the driver reported a failed message outside the batch: %w", publishErr)
+		partial = nil
+	}
+	if partial != nil && len(partial.Failed) > 0 {
 		for i, id := range ids {
 			result.Results[i].ID = id
 		}
@@ -309,10 +310,14 @@ func (p *Publisher) PublishBatch(ctx context.Context, messages []Message) (Batch
 		}
 		sort.Ints(failed)
 		for _, index := range failed {
-			if index >= 0 && index < len(result.Results) {
-				result.Results[index].ID = ""
-				result.Results[index].Err = partial.Failed[index]
+			cause := partial.Failed[index]
+			if cause == nil {
+				// The driver listed the message as failed without saying
+				// why; it still failed, so it must not read as published.
+				cause = errPublishFailedWithoutCause
 			}
+			result.Results[index].ID = ""
+			result.Results[index].Err = cause
 		}
 		if observed {
 			var firstErr error
@@ -334,6 +339,19 @@ func (p *Publisher) PublishBatch(ctx context.Context, messages []Message) (Batch
 	}
 	return result, publishErr
 }
+
+func failedIndexesInRange(failed map[int]error, size int) bool {
+	for index := range failed {
+		if index < 0 || index >= size {
+			return false
+		}
+	}
+	return true
+}
+
+// errPublishFailedWithoutCause stands in for the nil cause of a message a
+// driver reported as failed.
+var errPublishFailedWithoutCause = errors.New("f1: the driver reported the message as not published without a cause")
 
 func warnPublishError(logger *slog.Logger, ctx context.Context, err error) {
 	if logger == nil {

@@ -215,11 +215,11 @@ func TestWaitForPublishesSpansLateGenerationsAndBarsTeardownAdmission(t *testing
 	}
 }
 
-// TestWaitPublishIdleSpansLateGenerations pins the same property for the
+// TestPublishQuiescenceSpansLateGenerations pins the same property for the
 // reconnect path: waiting for publish quiescence before retiring the old
 // producer may not report idle while a newer publish generation is live,
 // even one that began after the wait started.
-func TestWaitPublishIdleSpansLateGenerations(t *testing.T) {
+func TestPublishQuiescenceSpansLateGenerations(t *testing.T) {
 	client, err := New(context.Background(), testClientConfig(t), WithDriver(&publishDriver{conn: &publishConn{info: driver.BrokerInfo{Kind: "test", Version: "1"}}}))
 	if err != nil {
 		t.Fatal(err)
@@ -232,7 +232,7 @@ func TestWaitPublishIdleSpansLateGenerations(t *testing.T) {
 	client.mu.Unlock()
 
 	waitDone := make(chan error, 1)
-	go func() { waitDone <- client.waitPublishIdle(context.Background()) }()
+	go func() { waitDone <- client.publishQuiescence(context.Background(), nil) }()
 
 	// Same settle delay as the Close-path generation test: it only
 	// strengthens mutation detection, never the correctness of the assertion.
@@ -243,11 +243,11 @@ func TestWaitPublishIdleSpansLateGenerations(t *testing.T) {
 	client.publishIdle = make(chan struct{})
 	client.mu.Unlock()
 
-	assertNotDone(t, waitDone, "waitPublishIdle")
+	assertNotDone(t, waitDone, "publish quiescence")
 
 	endPublish(client)
 	if err := <-waitDone; err != nil {
-		t.Fatalf("waitPublishIdle() = %v, want nil", err)
+		t.Fatalf("publishQuiescence() = %v, want nil", err)
 	}
 }
 

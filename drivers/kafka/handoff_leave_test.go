@@ -13,48 +13,59 @@ import (
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/clock"
 )
 
-// TestReleaseTearsDownAfterAFailedLeave covers the failure that used to strand
-// a connection: the leave finishes with an error, and Release has to end the
-// consumer anyway. The error stays visible on both channels out.
-func TestReleaseTearsDownAfterAFailedLeave(t *testing.T) {
-	const destination = "leave-failed"
-	connection := newLeaveTestConnection(destination)
-	c := newLeaveTestConsumer(t, connection, destination, 1)
-	c.leaveFn = func(context.Context, leaveRequest) error { return kerr.CoordinatorNotAvailable }
+// TestTeardownAfterAFailedLeave covers the failure that used to strand a
+// connection: the leave finishes with an error, and Release, or a Stop with no
+// Drain before it that meets the leave inside its own drain step, has to end
+// the consumer anyway. The error stays visible on both channels out.
+func TestTeardownAfterAFailedLeave(t *testing.T) {
+	for _, test := range []struct {
+		name        string
+		destination string
+		teardown    func(*consumer, context.Context) error
+	}{
+		{name: "Release", destination: "leave-failed", teardown: (*consumer).Release},
+		{name: "Stop", destination: "stop-failed", teardown: (*consumer).Stop},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			connection := newLeaveTestConnection(test.destination)
+			c := newLeaveTestConsumer(t, connection, test.destination, 1)
+			c.leaveFn = func(context.Context, leaveRequest) error { return kerr.CoordinatorNotAvailable }
 
-	err := c.Release(context.Background())
-	if !errors.Is(err, kerr.CoordinatorNotAvailable) {
-		t.Fatalf("Release error = %v, want it to wrap %v", err, kerr.CoordinatorNotAvailable)
-	}
-	if leaveTestConsumerRegistered(c) {
-		t.Fatal("consumer is still registered after a leave that finished with an error")
-	}
-	timer := clock.NewReal().Timer(time.Second)
-	defer timer.Stop()
-	select {
-	case got, open := <-c.Errors():
-		if !open {
-			t.Fatal("Errors() closed before delivering the leave error")
-		}
-		if !errors.Is(got, kerr.CoordinatorNotAvailable) {
-			t.Fatalf("Errors() delivered %v, want it to wrap %v", got, kerr.CoordinatorNotAvailable)
-		}
-	case <-timer.C:
-		t.Fatal("Errors() did not deliver the leave error")
-	}
-	if _, open := <-c.Errors(); open {
-		t.Fatal("Errors() is still open after Release")
-	}
-	select {
-	case _, open := <-c.Messages():
-		if open {
-			t.Fatal("Messages() delivered a message after Release")
-		}
-	case <-timer.C:
-		t.Fatal("Messages() was not closed by Release")
-	}
-	if err := c.Release(context.Background()); err != nil {
-		t.Fatalf("second Release = %v, want nil", err)
+			err := test.teardown(c, context.Background())
+			if !errors.Is(err, kerr.CoordinatorNotAvailable) {
+				t.Fatalf("%s error = %v, want it to wrap %v", test.name, err, kerr.CoordinatorNotAvailable)
+			}
+			if leaveTestConsumerRegistered(c) {
+				t.Fatal("consumer is still registered after a leave that finished with an error")
+			}
+			timer := clock.NewReal().Timer(time.Second)
+			defer timer.Stop()
+			select {
+			case got, open := <-c.Errors():
+				if !open {
+					t.Fatal("Errors() closed before delivering the leave error")
+				}
+				if !errors.Is(got, kerr.CoordinatorNotAvailable) {
+					t.Fatalf("Errors() delivered %v, want it to wrap %v", got, kerr.CoordinatorNotAvailable)
+				}
+			case <-timer.C:
+				t.Fatal("Errors() did not deliver the leave error")
+			}
+			if _, open := <-c.Errors(); open {
+				t.Fatalf("Errors() is still open after %s", test.name)
+			}
+			select {
+			case _, open := <-c.Messages():
+				if open {
+					t.Fatalf("Messages() delivered a message after %s", test.name)
+				}
+			case <-timer.C:
+				t.Fatalf("Messages() was not closed by %s", test.name)
+			}
+			if err := test.teardown(c, context.Background()); err != nil {
+				t.Fatalf("second %s = %v, want nil", test.name, err)
+			}
+		})
 	}
 }
 
@@ -178,51 +189,6 @@ func TestWaitForLeavePrefersAFinishedOutcome(t *testing.T) {
 		if !errors.Is(err, wantErr) {
 			t.Fatalf("waitForLeave error = %v, want %v", err, wantErr)
 		}
-	}
-}
-
-// TestStopTearsDownAfterAFailedLeave covers a Stop with no Drain before it, so
-// the leave is met inside the stop's own drain step: the consumer has to be
-// torn down anyway, and the error stays visible on both channels out.
-func TestStopTearsDownAfterAFailedLeave(t *testing.T) {
-	const destination = "stop-failed"
-	connection := newLeaveTestConnection(destination)
-	c := newLeaveTestConsumer(t, connection, destination, 1)
-	c.leaveFn = func(context.Context, leaveRequest) error { return kerr.CoordinatorNotAvailable }
-
-	err := c.Stop(context.Background())
-	if !errors.Is(err, kerr.CoordinatorNotAvailable) {
-		t.Fatalf("Stop error = %v, want it to wrap %v", err, kerr.CoordinatorNotAvailable)
-	}
-	if leaveTestConsumerRegistered(c) {
-		t.Fatal("consumer is still registered after a leave that finished with an error")
-	}
-	timer := clock.NewReal().Timer(time.Second)
-	defer timer.Stop()
-	select {
-	case got, open := <-c.Errors():
-		if !open {
-			t.Fatal("Errors() closed before delivering the leave error")
-		}
-		if !errors.Is(got, kerr.CoordinatorNotAvailable) {
-			t.Fatalf("Errors() delivered %v, want it to wrap %v", got, kerr.CoordinatorNotAvailable)
-		}
-	case <-timer.C:
-		t.Fatal("Errors() did not deliver the leave error")
-	}
-	if _, open := <-c.Errors(); open {
-		t.Fatal("Errors() is still open after Stop")
-	}
-	select {
-	case _, open := <-c.Messages():
-		if open {
-			t.Fatal("Messages() delivered a message after Stop")
-		}
-	case <-timer.C:
-		t.Fatal("Messages() was not closed by Stop")
-	}
-	if err := c.Stop(context.Background()); err != nil {
-		t.Fatalf("second Stop = %v, want nil", err)
 	}
 }
 

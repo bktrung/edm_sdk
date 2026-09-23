@@ -51,6 +51,19 @@ func TestOpenRefusesInsecureTLSOffLoopback(t *testing.T) {
 	assertFatalOpenError(t, err, "insecure TLS is only allowed for a test endpoint")
 }
 
+func TestOpenRefusesURIEndpointsWithoutEchoingThem(t *testing.T) {
+	for _, endpoint := range []string{"kafka://user:secret-value@127.0.0.1:1", "user:secret-value@127.0.0.1:1"} {
+		_, err := (Driver{}).Open(context.Background(), driver.Config{
+			Endpoints:      []string{endpoint},
+			ConnectTimeout: 100 * time.Millisecond,
+		})
+		assertFatalOpenError(t, err, "must be host:port")
+		if strings.Contains(err.Error(), "secret-value") || strings.Contains(err.Error(), "user") {
+			t.Fatalf("Open error %q echoes the endpoint's credentials", err)
+		}
+	}
+}
+
 func TestMakeTLSConfigUsesConfiguredServerName(t *testing.T) {
 	for _, test := range []struct {
 		name       string

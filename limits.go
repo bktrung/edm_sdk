@@ -8,14 +8,16 @@ import (
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/driver"
 )
 
-// Limits describes how the connected broker provides each SDK feature.
+// Limits describes the selected driver's capabilities and the mode used for
+// each SDK feature. Its zero value contains no driver or features.
 type Limits struct {
 	Driver   string
 	Broker   string
 	Features []FeatureStatus
 }
 
-// FeatureStatus describes one feature under the connected broker.
+// FeatureStatus describes one feature's availability under the connected
+// driver.
 type FeatureStatus struct {
 	Feature string
 	Mode    FeatureMode
@@ -23,6 +25,7 @@ type FeatureStatus struct {
 }
 
 // FeatureMode describes whether a feature is native, emulated, or unavailable.
+// Its zero value, FeatureNative, means the driver provides the feature directly.
 type FeatureMode int
 
 const (
@@ -34,8 +37,40 @@ const (
 	FeatureUnavailable
 )
 
+// capabilityName is the reported name of one capability entry. limitsFor
+// declares each entry with one of these values and the warning decision reads
+// the same value, so the name a decision compares against is the name the
+// report carries: a rename or a typo is a compile error at one declaration
+// instead of a silent detach between two literals.
+type capabilityName string
+
+const (
+	capabilityPerMessageAck    capabilityName = "per_message_ack"
+	capabilityOrderedByKey     capabilityName = "ordered_by_key"
+	capabilityPriorityFairness capabilityName = "priority_fairness"
+	capabilityNativeDelay      capabilityName = "native_delay"
+	capabilityDeliveryCount    capabilityName = "delivery_count"
+	capabilityDLQBackstop      capabilityName = "dlq_backstop"
+	capabilityLagMetrics       capabilityName = "lag_metrics"
+	capabilityConsumerScaling  capabilityName = "consumer_scaling"
+)
+
+// capabilityRequired reports whether a capability the connected driver reports
+// as unavailable is one the loaded configuration asks for, which is the case
+// that logs a warning rather than an information line. Ordered delivery is the
+// one: the core emulates it, so a subscription that asked for it runs on a
+// promise the driver does not make.
+//
+// The reported feature is a string because FeatureStatus.Feature is the public
+// name a caller reads, so the comparison converts the declared name here, in
+// the package that declares it.
+//
+// It reads the loaded configuration and not the live runners, so a subscription
+// passed straight to Subscribe is not counted and a configured subscription that
+// is never subscribed is. That is deliberate: the report describes what this
+// client's configuration asked of the driver.
 func capabilityRequired(c *Client, feature string) bool {
-	if c == nil || feature != "ordered_by_key" {
+	if c == nil || feature != string(capabilityOrderedByKey) {
 		return false
 	}
 	for _, subscription := range c.config.Subscriptions {
@@ -110,35 +145,35 @@ func (c *Client) Limits() Limits {
 }
 
 func limitsFor(driverName string, info driver.BrokerInfo, caps driver.Capabilities) Limits {
-	feature := func(name string, enabled bool, missing FeatureMode) FeatureStatus {
+	feature := func(name capabilityName, enabled bool, missing FeatureMode) FeatureStatus {
 		if enabled {
-			return FeatureStatus{Feature: name, Mode: FeatureNative}
+			return FeatureStatus{Feature: string(name), Mode: FeatureNative}
 		}
-		return FeatureStatus{Feature: name, Mode: missing}
+		return FeatureStatus{Feature: string(name), Mode: missing}
 	}
 	// native_delay carries the accuracy the connected driver's deferral path
 	// delivers, so an application plans against a stated bound rather than
 	// against the folklore that a delay is roughly honoured.
-	nativeDelay := feature("native_delay", caps.NativeDelay, FeatureEmulated)
+	nativeDelay := feature(capabilityNativeDelay, caps.NativeDelay, FeatureEmulated)
 	nativeDelay.Detail = delayAccuracyDetail(caps.DelayAccuracy)
-	perMessageAck := feature("per_message_ack", caps.PerMessageAck, FeatureEmulated)
+	perMessageAck := feature(capabilityPerMessageAck, caps.PerMessageAck, FeatureEmulated)
 	if caps.PerMessageAck {
 		perMessageAck.Detail = "the broker settles each message independently, so a slow message does not hold its lane's in-flight budget"
 	} else {
 		perMessageAck.Detail = "the core settles each message itself; settlement order is the core's, so a slow message holds its lane's in-flight budget"
 	}
 	priorityFairness := FeatureStatus{
-		Feature: "priority_fairness",
+		Feature: string(capabilityPriorityFairness),
 		Mode:    FeatureEmulated,
 		Detail:  "the core's scheduler substitutes weighted lanes, so fairness is per lane and not per broker",
 	}
-	deliveryCount := feature("delivery_count", caps.NativeDeliveryCount, FeatureEmulated)
+	deliveryCount := feature(capabilityDeliveryCount, caps.NativeDeliveryCount, FeatureEmulated)
 	if caps.NativeDeliveryCount {
 		deliveryCount.Detail = "the broker supplies a redelivery count to observer events, but handler code reads the core's one-based attempt count instead"
 	} else {
 		deliveryCount.Detail = "the core counts handler attempts in the envelope; retry copies increment that count, broker redeliveries do not, and a new publish resets it to one"
 	}
-	dlqBackstop := feature("dlq_backstop", caps.NativeDLQ, FeatureUnavailable)
+	dlqBackstop := feature(capabilityDLQBackstop, caps.NativeDLQ, FeatureUnavailable)
 	if caps.NativeDLQ {
 		dlqBackstop.Detail = "the broker routes an exhausted message to its dead-letter destination; the core also has a successor publish path, but this feature reports only broker-native dead-letter routing"
 	} else {
@@ -146,12 +181,12 @@ func limitsFor(driverName string, info driver.BrokerInfo, caps driver.Capabiliti
 	}
 	return Limits{Driver: driverName, Broker: info.Display(), Features: []FeatureStatus{
 		perMessageAck,
-		feature("ordered_by_key", caps.OrderedByKey, FeatureUnavailable),
+		feature(capabilityOrderedByKey, caps.OrderedByKey, FeatureUnavailable),
 		priorityFairness,
 		nativeDelay,
 		deliveryCount,
 		dlqBackstop,
-		feature("lag_metrics", caps.LagQueryable, FeatureUnavailable),
-		{Feature: "consumer_scaling", Mode: FeatureNative, Detail: caps.ConsumerScaling.String()},
+		feature(capabilityLagMetrics, caps.LagQueryable, FeatureUnavailable),
+		{Feature: string(capabilityConsumerScaling), Mode: FeatureNative, Detail: caps.ConsumerScaling.String()},
 	}}
 }

@@ -10,6 +10,7 @@ import (
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/driver"
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/clock"
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/lifecycle"
+	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/version"
 )
 
 type lifecycleObserver struct {
@@ -83,8 +84,8 @@ func TestObserverDriverSelected(t *testing.T) {
 	if got.ServerAddress != "h" || got.ServerPort != 5672 {
 		t.Fatalf("server = %q,%d want h,5672", got.ServerAddress, got.ServerPort)
 	}
-	if got.DriverVersion != "" {
-		t.Fatalf("DriverVersion = %q, want empty", got.DriverVersion)
+	if got.SDKVersion != version.SDK() || got.SDKVersion == "" {
+		t.Fatalf("SDKVersion = %q, want the SDK version %q", got.SDKVersion, version.SDK())
 	}
 }
 
@@ -347,7 +348,7 @@ func TestObserverDrain(t *testing.T) {
 	rec := &lifecycleObserver{}
 	timeout := 5 * time.Second
 	runner, _ := newLifecycleDrainRunner(t, rec, timeout)
-	id := runner.inflight.Add(nilInbound())
+	id := runner.inflight.Add()
 	drainDone := make(chan error, 1)
 	go func() { drainDone <- runner.Drain(context.Background()) }()
 	waitLifecycleCondition(t, "drain start did not arrive", func() bool {
@@ -429,7 +430,7 @@ func TestObserverDrainContextEndsFirst(t *testing.T) {
 	t.Parallel()
 	rec := &lifecycleObserver{}
 	runner, _ := newLifecycleDrainRunner(t, rec, 5*time.Second)
-	runner.inflight.Add(nilInbound())
+	runner.inflight.Add()
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	err := runner.Drain(ctx)
@@ -453,10 +454,6 @@ func TestObserverDrainContextEndsFirst(t *testing.T) {
 	if finish.ErrorClass != errorClassOf(context.Canceled) {
 		t.Fatalf("drain class = %q, want %q", finish.ErrorClass, errorClassOf(context.Canceled))
 	}
-}
-
-func nilInbound() (msg driver.InboundMessage) {
-	return driver.InboundMessage{}
 }
 
 func waitLifecycleCondition(t *testing.T, msg string, cond func() bool) {

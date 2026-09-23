@@ -165,3 +165,34 @@ func waitForwarderDone(t *testing.T, c *consumer) {
 		t.Fatal("forwarder did not stop")
 	}
 }
+
+// TestSecondReleaseWaitsForTheReleaseInProgress pins that a Release retried
+// while the first one is still tearing the consumer down does not report
+// success early: the consumer is still registered on its connection until the
+// first finishes, and a caller told otherwise would close a connection that
+// refuses to close.
+func TestSecondReleaseWaitsForTheReleaseInProgress(t *testing.T) {
+	c := newForwarderTestConsumer()
+	c.forward.Add(1) // a forwarder that has not exited yet holds the first Release
+	first := make(chan error, 1)
+	go func() { first <- c.Release(context.Background()) }()
+	waitForwarderState(t, "the first Release to start", func() bool {
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		return c.stopped
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	if err := c.Release(ctx); err == nil {
+		t.Fatal("second Release() = nil while the first was still releasing")
+	}
+
+	c.forward.Done()
+	if err := <-first; err != nil {
+		t.Fatalf("first Release() = %v", err)
+	}
+	if err := c.Release(context.Background()); err != nil {
+		t.Fatalf("Release() after the first finished = %v, want nil", err)
+	}
+}

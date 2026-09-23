@@ -16,7 +16,7 @@ import (
 
 const generatedHeader = `# Observer event reference
 
-This page is generated from [` + "`observer.go`" + `](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/observer.go). Run ` + "`make check-observer-events`" + ` to verify it. Edit ` + "`observer.go`" + `; do not edit the generated tables.
+This page is generated from F1's observer event vocabulary in [` + "`observer.go`" + `](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/observer.go). Run ` + "`make check-observer-events`" + ` to verify it. Edit ` + "`observer.go`" + `; do not edit the generated tables.
 
 <!-- BEGIN GENERATED CONTENT -->
 `

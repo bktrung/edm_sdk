@@ -118,7 +118,7 @@ func TestRetriedDeliveryDoesNotCountAsHandled(t *testing.T) {
 		}))
 		settler := &dispatchSettler{}
 		message := retryBridgeMessage(t, envelope("retried"), settler)
-		id := runner.inflight.Add(message)
+		id := runner.inflight.Add()
 		processDelivery(runner, context.Background(), delivery{id: id, message: message})
 
 		if got := len(producer.messages); got != 1 {
@@ -141,7 +141,7 @@ func TestRetriedDeliveryDoesNotCountAsHandled(t *testing.T) {
 		}))
 		settler := &dispatchSettler{}
 		message := retryBridgeMessage(t, envelope("handled"), settler)
-		id := runner.inflight.Add(message)
+		id := runner.inflight.Add()
 		processDelivery(runner, context.Background(), delivery{id: id, message: message})
 
 		if got := len(producer.messages); got != 0 {
@@ -331,7 +331,7 @@ func TestGenerationStartLeavesTheDrainWindowAlone(t *testing.T) {
 		t.Fatal("the drain installed no settlement window")
 	}
 
-	beginRunnerGeneration(runner, captured, func() {})
+	beginRunnerGeneration(runner, func() {})
 	if got := runnerSettlementContext(runner, captured); got != window {
 		t.Fatal("starting a generation replaced the drain's settlement window")
 	}
@@ -392,7 +392,7 @@ func TestCleanupKeepsUnsettledDeliveryAccountedUntilSettled(t *testing.T) {
 	ctx, cancelRun := context.WithCancel(context.Background())
 	cancelRun()
 
-	id := runner.inflight.Add(message)
+	id := runner.inflight.Add()
 	processDelivery(runner, ctx, delivery{id: id, message: message})
 
 	nacks, acks, outstanding := settler.state()
@@ -458,7 +458,7 @@ func TestCleanupRemovesDeliveryOnlyWhenSettlementBudgetExhausts(t *testing.T) {
 	ctx, cancelRun := context.WithCancel(context.Background())
 	cancelRun()
 
-	id := runner.inflight.Add(message)
+	id := runner.inflight.Add()
 	processDelivery(runner, ctx, delivery{id: id, message: message})
 
 	nacks, _, outstanding := settler.state()
@@ -481,5 +481,104 @@ func TestCleanupRemovesDeliveryOnlyWhenSettlementBudgetExhausts(t *testing.T) {
 	}
 	if err := runner.inflight.WaitZero(context.Background()); err != nil {
 		t.Fatalf("WaitZero() after the budget was exhausted = %v, want nil: a drain must terminate", err)
+	}
+}
+
+// ackRetrySettler fails its first Ack and every Nack, so a cleanup that
+// retries the ack in kind settles it and one that keeps nacking cannot.
+type ackRetrySettler struct {
+	mu        sync.Mutex
+	ackCalls  int
+	nackCalls int
+	acked     bool
+}
+
+func (s *ackRetrySettler) Ack(context.Context) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.ackCalls++
+	if s.ackCalls == 1 {
+		return &driver.Error{Driver: "test", Op: "ack", K: driver.KindTransient, Err: errors.New("injected transient ack failure")}
+	}
+	s.acked = true
+	return nil
+}
+
+func (s *ackRetrySettler) Nack(context.Context, driver.NackOptions) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.nackCalls++
+	return &driver.Error{Driver: "test", Op: "nack", K: driver.KindTransient, Err: errors.New("injected transient nack failure")}
+}
+
+// TestCancelPathCleanupRequeuesUntilTheNackSettles proves the delivery a
+// cancellation path takes back off the channel runs the same bounded cleanup as
+// a dispatched one: a nack that fails once is retried, and the registry entry
+// stays until the driver reports the delivery settled.
+func TestCancelPathCleanupRequeuesUntilTheNackSettles(t *testing.T) {
+	_, runner, _ := newSettlementOrderingRunner(t)
+	settler := &scriptedNackSettler{failFirst: 1}
+	// Every attempt must still see the delivery: the entry may not leave while
+	// the broker still owns the message.
+	var lenDuringBudget []int
+	settler.onNack = func() {
+		lenDuringBudget = append(lenDuringBudget, runner.inflight.Len())
+	}
+	envelope := Envelope{
+		SpecVersion: "1.0",
+		ID:          "cancel-requeue",
+		Source:      "/test/orders",
+		Type:        "orders.created.v1",
+		Priority:    PriorityHigh,
+		Attempt:     1,
+	}
+	message := retryBridgeMessage(t, envelope, settler)
+
+	ctx, cancelRun := context.WithCancel(context.Background())
+	cancelRun()
+
+	if enqueueDelivery(runner, ctx, make(chan delivery), message) {
+		t.Fatal("enqueueDelivery() accepted a delivery the cancelled context refused")
+	}
+
+	nacks, acks, outstanding := settler.state()
+	if acks != 0 {
+		t.Fatalf("Ack calls = %d, want 0: the cancel path requeues", acks)
+	}
+	if nacks != 2 {
+		t.Fatalf("Nack calls = %d, want 2: the failed requeue must be retried within the cleanup budget", nacks)
+	}
+	if outstanding {
+		t.Fatal("settler reported the delivery settled, want it retained until a Nack succeeded")
+	}
+	if len(lenDuringBudget) != 2 {
+		t.Fatalf("nack hooks = %d, want 2", len(lenDuringBudget))
+	}
+	for attempt, length := range lenDuringBudget {
+		if length != 1 {
+			t.Fatalf("inflight length during nack %d = %d, want 1: the entry stays while the driver still owns the delivery", attempt+1, length)
+		}
+	}
+	if got := runner.inflight.Len(); got != 0 {
+		t.Fatalf("inflight length = %d, want 0 once the delivery settled", got)
+	}
+	if err := runner.inflight.WaitZero(context.Background()); err != nil {
+		t.Fatalf("WaitZero() after the delivery settled = %v, want nil", err)
+	}
+}
+
+func TestCleanupRetriesAFailedAckInKindAfterTheRequeueFallback(t *testing.T) {
+	_, runner, _ := newSettlementOrderingRunner(t)
+	settler := &ackRetrySettler{}
+	envelope := Envelope{SpecVersion: "1.0", ID: "ack-retry", Source: "/test/orders", Type: "orders.created.v1", Priority: PriorityHigh, Attempt: 1}
+	message := retryBridgeMessage(t, envelope, settler)
+	state := &deliveryState{attempted: true, operation: settlementOperationAck}
+
+	retryDeliverySettlement(runner, context.Background(), message, state)
+
+	settler.mu.Lock()
+	defer settler.mu.Unlock()
+	if !settler.acked || !state.settled {
+		t.Fatalf("acked = %v, settled = %v after Ack calls = %d and Nack calls = %d, want the ack retried in kind", settler.acked, state.settled, settler.ackCalls, settler.nackCalls)
 	}
 }

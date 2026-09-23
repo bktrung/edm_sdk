@@ -116,20 +116,25 @@ func delayAccuracyForLadder(rungs []time.Duration) driver.DelayAccuracy {
 	return accuracy
 }
 
-// Capabilities reports the RabbitMQ behavior used by this driver.
+// Capabilities reports the default RabbitMQ capabilities: per-message
+// acknowledgements, key ordering, fanout at publish time, unrestricted
+// consumer scaling, and lag queries. It reports no native priority: the
+// driver declares no x-max-priority queue and sets no AMQP message priority,
+// because the core carries priority in its own per-priority destinations. It also
+// reports bounded delay accuracy for parking queues, but does not advertise
+// native delay support. A connection using classic queues does not report
+// native delivery counts or native dead-letter queues.
 func (Driver) Capabilities() driver.Capabilities {
 	return driver.Capabilities{
-		PerMessageAck:        true,
-		OrderedByKey:         true,
-		NativePriority:       driver.PriorityStrict,
-		NativePriorityLevels: 32,
-		NativeDelay:          false,
-		DelayAccuracy:        delayAccuracyForLadder(parkRungs[:]),
-		NativeDeliveryCount:  true,
-		NativeDLQ:            true,
-		ConsumerScaling:      driver.ScalingFree,
-		Fanout:               driver.FanoutAtPublish,
-		LagQueryable:         true,
+		PerMessageAck:       true,
+		OrderedByKey:        true,
+		NativeDelay:         false,
+		DelayAccuracy:       delayAccuracyForLadder(parkRungs[:]),
+		NativeDeliveryCount: true,
+		NativeDLQ:           true,
+		ConsumerScaling:     driver.ScalingFree,
+		Fanout:              driver.FanoutAtPublish,
+		LagQueryable:        true,
 	}
 }
 
@@ -155,6 +160,16 @@ func (Driver) Open(ctx context.Context, cfg driver.Config) (driver.Conn, error) 
 	if err != nil {
 		return nil, classify("open", driver.KindFatal, err)
 	}
+	// The AMQP settings, TLS material included, are the same for every
+	// endpoint and every attempt, so a file that fails to load is a
+	// configuration error: retrying the dial cannot fix it.
+	if len(cfg.Endpoints) == 0 {
+		return nil, classify("open", driver.KindFatal, errMissingEndpoints)
+	}
+	amqpConfig, err := makeAMQPConfig(cfg)
+	if err != nil {
+		return nil, classify("open", driver.KindFatal, err)
+	}
 	openCtx := ctx
 	if cfg.ConnectTimeout > 0 {
 		var cancel context.CancelFunc
@@ -162,9 +177,6 @@ func (Driver) Open(ctx context.Context, cfg driver.Config) (driver.Conn, error) 
 		defer cancel()
 	}
 
-	if len(cfg.Endpoints) == 0 {
-		return nil, classify("open", driver.KindFatal, errMissingEndpoints)
-	}
 	endpoints := cfg.Endpoints
 	var lastErr error
 	for {
@@ -175,7 +187,7 @@ func (Driver) Open(ctx context.Context, cfg driver.Config) (driver.Conn, error) 
 			if err := validateEndpoint(endpoint); err != nil {
 				return nil, classify("open", driver.KindFatal, err)
 			}
-			conn, err := dial(openCtx, endpoint, cfg)
+			conn, err := dial(openCtx, endpoint, amqpConfig, cfg.ConnectTimeout)
 			if err == nil {
 				managedConn, connErr := newConn(conn, capabilitiesForQueueKind(queueKind), endpoint, cfg, queueKind, trustBrokerTimestamp, brokerPrefetch)
 				if connErr != nil {
@@ -226,6 +238,10 @@ type conn struct {
 	closeFault      atomic.Bool
 	deferred        map[string]time.Duration
 	fixed           map[string]time.Duration
+	// durabilityUpgrades holds the destinations whose non-durable declaration
+	// this connection has already reported as upgraded to durable, so the
+	// report is one per destination rather than one per ensure topology pass.
+	durabilityUpgrades map[string]struct{}
 	// Publishing-block state, deliberately outside mu: Ping reads it on every
 	// health probe and the publish path reads it before every write, so neither
 	// may queue behind topology or consumer-admission work that wants a write
@@ -447,14 +463,37 @@ func (c *conn) log() *slog.Logger {
 	return c.logger
 }
 
+// reportDurabilityUpgrade records that destination was declared durable
+// although the spec asked for non-durable, and warns about it once. A quorum
+// queue is durable by definition, so a quorum deployment cannot honor the
+// request; the destination is then not what the caller asked for, and a silent
+// upgrade is a destination an operator cannot tell from the one they
+// configured.
+func (c *conn) reportDurabilityUpgrade(destination string) {
+	c.mu.Lock()
+	if c.durabilityUpgrades == nil {
+		c.durabilityUpgrades = make(map[string]struct{})
+	}
+	_, reported := c.durabilityUpgrades[destination]
+	c.durabilityUpgrades[destination] = struct{}{}
+	c.mu.Unlock()
+	if reported {
+		return
+	}
+	c.log().Warn("RabbitMQ quorum queue kind declares a non-durable destination as durable", "destination", destination)
+}
+
+// Capabilities returns the capabilities of this connection.
 func (c *conn) Capabilities() driver.Capabilities { return c.caps }
 
+// BrokerInfo returns a copy of the connected broker metadata.
 func (c *conn) BrokerInfo() driver.BrokerInfo {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	return copyBrokerInfo(c.info)
 }
 
+// Producer creates a producer using cfg.
 func (c *conn) Producer(ctx context.Context, cfg driver.ProducerConfig) (driver.Producer, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, classify("producer", driver.KindTransient, err)
@@ -488,6 +527,7 @@ func (c *conn) Producer(ctx context.Context, cfg driver.ProducerConfig) (driver.
 	return producer, nil
 }
 
+// Consumer creates a consumer using cfg.
 func (c *conn) Consumer(ctx context.Context, cfg driver.ConsumerConfig) (driver.Consumer, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, classify("consumer", driver.KindTransient, err)
@@ -549,6 +589,7 @@ func (c *conn) consumerAdmissionLocked(cfg driver.ConsumerConfig) error {
 	return nil
 }
 
+// Admin returns the topology administration surface for this connection.
 func (c *conn) Admin() driver.Admin { return &admin{operations: &adminOperations{conn: c}} }
 
 func (c *conn) removeConsumer(consumer *consumer) {
@@ -557,6 +598,7 @@ func (c *conn) removeConsumer(consumer *consumer) {
 	c.mu.Unlock()
 }
 
+// Ping checks whether the RabbitMQ connection is reachable.
 func (c *conn) Ping(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
 		return classify("ping", driver.KindTransient, err)
@@ -587,6 +629,7 @@ func (c *conn) Ping(ctx context.Context) error {
 	return nil
 }
 
+// Close releases the connection after its producers and consumers have closed.
 func (c *conn) Close(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
 		return classify("close", driver.KindTransient, err)
@@ -676,17 +719,18 @@ func (c *conn) Close(ctx context.Context) error {
 	return nil
 }
 
-func dial(ctx context.Context, endpoint string, cfg driver.Config) (*amqp.Connection, error) {
-	amqpConfig, err := makeAMQPConfig(cfg)
-	if err != nil {
-		return nil, err
-	}
-	timeout := cfg.ConnectTimeout
+func dial(ctx context.Context, endpoint string, amqpConfig amqp.Config, connectTimeout time.Duration) (*amqp.Connection, error) {
+	timeout := connectTimeout
 	if timeout <= 0 || timeout > 30*time.Second {
 		timeout = 30 * time.Second
 	}
 	dialer := &net.Dialer{Timeout: timeout}
 	amqpConfig.Dial = dialer.Dial
+	if amqpConfig.TLSClientConfig != nil {
+		// amqp091 writes the dialed host into an empty ServerName. Open shares
+		// one config across its endpoints, so each dial gets its own copy.
+		amqpConfig.TLSClientConfig = amqpConfig.TLSClientConfig.Clone()
+	}
 	result := make(chan *amqp.Connection, 1)
 	errResult := make(chan error, 1)
 	go func() {
@@ -703,9 +747,13 @@ func dial(ctx context.Context, endpoint string, cfg driver.Config) (*amqp.Connec
 	case err := <-errResult:
 		return nil, err
 	case <-ctx.Done():
+		// The dial still ends one way or the other; wait for either outcome so
+		// a dial that fails after the cancel does not strand this goroutine.
 		go func() {
-			if connection := <-result; connection != nil {
+			select {
+			case connection := <-result:
 				_ = connection.Close()
+			case <-errResult:
 			}
 		}()
 		return nil, ctx.Err()

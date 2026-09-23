@@ -22,23 +22,20 @@ func WithMeterProvider(provider metric.MeterProvider) Option {
 	return func(cfg *config) { cfg.meterProvider = provider }
 }
 
-// WithTracerProvider stores the application-owned provider that New uses to
-// create the Observer's tracer. If it is nil or unset, the Observer creates
-// no spans.
+// WithTracerProvider configures the provider used to create spans. A nil
+// provider disables span creation.
 func WithTracerProvider(provider trace.TracerProvider) Option {
 	return func(cfg *config) { cfg.tracerProvider = provider }
 }
 
-// WithPropagator stores the application-owned propagator that New uses to
-// inject and extract trace context. If it is nil or unset, propagation is
-// disabled.
+// WithPropagator configures trace context injection and extraction. A nil
+// propagator disables propagation.
 func WithPropagator(propagator propagation.TextMapPropagator) Option {
 	return func(cfg *config) { cfg.propagator = propagator }
 }
 
-// WithCreateSpans stores whether Observer.Start may create the message_built
-// span when a tracer is configured. It defaults to true; publish, process, and
-// settle spans are unaffected.
+// WithCreateSpans controls whether the Observer creates spans for
+// message_built events. It defaults to true and does not affect other span kinds.
 func WithCreateSpans(enabled bool) Option {
 	return func(cfg *config) { cfg.createSpans = enabled }
 }

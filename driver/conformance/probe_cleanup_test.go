@@ -5,6 +5,7 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/driver"
@@ -82,47 +83,39 @@ func TestInspectProbeReclaimsItsDestination(t *testing.T) {
 	}
 }
 
-func TestInspectProbeReclaimsItsDestinationDespiteARefusedPrune(t *testing.T) {
-	conn := newProbeTestConn()
-	conn.pruneRefusals = 2
-	const destination = "conformance.inspect.refused-prune.probe"
-	if _, err := conn.Admin().EnsureTopology(context.Background(), driver.TopologySpec{
-		Destinations: []driver.DestinationSpec{{Name: destination}},
-	}); err != nil {
-		t.Fatalf("EnsureTopology(%q): %v", destination, err)
-	}
+func TestProbeReclaimRetriesARefusedOrTransientPrune(t *testing.T) {
+	for _, test := range []struct {
+		name        string
+		destination string
+		fault       func(*probeTestConn, int)
+	}{
+		{name: "refused", destination: "conformance.inspect.refused-prune.probe", fault: func(conn *probeTestConn, n int) { conn.pruneRefusals = n }},
+		{name: "transient error", destination: "conformance.inspect.transient.probe", fault: func(conn *probeTestConn, n int) { conn.pruneTransientErrors = n }},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			// The bubble runs the cleanup's real retry waits on virtual time.
+			synctest.Test(t, func(t *testing.T) {
+				conn := newProbeTestConn()
+				const faults = 2
+				test.fault(conn, faults)
+				if _, err := conn.Admin().EnsureTopology(context.Background(), driver.TopologySpec{
+					Destinations: []driver.DestinationSpec{{Name: test.destination}},
+				}); err != nil {
+					t.Fatalf("EnsureTopology(%q): %v", test.destination, err)
+				}
 
-	errs := cleanupProfileErrors(context.Background(), conn, &recordingProbeProducer{events: &conn.events}, nil, destination)
-	if len(errs) != 0 {
-		t.Fatalf("cleanup errors = %v, want none", errs)
-	}
-	if want := conn.pruneRefusals + 1; conn.pruneCalls != want {
-		t.Fatalf("Prune calls = %d, want %d", conn.pruneCalls, want)
-	}
-	if _, err := conn.Admin().DescribeTopology(context.Background(), []string{destination}); !errors.Is(err, driver.ErrDestinationMissing) {
-		t.Fatalf("DescribeTopology(%q) after refused Prune = %v, want ErrDestinationMissing", destination, err)
-	}
-}
-
-func TestProbeReclaimSurvivesATransientPruneError(t *testing.T) {
-	conn := newProbeTestConn()
-	conn.pruneTransientErrors = 2
-	const destination = "conformance.inspect.transient.probe"
-	if _, err := conn.Admin().EnsureTopology(context.Background(), driver.TopologySpec{
-		Destinations: []driver.DestinationSpec{{Name: destination}},
-	}); err != nil {
-		t.Fatalf("EnsureTopology(%q): %v", destination, err)
-	}
-
-	errs := cleanupProfileErrors(context.Background(), conn, &recordingProbeProducer{events: &conn.events}, nil, destination)
-	if len(errs) != 0 {
-		t.Fatalf("cleanup errors = %v, want none", errs)
-	}
-	if want := conn.pruneTransientErrors + 1; conn.pruneCalls != want {
-		t.Fatalf("Prune calls = %d, want %d", conn.pruneCalls, want)
-	}
-	if _, err := conn.Admin().DescribeTopology(context.Background(), []string{destination}); !errors.Is(err, driver.ErrDestinationMissing) {
-		t.Fatalf("DescribeTopology(%q) after transient Prune errors = %v, want ErrDestinationMissing", destination, err)
+				errs := cleanupProfileErrors(context.Background(), conn, &recordingProbeProducer{events: &conn.events}, nil, test.destination)
+				if len(errs) != 0 {
+					t.Fatalf("cleanup errors = %v, want none", errs)
+				}
+				if want := faults + 1; conn.pruneCalls != want {
+					t.Fatalf("Prune calls = %d, want %d", conn.pruneCalls, want)
+				}
+				if _, err := conn.Admin().DescribeTopology(context.Background(), []string{test.destination}); !errors.Is(err, driver.ErrDestinationMissing) {
+					t.Fatalf("DescribeTopology(%q) after %s Prune = %v, want ErrDestinationMissing", test.destination, test.name, err)
+				}
+			})
+		})
 	}
 }
 

@@ -311,6 +311,7 @@ func TestAdmitReproducesEachCallSitePredicate(t *testing.T) {
 			state: admitState{lifecycle: lifecycle.Ready, connected: true, reconnectErr: admitTestExhaustion},
 			claim: 2,
 			want: admitWants{
+				publishEntry:      exhausted,
 				publish:           exhausted,
 				consumerAdmission: admitTestConsumeReconnecting,
 				reconnect:         exhausted,
@@ -357,13 +358,14 @@ func TestAdmitReproducesEachCallSitePredicate(t *testing.T) {
 			name:  "ready-live-connection-failed",
 			state: admitState{lifecycle: lifecycle.Ready, connected: true, reconnectErr: admitTestExhaustion},
 			want: admitWants{
-				publish: exhausted, reconnect: exhausted, health: exhausted,
+				publishEntry: exhausted, publish: exhausted, reconnect: exhausted, health: exhausted,
 			},
 		},
 		{
 			name:  "ready-live-reconnecting",
 			state: admitState{lifecycle: lifecycle.Ready, connected: true, conn: connReconnecting},
 			want: admitWants{
+				publishEntry:      admitTestPublishReconnecting,
 				publish:           admitTestPublishReconnecting,
 				consumerAdmission: admitTestConsumeReconnecting,
 				health:            reconnectText,
@@ -376,6 +378,7 @@ func TestAdmitReproducesEachCallSitePredicate(t *testing.T) {
 			name:  "ready-live-reconnecting-connection-failed",
 			state: admitState{lifecycle: lifecycle.Ready, connected: true, conn: connReconnecting, reconnectErr: admitTestExhaustion},
 			want: admitWants{
+				publishEntry:      exhausted,
 				publish:           exhausted,
 				consumerAdmission: admitTestConsumeReconnecting,
 				reconnect:         exhausted,
@@ -601,7 +604,8 @@ func claimName(s admitState, claim uint64) string {
 // branch is the predicate one of them ran, in the order it ran it, with the
 // stored lifecycle read where the flags behind it were read:
 //
-//   - the application publish's entry gate: shutdown begun, no connection;
+//   - the application publish's entry gate: shutdown begun, no connection,
+//     then the retained reconnect error, then a running attempt;
 //   - the shared publish admission: Closed, no connection, producer torn down,
 //     then the retained reconnect error, then a running attempt, then the
 //     caller's connection no longer being the client's. It never read a drain
@@ -623,6 +627,12 @@ func admitSiteAnswer(kind workKind, s admitState, claim uint64) string {
 	case workPublishEntry:
 		if shutdownBegan || !s.connected {
 			return "f1: client is closed"
+		}
+		if s.reconnectErr != nil {
+			return admitTestExhaustion.Error()
+		}
+		if s.conn == connReconnecting {
+			return admitTestPublishReconnecting
 		}
 	case workPublish:
 		if s.lifecycle == lifecycle.Closed || !s.connected || s.producerTeardown {
@@ -916,4 +926,14 @@ func connStateName(state connState) string {
 	default:
 		return "unknown-state"
 	}
+}
+
+// epochLocked returns the connection incarnation the client is on and the wake
+// that is released when that incarnation changes or when a reconnect attempt
+// ends. The caller holds c.mu, so the pair is one view: the epoch names the
+// connection the wake belongs to. Read c.attemptErr under the same lock after
+// the wake fires, and it carries the outcome of the attempt that released the
+// waiter.
+func (c *Client) epochLocked() (uint64, <-chan struct{}) {
+	return c.current.epoch, c.wakeLocked()
 }

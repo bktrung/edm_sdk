@@ -20,10 +20,12 @@ type settler struct {
 
 var _ driver.Settler = (*settler)(nil)
 
+// Ack acknowledges the delivery.
 func (s *settler) Ack(ctx context.Context) error {
 	return s.settle(ctx, driver.NackOptions{}, false)
 }
 
+// Nack negatively acknowledges the delivery. When Requeue is true, RabbitMQ can redeliver the message.
 func (s *settler) Nack(ctx context.Context, options driver.NackOptions) error {
 	return s.settle(ctx, options, true)
 }

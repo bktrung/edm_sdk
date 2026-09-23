@@ -112,7 +112,7 @@ func TestObserverSuccessorPreservesEnqueueFields(t *testing.T) {
 	message.EnqueuedAtSource = driver.EnqueueSourceBroker
 	var abandoned bool
 	var out Envelope
-	if !dispatchMessage(runner, context.Background(), message, &out, &abandoned) {
+	if !dispatchMessage(runner, context.Background(), message, &out, &abandoned, &deliveryState{}) {
 		t.Fatal("dispatchMessage did not settle")
 	}
 

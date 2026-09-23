@@ -23,7 +23,6 @@ f1:
   broker:
     driver: inmem
   codec:
-    contentMode: binary
   unknown: true
 `)
 	_, err := LoadConfig(path)
@@ -53,23 +52,6 @@ f1:
 	}
 }
 
-func TestLoadConfigRejectsUnsupportedKnownValue(t *testing.T) {
-	t.Parallel()
-	path := writeConfig(t, `
-f1:
-  env: test
-  service: orders
-  broker:
-    driver: inmem
-  codec:
-    contentMode: structured
-`)
-	_, err := LoadConfig(path)
-	if err == nil || !strings.Contains(err.Error(), "codec.contentMode") {
-		t.Fatalf("LoadConfig() error = %v, want contentMode error", err)
-	}
-}
-
 func TestLoadConfigFlattensBrokerOptions(t *testing.T) {
 	t.Parallel()
 	path := writeConfig(t, `
@@ -85,7 +67,6 @@ f1:
       sessionTimeout: 60s
       maxExpectedInstances: "3"
   codec:
-    contentMode: binary
 `)
 	cfg, err := LoadConfig(path)
 	if err != nil {
@@ -161,7 +142,6 @@ f1:
   broker:
     driver: inmem
   codec:
-    contentMode: binary
 `)
 	t.Setenv("F1_ENV", "environment")
 	cfg, err := LoadConfig(path)
@@ -202,7 +182,6 @@ f1:
   broker:
     driver: inmem
   codec:
-    contentMode: binary
   subscriptions:
     orders:
       topics: [com.za.order.created]
@@ -506,6 +485,9 @@ func TestValidateConfigRejectsProductionAliasEnvironments(t *testing.T) {
 		{name: "prd", env: "prd", wantErr: true},
 		{name: "staging", env: "staging", wantErr: false},
 		{name: "dev", env: "dev", wantErr: false},
+		{name: "production with a region suffix", env: "prod/us", wantErr: true},
+		{name: "production with a dotted suffix", env: "prod.us", wantErr: true},
+		{name: "hyphenated", env: "staging-eu", wantErr: false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -682,6 +664,57 @@ func TestValidateConfigRejectsInvalidSubscriptionModeAndPolicy(t *testing.T) {
 	cfg.Subscriptions["orders"] = sub
 	if err := validateConfiguredConfig(cfg); err == nil || !strings.Contains(err.Error(), "subscriptions.orders.unmatchedPolicy") {
 		t.Fatalf("validateConfiguredConfig() unmatched policy error = %v, want unsupported policy", err)
+	}
+}
+
+func TestValidateSubscriptionRejectsNamesThatSplitADestinationSegment(t *testing.T) {
+	cfg := validValidationConfig()
+	sub := cfg.Subscriptions["orders"]
+	// "orders.created" + "worker" and "orders" + "created.worker" would name
+	// the same queue if a dot were allowed in the subscription name.
+	for _, name := range []string{"created.worker", "billing/worker", "billing worker"} {
+		if err := validateSubscription(cfg, cfg.Broker.Driver, name, sub); err == nil || !strings.Contains(err.Error(), name) {
+			t.Fatalf("validateSubscription(%q) error = %v, want the name refused", name, err)
+		}
+	}
+	for _, name := range []string{"billing-worker", "billing_worker", "Worker2"} {
+		if err := validateSubscription(cfg, cfg.Broker.Driver, name, sub); err != nil {
+			t.Fatalf("validateSubscription(%q) error = %v, want nil", name, err)
+		}
+	}
+}
+
+func TestConfigAndSubscribeRejectTheSameSubscriptions(t *testing.T) {
+	cases := []struct {
+		name, want string
+		set        func(*SubscriptionConfig)
+	}{
+		{"duplicate topic", "name the same topic", func(sub *SubscriptionConfig) { sub.Topics = []string{"orders", "orders"} }},
+		{"versioned duplicate topic", "name the same topic", func(sub *SubscriptionConfig) { sub.Topics = []string{"orders", "orders.v2"} }},
+		{"negative budget", "fairness.budgets", func(sub *SubscriptionConfig) {
+			sub.Fairness.Budgets = map[Priority]time.Duration{PriorityMedium: -time.Second}
+		}},
+		{"negative retry weight divisor", "retryWeightDivisor", func(sub *SubscriptionConfig) { sub.Fairness.RetryWeightDivisor = -1 }},
+		{"negative prefetch factor", "prefetchFactor", func(sub *SubscriptionConfig) { sub.Fairness.PrefetchFactor = -1 }},
+		{"ordered buffer too large", "ordered mode", func(sub *SubscriptionConfig) {
+			sub.Mode = OrderedByKey
+			sub.Concurrency = 1024
+			sub.Prefetch = maxPrefetch
+		}},
+	}
+	for _, test := range cases {
+		t.Run(test.name, func(t *testing.T) {
+			cfg := validValidationConfig()
+			sub := cfg.Subscriptions["orders"]
+			test.set(&sub)
+			cfg.Subscriptions["orders"] = sub
+			if err := validateConfig(cfg, cfg.Broker.Driver); err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("validateConfig() error = %v, want %s", err, test.want)
+			}
+			if err := validateSubscription(cfg, cfg.Broker.Driver, "orders", sub); err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("validateSubscription() error = %v, want %s", err, test.want)
+			}
+		})
 	}
 }
 
@@ -921,6 +954,16 @@ func invalidRetryValueCases() []struct {
 		{name: "negative infinity multiplier", field: "multiplier", set: func(cfg *RetryConfig) { cfg.Multiplier = math.Inf(-1) }},
 		{name: "negative max interval", field: "maxInterval", set: func(cfg *RetryConfig) { cfg.MaxInterval = -time.Second }},
 		{name: "negative retry tier", field: "tiers", set: func(cfg *RetryConfig) { cfg.Tiers = []time.Duration{-time.Second} }},
+		{name: "retry tier past the longest delay", field: "longest retry delay", set: func(cfg *RetryConfig) {
+			cfg.Tiers = []time.Duration{maxRetryDelay + time.Millisecond}
+		}},
+		{name: "backoff past the longest delay", field: "longest retry delay", set: func(cfg *RetryConfig) {
+			cfg.MaxAttempts = 3
+			cfg.Tiers = nil
+			cfg.InitialInterval = 30 * 24 * time.Hour
+			cfg.Multiplier = 1
+			cfg.MaxInterval = 0
+		}},
 	}
 }
 
@@ -1020,7 +1063,7 @@ func TestNormalizeConfigAcceptsMinimalHandBuiltConfig(t *testing.T) {
 		t.Fatalf("validateConfiguredConfig() after normalization: %v", err)
 	}
 	defaults := defaultConfig()
-	if cfg.Codec.ContentMode != defaults.Codec.ContentMode || cfg.Codec.MaxHeaderBytes != defaults.Codec.MaxHeaderBytes || cfg.Codec.MaxBodyBytes != defaults.Codec.MaxBodyBytes {
+	if cfg.Codec.MaxHeaderBytes != defaults.Codec.MaxHeaderBytes || cfg.Codec.MaxBodyBytes != defaults.Codec.MaxBodyBytes {
 		t.Fatalf("codec defaults = %#v, want %#v", cfg.Codec, defaults.Codec)
 	}
 	if !reflect.DeepEqual(cfg.Topology.Priorities, defaults.Topology.Priorities) || cfg.Lifecycle != defaults.Lifecycle {

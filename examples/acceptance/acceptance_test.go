@@ -174,7 +174,6 @@ func acceptanceFlowConfig() f1.Config {
 		},
 		Codec: f1.CodecConfig{
 			Default:        "json",
-			ContentMode:    "binary",
 			MaxHeaderBytes: f1.CoreMaxHeaderBytes,
 			MaxBodyBytes:   1 << 20,
 		},

@@ -20,10 +20,10 @@ type backlogTarget struct {
 // clock's ticker and records one backlog_sampled per consume destination
 // present in the result. It returns when ctx ends.
 //
-// The destination table is built once from the subscription's topics and
-// priorities through consumeDestination, the same derivation
-// consumingTopicFamily uses, so destination strings are never parsed. A
-// retry-tier destination in the result is skipped, a driver error skips the
+// The destination table is the consume destinations this generation's
+// consumer was opened on, read once from the runner's destination metadata,
+// so capabilities that moved since the open cannot rename them and destination
+// strings are never parsed. A retry-tier destination in the result is skipped, a driver error skips the
 // tick silently, and an optional head timestamp is converted to client-clock
 // age without reporting a negative duration.
 //
@@ -34,19 +34,14 @@ func pollBacklog(r *Runner, ctx context.Context, consumer driver.Consumer) {
 	client := r.client
 	interval := client.backlogPollInterval
 	clk := client.options.clock
-	client.mu.Lock()
-	effective := client.effective
-	source := client.source
-	client.mu.Unlock()
-	subscription := r.subscription
-	targets := make(map[string]backlogTarget, len(subscription.Topics)*len(subscription.Priorities))
-	for _, topic := range subscription.Topics {
-		logical := topicFor(topic)
-		for _, priority := range subscription.Priorities {
-			destination := consumeDestination(effective, source, logical, priority, subscription.Name)
-			targets[destination] = backlogTarget{topic: logical, priority: priority}
+	r.mu.Lock()
+	targets := make(map[string]backlogTarget, len(r.destinationMetadata))
+	for destination, metadata := range r.destinationMetadata {
+		if metadata.tier == 0 {
+			targets[destination] = backlogTarget{topic: metadata.topic, priority: metadata.priority}
 		}
 	}
+	r.mu.Unlock()
 	backlogReader, hasBacklog := consumer.(driver.BacklogReader)
 	ticker := clk.Ticker(interval)
 	defer ticker.Stop()
@@ -61,42 +56,39 @@ func pollBacklog(r *Runner, ctx context.Context, consumer driver.Consumer) {
 		// cancellation stops both the tick wait and the call.
 		lagCtx, cancel := context.WithTimeout(ctx, interval)
 		var (
-			lag     map[string]int64
 			backlog map[string]driver.BacklogSample
 			err     error
 		)
 		if hasBacklog {
 			backlog, err = backlogReader.Backlog(lagCtx)
 		} else {
+			// The legacy read reports counts only, so it is normalised into
+			// the same sample shape here and both paths share one loop below:
+			// a second loop is a second place for the target lookup and the
+			// observation to drift.
+			var lag map[string]int64
 			lag, err = consumer.Lag(lagCtx)
+			if len(lag) > 0 {
+				backlog = make(map[string]driver.BacklogSample, len(lag))
+				for destination, count := range lag {
+					backlog[destination] = driver.BacklogSample{Lag: count}
+				}
+			}
 		}
 		cancel()
 		if err != nil {
 			continue
 		}
+		if len(backlog) == 0 {
+			continue
+		}
 		now := clk.Now()
-		if hasBacklog {
-			if len(backlog) == 0 {
-				continue
-			}
-			for _, destination := range slices.Sorted(maps.Keys(backlog)) {
-				target, ok := targets[destination]
-				if !ok {
-					continue
-				}
-				client.observeRecord(backlogPoint(now, subscription.Name, target, backlog[destination]))
-			}
-			continue
-		}
-		if len(lag) == 0 {
-			continue
-		}
-		for _, destination := range slices.Sorted(maps.Keys(lag)) {
+		for _, destination := range slices.Sorted(maps.Keys(backlog)) {
 			target, ok := targets[destination]
 			if !ok {
 				continue
 			}
-			client.observeRecord(backlogPoint(now, subscription.Name, target, driver.BacklogSample{Lag: lag[destination]}))
+			client.observeRecord(backlogPoint(now, r.subscription.Name, target, backlog[destination]))
 		}
 	}
 }

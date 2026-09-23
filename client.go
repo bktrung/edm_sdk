@@ -15,6 +15,7 @@ import (
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/driver"
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/clock"
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/lifecycle"
+	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/version"
 )
 
 var errClientReconnecting = errors.New("f1: client is reconnecting")
@@ -54,7 +55,19 @@ type currentConnection struct {
 	epoch uint64
 }
 
-// Client is an eagerly connected messaging client.
+// unreleasedConsumer is a consumer whose Release failed, kept with the
+// connection epoch it was opened on. A driver keeps such a consumer
+// registered, so the connection it belongs to refuses to close until a later
+// Release succeeds: the client owes it one more attempt, on the next Client
+// close, and on the swap that retires the connection it belongs to.
+type unreleasedConsumer struct {
+	epoch    uint64
+	consumer driver.Consumer
+}
+
+// Client owns a broker connection and coordinates publishing, subscriptions,
+// health checks, and shutdown. Create a Client with New; its zero value is not
+// usable. Client methods may be called concurrently.
 type Client struct {
 	limits         Limits
 	effective      driver.Capabilities
@@ -99,6 +112,13 @@ type Client struct {
 	producerTeardown    bool
 	runners             map[*Runner]struct{}
 	failedSubscriptions []failedSubscription
+	// unreleasedConsumers holds the consumers whose Release failed and which
+	// the driver therefore still has registered, each with the connection
+	// epoch it was opened on. A kept consumer is released again before the
+	// connection that carries it is closed: by the next Client.Close for the
+	// live connection, and by the swap that retires the connection it belongs
+	// to.
+	unreleasedConsumers []unreleasedConsumer
 
 	// current is the connection the client is on and the number that names it.
 	// Its epoch is 1 for the connection New opened, and a nil conn means the
@@ -200,7 +220,7 @@ func New(ctx context.Context, cfg Config, opts ...Option) (*Client, error) {
 		driverName:          driverName,
 		config:              cfg,
 		source:              fmt.Sprintf("/%s/%s", cfg.Env, cfg.Service),
-		producer:            fmt.Sprintf("%s/unknown/%s", cfg.Service, cfg.InstanceID),
+		producer:            fmt.Sprintf("%s/%s/%s", cfg.Service, cfg.Env, cfg.InstanceID),
 		reconnectRequests:   make(chan reconnectRequest, 1),
 		reconnectRandom:     rand.Float64,
 		supervisorCtx:       supervisorCtx,
@@ -238,6 +258,7 @@ func New(ctx context.Context, cfg Config, opts ...Option) (*Client, error) {
 			Kind:          ObserverDriverSelected,
 			At:            client.options.clock.Now(),
 			DriverName:    driverName,
+			SDKVersion:    version.SDK(),
 			ServerAddress: client.serverAddress,
 			ServerPort:    client.serverPort,
 		})
@@ -310,8 +331,9 @@ func logTopologyDrift(logger *slog.Logger, diff driver.TopologyDiff) {
 	}
 }
 
-// Publisher returns a publisher using this client's connected driver and
-// configured codec.
+// Publisher returns a reusable publisher bound to this Client's connection and
+// configured codec. Publish calls through it may run concurrently. A nil Client
+// returns an unconnected Publisher.
 func (c *Client) Publisher() *Publisher {
 	return &Publisher{client: c}
 }
@@ -368,7 +390,9 @@ func logCapabilities(c *Client) {
 	}
 }
 
-// Health reports whether the connected broker and active subscriptions are healthy.
+// Health checks the broker connection and reports stopped subscription runners.
+// It returns a ping error, an admission error, or an error for unhealthy
+// subscriptions. A nil Client returns an error.
 func (c *Client) Health(ctx context.Context) error {
 	if c == nil {
 		return fmt.Errorf("f1: client is not connected")
@@ -471,16 +495,15 @@ func (c *Client) clearFailedSubscription(name string) {
 	})
 }
 
-// Close drains active work and releases the driver resources. It keeps the
-// Client retryable when a shutdown phase is still pending, while refusing new
-// work after shutdown has begun. A timed-out phase continues in the
-// background, and a retried Close rejoins it rather than starting a second
-// driver call. A resolved producer-close error is logged, joined into the
-// returned error, and does not prevent connection shutdown. A resolved
-// connection-close error leaves the Client retryable so a later Close can
-// attempt it again. Once all phases have finished, the Client is closed even
-// when one of them returned an error. A concurrent Close call returns an error
-// stating that shutdown is already in progress.
+// Close drains active work and releases the driver resources. It refuses new
+// work after shutdown begins, and waits up to Lifecycle.CloseTimeout for a
+// reconnect in progress to stop before it closes the connection. A timed-out phase continues in the background,
+// and a retry rejoins that phase instead of starting a duplicate driver call.
+// A producer-close error is returned but does not prevent connection shutdown.
+// A connection-close error leaves the Client retryable; once all phases finish,
+// the Client is closed even if a phase returned an error. A concurrent call
+// returns an error while shutdown is in progress. A nil or fully closed Client
+// returns nil.
 func (c *Client) Close(ctx context.Context) error {
 	if c == nil {
 		return nil
@@ -498,7 +521,28 @@ func (c *Client) Close(ctx context.Context) error {
 	if err := c.waitForPublishes(ctx); err != nil {
 		return c.failClose(err)
 	}
+	if err := c.waitForSupervisor(ctx); err != nil {
+		return c.failClose(err)
+	}
 	return c.closeResources(ctx)
+}
+
+// waitForSupervisor waits, bounded by Lifecycle.CloseTimeout, for the
+// reconnect supervisor that beginClose cancelled to return, so a reconnect
+// still retiring its old connection finishes before Close closes the current
+// one and returns. A retried Close waits again.
+func (c *Client) waitForSupervisor(ctx context.Context) error {
+	if c.supervisorDone == nil {
+		return nil
+	}
+	return runWithClockTimeout(ctx, c.options.clock, c.config.Lifecycle.CloseTimeout, "reconnect", func(waitCtx context.Context) error {
+		select {
+		case <-c.supervisorDone:
+			return nil
+		case <-waitCtx.Done():
+			return waitCtx.Err()
+		}
+	})
 }
 
 func (c *Client) beginClose() ([]*Runner, bool, error) {
@@ -607,11 +651,96 @@ func (c *Client) waitForPublishes(ctx context.Context) error {
 	})
 }
 
+// keepUnreleasedConsumer records a consumer whose Release failed, with the
+// connection epoch it was opened on. The driver still has the consumer
+// registered, which is what makes the connection carrying it refuse to close,
+// so the client owes it one more release. A consumer that is already kept is
+// kept once: a second failed release of the same consumer is the same entry.
+func (c *Client) keepUnreleasedConsumer(consumer driver.Consumer, epoch uint64) {
+	if c == nil || consumer == nil {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for _, kept := range c.unreleasedConsumers {
+		if kept.consumer == consumer {
+			return
+		}
+	}
+	c.unreleasedConsumers = append(c.unreleasedConsumers, unreleasedConsumer{epoch: epoch, consumer: consumer})
+}
+
+// forgetUnreleasedConsumer drops one kept consumer whose release attempt
+// resolved it, either because it released or because the connection it
+// belonged to is gone.
+func (c *Client) forgetUnreleasedConsumer(entry unreleasedConsumer) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.unreleasedConsumers = slices.DeleteFunc(c.unreleasedConsumers, func(kept unreleasedConsumer) bool {
+		return kept.consumer == entry.consumer
+	})
+}
+
+// releaseKeptConsumers re-releases the consumers a failed Release left
+// registered on the driver, bounded by Lifecycle.CloseTimeout, before the
+// connection carrying them is closed. Each success drops the entry; each
+// failure keeps it and is returned joined, so a retried Client.Close attempts
+// it again. This is the second attempt the client owes a consumer whose
+// teardown failed while the client was still running, and it is what lets a
+// close that failed once succeed on a later call.
+func (c *Client) releaseKeptConsumers(ctx context.Context) error {
+	c.mu.Lock()
+	kept := append([]unreleasedConsumer(nil), c.unreleasedConsumers...)
+	c.mu.Unlock()
+	var errs []error
+	for _, entry := range kept {
+		err := runWithClockTimeout(ctx, c.options.clock, c.config.Lifecycle.CloseTimeout, "close", entry.consumer.Release)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("f1: release consumer on connection epoch %d: %w", entry.epoch, err))
+			continue
+		}
+		c.forgetUnreleasedConsumer(entry)
+	}
+	return errors.Join(errs...)
+}
+
+// retireKeptConsumers releases the consumers kept for the connection epoch
+// being retired, bounded by Lifecycle.CloseTimeout, and forgets them whatever
+// the outcome. The connection they were opened on is being closed, so no later
+// path has it to release them through, and a failure is logged like every
+// other teardown step of that connection rather than kept for an attempt with
+// nothing left to release it against.
+func (c *Client) retireKeptConsumers(ctx context.Context, epoch uint64) {
+	c.mu.Lock()
+	kept := make([]unreleasedConsumer, 0, len(c.unreleasedConsumers))
+	for _, entry := range c.unreleasedConsumers {
+		if entry.epoch == epoch {
+			kept = append(kept, entry)
+		}
+	}
+	c.mu.Unlock()
+	for _, entry := range kept {
+		if err := runWithClockTimeout(ctx, c.options.clock, c.config.Lifecycle.CloseTimeout, "close", entry.consumer.Release); err != nil {
+			lastResortClientLogger(c).Warn("f1 kept consumer release failed while retiring the connection",
+				"epoch", entry.epoch, "error", err)
+		}
+		c.forgetUnreleasedConsumer(entry)
+	}
+}
+
 func (c *Client) closeResources(ctx context.Context) error {
 	c.mu.Lock()
 	producer := c.producerHandle
 	conn := c.current.conn
 	c.mu.Unlock()
+	// A consumer whose Release failed is still registered on the driver, and a
+	// driver refuses to close a connection that still carries one. Attempting
+	// it here is what makes the close that failed on that release succeed on a
+	// later call; a release the driver still refuses keeps the entry and fails
+	// this close, which stays retryable.
+	if err := c.releaseKeptConsumers(ctx); err != nil {
+		return c.failClose(err)
+	}
 	if producer == nil {
 		return c.closeConnection(ctx, conn, nil)
 	}
@@ -628,7 +757,7 @@ func (c *Client) closeProducer(ctx context.Context, producer driver.Producer) (e
 	c.mu.Unlock()
 	if producerCloseWait == nil {
 		//nolint:contextcheck // this shutdown call must outlive the attempt and is rejoined on retry.
-		producerCloseWait = startShutdownPhase(context.Background(), producer.Close)
+		producerCloseWait = startPhase(context.Background(), producer.Close)
 		c.mu.Lock()
 		c.producerCloseWait = producerCloseWait
 		c.mu.Unlock()
@@ -663,7 +792,7 @@ func (c *Client) closeConnection(ctx context.Context, conn driver.Conn, producer
 	c.mu.Unlock()
 	if connCloseWait == nil {
 		//nolint:contextcheck // this shutdown call must outlive the attempt and is rejoined on retry.
-		connCloseWait = startShutdownPhase(context.Background(), conn.Close)
+		connCloseWait = startPhase(context.Background(), conn.Close)
 		c.mu.Lock()
 		c.connCloseWait = connCloseWait
 		c.mu.Unlock()
@@ -690,12 +819,6 @@ func (c *Client) finishClose(producerCloseErr error) error {
 	_ = c.lifecycle.Transition(lifecycle.Closed)
 	c.mu.Unlock()
 	return producerCloseErr
-}
-
-// startShutdownPhase starts a shutdown call with the context supplied by
-// Close. Close supplies Background so the call can outlive the attempt.
-func startShutdownPhase(ctx context.Context, fn func(context.Context) error) <-chan error {
-	return startPhase(ctx, fn)
 }
 
 func (c *Client) joinShutdownPhase(ctx context.Context, timeout time.Duration, phase string, done <-chan error) (error, bool) {
@@ -764,7 +887,7 @@ func (c *Client) sharedProducer(ctx context.Context, kind workKind, claim uint64
 	}
 	c.mu.Unlock()
 
-	built, err := conn.Producer(ctx, driver.ProducerConfig{RequireDurableAck: true, Effective: effective})
+	built, err := conn.Producer(ctx, driver.ProducerConfig{Effective: effective})
 	if err == nil && built == nil {
 		err = errNilProducer
 	}
@@ -812,13 +935,13 @@ func publishMessages(c *Client, ctx context.Context, messages ...driver.Outbound
 		// The driver's own failure is evidence about the connection; a driver
 		// that returned no producer at all said nothing about it.
 		if !errors.Is(result.buildErr, errNilProducer) {
-			requestReconnectOnTransient(c, result.buildErr, result.epoch)
+			requestReconnectOnTransient(ctx, c, result.buildErr, result.epoch)
 		}
 		return result.buildErr
 	}
 	defer endPublish(c)
 	err := result.producer.Publish(ctx, messages...)
-	requestReconnectOnTransient(c, err, result.epoch)
+	requestReconnectOnTransient(ctx, c, err, result.epoch)
 	return err
 }
 
@@ -843,8 +966,24 @@ func closeDiscardedProducer(c *Client, producer driver.Producer, ctx context.Con
 // untranslated reports KindTransient and reports it as classified. That default
 // is a retry hint for the caller and says nothing about the socket, so it must
 // not bring the connection down.
-func requestReconnectOnTransient(c *Client, err error, epoch uint64) {
+//
+// A call whose own context was canceled is not that evidence on its own: the
+// caller withdrew the call, so an error reporting that same cancellation is
+// about the caller, and a shutdown that cancels its in-flight publishes must
+// not start a reconnect. A driver error that reports something else is still
+// evidence, because a publish the caller gave up on can have failed on a
+// connection that was already broken when it was canceled. A context past its
+// deadline counts whenever the driver classified the error transient, because
+// a broker that stopped confirming is exactly what runs a publish out of time.
+//
+// The request itself carries no context: the attempt it starts runs on the
+// client's own supervisor context, so a request made from a canceled call is
+// already detached from that cancellation.
+func requestReconnectOnTransient(ctx context.Context, c *Client, err error, epoch uint64) {
 	if c == nil || err == nil {
+		return
+	}
+	if errors.Is(ctx.Err(), context.Canceled) && errors.Is(err, context.Canceled) {
 		return
 	}
 	if kind, classified := driver.Classify(err); !classified || kind != driver.KindTransient {

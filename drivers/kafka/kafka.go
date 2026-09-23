@@ -27,6 +27,7 @@ import (
 
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/driver"
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/clock"
+	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/version"
 )
 
 // A Conn owns one client for Ping, metadata, and broker configuration. The
@@ -44,9 +45,12 @@ var (
 
 var (
 	errMissingEndpoints = errors.New("kafka: broker endpoints must not be empty")
-	errBrokerConfig     = errors.New("kafka: invalid broker configuration")
-	errProtocolResponse = errors.New("kafka: invalid protocol response")
-	errConnClosing      = errors.New("kafka: connection is closing")
+	// errEndpointNotHostPort is fixed text on purpose: an endpoint written as a
+	// URI can carry a user name and password, and the error must not echo it.
+	errEndpointNotHostPort = errors.New("kafka: broker endpoints must be host:port; put credentials in broker.sasl")
+	errBrokerConfig        = errors.New("kafka: invalid broker configuration")
+	errProtocolResponse    = errors.New("kafka: invalid protocol response")
+	errConnClosing         = errors.New("kafka: connection is closing")
 )
 
 // Driver is a stateless Kafka driver factory.
@@ -108,19 +112,11 @@ func (Driver) Name() string {
 	return "kafka"
 }
 
-// Capabilities reports what every Kafka connection provides. Kafka consumes
-// with consumer groups, so parallelism is capped by the partition count, and
-// settles by offset, so there is no per-message acknowledgement and the broker
-// reports no redelivery count. The broker-derived limits are added by
-// brokerCapabilities once a connection has read them.
-//
-// No delay accuracy is declared. The driver does hold a deferred record and
-// release it from the poll loop once its due time arrives, but a record that is
-// not in hand at that moment waits on a fetch that no bound covers: the
-// per-destination hold pause and the unsettled budget both stop fetching with
-// no time limit, and a broker that is slow or unavailable stops it longer
-// still. Any number declared here would be a measured hope rather than a bound
-// the code holds to.
+// Capabilities reports the Kafka features available to every connection.
+// Consumer scaling is bounded by topic partitions. Settlements commit offsets
+// rather than individual messages, and native delivery counts and dead-letter
+// queues are unavailable. The driver supports key ordering, fanout at consume
+// time, and lag queries, but does not advertise native delay support.
 func (Driver) Capabilities() driver.Capabilities {
 	return driver.Capabilities{
 		PerMessageAck:       false,
@@ -168,6 +164,11 @@ func (Driver) Open(ctx context.Context, cfg driver.Config) (driver.Conn, error) 
 	}
 	if len(cfg.Endpoints) == 0 {
 		return nil, classify("open", driver.KindFatal, errMissingEndpoints)
+	}
+	for _, endpoint := range cfg.Endpoints {
+		if strings.Contains(endpoint, "://") || strings.Contains(endpoint, "@") {
+			return nil, classify("open", driver.KindFatal, errEndpointNotHostPort)
+		}
 	}
 
 	openCtx := ctx
@@ -479,11 +480,31 @@ func validateKafkaSessionTimeout(timeout time.Duration, settings brokerConfig) e
 	return nil
 }
 
+// kafkaSoftwareVersion fits version to the characters Kafka accepts in
+// ClientSoftwareVersion, letters, digits, '.' and '-', beginning and ending
+// with a letter or digit. A broker refuses the whole ApiVersions request
+// otherwise, so "(devel)" becomes "devel" and "v1.2.3+dirty" "v1.2.3-dirty".
+func kafkaSoftwareVersion(version string) string {
+	mapped := strings.Map(func(r rune) rune {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '.', r == '-':
+			return r
+		default:
+			return '-'
+		}
+	}, version)
+	trimmed := strings.Trim(mapped, ".-")
+	if trimmed == "" {
+		return "unknown"
+	}
+	return trimmed
+}
+
 func apiVersions(ctx context.Context, client *kgo.Client) (*kmsg.ApiVersionsResponse, error) {
 	request := kmsg.NewPtrApiVersionsRequest()
 	request.Version = 4
 	request.ClientSoftwareName = "f1-kafka-driver"
-	request.ClientSoftwareVersion = "1"
+	request.ClientSoftwareVersion = kafkaSoftwareVersion(version.SDK())
 	response, err := client.Request(ctx, request)
 	if err != nil {
 		return nil, err
@@ -519,8 +540,10 @@ func brokerInfo(metadata kadm.Metadata, versions *kmsg.ApiVersionsResponse) driv
 	return info
 }
 
+// Capabilities returns the capabilities of this connection.
 func (c *conn) Capabilities() driver.Capabilities { return c.caps }
 
+// BrokerInfo returns metadata for the connected Kafka brokers.
 func (c *conn) BrokerInfo() driver.BrokerInfo {
 	info := c.info
 	info.Nodes = append([]string(nil), c.info.Nodes...)
@@ -528,6 +551,7 @@ func (c *conn) BrokerInfo() driver.BrokerInfo {
 	return info
 }
 
+// Producer creates a producer using cfg.
 func (c *conn) Producer(ctx context.Context, cfg driver.ProducerConfig) (driver.Producer, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, classify("producer", driver.KindTransient, err)
@@ -555,10 +579,12 @@ func (c *conn) admissionError(operation string) error {
 	return nil
 }
 
+// Consumer creates a consumer group using cfg.
 func (c *conn) Consumer(ctx context.Context, cfg driver.ConsumerConfig) (driver.Consumer, error) {
 	return newConsumer(ctx, c, cfg)
 }
 
+// Admin returns the topology administration surface for this connection.
 func (c *conn) Admin() driver.Admin { return &admin{client: kadm.NewClient(c.client), conn: c} }
 
 func (c *conn) acquireLifecycle(ctx context.Context) error {
@@ -601,32 +627,7 @@ func (c *conn) log() *slog.Logger {
 	return c.logger
 }
 
-// destinationDelayAt reports the delay the destination had declared for a record
-// published at instant at, and whether it had declared one at all. A record
-// published before the destination's first declaration was not deferred by it,
-// which the caller reads as a zero delay and reports as ready.
-//
-// A record's timestamp is the publish instant rounded down to the millisecond
-// the broker stores, so a declaration anywhere inside that millisecond is in
-// force for the record. The conformance inspector is the only caller, as the
-// delay history's own comment says.
-func (c *conn) destinationDelayAt(destination string, at time.Time) (time.Duration, bool) {
-	latest := at.Truncate(kafkaTimestampPrecision).Add(kafkaTimestampPrecision)
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-	var (
-		delay time.Duration
-		known bool
-	)
-	for _, declared := range c.delays[destination] {
-		if declared.at.After(latest) {
-			break
-		}
-		delay, known = declared.delay, true
-	}
-	return delay, known
-}
-
+// Ping checks whether the Kafka cluster is reachable.
 func (c *conn) Ping(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
 		return classify("ping", driver.KindTransient, err)
@@ -637,6 +638,7 @@ func (c *conn) Ping(ctx context.Context) error {
 	return nil
 }
 
+// Close releases the connection after its producers and consumers have closed.
 func (c *conn) Close(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
 		return classify("close", driver.KindTransient, err)

@@ -3,9 +3,11 @@ package f1
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -14,6 +16,124 @@ import (
 
 	"golang.org/x/sync/errgroup"
 )
+
+// TestPendingDeliveryKeepsItsChannelEnqueueStamp proves a delivery's
+// deadline-promotion budget starts when the delivery leaves the fetch channel.
+// Four deliveries fill the lane while the one handler holds the pool, so the
+// fifth waits in the pipeline's pending slot, and every one of them leaves the
+// channel while the clock is still. The wait a promoted lane reports must
+// therefore measure the whole time from the channel, not only the part after
+// the full lane could take the delivery.
+//
+// Two things make the trace deterministic. The worker is held by a fake-clock
+// sleep that only this test advances, so no handler can return while the lane
+// fills. And the pending delivery names a family no lane feeds, so its enqueue
+// attempt logs the fallback warning: that line is written after the delivery's
+// enqueue stamp, which is when the test knows the clock can move without moving
+// the stamp with it.
+func TestPendingDeliveryKeepsItsChannelEnqueueStamp(t *testing.T) {
+	const (
+		holdDuration   = 30 * time.Minute
+		handlerAdvance = 20 * time.Second // Wider than the promotion rate-limit window, so every promotion is recorded.
+		deliveries     = 5                // One dispatched, three queued, one pending.
+	)
+	start := time.Unix(0, 0)
+	fake := clock.NewFake(start)
+	rec := &consumeRecordingObserver{}
+	var output logSink
+	client, runner := newRetryBridgeRunner(t, &dispatchProducer{}, "orders.created",
+		WithObserver(rec), withClock(fake), WithLogger(slog.New(slog.NewTextHandler(&output, nil))))
+	defer func() { _ = client.Close(context.Background()) }()
+	runner.subscription.Concurrency = 1
+	runner.subscription.Prefetch = 1
+	runner.subscription.HandlerTimeout = time.Hour
+	runner.subscription.Retry = RetryConfig{MaxAttempts: 1}
+	runner.subscription.Fairness = FairnessConfig{
+		Weights:        map[Priority]int{PriorityHigh: 1},
+		Budgets:        map[Priority]time.Duration{PriorityHigh: time.Second},
+		PrefetchFactor: 1,
+	}
+	runner.inflight = newInflightRegistry()
+	held := make(chan struct{})
+	var firstCall atomic.Bool
+	handler := HandlerFunc(func(ctx context.Context, _ *Event) error {
+		if firstCall.CompareAndSwap(false, true) {
+			if err := fake.SleepWithRegistration(ctx, holdDuration, func() { close(held) }); err != nil {
+				return err
+			}
+		}
+		fake.Advance(handlerAdvance)
+		return nil
+	})
+	runner.subscription.Handlers = map[string]Handler{"orders.created": handler, "payments.charged": handler}
+	messages := make([]driver.InboundMessage, 0, deliveries)
+	for i := range deliveries {
+		eventType := "orders.created"
+		if i == deliveries-1 {
+			// The pending delivery: no configured family names this event
+			// type's lane, so its enqueue attempt reaches the fallback lane,
+			// which the three queued deliveries have already filled.
+			eventType = "payments.charged"
+		}
+		messages = append(messages, retryBridgeMessage(t, Envelope{
+			SpecVersion: "1.0",
+			ID:          fmt.Sprintf("evt-stamp-%d", i),
+			Source:      "/test/orders",
+			Type:        eventType,
+			Priority:    PriorityHigh,
+			Attempt:     1,
+		}, &dispatchSettler{}))
+	}
+	dispatch := make(chan delivery)
+	go func() {
+		for _, message := range messages {
+			dispatch <- delivery{id: runner.inflight.Add(), message: message}
+		}
+		close(dispatch)
+	}()
+	pipelineDone := make(chan error, 1)
+	go func() {
+		pipelineDone <- runDispatchPipeline(runner, context.Background(), dispatch, runner.subscription.Prefetch)
+	}()
+	select {
+	case <-held:
+	case err := <-pipelineDone:
+		t.Fatalf("pipeline returned before the handler held the worker: %v", err)
+	case <-oneSecondTimer(t).C:
+		t.Fatal("handler did not hold the worker")
+	}
+	deadline := clock.NewReal().Timer(time.Second)
+	defer deadline.Stop()
+	poll := clock.NewReal().Ticker(time.Millisecond)
+	defer poll.Stop()
+	for !strings.Contains(output.String(), "routing to fallback lane") {
+		select {
+		case err := <-pipelineDone:
+			t.Fatalf("pipeline returned before the pending delivery reached its lane: %v", err)
+		case <-deadline.C:
+			t.Fatal("the pending delivery never reached a full lane")
+		case <-poll.C:
+		}
+	}
+	fake.Advance(holdDuration)
+	select {
+	case err := <-pipelineDone:
+		if err != nil {
+			t.Fatalf("runDispatchPipeline() error = %v, want nil", err)
+		}
+	case <-oneSecondTimer(t).C:
+		t.Fatal("pipeline did not drain after the worker was released")
+	}
+	promotions := promotionPoints(rec)
+	if len(promotions) == 0 {
+		t.Fatal("no deadline promotion was recorded")
+	}
+	for i, promotion := range promotions {
+		if want := promotion.At.Sub(start); promotion.LaneWait != want {
+			t.Fatalf("promotion %d lane wait = %v, want %v, the whole wait since its delivery left the channel", i, promotion.LaneWait, want)
+		}
+	}
+}
 
 func TestOversizeBodyDeadLettersBeforeHandlerRuns(t *testing.T) {
 	producer := &dispatchProducer{}
@@ -43,7 +163,7 @@ func TestOversizeBodyDeadLettersBeforeHandlerRuns(t *testing.T) {
 	settler := &dispatchSettler{}
 	message := driver.InboundMessage{Destination: "f1.test.orders.created.medium", Headers: headerSlice(headers), Body: []byte("oversize"), Settle: settler}
 	abandoned := false
-	if !dispatchMessage(runner, context.Background(), message, &Envelope{}, &abandoned) {
+	if !dispatchMessage(runner, context.Background(), message, &Envelope{}, &abandoned, &deliveryState{}) {
 		t.Fatal("oversize message was not settled")
 	}
 	if handled {
@@ -87,7 +207,7 @@ func TestDispatchSettlesMessagesWithoutDeliveryCount(t *testing.T) {
 		Settle:        settler,
 	}
 	abandoned := false
-	if !dispatchMessage(runner, context.Background(), message, &Envelope{}, &abandoned) {
+	if !dispatchMessage(runner, context.Background(), message, &Envelope{}, &abandoned, &deliveryState{}) {
 		t.Fatal("message was not settled")
 	}
 	if !settler.acked {
@@ -97,7 +217,7 @@ func TestDispatchSettlesMessagesWithoutDeliveryCount(t *testing.T) {
 	noCount.DeliveryCount = -1
 	noCountSettler := &dispatchSettler{}
 	noCount.Settle = noCountSettler
-	if !dispatchMessage(runner, context.Background(), noCount, &Envelope{}, &abandoned) {
+	if !dispatchMessage(runner, context.Background(), noCount, &Envelope{}, &abandoned, &deliveryState{}) {
 		t.Fatal("message without delivery count was not settled")
 	}
 	if !noCountSettler.acked {
@@ -125,7 +245,7 @@ func TestTerminalNotificationsCannotBlockSettlement(t *testing.T) {
 				}}
 				envelope := Envelope{SpecVersion: "1.0", ID: "evt-blocking", Source: "/test/orders", Type: "orders.created", Attempt: 1}
 				go func() {
-					result <- deadLetterAndSettle(runner, context.Background(), driver.InboundMessage{Destination: "orders", Settle: &dispatchSettler{}}, envelope, ReasonTerminal, errors.New("bad request"))
+					result <- deadLetterAndSettle(runner, context.Background(), driver.InboundMessage{Destination: "orders", Settle: &dispatchSettler{}}, envelope, ReasonTerminal, errors.New("bad request"), &deliveryState{})
 				}()
 			},
 		},
@@ -147,7 +267,9 @@ func TestTerminalNotificationsCannotBlockSettlement(t *testing.T) {
 					t.Fatal(err)
 				}
 				message := driver.InboundMessage{Destination: "orders", Headers: headerSlice(headers), Body: []byte(`{}`), Settle: &dispatchSettler{}}
-				go func() { result <- dispatchMessage(runner, context.Background(), message, &Envelope{}, new(bool)) }()
+				go func() {
+					result <- dispatchMessage(runner, context.Background(), message, &Envelope{}, new(bool), &deliveryState{})
+				}()
 			},
 		},
 	}
@@ -341,7 +463,7 @@ func TestProducerAttemptCapDoesNotCreateZeroRetryTier(t *testing.T) {
 	}}
 	settler := &dispatchSettler{}
 	envelope := Envelope{SpecVersion: "1.0", ID: "evt-cap", Source: "/test/orders", Type: "orders.created", Attempt: 1, MaxAttempts: 3}
-	if !retryAndSettle(runner, context.Background(), driver.InboundMessage{Destination: "orders", Settle: settler}, envelope, errors.New("temporary")) {
+	if !retryAndSettle(runner, context.Background(), driver.InboundMessage{Destination: "orders", Settle: settler}, envelope, errors.New("temporary"), &deliveryState{}) {
 		t.Fatal("producer-capped event was not settled")
 	}
 	if len(producer.messages) != 1 || !strings.Contains(producer.messages[0].Destination, ".dlq.") || strings.Contains(producer.messages[0].Destination, ".retry.0") {
@@ -693,7 +815,7 @@ func TestHandlerDeadlineIsRetriedAndPanicIsDeadLettered(t *testing.T) {
 				return context.DeadlineExceeded
 			}),
 		}
-		deadlineID := runner.inflight.Add(deadlineMessage)
+		deadlineID := runner.inflight.Add()
 		processDelivery(runner, context.Background(), delivery{id: deadlineID, message: deadlineMessage})
 
 		if got := len(producer.messages); got != 1 {
@@ -716,7 +838,7 @@ func TestHandlerDeadlineIsRetriedAndPanicIsDeadLettered(t *testing.T) {
 				panic("handler exploded")
 			}),
 		}
-		panicID := runner.inflight.Add(panicMessage)
+		panicID := runner.inflight.Add()
 		processDelivery(runner, context.Background(), delivery{id: panicID, message: panicMessage})
 
 		if got := len(producer.messages); got != 1 {
@@ -762,7 +884,7 @@ func TestMalformedHeadersDeadLetterAsDecodeBeforeHandlerRuns(t *testing.T) {
 		Body:   []byte(`{"id":"evt-1"}`),
 		Settle: settler,
 	}
-	if !dispatchMessage(runner, context.Background(), message, &Envelope{}, new(bool)) {
+	if !dispatchMessage(runner, context.Background(), message, &Envelope{}, new(bool), &deliveryState{}) {
 		t.Fatal("malformed message was not settled")
 	}
 	if handled {
@@ -774,4 +896,12 @@ func TestMalformedHeadersDeadLetterAsDecodeBeforeHandlerRuns(t *testing.T) {
 	if len(producer.messages) != 1 || headerValue(producer.messages[0].Headers, "f1deathreason") != ReasonDecode.String() {
 		t.Fatalf("DLQ messages = %#v, want one decode message", producer.messages)
 	}
+}
+
+// invokeHandler runs handler as one delivery of destination with deliveryCount.
+func invokeHandler(r *Runner, parent context.Context, handler Handler, event *Event, destination string, deliveryCount int) handlerResult {
+	return invokeHandlerMessage(r, parent, handler, event, driver.InboundMessage{
+		Destination:   destination,
+		DeliveryCount: deliveryCount,
+	})
 }

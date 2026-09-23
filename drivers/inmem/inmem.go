@@ -15,9 +15,8 @@ import (
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/testhook"
 )
 
-// Driver is an in-memory driver factory. New returns isolated connections;
-// NewShared returns connections over one broker. The minimal capability mode is
-// conformance-only and intentionally unexported.
+// Driver opens in-memory broker connections. Its zero value and the value returned by New create an isolated broker for each Open call.
+// NewShared returns a driver whose connections share one broker.
 type Driver struct {
 	clock   clock.Clock
 	minimal bool
@@ -65,14 +64,9 @@ func init() {
 // Name returns the stable in-memory driver key.
 func (Driver) Name() string { return "inmem" }
 
-// Capabilities reports the behavior implemented by the in-memory driver. Native DLQ,
-// priority, transactions, and server-side filtering are intentionally false.
+// Capabilities reports the features provided by the in-memory driver. It supports per-message acknowledgements, key ordering, native delays, delivery counts, unrestricted consumer scaling, and lag queries.
 //
-// DelayAccuracy is zero lateness with no delay excluded: the pump holds every
-// message it has accepted and releases one in the pass that the connection's
-// clock reaches its due time, so nothing between the due time and the release
-// can put the message late. MaxDelay at the largest duration is how the
-// declaration says no requested delay is above the bound.
+// The reported delay accuracy has no lateness for delays up to MaxDelay. The driver also reports a 1 MiB message-body limit and a 64 KiB header limit.
 func (d Driver) Capabilities() driver.Capabilities {
 	caps := driver.Capabilities{
 		PerMessageAck:       true,
@@ -153,6 +147,8 @@ type sharedConn struct {
 	closed bool
 }
 
+// Close releases this handle to a shared broker. The underlying connection
+// closes when the last handle closes and its producers and consumers are closed.
 func (c *sharedConn) Close(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
 		return err
@@ -261,10 +257,16 @@ type dispatchConsumerState struct {
 	unsettled   int
 }
 
+// Capabilities returns the capabilities of this connection.
 func (c *conn) Capabilities() driver.Capabilities { return c.caps }
-func (c *conn) BrokerInfo() driver.BrokerInfo     { return c.info }
-func (c *conn) Admin() driver.Admin               { return &admin{operations: &adminOperations{conn: c}} }
 
+// BrokerInfo returns broker metadata for this connection.
+func (c *conn) BrokerInfo() driver.BrokerInfo { return c.info }
+
+// Admin returns the topology administration surface for this connection.
+func (c *conn) Admin() driver.Admin { return &admin{operations: &adminOperations{conn: c}} }
+
+// Producer creates a producer using cfg.
 func (c *conn) Producer(ctx context.Context, cfg driver.ProducerConfig) (driver.Producer, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, classify("producer", driver.KindTransient, err)
@@ -278,6 +280,7 @@ func (c *conn) Producer(ctx context.Context, cfg driver.ProducerConfig) (driver.
 	return &producer{conn: c, cfg: cfg}, nil
 }
 
+// Consumer creates a consumer using cfg.
 func (c *conn) Consumer(ctx context.Context, cfg driver.ConsumerConfig) (driver.Consumer, error) {
 	return c.newConsumer(ctx, cfg, 0)
 }
@@ -396,20 +399,29 @@ func (c *conn) replayHistoryLocked(group string, destinations []string, startAft
 	}
 }
 
-// recordHistoryLocked appends entry to destination's replay history,
-// evicting the oldest entries first once maxDestinationHistory is exceeded.
-// The caller must hold c.mu.
+// recordHistoryLocked appends entry to destination's replay history, evicting
+// the oldest entry once the history holds maxDestinationHistory of them. The
+// caller must hold c.mu.
+//
+// Eviction drops the oldest entry and appends the new one to what is left, so
+// the copy the append needs happens only when the backing array runs out of
+// room rather than on every publish at the cap: the slice the readers see stays
+// exactly maxDestinationHistory entries, holding the newest ones, while the
+// capacity the append consumes shrinks by one per publish and is rebuilt once
+// per fraction of the cap.
 func (c *conn) recordHistoryLocked(destination string, entry *queuedMessage) {
 	entry.enqueuedAt = c.clock.Now()
-	entries := append(c.history[destination], entry)
-	if overflow := len(entries) - maxDestinationHistory; overflow > 0 {
-		kept := make([]*queuedMessage, len(entries)-overflow)
-		copy(kept, entries[overflow:])
-		entries = kept
+	entries := c.history[destination]
+	if len(entries) == maxDestinationHistory {
+		entries[0] = nil
+		entries = append(entries[1:], entry)
+	} else {
+		entries = append(entries, entry)
 	}
 	c.history[destination] = entries
 }
 
+// Ping checks whether the connection is still open.
 func (c *conn) Ping(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
 		return classify("ping", driver.KindTransient, err)
@@ -422,6 +434,7 @@ func (c *conn) Ping(ctx context.Context) error {
 	return nil
 }
 
+// Close releases the connection after its producers and consumers have closed.
 func (c *conn) Close(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
 		return classify("close", driver.KindTransient, err)
@@ -462,9 +475,7 @@ func (c *conn) signalWake() {
 	}
 }
 
-// ReleaseDue dispatches deferred messages whose due time has arrived.
-// It lets deterministic test helpers coordinate fake time with the driver's
-// deferred-delivery storage without adding test methods to the driver port.
+// ReleaseDue dispatches deferred messages whose scheduled delivery time has arrived.
 func (c *conn) ReleaseDue() {
 	if c == nil {
 		return
@@ -925,6 +936,7 @@ func (c *conn) inboundLocked(cs *consumer, destination string, msg *queuedMessag
 	}, delivery
 }
 
+// Backlog reports queue depth and, when available, the enqueue time of each destination's head message.
 func (c *consumer) Backlog(ctx context.Context) (map[string]driver.BacklogSample, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, classify("backlog", driver.KindTransient, err)

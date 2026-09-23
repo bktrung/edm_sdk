@@ -56,7 +56,7 @@ func runRebalance(group *groupContext) {
 		}
 		ackMessage(t, group, receiveMessage(t, group, first))
 		ackMessage(t, group, receiveMessage(t, group, second))
-		group.vector.Add(BehaviorEvent{ID: "rebalance-scale-up", Outcome: "distributed", FinalDestination: "rebalance.scale-up"})
+		group.vector.add(BehaviorEvent{ID: "rebalance-scale-up", Outcome: "distributed", FinalDestination: "rebalance.scale-up"})
 	})
 
 	group.Check("draining a consumer reassigns new work to a survivor", func(t *testing.T) {
@@ -80,7 +80,7 @@ func runRebalance(group *groupContext) {
 				return true, "no delivery to drained consumer"
 			}
 		})
-		group.vector.Add(BehaviorEvent{ID: "rebalance-reassign", Outcome: "reassigned", FinalDestination: "rebalance.reassign"})
+		group.vector.add(BehaviorEvent{ID: "rebalance-reassign", Outcome: "reassigned", FinalDestination: "rebalance.reassign"})
 	})
 
 	group.Check("drained consumer requeues in-flight work to one survivor", func(t *testing.T) {
@@ -115,7 +115,7 @@ func runRebalance(group *groupContext) {
 			view := inspectDestination(t, group, "rebalance.in-flight")
 			return view.Ready == 0 && view.Unsettled == 0, fmt.Sprintf("view=%+v", view)
 		})
-		group.vector.Add(BehaviorEvent{ID: "rebalance-in-flight", Outcome: "redelivered", AttemptCount: 2, FinalDestination: "rebalance.in-flight"})
+		group.vector.add(BehaviorEvent{ID: "rebalance-in-flight", Outcome: "redelivered", AttemptCount: 2, FinalDestination: "rebalance.in-flight"})
 	})
 
 	group.Check("redelivery count advances only when available", func(t *testing.T) {
@@ -142,7 +142,7 @@ func runRebalance(group *groupContext) {
 			t.Fatalf("DeliveryCount = %d, want -1 when unavailable", redelivery.DeliveryCount)
 		}
 		ackMessage(t, group, redelivery)
-		group.vector.Add(BehaviorEvent{ID: "rebalance-delivery-count", Outcome: "redelivered", AttemptCount: 2, FinalDestination: "rebalance.delivery-count"})
+		group.vector.add(BehaviorEvent{ID: "rebalance-delivery-count", Outcome: "redelivered", AttemptCount: 2, FinalDestination: "rebalance.delivery-count"})
 	})
 
 	group.Check("each consumer keeps its own prefetch budget after joining", func(t *testing.T) {
@@ -204,7 +204,7 @@ func runRebalance(group *groupContext) {
 			view := inspectDestination(t, group, "rebalance.prefetch")
 			return view.Ready == 0 && view.Unsettled == 0, fmt.Sprintf("view=%+v", view)
 		})
-		group.vector.Add(BehaviorEvent{ID: "rebalance-prefetch", Outcome: "bounded", FinalDestination: "rebalance.prefetch"})
+		group.vector.add(BehaviorEvent{ID: "rebalance-prefetch", Outcome: "bounded", FinalDestination: "rebalance.prefetch"})
 	})
 
 	group.Check("repeating a departure leaves redistribution stable", func(t *testing.T) {
@@ -222,7 +222,7 @@ func runRebalance(group *groupContext) {
 			t.Fatal(err)
 		}
 		ackMessage(t, group, receiveMessage(t, group, survivor))
-		group.vector.Add(BehaviorEvent{ID: "rebalance-repeat", Outcome: "stable", FinalDestination: "rebalance.repeat"})
+		group.vector.add(BehaviorEvent{ID: "rebalance-repeat", Outcome: "stable", FinalDestination: "rebalance.repeat"})
 	})
 
 	group.Check("delivery made before a membership change remains settleable", func(t *testing.T) {
@@ -268,7 +268,7 @@ func runRebalance(group *groupContext) {
 			view := inspectDestination(t, group, "rebalance.settle")
 			return view.Ready == 0 && view.Unsettled == 0, fmt.Sprintf("view=%+v", view)
 		})
-		group.vector.Add(BehaviorEvent{ID: "rebalance-settle", Outcome: "bounded", FinalDestination: "rebalance.settle"})
+		group.vector.add(BehaviorEvent{ID: "rebalance-settle", Outcome: "bounded", FinalDestination: "rebalance.settle"})
 	})
 
 	group.Check("a key remains ordered across bounded ownership transfer", func(t *testing.T) {
@@ -373,7 +373,7 @@ func runRebalance(group *groupContext) {
 			control := inspectDestination(t, group, "rebalance.key-b")
 			return view.Ready == 0 && view.Unsettled == 0 && control.Ready == 0 && control.Unsettled == 0, fmt.Sprintf("key=%+v control=%+v", view, control)
 		})
-		group.vector.Add(BehaviorEvent{ID: "rebalance-key-exclusive", Outcome: "bounded", FinalDestination: "rebalance.key-a"})
+		group.vector.add(BehaviorEvent{ID: "rebalance-key-exclusive", Outcome: "bounded", FinalDestination: "rebalance.key-a"})
 	})
 
 	group.Check("settled key reassigns after its holder drains", func(t *testing.T) {
@@ -393,7 +393,7 @@ func runRebalance(group *groupContext) {
 			t.Fatal(err)
 		}
 		ackMessage(t, group, receiveMessage(t, group, survivor))
-		group.vector.Add(BehaviorEvent{ID: "rebalance-settled-key", Outcome: "reassigned", FinalDestination: "rebalance.affinity"})
+		group.vector.add(BehaviorEvent{ID: "rebalance-settled-key", Outcome: "reassigned", FinalDestination: "rebalance.affinity"})
 	})
 
 	group.Check("joining consumer handles bounded ownership transfer", func(t *testing.T) {
@@ -471,7 +471,7 @@ func runRebalance(group *groupContext) {
 			view := inspectDestination(t, group, "rebalance.join-in-flight")
 			return view.Ready == 0 && view.Unsettled == 0, fmt.Sprintf("view=%+v", view)
 		})
-		group.vector.Add(BehaviorEvent{ID: "rebalance-join-in-flight", Outcome: "bounded", FinalDestination: "rebalance.join-in-flight"})
+		group.vector.add(BehaviorEvent{ID: "rebalance-join-in-flight", Outcome: "bounded", FinalDestination: "rebalance.join-in-flight"})
 	})
 
 	group.Check("joining an idle destination receives newly published work", func(t *testing.T) {
@@ -485,7 +485,7 @@ func runRebalance(group *groupContext) {
 		waitForRebalanceAssignment(t, group, joining)
 		publishRebalanceCount(t, group, producer, "rebalance.idle-join", 4)
 		ackAll(t, group, joining, 4)
-		group.vector.Add(BehaviorEvent{ID: "rebalance-idle-join", Outcome: "joined", FinalDestination: "rebalance.idle-join"})
+		group.vector.add(BehaviorEvent{ID: "rebalance-idle-join", Outcome: "joined", FinalDestination: "rebalance.idle-join"})
 	})
 }
 

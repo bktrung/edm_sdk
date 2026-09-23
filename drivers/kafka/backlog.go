@@ -100,6 +100,13 @@ func (s kafkaOffsetSnapshot) lagAndProbes(operation string) (map[string]int64, m
 }
 
 func selectKafkaBacklogHead(partitions []backlogPartitionProbe) (time.Time, driver.EnqueueSource, bool) {
+	return selectKafkaBacklogHeadFrom(kafkaBacklogPartitionIndex(partitions), partitions)
+}
+
+// selectKafkaBacklogHeadFrom is selectKafkaBacklogHead over an index already
+// built, so one backlog read indexes its fetch batch once for every
+// destination.
+func selectKafkaBacklogHeadFrom(index map[partitionKey]*kgo.FetchPartition, partitions []backlogPartitionProbe) (time.Time, driver.EnqueueSource, bool) {
 	var (
 		head       time.Time
 		headSource driver.EnqueueSource
@@ -109,7 +116,7 @@ func selectKafkaBacklogHead(partitions []backlogPartitionProbe) (time.Time, driv
 		if partition.lag == 0 {
 			continue
 		}
-		record, ok := kafkaBacklogPartitionHead(partition)
+		record, ok := kafkaBacklogPartitionHead(index, partition)
 		if !ok {
 			return time.Time{}, driver.EnqueueSourceUnknown, false
 		}
@@ -126,32 +133,63 @@ func selectKafkaBacklogHead(partitions []backlogPartitionProbe) (time.Time, driv
 	return head, headSource, found
 }
 
-func kafkaBacklogPartitionHead(partition backlogPartitionProbe) (*kgo.Record, bool) {
-	for _, fetch := range partition.fetches {
-		for _, topic := range fetch.Topics {
-			if topic.Topic != partition.destination {
-				continue
-			}
-			for _, fetchedPartition := range topic.Partitions {
-				if fetchedPartition.Partition != partition.partition {
-					continue
-				}
-				if fetchedPartition.Err != nil {
-					return nil, false
-				}
-				for _, record := range fetchedPartition.Records {
-					if record.Offset < partition.committed || record.Attrs.IsControl() {
-						continue
+// kafkaBacklogPartitionIndex maps a partition of the probes' fetch batches to
+// the fetched partition that carried it. Every probe of one backlog read is
+// probed with the same batch, and a batch carries an entry for each of the
+// partitions it was asked about, so the batches are indexed once each and every
+// probe is then served by a lookup: that replaces one walk of the whole batch
+// per probe. Where a batch carries a partition under more than one entry, the
+// index keeps the one a walk of the batch reaches first, which is the entry
+// such a walk answers from.
+func kafkaBacklogPartitionIndex(partitions []backlogPartitionProbe) map[partitionKey]*kgo.FetchPartition {
+	index := make(map[partitionKey]*kgo.FetchPartition, len(partitions))
+	walked := make(map[*kgo.Fetch]struct{}, len(partitions))
+	for _, partition := range partitions {
+		if len(partition.fetches) == 0 {
+			continue
+		}
+		batch := &partition.fetches[0]
+		if _, done := walked[batch]; done {
+			continue
+		}
+		walked[batch] = struct{}{}
+		for fetchIndex := range partition.fetches {
+			fetch := &partition.fetches[fetchIndex]
+			for topicIndex := range fetch.Topics {
+				topic := &fetch.Topics[topicIndex]
+				for partitionIndex := range topic.Partitions {
+					fetched := &topic.Partitions[partitionIndex]
+					key := partitionKey{destination: topic.Topic, partition: fetched.Partition}
+					if _, indexed := index[key]; !indexed {
+						index[key] = fetched
 					}
-					return record, true
 				}
-				return nil, false
 			}
 		}
+	}
+	return index
+}
+
+// kafkaBacklogPartitionHead returns the first record the indexed batch carried
+// for the probe's partition at or above the committed offset, skipping control
+// records. It reports false for every case a head is not knowable from the
+// batch: the batch carried no entry for the partition, the entry is an error,
+// or every record it carried is below the committed offset or a control record.
+func kafkaBacklogPartitionHead(index map[partitionKey]*kgo.FetchPartition, partition backlogPartitionProbe) (*kgo.Record, bool) {
+	fetched, indexed := index[partitionKey{destination: partition.destination, partition: partition.partition}]
+	if !indexed || fetched.Err != nil {
+		return nil, false
+	}
+	for _, record := range fetched.Records {
+		if record.Offset < partition.committed || record.Attrs.IsControl() {
+			continue
+		}
+		return record, true
 	}
 	return nil, false
 }
 
+// Backlog returns lag and, when available, the enqueue time of the oldest unread record for each subscribed topic.
 func (c *consumer) Backlog(ctx context.Context) (map[string]driver.BacklogSample, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, classify("backlog", driver.KindTransient, err)
@@ -168,18 +206,13 @@ func (c *consumer) Backlog(ctx context.Context) (map[string]driver.BacklogSample
 		return nil, err
 	}
 	fetches := c.probeBacklog(ctx, probes)
-	for destination, destinationProbes := range probes {
-		for index := range destinationProbes {
-			destinationProbes[index].fetches = fetches
-		}
-		probes[destination] = destinationProbes
-	}
+	index := kafkaBacklogPartitionIndex([]backlogPartitionProbe{{fetches: fetches}})
 
 	out := make(map[string]driver.BacklogSample, len(lag))
 	for _, destination := range snapshot.destinations {
 		sample := driver.BacklogSample{Lag: lag[destination]}
 		if sample.Lag > 0 {
-			sample.HeadEnqueuedAt, sample.HeadSource, _ = selectKafkaBacklogHead(probes[destination])
+			sample.HeadEnqueuedAt, sample.HeadSource, _ = selectKafkaBacklogHeadFrom(index, probes[destination])
 		}
 		out[destination] = sample
 	}

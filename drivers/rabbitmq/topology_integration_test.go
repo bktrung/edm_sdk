@@ -244,76 +244,15 @@ func TestVerifyTopologyReportsArgumentDrift(t *testing.T) {
 }
 
 // TestEnsureTopologyParkQueueArgumentsReachBroker proves the at-least-once
-// dead-letter arguments reach the broker rather than only a Go map: it reads
-// the declared park queue back through the management API, which is the only
-// channel that reports a queue's real arguments (AMQP passive declare checks
-// the name only).
+// dead-letter arguments reach the broker rather than only a Go map, on a rung
+// queue and on the queue above the ladder: it reads both back through the
+// management API, which is the only channel that reports a queue's real
+// arguments (AMQP passive declare checks the name only). The rung also carries
+// the queue-level TTL that makes expiry order FIFO order. The queue above the
+// ladder must not carry that TTL: it keeps the per-message expiration a due
+// time beyond the ladder needs, and a TTL there would release such a message
+// early.
 func TestEnsureTopologyParkQueueArgumentsReachBroker(t *testing.T) {
-	requireBroker(t)
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-	defer cancel()
-
-	const destination = "rabbitmq-driver-park-args-queue"
-	const park = destination + ".park"
-	raw, err := amqp.Dial(defaultEndpoint)
-	if err != nil {
-		t.Fatalf("Dial: %v", err)
-	}
-	t.Cleanup(func() { _ = raw.Close() })
-	rawChannel, err := raw.Channel()
-	if err != nil {
-		t.Fatalf("Channel: %v", err)
-	}
-	t.Cleanup(func() { _ = rawChannel.Close() })
-	deleteParkQueues(rawChannel, destination)
-	t.Cleanup(func() { deleteParkQueues(rawChannel, destination) })
-
-	conn, err := (Driver{}).Open(ctx, driver.Config{Endpoints: []string{defaultEndpoint}})
-	if err != nil {
-		t.Fatalf("Open: %v", err)
-	}
-	t.Cleanup(func() { _ = conn.Close(ctx) })
-
-	spec := driver.TopologySpec{
-		Destinations: []driver.DestinationSpec{{Name: destination, Durable: true, Delay: time.Second}},
-	}
-	if _, err := conn.Admin().EnsureTopology(ctx, spec); err != nil {
-		t.Fatalf("EnsureTopology: %v", err)
-	}
-
-	mgmt, err := newManagementClient(defaultEndpoint, driver.Config{})
-	if err != nil {
-		t.Fatalf("newManagementClient: %v", err)
-	}
-	queue, err := mgmt.getQueue(ctx, park)
-	if err != nil {
-		t.Fatalf("getQueue(%q): %v", park, err)
-	}
-	want := map[string]string{
-		"x-queue-type":              "quorum",
-		"x-dead-letter-exchange":    "",
-		"x-dead-letter-routing-key": destination,
-		"x-dead-letter-strategy":    "at-least-once",
-		"x-overflow":                "reject-publish",
-	}
-	for key, wantValue := range want {
-		got, present := queue.Arguments[key]
-		if !present {
-			t.Fatalf("park queue arguments %+v missing %q", queue.Arguments, key)
-		}
-		if fmt.Sprint(got) != wantValue {
-			t.Fatalf("park queue argument %q = %v, want %q", key, got, wantValue)
-		}
-	}
-}
-
-// TestEnsureTopologyRungQueueArgumentsReachBroker pins the queue-level TTL that
-// makes expiry order FIFO order, read back through the management API rather
-// than from the Go map, because AMQP passive declare checks a name and not its
-// arguments. The queue above the ladder is read in the same run and must not
-// carry that TTL: it keeps the per-message expiration a due time beyond the
-// ladder needs, and a TTL there would release such a message early.
-func TestEnsureTopologyRungQueueArgumentsReachBroker(t *testing.T) {
 	requireBroker(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
@@ -355,27 +294,19 @@ func TestEnsureTopologyRungQueueArgumentsReachBroker(t *testing.T) {
 	if err != nil {
 		t.Fatalf("getQueue(%q): %v", rungQueue, err)
 	}
-	want := map[string]string{
+	parkArguments := map[string]string{
 		"x-queue-type":              "quorum",
 		"x-dead-letter-exchange":    "",
 		"x-dead-letter-routing-key": destination,
 		"x-dead-letter-strategy":    "at-least-once",
 		"x-overflow":                "reject-publish",
-		"x-message-ttl":             "2000",
 	}
-	for key, wantValue := range want {
-		got, present := queue.Arguments[key]
-		if !present {
-			t.Fatalf("rung queue arguments %+v missing %q", queue.Arguments, key)
-		}
-		if fmt.Sprint(got) != wantValue {
-			t.Fatalf("rung queue argument %q = %v, want %q", key, got, wantValue)
-		}
-	}
+	assertQueueArguments(t, "rung", queue.Arguments, parkArguments, map[string]string{"x-message-ttl": "2000"})
 	above, err := mgmt.getQueue(ctx, aboveLadder)
 	if err != nil {
 		t.Fatalf("getQueue(%q): %v", aboveLadder, err)
 	}
+	assertQueueArguments(t, "above-ladder", above.Arguments, parkArguments, nil)
 	if value, present := above.Arguments["x-message-ttl"]; present {
 		t.Fatalf("the queue above the ladder carries x-message-ttl=%v, which would release a beyond-the-ladder due time early", value)
 	}
@@ -785,5 +716,22 @@ func TestEnsureTopologyFixedDelayReportsOldRungsAsOrphans(t *testing.T) {
 	}
 	if len(diff.Orphaned) != len(want) {
 		t.Fatalf("Orphaned = %v, want exactly the 8 old rung queues", diff.Orphaned)
+	}
+}
+
+// assertQueueArguments fails unless arguments carries every entry of each want
+// map, compared as printed values.
+func assertQueueArguments(t *testing.T, queue string, arguments map[string]any, wants ...map[string]string) {
+	t.Helper()
+	for _, want := range wants {
+		for key, wantValue := range want {
+			got, present := arguments[key]
+			if !present {
+				t.Fatalf("%s queue arguments %+v missing %q", queue, arguments, key)
+			}
+			if fmt.Sprint(got) != wantValue {
+				t.Fatalf("%s queue argument %q = %v, want %q", queue, key, got, wantValue)
+			}
+		}
 	}
 }

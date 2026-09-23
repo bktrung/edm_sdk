@@ -186,7 +186,7 @@ func TestObserverFinishGuardAbandonsExactlyOnce(t *testing.T) {
 		func() {
 			guard := client.newObserverGuard(ObserverProcess, token)
 			defer func() { guard.abandon() }()
-			guard.finish(ObserverOutcomeOK, "")
+			guard.finishWith(FinishEvent{Outcome: ObserverOutcomeOK})
 		}()
 		rec.mu.Lock()
 		finishes := rec.finishes

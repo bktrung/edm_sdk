@@ -5,6 +5,8 @@ package rabbitmq
 import (
 	"context"
 	"fmt"
+	"io"
+	"net/http"
 	"strings"
 	"sync"
 	"testing"
@@ -14,6 +16,27 @@ import (
 
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/driver"
 )
+
+// deleteQueue removes one queue through the management API, leaving a queue
+// that is already gone alone. The driver deletes queues only through Prune,
+// which uses its own AMQP channel and guards every precondition, so this lives
+// with the tests that declare fixtures directly and have to clean up after
+// themselves.
+func (m *managementClient) deleteQueue(ctx context.Context, name string) (bool, error) {
+	response, err := m.do(ctx, http.MethodDelete, m.queuePath(name))
+	if err != nil {
+		return false, err
+	}
+	defer response.Body.Close()
+	if response.StatusCode == http.StatusNotFound {
+		return false, nil
+	}
+	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
+		body, _ := io.ReadAll(io.LimitReader(response.Body, 4096))
+		return false, fmt.Errorf("management API DELETE queue %q: %s: %s", name, response.Status, strings.TrimSpace(string(body)))
+	}
+	return true, nil
+}
 
 func setupPruneTest(t *testing.T, kind queueKind, specs ...driver.DestinationSpec) (context.Context, *conn, *admin) {
 	t.Helper()
@@ -537,7 +560,7 @@ func TestPruneRefusesEveryParkingRung(t *testing.T) {
 				Durable: true,
 				Delay:   rung,
 			})
-			producer, err := rabbitConn.Producer(ctx, driver.ProducerConfig{RequireDurableAck: true})
+			producer, err := rabbitConn.Producer(ctx, driver.ProducerConfig{})
 			if err != nil {
 				t.Fatalf("Producer: %v", err)
 			}
@@ -702,6 +725,11 @@ func TestConcurrentAdminOperationsDoNotCrossReplies(t *testing.T) {
 	}
 	names := []string{firstDestination, secondDestination}
 	reverseNames := []string{secondDestination, firstDestination}
+	// 1,600 describes through the management API can outlast the 15 s setup
+	// budget on a busy machine, so the loop has its own bound. The test checks
+	// that concurrent replies are not crossed, not how fast they arrive.
+	loopCtx, cancelLoop := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancelLoop()
 	for iteration := range iterations {
 		start := make(chan struct{})
 		ready := make(chan struct{}, operationsPerIteration)
@@ -717,7 +745,7 @@ func TestConcurrentAdminOperationsDoNotCrossReplies(t *testing.T) {
 				defer operations.Done()
 				ready <- struct{}{}
 				<-start
-				state, err := facade.DescribeTopology(ctx, targets)
+				state, err := facade.DescribeTopology(loopCtx, targets)
 				results <- describeResult{state: state, err: err}
 			}(targets)
 		}
@@ -854,7 +882,7 @@ func TestPruneRefusesFixedParkingQueue(t *testing.T) {
 	spec := driver.DestinationSpec{Name: destination, Durable: true, Delay: 5 * time.Second, FixedDelay: true}
 	fixedQueue := fixedParkQueueName(destination, 5*time.Second)
 	ctx, rabbitConn, facade := setupPruneTest(t, queueKindQuorum, spec)
-	producer, err := rabbitConn.Producer(ctx, driver.ProducerConfig{RequireDurableAck: true})
+	producer, err := rabbitConn.Producer(ctx, driver.ProducerConfig{})
 	if err != nil {
 		t.Fatalf("Producer: %v", err)
 	}
@@ -891,7 +919,7 @@ func TestFixedParkingQueueCountsInDescribeAndPurge(t *testing.T) {
 	spec := driver.DestinationSpec{Name: destination, Durable: true, Delay: 5 * time.Second, FixedDelay: true}
 	fixedQueue := fixedParkQueueName(destination, 5*time.Second)
 	ctx, rabbitConn, facade := setupPruneTest(t, queueKindQuorum, spec)
-	producer, err := rabbitConn.Producer(ctx, driver.ProducerConfig{RequireDurableAck: true})
+	producer, err := rabbitConn.Producer(ctx, driver.ProducerConfig{})
 	if err != nil {
 		t.Fatalf("Producer: %v", err)
 	}

@@ -6,44 +6,7 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
-
-	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/driver"
 )
-
-func TestObserverDeliveryReceivedCarriesTopicAndPriority(t *testing.T) {
-	rec := &consumeRecordingObserver{}
-	client := newConsumeObserverClient(t, rec)
-	sub := consumeTestSubscription("orders", func(context.Context, *Event) error {
-		return nil
-	})
-	sub.Priorities = []Priority{PriorityHigh}
-	ctx, _, _, _ := startConsumeRunner(t, client, sub)
-	publishConsumeOne(t, client, ctx, "payload", WithPriority(PriorityHigh))
-	waitConsumeCondition(t, "delivery received event did not arrive", func() bool {
-		records, _, _, _ := rec.snapshot()
-		for _, record := range records {
-			if record.Kind == ObserverDeliveryReceived {
-				return true
-			}
-		}
-		return false
-	})
-
-	records, _, _, _ := rec.snapshot()
-	for _, record := range records {
-		if record.Kind != ObserverDeliveryReceived {
-			continue
-		}
-		if record.Priority != PriorityHigh {
-			t.Fatalf("delivery received priority = %v, want high", record.Priority)
-		}
-		if record.Topic != "orders.created" {
-			t.Fatalf("delivery received topic = %q, want orders.created", record.Topic)
-		}
-		return
-	}
-	t.Fatal("no delivery received event")
-}
 
 func TestObserverSettleCarriesTopicAndPriority(t *testing.T) {
 	rec := &consumeRecordingObserver{}
@@ -128,7 +91,10 @@ func TestObserverPrimaryPublishFinishCarriesTopicAndPriority(t *testing.T) {
 	})
 }
 
-func TestObserverRetryDeliveryMapsLogicalTopic(t *testing.T) {
+// TestObserverDeliveryReceivedCarriesLogicalTopicAndPriority checks the first
+// delivery and its retry: the retry arrives on a retry destination and must
+// still report the logical topic.
+func TestObserverDeliveryReceivedCarriesLogicalTopicAndPriority(t *testing.T) {
 	rec := &consumeRecordingObserver{}
 	client := newConsumeObserverClient(t, rec)
 	var attempts atomic.Int32
@@ -163,32 +129,12 @@ func TestObserverRetryDeliveryMapsLogicalTopic(t *testing.T) {
 	if len(received) < 2 {
 		t.Fatalf("delivery received count = %d, want at least 2", len(received))
 	}
-	retry := received[1]
-	if retry.Topic != "orders.created" {
-		t.Fatalf("retry delivery topic = %q, want orders.created", retry.Topic)
-	}
-	if retry.Priority != PriorityHigh {
-		t.Fatalf("retry delivery priority = %v, want high", retry.Priority)
-	}
-}
-
-func TestDestinationMetadataMapMarksCollapsedPriorityAmbiguous(t *testing.T) {
-	sub := Subscription{
-		Name:       "orders",
-		Topics:     []string{"orders.created"},
-		Priorities: []Priority{Priority(99), Priority(100)},
-		Retry:      RetryConfig{MaxAttempts: 1},
-	}
-	metadata := buildDestinationMetadataMap(driver.Capabilities{}, "/test/orders", sub)
-	destination := consumeDestination(driver.Capabilities{}, "/test/orders", "orders.created", Priority(99), "orders")
-	entry, ok := metadata[destination]
-	if !ok {
-		t.Fatalf("destination metadata missing %q", destination)
-	}
-	if !entry.ambiguous {
-		t.Fatal("collapsed destination is not ambiguous")
-	}
-	if entry.priority != 0 {
-		t.Fatalf("ambiguous priority = %v, want zero", entry.priority)
+	for i, delivery := range received[:2] {
+		if delivery.Topic != "orders.created" {
+			t.Fatalf("delivery %d topic = %q, want orders.created", i, delivery.Topic)
+		}
+		if delivery.Priority != PriorityHigh {
+			t.Fatalf("delivery %d priority = %v, want high", i, delivery.Priority)
+		}
 	}
 }

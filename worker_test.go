@@ -119,7 +119,7 @@ func TestUnknownLaneRoutesToTheFallbackLane(t *testing.T) {
 		Priority:    PriorityMedium,
 		Attempt:     1,
 	}, settler)
-	id := runner.inflight.Add(message)
+	id := runner.inflight.Add()
 	deliveries := make(chan delivery, 1)
 	deliveries <- delivery{id: id, message: message}
 	close(deliveries)
@@ -202,44 +202,40 @@ func TestLaneFullStillAppliesBackpressure(t *testing.T) {
 	}
 }
 
-func TestTruncateErrorBacksToRuneBoundary(t *testing.T) {
-	const prefixBytes = deathErrorCap - 2
-	value := strings.Repeat("a", prefixBytes) + "\u754c" + "suffix"
-	got := truncateError(errors.New(value))
-
-	if !utf8.ValidString(got) {
-		t.Fatalf("truncateError() returned invalid UTF-8")
-	}
-	if len(got) > deathErrorCap {
-		t.Fatalf("truncateError() length = %d, want at most %d", len(got), deathErrorCap)
-	}
-	if len(got) != prefixBytes {
-		t.Fatalf("truncateError() length = %d, want %d", len(got), prefixBytes)
-	}
-}
-
-func TestTruncateErrorKeepsExactByteCap(t *testing.T) {
-	value := strings.Repeat("a", deathErrorCap)
-	got := truncateError(errors.New(value))
-
-	if len(got) != deathErrorCap {
-		t.Fatalf("truncateError() length = %d, want %d", len(got), deathErrorCap)
-	}
-	if got != value {
-		t.Fatalf("truncateError() changed ASCII text at the exact cap")
-	}
-}
-
-func TestTruncateErrorKeepsOverCapAlignedBoundary(t *testing.T) {
-	value := strings.Repeat("a", deathErrorCap) + "\u754c"
-	got := truncateError(errors.New(value))
-	want := value[:deathErrorCap]
-
-	if len(got) != deathErrorCap {
-		t.Fatalf("truncateError() length = %d, want %d", len(got), deathErrorCap)
-	}
-	if got != want {
-		t.Fatalf("truncateError() = %q, want the first %d bytes", got, deathErrorCap)
+func TestTruncateErrorBoundaries(t *testing.T) {
+	for _, test := range []struct {
+		name  string
+		value string
+		want  string
+	}{
+		{
+			name:  "backs off a split rune",
+			value: strings.Repeat("a", deathErrorCap-2) + "\u754c" + "suffix",
+			want:  strings.Repeat("a", deathErrorCap-2),
+		},
+		{
+			name:  "keeps text at the exact cap",
+			value: strings.Repeat("a", deathErrorCap),
+			want:  strings.Repeat("a", deathErrorCap),
+		},
+		{
+			name:  "cuts at an aligned boundary over the cap",
+			value: strings.Repeat("a", deathErrorCap) + "\u754c",
+			want:  strings.Repeat("a", deathErrorCap),
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			got := truncateError(errors.New(test.value))
+			if !utf8.ValidString(got) {
+				t.Fatalf("truncateError() returned invalid UTF-8")
+			}
+			if len(got) > deathErrorCap {
+				t.Fatalf("truncateError() length = %d, want at most %d", len(got), deathErrorCap)
+			}
+			if got != test.want {
+				t.Fatalf("truncateError() = %d bytes, want the first %d bytes", len(got), len(test.want))
+			}
+		})
 	}
 }
 

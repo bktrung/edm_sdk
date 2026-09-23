@@ -137,7 +137,7 @@ func TestDrainAfterRunGivesInFlightWorkItsGraceBudget(t *testing.T) {
 	consumer := newDrainProbeConsumer()
 	runner, client, _ := newDrainRunner(t, consumer, true)
 	client.config.Lifecycle.DrainTimeout = time.Minute
-	id := runner.inflight.Add(driver.InboundMessage{})
+	id := runner.inflight.Add()
 
 	done := make(chan error, 1)
 	go func() { done <- runner.drainAfterRun(context.Background()) }()
@@ -177,7 +177,7 @@ func TestDrainAfterRunStillReleasesWhenTheWaitTimesOut(t *testing.T) {
 	runner, client, fake := newDrainRunner(t, consumer, true)
 	client.config.Lifecycle.DrainTimeout = 5 * time.Second
 	client.config.Lifecycle.CloseTimeout = time.Minute
-	runner.inflight.Add(driver.InboundMessage{})
+	runner.inflight.Add()
 
 	done := make(chan error, 1)
 	go func() { done <- runner.drainAfterRun(context.Background()) }()
@@ -217,7 +217,7 @@ func TestDrainAfterRunReleaseOutlivesACancelledParent(t *testing.T) {
 	runner, client, fake := newDrainRunner(t, consumer, true)
 	client.config.Lifecycle.DrainTimeout = time.Minute
 	client.config.Lifecycle.CloseTimeout = time.Minute
-	runner.inflight.Add(driver.InboundMessage{})
+	runner.inflight.Add()
 
 	// The wait runs on the runner's settlement window, which is the context the
 	// runner's own teardown cancels. A caller's context that is already
@@ -365,7 +365,7 @@ func TestDrainAfterRunRejectsNegativeDrainTimeout(t *testing.T) {
 	consumer := newDrainProbeConsumer()
 	runner, client, _ := newDrainRunner(t, consumer, true)
 	client.config.Lifecycle.DrainTimeout = -time.Second
-	runner.inflight.Add(driver.InboundMessage{})
+	runner.inflight.Add()
 
 	done := make(chan error, 1)
 	go func() { done <- runner.drainAfterRun(context.Background()) }()

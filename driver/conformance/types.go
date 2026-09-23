@@ -14,11 +14,12 @@ type Profile int
 const (
 	// ProfileFull runs with the capabilities advertised by the driver.
 	ProfileFull Profile = iota
-	// ProfileStrictPortability denies native optimization while retaining limits.
+	// ProfileStrictPortability runs with native optimizations disabled while
+	// preserving portable semantics and physical limits.
 	ProfileStrictPortability
 )
 
-// String returns the stable report and subtest name for p.
+// String returns "strict" for ProfileStrictPortability and "full" otherwise.
 func (p Profile) String() string {
 	if p == ProfileStrictPortability {
 		return "strict"
@@ -28,8 +29,11 @@ func (p Profile) String() string {
 
 // BrokerView is the broker-side state for one destination at one instant.
 type BrokerView struct {
-	Ready     int64
+	// Ready is the number of messages available for delivery.
+	Ready int64
+	// Unsettled is the number of delivered messages not yet settled.
 	Unsettled int64
+	// Auxiliary is the number of messages held in broker-side auxiliary destinations.
 	Auxiliary int64
 }
 
@@ -60,19 +64,23 @@ const (
 	FaultCloseFailure FaultKind = "close-failure"
 )
 
-// FaultInjector applies one deterministic port-level fault to the suite connection.
+// FaultInjector applies one deterministic port-level fault to the suite
+// connection and returns an error if it cannot inject the fault.
 type FaultInjector func(context.Context, FaultKind) error
 
 // DeadlineFixture creates consumers with a broker-side liveness deadline and
 // advances the fixture clock for deterministic pressure checks.
 type DeadlineFixture interface {
+	// Consumer creates a consumer whose broker-side liveness deadline is timeout.
 	Consumer(context.Context, time.Duration, driver.ConsumerConfig) (driver.Consumer, error)
+	// Now returns the fixture clock's current time.
 	Now() time.Time
+	// Advance moves the fixture clock forward by the supplied duration.
 	Advance(time.Duration)
 }
 
-// DeadlineFixtureFactory builds a deadline fixture on the suite connection.
-// The fixture is conformance-only; the frozen driver port remains unchanged.
+// DeadlineFixtureFactory builds a deadline fixture on the connection opened by
+// Run.
 type DeadlineFixtureFactory func(driver.Conn) (DeadlineFixture, error)
 
 // DeferralModel names the model a driver implements for a message that carries
@@ -94,10 +102,16 @@ const (
 
 // Suite describes one driver conformance run. Run executes both profiles.
 type Suite struct {
-	Driver             driver.Driver
-	Config             driver.Config
-	NewInspector       InspectorFactory
-	NewFaultInjector   func(driver.Conn) (FaultInjector, error)
+	// Driver is the adapter to exercise.
+	Driver driver.Driver
+	// Config is passed to Driver.Open.
+	Config driver.Config
+	// NewInspector is required and creates an inspector for the connection
+	// opened by Run.
+	NewInspector InspectorFactory
+	// NewFaultInjector optionally creates the fault injector used by Run.
+	NewFaultInjector func(driver.Conn) (FaultInjector, error)
+	// NewDeadlineFixture optionally creates the deadline fixture used by Run.
 	NewDeadlineFixture DeadlineFixtureFactory
 
 	// DeferralModel names the model the driver under test implements and selects
@@ -110,60 +124,82 @@ type Suite struct {
 
 // BehaviorEvent is one observable event in a behavior vector.
 type BehaviorEvent struct {
-	ID               string
-	Outcome          string
-	AttemptCount     int
+	// ID identifies the observed behavior.
+	ID string
+	// Outcome records the result observed by the conformance check.
+	Outcome string
+	// AttemptCount is the number of attempts observed for the event.
+	AttemptCount int
+	// FinalDestination is the destination where the event ended.
 	FinalDestination string
 }
 
 // BehaviorVector is an ordered, diffable record of observable behavior.
 type BehaviorVector []BehaviorEvent
 
-// Add appends one event to the vector in observation order.
-func (v *BehaviorVector) Add(event BehaviorEvent) {
+// add appends one event to the vector in observation order.
+func (v *BehaviorVector) add(event BehaviorEvent) {
 	*v = append(*v, event)
 }
 
 // ProfileReport contains one profile's vectors and group results.
 type ProfileReport struct {
+	// Profile is the capability policy used for this report.
 	Profile Profile
-	Vector  BehaviorVector
-	Groups  []GroupResult
+	// Vector is the ordered behavior observed under this profile.
+	Vector BehaviorVector
+	// Groups contains the results of the conformance groups that ran.
+	Groups []GroupResult
 }
 
 // GroupResult records the observed and declared size of a conformance group.
 type GroupResult struct {
-	Name     string
+	// Name identifies the conformance group.
+	Name string
+	// Declared is the number of checks specified for the group.
 	Declared int
+	// Observed is the number of checks run for the group.
 	Observed int
-	Status   string
-	Skipped  []CheckSkip
+	// Status records the group's result.
+	Status string
+	// Skipped contains checks explicitly skipped by the harness.
+	Skipped []CheckSkip
 }
 
-// CheckSkip records a check the harness's declared conditions gate before marking its
-// subtest skipped. It distinguishes an intentional result, such as an absent
-// fixture or a deferral model the check does not apply to, from t.Skip used to
-// pad a group while still satisfying its manifest count.
+// CheckSkip records a conformance check skipped because a declared condition
+// made it inapplicable, such as a missing fixture or an unsupported deferral
+// model.
 type CheckSkip struct {
-	Name   string
+	// Name identifies the skipped check.
+	Name string
+	// Reason explains why the check was skipped.
 	Reason string
 }
 
 // CapabilityResult is one capability check in a report.
 type CapabilityResult struct {
-	Profile    Profile
+	// Profile is the capability policy under which the check ran.
+	Profile Profile
+	// Capability identifies the capability being checked.
 	Capability string
-	Declared   string
-	Status     string
-	Evidence   string
+	// Declared records the capability value declared by the driver.
+	Declared string
+	// Status records the check result.
+	Status string
+	// Evidence describes the observed behavior used by the check.
+	Evidence string
 }
 
 // Report is the result of one Run call.
 type Report struct {
-	Driver       string
-	Profiles     []ProfileReport
+	// Driver is the name of the driver under test.
+	Driver string
+	// Profiles contains the reports for profiles that completed.
+	Profiles []ProfileReport
+	// Capabilities contains the capability checks recorded during the run.
 	Capabilities []CapabilityResult
-	Pending      []string
+	// Pending lists conformance groups declared but not registered by this package.
+	Pending []string
 }
 
 // Diff returns a human-readable vector difference, or an empty string.

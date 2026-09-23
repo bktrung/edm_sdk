@@ -14,7 +14,12 @@ import (
 // Work is one handler invocation. Run must include the complete settlement
 // path when ordering is required.
 type Work struct {
+	// Key selects the worker in ordered mode. Submit hashes it synchronously
+	// and nothing reads it afterwards, so the caller may reuse or mutate the
+	// slice once Submit returns.
 	Key []byte
+	// Run is the invocation itself. It must not read Key, because the caller
+	// owns that slice again as soon as Submit returns.
 	Run func(context.Context)
 }
 
@@ -37,10 +42,12 @@ type Pool struct {
 	// active counts Submit calls that have not returned, so Close can wait
 	// for them before it stops the workers.
 	active int
-	// outstanding counts accepted work that has not finished: queued plus
-	// running. It is exact, and it is the whole answer in unordered mode, where
-	// one queue serves every worker. The capacity-1 free channel below is a
-	// wake-up hint that drops extras and can therefore never be counted.
+	// outstanding counts accepted work that has not finished in unordered
+	// mode: queued plus running. One queue serves every worker there, so this
+	// exact count is the whole answer for Free. Ordered mode bounds each
+	// worker instead, and reads no total, so it neither maintains nor reads
+	// this counter. The capacity-1 free channel below is a wake-up hint that
+	// drops extras and can therefore never be counted.
 	outstanding int
 	// unfinished[i] counts the accepted work not finished for worker i, queued
 	// plus running, and idleWorkers counts the workers with none. Ordered mode
@@ -166,7 +173,6 @@ func (p *Pool) Submit(ctx context.Context, work Work) error {
 		return errors.New("dispatch: pool is closed")
 	}
 	p.active++
-	p.outstanding++
 	if p.ordered {
 		// A worker's count moves 0 -> 1 only on its first item, so the idle
 		// count moves at most once per accepted item.
@@ -174,6 +180,8 @@ func (p *Pool) Submit(ctx context.Context, work Work) error {
 			p.idleWorkers--
 		}
 		p.unfinished[worker]++
+	} else {
+		p.outstanding++
 	}
 	p.mu.Unlock()
 	defer p.finishSubmit()
@@ -239,8 +247,9 @@ func (p *Pool) release(worker int) {
 		if p.unfinished[worker] == 0 {
 			p.idleWorkers++
 		}
+	} else {
+		p.outstanding--
 	}
-	p.outstanding--
 	p.mu.Unlock()
 	select {
 	case p.free <- struct{}{}:

@@ -25,6 +25,8 @@ type UnrecognisedValueError struct {
 	Value string
 }
 
+// Error returns a message identifying the unsupported header attribute and
+// value.
 func (e *UnrecognisedValueError) Error() string {
 	return fmt.Sprintf("f1: unrecognised %s value %q", e.Attribute, e.Value)
 }

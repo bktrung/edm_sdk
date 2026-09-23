@@ -247,14 +247,11 @@ func (a *admin) pruneGuard(ctx context.Context, name string) (string, error) {
 	return "", nil
 }
 
-// EnsureTopology accepts exchanges, bindings, DeadLetter, and DeliveryLimit
-// fields, but Kafka does not honor them: routing is FanoutAtConsume, native
-// dead lettering is unavailable, and the core retry ladder owns those semantics.
-//
-// Under TopologyNone it creates nothing and makes no broker request; it still
-// records each destination's delay, which is local bookkeeping the conformance
-// inspector reads and not a broker round trip. The consume path does not: a
-// consumer takes its due times from the delay its own config carries.
+// EnsureTopology applies the requested topology policy and returns a topology
+// diff. Kafka uses topics as destinations and does not create exchanges or
+// bindings; routing uses fanout at consume time. The driver does not advertise
+// native dead-letter queue or delay support. Under TopologyNone, it makes no
+// broker request.
 func (a *admin) EnsureTopology(ctx context.Context, spec driver.TopologySpec) (driver.TopologyDiff, error) {
 	release, err := a.admission(ctx, "ensure_topology")
 	if err != nil {
@@ -278,8 +275,8 @@ func (a *admin) recordDestinationDelays(destinations []driver.DestinationSpec) {
 	// The instant is read under the lock, not before it, because the history is
 	// read as ordered: two EnsureTopology calls that interleave would otherwise
 	// append their declarations in the order they took the clock rather than the
-	// order they appended, and destinationDelayAt walks the history forward and
-	// stops at the first declaration later than the record it is asked about.
+	// order they appended, and a reader walks the history forward and stops at
+	// the first declaration later than the record it is asked about.
 	now := clock.NewReal().Now()
 	for _, destination := range destinations {
 		history := a.conn.delays[destination.Name]
@@ -299,6 +296,7 @@ func (a *admin) clearDestinationDelay(destination string) {
 	delete(a.conn.delays, destination)
 }
 
+// DescribeTopology returns the current topology state for the requested names.
 func (a *admin) DescribeTopology(ctx context.Context, names []string) (driver.TopologyState, error) {
 	release, err := a.admission(ctx, "describe_topology")
 	if err != nil {

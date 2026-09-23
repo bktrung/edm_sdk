@@ -10,9 +10,9 @@ var _ interface {
 	InjectTrace(context.Context) (string, string)
 } = (*Observer)(nil)
 
-// InjectTrace serializes the span in ctx with the configured propagator. A nil
-// or unconfigured propagator returns empty strings and never consults the otel
-// global propagator.
+// InjectTrace returns the traceparent and tracestate values produced by the
+// configured propagator for ctx. It returns empty strings for a nil receiver,
+// nil context, or missing propagator, and never uses the global propagator.
 func (o *Observer) InjectTrace(ctx context.Context) (traceParent, traceState string) {
 	if o == nil || o.propagator == nil {
 		return "", ""

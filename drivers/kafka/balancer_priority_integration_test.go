@@ -29,11 +29,9 @@ import (
 	"github.com/twmb/franz-go/pkg/kerr"
 	"github.com/twmb/franz-go/pkg/kgo"
 
-	//nolint:depguard // the priority measurement must drive the public SDK, which a driver's own external test package is allowed to import.
 	f1 "fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk"
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/driver"
 
-	//nolint:depguard // this driver's own external test package exercises the driver through its exported port.
 	kafka "fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/drivers/kafka"
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/clock"
 )
@@ -326,7 +324,6 @@ func measurePriorityConfig(member string, shape measureShape) f1.Config {
 		Topology: f1.TopologyConfig{Priorities: priorities},
 		Codec: f1.CodecConfig{
 			Default:        "json",
-			ContentMode:    "binary",
 			MaxHeaderBytes: f1.CoreMaxHeaderBytes,
 			MaxBodyBytes:   1 << 20,
 		},
@@ -868,6 +865,10 @@ func measureCreateTopic(t *testing.T, admin *kadm.Client, ctx context.Context, n
 	if response, ok := responses[name]; ok && response.Err != nil && !errors.Is(response.Err, kerr.TopicAlreadyExists) {
 		t.Fatalf("CreateTopics %q: %v", name, response.Err)
 	}
+	// Creation returns before every partition has a leader; a publish in that
+	// window fails with UNKNOWN_TOPIC_OR_PARTITION.
+	destination := &portFixture{ctx: ctx, clock: clock.NewReal(), admin: admin, topic: name, partitions: int(partitions)}
+	destination.awaitDestination(t) //nolint:contextcheck // the fixture carries ctx
 }
 
 // measureCleanup deletes what one priority run created: the group, then every
@@ -930,7 +931,7 @@ func measureMoveRun(t *testing.T, run int) {
 
 	holderConnection := measureOpenConnection(t, ctx, "member-0")
 	joinerConnection := measureOpenConnection(t, ctx, "member-1")
-	producer, err := holderConnection.Producer(ctx, driver.ProducerConfig{RequireDurableAck: true, Effective: holderConnection.Capabilities()})
+	producer, err := holderConnection.Producer(ctx, driver.ProducerConfig{Effective: holderConnection.Capabilities()})
 	if err != nil {
 		t.Fatalf("%s: Producer(): %v", label, err)
 	}

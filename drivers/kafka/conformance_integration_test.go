@@ -251,3 +251,30 @@ func countDeferredRecords(ctx context.Context, connection *conn, destination str
 	}
 	return auxiliary, nil
 }
+
+// destinationDelayAt reports the delay the destination had declared for a
+// record published at instant at, and whether it had declared one at all. A
+// record published before the destination's first declaration was not deferred
+// by it, which a caller reads as a zero delay and reports as ready.
+//
+// A record's timestamp is the publish instant rounded down to the millisecond
+// the broker stores, so a declaration anywhere inside that millisecond is in
+// force for the record. The delay history is otherwise read by no production
+// path, and this method exists for the tests that check a record's due time
+// against what EnsureTopology recorded.
+func (c *conn) destinationDelayAt(destination string, at time.Time) (time.Duration, bool) {
+	latest := at.Truncate(kafkaTimestampPrecision).Add(kafkaTimestampPrecision)
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	var (
+		delay time.Duration
+		known bool
+	)
+	for _, declared := range c.delays[destination] {
+		if declared.at.After(latest) {
+			break
+		}
+		delay, known = declared.delay, true
+	}
+	return delay, known
+}

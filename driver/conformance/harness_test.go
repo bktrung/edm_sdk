@@ -361,7 +361,7 @@ func TestRunFailureHelper(t *testing.T) {
 		groupRunners = map[string]groupRunner{}
 		registerGroup("publish", func(group *groupContext) {
 			group.Check("profile behavior differs", func(*testing.T) {
-				group.vector.Add(BehaviorEvent{ID: "profile", Outcome: group.profile.String()})
+				group.vector.add(BehaviorEvent{ID: "profile", Outcome: group.profile.String()})
 			})
 		})
 		factory = runTestInspector

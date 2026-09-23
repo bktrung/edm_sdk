@@ -122,11 +122,11 @@ func runCapability(group *groupContext) {
 		if err := producer.Publish(group.ctx, driver.OutboundMessage{Destination: name, Body: []byte("delayed"), DelayUntil: due}); err != nil {
 			t.Fatal(err)
 		}
-		assertNoDelivery(t, group, consumer, "delayed capability message before due time")
+		assertNoDeliveryBefore(t, group, consumer, due, "delayed capability message before due time")
 		advanceDeferredTo(group, due)
 		message := receiveBefore(t, group, consumer, due.Add(deferredLateBound), "delayed capability message")
-		if string(message.Body) != "delayed" {
-			t.Fatalf("body=%q, want delayed", message.Body)
+		if string(message.Body) != "delayed" || message.ReceivedAt.Before(due) {
+			t.Fatalf("delivery body=%q at %s, want delayed at or after %s", message.Body, message.ReceivedAt, due)
 		}
 		ackMessage(t, group, message)
 		group.capability("NativeDelay/delivery", strconv.FormatBool(group.effective.NativeDelay), capabilityBoolStatus(group.effective.NativeDelay), "DelayUntil was honored with the declared native or portable path")
@@ -423,7 +423,7 @@ func checkFanoutDeclaration(group *groupContext) {
 			t.Fatalf("EnsureTopology fanout probe: %v", err)
 		}
 		producer, err := group.conn.Producer(group.ctx, driver.ProducerConfig{
-			RequireDurableAck: true, Effective: group.effective,
+			Effective: group.effective,
 		})
 		if err != nil {
 			t.Fatalf("Producer fanout probe: %v", err)

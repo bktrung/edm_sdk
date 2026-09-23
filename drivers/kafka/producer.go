@@ -51,6 +51,8 @@ func (p *producer) endOperation() {
 
 var _ driver.Producer = (*producer)(nil)
 
+// Publish sends messages to Kafka and waits for their broker results. Partial
+// failures are returned as PublishError, and an empty batch succeeds.
 func (p *producer) Publish(ctx context.Context, msgs ...driver.OutboundMessage) error {
 	if err := ctx.Err(); err != nil {
 		return classify("publish", driver.KindTransient, err)
@@ -233,6 +235,7 @@ func resolveBatchLinger(options map[string]string) (time.Duration, error) {
 	return linger, nil
 }
 
+// Close stops new publishes and waits for active publishes to finish or ctx to expire.
 func (p *producer) Close(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
 		return classify("producer.close", driver.KindTransient, err)

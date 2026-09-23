@@ -98,7 +98,7 @@ func TestTypedDecodeFailureIsTerminalOnFirstAttempt(t *testing.T) {
 		Headers:     headerSlice(headers),
 		Body:        []byte(`{"name":`),
 		Settle:      settler,
-	}, &Envelope{}, new(bool)) {
+	}, &Envelope{}, new(bool), &deliveryState{}) {
 		t.Fatal("typed decode failure was not settled")
 	}
 	if handled {
@@ -161,7 +161,7 @@ func TestChain_UserMiddlewareOrderIsPreserved(t *testing.T) {
 		Headers:     headerSlice(headers),
 		Body:        []byte(`{}`),
 		Settle:      settler,
-	}, &Envelope{}, new(bool)) {
+	}, &Envelope{}, new(bool), &deliveryState{}) {
 		t.Fatal("middleware-classified message was not settled")
 	}
 	if !settler.acked {
@@ -215,7 +215,7 @@ func TestChain_UserMiddlewarePanicIsRecovered(t *testing.T) {
 		Headers:     headerSlice(headers),
 		Body:        []byte(`{}`),
 		Settle:      settler,
-	}, &Envelope{}, new(bool)) {
+	}, &Envelope{}, new(bool), &deliveryState{}) {
 		t.Fatal("panicking middleware message was not settled")
 	}
 	if !settler.acked {

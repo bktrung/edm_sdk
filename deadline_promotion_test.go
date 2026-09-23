@@ -529,12 +529,12 @@ func publishPromotionMessage(t *testing.T, client *Client, ctx context.Context, 
 		if err != nil {
 			t.Fatalf("PublishBatch() error = %v", err)
 		}
-		if len(result.Failed()) == 0 {
+		if len(failedIndexes(result)) == 0 {
 			return
 		}
 		select {
 		case <-deadline.C:
-			t.Fatalf("publish did not reach the topology: %v", result.Results[result.Failed()[0]].Err)
+			t.Fatalf("publish did not reach the topology: %v", result.Results[failedIndexes(result)[0]].Err)
 			return
 		case <-ticker.C:
 		}

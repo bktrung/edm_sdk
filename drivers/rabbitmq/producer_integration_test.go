@@ -31,7 +31,7 @@ func TestProducerConfirmAndReturn(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("EnsureTopology: %v", err)
 	}
-	producer, err := conn.Producer(ctx, driver.ProducerConfig{RequireDurableAck: true})
+	producer, err := conn.Producer(ctx, driver.ProducerConfig{})
 	if err != nil {
 		t.Fatalf("Producer: %v", err)
 	}
@@ -112,7 +112,7 @@ func TestProducerAbandonedConfirmationRelay(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("EnsureTopology: %v", err)
 	}
-	rawProducer, err := conn.Producer(ctx, driver.ProducerConfig{RequireDurableAck: true})
+	rawProducer, err := conn.Producer(ctx, driver.ProducerConfig{})
 	if err != nil {
 		t.Fatalf("Producer: %v", err)
 	}
@@ -179,7 +179,7 @@ func TestProducerConfirmedSequence(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("EnsureTopology: %v", err)
 	}
-	producer, err := conn.Producer(ctx, driver.ProducerConfig{RequireDurableAck: true})
+	producer, err := conn.Producer(ctx, driver.ProducerConfig{})
 	if err != nil {
 		t.Fatalf("Producer: %v", err)
 	}
@@ -212,7 +212,7 @@ func TestProducerBatchPublishesWindowBeforeReadingConfirmation(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("EnsureTopology: %v", err)
 	}
-	rawProducer, err := conn.Producer(ctx, driver.ProducerConfig{RequireDurableAck: true})
+	rawProducer, err := conn.Producer(ctx, driver.ProducerConfig{})
 	if err != nil {
 		t.Fatalf("Producer: %v", err)
 	}
@@ -279,7 +279,7 @@ func TestProducerBatchReturnFailsItsOwnIndex(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("EnsureTopology: %v", err)
 	}
-	rawProducer, err := conn.Producer(ctx, driver.ProducerConfig{RequireDurableAck: true})
+	rawProducer, err := conn.Producer(ctx, driver.ProducerConfig{})
 	if err != nil {
 		t.Fatalf("Producer: %v", err)
 	}
@@ -363,7 +363,7 @@ func TestProducerBatchReturnFromBrokerFailsOnlyItsOwnIndex(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("EnsureTopology: %v", err)
 	}
-	rawProducer, err := conn.Producer(ctx, driver.ProducerConfig{RequireDurableAck: true})
+	rawProducer, err := conn.Producer(ctx, driver.ProducerConfig{})
 	if err != nil {
 		t.Fatalf("Producer: %v", err)
 	}
@@ -434,7 +434,7 @@ func TestProducerNegativeConfirmFailsItsOwnIndex(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("EnsureTopology: %v", err)
 	}
-	rawProducer, err := conn.Producer(ctx, driver.ProducerConfig{RequireDurableAck: true})
+	rawProducer, err := conn.Producer(ctx, driver.ProducerConfig{})
 	if err != nil {
 		t.Fatalf("Producer: %v", err)
 	}
@@ -526,7 +526,7 @@ func TestProducerSizeRefusalFailsOnlyItsOwnIndex(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("EnsureTopology: %v", err)
 	}
-	rawProducer, err := conn.Producer(ctx, driver.ProducerConfig{RequireDurableAck: true})
+	rawProducer, err := conn.Producer(ctx, driver.ProducerConfig{})
 	if err != nil {
 		t.Fatalf("Producer: %v", err)
 	}
@@ -614,7 +614,7 @@ func TestProducerSizeRefusalIsTheOnlyFailure(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("EnsureTopology: %v", err)
 	}
-	rawProducer, err := conn.Producer(ctx, driver.ProducerConfig{RequireDurableAck: true})
+	rawProducer, err := conn.Producer(ctx, driver.ProducerConfig{})
 	if err != nil {
 		t.Fatalf("Producer: %v", err)
 	}
@@ -665,7 +665,7 @@ func TestProducerConfirmsArriveInPublishOrder(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("EnsureTopology: %v", err)
 	}
-	rawProducer, err := conn.Producer(ctx, driver.ProducerConfig{RequireDurableAck: true})
+	rawProducer, err := conn.Producer(ctx, driver.ProducerConfig{})
 	if err != nil {
 		t.Fatalf("Producer: %v", err)
 	}
@@ -717,7 +717,7 @@ func TestProducerCancelledWindowInvalidatesChannel(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("EnsureTopology: %v", err)
 	}
-	rawProducer, err := conn.Producer(ctx, driver.ProducerConfig{RequireDurableAck: true})
+	rawProducer, err := conn.Producer(ctx, driver.ProducerConfig{})
 	if err != nil {
 		t.Fatalf("Producer: %v", err)
 	}
@@ -785,7 +785,7 @@ func TestProducerCancelledWindowInvalidatesChannel(t *testing.T) {
 		t.Fatalf("receiving the publish that followed the cancelled window: %v", ctx.Err())
 	}
 
-	fresh, err := conn.Producer(ctx, driver.ProducerConfig{RequireDurableAck: true})
+	fresh, err := conn.Producer(ctx, driver.ProducerConfig{})
 	if err != nil {
 		t.Fatalf("Producer: %v", err)
 	}
@@ -832,7 +832,7 @@ func TestProducerBatchWithoutMessageIDsFailsOnlyItsOwnIndex(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("EnsureTopology: %v", err)
 	}
-	rawProducer, err := conn.Producer(ctx, driver.ProducerConfig{RequireDurableAck: true})
+	rawProducer, err := conn.Producer(ctx, driver.ProducerConfig{})
 	if err != nil {
 		t.Fatalf("Producer: %v", err)
 	}
@@ -909,7 +909,7 @@ func TestProducerBatchLocalEncodingFailureDoesNotStallWindow(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("EnsureTopology: %v", err)
 	}
-	rawProducer, err := conn.Producer(ctx, driver.ProducerConfig{RequireDurableAck: true})
+	rawProducer, err := conn.Producer(ctx, driver.ProducerConfig{})
 	if err != nil {
 		t.Fatalf("Producer: %v", err)
 	}
@@ -1027,7 +1027,7 @@ func TestProducerPublishesToDeclaredFanoutExchange(t *testing.T) {
 	if _, err := conn.Admin().EnsureTopology(ctx, spec); err != nil {
 		t.Fatalf("EnsureTopology: %v", err)
 	}
-	producer, err := conn.Producer(ctx, driver.ProducerConfig{RequireDurableAck: true})
+	producer, err := conn.Producer(ctx, driver.ProducerConfig{})
 	if err != nil {
 		t.Fatalf("Producer: %v", err)
 	}
@@ -1154,7 +1154,7 @@ func TestProducerParkingFailureNamesMissingQueue(t *testing.T) {
 		t.Fatalf("QueueDeclare(%q): %v", destination, err)
 	}
 
-	publisher, err := conn.Producer(ctx, driver.ProducerConfig{RequireDurableAck: true})
+	publisher, err := conn.Producer(ctx, driver.ProducerConfig{})
 	if err != nil {
 		t.Fatalf("Producer: %v", err)
 	}
@@ -1270,59 +1270,29 @@ func TestParkingFailureRendersEveryDeclareArgument(t *testing.T) {
 	}
 }
 
-// TestProducerTargetRoutesEntryPointToExchange proves target() routes an
-// entry-point publish to its named exchange with no routing key, purely from
-// OutboundMessage.EntryPoint, and offline: no live broker connection. The
-// table runs once per topology policy to document that this is now true
-// regardless of policy - the defect this replaces was that a pre-provisioned
-// exchange only routed correctly once EnsureTopology had populated a
-// process-local cache, so it broke under exactly the policy where a
-// pre-provisioned exchange is the whole point (no admin call is ever made).
-// target() takes no policy argument any more; the loop asserts the same
-// answer under all three names so a future reintroduction of policy-derived
-// routing would have to change this test to pass.
-func TestProducerTargetRoutesEntryPointToExchange(t *testing.T) {
-	policies := map[string]driver.TopologyPolicy{
-		"TopologyNone":    driver.TopologyNone,
-		"TopologyDeclare": driver.TopologyDeclare,
-		"TopologyVerify":  driver.TopologyVerify,
-	}
-	for name, policy := range policies {
-		t.Run(name, func(t *testing.T) {
-			t.Logf("target() takes no policy argument; asserting under policy %d (%s) for documentation", policy, name)
-			p := &producer{clock: clock.NewReal(), conn: &conn{}}
-			exchange, routingKey, expiration := p.target(driver.OutboundMessage{Destination: "orders.fanout", EntryPoint: true})
-			if exchange != "orders.fanout" {
-				t.Fatalf("target() exchange = %q, want %q", exchange, "orders.fanout")
-			}
-			if routingKey != "" {
-				t.Fatalf("target() routingKey = %q, want empty for a fanout exchange", routingKey)
-			}
-			if expiration != "" {
-				t.Fatalf("target() expiration = %q, want empty for a non-deferred publish", expiration)
-			}
-		})
-	}
-}
-
-// TestProducerTargetRetryAndDLQStayConcreteDestinations proves the fix does
-// not pass by routing everything to an exchange: a retry or DLQ publish
-// carries EntryPoint: false, its zero value, and must still route to the
-// AMQP default exchange with the destination as routing key.
-func TestProducerTargetRetryAndDLQStayConcreteDestinations(t *testing.T) {
-	cases := []string{
-		"f1.prod.orders.created.worker.high.retry.1",
-		"f1.prod.orders.created.dlq.worker",
-	}
+// TestProducerTargetRoutesOnlyEntryPointsToAnExchange pins publish routing:
+// an entry-point publish goes to its fanout exchange with no routing key, and
+// a retry or DLQ publish, which carries EntryPoint: false, its zero value,
+// still routes to the AMQP default exchange with the destination as routing
+// key, so the entry-point path cannot pass by routing everything to an exchange.
+func TestProducerTargetRoutesOnlyEntryPointsToAnExchange(t *testing.T) {
 	p := &producer{clock: clock.NewReal(), conn: &conn{}}
-	for _, destination := range cases {
-		t.Run(destination, func(t *testing.T) {
-			exchange, routingKey, expiration := p.target(driver.OutboundMessage{Destination: destination})
-			if exchange != "" {
-				t.Fatalf("target() exchange = %q, want empty for a concrete destination", exchange)
+	for _, test := range []struct {
+		message        driver.OutboundMessage
+		wantExchange   string
+		wantRoutingKey string
+	}{
+		{message: driver.OutboundMessage{Destination: "orders.fanout", EntryPoint: true}, wantExchange: "orders.fanout"},
+		{message: driver.OutboundMessage{Destination: "f1.prod.orders.created.worker.high.retry.1"}, wantRoutingKey: "f1.prod.orders.created.worker.high.retry.1"},
+		{message: driver.OutboundMessage{Destination: "f1.prod.orders.created.dlq.worker"}, wantRoutingKey: "f1.prod.orders.created.dlq.worker"},
+	} {
+		t.Run(test.message.Destination, func(t *testing.T) {
+			exchange, routingKey, expiration := p.target(test.message)
+			if exchange != test.wantExchange {
+				t.Fatalf("target() exchange = %q, want %q", exchange, test.wantExchange)
 			}
-			if routingKey != destination {
-				t.Fatalf("target() routingKey = %q, want %q", routingKey, destination)
+			if routingKey != test.wantRoutingKey {
+				t.Fatalf("target() routingKey = %q, want %q", routingKey, test.wantRoutingKey)
 			}
 			if expiration != "" {
 				t.Fatalf("target() expiration = %q, want empty for a non-deferred publish", expiration)

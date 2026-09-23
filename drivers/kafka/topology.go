@@ -25,8 +25,6 @@ type kafkaTopicSpec struct {
 
 type kafkaTopologyPlan struct {
 	destinations []kafkaTopicSpec
-	exchanges    []string
-	bindings     []driver.BindingSpec
 }
 
 type topicVisibility uint8

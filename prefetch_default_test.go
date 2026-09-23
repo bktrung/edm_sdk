@@ -66,19 +66,6 @@ func TestPrefetchDefaultSubscribeRaisesUnnamed(t *testing.T) {
 	}
 }
 
-func TestPrefetchDefaultSubscribeKeepsNamedBelowFloor(t *testing.T) {
-	t.Parallel()
-	client := newPublishClient(t, &recordingProducer{})
-	_, err := client.Subscribe(context.Background(), Subscription{
-		Name:     "orders",
-		Topics:   prefetchDefaultSixTopics,
-		Prefetch: 64,
-	})
-	if err == nil || !strings.Contains(err.Error(), "prefetch 64") || !strings.Contains(err.Error(), "lane count 72") {
-		t.Fatalf("Subscribe() error = %v, want named prefetch below lane count to fail", err)
-	}
-}
-
 func TestPrefetchDefaultConfigRaisesUnnamed(t *testing.T) {
 	t.Parallel()
 	path := writeConfig(t, "f1:\n  env: test\n  service: orders\n  broker:\n    driver: inmem\n  subscriptions:\n    orders:\n      topics: [t0, t1, t2, t3, t4, t5]\n")
