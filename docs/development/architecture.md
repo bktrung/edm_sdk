@@ -1,6 +1,7 @@
 # Architecture
 
-This is the canonical maintainer map of the F1 repository. It explains where
+F1 keeps its delivery rules in the root package and gives every broker operation
+to the driver port and its adapters. This maintainer map explains where
 responsibilities live and which boundaries are deliberate. The source and tests
 remain authoritative for current behavior; use the links below to inspect the
 implementation when a detail matters.
@@ -11,17 +12,18 @@ or decide whether a behavior belongs in the core SDK or in a driver.
 ## System shape
 
 ```mermaid
+%%{init: {"flowchart": {"nodeSpacing": 24, "rankSpacing": 40}}}%%
 flowchart TB
     APP[Application]
-    CORE[Root package f1<br/>public API and orchestration]
-    CODEC[codec/<br/>payload codecs]
-    INTERNAL[internal/*<br/>portable runtime primitives]
-    PORT[driver/<br/>broker-independent port]
-    OBS[Observer port<br/>f1.Observer]
-    OTEL[f1otel/<br/>OpenTelemetry adapter]
-    INMEM[drivers/inmem/<br/>reference driver]
-    RABBIT[drivers/rabbitmq/<br/>RabbitMQ adapter]
-    KAFKA[drivers/kafka/<br/>Kafka adapter]
+    CORE[f1]
+    CODEC[codec/]
+    INTERNAL[internal/]
+    PORT[driver/]
+    OBS[f1.Observer]
+    OTEL[f1otel/]
+    INMEM[inmem]
+    RABBIT[rabbitmq]
+    KAFKA[kafka]
     BROKER[(External broker)]
 
     APP --> CORE
@@ -37,6 +39,16 @@ flowchart TB
     KAFKA --> BROKER
 ```
 
+| Package | Role |
+| --- | --- |
+| `f1` (root) | Public API and orchestration |
+| `codec/` | Payload codecs |
+| `internal/` | Portable runtime primitives |
+| `driver/` | Broker-independent port |
+| `f1.Observer` | Observer port; `f1otel/` is its OpenTelemetry adapter |
+| `drivers/inmem/` (inmem) | Reference driver |
+| `drivers/rabbitmq/`, `drivers/kafka/` | Broker adapters |
+
 ## Runtime paths at a glance
 
 The public path is the same regardless of the connected driver: the root
@@ -46,20 +58,21 @@ the port operation into broker work.
 ### Publish path
 
 ```mermaid
+%%{init: {"sequence": {"actorMargin": 24, "width": 100}}}%%
 sequenceDiagram
     participant App
-    participant P as f1.Publisher
-    participant C as codec.Codec
+    participant P as Publisher
+    participant C as Codec
     participant E as Envelope
-    participant D as driver.Producer
+    participant D as Producer
     participant B as Broker
 
-    App->>P: Publish(eventType, payload, options)
+    App->>P: Publish(type, payload)
     P->>C: Encode(payload)
-    P->>E: Build ID, routing, metadata
-    E-->>P: Canonical headers
+    P->>E: build envelope
+    E-->>P: headers
     P->>D: Publish(OutboundMessage)
-    D->>B: Broker write + durable confirmation
+    D->>B: Write, await confirm
     B-->>D: Confirm or failure
     D-->>P: Result
     P-->>App: Event ID or error
@@ -71,30 +84,33 @@ including topology, producer admission, and close interaction.
 ### Consume path
 
 ```mermaid
+%%{init: {"sequence": {"actorMargin": 24, "width": 100}}}%%
 sequenceDiagram
     participant B as Broker
-    participant D as driver.Consumer
+    participant D as Consumer
     participant R as Runner
     participant S as Scheduler
-    participant W as Dispatch pool
+    participant W as Pool
     participant H as Handler
-    participant P as Shared producer
+    participant P as Producer
 
     B->>D: Delivery
-    D->>R: InboundMessage + Settler
-    R->>S: Enqueue bounded lane
-    S->>W: Select next delivery
-    W->>H: Decode Event and invoke handler
+    D->>R: message + settler
+    R->>S: enqueue in lane
+    S->>W: next delivery
+    W->>H: Decode and invoke
     alt success or Drop
         W->>D: Ack original
     else retryable failure
-        W->>P: Publish retry successor durably
+        W->>P: Publish retry copy
         W->>D: Ack original
-    else terminal failure, panic, decode, expiry, or unmatched DLQ policy
-        W->>P: Publish DLQ successor durably
+    else dead-letter outcome
+        W->>P: Publish DLQ copy
         W->>D: Ack original
     end
 ```
+
+A dead-letter outcome is a terminal failure, a panic, a decode failure, an expiry, or an unmatched event under the dead-letter policy. Both successor copies are published with a durable confirmation before the original is acked.
 
 See [Consume flow](/development/consume-flow) and
 [Lifecycle and shutdown](/advanced-topics/lifecycle-and-shutdown) for
@@ -103,7 +119,7 @@ dispatch, settlement, reconnect, and drain behavior.
 The verification packages sit beside the runtime and point at what they exercise:
 
 ```mermaid
-flowchart LR
+flowchart TB
     CONFORMANCE[driver/conformance/<br/>port contract suite]
     F1TEST[f1test/<br/>deterministic test client]
     TOOLS[tools/<br/>API and compatibility checks]
@@ -152,6 +168,7 @@ own the details.
 | `internal/dispatch/` | Worker pool, ordered-key routing, and in-flight delivery accounting | [`internal/dispatch/pool.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/internal/dispatch/pool.go), [`internal/dispatch/registry.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/internal/dispatch/registry.go) |
 | `internal/lifecycle/` | Runner lifecycle state machine and transition validation | [`internal/lifecycle/state.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/internal/lifecycle/state.go) |
 | `internal/kafka/` | Standard-library-only Kafka timeout rules shared by core configuration validation and Kafka consumer admission | [`internal/kafka/drain.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/internal/kafka/drain.go) |
+| `internal/wire/` | Wire header names shared by the envelope codec and the RabbitMQ property mapping | [`internal/wire/headers.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/internal/wire/headers.go) |
 | `f1otel/` | Application-owned OpenTelemetry metrics, spans, and trace propagation adapter for `f1.Observer` | [`f1otel/doc.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/f1otel/doc.go), [`f1otel/observer.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/f1otel/observer.go) |
 | `drivers/inmem/` | Deterministic in-memory broker, including topology, delivery, settlement, and fault behavior for tests | [`drivers/inmem/inmem.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/drivers/inmem/inmem.go) |
 | `drivers/rabbitmq/` | RabbitMQ transport, topology, management, settlement, reconnect, and broker-specific tests | [`drivers/rabbitmq/rabbitmq.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/drivers/rabbitmq/rabbitmq.go) |
@@ -210,7 +227,7 @@ primary owner:
   OpenTelemetry providers. See [Observer](/basics/observer) and
   [Observability](/advanced-topics/observability).
 
-The canonical implementation walkthroughs are [Publish flow](/development/publish-flow)
+The implementation walkthroughs are [Publish flow](/development/publish-flow)
 and [Consume flow](/development/consume-flow). The provider guide remains a
 useful companion page for adapter-specific notes and broker operations.
 
@@ -272,26 +289,22 @@ bridge tests in [`worker_retry_bridge_test.go`](https://fgit.zapps.vn/zatf2026-b
 
 ### Delivery is at least once
 
-A message may be delivered again after a connection failure, an uncertain
-settlement, a release, or a process restart. F1 preserves message identity and
-does not deduplicate application effects. Handlers must make externally visible
-effects idempotent, normally using the event idempotency key exposed by the
-public event model.
+F1 provides at-least-once delivery: connection failures, uncertain settlements,
+releases, and process restarts may redeliver a message with its stable identity.
+F1 does not deduplicate application effects.
 
-The user-facing trade-off is documented in
-[Failure handling](/advanced-topics/failure-handling); the settlement
-state and redelivery behavior are covered by the root settlement and driver
-tests.
+See [Failure handling](/advanced-topics/failure-handling) and
+[Life of a delivery](/deep-dives/life-of-a-delivery) for the user-facing
+trade-offs and failure cases.
 
 ### Handlers must be idempotent
 
-The SDK can provide stable identity and safe retry routing, but it does not own
-the application's effect store or deduplication policy. A handler that charges a
-card, updates a database, or emits an external side effect must tolerate the
-same event being observed more than once.
+Handlers must tolerate the same event more than once because F1 does not own the
+application's effect store or deduplication policy.
 
-This is the application boundary of at-least-once delivery, not an optional
-optimization.
+See [Failure handling](/advanced-topics/failure-handling) and
+[Life of a delivery](/deep-dives/life-of-a-delivery) for the user-facing
+trade-offs and failure cases.
 
 ### Capabilities may be reduced at runtime
 
@@ -337,5 +350,11 @@ The maintainer route is:
    differences and the current adapter notes.
 6. [Source-reading guide](/development/source-reading-guide) for a staged source and test tour.
 
-The development documentation is the canonical maintainer route. The root
+The development pages are the maintainer route. The root
 `ARCHITECTURE.md` remains a stable entrypoint that points here.
+
+## Go further
+
+- [Publish flow](/development/publish-flow) - the outbound message path;
+- [Consume flow](/development/consume-flow) - delivery, settlement, drain, and reconnect;
+- [Driver contract](/development/driver-contract) - the broker-independent port.

@@ -1,26 +1,14 @@
 # Ordering and scheduling
 
-F1 has two separate delivery decisions:
+F1 makes two separate delivery decisions: ordering controls whether equal keys overlap, while scheduling controls which ready delivery receives the next handler slot.
 
-- **Ordering** answers whether deliveries with the same message key may run at
-  the same time.
-- **Scheduling** answers which ready delivery receives the next available
-  handler slot when topics, priorities, or retry work compete.
-
-Do not use one setting to solve the other. `OrderedByKey` protects a per-key
-business invariant; `FairnessConfig` protects service capacity across work
-classes. Both operate within F1's at-least-once delivery model, so ordering
-does not remove the need for idempotent effects. See [Message](/basics/message)
-and [Publisher and subscriber](/basics/pubsub) for the application-facing
-message and subscription model.
+Do not use one setting to solve the other. `OrderedByKey` protects a per-key business rule; `FairnessConfig` shares service capacity across topics, priorities, and retry work. Both operate within [at-least-once delivery](/learn/glossary#at-least-once-delivery), so ordering does not remove the need for idempotent effects.
 
 ## Choose the ordering guarantee
 
-The default subscription mode is `f1.Unordered`. It allows the configured
-handler concurrency to process deliveries in parallel and makes no ordering
-promise between deliveries.
+The default subscription mode is `f1.Unordered`. It allows configured handler concurrency to process deliveries in parallel and makes no ordering promise.
 
-Use `f1.OrderedByKey` when a business entity must be processed serially:
+Use `f1.OrderedByKey` when one business entity must be processed serially.
 
 ```go
 runner, err := client.Subscribe(ctx, f1.Subscription{
@@ -34,31 +22,15 @@ runner, err := client.Subscribe(ctx, f1.Subscription{
 })
 ```
 
-In ordered mode:
+Equal message keys are handled one at a time. Different keys may run concurrently. F1 does not provide one global order across topics, priorities, keys, or consumer instances.
 
-- deliveries with equal message keys are assigned to the same worker and do
-  not overlap;
-- different keys may run concurrently on different workers; and
-- F1 does not provide one global order across all topics, priorities, keys, or
-  consumer instances.
+This guarantee ends at a retry. Once the retry copy is stored, the failed original is acknowledged and releases the key. A later message with that key can run before the retry returns. If a key must never be handled out of order, set `RetryConfig{MaxAttempts: 1}` so failure goes directly to dead-letter, or make the handler tolerate the reorder.
 
-This guarantee ends at a retry. A delivery that fails and is retried is
-acknowledged as soon as its retry copy is stored, which releases the key, so
-the next message with that key is handled before the retry comes back. When a
-key must not be handled out of order at all, either set
-`RetryConfig{MaxAttempts: 1}` for the subscription so a failure goes straight
-to the dead-letter destination, or make the handler tolerate the reorder.
+The connected driver must advertise [`ordered_by_key`](/drivers-and-capabilities#capability-report). F1 rejects an ordered subscription when the capability is unavailable. Check `client.Limits()` during startup when deployment portability matters.
 
-The connected driver must advertise the `ordered_by_key` capability. F1
-rejects an ordered subscription when that capability is unavailable. Check
-`client.Limits()` during startup when deployment portability matters; the
-capability report is the authority for the connected driver. The capability
-contract is defined by [`driver.Capabilities`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/driver/capability.go) and
-the subscription check is in `Subscribe`.
+## Publish a stable key
 
-### Make the key stable
-
-Publish the same logical key for every event whose state must be serialized:
+Ordering follows the message key, not the event type or idempotency key unless the application deliberately uses that value as a key.
 
 ```go
 _, err := client.Publisher().Publish(
@@ -69,92 +41,53 @@ _, err := client.Publisher().Publish(
 )
 ```
 
-`WithKey` is the explicit partition/routing key. If it is omitted, F1 derives
-the transport key from the subject and then the generated event ID. That is
-safe as a default, but generated IDs do not create a useful per-order
-ordering relationship. `WithSubject` can provide a stable default when the
-subject is the business entity. See [`WithKey`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/publisher.go) and
-[Message metadata](/basics/message#metadata-and-the-envelope).
+`WithKey` sets the routing key explicitly. `WithSubject` supplies a stable default when no explicit key is present. With neither option, F1 falls back to the generated event ID, which is safe but does not create a useful per-order relationship.
 
-Ordering follows the message key. `WithKey` sets it explicitly; `WithSubject`
-supplies it when no explicit key is present; and when neither is provided F1
-falls back to the generated event ID. Ordering does not follow the event type
-or idempotency key unless the application deliberately uses that value as a
-key.
+## See what a retry does to key order
 
-### Understand the trade-off
+A failed delivery releases its key as soon as the [retry copy](/learn/glossary#successor-publish) is stored. The next same-key message can therefore run before the retry is eligible again.
 
-Ordered mode preserves serial execution for a key across the handler and its
-settlement path, but a single hot key remains a single serial bottleneck. If
-all messages use one key, increasing `Concurrency` cannot make that key run in
-parallel. If the service needs more throughput, use a key that matches the
-business serialization boundary rather than enabling global ordering.
+```mermaid
+sequenceDiagram
+    participant B as broker
+    participant F as F1
+    participant H as handler
+    B->>F: A1 (key k)
+    F->>H: deliver A1
+    H->>F: fail A1
+    F--)B: retry A1
+    F->>B: ack A1
+    B->>F: A2 (key k)
+    F->>H: handle A2
+    B->>F: retry A1
+    F->>H: handle retry A1
+```
 
-An ordered subscription's dispatch queue is bounded: it holds at most 2,097,152
-queued entries, which is 64 MiB of work items on a 64-bit platform, and F1
-checks the bound as `Concurrency` times `Prefetch`. Reduce either value when
-their product exceeds it.
-
-An ordered subscription also needs enough distinct keys to use its workers.
-Measure the active key distribution before increasing concurrency; more worker
-slots do not help when most work hashes to one key.
+The diagram shows why `OrderedByKey` is a per-attempt execution guarantee, not a durable sequence across retries. Use the failure policy to choose whether that trade-off is acceptable.
 
 ## Configure execution capacity
 
-`Concurrency` and `Prefetch` control different parts of the pipeline:
+`Concurrency`, `Prefetch`, [lane](/learn/glossary#lane) capacity, the Kafka partition ceiling, and the handler pool form one bounded path. Raising one knob cannot exceed a lower ceiling later in the path.
 
-| Setting | Controls | Main trade-off |
-| --- | --- | --- |
-| `Concurrency` | Number of handler workers available to a subscription | More parallelism requires thread-safe, idempotent handler effects and more downstream capacity. |
-| `Prefetch` | How many deliveries the consumer may hold ahead of settlement; in ordered mode the effective prefetch is also the dispatch queue budget. A partition-bound driver admits one delivery per partition whatever this is set to, so there the ceiling is the number of partitions assigned to the consumer | More buffering can improve utilization but increases in-flight work, memory, and shutdown backlog. Raising it above the partitions assigned to the consumer does not raise the ceiling, because each of those partitions is already carrying one delivery. |
+```mermaid
+flowchart TB
+    B[(broker)] --> P[Prefetch]
+    C[Concurrency] --> W[handler pool]
+    P --> L[lane capacity]
+    K[Kafka ceiling] --> L
+    L --> W
+    W --> H([handler])
+```
 
-F1 keeps admission and scheduling bounded. A delivery passes through the
-driver's prefetch budget, the fetch-to-dispatch boundary, bounded scheduler
-lanes, and the dispatch pool before the handler runs. When a downstream stage
-is full, the pipeline waits for capacity instead of growing an unbounded
-in-memory queue. The executable pipeline is owned by
-[`runDispatchPipeline`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/worker.go); the internal rationale is in
-[Consume flow](/development/consume-flow).
+`Concurrency` is the number of handler workers. `Prefetch` is the subscription's in-flight limit, not a promise that the broker hands over that many messages at once. In ordered mode, lane capacity also bounds the dispatch queue. When a stage is full, F1 waits for capacity instead of growing an unbounded in-memory queue.
 
-Start with `Concurrency` matched to the safe parallelism of the handler and
-its dependencies. Set `Prefetch` high enough to keep those workers supplied,
-but not so high that a slow dependency creates an unnecessarily large
-in-flight backlog. Tune one setting at a time while observing handler
-latency, downstream saturation, redelivery, and drain time.
+On a driver whose [parallelism is limited by partition count](/learn/glossary#partition-bound-scaling), F1 lets in one delivery per partition owned by a consumer. Its effective parallelism is the smaller of `Concurrency` and the assigned partition count. Raising `Prefetch` or priority weights above that count does not raise the ceiling. See [Kafka driver](/drivers/kafka#kafka-parallelism-and-partitions) for the warning and the `broker.kafka.maxExpectedInstances` setting.
+On a driver whose [parallelism is not limited by partitions](/learn/glossary#free-scaling), a subscription's effective `Prefetch` is the smaller
+of its configured prefetch and the sum of its lane capacities.
 
-A partition-bound driver, which is Kafka, admits one delivery per partition
-owned by a member. The effective handler parallelism for a destination is the
-smaller of `Concurrency` and that member's assigned partition count. Priority
-weights above the assigned partition count do nothing, and `Prefetch` cannot
-raise the ceiling.
+Use `Concurrency` that matches safe handler parallelism and downstream capacity. Set `Prefetch` high enough to keep those workers supplied, but not so high that a slow dependency creates an unnecessarily large in-flight backlog. Tune one setting at a time while watching handler latency, dependency saturation, redelivery, and drain time. [Why lane capacity stays small](/deep-dives/scheduler#why-lane-capacity-stays-small) explains what a deeper buffer costs.
 
-When the assigned count is below the destination's resolved slot budget, Kafka logs one warning
-naming the gap and the lever. [Drivers and
-capabilities](/drivers-and-capabilities#kafka-parallelism-and-partitions) owns that warning and the
-`broker.kafka.maxExpectedInstances` floor.
-
-`Prefetch` is not the amount the broker is asked to hand over at a time. It is
-the ceiling on the subscription's in-flight budget, and each destination gets a
-window derived from the handler concurrency and the fairness weights. That
-window, not the configured value, is what lets a handler that takes time find
-the next delivery already waiting instead of waiting on the broker round trip
-that follows its own acknowledgement.
-
-A configured `Prefetch` larger than those windows add up to does not raise that
-budget: the consumer is capped at the lower total, and F1 logs a warning naming
-the configured value and the effective one. The warning is about a budget the
-caller named, so a subscription that names no `Prefetch` takes the default
-silently. The default is the broker's `DefaultPrefetch` (64) or the
-subscription's lane count, whichever is larger, where the lane count is topics
-times priorities times one plus the retry tiers. A named `Prefetch` below the
-lane count is refused, and a `Prefetch` below the windows' total does not shrink
-them: each destination keeps the window its lanes need, because the lanes, not
-the total, are what stop the driver fetching ahead of the work the subscription
-can run.
-
-Naming the budget explicitly makes the relationship visible. With one topic,
-three priority lanes, and the default retry ladder, the lane count is 12, so a
-named `Prefetch` below that is refused:
+A named `Prefetch` must cover every topic, priority, and retry lane. Four attempts give three [retry steps](/learn/glossary#retry-tier). With one topic, three priorities, and four attempts, the minimum is 12, so `32` passes. An unnamed `Prefetch` is raised to the lane count automatically.
 
 ```go
 runner, err := client.Subscribe(ctx, f1.Subscription{
@@ -167,24 +100,11 @@ runner, err := client.Subscribe(ctx, f1.Subscription{
 })
 ```
 
-`Prefetch` is not a substitute for capacity planning. A larger value cannot
-make a hot ordered key concurrent, and it cannot make a handler that is
-blocked on a dependency complete faster. It also cannot raise a
-partition-bound driver's ceiling: that driver admits one delivery per
-partition, so on Kafka the effective ceiling is the number of partitions
-assigned to the consumer, and raising `Prefetch` past that does nothing.
+A larger value cannot make a hot ordered key concurrent or make a blocked dependency complete faster. Increasing broker credit through `broker.rabbitmq.brokerPrefetch` also increases memory pressure and can return a redelivery burst during close or revoke. Held deliveries can age toward RabbitMQ's `consumer_timeout` setting; configure that broker setting with its [acknowledgement timeout](https://www.rabbitmq.com/docs/consumers#acknowledgement-timeout) in mind.
 
-Raising the broker's own credit on top of the core budget, through
-`broker.rabbitmq.brokerPrefetch`, has costs: memory grows with message size
-times the broker window per destination; a close or revoke can return a
-redelivery burst; held deliveries age toward `consumer_timeout`; and priorities
-weaken because more messages are already held.
+## Use priorities as fair lanes
 
-## Priorities are fair scheduling lanes
-
-`Priority` selects a delivery lane. The values `high`, `medium`, and `low` are
-lane identifiers; their numeric values do not define a strict execution order.
-Publish priority explicitly when it is part of the event's service policy:
+`Priority` selects a delivery lane. `high`, `medium`, and `low` are labels for the scheduling policy, not strict execution precedence.
 
 ```go
 _, err := client.Publisher().Publish(
@@ -196,142 +116,53 @@ _, err := client.Publisher().Publish(
 )
 ```
 
-A subscription chooses which priority lanes it consumes with
-`Subscription.Priorities`. The scheduler then applies the subscription's
-`FairnessConfig` across its configured topics, priorities, and retry tiers.
-Weights express relative opportunity, not a promise that one lane always wins.
-This is intentional: strict priority could starve medium work during a
-sustained high-priority load.
-
-The default fairness policy is defined by `defaultSubscription` in
-`config.go`. Override it when the service has a measured
-capacity policy rather than copying defaults into application code:
+A subscription chooses its priority lanes with `Subscription.Priorities`. `FairnessConfig` then assigns relative opportunity across topics, priorities, and retry steps. Weights prevent sustained high-priority traffic from starving lower lanes.
 
 ```go
-	fairness := f1.FairnessConfig{
-		Weights: map[f1.Priority]int{
-			f1.PriorityHigh:   8,
-			f1.PriorityMedium: 4,
-			f1.PriorityLow:    1,
-		},
-		Budgets: map[f1.Priority]time.Duration{
-			f1.PriorityHigh:   5 * time.Second,
-			f1.PriorityMedium: 30 * time.Second,
-			f1.PriorityLow:    2 * time.Minute,
+fairness := f1.FairnessConfig{
+	Weights: map[f1.Priority]int{
+		f1.PriorityHigh:   8,
+		f1.PriorityMedium: 4,
+		f1.PriorityLow:    1,
+	},
+	Budgets: map[f1.Priority]time.Duration{
+		f1.PriorityHigh:   5 * time.Second,
+		f1.PriorityMedium: 30 * time.Second,
+		f1.PriorityLow:    2 * time.Minute,
 	},
 	RetryWeightDivisor: 2,
 	PrefetchFactor:     2,
 }
 ```
 
-The fields have distinct jobs:
+`Weights` controls relative share. `Budgets` sets each priority's [wait limit](/learn/glossary#lane-budget): a lane whose oldest message waits longer can [jump the queue](/learn/glossary#deadline-promotion). `RetryWeightDivisor` reduces retry pressure, and `PrefetchFactor` scales bounded lane capacity. `DisableDeadlinePromotion` turns queue jumping off; its zero value leaves it on.
 
-- `Weights` controls the relative share of ready lanes;
-- `Budgets` defines how long a lane may wait before deadline promotion can promote it;
-- `RetryWeightDivisor` reduces retry pressure relative to fresh work;
-- `PrefetchFactor` scales each scheduler lane's bounded capacity; and
-- `DisableDeadlinePromotion` turns off deadline promotion for lanes that exceed their
-  budget. Its zero value leaves promotion on, which is the default.
+The scheduler deep dive explains weighted selection, score traces, empty-lane reset, and how an overdue lane jumps the queue. This page keeps the application decisions and their limits; read [How F1 picks the next message](/deep-dives/scheduler) for the algorithm.
 
-The scheduler uses weighted round-robin when no lane has exceeded its
-budget. When deadline promotion is enabled, the lane with the greatest budget overrun may
-be selected first. This gives latency-sensitive work a way to recover from
-temporary contention without turning the whole policy into strict priority.
-The implementation is `internal/sched`, and its lane
-construction is [`newRunnerScheduler`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/worker.go).
+## Keep retries from taking all capacity
 
-## Keep retry work from taking all capacity
+Retry timing and ready-work scheduling are separate decisions:
 
-Retry timing and ready-work scheduling are separate:
+1. `RetryConfig` decides when a failed event becomes eligible.
+2. `FairnessConfig` decides how that ready retry competes with fresh work.
 
-1. `RetryConfig` decides when a failed event becomes eligible for another
-   attempt.
-2. `FairnessConfig` decides how that ready retry competes with fresh work and
-   other retry tiers.
+F1 gives retry lanes their own scheduling groups and normally reduces their weight with `RetryWeightDivisor`. A retry storm therefore does not consume all handler capacity, while a retry lane that has waited past its wait limit can still jump the queue. Returning `f1.RetryAfter` changes eligibility time, not priority after the retry is ready.
 
-F1 gives retry lanes their own scheduler groups and normally reduces their
-weight with `RetryWeightDivisor`. This prevents a retry storm from consuming
-all handler capacity and starving new events. Deadline promotion can still promote a retry
-lane that has waited beyond its configured budget.
+## Tune in this order
 
-Returning `f1.RetryAfter` changes the event's next eligible time; it does not
-give that retry priority over fresh work once it is ready. Configure retry
-classification and delay in [Failure handling](/advanced-topics/failure-handling), then use
-fairness settings for the service-level capacity decision.
+When a subscription is slow or unfair, identify the needed guarantee first.
 
-## A practical tuning sequence
+1. Use `OrderedByKey` and a stable `WithKey` for serial state transitions. Do not use `Concurrency: 1` unless the whole subscription needs global serialization.
+2. If handlers are idle while work exists, check `Prefetch`, lane capacity, distinct keys, and assigned partitions before increasing concurrency.
+3. If fresh work is delayed by retries, lower retry share with `RetryWeightDivisor` instead of discarding transient failures.
+4. If a lane waits too long, turn queue jumping back on or adjust its wait limit after checking downstream capacity. A wait limit is an escape hatch, not a latency guarantee.
+5. If high priority dominates, reduce its weight or split the workload into subscriptions with independent capacity.
 
-When a subscription is slow or unfair, identify which guarantee is actually
-needed before changing configuration:
+Every handler must remain safe under redelivery. Changing concurrency, key distribution, or retry timing can expose duplicate effects and races that at-least-once delivery already permits.
 
-1. **Need serial state transitions for one entity?** Use `OrderedByKey` and a
-   stable `WithKey`. Do not use `Concurrency: 1` unless the whole subscription
-   truly needs global serialization.
-2. **Handlers are idle while work is available?** Check `Prefetch`, lane
-   capacity, the number of distinct keys, and the partitions assigned to the
-   consumer before increasing concurrency. On a partition-bound driver a
-   `Prefetch` above that partition count is not what is holding the workers
-   back.
-3. **Fresh work is delayed by retries?** Keep retry lanes available but lower
-   their relative weight with `RetryWeightDivisor`; do not discard retries that
-   represent a real transient failure.
-4. **A lane waits too long?** Enable deadline promotion or adjust its budget after checking
-   the weight and downstream capacity. A budget is a scheduling escape hatch,
-   not a latency guarantee.
-5. **A high-priority lane dominates?** Reduce its weight or split the workload
-   into subscriptions with independent capacity. Do not assume the priority
-   label itself is strict.
+## Go further
 
-Every handler must remain safe under redelivery. Increasing concurrency,
-changing key distribution, or allowing retries to run later can expose races
-and duplicate effects that were already possible under at-least-once delivery.
-
-## Test ordering and fairness
-
-Use [`f1test`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/f1test/f1test.go) for deterministic service-policy tests:
-
-- configure `Mode: f1.OrderedByKey` and verify equal keys never overlap;
-- publish different keys and verify the subscription can use its configured
-  concurrency within the lane buffer;
-- publish explicit priorities and verify the selected lanes receive service;
-- fill fresh and retry lanes and verify retry pressure does not starve fresh
-  work; and
-- advance the fake clock when testing retry eligibility or deadline promotion instead of
-  sleeping in the test.
-
-The repository's `ordered_test.go` covers equal-key serialization and different-key concurrency: one test names `PrefetchFactor: 3` to extend the lane buffer, and a second runs different keys within the default buffer.
-The scheduler unit tests in `internal/sched/scheduler_test.go`
-cover weighted selection, bounded lanes, and deadline promotion; the retry-storm test in
-`retry_storm_test.go` guards fresh-work share under
-retry pressure. A driver implementation must also preserve the capability
-contract validated by the driver conformance package.
-
-## Common mistakes
-
-- Treating `OrderedByKey` as global ordering across keys, topics, or consumer
-  instances.
-- Publishing without a stable business key and expecting event IDs to preserve
-  entity order.
-- Using `Concurrency: 1` to compensate for a missing key or an incorrect
-  downstream idempotency design.
-- Assuming `PriorityHigh` is strict priority and that medium or low work will
-  stop while high work exists.
-- Increasing `Prefetch` to solve a slow dependency, a hot ordered key, or a
-  partition-bound driver's per-partition ceiling.
-- Letting retry volume consume all capacity by omitting retry fairness from
-  load testing.
-- Assuming changing `Concurrency` is enough to scale an ordered subscription;
-  the key distribution and connected driver's capability model also matter.
-
-## Continue from here
-
-- [Failure handling](/advanced-topics/failure-handling) - retry classification, dead letters,
-  and idempotent effects;
-- [Message](/basics/message) - keys, priority metadata, and delivery
-  identity;
-- [Publisher and subscriber](/basics/pubsub) - publish and subscription
-  boundaries;
-- [Driver and capabilities](/drivers-and-capabilities) - capability
-  discovery and portability; and
-- [Consume flow](/development/consume-flow) - implementation details for
-  lanes, pool routing, and backpressure.
+- [Failure handling](/advanced-topics/failure-handling) - retry classification and idempotent effects;
+- [Lifecycle and shutdown](/advanced-topics/lifecycle-and-shutdown) - drain, close, and in-flight work;
+- [Drivers and capabilities](/drivers-and-capabilities) - provider limits and portability; and
+- [Message](/basics/message) - keys, priority metadata, and delivery identity.

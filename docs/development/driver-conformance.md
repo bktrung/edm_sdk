@@ -1,6 +1,6 @@
 # Driver conformance
 
-The shared conformance suite is the executable compatibility check for the
+F1's shared conformance suite is the executable compatibility check for the
 [`driver` port](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/driver/driver.go). It runs the same broker-independent
 behavior checks against each adapter through `driver.Driver`, `driver.Conn`,
 and the other port interfaces. A driver-specific test supplies only the
@@ -40,9 +40,7 @@ flowchart TB
     TEST[Provider TestConformance]
     RUN[conformance.Run]
     CONN[One driver.Conn]
-    INSPECT[Provider Inspect]
-    FAULT[Optional FaultInjector]
-    DEADLINE[Optional DeadlineFixture]
+    FIXTURES[Provider Inspect, optional<br/>FaultInjector and DeadlineFixture]
     FULL[Full profile]
     STRICT[Strict portability profile]
     GROUPS[Manifest groups]
@@ -50,9 +48,7 @@ flowchart TB
 
     TEST --> RUN
     RUN --> CONN
-    CONN --> INSPECT
-    CONN --> FAULT
-    CONN --> DEADLINE
+    CONN --> FIXTURES
     RUN --> FULL
     RUN --> STRICT
     FULL --> GROUPS
@@ -68,10 +64,11 @@ profile name. The tracked connection records resources and touched
 destinations so failures can be cleaned up before the next group.
 
 The runner performs a broker-state self-check before the behavior groups: it
-publishes two messages, receives them, settles them, and asks the inspector to
-confirm the expected ready and unsettled deltas. This catches an inspector
-that reports plausible values but does not describe the same state transitions
-as the driver.
+publishes two messages, or one when the driver declares
+`ScalingPartitionBound` (Kafka), receives them, settles them, and asks the
+inspector to confirm the expected ready and unsettled deltas. This catches an
+inspector that reports plausible values but does not describe the same state
+transitions as the driver.
 
 ## Core contract tests and provider tests
 
@@ -197,6 +194,7 @@ the useful reading guide, not a second test manifest:
 | Retry and redelivery | Transient recovery, delivery faults, redelivery count, stale settlement, and classified fatal errors at the driver boundary | [`failure.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/driver/conformance/failure.go) |
 | Ordering | Equal-key receipt order, independent-key progress, requeued-key precedence, nil keys, and usable exclusive ordering | [`ordering.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/driver/conformance/ordering.go) |
 | Deferred delivery | Due-time behavior, destination delay and the publish order that model owes, auxiliary depth, and delivery-deadline interaction | [`deferred.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/driver/conformance/deferred.go) |
+| Enqueue | Enqueue timestamps, backlog samples, head ordering, and empty head | [`enqueue.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/driver/conformance/enqueue.go) |
 | Draining | Stop-fetch semantics, settleability after drain, open channels, refusal and timeout, idempotence, stop closure, and release redelivery | [`drain.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/driver/conformance/drain.go) |
 | Rebalance | Work redistribution, per-consumer budgets, in-flight transfer, key ordering across ownership changes, and stable repeated departure | [`rebalance.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/driver/conformance/rebalance.go) |
 | Lag | Per-destination coverage, backlog growth and fall, broker-depth agreement, and classified unsupported behavior | [`lag.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/driver/conformance/lag.go) |
@@ -256,16 +254,19 @@ A driver whose deferral semantics differ from exact due times declares which
 model it implements through [`Suite.DeferralModel`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/driver/conformance/types.go).
 `DeferralExact` delivers each deferred message at the due time the message
 carries, and it is the zero value, so a harness that declares nothing keeps
-exact deferral and needs no edit. `DeferralDestinationDelay` delivers a
-deferred message at its publish instant plus its destination's declared delay,
-whatever due time the message carries. Its deliveries are never earlier than
-that instant, and the messages it deferred within one partition of a
-destination are delivered in the order they were published. The field is a
-harness declaration rather than a capability: it states the semantics the
-driver implements, where a capability states an optimization the core can do
-without, and the deferred group records a skip for each of its checks the
-declared model does not owe instead of holding a driver to a due time its
-model never promised.
+exact deferral and needs no edit.
+
+`DeferralDestinationDelay` delivers a deferred message at its publish instant
+plus its destination's declared delay, whatever due time the message carries.
+Its deliveries are never earlier than that instant, and the messages it deferred
+within one partition of a destination are delivered in the order they were
+published.
+
+The field is a harness declaration rather than a capability: it states the
+semantics the driver implements, where a capability states an optimization the
+core can do without, and the deferred group records a skip for each of its
+checks the declared model does not owe instead of holding a driver to a due time
+its model never promised.
 
 The authoritative pending list and group counts are in
 [`manifest.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/driver/conformance/manifest.go). Do not copy the list or
@@ -309,8 +310,9 @@ Run the shared harness tests without a broker first:
 go test ./driver/conformance
 ```
 
-Run the in-memory adapter's two conformance tests directly. The regular Go
-test pattern matches both `TestConformance` and its minimal-capability variant:
+Run the in-memory adapter's conformance tests directly. The pattern matches
+`TestConformance`, `TestConformanceDestinationDelay`, and
+`TestConformanceMinimalCapabilities`:
 
 ```sh
 go test -race -count=1 -run '^TestConformance' ./drivers/inmem/...
@@ -360,3 +362,9 @@ The conformance suite is a contract guard, not a second architecture. If the
 shared test needs a broker-specific concept, first check whether the concept
 belongs in the port. If it does not, keep it in provider tests or in the
 provider fixture rather than widening the core abstraction.
+
+## Go further
+
+- [Driver contract](/development/driver-contract) - the port rules these checks enforce.
+- [Testing](/development/testing) - where conformance runs in the test targets.
+- [Architecture](/development/architecture) - why broker concepts stay out of the core.

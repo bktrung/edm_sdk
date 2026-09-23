@@ -2,103 +2,152 @@
 
 *By trungbk.*
 
-One worker slot frees up and a hundred messages are waiting: some high priority, some low, some on their second attempt. F1 serves exactly one of them, and it decides which one in the moment the worker is free. That decision is what this page is about.
+When a worker slot opens, F1 chooses one message from all [lanes](/learn/glossary#lane), the bounded queues inside F1, that currently have work. I use weights for normal picks, and let the lane whose oldest message is most overdue [jump the queue](/learn/glossary#deadline-promotion).
 
-Where the queues come from, and how a delivery reaches one, is [Life of a delivery](/deep-dives/life-of-a-delivery). Here I stay on the choice itself.
+A scheduler pick is late by design. If F1 chose a lane when a message arrived, the choice would be fixed before the other lanes filled or drained. Choosing when a worker can accept work lets the current backlog shape the next decision.
 
-## Picking late
+## What competes
 
-F1 asks for a pick only while a worker is free. While every worker is busy, deliveries keep arriving and keep landing in lanes, and nothing is chosen. The choice waits for the moment it can be used.
+A lane combines one topic, one priority, and one [retry step](/learn/glossary#retry-tier). A main lane carries fresh traffic. Each retry step has its own lane. The scheduler picks between groups, not lanes: the main lane is a group of one, and all retry steps for one topic and priority form one retry group.
 
-This is the reason fairness has any effect at all. If F1 picked at arrival and queued the result in front of the workers, every lane would hold at most one message at the moment of the choice, and the order would be fixed by arrival. Choosing late means the choice sees the lanes as they are now. A lane that drained while others filled is not owed anything, and a lane that filled while others drained competes with all of it.
-
-The loop asks again after each worker finishes, so a lane that fills up between two picks still competes for the next free slot. A busy pool stops the picking entirely, which is one link in the backpressure chain that page follows.
-
-## Lanes and contenders
-
-A lane is one topic, one priority, and one tier. Every topic and priority has a main lane for fresh traffic and one lane per retry tier, so the default retry ladder of four attempts gives three retry tiers.
-
-Lanes are grouped into contenders, and the contenders are what compete.
-
-- Each main lane is its own contender.
-- All retry tiers of one topic and priority are one contender. Inside it, the tiers take turns in rotation, so a message on its second attempt does not queue behind every message on its fourth.
-
-Weights decide how much of the picking attention each contender gets. The defaults are high 8, medium 4 and low 1, from `FairnessConfig.Weights`. A retry contender gets its priority's weight divided by `RetryWeightDivisor`, which defaults to 2, and never below 1. The retry contender for a high-priority topic therefore competes with weight 4, and the low-priority retry contender competes with weight 1, exactly like a main low lane.
+The default retry policy has three retry steps. The steps take turns inside their retry group: each time the group wins a pick, the next retry step after the last one picked that has a message waiting supplies it, skipping empty steps, so three retry steps share one group's picks instead of each getting a full share. With messages waiting in steps 1, 2 and 3, the group's wins go to step 1, step 2, step 3, step 1, and so on. A retry group's weight is its priority weight divided by `RetryWeightDivisor`, with a floor of one.
 
 ```mermaid
 flowchart LR
-    H[high] --> HM[main<br/>weight 8]
-    H --> HR[retry tiers<br/>weight 4]
-    L[low] --> LM[main<br/>weight 1]
-    L --> LR[retry tiers<br/>weight 1]
-    M[medium] --> MM[main<br/>weight 4]
-    M --> MR[retry tiers<br/>weight 2]
-    HM --> P[the next pick]
-    LM --> P
-    MM --> P
+    H[high] --> HM[main, weight 8]
+    H --> HR[retry steps, weight 4]
+    L[low] --> LM[main, weight 1]
+    L --> LR[retry steps, weight 1]
+    M[medium] --> MM[main, weight 4]
+    M --> MR[retry steps, weight 2]
+    HM --> P[next pick]
     HR --> P
+    LM --> P
     LR --> P
+    MM --> P
     MR --> P
 ```
 
-Six contenders for one topic, and the pick is one of them.
+For one topic, the production group order is high main, high retry, low main, low retry, medium main, and medium retry. That is simply alphabetical order of the lane names (high, low, medium), not a ranking. It matters only for ties: equal scores keep the earlier group, so low main wins a tie against medium main.
 
-The order they sit in is not decoration. F1 lays its lanes out in a fixed order, and when two contenders tie on score, the one earlier in that order keeps the pick. The diagram above lists the contenders in that order, which is why low sits between high and medium.
+## The default lane sizes
 
-## The pick
+The default subscription has concurrency 16, priority weights 8, 4, and 1, a retry divisor of 2, a prefetch factor of 2, and four total attempts. The retry policy therefore adds three lanes to each retry group.
 
-The rule is smooth weighted round robin. On every pick, each contender that has something waiting adds its weight to a running score. The highest score wins, and a tie goes to the contender listed first. The winner then gives back the total weight that took part in that pick.
+| Lane group | Lanes in the group | Weight | Wait limit | Capacity per lane |
+| --- | --- | ---: | ---: | ---: |
+| High main | one fresh lane | 8 | 5 s | 14 |
+| High retry | three retry lanes | 4 | 10 s | 8 |
+| Low main | one fresh lane | 1 | 2 min | 6 |
+| Low retry | three retry lanes | 1 | 4 min | 6 |
+| Medium main | one fresh lane | 4 | 30 s | 8 |
+| Medium retry | three retry lanes | 2 | 1 min | 6 |
 
-With all three priorities backed up, the total in play is 13 on every pick. Five picks in:
+Each lane's capacity is `max(ceil(Concurrency x group weight / total group weight), 3) x PrefetchFactor`. For high main at the defaults: 16 x 8 / 20 = 6.4, rounded up to 7, above the floor of 3, times 2 = 14. The six group weights total 20, so the capacities above are the bounded depth for one topic at concurrency 16.
 
-| Pick | Winner | Scores after, high, medium, low |
+## Why lane capacity stays small
+
+Capacity is not throughput. `Concurrency` decides how many handlers run at once; a lane only holds the messages waiting for the next free worker. The formula therefore sizes each lane to its weighted share of the workers, doubled by the prefetch factor so the next batch is already in hand while the current one runs.
+
+The weights shape capacity only once the shares are larger than the floor. With 4 workers and three fresh lanes weighted 8, 4, and 1, the shares are 3, 2, and 1 workers, the floor of 3 wins everywhere, and every lane holds 6. At the default concurrency of 16 the same weights give 14, 8, and 6. More workers mean bigger lanes, in proportion to the weights.
+
+The floor of 3 exists for fast handlers at low concurrency. With a lane capacity of only 2, the broker sends the next message only after an ack frees a slot, so a handler that finishes before that round trip does sits idle waiting for the next message. A third slot keeps one message ready during the round trip.
+
+A larger buffer would not make handlers faster, and it costs in four places:
+
+- **Load sharing.** A message the broker still holds can go to any instance. A message already fetched into one process waits for that process, even while another instance is idle.
+- **Redelivery.** Every fetched message that is not yet acked is redelivered after a crash, reconnect, or revoke, so a deeper buffer means more duplicate work.
+- **Drain time.** A drain dispatches everything already in the lanes, so a deeper buffer needs more of `DrainTimeout`.
+- **Hidden backlog.** Messages age inside the process while the broker's queue depth looks healthy.
+
+On Kafka, one record per partition is outstanding at a time, so a larger lane mostly stays empty; the partition count is the parallelism lever.
+
+The same capacity also bounds the driver. Each destination, the broker queue or topic behind one lane, may have only that lane's capacity outstanding, and the subscription's effective prefetch is capped at the sum of all its lanes. For one topic at the defaults that is 14 + 6 + 8 for the main lanes plus three lanes each of 8, 6, and 6 for retries, 88 in all. When a lane is full, its destination has spent its credit and new messages stay at the broker. Nothing is nacked or redelivered. The two drivers stop the flow in different places:
+
+- **RabbitMQ: the broker holds back.** Each destination's channel is opened with a prefetch (`basic.qos`) equal to its lane capacity. Once that many deliveries are unacknowledged, RabbitMQ stops pushing to the consumer, and each ack or nack lets it send one more. F1 does nothing active.
+- **Kafka: the driver holds back.** Kafka is pull-based and has no unacknowledged limit, so the driver counts records not yet acked per destination. When the count reaches the lane capacity, it pauses fetching that topic, and it resumes when an ack or nack brings the count below the capacity. Records fetched before the pause stay in the client's buffer and are delivered after it, not fetched again. A record counts toward the lane capacity only once the driver hands it to F1, so buffered records are not counted; the buffer has its own per-partition bound, and the driver pauses a partition whose buffer reaches it. Separately, only one record per partition is outstanding at a time, which usually binds first when a topic has few partitions.
+
+| | RabbitMQ | Kafka |
 | --- | --- | --- |
+| Who stops the flow | The broker, through the channel prefetch | The driver, by pausing the topic's fetches |
+| The limit | Unacknowledged deliveries per destination | Records not yet acked per destination, and one per partition |
+| Flow resumes on | Each ack or nack | An ack or nack that brings the count below the capacity |
+| A lane can still fill | With `brokerPrefetch`, or on the fallback lane | On the fallback lane |
+
+A lane can still fill in the two cases in the last row: `broker.rabbitmq.brokerPrefetch` lets RabbitMQ send more than the lane holds, and the fallback lane takes deliveries from any destination it cannot map.
+
+The [fallback lane](/learn/glossary#lane) takes a delivery whose destination F1 cannot map to a lane; it is the main lane of the subscription's first topic and priority. F1 then holds the one delivery that did not fit, outside any lane, and stops reading new deliveries for the whole subscription until a worker frees a slot in that lane. It never holds more than one.
+
+The delivery is kept, not requeued, but one full lane slows intake for the whole subscription.
+
+To buffer more, raise `Concurrency` first. Raise `PrefetchFactor` only when the broker round trip is long compared with the handler time, and expect more redelivery and a longer drain in the same proportion.
+
+## The weighted pick
+
+Smooth weighted round robin gives each non-empty group its weight as running score. The highest score wins, and that winner gives back the total active weight, the sum of the weights of the groups that have work right now. An empty group resets its score instead of banking credit for a later burst.
+
+The following trace uses three saturated main lanes with weights 8, 4, and 1. The scores are the values after each pick. The columns are in weight order; the alphabetical group order only breaks ties. The thirteen picks return the scores to zero and give eight picks to high, four to medium, and one to low.
+
+<F1SchedulerStepper scenario="weighted" />
+
+The steps are recorded from the Go scheduler by a test, so the figure changes only when the scheduler does.
+
+<details>
+<summary>The same trace as a table</summary>
+
+| Pick | Winner | Scores after pick, high, medium, low |
+| ---: | --- | --- |
 | 1 | high | -5, 4, 1 |
 | 2 | medium | 3, -5, 2 |
 | 3 | high | -2, -1, 3 |
 | 4 | high | -7, 3, 4 |
 | 5 | medium | 1, -6, 5 |
+| 6 | high | -4, -2, 6 |
+| 7 | low | 4, 2, -6 |
+| 8 | high | -1, 6, -5 |
+| 9 | medium | 7, -3, -4 |
+| 10 | high | 2, 1, -3 |
+| 11 | high | -3, 5, -2 |
+| 12 | medium | 5, -4, -1 |
+| 13 | high | 0, 0, 0 |
 
-Thirteen picks close the round and the scores come back to zero. The order is high, medium, high, high, medium, high, low, high, medium, high, high, medium, high: eight highs, four mediums and one low, with the high lane's turns spread through the sequence instead of bunched at the front. A scheme that served a contender its weight in a row would put eight highs together, and medium would wait behind all of them. Here medium's turns are never more than four picks apart.
+</details>
 
-<F1SchedulerSim />
+This is a share guarantee for weighted picks while a group stays non-empty, not a latency guarantee; picks made by jumping the queue come on top of it. A group that empties loses its accumulated score, so it starts clean when work returns.
 
-## Empty means reset
+## Jumping the queue when overdue
 
-A contender with nothing waiting has its score set back to zero. That is not a small detail: the score is credit, and a lane that empties loses whatever it had built.
+Weights control opportunity. They do not stop one message from becoming overdue, so F1 checks the oldest item in each lane before a weighted pick.
 
-The alternative would let a lane bank credit while it is idle and spend it in a burst when it refills, which is the opposite of what the weights promise. A lane that is often briefly empty pays for the rule. It drains, resets, refills, and starts again from nothing, so it gets exactly its weight's share of the picks it was present for and never more. The bursty lane scenario in the figure above shows this: watch the lane that empties and comes back, and its bar restarts from the middle while a lane that stayed busy keeps its place.
+The wait clock starts when F1 takes a message for its lane. A delivery held back because its lane is full is already waiting, so that time counts. Once the oldest message has waited its lane's [wait limit](/learn/glossary#lane-budget), the lane may jump the queue. F1 picks the lane furthest past its limit, measured in time, not the earliest deadline. A jump does not charge the winning group's score; only groups that are empty reset to zero, as in any pick.
 
-## Deadline promotion
+| Moment | Lane state | Next decision |
+| --- | --- | --- |
+| Message taken | F1 records when it took the message for the lane. | The message waits for a normal pick. |
+| Before the limit | The lane's wait is below its limit. | Weighted selection continues. |
+| At the limit | The wait equals the limit. | The lane may jump the queue. |
+| Next pick | The lane is at or past its limit. | The lane furthest past its limit wins, and the winner's score is not charged. |
 
-Weights decide shares. They do not decide how long any one message waits, and a share can be fair while every message in it is late. F1 has a second rule for the lane that is simply late.
+<F1SchedulerStepper scenario="promotion" />
 
-Every lane has a budget: five seconds for high, thirty for medium and two minutes for low, and a retry lane gets twice its priority's budget. The budget clock starts when a message enters its lane, not when it was published. Before the weighted pick, F1 checks whether any lane's oldest message has waited longer than its budget. If one has, the lane that is furthest over its budget is served first, whatever the scores say. A promoted pick adds no weight and gives nothing back, so it leaves the scores alone.
+Watch the jump leave the non-empty groups' scores unchanged even as the low lane wins.
 
-Where the clock starts decides when promotion fires. A lane holds only a handful of messages: its capacity is its share of the workers, doubled, with a small floor. When a lane is full, further messages for it wait at the broker, and that wait is not on the budget clock. So a message's time in its lane is bounded by how long a full lane takes to drain, which is a few handler times for any lane whose share is above the floor, whatever its priority. A lane at the floor, which is usually low at a small concurrency, drains more slowly, because it holds more than its share.
+Jumping the queue is an escape hatch for overdue lanes, not a cap on waiting. Another lane can be further past its limit on every check. Capacity limits how many messages wait in a lane, not how long: a full lane waits at the broker, where the wait clock does not run.
 
-That makes the handler the thing that makes a lane late, not the backlog. With fast handlers no lane comes near its budget, however deep the queue at the broker is. As handlers slow down, the lane with the shortest budget goes over first, and that is high: at five seconds, a handler that takes a second or two is enough. Once lanes are over their budgets, promotion serves whichever is furthest over first, and the weighted order only runs for the picks in between. The slow handlers scenario in the figure shows that point.
-
-That is what promotion is: not priority, and not a promise. It is a cap on waiting inside F1, applied to whichever lane is furthest past its own. Wait at the broker is outside it; a lane that falls behind there shows as backlog, which is what the backlog alerts on [Alerts](/advanced-topics/alerts) watch.
-
-`DisableDeadlinePromotion` turns the rule off, and its zero value leaves it on, which is the default. Promotions are reported to the observer as a deadline promotion event, rate limited per lane, with a count of the promotions that were collapsed into the same window. The event and its fields are on [Observer](/basics/observer).
+`DisableDeadlinePromotion` turns this rule off. Its zero value leaves it on. Each jump is reported to the observer, at most once per lane in a 15-second window. Jumps inside a window that already reported are counted, and the count rides on the lane's next reported jump. The event fields are in [Observer](/basics/observer).
 
 ## Trade-offs
 
-- Strict priority starves medium and low forever under a sustained high load. Weights guarantee a share instead, and promotion caps the wait. That is the whole design, and it is why a priority value is a lane name rather than an execution order.
-- Plain round robin ignores priority entirely, which is the other failure: a low-priority lane would take half the picks from a two-lane subscription.
-- The empty-lane reset costs the lane that is often briefly empty. It gives up credit it had built, every time.
-- Every weighted pick looks at every contender, so the work of one pick grows with the number of contenders: topics times priorities, doubled when retry lanes exist. That is a small number next to a handler call, and it is what the smoothness costs. What the default lanes do to a delivery's wait, with the command that produces it, is on [Benchmarks](/development/benchmarks#scheduler-fairness-by-priority).
-- Promotion is a wait cap, not a latency guarantee. A lane can still be late, and it can be late for a long time, if another lane is further past its budget every time the check runs.
-- The budget clock starts at the lane, so it cannot see a message waiting at the broker behind a full lane. That wait is backlog, and it is watched as backlog, not as a deadline.
-
-## What I would change
-
-<!-- TODO(trungbk): what you would change about this pick, in your own words. -->
+- Strict priority can starve lower priorities, while weights preserve a share for each non-empty group.
+- Retry weight reduction keeps fresh traffic ahead on average, but an overdue retry can still jump the queue.
+- Ordered delivery can serialize one hot key even when other worker slots are free; more concurrency does not split that key.
+- The picker scans every lane group on each weighted choice, so work grows with the number of topics, priorities, and retry groups. The [benchmarks](/development/benchmarks) page records the finding without making benchmark numbers part of this contract.
+- Jumping the queue eases starvation without promising a latency SLA. Broker backlog and handler duration stay outside its clock.
 
 ## Go further
 
-- [Ordering and scheduling](/advanced-topics/ordering-and-scheduling) - the settings an application uses to steer this, and what they do not promise.
-- [Life of a delivery](/deep-dives/life-of-a-delivery) - where lanes come from and how a message reaches one.
-- [Benchmarks](/development/benchmarks#scheduler-fairness-by-priority) - settle latency by priority on the in-memory driver, with the command to reproduce it.
-- [Observer](/basics/observer) - the events a promotion, a retry and a settlement emit.
+- [Ordering and scheduling](/advanced-topics/ordering-and-scheduling) - the public fairness settings and their limits.
+- [Life of a delivery](/deep-dives/life-of-a-delivery) - how a fetched message reaches a lane and a handler.
+- [Benchmarks](/development/benchmarks) - measured scheduler and delivery behavior.
+- [Observer](/basics/observer) - queue-jump, retry, and ack events.
+- [Source-reading guide](/development/source-reading-guide) - the maintainer route through the implementation.

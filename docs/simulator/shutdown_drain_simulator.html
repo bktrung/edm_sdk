@@ -1,0 +1,839 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>f1 SDK - Shutdown &amp; Drain Simulator</title>
+  <style>
+    :root {
+      --bg-canvas: #09090b;
+      --bg-surface: #111115;
+      --bg-surface-glass: rgba(17, 17, 21, 0.75);
+      --border-subtle: #222228;
+      --border-hairline: rgba(255, 255, 255, 0.08);
+      --text-primary: #f4f4f6;
+      --text-secondary: #9090a0;
+      --text-muted: #555562;
+
+      --color-high: #38bdf8;
+      --color-medium: #818cf8;
+      --color-low: #94a3b8;
+      --color-promo: #f59e0b;
+      --color-worker: #10b981;
+      --color-break: #f43f5e;
+
+      --font-sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Geist", "Inter", sans-serif;
+      --font-mono: "Geist Mono", "JetBrains Mono", "SF Mono", Menlo, monospace;
+    }
+
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      background-color: var(--bg-canvas);
+      color: var(--text-primary);
+      font-family: var(--font-sans);
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+      overflow-x: hidden;
+      background-image: radial-gradient(var(--border-subtle) 1px, transparent 1px);
+      background-size: 28px 28px;
+    }
+
+    header {
+      padding: 16px 36px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 16px;
+      flex-wrap: wrap;
+      border-bottom: 1px solid var(--border-hairline);
+      background: rgba(9, 9, 11, 0.85);
+      backdrop-filter: blur(12px);
+      position: sticky;
+      top: 0;
+      z-index: 100;
+    }
+
+    .brand { display: flex; align-items: center; gap: 12px; }
+
+    .brand-logo {
+      width: 24px;
+      height: 24px;
+      border-radius: 6px;
+      background: linear-gradient(135deg, #38bdf8, #818cf8);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-family: var(--font-mono);
+      font-size: 11px;
+      font-weight: 700;
+      color: #000;
+    }
+
+    .brand-title { font-size: 13px; font-weight: 500; letter-spacing: -0.01em; }
+    .brand-sub { color: var(--text-muted); font-size: 12px; margin-left: 6px; font-family: var(--font-mono); }
+
+    .controls-pill {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      background: var(--bg-surface-glass);
+      border: 1px solid var(--border-hairline);
+      border-radius: 9999px;
+      padding: 4px 10px;
+      box-shadow: 0 8px 32px rgba(0, 0, 0, 0.4);
+    }
+
+    .btn-pill {
+      background: transparent;
+      border: none;
+      color: var(--text-secondary);
+      padding: 6px 12px;
+      font-size: 12px;
+      font-family: var(--font-sans);
+      font-weight: 500;
+      border-radius: 9999px;
+      cursor: pointer;
+      transition: all 0.15s ease;
+    }
+
+    .btn-pill:hover { color: var(--text-primary); background: rgba(255, 255, 255, 0.05); }
+    .btn-pill.active { color: var(--text-primary); background: rgba(255, 255, 255, 0.1); }
+
+    .divider { width: 1px; height: 14px; background: var(--border-hairline); }
+
+    .clock-tag { font-family: var(--font-mono); font-size: 11px; color: var(--text-secondary); padding: 0 6px; }
+
+    main {
+      flex: 1;
+      padding: 24px 36px 40px;
+      max-width: 1400px;
+      margin: 0 auto;
+      width: 100%;
+      display: flex;
+      flex-direction: column;
+      gap: 24px;
+    }
+
+    .scenarios-bar {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 16px;
+      flex-wrap: wrap;
+      padding: 4px 8px;
+    }
+
+    .tab-row { display: flex; gap: 12px; flex-wrap: wrap; }
+
+    .scenario-tabs {
+      display: flex;
+      gap: 6px;
+      background: rgba(17, 17, 21, 0.6);
+      border: 1px solid var(--border-hairline);
+      padding: 3px;
+      border-radius: 8px;
+    }
+
+    .scenario-tab {
+      background: transparent;
+      border: none;
+      color: var(--text-muted);
+      font-size: 12px;
+      font-family: var(--font-sans);
+      font-weight: 500;
+      padding: 6px 14px;
+      border-radius: 6px;
+      cursor: pointer;
+      transition: all 0.15s ease;
+    }
+
+    .scenario-tab:hover { color: var(--text-secondary); }
+    .scenario-tab.active { color: var(--text-primary); background: #1e1e24; box-shadow: 0 2px 8px rgba(0, 0, 0, 0.3); }
+
+    .scenario-desc { font-size: 12px; color: var(--text-muted); font-family: var(--font-mono); max-width: 620px; line-height: 1.5; }
+
+    .stage-container {
+      position: relative;
+      background: var(--bg-surface);
+      border: 1px solid var(--border-hairline);
+      border-radius: 16px;
+      overflow: hidden;
+      box-shadow: 0 16px 48px rgba(0, 0, 0, 0.6);
+    }
+
+    svg.runtime-svg { width: 100%; height: auto; display: block; }
+    svg text { user-select: none; }
+    svg text:not([fill]) { fill: var(--text-primary); }
+
+    .wire-path { fill: none; stroke: var(--border-subtle); stroke-width: 1.5; }
+
+    .box {
+      fill: #141419;
+      stroke: var(--border-hairline);
+      stroke-width: 1;
+    }
+
+    .tray { fill: #0d0d12; stroke: var(--border-hairline); }
+
+    .worker-slot { fill: #141419; stroke: var(--border-hairline); stroke-width: 1; transition: all 0.2s ease; }
+    .worker-slot.busy { stroke: var(--color-worker); fill: rgba(16, 185, 129, 0.05); }
+
+    .hud-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 16px; }
+
+    @media (max-width: 900px) {
+      .hud-grid { grid-template-columns: repeat(2, 1fr); }
+      header, main { padding-left: 16px; padding-right: 16px; }
+    }
+
+    .hud-card {
+      background: var(--bg-surface);
+      border: 1px solid var(--border-hairline);
+      border-radius: 12px;
+      padding: 16px;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      text-align: center;
+      gap: 6px;
+    }
+
+    .hud-label { font-size: 11px; font-family: var(--font-mono); text-transform: uppercase; letter-spacing: 0.05em; color: var(--text-muted); }
+    .hud-value { font-size: 18px; font-family: var(--font-mono); font-weight: 600; }
+    .hud-sub { font-size: 11px; color: var(--text-secondary); line-height: 1.4; }
+
+    .gauge-bar { width: 100%; height: 3px; background: var(--border-subtle); border-radius: 2px; margin-top: 6px; overflow: hidden; }
+    .gauge-fill { height: 100%; background: var(--color-high); transition: width 0.2s ease; }
+
+    #tooltip {
+      position: absolute;
+      background: rgba(17, 17, 21, 0.92);
+      border: 1px solid rgba(255, 255, 255, 0.12);
+      backdrop-filter: blur(12px);
+      padding: 10px 14px;
+      border-radius: 8px;
+      font-size: 12px;
+      font-family: var(--font-mono);
+      pointer-events: none;
+      opacity: 0;
+      transform: translateY(4px);
+      transition: opacity 0.15s ease, transform 0.15s ease;
+      box-shadow: 0 8px 24px rgba(0, 0, 0, 0.5);
+      z-index: 200;
+      max-width: 280px;
+    }
+
+    #tooltip.visible { opacity: 1; transform: translateY(0); }
+
+    @media (max-width: 700px) {
+      .controls-pill, .scenario-tabs { flex-wrap: wrap; border-radius: 12px; }
+      .brand-sub { display: none; }
+      .stage-container { overflow-x: auto; }
+      svg.runtime-svg { min-width: 720px; }
+    }
+
+  </style>
+</head>
+<body>
+
+  <header>
+    <div class="brand">
+      <div class="brand-logo">f1</div>
+      <div class="brand-title">event-driven-messaging-sdk</div>
+      <div class="brand-sub">/ Client.Close &amp; Runner.Drain / Shutdown Simulator</div>
+    </div>
+
+    <div class="controls-pill">
+      <button class="btn-pill" id="btn-play-pause"><span id="play-text">Pause</span></button>
+      <button class="btn-pill" id="btn-step">Step</button>
+      <div class="divider"></div>
+      <button class="btn-pill speed-btn" data-speed="0.5">0.5x</button>
+      <button class="btn-pill speed-btn active" data-speed="1.0">1.0x</button>
+      <button class="btn-pill speed-btn" data-speed="2.0">2.0x</button>
+      <button class="btn-pill speed-btn" data-speed="4.0">4.0x</button>
+      <div class="divider"></div>
+      <span class="clock-tag" id="clock-display">T = 00:00.00</span>
+    </div>
+  </header>
+
+  <main>
+    <div class="scenarios-bar">
+      <div class="scenario-tabs">
+        <button class="scenario-tab active" data-scenario="clean">Clean Drain</button>
+        <button class="scenario-tab" data-scenario="slow">Slow Handler</button>
+        <button class="scenario-tab" data-scenario="stuck">Handler Ignores Cancel</button>
+        <button class="scenario-tab" data-scenario="publish">Publishing During Close</button>
+        <button class="scenario-tab" data-scenario="aborted">Aborted, Then Retried</button>
+      </div>
+      <div class="scenario-desc" id="scenario-desc"></div>
+    </div>
+
+    <div class="stage-container" id="stage-box">
+      <svg class="runtime-svg" id="svg-canvas" viewBox="0 0 1200 480">
+        <g fill="var(--text-secondary)" opacity="0.85" font-family="var(--font-mono)" font-size="10" font-weight="600" letter-spacing="0.08em" text-anchor="middle">
+          <text x="130" y="42">01 / LIFECYCLE</text>
+          <text x="410" y="42">02 / ADMISSION (admit)</text>
+          <text x="745" y="42">03 / RUNNER DRAIN</text>
+          <text x="1055" y="42">04 / CLOSE PHASES</text>
+        </g>
+        <g id="stage-layer"></g>
+      </svg>
+    </div>
+
+    <div class="hud-grid">
+      <div class="hud-card">
+        <span class="hud-label">Client Lifecycle</span>
+        <div class="hud-value" id="hud-state">READY</div>
+        <div class="hud-sub" id="hud-state-sub"></div>
+        <div class="gauge-bar"><div class="gauge-fill" id="gauge-state" style="width: 0%;"></div></div>
+      </div>
+      <div class="hud-card">
+        <span class="hud-label">Close() Result</span>
+        <div class="hud-value" id="hud-close">-</div>
+        <div class="hud-sub" id="hud-close-sub">Not called yet</div>
+        <div class="gauge-bar"><div class="gauge-fill" id="gauge-close" style="width: 0%; background: var(--color-worker);"></div></div>
+      </div>
+      <div class="hud-card">
+        <span class="hud-label">Accepted Work</span>
+        <div class="hud-value" id="hud-work">0 / 0</div>
+        <div class="hud-sub" id="hud-work-sub">queued / running</div>
+        <div class="gauge-bar"><div class="gauge-fill" id="gauge-work" style="width: 0%; background: var(--color-worker);"></div></div>
+      </div>
+      <div class="hud-card">
+        <span class="hud-label">Settled During Drain</span>
+        <div class="hud-value" id="hud-settled">0</div>
+        <div class="hud-sub" id="hud-settled-sub"></div>
+        <div class="gauge-bar"><div class="gauge-fill" style="width: 100%; background: var(--color-medium);"></div></div>
+      </div>
+    </div>
+  </main>
+
+  <div id="tooltip"></div>
+
+  <script>
+    // =========================================================================
+    // 1. DETERMINISTIC VIRTUAL CLOCK
+    // =========================================================================
+    class VirtualClock {
+      constructor() { this.currentMs = 0; }
+      now() { return this.currentMs; }
+      advance(ms) { this.currentMs += ms; }
+      format() {
+        const totalSec = Math.floor(this.currentMs / 1000);
+        const mins = Math.floor(totalSec / 60).toString().padStart(2, "0");
+        const secs = (totalSec % 60).toString().padStart(2, "0");
+        const frac = Math.floor((this.currentMs % 1000) / 10).toString().padStart(2, "0");
+        return `T = ${mins}:${secs}.${frac}`;
+      }
+    }
+
+    // =========================================================================
+    // 2. F1 LIFECYCLE (1:1 PORT OF internal/lifecycle/state.go allowed() AND
+    //    the admit table in admission.go)
+    // =========================================================================
+    function allowed(from, to) {
+      if (from === to) return true;
+      if (to === "aborted" && from !== "closed" && from !== "aborted") return true;
+      if (from === "aborted" && to === "draining") return true;
+      switch (from) {
+        case "ready": return to === "draining";
+        case "draining": return to === "closed";
+        default: return false;
+      }
+    }
+
+    // Returns null to admit, or the error the call site returns.
+    function admit(kind, c) {
+      switch (kind) {
+        case "publishEntry":
+          return c.lifecycle !== "ready" ? "f1: client is closed" : null;
+        case "publish":
+          return c.lifecycle === "closed" || c.producerTeardown ? "f1: client is closed" : null;
+        case "subscribe":
+          if (c.lifecycle === "closed") return "f1: client is closed";
+          return c.lifecycle !== "ready" ? "f1: client is closing" : null;
+        case "run":
+          return c.lifecycle !== "ready" ? "f1: client is closing" : null;
+      }
+      return null;
+    }
+
+    // Runner.Drain: the handler context is cancelled at DrainTimeout minus
+    // HandlerGrace, the shutdown context HandlerGrace later. A grace that is
+    // negative or not below DrainTimeout counts as zero.
+    function drainTimers(drainTimeout, handlerGrace) {
+      let grace = handlerGrace;
+      if (grace < 0 || grace >= drainTimeout) grace = 0;
+      return { cancelAfter: drainTimeout - grace, shutdownAfter: drainTimeout };
+    }
+
+    // =========================================================================
+    // 3. SCENARIOS
+    // =========================================================================
+    // Budgets are shortened so a drain fits on screen: DrainTimeout 12s,
+    // HandlerGrace 4s, CloseTimeout 3s (defaults: 1m, 5s, 10s).
+    const BASE = { drainTimeout: 12000, handlerGrace: 4000, closeTimeout: 3000, consumerDrainTimeout: 0 };
+    const scenarios = {
+      clean: {
+        desc: "Close at 4s. Intake stops, but everything already accepted, running or queued, is still handled. Then publishes settle, the producer and connection close.",
+        closeAt: 4000, special: null,
+      },
+      slow: {
+        desc: "One handler would run for 60s but watches its context. At DrainTimeout - HandlerGrace (8s) its context is cancelled; it returns, and the retryable error still publishes a retry copy.",
+        closeAt: 4000, special: { at: 2000, kind: "respects", ms: 60000 },
+      },
+      stuck: {
+        desc: "One handler ignores cancellation. At DrainTimeout (12s) the shutdown context ends, the delivery is abandoned and nacked with requeue, and the drain can finish.",
+        closeAt: 4000, special: { at: 2000, kind: "ignores", ms: 600000 },
+      },
+      publish: {
+        desc: "The app keeps publishing. From Close on, the entry gate refuses it; publishes admitted earlier still hold the quiescence phase, and successor copies pass until the producer is torn down.",
+        closeAt: 4000, special: { at: 2000, kind: "respects", ms: 60000 }, appPublish: true,
+      },
+      aborted: {
+        desc: "ConsumerDrainTimeout 5s with a 7s handler: the drain bound expires, Close fails and the client goes to Aborted. The runner keeps draining; a retried Close re-enters Draining and finishes.",
+        closeAt: 4000, special: { at: 3000, kind: "respects", ms: 7000 }, consumerDrainTimeout: 5000, retryAfter: 4000,
+      },
+    };
+
+    // =========================================================================
+    // 4. ORCHESTRATOR
+    // =========================================================================
+    const clock = new VirtualClock();
+    const WORKERS = 4;
+    const PHASES = [
+      { id: "admission", name: "close admission" },
+      { id: "supervisor", name: "stop reconnect supervisor" },
+      { id: "drain", name: "drain runners", budget: "consumerDrainTimeout" },
+      { id: "quiesce", name: "publish quiescence", budget: "drainTimeout" },
+      { id: "producer", name: "producer close", budget: "closeTimeout" },
+      { id: "connection", name: "connection close", budget: "closeTimeout" },
+    ];
+    let currentScenario = "clean";
+    let cfg = null;
+    let c = null;
+    let isPlaying = true;
+    let speedFactor = 1.0;
+
+    function setScenario(sc) {
+      currentScenario = sc;
+      document.querySelectorAll(".scenario-tab").forEach(t => t.classList.toggle("active", t.dataset.scenario === sc));
+      document.getElementById("scenario-desc").textContent = scenarios[sc].desc;
+      reset();
+    }
+
+    function reset() {
+      clock.currentMs = 0;
+      const s = scenarios[currentScenario];
+      cfg = { ...BASE, consumerDrainTimeout: s.consumerDrainTimeout || 0 };
+      c = {
+        lifecycle: "ready",
+        producerTeardown: false,
+        closeCalls: [],
+        closeResult: null,
+        closeRunning: false,
+        phase: -1,
+        phaseStart: 0,
+        phases: PHASES.map(p => ({ ...p, status: "pending", elapsed: 0 })),
+        runner: { draining: false, drainStart: null, done: false, intakeOpen: true, handlerCtx: "live", shutdownCtx: "live" },
+        queue: [],
+        workers: Array.from({ length: WORKERS }, (_, id) => ({ id, job: null })),
+        publishes: [],
+        admissionLog: {},
+        settled: { ack: 0, retry: 0, requeue: 0 },
+        specialSent: false,
+        nextId: 1,
+        nextAppPublish: 0,
+        retryAt: null,
+      };
+      buildLayout();
+    }
+
+    function transition(next) {
+      if (!allowed(c.lifecycle, next)) return false;
+      c.lifecycle = next;
+      return true;
+    }
+
+    // Client.Close: beginClose, then the phases in order.
+    function callClose() {
+      c.closeCalls.push(clock.now());
+      if (c.lifecycle === "closed") { c.closeResult = { ok: true, text: "nil (already closed)" }; return; }
+      if (c.lifecycle === "draining") { c.closeResult = { ok: false, text: "f1: client is closing" }; return; }
+      transition("draining");
+      c.closeRunning = true;
+      c.closeResult = { pending: true, text: "running" };
+      // A retried Close rejoins: phases already done finish at once.
+      c.phase = 0;
+      c.phaseStart = clock.now();
+      c.phases.forEach(p => { if (p.status !== "done") p.status = "pending"; });
+    }
+
+    function failClose(err) {
+      transition("aborted");
+      c.closeRunning = false;
+      c.closeResult = { ok: false, text: err };
+      c.phases[c.phase].status = "timeout";
+      if (scenarios[currentScenario].retryAfter) c.retryAt = clock.now() + scenarios[currentScenario].retryAfter;
+    }
+
+    function startRunnerDrain() {
+      const r = c.runner;
+      if (r.draining) return;
+      r.draining = true;
+      r.drainStart = clock.now();
+      r.intakeOpen = false;
+      const t = drainTimers(cfg.drainTimeout, cfg.handlerGrace);
+      r.cancelAt = r.drainStart + t.cancelAfter;
+      r.shutdownAt = r.drainStart + t.shutdownAfter;
+    }
+
+    function successorPublish(label) {
+      const err = admit("publish", c);
+      c.admissionLog.publish = { err, at: clock.now(), label };
+      if (!err) c.publishes.push({ label, until: clock.now() + 300, kind: "successor" });
+      return !err;
+    }
+
+    function stepPhases() {
+      if (!c.closeRunning) return;
+      const phase = c.phases[c.phase];
+      if (phase.status === "pending") { phase.status = "running"; c.phaseStart = clock.now(); }
+      phase.elapsed = clock.now() - c.phaseStart;
+      let done = false;
+      switch (phase.id) {
+        case "admission":
+        case "supervisor":
+          done = true;
+          break;
+        case "drain":
+          startRunnerDrain();
+          done = c.runner.done;
+          if (!done && cfg.consumerDrainTimeout > 0 && phase.elapsed >= cfg.consumerDrainTimeout) {
+            failClose("f1: shutdown consumer drain phase timed out: context deadline exceeded");
+            return;
+          }
+          break;
+        case "quiesce":
+          done = c.publishes.length === 0;
+          if (done) c.producerTeardown = true;
+          if (!done && phase.elapsed >= cfg.drainTimeout) {
+            failClose("f1: shutdown drain phase timed out: context deadline exceeded");
+            return;
+          }
+          break;
+        case "producer":
+        case "connection":
+          done = phase.elapsed >= 400;
+          break;
+      }
+      if (!done) return;
+      phase.status = "done";
+      c.phase++;
+      c.phaseStart = clock.now();
+      if (c.phase >= c.phases.length) {
+        transition("closed");
+        c.closeRunning = false;
+        c.closeResult = { ok: true, text: "nil" };
+        c.phase = c.phases.length - 1;
+      }
+    }
+
+    function simulationStep(deltaMs) {
+      clock.advance(deltaMs);
+      const s = scenarios[currentScenario];
+      const now = clock.now();
+      const r = c.runner;
+
+      if (now >= s.closeAt && c.closeCalls.length === 0) callClose();
+      if (c.retryAt !== null && now >= c.retryAt) { c.retryAt = null; callClose(); }
+
+      // Intake: deliveries arrive only while the consumer still fetches.
+      if (r.intakeOpen && c.queue.length < 6 && Math.random() < 2.2 * (deltaMs / 1000)) {
+        c.queue.push({ id: `d${c.nextId++}`, kind: "normal", ms: 1000 + Math.random() * 2200 });
+      }
+      if (r.intakeOpen && s.special && !c.specialSent && now >= s.special.at) {
+        c.specialSent = true;
+        c.queue.unshift({ id: `d${c.nextId++}`, kind: s.special.kind, ms: s.special.ms });
+      }
+
+      // App publishes go through the entry gate first.
+      if (s.appPublish && now >= c.nextAppPublish && c.lifecycle !== "closed") {
+        c.nextAppPublish = now + 700;
+        const err = admit("publishEntry", c);
+        c.admissionLog.publishEntry = { err, at: now, label: "app publish" };
+        if (!err) c.publishes.push({ label: "app", until: now + 2500, kind: "app" });
+      }
+      c.publishes = c.publishes.filter(p => p.until > now);
+
+      // Handler contexts during a drain.
+      if (r.draining) {
+        if (r.handlerCtx === "live" && now >= r.cancelAt) r.handlerCtx = "cancelled";
+        if (r.shutdownCtx === "live" && now >= r.shutdownAt) r.shutdownCtx = "cancelled";
+      }
+
+      for (const w of c.workers) {
+        if (!w.job) continue;
+        const job = w.job;
+        job.remaining -= deltaMs;
+        let outcome = null;
+        if (job.remaining <= 0) outcome = "ack";
+        else if (job.kind === "respects" && r.handlerCtx === "cancelled") outcome = "retry";
+        else if (job.kind === "ignores" && r.shutdownCtx === "cancelled") outcome = "requeue";
+        if (!outcome) continue;
+        if (outcome === "retry") {
+          // ctx.Err() is an ordinary retryable error: a retry copy, then ack.
+          if (!successorPublish(`retry copy of ${job.id}`)) outcome = "requeue";
+        }
+        if (r.draining) c.settled[outcome]++;
+        w.last = { id: job.id, outcome, at: now };
+        w.job = null;
+      }
+
+      // Dispatch keeps choosing queued work during a drain: the pipeline ends
+      // only when intake is closed and the scheduler is empty.
+      for (const w of c.workers) {
+        if (w.job || c.queue.length === 0) continue;
+        const d = c.queue.shift();
+        w.job = { ...d, remaining: d.ms, total: d.ms };
+      }
+
+      if (r.draining && !r.done && c.queue.length === 0 && c.workers.every(w => !w.job)) {
+        r.done = true;
+        r.doneAt = now;
+      }
+      stepPhases();
+    }
+
+    // =========================================================================
+    // 5. RENDERER
+    // =========================================================================
+    const svgNS = "http://www.w3.org/2000/svg";
+    const STATES = ["ready", "draining", "aborted", "closed"];
+    const STATE_POS = { ready: [130, 90], draining: [130, 180], aborted: [60, 270], closed: [200, 270] };
+    const ADMIT_ROWS = [
+      { kind: "publishEntry", label: "application publish", note: "entry gate: Ready only" },
+      { kind: "publish", label: "successor publish", note: "retry / dead-letter copy" },
+      { kind: "subscribe", label: "Subscribe", note: "" },
+      { kind: "run", label: "Runner.Run", note: "" },
+    ];
+
+    function el(tag, attrs, parent, text) {
+      const node = document.createElementNS(svgNS, tag);
+      for (const [k, v] of Object.entries(attrs)) if (v !== undefined) node.setAttribute(k, v);
+      if (text !== undefined) node.textContent = text;
+      if (parent) parent.appendChild(node);
+      return node;
+    }
+
+    function fmt(ms) { return `${(ms / 1000).toFixed(1)}s`; }
+
+    function buildLayout() {
+      const stage = document.getElementById("stage-layer");
+      stage.innerHTML = "";
+      const mono = { "font-family": "var(--font-mono)" };
+
+      // Lifecycle graph.
+      const edges = [["ready", "draining"], ["draining", "closed"], ["draining", "aborted"], ["aborted", "draining"]];
+      edges.forEach(([a, b], i) => {
+        const [x1, y1] = STATE_POS[a], [x2, y2] = STATE_POS[b];
+        const bend = i === 3 ? -40 : (i === 2 ? 20 : 0);
+        el("path", { d: `M ${x1} ${y1 + 16} Q ${(x1 + x2) / 2 + bend} ${(y1 + y2) / 2}, ${x2} ${y2 - 16}`, class: "wire-path", id: `edge-${a}-${b}` }, stage);
+      });
+      STATES.forEach(s => {
+        const [x, y] = STATE_POS[s];
+        const g = el("g", { transform: `translate(${x - 55}, ${y - 16})` }, stage);
+        el("rect", { width: 110, height: 32, rx: 16, class: "box", id: `state-${s}` }, g);
+        el("text", { x: 55, y: 20, "text-anchor": "middle", ...mono, "font-size": 10, "font-weight": 600, id: `state-t-${s}` }, g, s);
+      });
+      el("text", { x: 40, y: 330, ...mono, "font-size": 9, fill: "var(--text-muted)", id: "close-calls" }, stage, "");
+      el("text", { x: 40, y: 348, ...mono, "font-size": 8.5, fill: "var(--text-muted)", id: "close-err1" }, stage, "");
+      el("text", { x: 40, y: 362, ...mono, "font-size": 8.5, fill: "var(--text-muted)", id: "close-err2" }, stage, "");
+
+      // Admission table.
+      ADMIT_ROWS.forEach((row, i) => {
+        const g = el("g", { transform: `translate(280, ${70 + i * 66})` }, stage);
+        el("rect", { width: 260, height: 56, rx: 8, class: "box", id: `adm-rect-${row.kind}` }, g);
+        el("text", { x: 12, y: 20, ...mono, "font-size": 10, "font-weight": 600 }, g, row.label);
+        el("text", { x: 248, y: 20, "text-anchor": "end", ...mono, "font-size": 10, "font-weight": 700, id: `adm-v-${row.kind}` }, g, "");
+        el("text", { x: 12, y: 38, ...mono, "font-size": 8.5, fill: "var(--text-muted)", id: `adm-e-${row.kind}` }, g, row.note);
+      });
+      el("text", { x: 280, y: 346, ...mono, "font-size": 8.5, fill: "var(--text-muted)", id: "producer-state" }, stage, "");
+      el("text", { x: 280, y: 362, ...mono, "font-size": 8.5, fill: "var(--text-muted)", id: "publish-count" }, stage, "");
+
+      // Runner.
+      const rg = el("g", { transform: "translate(580, 64)" }, stage);
+      el("rect", { width: 330, height: 300, rx: 10, class: "box" }, rg);
+      el("text", { x: 14, y: 22, ...mono, "font-size": 10, "font-weight": 600 }, rg, "intake");
+      el("text", { x: 316, y: 22, "text-anchor": "end", ...mono, "font-size": 9, id: "intake-state" }, rg, "");
+      el("text", { x: 14, y: 46, ...mono, "font-size": 9, fill: "var(--text-muted)" }, rg, "lanes (queued, accepted)");
+      el("rect", { x: 14, y: 54, width: 302, height: 22, rx: 4, class: "tray" }, rg);
+      el("g", { id: "queue-items", transform: "translate(30, 65)" }, rg);
+      for (let i = 0; i < WORKERS; i++) {
+        const g = el("g", { transform: `translate(14, ${88 + i * 44})` }, rg);
+        el("rect", { width: 302, height: 38, rx: 6, class: "worker-slot", id: `w-rect-${i}` }, g);
+        el("text", { x: 10, y: 16, ...mono, "font-size": 9.5, "font-weight": 600 }, g, `worker #${i}`);
+        el("text", { x: 292, y: 16, "text-anchor": "end", ...mono, "font-size": 8.5, id: `w-state-${i}` }, g, "");
+        el("rect", { x: 10, y: 25, width: 282, height: 3, rx: 1.5, fill: "#222228" }, g);
+        el("rect", { x: 10, y: 25, width: 0, height: 3, rx: 1.5, fill: "var(--color-worker)", id: `w-prog-${i}` }, g);
+      }
+
+      // Close phases.
+      PHASES.forEach((p, i) => {
+        const g = el("g", { transform: `translate(950, ${64 + i * 50})` }, stage);
+        el("rect", { width: 220, height: 42, rx: 8, class: "box", id: `ph-rect-${i}` }, g);
+        el("text", { x: 12, y: 17, ...mono, "font-size": 9.5, "font-weight": 600 }, g, `${i + 1}. ${p.name}`);
+        el("text", { x: 208, y: 17, "text-anchor": "end", ...mono, "font-size": 8.5, id: `ph-status-${i}` }, g, "");
+        el("text", { x: 12, y: 33, ...mono, "font-size": 8.5, fill: "var(--text-muted)", id: `ph-budget-${i}` }, g, "");
+      });
+
+      // Drain timeline.
+      const t = el("g", { transform: "translate(580, 392)" }, stage);
+      el("text", { x: 0, y: 0, ...mono, "font-size": 10, "font-weight": 600, "letter-spacing": "0.08em", fill: "var(--text-secondary)" }, t, "05 / RUNNER.DRAIN TIMELINE");
+      el("rect", { x: 0, y: 14, width: 590, height: 10, rx: 5, class: "tray" }, t);
+      el("rect", { x: 0, y: 14, width: 0, height: 10, rx: 5, fill: "var(--color-high)", opacity: 0.6, id: "tl-fill" }, t);
+      const timers = drainTimers(cfg.drainTimeout, cfg.handlerGrace);
+      const scale = 590 / (cfg.drainTimeout * 1.1);
+      [[timers.cancelAfter, "handler ctx cancelled", "var(--color-promo)"], [timers.shutdownAfter, "shutdown ctx ends", "var(--color-break)"]].forEach(([ms, label, color], i) => {
+        el("rect", { x: ms * scale - 1, y: 8, width: 2, height: 22, fill: color }, t);
+        el("text", { x: ms * scale - 4, y: i ? 58 : 44, "text-anchor": "end", ...mono, "font-size": 8.5, fill: color }, t, `${label} @ ${fmt(ms)}`);
+      });
+      el("text", { x: 0, y: 44, ...mono, "font-size": 8.5, fill: "var(--text-muted)" }, t, `DrainTimeout ${fmt(cfg.drainTimeout)} - HandlerGrace ${fmt(cfg.handlerGrace)} = ${fmt(timers.cancelAfter)}`);
+      el("text", { x: -540, y: 30, ...mono, "font-size": 8.5, fill: "var(--text-muted)" }, t, "Budgets shortened for the demo; defaults are 1m / 5s / 10s.");
+    }
+
+    function render() {
+      document.getElementById("clock-display").textContent = clock.format();
+      const now = clock.now();
+      const r = c.runner;
+      const stateColor = { ready: "var(--color-worker)", draining: "var(--color-high)", aborted: "var(--color-break)", closed: "var(--text-secondary)" };
+
+      STATES.forEach(s => {
+        const on = c.lifecycle === s;
+        document.getElementById(`state-${s}`).setAttribute("stroke", on ? stateColor[s] : "var(--border-hairline)");
+        document.getElementById(`state-${s}`).setAttribute("stroke-width", on ? 2 : 1);
+        document.getElementById(`state-t-${s}`).setAttribute("fill", on ? stateColor[s] : "var(--text-muted)");
+      });
+      document.getElementById("close-calls").textContent = `Close() calls: ${c.closeCalls.map(t => fmt(t)).join(", ") || "none"}`;
+      const err = c.closeResult && !c.closeResult.ok && !c.closeResult.pending ? c.closeResult.text : "";
+      document.getElementById("close-err1").textContent = err.slice(0, 34);
+      document.getElementById("close-err2").textContent = err.slice(34);
+      document.getElementById("close-err1").setAttribute("fill", "var(--color-break)");
+      document.getElementById("close-err2").setAttribute("fill", "var(--color-break)");
+
+      ADMIT_ROWS.forEach(row => {
+        const e = admit(row.kind, c);
+        const v = document.getElementById(`adm-v-${row.kind}`);
+        v.textContent = e ? "REFUSE" : "ADMIT";
+        v.setAttribute("fill", e ? "var(--color-break)" : "var(--color-worker)");
+        const recent = c.admissionLog[row.kind];
+        const note = document.getElementById(`adm-e-${row.kind}`);
+        note.textContent = e ? e : (recent && now - recent.at < 1500 ? `admitted: ${recent.label}` : row.note);
+        note.setAttribute("fill", e ? "var(--color-break)" : "var(--text-muted)");
+        document.getElementById(`adm-rect-${row.kind}`).setAttribute("stroke", recent && now - recent.at < 600 ? (recent.err ? "var(--color-break)" : "var(--color-worker)") : "var(--border-hairline)");
+      });
+      document.getElementById("producer-state").textContent = c.producerTeardown ? "producer torn down: successors refused" : "producer stands";
+      document.getElementById("publish-count").textContent = `publishes in flight: ${c.publishes.length}`;
+
+      const intake = document.getElementById("intake-state");
+      intake.textContent = r.intakeOpen ? "fetching" : "stopped (drain)";
+      intake.setAttribute("fill", r.intakeOpen ? "var(--color-worker)" : "var(--color-promo)");
+      document.getElementById("queue-items").innerHTML = c.queue.slice(0, 8).map((d, i) => `<g transform="translate(${i * 36}, 0)">
+          <rect x="-15" y="-8" width="30" height="16" rx="4" fill="${d.kind === "normal" ? "var(--color-high)" : "var(--color-promo)"}" fill-opacity="0.85" />
+          <text x="0" y="3.5" text-anchor="middle" font-family="var(--font-mono)" font-size="8.5" font-weight="700" fill="#09090b">${d.id}</text></g>`).join("");
+      c.workers.forEach(w => {
+        const rect = document.getElementById(`w-rect-${w.id}`);
+        const state = document.getElementById(`w-state-${w.id}`);
+        const prog = document.getElementById(`w-prog-${w.id}`);
+        rect.classList.toggle("busy", !!w.job);
+        if (w.job) {
+          const label = w.job.kind === "respects" ? "watches ctx" : (w.job.kind === "ignores" ? "ignores ctx" : "");
+          state.textContent = `${w.job.id} ${label} ${fmt(Math.max(0, w.job.total - w.job.remaining))}`;
+          state.setAttribute("fill", w.job.kind === "normal" ? "var(--color-worker)" : "var(--color-promo)");
+          prog.setAttribute("width", 282 * Math.min(1, 1 - w.job.remaining / w.job.total));
+        } else if (w.last && now - w.last.at < 2500) {
+          const text = { ack: "acked", retry: "ctx error: retry copy + ack", requeue: "abandoned: nack requeue" }[w.last.outcome];
+          state.textContent = `${w.last.id} ${text}`;
+          state.setAttribute("fill", w.last.outcome === "ack" ? "var(--text-muted)" : (w.last.outcome === "retry" ? "var(--color-promo)" : "var(--color-break)"));
+          prog.setAttribute("width", 0);
+        } else {
+          state.textContent = "idle";
+          state.setAttribute("fill", "var(--text-muted)");
+          prog.setAttribute("width", 0);
+        }
+      });
+
+      c.phases.forEach((p, i) => {
+        const status = document.getElementById(`ph-status-${i}`);
+        const colors = { pending: "var(--text-muted)", running: "var(--color-high)", done: "var(--color-worker)", timeout: "var(--color-break)" };
+        const running = p.status === "running" && c.closeRunning;
+        status.textContent = p.status === "timeout" ? "TIMED OUT" : (running ? `running ${fmt(p.elapsed)}` : p.status);
+        status.setAttribute("fill", colors[p.status]);
+        document.getElementById(`ph-rect-${i}`).setAttribute("stroke", p.status === "pending" ? "var(--border-hairline)" : colors[p.status]);
+        const budget = p.budget ? cfg[p.budget] : null;
+        document.getElementById(`ph-budget-${i}`).textContent = p.budget ? `${p.budget}: ${budget ? fmt(budget) : "0 (caller ctx only)"}` : "instant";
+      });
+
+      const scale = 590 / (cfg.drainTimeout * 1.1);
+      const elapsed = r.draining ? Math.min((r.done ? r.doneAt : now) - r.drainStart, cfg.drainTimeout * 1.1) : 0;
+      document.getElementById("tl-fill").setAttribute("width", elapsed * scale);
+
+      // HUD.
+      const hud = document.getElementById("hud-state");
+      hud.textContent = c.lifecycle.toUpperCase();
+      hud.style.color = stateColor[c.lifecycle];
+      document.getElementById("hud-state-sub").textContent = { ready: "Accepting work; Close() not called", draining: "A Close attempt is in flight; admission is shut", aborted: "A phase timed out; Close may be retried", closed: "Terminal: nothing moves out of Closed" }[c.lifecycle];
+      document.getElementById("gauge-state").style.width = `${(STATES.indexOf(c.lifecycle) === 3 ? 1 : c.phase < 0 ? 0 : (c.phase + 1) / PHASES.length) * 100}%`;
+      const cr = c.closeResult;
+      document.getElementById("hud-close").textContent = !cr ? "-" : (cr.pending ? "RUNNING" : (cr.ok ? "nil" : "ERROR"));
+      document.getElementById("hud-close").style.color = !cr || cr.pending ? "var(--text-primary)" : (cr.ok ? "var(--color-worker)" : "var(--color-break)");
+      document.getElementById("hud-close-sub").textContent = !cr ? "Not called yet" : cr.text;
+      const running = c.workers.filter(w => w.job).length;
+      document.getElementById("hud-work").textContent = `${c.queue.length} / ${running}`;
+      document.getElementById("hud-work-sub").textContent = r.done ? `runner drained at ${fmt(r.doneAt)}` : (r.draining ? "queued / running; intake stopped, accepted work still runs" : "queued / running");
+      document.getElementById("gauge-work").style.width = `${Math.min(100, ((c.queue.length + running) / 10) * 100)}%`;
+      document.getElementById("hud-settled").textContent = c.settled.ack + c.settled.retry + c.settled.requeue;
+      document.getElementById("hud-settled-sub").textContent = `acked ${c.settled.ack} | retry copy ${c.settled.retry} | requeued ${c.settled.requeue}`;
+    }
+
+    document.getElementById("btn-play-pause").addEventListener("click", () => {
+      isPlaying = !isPlaying;
+      document.getElementById("play-text").textContent = isPlaying ? "Pause" : "Play";
+    });
+    document.getElementById("btn-step").addEventListener("click", () => {
+      if (!isPlaying) { simulationStep(100); render(); }
+    });
+    document.querySelectorAll(".speed-btn").forEach(btn => {
+      btn.addEventListener("click", () => {
+        document.querySelectorAll(".speed-btn").forEach(b => b.classList.remove("active"));
+        btn.classList.add("active");
+        speedFactor = parseFloat(btn.dataset.speed);
+      });
+    });
+    document.querySelectorAll(".scenario-tab").forEach(tab => tab.addEventListener("click", () => setScenario(tab.dataset.scenario)));
+
+    let lastFrameTime = performance.now();
+    document.addEventListener("visibilitychange", () => { lastFrameTime = performance.now(); });
+    function loop(currentTime) {
+      if (document.hidden) {
+        lastFrameTime = currentTime;
+        requestAnimationFrame(loop);
+        return;
+      }
+      const delta = Math.min(currentTime - lastFrameTime, 100);
+      lastFrameTime = currentTime;
+      // The scenario replays a few seconds after the client closes.
+      if (isPlaying) {
+        simulationStep(delta * speedFactor);
+        if (c.lifecycle === "closed" && clock.now() - c.closeCalls[c.closeCalls.length - 1] > 30000) reset();
+      }
+      render();
+      requestAnimationFrame(loop);
+    }
+
+    setScenario("clean");
+    requestAnimationFrame(loop);
+  </script>
+</body>
+</html>

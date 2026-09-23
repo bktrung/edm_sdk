@@ -1,6 +1,7 @@
 # Driver contract
 
-This is the authoritative guide for implementing a driver for F1. The
+An F1 driver implements the broker-facing interfaces in the `driver` package,
+and this page is the guide for writing one. The
 interfaces and comments in [`driver/driver.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/driver/driver.go),
 [`driver/message.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/driver/message.go),
 [`driver/capability.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/driver/capability.go),
@@ -135,7 +136,11 @@ conformance suite rather than reported by `Capabilities`.
 ### `InboundMessage`
 
 An inbound message must include the physical destination, body, headers, broker
-reference, and a valid `Settler`. `DeliveryCount` is the previous broker
+reference, and a valid `Settler`. `Key` is the message key; the core uses it
+to pick the worker in ordered mode. `ReceivedAt` is when the driver received
+the delivery and must not be zero. `EnqueuedAt` is when the broker or producer
+enqueued the event, with `EnqueuedAtSource` saying which; both stay zero when
+unknown, and the conformance suite checks that they are set together. `DeliveryCount` is the previous broker
 redelivery count or `-1` when the broker cannot provide it. The core does not
 interpret provider-specific fields inside `BrokerRef`.
 
@@ -149,6 +154,8 @@ before the next delivery can mutate the storage.
 same delivery to be settled twice; subsequent calls should expose
 [`ErrAlreadySettled`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/driver/errors.go) or the equivalent documented
 portable error.
+
+For Kafka's partition cursor and commit ordering, see [the Kafka ack tracker](/deep-dives/kafka-ack-tracker).
 
 - `Ack` marks the original delivery successfully handled.
 - `Nack` asks the broker to redeliver or apply broker failure policy according
@@ -169,13 +176,10 @@ commit merely because its broker API uses a different verb.
 ### Publish durability
 
 `Producer.Publish` must not return `nil` until every message in the call has a
-durable broker acknowledgment under the requested configuration. The exact
-confirmation mechanism is provider-specific, but a local buffer write or an
-unconfirmed client enqueue is not sufficient.
-
-The core always requests `ProducerConfig.RequireDurableAck = true` in the v1
-publish path. A driver must honor that flag rather than downgrade it based on a
-provider default.
+durable broker acknowledgment. This holds for every producer a driver builds;
+there is no setting that relaxes it, and a driver must not downgrade it based
+on a provider default. The exact confirmation mechanism is provider-specific,
+but a local buffer write or an unconfirmed client enqueue is not sufficient.
 
 `Publish` accepts multiple messages and must be safe for concurrent use. It may
 return a [`PublishError`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/driver/errors.go) when only some indexes failed.
@@ -265,8 +269,10 @@ but did not settle.
 Release makes no durability promise about committed positions. It is the
 explicit handoff operation for connection loss, reconnect, and shutdown paths
 where the core cannot prove settlement. It must be idempotent and safe after a
-previous release or stop. A broker that cannot return unsettled work must
-return [`ErrUnsupported`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/driver/errors.go).
+previous release or stop. The core calls `Release` after any `Stop` error, and a
+driver whose `Stop` did not return within the phase budget may still receive it,
+so the two calls can overlap. A `Stop` after `Release` returns nil. A broker
+that cannot return unsettled work must return [`ErrUnsupported`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/driver/errors.go).
 
 ### Lag
 
@@ -320,7 +326,12 @@ missing destination from an existing empty destination.
 The topology structures and their ownership rules are defined in
 [`driver/topology.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/driver/topology.go). Optional destructive
 operations are exposed separately through `driver.Maintenance`; they are not
-part of the required `Admin` contract.
+part of the required `Admin` contract. `Purge` empties a destination and keeps
+it. `Prune` is the only delete in the port: it deletes a destination only when
+it and its driver-managed auxiliary destinations are empty and no consumer is
+attached, rechecks those guards before each delete, deletes auxiliaries first,
+and reports a refusal per name, so a nil error does not mean everything was
+deleted.
 
 ## Configuration passed to a driver
 
@@ -329,10 +340,8 @@ instance identity, reconnect/drain timing, TLS, SASL, and opaque
 `DriverOptions`. Credentials must not be logged. Driver-specific options may be
 interpreted only by that driver.
 
-`ProducerConfig` carries:
-
-- `RequireDurableAck`, which is true for core-originated v1 publishing; and
-- `Effective`, the capability profile selected by the core.
+`ProducerConfig` carries `Effective`, the capability profile selected by the
+core.
 
 `ConsumerConfig` carries:
 
@@ -434,8 +443,9 @@ being mistaken for success, but drivers should classify known errors at the
 boundary and preserve the broker cause through `Unwrap`.
 
 `PublishError` aggregates per-message causes. Its `Kind` is the most severe
-classification among the failed indexes, and `Retryable` is true only when all
-failed messages are transient.
+classification among the failed indexes, not counting notifications, and
+`Retryable` is true only when all failed messages are transient. When every
+cause is a notification, `Kind` is `KindNotification` and `Retryable` is false.
 
 The rules are exercised by [`driver/errors_test.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/driver/errors_test.go)
 and the provider error tests.

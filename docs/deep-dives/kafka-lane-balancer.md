@@ -1,121 +1,73 @@
-# Kafka partition assignment and rebalancing
+# Partitions set Kafka parallelism, and a rebalance moves them without losing records
 
-*By F1 maintainers, September 2026.*
+*By trungbk.*
 
-Kafka assigns partitions to members of a consumer group. F1 maps each logical
-destination, priority, and retry tier to a Kafka topic, then joins the topics
-for one subscription in one group. The assignment determines which service
-instance can receive each destination's records and how much parallel work that
-instance can admit.
-
-This page describes the stock balancer protocols selected by the Kafka driver.
-The former custom lane protocol is gone and is refused when configured.
+I run two instances of a service with `Concurrency: 16` against a topic with 4 partitions, and each instance handles only 2 messages at a time. Then a third instance starts, Kafka moves partitions between members mid-message, and some records arrive twice. Both surprises come from the same fact: Kafka, not F1, decides which consumer owns each partition. F1 maps a destination, priority, and [retry step](/learn/glossary#retry-tier) to a topic and lets the consumer group assign partitions to members, so the assignment sets how much each instance can run in parallel and what a rebalance can redeliver.
 
 ## Group assignment
 
-A Kafka consumer group is a set of members reading the same topics, with each
-partition read by one member at a time. A member is one consumer in that group,
-usually one running service instance. A partition is one slice of a Kafka topic
-that one member reads at a time.
+A consumer group has members, and Kafka gives each partition to one member at a time. When membership changes, the group leader computes a new assignment using the assignment strategy the members agree on.
 
-When members join or leave, Kafka starts a rebalance and assigns the group's
-partitions again. The group leader performs the assignment using the protocol
-all members advertised. The driver uses franz-go's stock assignors and does not
-maintain a custom per-topic plan.
+The `broker.kafka.balancer` setting picks that strategy from three built-in choices:
 
-The option is `broker.kafka.balancer`:
+- `cooperative-sticky` is the default. Members retain partitions that do not need to move.
+- `sticky` prefers stable ownership but uses eager revocation before the new assignment.
+- `range` assigns contiguous ranges per topic and also uses eager revocation.
 
-- `cooperative-sticky` is the default. It tries to keep each member's current
-  partitions and transfers only what the new membership requires.
-- `sticky` also prefers to keep current ownership, but uses Kafka's eager
-  protocol. Members revoke their assignments before receiving the new ones.
-- `range` assigns contiguous ranges for each topic and also uses the eager
-  protocol.
-- `lane` is refused. It was a custom eager protocol and is not an alias for
-  any stock assignor.
+Every member must advertise a compatible strategy. I change this setting across the group as one deployment. Moving from cooperative-sticky to an eager protocol takes every partition away from every member once and can redeliver records that were not committed before the move.
 
-Every member of a group must advertise a compatible protocol. Change the value
-on all members as one deployment. Moving a group from cooperative-sticky to an
-eager protocol causes a full revoke and re-consumption, so records can be
-delivered again during that change.
+## Parallelism is limited by partition count
 
-## Parallelism is partition-bound
+The Kafka driver lets in one delivery per partition at a time. For one destination, effective handler parallelism is the smaller of `Concurrency` and the number of assigned partitions.
 
-The Kafka driver admits one delivery per partition at a time. For a destination,
-the member's transport ceiling is therefore the number of that destination's
-partitions assigned to it. The handler pool adds a second ceiling: effective
-handler parallelism is the smaller of `Concurrency` and the assigned partition
-count.
+F1's priority weights can choose among available work, but they cannot create a partition. If a member is assigned fewer partitions than the destination's prefetch could keep busy, F1 emits one warning with the assigned count, that prefetch number, and what to scale. What to scale is the destination's partition count unless `broker.kafka.maxExpectedInstances` sets a floor. That setting is the number of instances you expect to run, and F1 uses it as the minimum partition count for every destination.
 
-F1's priority and retry lanes still compete through the core scheduler, but a
-weight cannot create a partition. If a member owns fewer partitions than the
-resolved destination slot budget, the driver emits one warning with
-`assigned_partitions`, `budget`, and `lever`. The `lever` is the destination
-partition count by default, or `broker.kafka.maxExpectedInstances` when that
-floor is configured.
+The operator response is to provision more partitions or configure that floor before consumers start. Increasing a topic's partition count remaps keys and cannot be undone, so the keying scheme must remain valid after the change.
 
-The operator response is to provision more partitions or require a partition
-floor with `broker.kafka.maxExpectedInstances`. Raising a partition count
-re-maps keys already published to the topic, and Kafka cannot lower a topic's
-partition count. Treat an increase as a one-way capacity decision, and choose a
-keying scheme that remains valid after the remap.
+A cooperative callback can report only part of the eventual assignment. F1 logs the partition-shortfall warning once, and does not retract it when a later callback brings in more partitions. The warning describes assignment shape, not a consumer failure.
 
-A warning can be produced by the first callback of a cooperative rebalance
-when the callback carries only part of the member's eventual assignment. The
-driver records the warning once rather than retracting it if a later callback
-fills the budget. The warning is therefore an operator signal about a possible
-partition shortfall, not a promise that the final callback has already arrived.
+## Rebalancing without losing ownership
 
-## Cooperative rebalancing
+A cooperative revoke keeps unaffected partitions and drains only the partitions that must move. The drain has a time limit derived from the broker's timeouts, so the next owner can read a record that was not yet acked when the old owner cannot finish in time.
 
-Cooperative assignment lets a member retain partitions that do not need to
-move. A revoke callback waits for the one delivery in flight on each revoked
-partition, bounded by `lifecycle.rebalanceDrainTimeout`. If the delivery has
-not settled when that bound expires, the member gives up the assignment and the
-next owner may read the record from its committed offset. That is an
-at-least-once redelivery, not a loss.
+```mermaid
+stateDiagram-v2
+    [*] --> Owned
+    Owned --> Draining: revoke
+    Draining --> Committed: acked in time
+    Draining --> Uncommitted: time runs out
+    Committed --> NewOwner: reads after commit
+    Uncommitted --> NewOwner: redelivers record
+    NewOwner --> [*]
+```
 
-`broker.kafka.rebalanceTimeout` is the broker's window for completing the
-rebalance. It must be greater than `lifecycle.rebalanceDrainTimeout`; the driver
-refuses a value at or below that bound. The larger window is required because
-the revoke callback holds the rebalance while it waits for the in-flight
-settlement.
+The diagram's time-runs-out branch is [at-least-once](/learn/glossary#at-least-once-delivery) redelivery, not loss. An eager strategy follows the same ownership idea but revokes every assignment before assigning again.
 
-The cooperative protocol is not an eager protocol with a different name. A
-mixed group that changes protocol must be rolled out consistently, and moving
-back to `sticky` or `range` accepts a full revoke and possible duplicates.
+The order inside a revoke matters. F1 first stops letting new records in from the partitions that are leaving, then waits for the deliveries already in hand, with one shared time limit for the whole revoke. After the wait it closes the old offset records, so late acks through them are refused, and commits the acked prefix: the offsets acked in a row after the last commit, up to the first one still unacked.
 
-## Partition floors and topology
+If that final commit fails, F1 reports it and the next owner starts from Kafka's previous committed position, so it gets every record after that position again, including records whose handlers already finished. A handler still running when the time limit ends is not stopped; its ack is refused, and the next owner can handle the same record while it runs.
 
-A destination with fewer partitions than its members cannot give every member
-work for that destination. `broker.kafka.maxExpectedInstances` makes this
-capacity requirement explicit: topology declaration fills an unspecified count
-with the floor, and topology verification refuses an existing destination
-below it. Its default `0` leaves the broker's partition count in charge.
+A lost assignment is different from a revoke. It happens when the group coordinator has already dropped this member, for example because its session expired without heartbeats. Then its commits would be refused anyway, so F1 does not wait and does not commit: it drops the partitions at once, and the next owner redelivers everything this member did not commit.
 
-The floor does not change an existing topic. Provision the topic with the
-needed count before starting consumers, and remember that increasing the count
-changes key-to-partition mapping. `TopologyNone` skips this check because the
-driver neither declares nor verifies the destination there.
+`lifecycle.rebalanceDrainTimeout` is the wait for one in-flight delivery on each revoked partition. It must fit both broker group windows: the value must not exceed 0.6 times the smaller of `broker.kafka.sessionTimeout` and `broker.kafka.rebalanceTimeout`, which leaves the rest of the window for the final commit and the rejoin.
 
-## Retry topics and delayed work
+## Partition floors and retry topics
 
-Retry tiers are separate Kafka topics, and their records are due at the record
-timestamp plus the tier delay. The driver uses the timestamp Kafka exposes: a
-producer `CreateTime` by default, or broker append time when the topic uses
-`message.timestamp.type=LogAppendTime`. Publisher clock skew and append lag may
-make a retry late, never early. A handler's `RetryDelay` request does not become
-an arbitrary Kafka due time; the configured tier delay is the value the driver
-uses.
+`broker.kafka.maxExpectedInstances` makes a capacity floor explicit. When F1 declares topology, a destination with no partition count set is created with the floor, a declared count below the floor is refused, and an existing topic is accepted only at or above the floor. Topology verification refuses an existing destination below it. Retry topics are destinations too, so the floor applies to them. Its zero value leaves the broker's count in charge. `TopologyNone` skips declaration and verification, so the operator provisions the topic and its floor outside F1.
 
-Retry topics are still subject to the same one-delivery-per-partition rule. A
-retry topic with too few partitions can leave assigned handler capacity idle,
-but retry traffic is not a reason to raise the partition count casually: the
-same key-remapping and irreversible partition-count rules apply.
+Retry steps use separate Kafka topics and the same one-delivery-per-partition rule. Their due time comes from the record timestamp plus the step's configured delay. A retry topic with too few partitions can leave handler capacity idle; the same irreversible key-remapping trade-off applies.
 
-## Read the code
+## Limits and trade-offs
 
-- [`resolveBalancer`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/drivers/kafka/balancer.go) - accepted protocols and the cooperative default.
-- [`consumerClientOpts`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/drivers/kafka/consumer.go) - group options, callbacks, and the one-delivery admission path.
-- [`resolveRebalanceTimeout`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/drivers/kafka/consumer.go) - the timeout refusal that protects the revoke wait.
-- [`assignmentWarningsLocked`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/drivers/kafka/consumer.go) - the assigned partition and budget warning.
+- Cooperative assignment moves fewer partitions but can redeliver records not yet acked when the drain time runs out.
+- Eager protocols simplify full reassignment at the cost of revoking every partition during a change.
+- A partition-floor warning is an assignment-shape risk, not proof that Kafka or the consumer is broken.
+- Raising a partition count increases possible parallelism but remaps keys permanently.
+- A rebalance drain time that fits `broker.kafka.rebalanceTimeout` can still violate the separate session-timeout fraction, so both bounds must be checked.
+
+## Go further
+
+- [Drivers and capabilities](/drivers-and-capabilities) - Kafka options, topology, and capability limits.
+- [Kafka ack tracker](/deep-dives/kafka-ack-tracker) - how acks behave when ownership changes.
+- [Driver contract](/development/driver-contract) - the broker-independent consumer contract.
+- [Source-reading guide](/development/source-reading-guide) - the maintainer route through the implementation.

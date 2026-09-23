@@ -1,18 +1,43 @@
 # Getting started
 
-F1 is the Go SDK every service in the estate uses to publish and consume events. A service author
-writes handlers and event structs. F1 owns envelope construction, delivery guarantees,
-acknowledgement, retry ladders, dead-letter routing, poison-message containment, priority
-scheduling, zero-loss shutdown, and observability.
+F1 is a Go SDK for publishing and consuming events without writing broker code.
 
-The message broker is a pluggable driver chosen by the application at its composition root.
-Business code talks to F1, never to a broker client, so moving between brokers changes
-configuration rather than handlers.
+An HTTP handler never reads a request off a socket; `net/http` does that for it. F1 does the same job
+for message brokers. The RabbitMQ and Kafka client libraries hand you raw deliveries and leave the
+hard parts to you: when to ack, how to retry after a delay, where a message that keeps failing goes,
+and how to shut down without dropping what is in flight. F1 solves those once, the same way on every
+supported broker.
 
-The repository contains the core SDK, the public codec and driver ports, the deterministic
-in-memory driver, the RabbitMQ driver, and a connected Kafka driver. Kafka consumes with consumer
-groups. Each driver reports its transport limits through `Client.Limits()`, and the core emulates
-F1 retry, delay, and dead-letter behavior where a broker has no native equivalent.
+A service author writes handlers and event structs. F1 handles envelope construction, delivery
+guarantees, acknowledgement, retry delays, dead-letter routing, poison-message, priorities,
+zero-loss shutdown, and observability.
+
+New to a term? See the [glossary](/learn/glossary).
+
+F1 ships three drivers: in-memory for tests and local runs, RabbitMQ, and Kafka. You choose one in
+configuration, and your handlers never talk to a broker client, so switching brokers does not change
+them. When a broker lacks a feature, such as delayed retries on RabbitMQ, F1 provides it;
+`Client.Limits()` lists what the connected broker supports.
+
+The minimal program follows one lifecycle: create the client, declare the subscription, start the runner, publish, handle, acknowledge, and close.
+
+```mermaid
+sequenceDiagram
+    participant app
+    participant F1
+    participant broker
+    participant handler
+    app->>F1: New
+    app->>F1: Subscribe
+    app->>F1: Run (F1 starts consuming)
+    app->>F1: Publish
+    F1->>broker: Publish
+    broker-->>F1: deliver
+    F1->>handler: call handler
+    handler-->>F1: return nil
+    F1->>broker: ack
+    app->>F1: Close
+```
 
 ## Install
 
@@ -32,14 +57,14 @@ in handler code. [Quickstart](/learn/quickstart) runs a complete program with no
 ## The one-minute background
 
 An event has two names. Its **event type** is the contract being handled, such as
-`orders.placed.v1`. Its **topic** is the logical destination carrying related events: F1 derives
+`orders.placed.v1`. Its **topic** is the name your code uses for the stream carrying related events: F1 derives
 `orders.placed` from `orders.placed.v1` by removing the trailing version segment. The publisher
-encodes the payload and attaches an **envelope** carrying the event type, ID, subject, routing
+encodes the payload and attaches an [**envelope**](/learn/glossary#envelope) carrying the event type, ID, subject, routing
 metadata, and delivery metadata. A subscription reads topics and routes each event to the handler
 registered for its type.
 
-Delivery is at least once. A handler can see the same event again after a redelivery, so the side
-effect it performs must be idempotent. `Event.IdempotencyKey()` returns the stable application key
+Delivery is [at least once](/learn/glossary#at-least-once-delivery). A handler can see the same event again after a redelivery, so the side
+effect it performs must be idempotent. `Event.IdempotencyKey()` returns the stable [idempotency key](/learn/glossary#idempotency-key)
 when the publisher set one, and the event ID otherwise; an attempt number is not a deduplication
 key, because attempts change on redelivery. Version the event type when the payload contract
 changes, and keep the old handler until its events are retired.
@@ -64,7 +89,7 @@ func connect(ctx context.Context, configPath string, selectedDriver driver.Drive
 
 `f1.New` opens the driver before it returns, so a startup failure surfaces at the connection
 boundary. Keep `broker.driver` aligned with `selectedDriver.Name()`: F1 logs a driver-identity
-mismatch so a configuration split is visible. Add `f1.WithPublishTopics(...)` when F1 should ensure
+mismatch so a configuration split is visible. Add `f1.WithPublishTopics(...)` when F1 should set up
 the publisher's topology at startup; production topology is normally provisioned separately. Every
 driver setting is in [Drivers and capabilities](/drivers-and-capabilities).
 
@@ -99,7 +124,7 @@ such as an order ID beats a random one. Use `f1.WithTopic` only to override the 
 
 ## Subscribe and handle events
 
-A subscription names its consumer group, declares the logical topics it reads, and maps event types
+A subscription names its [consumer group](/learn/glossary#consumer-group), declares the topics it reads, and maps event types
 to handlers:
 
 ```go
@@ -121,9 +146,9 @@ func subscribeOrders(ctx context.Context, client *f1.Client) (*f1.Runner, error)
 }
 ```
 
-The handler's result settles the delivery:
+The handler's result decides the [ack or nack](/learn/glossary#settlement):
 
-- return `nil` after the side effect succeeds, and F1 settles the event as handled;
+- return `nil` after the side effect succeeds, and F1 acks the event as handled;
 - return an ordinary error for a transient failure, and F1 applies the configured retry policy; and
 - wrap an unrecoverable error with `f1.Terminal` when retrying cannot help.
 
@@ -162,7 +187,7 @@ func runOrders(ctx context.Context, client *f1.Client, runner *f1.Runner) error 
 
 Here `ctx` is only the shutdown trigger. A real service watches termination signals and calls
 `client.Close` with a fresh timeout context, or `runner.Drain` for one subscription, rather than
-cancelling `Run`'s context: cancelling `Run` skips the grace period and abandons the handler in
+cancelling `Run`'s context: cancelling `Run` skips the grace period and gives up on the handler in
 flight. Give shutdown its own deadline so a stalled handler cannot keep the process alive, and note
 that the process creating the client owns its runners and must drain them. [Lifecycle and
 shutdown](/advanced-topics/lifecycle-and-shutdown) shows the signal-driven pattern.
@@ -196,7 +221,7 @@ expecting the SDK to cover them.
 
 <!--@include: ../../README.md#non-goals-->
 
-## What next
+## Go further
 
 - [Message](/basics/message) and [Publisher and subscriber](/basics/pubsub) - the event, envelope,
   and subscription model.

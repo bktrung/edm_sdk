@@ -95,3 +95,9 @@ Run it:
 $ go run ./inmem-first-run/main.go
 received: hello from in-memory driver
 ```
+
+## Go further
+
+- [Getting started](/learn/getting-started) - connect a driver in a service and plan shutdown.
+- [Message](/basics/message) - learn how payloads, envelopes, and events relate.
+- [Publisher and subscriber](/basics/pubsub) - move from the in-memory run to subscriptions.

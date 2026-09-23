@@ -1,195 +1,159 @@
 # Observability
 
-Attach one observer to a client and F1 emits typed lifecycle events without
-adding metrics code to handlers. The `f1otel` adapter turns those events into
-standard OpenTelemetry metrics using an application-owned `MeterProvider`.
+F1 emits typed lifecycle events, and the `f1otel` adapter turns them into OpenTelemetry metrics and spans without adding instrumentation to handlers.
 
-For the complete event and field reference, see [Observer events](/development/observer-events).
+The adapter uses an application-owned `MeterProvider`, `TracerProvider`, and propagator. It is safe for concurrent calls and uses event timestamps rather than the wall clock. See [Observer events](/development/observer-events) for the complete event and field reference.
 
-## Install the metrics adapter
+## Install the adapter
 
-Create and configure the provider in the application, then pass the adapter to
-`f1.New` with `f1.WithObserver`:
+Create providers in the application and pass the observer to `f1.New`.
 
 ```go
 import (
-    "context"
+	"context"
 
-    f1 "fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk"
-    "fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/f1otel"
-    sdkmetric "go.opentelemetry.io/otel/sdk/metric"
+	f1 "fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk"
+	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/f1otel"
+	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 )
 
 meterProvider := sdkmetric.NewMeterProvider()
 observer, err := f1otel.New(f1otel.WithMeterProvider(meterProvider))
 if err != nil {
-    return err
+	return err
 }
 
 client, err := f1.New(
-    context.Background(),
-    cfg,
-    f1.WithDriver(driver),
-    f1.WithObserver(observer),
+	context.Background(),
+	cfg,
+	f1.WithDriver(driver),
+	f1.WithObserver(observer),
 )
-if err != nil {
-    return err
-}
 ```
 
-The provider owns exporters and shutdown. `f1otel.New` creates no exporter and
-never selects the OpenTelemetry global provider. A nil provider, the zero
-`f1otel.Observer`, and a nil observer are no-ops. The adapter is safe for
-concurrent calls and uses event timestamps rather than the wall clock.
+`f1otel.New` creates no exporter and never selects the global OpenTelemetry provider. A nil provider, a zero observer, and a nil observer are no-ops. The application owns exporter setup and provider shutdown. Configure views in the application when duration histograms need explicit buckets; `f1otel` installs no view.
 
-The metrics adapter uses OpenTelemetry semantic conventions v1.43.0. Configure
-views in the application when duration histograms need explicit buckets;
-`f1otel` does not install a view.
+## Trace publish, process, and ack
 
-## Writing an observer
+A primary publish creates producer spans, a delivery creates a process span, and [the final ack or nack](/learn/glossary#settlement) creates a `settle` client span. Retry and dead-letter sends are new producer roots linked to the process span that caused them.
 
-The `Observer` interface, its three methods, the token that matches a `Finish` to its `Start`, and
-the rules an implementation must follow are in [Observer](/basics/observer). An adapter that records
-more than `f1otel` does implements that interface directly.
+```mermaid
+flowchart LR
+    S[send] --> C[create]
+    S -->|link| P[process]
+    P --> H[handler spans]
+    T[settle]
+    P -->|link| R[retry send]
+    P -->|link| D[dead-letter send]
+```
+
+The process span is a new root linked to the inbound trace context, and the context returned by `Start` reaches the handler so handler spans become its children. Retry and dead-letter sends are new roots linked to the incoming process context. `WithCreateSpans(false)` removes the `create` span; the default creates it.
+
+`InjectTrace` writes `traceparent` and `tracestate` only when a propagator was configured with `WithPropagator`. It never reads the global propagator.
 
 ## OpenTelemetry metrics
 
-For alert examples built from these instruments, see [Alerts](/advanced-topics/alerts).
+`f1otel` records eleven instruments. Names below are the OpenTelemetry names emitted by the adapter. `messaging.destination.name` is the [topic name from your code](/learn/glossary#logical-topic), not the [broker queue or topic name](/learn/glossary#physical-destination). `messaging.system` is `f1.<driver>` when the driver is known.
 
-`f1otel` records eleven instruments. The attribute names below are the exact
-names emitted by the adapter. `messaging.destination.name` is the logical
-topic, not a physical broker destination. `messaging.system` is `f1.<driver>`
-when the driver is known. `server.address` and `server.port` are included when
-the driver reports them.
+| Name | Kind | Unit | Recorded when |
+| --- | --- | --- | --- |
+| `messaging.client.sent.messages` | sum | `{message}` | A publish finishes successfully; a confirmed retry or dead-letter copy with no result slice counts as one. |
+| `messaging.client.consumed.messages` | sum | `{message}` | F1 reports a delivery receipt. |
+| `messaging.client.operation.duration` | histogram | `s` | A publish or an ack or nack finishes, using matching event timestamps. |
+| `messaging.process.duration` | histogram | `s` | A process finishes, using event timestamps and an optional classified error. |
+| `f1.messaging.broker.wait.duration` | histogram | `s` | A delivery has a trusted broker enqueue timestamp. |
+| `f1.messaging.backlog.messages` | gauge | none | Each backlog sample reports sampled lag. |
+| `f1.messaging.backlog.oldest.age` | gauge | `s` | A backlog head timestamp is known and came from the broker. |
+| `f1.messaging.deadline.promotions` | sum | none | A [lane](/learn/glossary#lane) waits past its wait limit and jumps the queue. |
+| `f1.messaging.lane.wait.duration` | histogram | `s` | A lane [jumping the queue when overdue](/learn/glossary#deadline-promotion) reports the lane wait. |
+| `f1.messaging.retries` | sum | none | A retry schedule is confirmed. |
+| `f1.messaging.dead_letters` | sum | none | A dead-letter publication is confirmed. |
+| Attribute | Meaning | Instruments |
+| --- | --- | --- |
+| `messaging.system` | Driver system, `f1.<driver>` when known | All instruments |
+| `messaging.destination.name` | Topic name from your code | All instruments |
+| `messaging.operation.name` | Operation name | `messaging.client.sent.messages` (`publish`), `messaging.client.consumed.messages` (`receive`), `messaging.client.operation.duration` (`publish` or `settle`), and `messaging.process.duration` (`process`) |
+| `messaging.consumer.group.name` | Consumer group | `messaging.client.consumed.messages`, `messaging.client.operation.duration` for `settle` only, `messaging.process.duration`, `f1.messaging.broker.wait.duration`, `f1.messaging.backlog.messages`, `f1.messaging.backlog.oldest.age`, `f1.messaging.deadline.promotions`, `f1.messaging.lane.wait.duration`, `f1.messaging.retries`, and `f1.messaging.dead_letters`; omitted from sent messages |
+| `f1.priority` | F1 priority | All instruments |
+| `server.address`, `server.port` | Broker endpoint when known | All instruments |
+| `error.type` | Classified error | `messaging.process.duration` when classified, `f1.messaging.retries`, and `f1.messaging.dead_letters` |
+| `reason` | Dead-letter reason when known | `f1.messaging.dead_letters` |
 
-| Name | Kind | Unit | Attributes | When recorded |
-| --- | --- | --- | --- | --- |
-| `messaging.client.sent.messages` | sum | `{message}` | `messaging.system`, `messaging.destination.name`, `messaging.operation.name=publish`, `f1.priority`, optional server attributes | On a publish finish, for successfully published messages. A confirmed successor with no result slice counts as one. |
-| `messaging.client.consumed.messages` | sum | `{message}` | `messaging.system`, `messaging.destination.name`, `messaging.operation.name=receive`, `messaging.consumer.group.name`, `f1.priority`, optional server attributes | On `ObserverDeliveryReceived`. |
-| `messaging.client.operation.duration` | histogram | `s` | `messaging.system`, `messaging.destination.name`, `messaging.operation.name=publish|settle`, `messaging.consumer.group.name` for settle, `f1.priority`, optional server attributes | On publish and settle finishes, using the event timestamp minus the matching start timestamp. |
-| `messaging.process.duration` | histogram | `s` | `messaging.system`, `messaging.destination.name`, `messaging.operation.name=process`, `messaging.consumer.group.name`, `f1.priority`, optional server attributes, `error.type` when classified | On a process finish, using event timestamps. |
-| `f1.messaging.broker.wait.duration` | histogram | `s` | `messaging.system`, `messaging.destination.name`, `messaging.consumer.group.name`, `f1.priority`, optional server attributes | On delivery receipt only when the enqueue source is the broker and its timestamp is known. |
-| `f1.messaging.backlog.messages` | gauge | none | `messaging.system`, `messaging.destination.name`, `messaging.consumer.group.name`, `f1.priority`, optional server attributes | On each backlog sample, with the sampled lag. |
-| `f1.messaging.backlog.oldest.age` | gauge | `s` | `messaging.system`, `messaging.destination.name`, `messaging.consumer.group.name`, `f1.priority`, optional server attributes | On a backlog sample when the head timestamp is known and its source is the broker. |
-| `f1.messaging.deadline.promotions` | sum | none | `messaging.system`, `messaging.destination.name`, `messaging.consumer.group.name`, `f1.priority`, optional server attributes | On a deadline promotion. The value includes the promotion and any suppressed promotions reported by the event. |
-| `f1.messaging.lane.wait.duration` | histogram | `s` | `messaging.system`, `messaging.destination.name`, `messaging.consumer.group.name`, `f1.priority`, optional server attributes | On a deadline promotion, using the reported lane wait. |
-| `f1.messaging.retries` | sum | none | `messaging.system`, `messaging.destination.name`, `messaging.consumer.group.name`, `f1.priority`, optional server attributes, `error.type` | On a confirmed `ObserverRetryScheduled` point. |
-| `f1.messaging.dead_letters` | sum | none | `messaging.system`, `messaging.destination.name`, `messaging.consumer.group.name`, `f1.priority`, optional server attributes, `error.type`, optional `reason` | On a confirmed `ObserverDeadLetterPublished` point. |
+Attributes are omitted when empty or undefined for an event kind. The adapter does not emit a duration when its required timestamp source is unavailable. Mixed-priority publish calls report `medium`, and mixed-topic publish calls leave the topic empty.
 
-`messaging.operation.name` identifies the operation as `publish`, `receive`,
-`process`, or `settle`. Attributes that are empty or not defined for an event
-kind are omitted. The adapter does not emit metrics for unknown kinds, and it
-does not emit a duration when its required timestamp source is unavailable.
+Connection changes are not metrics. The observer receives `connection_lost` and
+`connection_restored` point events from the reconnect supervisor, but `f1otel`
+does not turn them into instruments. To alert on reconnects, handle those kinds
+in your own [observer](/basics/observer), or watch `Client.Health`.
 
-Remaining gap: mixed-priority publish calls and destinations shared by several priorities report
-`medium`; topic is empty for mixed-topic publish calls.
+## Use enqueue timestamps correctly
 
-## Enqueue time, backlog, and oldest age
+F1 carries both an enqueue timestamp and its source.
 
-F1 carries the enqueue timestamp with its source:
+| Source | Meaning |
+| --- | --- |
+| `producer` | Event creation time; retry and dead-letter copies include earlier attempts. |
+| `broker` | Timestamp supplied by the broker for the current hop. |
+| `unknown` | The timestamp is absent or its source is unavailable. |
 
-- `producer` is the event's creation time. On a retry or dead-letter copy,
-  producer time includes all earlier attempts.
-- `broker` is the timestamp supplied by the broker. Use it for per-hop broker
-  wait.
-- `unknown` means the timestamp is absent or its source is unavailable.
+Broker wait uses only `source=broker`. A producer timestamp does not represent the current broker hop. Backlog samples report lag when the driver supports backlog reads. Oldest age is omitted when the broker gives no head timestamp; unknown age is not reported as zero.
 
-The broker-wait histogram uses only `source=broker`. A producer timestamp is
-still carried on the observer event, but it does not represent the current
-broker hop. A backlog sample always records lag when the driver supports
-backlog reads. The oldest-age gauge is omitted when the broker gives no head
-timestamp, so an unknown age is not reported as zero.
+`WithBacklogPollInterval` controls sampling. Zero selects the 15-second default, a negative interval disables polling, and a positive interval below one second is rejected by `New`.
 
-`f1.WithBacklogPollInterval` controls how often the client samples a
-subscription. Zero selects the 15s default, a negative interval disables
-polling, and a positive interval below 1s is rejected by `New`.
+## Configure broker timestamps
 
-## Kafka operator setting
-
-Kafka uses producer `CreateTime` by default. For broker-clock wait, configure
-the destination with:
+Kafka uses producer [`CreateTime`](/drivers/kafka#kafka-retry-timing) by default. For broker-clock wait, configure each destination whose broker append time matters with [`LogAppendTime`](/drivers/kafka#kafka-retry-timing):
 
 ```text
 message.timestamp.type=LogAppendTime
 ```
 
-`LogAppendTime` makes the Kafka adapter report the broker append timestamp as
-the enqueue source. Apply the topic setting to every destination whose broker
-clock you want to measure.
+For RabbitMQ, enable overwrite on the incoming [`set_header_timestamp` interceptor](/drivers/rabbitmq):
 
-## RabbitMQ operator setting
+```text
+message_interceptors.incoming.set_header_timestamp.overwrite = true
+```
 
-Set `broker.rabbitmq.trustBrokerTimestamp` to `true` only when the RabbitMQ
-`set_header_timestamp` incoming interceptor is configured with
-`message_interceptors.incoming.set_header_timestamp.overwrite = true`.
-Without overwrite mode, `timestamp_in_ms` is publisher-controlled and is not a
-trusted broker timestamp. The default is `false`.
+RabbitMQ requires an incoming `set_header_timestamp` interceptor with overwrite enabled before `broker.rabbitmq.trustBrokerTimestamp: true` is useful. Without overwrite mode, `timestamp_in_ms` is publisher-controlled and is not a trusted broker timestamp.
 
-RabbitMQ resolves enqueue time in this order:
+RabbitMQ resolves enqueue time from a trusted `timestamp_in_ms`, then `cloudEvents:time`, then the AMQP timestamp property, and finally `unknown`. Its backlog count is `Lag`. Quorum queues have no trusted head time for oldest-age reporting.
 
-1. A trusted `timestamp_in_ms` header, marked `broker`.
-2. The `cloudEvents:time` header, marked `producer`.
-3. The AMQP timestamp property, with whole-second precision, marked `producer`.
-4. No timestamp, marked `unknown`.
+## Configure tracing
 
-RabbitMQ's backlog count is the same value as `Lag`. The head time comes from
-the management API for classic queues only. The default quorum queue type has
-an unknown head time. A management head timestamp is always marked
-`producer`, so RabbitMQ does not report the oldest-age metric.
-
-## OpenTelemetry tracing
-
-Configure an application-owned tracer provider and propagator when creating the
-`f1otel` observer:
+Configure an application-owned tracer provider and propagator when creating the observer.
 
 ```go
 import (
-    "context"
+	"context"
 
-    f1 "fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk"
-    "fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/f1otel"
-    "go.opentelemetry.io/otel/propagation"
-    sdktrace "go.opentelemetry.io/otel/sdk/trace"
+	f1 "fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk"
+	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/f1otel"
+	"go.opentelemetry.io/otel/propagation"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 )
 
 tracerProvider := sdktrace.NewTracerProvider()
 observer, err := f1otel.New(
-    f1otel.WithTracerProvider(tracerProvider),
-    f1otel.WithPropagator(propagation.TraceContext{}),
+	f1otel.WithTracerProvider(tracerProvider),
+	f1otel.WithPropagator(propagation.TraceContext{}),
 )
 if err != nil {
-    return err
+	return err
 }
 
 client, err := f1.New(
-    context.Background(),
-    cfg,
-    f1.WithDriver(driver),
-    f1.WithObserver(observer),
+	context.Background(),
+	cfg,
+	f1.WithDriver(driver),
+	f1.WithObserver(observer),
 )
 ```
 
-The five span stages are:
+A primary `send <topic>` span is named with the topic when the publish is uniform, and `send` for a mixed-topic batch. `create <topic>` is its child. `process <topic>` is a consumer root linked to the inbound context. `settle` is parented by the acknowledgement or release context. Retry and dead-letter sends use the topic known at their start.
 
-| Span | Kind | Parent or link | Starts and ends |
-| --- | --- | --- | --- |
-| `send <topic>` or `send` | producer | Parent is the caller context for a primary publish | Starts after publish admission; ends after the producer result |
-| `create <topic>` | producer | Child of the primary `send` span | Starts after message identity is known; ends after envelope headers are encoded |
-| `process <topic>` | consumer | New root with a link to the inbound trace context | Starts before the handler; ends after the handler outcome |
-| `settle` | client | Parent is the context used for Ack or Nack | Starts before the broker settlement call; ends after it returns |
-| `send <topic>` or `send` for retry/DLQ | producer | New root with a link to the incoming process context | Starts before the successor publish; ends after it is confirmed or fails |
+## Go further
 
-A primary send span is named `send <topic>` when its publish finishes with a uniform topic; it
-remains `send` for a mixed-topic batch. Retry and dead-letter sends use the topic known at their
-start.
-Span timestamps come from the observer events, not the wall clock at export.
-The process span is a new root linked to the inbound context, and the context
-returned by `Start` reaches the handler, so handler spans are its children.
-Retry and dead-letter sends are new roots linked to the incoming process
-context. `WithCreateSpans(false)` removes the `create` span; the default is to
-create it.
-
-`InjectTrace` writes `traceparent` and `tracestate` only when a propagator was
-configured with `WithPropagator`. It never reads the OpenTelemetry global
-propagator. Spans carry `f1.priority`, `f1.attempt`, `f1.route`, and
-`f1.destination`; metrics carry only `f1.priority` among these F1 attributes.
+- [Alerts](/advanced-topics/alerts) - PromQL starting points and triage;
+- [Running in production](/advanced-topics/running-in-production) - provider shutdown and readiness;
+- [Observer](/basics/observer) - event and callback contracts; and
+- [Observer events](/development/observer-events) - the complete event vocabulary.

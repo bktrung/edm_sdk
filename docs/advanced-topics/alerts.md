@@ -1,17 +1,32 @@
 # Alerts
 
-This runbook uses the OpenTelemetry-to-Prometheus naming rule: dots become
-underscores, instrument units add suffixes such as `_seconds`, and counters
-add `_total`. The PromQL below is a starting point. Tune windows, labels, and
-thresholds to the traffic and service-level objectives of each deployment.
+F1 alert queries use names produced by the configured OpenTelemetry Prometheus exporter. That exporter normally changes dots to underscores, appends unit suffixes such as `_seconds`, and adds `_total` to counters. The thresholds here are starting points, not SDK guarantees.
+
+## Triage every alert first
+
+Use the same first pass for every signal:
+
+1. Confirm `messaging_system`, destination, consumer group, priority, error, and reason labels identify the intended series.
+2. Compare the signal with receive, process, retry, dead-letter, backlog, and broker health signals for the same group.
+3. Check the handler, its dependencies, broker assignment, and recent configuration changes before changing a threshold.
+
+```mermaid
+flowchart TB
+    S[alert signal] --> L[drill labels]
+    L --> D{where?}
+    D --> H[handler checks]
+    D --> X[dependency checks]
+    D --> B[broker checks]
+    H --> R[choose response]
+    X --> R
+    B --> R
+```
+
+Each query is a starting point. Tune its window, labels, and threshold to the deployment's traffic and service-level objective.
 
 ## Dead letters appearing
 
-**What it means:** A non-zero rate means F1 confirmed a dead-letter publication
-or routing. Grouping shows which bounded error class and death reason produced
-it.
-
-**PromQL:**
+A non-zero rate means F1 confirmed a dead-letter publication or routing. Group by error class and death reason to identify the failing path.
 
 ```text
 sum by (messaging_system, messaging_destination_name, messaging_consumer_group_name, f1_priority, error_type, reason) (
@@ -19,24 +34,13 @@ sum by (messaging_system, messaging_destination_name, messaging_consumer_group_n
 ) > 0
 ```
 
-**Starting threshold:** Start with any rate above zero over a 5-minute window;
-add an alert hold if isolated dead letters are normal for the service.
+Start with any rate above zero over five minutes, then add a hold duration (`for`) so the condition must remain true before firing when isolated dead letters are normal.
 
-**First three things to check:**
+Check the matching handler, decode, and poison-message errors. Then inspect the dead-letter destination and error handler for publication or notification failures.
 
-1. Group the result by `error_type`, `reason`, destination, and consumer group.
-2. Check handler, decode, and poison-message logs for the matching class.
-3. Check the dead-letter destination and the error handler for publication or
-   notification failures.
+## Retry rate high relative to consumption
 
-## Retry rate high relative to consumed messages
-
-**What it means:** Retries are consuming a material share of deliveries rather
-than being occasional recovery. The ratio is grouped by messaging system and
-consumer group because delivery-receipt metrics can lack topic and priority;
-use the retry labels for destination and priority drilldown.
-
-**PromQL:**
+A high retry ratio means recovery work consumes a material share of deliveries. Group the ratio by messaging system and consumer group; use retry labels for destination and priority drilldown.
 
 ```text
 (
@@ -53,24 +57,13 @@ use the retry labels for destination and priority drilldown.
 ) > 0.1
 ```
 
-**Starting threshold:** Start at 10% retries per consumed message over 5
-minutes. Raise or lower it after observing the normal retry mix.
+Start at 10 percent retries per consumed message over five minutes. Tune it after observing the normal retry mix.
 
-**First three things to check:**
-
-1. Break retries down by `error_type` and inspect the retry ladder and attempt
-   limits.
-2. Confirm consumed traffic is present and that the query filters the intended
-   consumer group; use retry labels for destination and priority drilldown.
-3. Check handler errors, broker redeliveries, and dependency health for the
-   dominant failure class.
+Break retries down by error type, confirm the query targets the intended group, and check handler errors, broker redeliveries, and dependency health.
 
 ## Backlog growing
 
-**What it means:** The backlog is increasing over 15 minutes and is above a
-small floor, which avoids paging on a few transient messages.
-
-**PromQL:**
+A growing backlog is a positive 15-minute derivative above a small floor, which avoids paging on a few transient messages.
 
 ```text
 deriv(f1_messaging_backlog_messages[15m]) > 0
@@ -78,45 +71,21 @@ and
 f1_messaging_backlog_messages > 10
 ```
 
-**Starting threshold:** Start with a floor of 10 messages and the positive
-15-minute derivative; choose a floor that reflects the service's normal burst
-size.
-
-**First three things to check:**
-
-1. Check consumer membership, assigned work, concurrency, and paused
-   destinations.
-2. Check handler latency and retry or dead-letter rates for the same series.
-3. Check broker queue or partition lag and whether producers exceed consumer
-   capacity.
+Start with a floor of 10 messages. Check membership, assigned work, concurrency, paused destinations, handler latency, retry or dead-letter rates, and broker lag.
 
 ## Oldest message age
 
-**What it means:** A Kafka backlog has an old broker append timestamp. This
-signal is meaningful only for Kafka destinations configured with
-`message.timestamp.type=LogAppendTime`; RabbitMQ does not report this metric.
-
-**PromQL:**
+The oldest-age signal is meaningful when a broker supplies a trusted head timestamp. For Kafka, configure `message.timestamp.type=LogAppendTime`; RabbitMQ does not report this metric for its default quorum queue type.
 
 ```text
 f1_messaging_backlog_oldest_age_seconds{messaging_system="f1.kafka"} > 300
 ```
 
-**Starting threshold:** Start at 5 minutes and tune it to the destination's
-latency objective. Keep this alert scoped to Kafka topics using `LogAppendTime`.
+Start at five minutes and tune it to the destination latency objective. Verify the Kafka timestamp setting, then check backlog by destination and group, partition assignment, consumer health, and handler latency.
 
-**First three things to check:**
+## Handler latency near its timeout
 
-1. Verify the affected Kafka topics use `message.timestamp.type=LogAppendTime`.
-2. Check backlog by destination, consumer group, and priority.
-3. Check partition assignment, consumer health, and handler latency.
-
-## Handler latency near `handlerTimeout`
-
-**What it means:** The p99 process duration is approaching the configured
-handler timeout, leaving little room for settlement and broker liveness work.
-
-**PromQL:**
+A p99 process duration near `handlerTimeout` leaves little room for [the final ack or nack](/learn/glossary#settlement) and the broker's check that the consumer is still alive.
 
 ```text
 histogram_quantile(
@@ -127,23 +96,11 @@ histogram_quantile(
 ) > 24
 ```
 
-**Starting threshold:** Start at 80% of the configured `handlerTimeout`. The
-query uses 24 seconds as an example for a 30-second timeout; replace it with
-the value for the deployment.
-
-**First three things to check:**
-
-1. Compare p99 with the actual `handlerTimeout` and the broker consumer timeout
-   where one is configured.
-2. Split process observations by `error_type` and inspect the slow handler path.
-3. Check downstream dependencies, broker wait, CPU, and concurrency saturation.
+The query uses 24 seconds as an example for a 30-second timeout. Replace it with 80 percent of the deployment's configured `handlerTimeout`. Compare p99 with that timeout and any broker consumer timeout, then inspect slow handlers and downstream dependencies.
 
 ## Broker wait high
 
-**What it means:** The p99 time from a broker enqueue timestamp to delivery is
-high. The metric exists only when F1 has a trusted broker enqueue timestamp.
-
-**PromQL:**
+Broker wait measures time from a trusted broker enqueue timestamp to delivery. It exists only when F1 has that timestamp.
 
 ```text
 histogram_quantile(
@@ -154,24 +111,11 @@ histogram_quantile(
 ) > 1
 ```
 
-**Starting threshold:** Start at 1 second over a 5-minute window, then set the
-value from normal broker and network latency.
-
-**First three things to check:**
-
-1. Verify the timestamp source: Kafka needs `LogAppendTime`; RabbitMQ needs a
-   trusted `timestamp_in_ms` configuration.
-2. Check broker queue or partition lag, fetch capacity, and consumer
-   assignment.
-3. Check broker health, network latency, and connection or channel errors.
+Start at one second over five minutes. Verify Kafka `LogAppendTime` or RabbitMQ's trusted `timestamp_in_ms` configuration, then inspect broker lag, fetch capacity, assignment, broker health, and network latency.
 
 ## No consumption while backlog is positive
 
-**What it means:** F1 sees backlog but no received-message rate for the same
-messaging system and consumer group. The backlog is aggregated across
-destinations and priorities because delivery-receipt metrics can omit them.
-
-**PromQL:**
+This signal means F1 sees backlog but no received-message rate for the same messaging system and consumer group.
 
 ```text
 (
@@ -195,18 +139,12 @@ and on (messaging_system, messaging_consumer_group_name)
 )
 ```
 
-**Starting threshold:** Start after 5 minutes of zero consumption while the
-backlog remains above zero.
+Start after five minutes of zero consumption while backlog remains positive. Check process health, group membership, assignment, connection errors, broker permissions, paused destinations, and the configured error handler.
 
-**First three things to check:**
+F1 does not emit a metric for connection lost or connection restored. Use the error handler and logs for those signals instead of adding an alert for a nonexistent series.
 
-1. Check consumer process health, group membership, assignment, and connection
-   errors.
-2. Check the broker backlog and whether the destination is paused or blocked by
-   topology or permissions.
-3. Check the configured error handler and logs for connection or consumer
-   failures.
+## Go further
 
-F1 does not emit a metric for connection lost or connection restored. Use the
-error handler and logs for those signals instead of adding an alert for a
-nonexistent series.
+- [Observability](/advanced-topics/observability) - metric names, attributes, and timestamp sources;
+- [Running in production](/advanced-topics/running-in-production) - readiness and shutdown; and
+- [Failure handling](/advanced-topics/failure-handling) - retry and dead-letter outcomes.

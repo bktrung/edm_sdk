@@ -2,7 +2,7 @@
 
 ## Public API
 
-The public compatibility surface consists of the exported API in these packages:
+F1's compatibility promise covers the exported API in these packages:
 
 - `f1`
 - `driver`
@@ -17,6 +17,9 @@ The driver-specific configuration keys are also public compatibility surface:
 - `drivers/rabbitmq`: `broker.rabbitmq.vhost`, `broker.rabbitmq.queueType`, `broker.rabbitmq.consumerTimeout`, `broker.rabbitmq.brokerPrefetch`, `broker.rabbitmq.managementPort`, and `broker.rabbitmq.trustBrokerTimestamp`.
 
 Everything under `internal/` is private implementation detail and is not covered by this promise.
+
+`driver/conformance`, the driver contract suite, is experimental. Its API may change in any release,
+including a patch release, and it is not covered by this promise.
 
 ## v0.x promise
 
@@ -35,7 +38,15 @@ draft-API decision.
 
 ## Enforcement
 
-The committed public API fixtures record the exported symbols that must remain intentional. The
-`check-api-surface` and `check-api-diff` Makefile targets enforce those fixtures and the recorded API
-diff policy. See [API and repository boundary checks](./testing.md#api-and-repository-boundary-checks) for
+The `check-api-surface` target and the per-package
+`check-api-surface-codec`, `check-api-surface-driver`,
+`check-api-surface-f1test`, and `check-api-surface-f1otel` targets compare
+exported symbols with committed surface fixtures. The `check-api-diff` target
+compares `f1`, `driver`, `codec`, and `f1otel` with recorded API-diff baselines;
+`f1test` is not included. See [API and repository boundary checks](./testing.md#api-and-repository-boundary-checks) for
 the commands and their failure rules.
+
+## Go further
+
+- [Testing strategy](/development/testing) - repository gates and their failure rules;
+- [Observer](/basics/observer) - the draft observer contract and event model.

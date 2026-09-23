@@ -1,0 +1,824 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>f1 SDK - Broker Retry Wait Simulator</title>
+  <style>
+    :root {
+      --bg-canvas: #09090b;
+      --bg-surface: #111115;
+      --bg-surface-glass: rgba(17, 17, 21, 0.75);
+      --border-subtle: #222228;
+      --border-hairline: rgba(255, 255, 255, 0.08);
+      --text-primary: #f4f4f6;
+      --text-secondary: #9090a0;
+      --text-muted: #555562;
+
+      --color-high: #38bdf8;
+      --color-medium: #818cf8;
+      --color-low: #94a3b8;
+      --color-promo: #f59e0b;
+      --color-worker: #10b981;
+      --color-break: #f43f5e;
+
+      --font-sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Geist", "Inter", sans-serif;
+      --font-mono: "Geist Mono", "JetBrains Mono", "SF Mono", Menlo, monospace;
+    }
+
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      background-color: var(--bg-canvas);
+      color: var(--text-primary);
+      font-family: var(--font-sans);
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+      overflow-x: hidden;
+      background-image: radial-gradient(var(--border-subtle) 1px, transparent 1px);
+      background-size: 28px 28px;
+    }
+
+    header {
+      padding: 16px 36px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 16px;
+      flex-wrap: wrap;
+      border-bottom: 1px solid var(--border-hairline);
+      background: rgba(9, 9, 11, 0.85);
+      backdrop-filter: blur(12px);
+      position: sticky;
+      top: 0;
+      z-index: 100;
+    }
+
+    .brand { display: flex; align-items: center; gap: 12px; }
+
+    .brand-logo {
+      width: 24px;
+      height: 24px;
+      border-radius: 6px;
+      background: linear-gradient(135deg, #38bdf8, #818cf8);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-family: var(--font-mono);
+      font-size: 11px;
+      font-weight: 700;
+      color: #000;
+    }
+
+    .brand-title { font-size: 13px; font-weight: 500; letter-spacing: -0.01em; }
+    .brand-sub { color: var(--text-muted); font-size: 12px; margin-left: 6px; font-family: var(--font-mono); }
+
+    .controls-pill {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      background: var(--bg-surface-glass);
+      border: 1px solid var(--border-hairline);
+      border-radius: 9999px;
+      padding: 4px 10px;
+      box-shadow: 0 8px 32px rgba(0, 0, 0, 0.4);
+    }
+
+    .btn-pill {
+      background: transparent;
+      border: none;
+      color: var(--text-secondary);
+      padding: 6px 12px;
+      font-size: 12px;
+      font-family: var(--font-sans);
+      font-weight: 500;
+      border-radius: 9999px;
+      cursor: pointer;
+      transition: all 0.15s ease;
+    }
+
+    .btn-pill:hover { color: var(--text-primary); background: rgba(255, 255, 255, 0.05); }
+    .btn-pill.active { color: var(--text-primary); background: rgba(255, 255, 255, 0.1); }
+
+    .divider { width: 1px; height: 14px; background: var(--border-hairline); }
+
+    .clock-tag { font-family: var(--font-mono); font-size: 11px; color: var(--text-secondary); padding: 0 6px; }
+
+    main {
+      flex: 1;
+      padding: 24px 36px 40px;
+      max-width: 1400px;
+      margin: 0 auto;
+      width: 100%;
+      display: flex;
+      flex-direction: column;
+      gap: 24px;
+    }
+
+    .scenarios-bar {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 16px;
+      flex-wrap: wrap;
+      padding: 4px 8px;
+    }
+
+    .tab-row { display: flex; gap: 12px; flex-wrap: wrap; }
+
+    .scenario-tabs {
+      display: flex;
+      gap: 6px;
+      background: rgba(17, 17, 21, 0.6);
+      border: 1px solid var(--border-hairline);
+      padding: 3px;
+      border-radius: 8px;
+    }
+
+    .scenario-tab {
+      background: transparent;
+      border: none;
+      color: var(--text-muted);
+      font-size: 12px;
+      font-family: var(--font-sans);
+      font-weight: 500;
+      padding: 6px 14px;
+      border-radius: 6px;
+      cursor: pointer;
+      transition: all 0.15s ease;
+    }
+
+    .scenario-tab:hover { color: var(--text-secondary); }
+    .scenario-tab.active { color: var(--text-primary); background: #1e1e24; box-shadow: 0 2px 8px rgba(0, 0, 0, 0.3); }
+
+    .scenario-desc { font-size: 12px; color: var(--text-muted); font-family: var(--font-mono); max-width: 620px; line-height: 1.5; }
+
+    .stage-container {
+      position: relative;
+      background: var(--bg-surface);
+      border: 1px solid var(--border-hairline);
+      border-radius: 16px;
+      overflow: hidden;
+      box-shadow: 0 16px 48px rgba(0, 0, 0, 0.6);
+    }
+
+    svg.runtime-svg { width: 100%; height: auto; display: block; }
+    svg text { user-select: none; }
+    svg text:not([fill]) { fill: var(--text-primary); }
+
+    .wire-path { fill: none; stroke: var(--border-subtle); stroke-width: 1.5; }
+
+    .box {
+      fill: #141419;
+      stroke: var(--border-hairline);
+      stroke-width: 1;
+    }
+
+    .tray { fill: #0d0d12; stroke: var(--border-hairline); }
+
+    .worker-slot { fill: #141419; stroke: var(--border-hairline); stroke-width: 1; transition: all 0.2s ease; }
+    .worker-slot.busy { stroke: var(--color-worker); fill: rgba(16, 185, 129, 0.05); }
+
+    .hud-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 16px; }
+
+    @media (max-width: 900px) {
+      .hud-grid { grid-template-columns: repeat(2, 1fr); }
+      header, main { padding-left: 16px; padding-right: 16px; }
+    }
+
+    .hud-card {
+      background: var(--bg-surface);
+      border: 1px solid var(--border-hairline);
+      border-radius: 12px;
+      padding: 16px;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      text-align: center;
+      gap: 6px;
+    }
+
+    .hud-label { font-size: 11px; font-family: var(--font-mono); text-transform: uppercase; letter-spacing: 0.05em; color: var(--text-muted); }
+    .hud-value { font-size: 18px; font-family: var(--font-mono); font-weight: 600; }
+    .hud-sub { font-size: 11px; color: var(--text-secondary); line-height: 1.4; }
+
+    .gauge-bar { width: 100%; height: 3px; background: var(--border-subtle); border-radius: 2px; margin-top: 6px; overflow: hidden; }
+    .gauge-fill { height: 100%; background: var(--color-high); transition: width 0.2s ease; }
+
+    #tooltip {
+      position: absolute;
+      background: rgba(17, 17, 21, 0.92);
+      border: 1px solid rgba(255, 255, 255, 0.12);
+      backdrop-filter: blur(12px);
+      padding: 10px 14px;
+      border-radius: 8px;
+      font-size: 12px;
+      font-family: var(--font-mono);
+      pointer-events: none;
+      opacity: 0;
+      transform: translateY(4px);
+      transition: opacity 0.15s ease, transform 0.15s ease;
+      box-shadow: 0 8px 24px rgba(0, 0, 0, 0.5);
+      z-index: 200;
+      max-width: 280px;
+    }
+
+    #tooltip.visible { opacity: 1; transform: translateY(0); }
+
+    @media (max-width: 700px) {
+      .controls-pill, .scenario-tabs { flex-wrap: wrap; border-radius: 12px; }
+      .brand-sub { display: none; }
+      .stage-container { overflow-x: auto; }
+      svg.runtime-svg { min-width: 720px; }
+    }
+
+  </style>
+</head>
+<body>
+
+  <header>
+    <div class="brand">
+      <div class="brand-logo">f1</div>
+      <div class="brand-title">event-driven-messaging-sdk</div>
+      <div class="brand-sub">/ drivers / RabbitMQ Retry Parking &amp; Kafka Head-Hold Simulator</div>
+    </div>
+
+    <div class="controls-pill">
+      <button class="btn-pill" id="btn-play-pause"><span id="play-text">Pause</span></button>
+      <button class="btn-pill" id="btn-step">Step</button>
+      <div class="divider"></div>
+      <button class="btn-pill speed-btn" data-speed="0.5">0.5x</button>
+      <button class="btn-pill speed-btn active" data-speed="1.0">1.0x</button>
+      <button class="btn-pill speed-btn" data-speed="2.0">2.0x</button>
+      <button class="btn-pill speed-btn" data-speed="4.0">4.0x</button>
+      <button class="btn-pill speed-btn" data-speed="8.0">8.0x</button>
+      <button class="btn-pill speed-btn" data-speed="16.0">16x</button>
+      <div class="divider"></div>
+      <span class="clock-tag" id="clock-display">T = 00:00.00</span>
+    </div>
+  </header>
+
+  <main>
+    <div class="scenarios-bar">
+      <div class="scenario-tabs">
+        <button class="scenario-tab active" data-scenario="tiers">RabbitMQ: Retry Tiers</button>
+        <button class="scenario-tab" data-scenario="any">Generic Ladder: Any Delay</button>
+        <button class="scenario-tab" data-scenario="above">Generic Ladder: Above 64s</button>
+        <button class="scenario-tab" data-scenario="single">One Shared Queue (hypothetical)</button>
+        <button class="scenario-tab" data-scenario="kafka">Kafka: Head-Hold</button>
+      </div>
+      <div class="scenario-desc" id="scenario-desc"></div>
+    </div>
+
+    <div class="stage-container" id="stage-box">
+      <svg class="runtime-svg" id="svg-canvas" viewBox="0 0 1200 480">
+        <defs>
+          <filter id="glow" x="-50%" y="-50%" width="200%" height="200%">
+            <feGaussianBlur in="SourceGraphic" stdDeviation="2.5" result="blur" />
+            <feMerge><feMergeNode in="blur" /><feMergeNode in="SourceGraphic" /></feMerge>
+          </filter>
+        </defs>
+        <g id="headers-layer" fill="var(--text-secondary)" opacity="0.85" font-family="var(--font-mono)" font-size="10" font-weight="600" letter-spacing="0.08em" text-anchor="middle"></g>
+        <g id="wires-layer"></g>
+        <g id="stage-layer"></g>
+        <g id="particles-layer"></g>
+      </svg>
+    </div>
+
+    <div class="hud-grid">
+      <div class="hud-card">
+        <span class="hud-label" id="hud1-label">Last Routing</span>
+        <div class="hud-value" id="hud1">-</div>
+        <div class="hud-sub" id="hud1-sub"></div>
+        <div class="gauge-bar"><div class="gauge-fill" style="width: 100%;"></div></div>
+      </div>
+      <div class="hud-card">
+        <span class="hud-label" id="hud2-label">Released Early</span>
+        <div class="hud-value" id="hud2">0</div>
+        <div class="hud-sub" id="hud2-sub"></div>
+        <div class="gauge-bar"><div class="gauge-fill" id="gauge2" style="width: 0%; background: var(--color-worker);"></div></div>
+      </div>
+      <div class="hud-card">
+        <span class="hud-label" id="hud3-label">Max Lateness</span>
+        <div class="hud-value" id="hud3">0s</div>
+        <div class="hud-sub" id="hud3-sub"></div>
+        <div class="gauge-bar"><div class="gauge-fill" id="gauge3" style="width: 0%; background: var(--color-promo);"></div></div>
+      </div>
+      <div class="hud-card">
+        <span class="hud-label" id="hud4-label">Blocked Behind Head</span>
+        <div class="hud-value" id="hud4">0</div>
+        <div class="hud-sub" id="hud4-sub"></div>
+        <div class="gauge-bar"><div class="gauge-fill" id="gauge4" style="width: 0%; background: var(--color-break);"></div></div>
+      </div>
+    </div>
+  </main>
+
+  <div id="tooltip"></div>
+
+  <script>
+    // =========================================================================
+    // 1. DETERMINISTIC VIRTUAL CLOCK
+    // =========================================================================
+    class VirtualClock {
+      constructor() { this.currentMs = 0; }
+      now() { return this.currentMs; }
+      advance(ms) { this.currentMs += ms; }
+      format() {
+        const totalSec = Math.floor(this.currentMs / 1000);
+        const mins = Math.floor(totalSec / 60).toString().padStart(2, "0");
+        const secs = (totalSec % 60).toString().padStart(2, "0");
+        const frac = Math.floor((this.currentMs % 1000) / 10).toString().padStart(2, "0");
+        return `T = ${mins}:${secs}.${frac}`;
+      }
+    }
+
+    // =========================================================================
+    // 2. F1 RABBITMQ PARKING (1:1 PORT OF drivers/rabbitmq parkRung AND
+    //    producer.target) AND KAFKA ADMISSION (drivers/kafka/deferral.go)
+    // =========================================================================
+    const parkRungs = [500, 1000, 2000, 4000, 8000, 16000, 32000, 64000];
+
+    // parkRung rounds a remaining delay up to the rung that holds it, or
+    // returns zero when the delay is above the ladder.
+    function parkRung(delay) {
+      for (const rung of parkRungs) {
+        if (delay <= rung) return rung;
+      }
+      return 0;
+    }
+
+    function parseTtl(name) {
+      const fixed = name.match(/^park\.fixed-(\d+)ms$/);
+      if (fixed) return +fixed[1];
+      return parkRungs.find(r => `park.${fmt(r)}` === name) || 0;
+    }
+
+    function expirationMillis(remaining) {
+      return Math.max(1, Math.ceil(remaining));
+    }
+
+    function fixedParkQueueName(delay) {
+      return `park.fixed-${Math.ceil(delay)}ms`;
+    }
+
+    // target: a retry tier is a fixed-delay destination, so a remaining delay
+    // within the tier delay parks in the tier's one fixed queue. A generic
+    // deferred destination rounds up to a rung. Either way the queue's own
+    // x-message-ttl does the delaying and the message carries no expiration;
+    // otherwise the per-message parking queue takes an expiration.
+    function target(remaining, mode, fixedDelay) {
+      if (remaining <= 0) return { queue: "destination" };
+      if (mode === "fixed" && remaining <= fixedDelay) {
+        return { queue: fixedParkQueueName(fixedDelay), ttl: fixedDelay };
+      }
+      if (mode === "ladder") {
+        const rung = parkRung(remaining);
+        if (rung > 0) return { queue: `park.${fmt(rung)}`, ttl: rung };
+      }
+      return { queue: "park", expiration: expirationMillis(remaining) };
+    }
+
+    // Kafka: the record's stored timestamp is milliseconds, so the earliest
+    // instant consistent with it is the next millisecond boundary.
+    const kafkaTimestampPrecision = 1;
+    function dueTime(record, delay) {
+      if (delay <= 0) return null;
+      return Math.floor(record.timestamp / kafkaTimestampPrecision) * kafkaTimestampPrecision + kafkaTimestampPrecision + delay;
+    }
+
+    // =========================================================================
+    // 3. SCENARIOS
+    // =========================================================================
+    const scenarios = {
+      tiers: {
+        kind: "rabbit", mode: "fixed", tiers: [1000, 5000, 25000],
+        desc: "What retries use. Each tier (defaults 1s, 5s, 25s) is a fixed-delay destination with one parking queue whose TTL is the tier delay. Copies leave in order and on time.",
+        delays: () => [1000, 5000, 25000][Math.floor(Math.random() * 3)], rate: 1.2,
+      },
+      any: {
+        kind: "rabbit", mode: "ladder",
+        desc: "Not used by retries: a destination with a delay but no fixed delay. Any remaining delay up to 64s is rounded up to the smallest rung at least as large. One TTL per rung makes expiry order FIFO order.",
+        delays: () => 200 + Math.random() * 63000, rate: 1.4,
+      },
+      above: {
+        kind: "rabbit", mode: "ladder",
+        desc: "Not used by retries: on the generic ladder, above the top rung there is no rung, so the copy takes the per-message path with an expiration. Only those copies can wait behind a later head.",
+        delays: () => (Math.random() < 0.5 ? 65000 + Math.random() * 85000 : 500 + Math.random() * 20000), rate: 0.3,
+      },
+      single: {
+        kind: "rabbit", mode: "single",
+        desc: "Hypothetical: all tiers share one queue with per-message expirations. RabbitMQ expires only the head, so a 1s copy waits behind a 25s one. Per-tier queues avoid this.",
+        delays: () => [1000, 5000, 25000][Math.floor(Math.random() * 3)], rate: 0.8,
+      },
+      kafka: {
+        kind: "kafka",
+        desc: "A Kafka retry topic has one delay. A partition whose head is not yet due is paused with reason head-hold; other partitions keep delivering.",
+        delay: 5000, partitions: 3, rate: 1.1,
+      },
+    };
+
+    // =========================================================================
+    // 4. ORCHESTRATOR
+    // =========================================================================
+    const clock = new VirtualClock();
+    const COLORS = ["#38bdf8", "#818cf8", "#34d399", "#f472b6", "#a3e635", "#fb923c"];
+    let QUEUE_NAMES = [];
+    function queueNamesFor(cfg) {
+      if (cfg.mode === "fixed") return [...cfg.tiers.map(fixedParkQueueName), "park"];
+      if (cfg.mode === "ladder") return [...parkRungs.map(r => `park.${fmt(r)}`), "park"];
+      return ["park"];
+    }
+    let currentScenario = "tiers";
+    let queues = {};
+    let released = [];
+    let partitions = [];
+    let handlers = [];
+    let lastRoute = null;
+    let early = 0;
+    let maxLate = 0;
+    let particles = [];
+    let nextId = 1;
+    let isPlaying = true;
+    let speedFactor = 1.0;
+
+    function fmt(ms) {
+      if (ms < 1000) return `${Math.round(ms)}ms`;
+      return `${+(ms / 1000).toFixed(ms % 1000 === 0 ? 0 : 1)}s`;
+    }
+
+    function setScenario(sc) {
+      currentScenario = sc;
+      document.querySelectorAll(".scenario-tab").forEach(t => t.classList.toggle("active", t.dataset.scenario === sc));
+      document.getElementById("scenario-desc").textContent = scenarios[sc].desc;
+      QUEUE_NAMES = scenarios[sc].kind === "rabbit" ? queueNamesFor(scenarios[sc]) : [];
+      queues = Object.fromEntries(QUEUE_NAMES.map(n => [n, []]));
+      released = [];
+      lastRoute = null;
+      early = 0;
+      maxLate = 0;
+      particles = [];
+      const cfg = scenarios[sc];
+      partitions = cfg.kind === "kafka" ? Array.from({ length: cfg.partitions }, (_, id) => ({ id, log: [], cursor: 0, heldUntil: null, outstanding: null })) : [];
+      handlers = [];
+      buildLayout();
+    }
+
+    function publishRabbit() {
+      const cfg = scenarios[currentScenario];
+      const delay = cfg.delays();
+      const id = nextId++;
+      const msg = { id: `r${id}`, color: COLORS[id % COLORS.length], publishedAt: clock.now(), due: clock.now() + delay, delay };
+      // A retry copy is published right away, so its remaining delay is its tier delay.
+      const t = target(delay, cfg.mode, delay);
+      lastRoute = { ...t, msg, remaining: delay };
+      msg.queue = t.queue;
+      msg.expiresAt = clock.now() + (t.ttl || t.expiration);
+      queues[t.queue].push(msg);
+      particles.push({ type: "park", queue: t.queue, progress: 0, color: msg.color });
+    }
+
+    function stepRabbit() {
+      for (const name of QUEUE_NAMES) {
+        const q = queues[name];
+        // Only the head can expire. On a rung the TTL is shared, so the head
+        // is always the first to expire; on the per-message queue it is not.
+        while (q.length > 0 && q[0].expiresAt <= clock.now()) {
+          const msg = q.shift();
+          const late = clock.now() - msg.due;
+          if (late < -1) early++;
+          maxLate = Math.max(maxLate, late);
+          released.push({ ...msg, releasedAt: clock.now(), late });
+          if (released.length > 14) released.shift();
+          particles.push({ type: "release", queue: name, progress: 0, color: msg.color });
+        }
+      }
+    }
+
+    function publishKafka() {
+      const cfg = scenarios[currentScenario];
+      const id = nextId++;
+      const p = partitions[Math.floor(Math.random() * partitions.length)];
+      // A producer CreateTime is written in whole milliseconds.
+      const timestamp = Math.floor(clock.now());
+      p.log.push({ id: `k${id}`, offset: p.log.length, color: COLORS[id % COLORS.length], timestamp, publishedAt: clock.now() });
+      particles.push({ type: "append", partition: p.id, progress: 0, color: COLORS[id % COLORS.length] });
+    }
+
+    function stepKafka() {
+      const cfg = scenarios[currentScenario];
+      for (const p of partitions) {
+        if (p.outstanding) {
+          p.outstanding.remaining -= lastDelta;
+          if (p.outstanding.remaining <= 0) {
+            p.cursor++;
+            p.outstanding = null;
+          }
+          continue;
+        }
+        const head = p.log[p.cursor];
+        if (!head) { p.heldUntil = null; continue; }
+        // admissionLocked: a head not yet due holds the partition.
+        const due = dueTime(head, cfg.delay);
+        if (due !== null && due > clock.now()) {
+          p.heldUntil = due;
+          continue;
+        }
+        p.heldUntil = null;
+        const late = clock.now() - due;
+        if (clock.now() < head.publishedAt + cfg.delay) early++;
+        maxLate = Math.max(maxLate, late);
+        p.outstanding = { record: head, remaining: 600 + Math.random() * 500 };
+        released.push({ ...head, releasedAt: clock.now(), late, partition: p.id });
+        if (released.length > 14) released.shift();
+        particles.push({ type: "deliver", partition: p.id, progress: 0, color: head.color });
+      }
+    }
+
+    let lastDelta = 0;
+    function simulationStep(deltaMs) {
+      lastDelta = deltaMs;
+      clock.advance(deltaMs);
+      const cfg = scenarios[currentScenario];
+      if (Math.random() < cfg.rate * (deltaMs / 1000)) {
+        if (cfg.kind === "kafka") publishKafka(); else publishRabbit();
+      }
+      if (cfg.kind === "kafka") stepKafka(); else stepRabbit();
+      for (let i = particles.length - 1; i >= 0; i--) {
+        particles[i].progress += 0.035 * (deltaMs / 16.67) / Math.max(1, speedFactor / 2);
+        if (particles[i].progress >= 1) particles.splice(i, 1);
+      }
+    }
+
+    // =========================================================================
+    // 5. RENDERER
+    // =========================================================================
+    const svgNS = "http://www.w3.org/2000/svg";
+    const tooltip = document.getElementById("tooltip");
+    const stageBox = document.getElementById("stage-box");
+    let rowY = {};
+    let wires = {};
+
+    function el(tag, attrs, parent, text) {
+      const node = document.createElementNS(svgNS, tag);
+      for (const [k, v] of Object.entries(attrs)) if (v !== undefined) node.setAttribute(k, v);
+      if (text !== undefined) node.textContent = text;
+      if (parent) parent.appendChild(node);
+      return node;
+    }
+
+    function pointOn(path, t) {
+      const len = path.getTotalLength();
+      return path.getPointAtLength(Math.min(Math.max(t, 0), 1) * len);
+    }
+
+    function buildLayout() {
+      const headers = document.getElementById("headers-layer");
+      const wireLayer = document.getElementById("wires-layer");
+      const stage = document.getElementById("stage-layer");
+      [headers, wireLayer, stage].forEach(l => { l.innerHTML = ""; });
+      rowY = {};
+      wires = { park: {}, release: {}, append: [], deliver: [] };
+      const cfg = scenarios[currentScenario];
+      const mono = { "font-family": "var(--font-mono)" };
+
+      if (cfg.kind === "rabbit") {
+        [["120", "01 / RETRY PUBLISH"], ["560", "02 / PARKING QUEUES"], ["1050", "03 / RELEASED TO DESTINATION"]].forEach(([x, t]) => el("text", { x, y: 42 }, headers, t));
+        const pub = el("g", { transform: "translate(40, 170)" }, stage);
+        el("rect", { width: 170, height: 130, rx: 10, class: "box" }, pub);
+        el("text", { x: 14, y: 22, ...mono, "font-size": 11, "font-weight": 600 }, pub, "producer.target()");
+        el("text", { x: 14, y: 46, ...mono, "font-size": 9, fill: "var(--text-muted)", id: "pub-l1" }, pub, "");
+        el("text", { x: 14, y: 64, ...mono, "font-size": 9, fill: "var(--color-promo)", id: "pub-l2" }, pub, "");
+        el("text", { x: 14, y: 82, ...mono, "font-size": 9, fill: "var(--text-muted)", id: "pub-l3" }, pub, "");
+        el("text", { x: 14, y: 112, ...mono, "font-size": 8.5, fill: "var(--text-muted)" }, pub, { fixed: "one queue per retry tier", ladder: "generic rungs: 500ms .. 64s", single: "hypothetical: one queue" }[cfg.mode]);
+
+        const names = QUEUE_NAMES;
+        const top = cfg.mode === "fixed" ? 110 : 62, gap = cfg.mode === "fixed" ? 70 : 40;
+        names.forEach((name, i) => {
+          const y = cfg.mode === "single" ? 235 : top + i * gap + 16;
+          rowY[name] = y;
+          wires.park[name] = el("path", { d: `M 210 235 C 245 235, 245 ${y}, 280 ${y}`, class: "wire-path", opacity: 0.4 }, wireLayer);
+          wires.release[name] = el("path", { d: `M 840 ${y} C 880 ${y}, 880 235, 920 235`, class: "wire-path", opacity: 0.4 }, wireLayer);
+          const g = el("g", { transform: `translate(280, ${y - 16})` }, stage);
+          el("rect", { width: 560, height: 32, rx: 6, class: "box", id: `q-rect-${name}` }, g);
+          el("text", { x: 10, y: 20, ...mono, "font-size": 9.5, "font-weight": 600 }, g, name === "park" ? "park (per-message)" : name);
+          el("text", { x: 550, y: 20, "text-anchor": "end", ...mono, "font-size": 8.5, fill: "var(--text-muted)", id: `q-info-${name}` }, g, name === "park" ? (cfg.mode === "fixed" ? "fallback only" : "expiration per message") : `x-message-ttl ${fmt(parseTtl(name))}`);
+          el("rect", { x: 130, y: 12, width: 300, height: 8, rx: 4, class: "tray" }, g);
+          el("g", { id: `q-items-${name}`, transform: "translate(130, 16)" }, g);
+        });
+        const dest = el("g", { transform: "translate(920, 64)" }, stage);
+        el("rect", { width: 250, height: 350, rx: 10, class: "box" }, dest);
+        el("text", { x: 14, y: 22, ...mono, "font-size": 10, "font-weight": 600 }, dest, cfg.mode === "fixed" ? "retry.N destinations" : "destination");
+        [[14, "id"], [66, "asked"], [126, "waited"], [186, "late"]].forEach(([x, t]) => el("text", { x, y: 40, ...mono, "font-size": 8.5, fill: "var(--text-muted)" }, dest, t));
+        el("g", { id: "released-list", transform: "translate(14, 58)" }, dest);
+      } else {
+        [["120", "01 / RETRY TOPIC"], ["530", "02 / PARTITIONS (offsets)"], ["870", "03 / ADMISSION"], ["1080", "04 / HANDLER"]].forEach(([x, t]) => el("text", { x, y: 42 }, headers, t));
+        const pub = el("g", { transform: "translate(40, 170)" }, stage);
+        el("rect", { width: 170, height: 130, rx: 10, class: "box" }, pub);
+        el("text", { x: 14, y: 22, ...mono, "font-size": 11, "font-weight": 600 }, pub, "orders.high.retry.2");
+        el("text", { x: 14, y: 44, ...mono, "font-size": 9, fill: "var(--color-promo)" }, pub, `topic delay ${fmt(cfg.delay)}`);
+        el("text", { x: 14, y: 66, ...mono, "font-size": 8.5, fill: "var(--text-muted)" }, pub, "due = trunc(ts, 1ms)");
+        el("text", { x: 14, y: 80, ...mono, "font-size": 8.5, fill: "var(--text-muted)" }, pub, "      + 1ms + delay");
+        el("text", { x: 14, y: 110, ...mono, "font-size": 8.5, fill: "var(--text-muted)" }, pub, "one record in flight per partition");
+        partitions.forEach((p, i) => {
+          const y = 120 + i * 120;
+          rowY[`p${i}`] = y;
+          wires.append.push(el("path", { d: `M 210 235 C 245 235, 245 ${y}, 280 ${y}`, class: "wire-path", opacity: 0.4 }, wireLayer));
+          wires.deliver.push(el("path", { d: `M 780 ${y} L 960 ${y} C 990 ${y}, 990 235, 1000 235`, class: "wire-path", opacity: 0.4 }, wireLayer));
+          const g = el("g", { transform: `translate(280, ${y - 40})` }, stage);
+          el("rect", { width: 500, height: 80, rx: 10, class: "box", id: `p-rect-${i}` }, g);
+          el("text", { x: 14, y: 20, ...mono, "font-size": 10, "font-weight": 600 }, g, `partition ${i}`);
+          el("text", { x: 486, y: 20, "text-anchor": "end", ...mono, "font-size": 9, id: `p-state-${i}` }, g, "");
+          el("g", { id: `p-cells-${i}`, transform: "translate(14, 32)" }, g);
+          const adm = el("g", { transform: `translate(800, ${y - 28})` }, stage);
+          el("rect", { width: 150, height: 56, rx: 8, class: "box", id: `adm-rect-${i}` }, adm);
+          el("text", { x: 10, y: 20, ...mono, "font-size": 9, "font-weight": 600, id: `adm-l1-${i}` }, adm, "");
+          el("text", { x: 10, y: 38, ...mono, "font-size": 8.5, fill: "var(--text-muted)", id: `adm-l2-${i}` }, adm, "");
+        });
+        const h = el("g", { transform: "translate(1000, 150)" }, stage);
+        el("rect", { width: 170, height: 170, rx: 10, class: "box" }, h);
+        el("text", { x: 14, y: 22, ...mono, "font-size": 10, "font-weight": 600 }, h, "handler");
+        el("g", { id: "handler-list", transform: "translate(14, 44)" }, h);
+      }
+    }
+
+    function render() {
+      document.getElementById("clock-display").textContent = clock.format();
+      const cfg = scenarios[currentScenario];
+      const now = clock.now();
+      let blocked = 0;
+
+      if (cfg.kind === "rabbit") {
+        if (lastRoute) {
+          document.getElementById("pub-l1").textContent = `remaining ${fmt(lastRoute.remaining)}`;
+          document.getElementById("pub-l2").textContent = lastRoute.ttl ? `-> ${lastRoute.queue}` : `-> park, expiration ${lastRoute.expiration}`;
+          document.getElementById("pub-l3").textContent = lastRoute.ttl ? (lastRoute.ttl > lastRoute.remaining ? `rounded up ${fmt(lastRoute.ttl - lastRoute.remaining)}` : "TTL = tier delay, exact") : ({ fixed: "beyond the tier delay", ladder: "above the top rung", single: "hypothetical: shared queue" }[scenarios[currentScenario].mode]);
+        }
+        for (const name of Object.keys(rowY)) {
+          const q = queues[name];
+          const items = document.getElementById(`q-items-${name}`);
+          items.innerHTML = q.slice(0, name === "park" ? 11 : q.length).map((m, i) => {
+            const span = m.expiresAt - m.publishedAt;
+            const f = Math.min(1, (now - m.publishedAt) / Math.max(1, span));
+            const stuck = name === "park" && i > 0 && m.expiresAt <= now;
+            if (stuck) blocked++;
+            const x = name === "park" ? 12 + i * 25 : f * 300;
+            return `<g class="packet-node" data-id="${m.id}" data-asked="${fmt(m.delay)}" data-queue="${name}" data-left="${fmt(Math.max(0, m.expiresAt - now))}" data-stuck="${stuck}">
+              <circle cx="${x.toFixed(1)}" cy="0" r="5" fill="${m.color}" stroke="${stuck ? "var(--color-break)" : "none"}" stroke-width="2" />
+              ${name === "park" ? `<text x="${x.toFixed(1)}" y="-9" text-anchor="middle" font-family="var(--font-mono)" font-size="7.5" fill="${stuck ? "var(--color-break)" : "var(--text-muted)"}">${fmt(Math.max(0, m.expiresAt - now))}</text>` : ""}
+            </g>`;
+          }).join("") + (name === "park" && q.length > 11 ? `<text x="300" y="3" text-anchor="end" font-family="var(--font-mono)" font-size="8.5" fill="var(--text-muted)">+${q.length - 11}</text>` : "");
+          document.getElementById(`q-rect-${name}`).setAttribute("stroke", q.length ? (name === "park" && q.some((m, i) => i > 0 && m.expiresAt <= now) ? "var(--color-break)" : "var(--color-promo)") : "var(--border-hairline)");
+        }
+        document.getElementById("released-list").innerHTML = released.slice().reverse().map((r, i) => {
+          const lateColor = r.queue === "park" && r.late > 50 ? "var(--color-break)" : (r.late > 50 ? "var(--color-promo)" : "var(--color-worker)");
+          return `<g transform="translate(0, ${i * 20})">
+            <circle cx="4" cy="-3" r="4" fill="${r.color}" />
+            <text x="14" y="0" font-family="var(--font-mono)" font-size="9">${r.id}</text>
+            <text x="52" y="0" font-family="var(--font-mono)" font-size="9" fill="var(--text-secondary)">${fmt(r.delay)}</text>
+            <text x="112" y="0" font-family="var(--font-mono)" font-size="9" fill="var(--text-secondary)">${fmt(r.releasedAt - r.publishedAt)}</text>
+            <text x="172" y="0" font-family="var(--font-mono)" font-size="9" fill="${lateColor}">+${fmt(Math.max(0, r.late))}</text>
+          </g>`;
+        }).join("");
+      } else {
+        partitions.forEach((p, i) => {
+          const start = Math.max(0, p.cursor - 2);
+          const cells = p.log.slice(start, start + 9);
+          document.getElementById(`p-cells-${i}`).innerHTML = cells.map((r, j) => {
+            const offset = start + j;
+            const state = offset < p.cursor ? "done" : (offset === p.cursor ? "head" : "wait");
+            const fill = state === "done" ? "rgba(16,185,129,0.2)" : (state === "head" ? (p.heldUntil ? "rgba(245,158,11,0.2)" : "rgba(56,189,248,0.2)") : "#0d0d12");
+            const stroke = state === "done" ? "var(--color-worker)" : (state === "head" ? (p.heldUntil ? "var(--color-promo)" : "var(--color-high)") : "var(--border-hairline)");
+            const due = dueTime(r, cfg.delay);
+            if (state === "wait") blocked++;
+            return `<g class="packet-node" data-id="${r.id}" data-offset="${offset}" data-ts="${r.timestamp}" data-due="${due}" data-left="${fmt(Math.max(0, due - now))}">
+              <rect x="${j * 52}" y="0" width="46" height="36" rx="6" fill="${fill}" stroke="${stroke}" stroke-width="1.5" />
+              <circle cx="${j * 52 + 10}" cy="10" r="3" fill="${r.color}" />
+              <text x="${j * 52 + 23}" y="24" text-anchor="middle" font-family="var(--font-mono)" font-size="10" font-weight="600">${offset}</text>
+            </g>`;
+          }).join("");
+          const state = document.getElementById(`p-state-${i}`);
+          const l1 = document.getElementById(`adm-l1-${i}`);
+          const l2 = document.getElementById(`adm-l2-${i}`);
+          if (p.heldUntil) {
+            state.textContent = "PAUSED: head-hold";
+            state.setAttribute("fill", "var(--color-promo)");
+            l1.textContent = `due in ${fmt(p.heldUntil - now)}`;
+            l1.setAttribute("fill", "var(--color-promo)");
+            l2.textContent = "fetch paused, timer set";
+          } else if (p.outstanding) {
+            state.textContent = `delivering offset ${p.cursor}`;
+            state.setAttribute("fill", "var(--color-high)");
+            l1.textContent = "admitted";
+            l1.setAttribute("fill", "var(--color-high)");
+            l2.textContent = "outstanding 1: next waits";
+          } else {
+            state.textContent = "idle";
+            state.setAttribute("fill", "var(--text-muted)");
+            l1.textContent = "no record";
+            l1.setAttribute("fill", "var(--text-muted)");
+            l2.textContent = "";
+          }
+          document.getElementById(`p-rect-${i}`).setAttribute("stroke", p.heldUntil ? "var(--color-promo)" : "var(--border-hairline)");
+          document.getElementById(`adm-rect-${i}`).setAttribute("stroke", p.heldUntil ? "var(--color-promo)" : (p.outstanding ? "var(--color-high)" : "var(--border-hairline)"));
+        });
+        document.getElementById("handler-list").innerHTML = partitions.map((p, i) => p.outstanding
+          ? `<text x="0" y="${i * 22}" font-family="var(--font-mono)" font-size="9" fill="${p.outstanding.record.color}">p${i} offset ${p.cursor} (${Math.ceil(p.outstanding.remaining)}ms)</text>`
+          : `<text x="0" y="${i * 22}" font-family="var(--font-mono)" font-size="9" fill="var(--text-muted)">p${i} idle</text>`).join("")
+          + released.slice(-4).reverse().map((r, i) => `<text x="0" y="${80 + i * 16}" font-family="var(--font-mono)" font-size="8.5" fill="var(--text-secondary)">${r.id} p${r.partition} +${fmt(Math.max(0, r.late))} after due</text>`).join("");
+      }
+
+      document.getElementById("particles-layer").innerHTML = particles.map(p => {
+        let pt = null;
+        if (p.type === "park" && wires.park[p.queue]) pt = pointOn(wires.park[p.queue], p.progress);
+        else if (p.type === "release" && wires.release[p.queue]) pt = pointOn(wires.release[p.queue], p.progress);
+        else if (p.type === "append" && wires.append[p.partition]) pt = pointOn(wires.append[p.partition], p.progress);
+        else if (p.type === "deliver" && wires.deliver[p.partition]) pt = pointOn(wires.deliver[p.partition], p.progress);
+        if (!pt) return "";
+        return `<circle cx="${pt.x.toFixed(1)}" cy="${pt.y.toFixed(1)}" r="3.5" fill="${p.color}" filter="url(#glow)" />`;
+      }).join("");
+
+      // HUD.
+      const kafka = cfg.kind === "kafka";
+      document.getElementById("hud1-label").textContent = kafka ? "Paused Partitions" : "Last Routing";
+      if (kafka) {
+        const held = partitions.filter(p => p.heldUntil).length;
+        document.getElementById("hud1").textContent = `${held} / ${partitions.length}`;
+        document.getElementById("hud1-sub").textContent = "Pause reason head-hold; one timer for the earliest due head";
+      } else if (lastRoute) {
+        document.getElementById("hud1").textContent = lastRoute.ttl ? lastRoute.queue : "park";
+        document.getElementById("hud1-sub").textContent = lastRoute.ttl ? (cfg.mode === "fixed" ? `remaining ${fmt(lastRoute.remaining)} <= tier delay -> the tier's fixed queue; no per-message expiration` : `remaining ${fmt(lastRoute.remaining)} -> smallest rung >= it; no per-message expiration`) : `remaining ${fmt(lastRoute.remaining)} -> per-message expiration ${lastRoute.expiration}`;
+      }
+      document.getElementById("hud2").textContent = early;
+      document.getElementById("hud2").style.color = early ? "var(--color-break)" : "var(--color-worker)";
+      document.getElementById("hud2-sub").textContent = kafka ? "Delivered before its publish instant plus the topic delay" : "Released before its due time";
+      document.getElementById("gauge2").style.width = early ? "100%" : "0%";
+      document.getElementById("hud3").textContent = fmt(Math.max(0, maxLate));
+      document.getElementById("hud3-sub").textContent = kafka ? "After due: the wait for the handler ahead in the same partition" : ({ fixed: "A tier queue's TTL equals its delay: no rounding, no head-of-line", ladder: "Rounding up to a rung, plus head-of-line on the per-message path", single: "Head-of-line wait in one shared queue is unbounded" }[cfg.mode]);
+      document.getElementById("gauge3").style.width = `${Math.min(100, maxLate / 300)}%`;
+      document.getElementById("hud4-label").textContent = kafka ? "Records Behind Heads" : "Due, Blocked Behind Head";
+      document.getElementById("hud4").textContent = blocked;
+      document.getElementById("hud4").style.color = blocked && !kafka ? "var(--color-break)" : "var(--text-primary)";
+      document.getElementById("hud4-sub").textContent = kafka ? "Later offsets wait for the head: the log is read in order" : "Expired copies RabbitMQ cannot drop until the head goes";
+      document.getElementById("gauge4").style.width = `${Math.min(100, blocked * 10)}%`;
+    }
+
+    stageBox.addEventListener("mouseover", (e) => {
+      const node = e.target.closest(".packet-node");
+      if (!node) return;
+      const d = node.dataset;
+      tooltip.innerHTML = d.offset !== undefined
+        ? `<div style="font-weight:600; margin-bottom:4px;">${d.id} (offset ${d.offset})</div>
+           <div style="color: var(--text-secondary);">timestamp: <span style="color:#fff;">${d.ts}ms</span></div>
+           <div style="color: var(--text-secondary);">due: <span style="color:#fff;">${d.due}ms</span> (in ${d.left})</div>`
+        : `<div style="font-weight:600; margin-bottom:4px;">${d.id}</div>
+           <div style="color: var(--text-secondary);">asked for: <span style="color:#fff;">${d.asked}</span></div>
+           <div style="color: var(--text-secondary);">queue: <span style="color:#fff;">${d.queue}</span>, expires in ${d.left}</div>
+           ${d.stuck === "true" ? `<div style="margin-top:4px; font-size:10px; color: var(--color-break);">Expired, but not at the head: it waits</div>` : ""}`;
+      tooltip.classList.add("visible");
+    });
+    stageBox.addEventListener("mousemove", (e) => {
+      const rect = stageBox.getBoundingClientRect();
+      tooltip.style.left = `${e.clientX - rect.left + 16}px`;
+      tooltip.style.top = `${e.clientY - rect.top + 16}px`;
+    });
+    stageBox.addEventListener("mouseout", (e) => {
+      if (e.target.closest(".packet-node")) tooltip.classList.remove("visible");
+    });
+
+    document.getElementById("btn-play-pause").addEventListener("click", () => {
+      isPlaying = !isPlaying;
+      document.getElementById("play-text").textContent = isPlaying ? "Pause" : "Play";
+    });
+    document.getElementById("btn-step").addEventListener("click", () => {
+      if (!isPlaying) { simulationStep(100); render(); }
+    });
+    document.querySelectorAll(".speed-btn").forEach(btn => {
+      btn.addEventListener("click", () => {
+        document.querySelectorAll(".speed-btn").forEach(b => b.classList.remove("active"));
+        btn.classList.add("active");
+        speedFactor = parseFloat(btn.dataset.speed);
+      });
+    });
+    document.querySelectorAll(".scenario-tab").forEach(tab => tab.addEventListener("click", () => setScenario(tab.dataset.scenario)));
+
+    let lastFrameTime = performance.now();
+    document.addEventListener("visibilitychange", () => { lastFrameTime = performance.now(); });
+    function loop(currentTime) {
+      if (document.hidden) {
+        lastFrameTime = currentTime;
+        requestAnimationFrame(loop);
+        return;
+      }
+      const delta = Math.min(currentTime - lastFrameTime, 100);
+      lastFrameTime = currentTime;
+      if (isPlaying) simulationStep(delta * speedFactor);
+      render();
+      requestAnimationFrame(loop);
+    }
+
+    setScenario("tiers");
+    requestAnimationFrame(loop);
+  </script>
+</body>
+</html>
