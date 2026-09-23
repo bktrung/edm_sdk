@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"math/rand/v2"
+	"sync"
 	"time"
 
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/driver"
@@ -199,7 +200,7 @@ func (c *Client) finishReconnectLocked(err error) {
 
 func (c *Client) reconnectOnce(ctx context.Context, cause error) error {
 	c.abandonRunners(ctx)
-	if err := c.waitPublishIdle(ctx); err != nil {
+	if err := c.publishQuiescence(ctx, nil); err != nil {
 		return err
 	}
 
@@ -225,6 +226,9 @@ func (c *Client) reconnectOnce(ctx context.Context, cause error) error {
 					effective = effective.Strict()
 				}
 				err = c.ensurePublisherTopologyOn(ctx, connection, effective)
+				if err == nil {
+					err = c.ensureSubscriptionTopologiesOn(ctx, connection, effective)
+				}
 				if err == nil {
 					c.mu.Lock()
 					if c.lifecycleLocked() != lifecycle.Ready {
@@ -383,8 +387,9 @@ func (c *Client) reconnectSample() float64 {
 // same reason, and every other step that retires that connection is already
 // logged and continued. Aborting instead would strand the runners already
 // cancelled on a client that stays healthy and leave the rest un-abandoned. A
-// consumer left open by its failed Release is the same leak the retiring
-// connection already logs, not a second defect.
+// consumer left open by its failed Release is kept on the client with the
+// connection it was opened on, and the swap retries that release before it
+// closes that connection.
 func (c *Client) abandonRunners(ctx context.Context) {
 	c.mu.Lock()
 	runners := make([]*Runner, 0, len(c.runners))
@@ -399,8 +404,93 @@ func (c *Client) abandonRunners(ctx context.Context) {
 	}
 }
 
-func (c *Client) waitPublishIdle(ctx context.Context) error {
-	return c.publishQuiescence(ctx, nil)
+// topologyReplayConcurrency bounds how many subscription topologies one
+// reconnect replays at once. The replay is the longest step of a swap on a
+// broker that opens a channel per destination, and it is bounded because every
+// replay call opens broker resources on the connection the swap is about to
+// install.
+const topologyReplayConcurrency = 4
+
+// ensureSubscriptionTopologiesOn replays every subscription's topology on a
+// replacement connection before it is installed. A driver learns how to route
+// a delayed destination, such as a retry tier's parking queue, from the
+// EnsureTopology call made on that connection, and a handler still running
+// when the swap lands publishes its retry or dead-letter successor on the new
+// connection before its runner reopens and replays the topology itself.
+// Without this replay that successor is routed as if the destination had no
+// declared delay and can reach a queue that was never declared.
+//
+// The replays run concurrently, at most topologyReplayConcurrency at a time,
+// because the swap rebrands one destination at a time otherwise and the
+// downtime grows with the subscription count. The outcome is the one the
+// serial replay gave: a refusal the broker makes for one subscription is
+// logged and skipped, leaving that subscription to fail its own reopen, and a
+// transient failure ends the attempt with the error that names its
+// subscription. That failure stops further replays from starting and cancels
+// the ones in flight, so an aborted attempt does not keep declaring topology
+// on the connection it is about to throw away; the first such failure is the
+// one reported.
+func (c *Client) ensureSubscriptionTopologiesOn(ctx context.Context, conn driver.Conn, effective driver.Capabilities) error {
+	c.mu.Lock()
+	runners := make([]*Runner, 0, len(c.runners))
+	for runner := range c.runners {
+		runners = append(runners, runner)
+	}
+	source := c.source
+	c.mu.Unlock()
+	if len(runners) == 0 {
+		return nil
+	}
+	admin := conn.Admin()
+	if admin == nil {
+		return errors.New("f1: consumer topology requires driver admin")
+	}
+	policy := c.topologyPolicy()
+	replayCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	slots := make(chan struct{}, topologyReplayConcurrency)
+	var (
+		mu      sync.Mutex
+		failed  error
+		running sync.WaitGroup
+	)
+	stopped := func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return failed != nil
+	}
+	for _, runner := range runners {
+		// The slot is taken before the stop is read, so a replay that has been
+		// granted capacity never starts after the attempt gave up.
+		slots <- struct{}{}
+		if stopped() {
+			<-slots
+			break
+		}
+		running.Add(1)
+		go func() {
+			defer running.Done()
+			defer func() { <-slots }()
+			spec := subscriptionTopologySpecs(effective, source, runner.subscription)
+			spec.Policy = policy
+			if _, err := admin.EnsureTopology(replayCtx, spec); err != nil {
+				if kind, classified := driver.Classify(err); classified && kind != driver.KindTransient {
+					lastResortClientLogger(c).Warn("f1 subscription topology replay refused during reconnect", "subscription", runner.subscription.Name, "error", err)
+					return
+				}
+				mu.Lock()
+				if failed == nil {
+					failed = fmt.Errorf("f1: ensure subscription %s topology: %w", runner.subscription.Name, err)
+				}
+				mu.Unlock()
+				cancel()
+			}
+		}()
+	}
+	running.Wait()
+	mu.Lock()
+	defer mu.Unlock()
+	return failed
 }
 
 // retireConnection closes what the swap replaced: the producer that was built
@@ -410,8 +500,13 @@ func (c *Client) waitPublishIdle(ctx context.Context) error {
 // nothing will use again, and its consumers have already been released.
 func (c *Client) retireConnection(ctx context.Context, producer driver.Producer, oldConn driver.Conn, oldEpoch uint64) {
 	closeCtx := context.WithoutCancel(ctx)
+	// The replacement is already installed, but the client reads as
+	// reconnecting until this returns, so each close is bounded by
+	// Lifecycle.CloseTimeout: a retired connection whose teardown hangs on a
+	// dead broker must not keep publishes refused on a healthy one.
+	closeTimeout := c.config.Lifecycle.CloseTimeout
 	if producer != nil {
-		if err := producer.Close(closeCtx); err != nil {
+		if err := runWithClockTimeout(closeCtx, c.options.clock, closeTimeout, "retired producer close", producer.Close); err != nil {
 			lastResortClientLogger(c).Warn("f1 retired producer close failed", "error", err)
 		}
 	}
@@ -424,7 +519,12 @@ func (c *Client) retireConnection(ctx context.Context, producer driver.Producer,
 	if !retired {
 		return
 	}
-	if err := oldConn.Close(closeCtx); err != nil {
+	// A consumer kept for this connection is still registered on it, and the
+	// driver refuses to close a connection that carries one. Release it before
+	// the close, on the same detached context and with the same bound the
+	// swap's own teardown uses.
+	c.retireKeptConsumers(closeCtx, oldEpoch)
+	if err := runWithClockTimeout(closeCtx, c.options.clock, closeTimeout, "retired connection close", oldConn.Close); err != nil {
 		lastResortClientLogger(c).Warn("f1 retired connection close failed", "error", err)
 	}
 }
@@ -432,12 +532,8 @@ func (c *Client) retireConnection(ctx context.Context, producer driver.Producer,
 func (r *Runner) abandonForReconnect(ctx context.Context) error {
 	r.mu.Lock()
 	if r.lifecycle != nil && r.lifecycle.State() == lifecycle.Failed {
-		consumer := r.consumer
 		r.mu.Unlock()
-		if consumer == nil {
-			return nil
-		}
-		return consumer.Release(ctx)
+		return releaseRunnerConsumer(r, ctx)
 	}
 	if r.lifecycle != nil && r.lifecycle.State() == lifecycle.Ready {
 		_ = r.lifecycle.Transition(lifecycle.Reconnecting)
@@ -449,7 +545,6 @@ func (r *Runner) abandonForReconnect(ctx context.Context) error {
 	// waiting on an attempt the supervisor has not started yet.
 	events, done := r.events, r.done
 	cancel := r.cancel
-	consumer := r.consumer
 	r.mu.Unlock()
 	if events != nil {
 		select {
@@ -460,10 +555,7 @@ func (r *Runner) abandonForReconnect(ctx context.Context) error {
 	if cancel != nil {
 		cancel()
 	}
-	if consumer == nil {
-		return nil
-	}
-	return consumer.Release(ctx)
+	return releaseRunnerConsumer(r, ctx)
 }
 
 func (c *Client) reconnectingError(op string) error {
@@ -485,8 +577,8 @@ func (r *Runner) transitionToReconnecting() {
 }
 
 // drainAfterRun releases a runner at the end of Run: it waits for in-flight
-// deliveries to leave the registry within DrainTimeout and then releases the
-// consumer within CloseTimeout.
+// deliveries to leave the registry within DrainTimeout and then stops or
+// releases the consumer, bounding each teardown call by CloseTimeout.
 //
 // The release runs even when the wait fails. A consumer left open past the
 // wait keeps redelivering work that nothing is settling, so the failure path
@@ -509,10 +601,8 @@ func (r *Runner) drainAfterRun(runCtx context.Context) error {
 	}
 	phaseClock := r.client.options.clock
 	drainTimeout := r.client.config.Lifecycle.DrainTimeout
-	closeTimeout := r.client.config.Lifecycle.CloseTimeout
-	release := func(ctx context.Context) error { return stopRunnerConsumer(r, ctx) }
 	if waitErr := runWithClockTimeout(shutdownCtx, phaseClock, drainTimeout, "drain", r.inflight.WaitZero); waitErr != nil {
-		releaseErr := runWithClockTimeout(context.WithoutCancel(shutdownCtx), phaseClock, closeTimeout, "close", release)
+		releaseErr := stopRunnerConsumer(r, context.WithoutCancel(shutdownCtx))
 		if machine != nil {
 			if err := machine.Transition(lifecycle.Aborted); err != nil {
 				return errors.Join(waitErr, releaseErr, err)
@@ -520,7 +610,7 @@ func (r *Runner) drainAfterRun(runCtx context.Context) error {
 		}
 		return errors.Join(waitErr, releaseErr)
 	}
-	if releaseErr := runWithClockTimeout(shutdownCtx, phaseClock, closeTimeout, "close", release); releaseErr != nil {
+	if releaseErr := stopRunnerConsumer(r, shutdownCtx); releaseErr != nil {
 		if machine != nil {
 			if err := machine.Transition(lifecycle.Aborted); err != nil {
 				return errors.Join(releaseErr, err)

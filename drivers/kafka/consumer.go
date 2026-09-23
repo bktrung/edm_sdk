@@ -31,9 +31,6 @@ const (
 type pauseReasonSet map[pauseReason]struct{}
 
 func (s pauseReasonSet) add(reason pauseReason) bool {
-	if s == nil {
-		return true
-	}
 	if _, exists := s[reason]; exists {
 		return false
 	}
@@ -118,6 +115,11 @@ type consumer struct {
 	partitionPauses map[partitionKey]partitionPauseSet
 	pending         map[partitionKey][]*kgo.Record
 	heldUntil       map[partitionKey]time.Time
+	// readAheadCounts maps a partition to the number of records its queue
+	// holds. The read-ahead reconciliation fills it in place on every poll
+	// iteration, so the reconciliation allocates nothing while the number of
+	// partitions this consumer owns does not grow.
+	readAheadCounts map[partitionKey]int
 	settlers        map[*settler]struct{}
 	trackers        map[partitionKey]*ackTracker
 	// owned holds the partitions this consumer currently owns. The rebalance
@@ -137,6 +139,11 @@ type consumer struct {
 	// means, and the records this loop is holding for the partition are the
 	// ones whose delivery is still owed.
 	inHand map[*kgo.Record]struct{}
+	// fetchScratch holds the records of the fetch response the poll loop took
+	// in hand last time it polled. The loop takes them in hand and collects
+	// them in one pass and queues them in a second pass over this slice, so a
+	// response is walked once for its records rather than once per pass.
+	fetchScratch []*kgo.Record
 	// requeued counts, per partition, the records waiting at the head of the
 	// queue that a caller put back. A redelivery replaces the delivery that
 	// held the partition rather than adding a second one, so the partition's
@@ -215,7 +222,6 @@ type settler struct {
 	// completes without an error rather than reporting a revocation the caller
 	// can do nothing about. Guarded by owner.mu, like tracker.
 	drainingRevoked bool
-	requeued        bool
 	slotReleased    bool
 	key             partitionKey
 	mu              sync.Mutex
@@ -234,12 +240,25 @@ func (s *settler) completeRevocation() {
 	}
 }
 
-// Ack commits the next offset after this delivery's offset and releases this
-// delivery's destination prefetch slot. The tracker commits one offset at a
-// time from its own base, so an acknowledgement that does not carry the offset
-// the cursor sits at is refused as already settled; a partition has one
-// delivery in flight at a time, which is what keeps the cursor at the offset
-// the acknowledged delivery carried.
+// commitRecord commits this delivery's offset through the selected tracker.
+// Only the tracker that admitted it may skip offsets franz-go did not deliver;
+// a renewed owner must still settle its exact base offset. admitted is
+// s.tracker read under owner.mu in the same section that selected tracker,
+// because a draining revoke clears s.tracker under that lock.
+func (s *settler) commitRecord(ctx context.Context, tracker, admitted *ackTracker) error {
+	commit := func(commitPoint int64) error {
+		return s.owner.commitOffset(ctx, s.key, commitPoint)
+	}
+	if tracker == admitted {
+		return tracker.AckOwn(s.record.Offset, commit)
+	}
+	return tracker.Ack(s.record.Offset, commit)
+}
+
+// Ack acknowledges this delivery and commits the Kafka offset after its record.
+// Each partition permits only one outstanding delivery at a time. The tracker
+// that admitted the delivery may skip offsets franz-go never delivered, but a
+// settlement routed through a newer tracker must match that tracker's cursor.
 func (s *settler) Ack(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
 		return classify("ack", driver.KindTransient, err)
@@ -253,15 +272,14 @@ func (s *settler) Ack(ctx context.Context) error {
 		return classify("ack", driver.KindFatal, driver.ErrAlreadySettled)
 	}
 	tracker := s.owner.settlementTrackerLocked(s)
+	admitted := s.tracker
 	s.owner.mu.Unlock()
 	if tracker == nil {
 		s.completeRevocation()
 		return classify("ack", driver.KindFatal, ErrRevoked)
 	}
 
-	if err := tracker.Ack(s.record.Offset, func(commitPoint int64) error {
-		return s.owner.commitOffset(ctx, s.key, commitPoint)
-	}); err != nil {
+	if err := s.commitRecord(ctx, tracker, admitted); err != nil {
 		if errors.Is(err, ErrRevoked) {
 			s.completeRevocation()
 		}
@@ -289,6 +307,7 @@ func (s *settler) Nack(ctx context.Context, options driver.NackOptions) error {
 		return classify("nack", driver.KindFatal, driver.ErrAlreadySettled)
 	}
 	tracker := s.owner.settlementTrackerLocked(s)
+	admitted := s.tracker
 	draining := s.owner.draining
 	drainingRevoked := s.drainingRevoked && draining
 	s.owner.mu.Unlock()
@@ -302,7 +321,6 @@ func (s *settler) Nack(ctx context.Context, options driver.NackOptions) error {
 	}
 
 	if options.Requeue {
-		s.requeued = true
 		s.owner.mu.Lock()
 		// A requeue queues the redelivery this consumer owes, and it owes one
 		// here only while the partition is still this consumer's and the delivery
@@ -337,9 +355,7 @@ func (s *settler) Nack(ctx context.Context, options driver.NackOptions) error {
 		return nil
 	}
 
-	if err := tracker.Ack(s.record.Offset, func(commitPoint int64) error {
-		return s.owner.commitOffset(ctx, s.key, commitPoint)
-	}); err != nil {
+	if err := s.commitRecord(ctx, tracker, admitted); err != nil {
 		if errors.Is(err, ErrRevoked) {
 			s.completeRevocation()
 		}
@@ -494,7 +510,7 @@ func newConsumer(ctx context.Context, connection *conn, cfg driver.ConsumerConfi
 	}
 	consumer.leaveFn = consumer.leaveGroup
 	for index, destination := range cfg.Destinations {
-		consumer.budgets[destination] = destinationPrefetch(cfg, destination, index)
+		consumer.budgets[destination] = cfg.DestinationPrefetch(index)
 	}
 
 	opts, err := consumerClientOpts(connection, cfg, group, consumer)
@@ -781,8 +797,8 @@ func consumerStartOffset(start driver.StartPosition) kgo.ConsumerOpt {
 
 func totalPrefetch(cfg driver.ConsumerConfig) int {
 	total := 0
-	for index, destination := range cfg.Destinations {
-		total += destinationPrefetch(cfg, destination, index)
+	for index := range cfg.Destinations {
+		total += cfg.DestinationPrefetch(index)
 	}
 	if total < 1 {
 		return 1
@@ -790,24 +806,11 @@ func totalPrefetch(cfg driver.ConsumerConfig) int {
 	return total
 }
 
-func destinationPrefetch(cfg driver.ConsumerConfig, destination string, index int) int {
-	if value := cfg.PerDestination[destination]; value > 0 {
-		return value
-	}
-	if cfg.Prefetch > 0 && len(cfg.Destinations) > 0 {
-		base := cfg.Prefetch / len(cfg.Destinations)
-		if index < cfg.Prefetch%len(cfg.Destinations) {
-			base++
-		}
-		if base > 0 {
-			return base
-		}
-	}
-	return 1
-}
-
+// Messages returns the channel of delivered messages. The channel closes when Stop or Release completes.
 func (c *consumer) Messages() <-chan driver.InboundMessage { return c.messages }
-func (c *consumer) Errors() <-chan error                   { return c.errors }
+
+// Errors returns asynchronous consumer errors. The channel closes when Stop or Release completes.
+func (c *consumer) Errors() <-chan error { return c.errors }
 
 func (c *consumer) requestLeaveLocked() {
 	if c.leaveClosed {
@@ -832,14 +835,6 @@ func (c *consumer) requestLeave() {
 	c.leaveMu.Lock()
 	c.requestLeaveLocked()
 	c.leaveMu.Unlock()
-}
-
-// requestLeaveAndWait asks the leave loop to leave the group and returns the
-// leave's error alone. A caller whose decision also depends on whether the
-// leave finished, rather than on the wait being abandoned, uses waitForLeave.
-func (c *consumer) requestLeaveAndWait(ctx context.Context) error {
-	_, err := c.waitForLeave(ctx)
-	return err
 }
 
 // waitForLeave asks the leave loop to leave the group and waits for the
@@ -1008,14 +1003,26 @@ func (c *consumer) poll(ctx context.Context) {
 
 func (c *consumer) handleFetches(fetches kgo.Fetches, bounded bool) bool {
 	c.mu.Lock()
-	if c.inHand == nil {
-		c.inHand = make(map[*kgo.Record]struct{})
+	records := c.fetchScratch[:0]
+	if count := fetches.NumRecords(); count > cap(records) {
+		records = make([]*kgo.Record, 0, count)
 	}
-	fetches.EachRecord(c.tagRecordLocked)
-	for record := range fetches.RecordsAll() {
+	// One pass takes every record of the response in hand and collects it, so
+	// the queueing pass walks the collected records rather than the response a
+	// second time.
+	fetches.EachRecord(func(record *kgo.Record) {
+		c.tagRecordLocked(record)
+		records = append(records, record)
+	})
+	for _, record := range records {
 		key := partitionKey{destination: record.Topic, partition: record.Partition}
 		c.pending[key] = append(c.pending[key], record)
 	}
+	// The records belong to in-hand and to the queues from here on, and holding
+	// the slice of them past this point would keep the response they came from
+	// alive until the next poll with nothing left to read them for.
+	clear(records)
+	c.fetchScratch = records[:0]
 	c.mu.Unlock()
 	defer c.client.AllowRebalance()
 
@@ -1100,7 +1107,7 @@ func (c *consumer) flushPending() bool {
 					delete(c.inHand, record)
 					c.clearHeadHoldLocked(key)
 				} else {
-					c.pending[key] = append([]*kgo.Record{record}, c.pending[key]...)
+					c.restorePendingHeadLocked(key, record)
 				}
 				c.mu.Unlock()
 			}
@@ -1113,28 +1120,19 @@ func (c *consumer) flushPending() bool {
 	return true
 }
 
-// isRecordStale reports whether a record the loop is holding is one this
-// consumer must drop rather than deliver: it belongs to a partition this
-// consumer does not own. The poll loop asks before it admits a record and
-// again before it keeps one, so a revoke empties the pending list of the
-// partitions it took away on the loop's next pass, and the broker's own
-// redelivery to the new owner is the copy that remains.
-func (c *consumer) isRecordStale(record *kgo.Record) bool {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.isRecordStaleLocked(record)
+// restorePendingHeadLocked puts a record emit refused back at the head of its
+// partition's queue, where the advance that preceded the emission took it from.
+// The path is rare, taken only when a concurrent revoke or Pause changed the
+// admission between the two checks, so it copies the queue rather than
+// reasoning about the array the advance narrowed. The caller holds c.mu.
+func (c *consumer) restorePendingHeadLocked(key partitionKey, record *kgo.Record) {
+	c.pending[key] = append([]*kgo.Record{record}, c.pending[key]...)
 }
 
-// tagRecord records a record the poll loop has taken from franz-go and not yet
-// resolved. A fresh tracker for the record's partition takes its base from the
+// tagRecordLocked records a record the poll loop has taken from franz-go and
+// not yet resolved. The caller holds c.mu. A fresh tracker for the record's partition takes its base from the
 // lowest offset in hand, which is why the loop tags every record of a fetch
 // response before it admits any of them.
-func (c *consumer) tagRecord(record *kgo.Record) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.tagRecordLocked(record)
-}
-
 func (c *consumer) tagRecordLocked(record *kgo.Record) {
 	if c.inHand == nil {
 		c.inHand = make(map[*kgo.Record]struct{})
@@ -1142,14 +1140,15 @@ func (c *consumer) tagRecordLocked(record *kgo.Record) {
 	c.inHand[record] = struct{}{}
 }
 
+// isRecordStaleLocked reports whether a record the loop is holding is one this
+// consumer must drop rather than deliver: it belongs to a partition this
+// consumer does not own. The poll loop asks before it admits a record and
+// again before it keeps one, so a revoke empties the pending list of the
+// partitions it took away on the loop's next pass, and the broker's own
+// redelivery to the new owner is the copy that remains. The caller must hold
+// c.mu.
 func (c *consumer) isRecordStaleLocked(record *kgo.Record) bool {
 	return !c.owned[partitionKey{destination: record.Topic, partition: record.Partition}]
-}
-
-func (c *consumer) discardStaleRecord(record *kgo.Record) {
-	c.mu.Lock()
-	delete(c.inHand, record)
-	c.mu.Unlock()
 }
 
 // releaseSlotsLocked returns up to slots destination slots that unsettled deliveries were
@@ -1524,16 +1523,18 @@ func inboundMessage(record *kgo.Record, settler *settler, receivedAt time.Time) 
 		Ref: driver.BrokerRef{
 			Partition: record.Partition,
 			Offset:    record.Offset,
-			Raw:       fmt.Sprintf("%s/%d/%d", record.Topic, record.Partition, record.Offset),
+			Raw:       record.Topic + "/" + strconv.FormatInt(int64(record.Partition), 10) + "/" + strconv.FormatInt(record.Offset, 10),
 		},
 		Settle: settler,
 	}
 }
 
+// Pause pauses delivery from the listed topics. With no topics, it pauses every topic this consumer subscribes to.
 func (c *consumer) Pause(destinations ...string) error {
 	return c.setUserPaused(destinations, true)
 }
 
+// Resume resumes delivery from the listed topics. With no topics, it resumes every topic this consumer subscribes to.
 func (c *consumer) Resume(destinations ...string) error {
 	return c.setUserPaused(destinations, false)
 }
@@ -1595,6 +1596,7 @@ func (c *consumer) setPauseReasonLocked(destination string, reason pauseReason, 
 	}
 }
 
+// Drain stops fetching new messages while keeping outstanding messages settleable.
 func (c *consumer) Drain(ctx context.Context) error {
 	_, err := c.drain(ctx)
 	return err
@@ -1648,6 +1650,8 @@ func (c *consumer) waitPoll(ctx context.Context, operation string, pollDone <-ch
 	}
 }
 
+// Stop drains the consumer and closes its channels after every delivered message has been settled.
+// It returns ErrResourcesOutstanding if deliveries remain unsettled.
 func (c *consumer) Stop(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
 		return stopContextError(err)
@@ -1791,6 +1795,7 @@ func (c *consumer) deleteGroup(ctx context.Context) error {
 	return nil
 }
 
+// Release abandons unsettled deliveries without committing their offsets, then closes the consumer.
 func (c *consumer) Release(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
 		return classify("release", driver.KindTransient, err)
@@ -1867,6 +1872,9 @@ func (c *consumer) Release(ctx context.Context) error {
 	return nil
 }
 
+// Lag returns the backlog count for each topic this consumer subscribes to,
+// summed across all of its partitions against the group's committed offsets.
+// It is the group's lag, not only this member's share.
 func (c *consumer) Lag(ctx context.Context) (map[string]int64, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, classify("lag", driver.KindTransient, err)
@@ -1883,10 +1891,6 @@ func (c *consumer) Lag(ctx context.Context) (map[string]int64, error) {
 		return nil, err
 	}
 	return lag, nil
-}
-
-func classifyLagError(err error) error {
-	return classifyKafkaOffsetError("lag", err)
 }
 
 func classifyKafkaOffsetError(operation string, err error) error {
@@ -1978,8 +1982,14 @@ func (c *consumer) sendError(err error) {
 			return
 		default:
 		}
+		// Make room by evicting the oldest error, unless that one is fatal:
+		// the core fails the subscription only on a fatal error, so a
+		// merely severe one must not push it out.
 		select {
-		case <-c.errors:
+		case evicted := <-c.errors:
+			if evictedKind, evictedClassified := driver.Classify(evicted); evictedClassified && evictedKind == driver.KindFatal && kind != driver.KindFatal {
+				err = evicted
+			}
 		default:
 		}
 		select {

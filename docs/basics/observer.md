@@ -28,7 +28,7 @@ that happened at an instant. Every event carries a `Kind` saying which stage it
 belongs to, and an `At` timestamp from the client's clock.
 
 Events are passed by value, and a field that does not apply to a kind is left at
-its zero value. A drain event has no `EventType`; a publish `Start` is emitted
+its zero value. A [drain](/learn/glossary#drain) event has no `EventType`; a publish `Start` is emitted
 before the message is resolved, so it has no `Topic` yet. The field comments in
 `observer.go` say which kinds set which fields, and the
 [observer events reference](/development/observer-events) lists every value.
@@ -103,41 +103,58 @@ func (o *spanObserver) Finish(token f1.Token, event f1.FinishEvent) {
 }
 ```
 
-`Handle` is yours. F1 does not read it. `Kind` and `Start` are filled in for you
-and are there so an adapter can work without its own lookup when that is enough.
+`Handle`, `Kind`, and `Start` belong to the observer. F1 returns the exact
+`Token` value from `Start` to `Finish` without inspecting or filling it. If the
+observer returns a token without `Kind` or `Start`, those fields are still
+absent at `Finish`.
 
 The zero token means no stage was started, so check for it rather than assuming
 a `Finish` always maps to state you hold.
 
 Every started stage gets exactly one `Finish`. If the stage exits without
-reporting an outcome, F1's finish guard sends one anyway with
-`ObserverOutcomeAbandoned`, so an adapter never leaks a span or a timer. The
-guard lives in [`observer_call.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/observer_call.go).
+reporting an outcome, F1 emits `ObserverOutcomeAbandoned` (the stage was given up on) so an adapter never
+leaks a span or timer.
+
+The observer lifecycle is one paired flow, with point events recorded alongside it:
+
+```mermaid
+sequenceDiagram
+    participant F1
+    participant observer
+    F1->>observer: Start(ctx, event)
+    observer-->>F1: return ctx and token
+    F1->>F1: run stage with that ctx
+    F1->>observer: Record(point)
+    F1->>observer: Finish(token, event)
+```
 
 ## Paired kinds and point kinds
 
-Five kinds are paired, meaning they arrive as a `Start` and a matching `Finish`:
-publish, message building, processing, settlement, and drain. Everything else is
-a point kind and arrives only through `Record`.
+Five kinds are paired: publish, message building, processing, [the final ack or nack](/learn/glossary#settlement), and
+drain. Each arrives through `Start` and a matching `Finish`.
+
+Every other kind is a point event delivered only through `Record`.
 
 The kinds are named for where an observation belongs in the lifecycle, not for a
 broker API:
 
-- **Publishing.** `ObserverPublish` surrounds an admitted publish call;
+- **Publishing.** `ObserverPublish` surrounds a publish call that was allowed to start;
   `ObserverMessageBuilt` surrounds building each outbound message inside it.
-- **Consuming.** `ObserverDeliveryReceived` marks a delivery admitted to
+- **Consuming.** `ObserverDeliveryReceived` marks a delivery let in to
   dispatch, `ObserverProcess` surrounds the handler, and `ObserverSettle`
   surrounds the ack or nack.
-- **Failing.** `ObserverRetryScheduled` fires when a retry successor is
+- **Failing.** `ObserverRetryScheduled` fires when a [retry copy](/learn/glossary#successor-publish) is
   confirmed. The dead-letter kinds separate the decision from the publish result,
   so you can tell "we decided to dead-letter" from "the dead-letter publish
-  failed". `ObserverPoisonRejected` covers a delivery dropped for decode failure,
-  poison, expiry, or no matching handler.
+  failed". `ObserverPoisonRejected` fires only after `ObserverDeadLetterFailed`
+  when a delivery is dropped because its poison reason has no dead-letter route or
+  its dead-letter copy is too large for the broker or cannot be encoded. A
+  normally dead-lettered delivery emits `ObserverDeadLetterPublished` instead.
 - **Connecting.** `ObserverConnectionLost` and `ObserverConnectionRestored`
   report transitions; `ObserverDriverSelected` fires once per client.
 - **Scheduling.** `ObserverDrain` surrounds a runner drain,
   `ObserverBacklogSampled` reports a sampled destination, and
-  `ObserverDeadlinePromoted` reports a lane promotion, rate limited per lane.
+  `ObserverDeadlinePromoted` reports a [lane](/learn/glossary#lane) that [jumped the queue when overdue](/learn/glossary#deadline-promotion), rate limited per lane.
 
 A message does not pass through every stage. One rejected before dispatch never
 produces a processing pair, so do not build a dashboard that assumes publish and
@@ -160,10 +177,9 @@ failures.WithLabelValues(
 ).Inc()
 ```
 
-These strings are a public contract and they surface to operators through the
-metric labels the OpenTelemetry adapter emits. The full list is in the
-[observer events reference](/development/observer-events); the mapping from a Go
-error to a class is [`errorClassOf`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/observer_call.go).
+These strings are a public contract and appear as metric labels in the
+OpenTelemetry adapter. The [observer events reference](/development/observer-events)
+lists all values and their meanings.
 
 ## Rules an observer must follow
 
@@ -173,13 +189,13 @@ on different goroutines. For one message, its `Start` happens before its
 `Finish`; between different messages F1 promises no ordering at all.
 
 **Return quickly.** Observer methods run synchronously on the path that emitted
-the event. A slow one stalls intake, dispatch, settlement, or drain. Buffer and
+the event. A slow one stalls intake, dispatch, acks, or drain. Buffer and
 flush elsewhere; do not do I/O inline. F1 applies no timeout to an observer call:
-the path that emitted the event waits for it, and on the settlement path that
-wait can spend the consumer liveness window.
+the path that emitted the event waits for it, and on the ack path that
+wait can use up the time the broker allows before it treats the consumer as dead.
 
 **Panicking is contained but not free.** F1 recovers a panic in an observer so it
-cannot change how a message settles, and logs the first one per kind, but the
+cannot change how a message is acked, and logs the first one per kind, but the
 observation is lost.
 
 **A nil observer is free.** F1 checks for nil before it builds the event, so a
@@ -195,13 +211,13 @@ after the call returns, because the core may reuse its storage.
 client's clock. Derive durations from event timestamps instead of calling
 `time.Now`, so a fake-clock test stays exact.
 
-**Keep metric cardinality bounded.** Do not use a physical destination or a
-message identity as a metric dimension. Use the logical topic, the subscription
+**Keep metric cardinality bounded.** Do not use a [broker queue or topic name](/learn/glossary#physical-destination) or a
+message identity as a metric dimension. Use the [topic name from your code](/learn/glossary#logical-topic), the subscription
 or consumer group, the kind, and the bounded `ErrorClass`.
 
-F1 never calls an observer while holding a client or runner lock, so you cannot
-deadlock the SDK from inside one. The contract is stated on `Observer` and pinned
-by the tests in [`observer_contract_test.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/observer_contract_test.go).
+F1 never calls an observer while holding a client or runner lock, so an observer
+cannot deadlock the SDK from inside one. The public `Observer` contract and the
+[observer events reference](/development/observer-events) define this boundary.
 
 ## Trace context
 
@@ -225,7 +241,7 @@ F1 checks for the interface once and calls it after starting a message build or
 a republish. An injector that is missing or panics does not fail the publish.
 
 One boundary worth knowing: the context from `Start` for `ObserverProcess` is the
-context the handler receives, but settlement and retry publication can run on a
+context the handler receives, but the ack and the retry publish can run on a
 different drain-time context. Trace context crossing a retry or dead-letter hop
 travels on the message, not on a context.
 
@@ -248,7 +264,7 @@ for _, call := range recorder.Calls() {
 `Recorder.Wait` blocks until the recorded calls satisfy a predicate, which is how
 you wait for an event without sleeping.
 
-## Continue from here
+## Go further
 
 - [Observability](/advanced-topics/observability) - the OpenTelemetry adapter, metrics, and operator setup;
 - [Observer events reference](/development/observer-events) - every kind, outcome, error class, and field; and

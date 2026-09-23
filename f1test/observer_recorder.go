@@ -61,17 +61,19 @@ func (r *Recorder) Record(event f1.PointEvent) {
 	r.mu.Unlock()
 }
 
-// Calls returns a copy of every call so far, in call order. Calls is safe for
-// concurrent use and does not expose Recorder's internal slice or finish results.
+// Calls returns a snapshot of recorded calls in call order. It returns nil when
+// there are no calls and copies the call slice and each Finish.Results slice, so
+// changes to those slices do not alter the recorder. Calls is concurrency-safe.
 func (r *Recorder) Calls() []ObserverCall {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return cloneCalls(r.calls)
 }
 
-// Wait blocks until done reports true for the calls so far, or ctx ends. Wait
-// invokes done outside Recorder's mutex and is safe to use concurrently with
-// observer calls and other Wait calls.
+// Wait calls done with copied calls in call order outside the recorder's lock,
+// repeating after new calls arrive until done returns true or ctx ends. It
+// returns nil if done returns true, otherwise ctx.Err(). Concurrent Wait calls
+// may invoke done concurrently, so done must support concurrent calls.
 func (r *Recorder) Wait(ctx context.Context, done func([]ObserverCall) bool) error {
 	for {
 		r.mu.Lock()

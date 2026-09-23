@@ -626,7 +626,7 @@ func TestKafkaGroupTimeoutsReachBrokerGroupMetadata(t *testing.T) {
 	createKafkaTopic(t, admin, ctx, topic, 1)
 
 	producer, err := connection.Producer(ctx, driver.ProducerConfig{
-		RequireDurableAck: true, Effective: connection.Capabilities(),
+		Effective: connection.Capabilities(),
 	})
 	if err != nil {
 		t.Fatalf("Producer: %v", err)

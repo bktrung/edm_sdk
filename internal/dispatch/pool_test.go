@@ -78,32 +78,6 @@ func TestPoolBoundsOrderedBuffer(t *testing.T) {
 	unordered.Close()
 }
 
-func TestQueueIndexKeepsHighBitHashInRange(t *testing.T) {
-	const (
-		queueCount    uint32 = 4
-		key                  = "key-10"
-		expectedHash         = uint32(3421672898) // FNV-1a sum for key-10; high bit set.
-		expectedIndex uint32 = 2
-	)
-
-	hash := fnv.New32a()
-	_, _ = hash.Write([]byte(key))
-	if got := hash.Sum32(); got != expectedHash {
-		t.Fatalf("FNV-1a sum for %q = %d, want %d", key, got, expectedHash)
-	}
-	if expectedHash&0x80000000 == 0 {
-		t.Fatalf("FNV-1a sum for %q = %#x, want high bit set", key, expectedHash)
-	}
-
-	got := queueIndex(hash.Sum32(), queueCount)
-	if got >= queueCount {
-		t.Fatalf("queue index = %d, want range [0, %d)", got, queueCount)
-	}
-	if got != expectedIndex {
-		t.Fatalf("queue index for %q = %d, want %d", key, got, expectedIndex)
-	}
-}
-
 func TestQueueIndexPreservesFNVDistribution(t *testing.T) {
 	const queueCount uint32 = 4
 	tests := []struct {
@@ -117,7 +91,7 @@ func TestQueueIndexPreservesFNVDistribution(t *testing.T) {
 		{key: "beta", hash: 2944525511, expected: 3},
 		{key: "key-0", hash: 1491088857, expected: 1},
 		{key: "key-1", hash: 1474311238, expected: 2},
-		{key: "key-10", hash: 3421672898, expected: 2},
+		{key: "key-10", hash: 3421672898, expected: 2}, // high bit set
 		{key: "key-11", hash: 3438450517, expected: 1},
 	}
 

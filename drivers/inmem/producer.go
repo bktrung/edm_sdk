@@ -16,6 +16,7 @@ type producer struct {
 
 var _ driver.Producer = (*producer)(nil)
 
+// Publish sends messages to their configured destinations and waits for the in-memory broker to accept them.
 func (p *producer) Publish(ctx context.Context, messages ...driver.OutboundMessage) error {
 	if err := ctx.Err(); err != nil {
 		return classify("publish", driver.KindTransient, err)
@@ -83,6 +84,7 @@ func headerBytes(headers []driver.Header) int {
 	return total
 }
 
+// Close releases the producer. Further publish calls return an error.
 func (p *producer) Close(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
 		return classify("producer.close", driver.KindTransient, err)

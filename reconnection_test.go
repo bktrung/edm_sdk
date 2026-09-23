@@ -15,6 +15,7 @@ import (
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/clock"
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/lifecycle"
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/retry"
+	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/sched"
 )
 
 type reconnectTestDriver struct {
@@ -29,6 +30,14 @@ type reconnectTestDriver struct {
 	connections      []*reconnectTestConn
 	created          chan *reconnectTestConsumer
 	prefetches       []int
+	consumerConfigs  []driver.ConsumerConfig
+	// refuseTopology, when set, is the answer every connection after the
+	// first gives to an EnsureTopology call.
+	refuseTopology func(driver.TopologySpec) error
+	// firstCloseGate, when set, holds the first connection's Close until it is
+	// closed, the way a driver whose teardown hangs on a dead broker does.
+	firstCloseGate    chan struct{}
+	firstCloseEntered atomic.Bool
 }
 
 func (d *reconnectTestDriver) Name() string { return "reconnect-test" }
@@ -48,7 +57,11 @@ func (d *reconnectTestDriver) Open(context.Context, driver.Config) (driver.Conn,
 		}
 		return nil, &driver.Error{Driver: d.Name(), Op: "open", K: driver.KindTransient, Err: errors.New("open failed")}
 	}
-	conn := &reconnectTestConn{driver: d, admin: &reconnectTestAdmin{}}
+	admin := &reconnectTestAdmin{}
+	if d.opens > 1 {
+		admin.refuse = d.refuseTopology
+	}
+	conn := &reconnectTestConn{driver: d, admin: admin}
 	d.connections = append(d.connections, conn)
 	return conn, nil
 }
@@ -138,6 +151,7 @@ func (c *reconnectTestConn) Producer(context.Context, driver.ProducerConfig) (dr
 func (c *reconnectTestConn) Consumer(ctx context.Context, cfg driver.ConsumerConfig) (driver.Consumer, error) {
 	c.driver.mu.Lock()
 	c.driver.prefetches = append(c.driver.prefetches, cfg.Prefetch)
+	c.driver.consumerConfigs = append(c.driver.consumerConfigs, cfg)
 	if c.driver.failConsumers > 0 {
 		c.driver.failConsumers--
 		err := c.driver.consumerErr
@@ -175,6 +189,14 @@ func (c *reconnectTestConn) Consumer(ctx context.Context, cfg driver.ConsumerCon
 func (c *reconnectTestConn) Admin() driver.Admin      { return c.admin }
 func (*reconnectTestConn) Ping(context.Context) error { return nil }
 func (c *reconnectTestConn) Close(context.Context) error {
+	c.driver.mu.Lock()
+	gate := c.driver.firstCloseGate
+	first := len(c.driver.connections) > 0 && c.driver.connections[0] == c
+	c.driver.mu.Unlock()
+	if gate != nil && first {
+		c.driver.firstCloseEntered.Store(true)
+		<-gate
+	}
 	c.openAtClose.Store(c.openConsumers.Load())
 	if c.refuseCloseWithConsumers.Load() && c.openConsumers.Load() > 0 {
 		return &driver.Error{
@@ -190,11 +212,36 @@ func (c *reconnectTestConn) Close(context.Context) error {
 
 type reconnectTestAdmin struct {
 	ensures atomic.Int32
+	mu      sync.Mutex
+	specs   []driver.TopologySpec
+	refuse  func(driver.TopologySpec) error
 }
 
-func (a *reconnectTestAdmin) EnsureTopology(context.Context, driver.TopologySpec) (driver.TopologyDiff, error) {
+func (a *reconnectTestAdmin) EnsureTopology(_ context.Context, spec driver.TopologySpec) (driver.TopologyDiff, error) {
 	a.ensures.Add(1)
+	if a.refuse != nil {
+		if err := a.refuse(spec); err != nil {
+			return driver.TopologyDiff{}, err
+		}
+	}
+	a.mu.Lock()
+	a.specs = append(a.specs, spec)
+	a.mu.Unlock()
 	return driver.TopologyDiff{}, nil
+}
+
+// ensuredDestinations reports every destination name an EnsureTopology call on
+// this admin carried.
+func (a *reconnectTestAdmin) ensuredDestinations() map[string]struct{} {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	names := make(map[string]struct{})
+	for _, spec := range a.specs {
+		for _, destination := range spec.Destinations {
+			names[destination.Name] = struct{}{}
+		}
+	}
+	return names
 }
 
 func (*reconnectTestAdmin) DescribeTopology(context.Context, []string) (driver.TopologyState, error) {
@@ -607,50 +654,43 @@ func TestRequestReconnectCancellationStillFinishesItsAttempt(t *testing.T) {
 	}
 }
 
-func TestReconnectStartUsesConfiguredLogger(t *testing.T) {
-	defaultOutput := captureProcessDefault(t)
-	var configuredOutput logSink
-	fake := clock.NewFake(time.Unix(450, 0))
-	recorded := &recordingClock{Fake: fake}
-	d := &reconnectTestDriver{created: make(chan *reconnectTestConsumer, 1)}
-	client := newReconnectTestClientWithLogger(
-		t,
-		d,
-		recorded,
-		0,
-		slog.New(slog.NewTextHandler(&configuredOutput, nil)),
-	)
-	cause := errors.New("configured reconnect cause")
-	err := client.requestReconnect(cause, 0)
-	if err != nil {
-		t.Fatal(err)
+func TestReconnectStartLogsToTheClientLogger(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		configured bool
+	}{
+		{name: "configured logger", configured: true},
+		{name: "process default without a configured logger"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			defaultOutput := captureProcessDefault(t)
+			var configuredOutput logSink
+			var logger *slog.Logger
+			if test.configured {
+				logger = slog.New(slog.NewTextHandler(&configuredOutput, nil))
+			}
+			fake := clock.NewFake(time.Unix(450, 0))
+			recorded := &recordingClock{Fake: fake}
+			d := &reconnectTestDriver{created: make(chan *reconnectTestConsumer, 1)}
+			client := newReconnectTestClientWithLogger(t, d, recorded, 0, logger)
+			cause := errors.New("reconnect cause for " + test.name)
+			if err := client.requestReconnect(cause, 0); err != nil {
+				t.Fatal(err)
+			}
+			advanceReconnect(t, recorded, 500*time.Millisecond, 1)
+			if err := client.awaitRebuild(context.Background(), nil, 0, nil); err != nil {
+				t.Fatalf("reconnect = %v, want nil", err)
+			}
+			if !test.configured {
+				assertReconnectStartedLog(t, defaultOutput.String(), cause)
+				return
+			}
+			assertReconnectStartedLog(t, configuredOutput.String(), cause)
+			if got := defaultOutput.String(); got != "" {
+				t.Fatalf("process default output = %q, want empty", got)
+			}
+		})
 	}
-	advanceReconnect(t, recorded, 500*time.Millisecond, 1)
-	if err := client.awaitRebuild(context.Background(), nil, 0, nil); err != nil {
-		t.Fatalf("reconnect = %v, want nil", err)
-	}
-	assertReconnectStartedLog(t, configuredOutput.String(), cause)
-	if got := defaultOutput.String(); got != "" {
-		t.Fatalf("process default output = %q, want empty", got)
-	}
-}
-
-func TestReconnectStartUsesProcessDefaultWithoutConfiguredLogger(t *testing.T) {
-	defaultOutput := captureProcessDefault(t)
-	fake := clock.NewFake(time.Unix(450, 0))
-	recorded := &recordingClock{Fake: fake}
-	d := &reconnectTestDriver{created: make(chan *reconnectTestConsumer, 1)}
-	client := newReconnectTestClientWithLogger(t, d, recorded, 0, nil)
-	cause := errors.New("default reconnect cause")
-	err := client.requestReconnect(cause, 0)
-	if err != nil {
-		t.Fatal(err)
-	}
-	advanceReconnect(t, recorded, 500*time.Millisecond, 1)
-	if err := client.awaitRebuild(context.Background(), nil, 0, nil); err != nil {
-		t.Fatalf("reconnect = %v, want nil", err)
-	}
-	assertReconnectStartedLog(t, defaultOutput.String(), cause)
 }
 
 func TestRunnerReconnectReportsGenerationCause(t *testing.T) {
@@ -1055,6 +1095,81 @@ func TestFatalConsumerErrorStopsOnlyItsRunner(t *testing.T) {
 	case err := <-healthyDone:
 		t.Fatalf("healthy runner stopped after sibling fatal error: %v", err)
 	default:
+	}
+}
+
+func TestAHungRetiredConnectionCloseEndsTheReconnectAndCloseWaitsForIt(t *testing.T) {
+	d := &reconnectTestDriver{created: make(chan *reconnectTestConsumer, 1), firstCloseGate: make(chan struct{})}
+	client := newReconnectTestClient(t, d, nil, 0)
+	t.Cleanup(func() { close(d.firstCloseGate) })
+	cause := &driver.Error{Driver: d.Name(), Op: "publish", K: driver.KindTransient, Err: errors.New("connection reset")}
+	if err := client.requestReconnect(cause, 1); err != nil {
+		t.Fatal(err)
+	}
+	waitReconnectCondition(t, d.firstCloseEntered.Load)
+	// The new connection is installed; a retired connection whose Close hangs
+	// must not keep the client reconnecting past the close bound.
+	waitReconnectCondition(t, func() bool { return !client.isReconnecting() })
+	if err := client.Close(context.Background()); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+	select {
+	case <-client.supervisorDone:
+	default:
+		t.Fatal("Close() returned while the reconnect supervisor was still running")
+	}
+}
+
+func TestSevereConsumerErrorKeepsTheErrorReaderAlive(t *testing.T) {
+	d := &reconnectTestDriver{created: make(chan *reconnectTestConsumer, 1)}
+	recorder := newErrorHandlerRecorder()
+	client := newReconnectTestClient(t, d, nil, 0, WithErrorHandler(recorder.handle))
+	runner, err := client.Subscribe(context.Background(), Subscription{
+		Name:           "severe",
+		Topics:         []string{"orders.created"},
+		Prefetch:       12,
+		HandlerTimeout: 10 * time.Millisecond,
+		Handlers: map[string]Handler{
+			"orders.created": HandlerFunc(func(context.Context, *Event) error { return nil }),
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	done := make(chan error, 1)
+	go func() { done <- runner.Run(ctx) }()
+
+	var consumer *reconnectTestConsumer
+	select {
+	case consumer = <-d.created:
+	case <-clock.NewReal().Timer(2 * time.Second).C:
+		t.Fatal("timed out waiting for the subscription consumer")
+	}
+	waitReconnectCondition(t, func() bool { return runner.lifecycle.State() == lifecycle.Ready })
+
+	consumer.sendError(&driver.Error{Driver: d.Name(), Op: "consumer", K: driver.KindNotFound, Err: errors.New("queue missing")})
+	recorder.waitForCall(t, time.Second)
+	if state := runner.lifecycle.State(); state != lifecycle.Ready {
+		t.Fatalf("state after a not-found consumer error = %s, want ready", state)
+	}
+
+	// A fatal error after the severe one must still reach the core, so the
+	// reader has to keep draining Errors() once it has reported the first.
+	fatal := &driver.Error{Driver: d.Name(), Op: "consumer", K: driver.KindFatal, Err: errors.New("permission denied")}
+	consumer.sendError(fatal)
+	select {
+	case runErr := <-done:
+		// Run returns the first failure it saw, which is the not-found error.
+		if runErr == nil {
+			t.Fatal("Run() = nil, want the runner's failure")
+		}
+	case <-clock.NewReal().Timer(2 * time.Second).C:
+		t.Fatal("a fatal consumer error after a not-found one did not stop the runner")
+	}
+	if state := runner.lifecycle.State(); state != lifecycle.Failed {
+		t.Fatalf("state = %s, want failed", state)
 	}
 }
 
@@ -3208,4 +3323,498 @@ func TestRetiredConnectionClosesOnlyAfterTheAbandonedRunnerReleases(t *testing.T
 	if err := client.Health(context.Background()); err != nil {
 		t.Fatalf("Health() after the reconnect = %v, want nil", err)
 	}
+}
+
+// TestReconnectRetriesAFailedReleaseBeforeClosingTheReplacedConnection proves
+// that a consumer the abandon could not release is released again before the
+// swap closes the connection carrying it. A driver refuses to close a
+// connection that still has a consumer on it, so without the retry the
+// replaced connection is never retired.
+func TestReconnectRetriesAFailedReleaseBeforeClosingTheReplacedConnection(t *testing.T) {
+	fake := clock.NewFake(time.Unix(870, 0))
+	recorded := &recordingClock{Fake: fake, sleepStarted: make(chan chan struct{}, 4)}
+	d := &reconnectTestDriver{created: make(chan *reconnectTestConsumer, 8)}
+	client := newReconnectTestClient(t, d, recorded, 0)
+	client.reconnectRandom = func() float64 { return 0 }
+
+	var causingHandled, victimHandled atomic.Int32
+	causing := namedRunner(t, client, "causing", &causingHandled)
+	victim := namedRunner(t, client, "victim", &victimHandled)
+	consumers, _ := startRunners(t, d, map[string]*Runner{"causing": causing, "victim": victim})
+	waitReconnectCondition(t, func() bool {
+		return runnerState(causing) == lifecycle.Ready && runnerState(victim) == lifecycle.Ready
+	})
+	d.mu.Lock()
+	retiring := d.connections[0]
+	d.mu.Unlock()
+	retiring.refuseCloseWithConsumers.Store(true)
+	consumers["victim"].setFailRelease(1, errors.New("release failed"))
+
+	d.setFailConsumers(1)
+	consumers["causing"].sendError(consumerTransient(d, "causing consumer disconnected"))
+	advanceReconnect(t, recorded, 0, 1)
+	waitReconnectCondition(t, func() bool { return !client.isReconnecting() })
+
+	if !retiring.closed.Load() {
+		t.Fatal("the replaced connection was not closed after the failed release was retried")
+	}
+	if got := retiring.openAtClose.Load(); got != 0 {
+		t.Fatalf("consumers open when the replaced connection closed = %d, want 0", got)
+	}
+	if got := retiring.openConsumers.Load(); got != 0 {
+		t.Fatalf("consumers left on the replaced connection = %d, want 0", got)
+	}
+}
+
+// TestCallerCanceledPublishDoesNotRequestReconnect proves that a publish its
+// own caller canceled says nothing about the connection: a shutdown that
+// cancels its in-flight publishes must not start a reconnect. A publish that
+// ran out of time still does, because a broker that stopped confirming is what
+// runs a publish past its deadline.
+func TestCallerCanceledPublishDoesNotRequestReconnect(t *testing.T) {
+	fake := clock.NewFake(time.Unix(500, 0))
+	recorded := &recordingClock{Fake: fake}
+	d := &reconnectTestDriver{created: make(chan *reconnectTestConsumer, 4)}
+	client := newReconnectTestClient(t, d, recorded, 0)
+	transient := &driver.Error{Driver: d.Name(), Op: "publish", K: driver.KindTransient, Err: context.Canceled}
+
+	canceled, cancel := context.WithCancel(context.Background())
+	cancel()
+	requestReconnectOnTransient(canceled, client, transient, 1)
+	if client.isReconnecting() {
+		t.Fatal("a publish its caller canceled requested a reconnect")
+	}
+
+	expired, cancelExpired := context.WithDeadline(context.Background(), time.Unix(0, 0))
+	defer cancelExpired()
+	requestReconnectOnTransient(expired, client, transient, 1)
+	if !client.isReconnecting() {
+		t.Fatal("a publish that ran past its deadline did not request a reconnect")
+	}
+}
+
+// TestCallerCanceledPublishReportsATransportFailure proves that a publish its
+// caller gave up on can still be the call that noticed a broken connection:
+// only an error reporting the caller's own cancellation is about the caller,
+// so only that one suppresses the reconnect.
+func TestCallerCanceledPublishReportsATransportFailure(t *testing.T) {
+	fake := clock.NewFake(time.Unix(505, 0))
+	recorded := &recordingClock{Fake: fake}
+	d := &reconnectTestDriver{created: make(chan *reconnectTestConsumer, 4)}
+	client := newReconnectTestClient(t, d, recorded, 0)
+	transport := &driver.Error{Driver: d.Name(), Op: "publish", K: driver.KindTransient, Err: errors.New("connection reset by peer")}
+
+	canceled, cancel := context.WithCancel(context.Background())
+	cancel()
+	requestReconnectOnTransient(canceled, client, transport, 1)
+	if !client.isReconnecting() {
+		t.Fatal("a publish that failed on the connection did not request a reconnect because its caller canceled")
+	}
+}
+
+// TestReconnectReplaysSubscriptionTopologyOnTheReplacementConnection proves
+// that the replacement connection learns every subscription's delayed
+// destinations before it is installed. A handler still running when the swap
+// lands publishes its retry successor on the new connection before its runner
+// reopens, and a driver routes a delayed destination only from what an
+// EnsureTopology call on that connection told it.
+func TestReconnectReplaysSubscriptionTopologyOnTheReplacementConnection(t *testing.T) {
+	fake := clock.NewFake(time.Unix(510, 0))
+	recorded := &recordingClock{Fake: fake, sleepStarted: make(chan chan struct{}, 4)}
+	d := &reconnectTestDriver{created: make(chan *reconnectTestConsumer, 4)}
+	client := newReconnectTestClient(t, d, recorded, 0)
+	client.reconnectRandom = func() float64 { return 0 }
+
+	// The runner is never run, so nothing but the reconnect can ensure its
+	// topology on the replacement connection.
+	runner, err := client.Subscribe(context.Background(), Subscription{
+		Name:           "orders",
+		Topics:         []string{"orders.created"},
+		Prefetch:       12,
+		HandlerTimeout: 10 * time.Millisecond,
+		Retry:          RetryConfig{MaxAttempts: 2, InitialInterval: 250 * time.Millisecond},
+		Handlers: map[string]Handler{
+			"orders.created": HandlerFunc(func(context.Context, *Event) error { return nil }),
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	client.mu.Lock()
+	want := subscriptionTopologySpecs(client.effective, client.source, runner.subscription)
+	client.mu.Unlock()
+	var delayed []string
+	for _, destination := range want.Destinations {
+		if destination.Delay > 0 {
+			delayed = append(delayed, destination.Name)
+		}
+	}
+	if len(delayed) == 0 {
+		t.Fatal("the subscription declares no delayed destination to route retries through")
+	}
+
+	if err := client.requestReconnect(errors.New("transient"), 0); err != nil {
+		t.Fatalf("requestReconnect = %v, want nil", err)
+	}
+	select {
+	case token := <-recorded.sleepStarted:
+		<-token
+	case <-clock.NewReal().Timer(2 * time.Second).C:
+		t.Fatal("reconnect sleep did not start")
+	}
+	fake.Advance(0)
+	waitReconnectCondition(t, func() bool { return !client.isReconnecting() })
+
+	d.mu.Lock()
+	connections := append([]*reconnectTestConn(nil), d.connections...)
+	d.mu.Unlock()
+	if len(connections) != 2 {
+		t.Fatalf("driver connections after the reconnect = %d, want 2", len(connections))
+	}
+	ensured := connections[1].admin.ensuredDestinations()
+	for _, name := range delayed {
+		if _, ok := ensured[name]; !ok {
+			t.Fatalf("replacement connection was installed without the delayed destination %q", name)
+		}
+	}
+}
+
+// TestReconnectReplaysSubscriptionTopologiesConcurrently proves that one
+// reconnect replays several subscriptions' topologies at once, bounded by
+// topologyReplayConcurrency, instead of waiting for each destination family
+// before it starts the next. The gate holds every replay, so a serial replay
+// never reaches the second entry at all.
+func TestReconnectReplaysSubscriptionTopologiesConcurrently(t *testing.T) {
+	const subscriptions = 6
+	fake := clock.NewFake(time.Unix(530, 0))
+	recorded := &recordingClock{Fake: fake, sleepStarted: make(chan chan struct{}, 4)}
+	d := &reconnectTestDriver{created: make(chan *reconnectTestConsumer, 4)}
+	client := newReconnectTestClient(t, d, recorded, 0)
+	client.reconnectRandom = func() float64 { return 0 }
+
+	gate := make(chan struct{})
+	entered := make(chan struct{}, subscriptions)
+	var concurrent, peak atomic.Int32
+	d.refuseTopology = func(driver.TopologySpec) error {
+		current := concurrent.Add(1)
+		for {
+			observed := peak.Load()
+			if current <= observed || peak.CompareAndSwap(observed, current) {
+				break
+			}
+		}
+		entered <- struct{}{}
+		<-gate
+		concurrent.Add(-1)
+		return nil
+	}
+
+	names := []string{"orders-a", "orders-b", "orders-c", "orders-d", "orders-e", "orders-f"}
+	for _, name := range names {
+		if _, err := client.Subscribe(context.Background(), Subscription{
+			Name:           name,
+			Topics:         []string{"orders.created"},
+			HandlerTimeout: 10 * time.Millisecond,
+			Handlers: map[string]Handler{
+				"orders.created": HandlerFunc(func(context.Context, *Event) error { return nil }),
+			},
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := client.requestReconnect(errors.New("connection lost"), 0); err != nil {
+		t.Fatal(err)
+	}
+	advanceReconnect(t, recorded, 0, 1)
+	for range topologyReplayConcurrency {
+		select {
+		case <-entered:
+		case <-clock.NewReal().Timer(2 * time.Second).C:
+			t.Fatalf("the replay did not run %d subscription topologies at once", topologyReplayConcurrency)
+		}
+	}
+	close(gate)
+	waitReconnectCondition(t, func() bool { return !client.isReconnecting() })
+
+	if got := peak.Load(); got != topologyReplayConcurrency {
+		t.Fatalf("topology replay concurrency = %d, want %d", got, topologyReplayConcurrency)
+	}
+	d.mu.Lock()
+	connections := append([]*reconnectTestConn(nil), d.connections...)
+	d.mu.Unlock()
+	if len(connections) != 2 {
+		t.Fatalf("driver connections after the reconnect = %d, want 2", len(connections))
+	}
+	connections[1].admin.mu.Lock()
+	replays := len(connections[1].admin.specs)
+	connections[1].admin.mu.Unlock()
+	if replays != subscriptions {
+		t.Fatalf("replayed topologies on the replacement connection = %d, want %d", replays, subscriptions)
+	}
+}
+
+// TestReconnectInstallsTheConnectionWhenOneSubscriptionTopologyIsRefused proves
+// that a broker refusing one subscription's topology on the replacement
+// connection does not keep the client on the old one: the connection is
+// installed, the other subscription's topology is on it, and the refused
+// subscription is left for its own runner to report when it reopens.
+func TestReconnectInstallsTheConnectionWhenOneSubscriptionTopologyIsRefused(t *testing.T) {
+	fake := clock.NewFake(time.Unix(520, 0))
+	recorded := &recordingClock{Fake: fake, sleepStarted: make(chan chan struct{}, 4)}
+	d := &reconnectTestDriver{created: make(chan *reconnectTestConsumer, 4)}
+	client := newReconnectTestClient(t, d, recorded, 0)
+	client.reconnectRandom = func() float64 { return 0 }
+
+	subscribe := func(name, topic string) *Runner {
+		t.Helper()
+		runner, err := client.Subscribe(context.Background(), Subscription{
+			Name:           name,
+			Topics:         []string{topic},
+			HandlerTimeout: 10 * time.Millisecond,
+			Retry:          RetryConfig{MaxAttempts: 2, InitialInterval: 250 * time.Millisecond},
+			Handlers: map[string]Handler{
+				topic: HandlerFunc(func(context.Context, *Event) error { return nil }),
+			},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return runner
+	}
+	orders := subscribe("orders", "orders.created")
+	subscribe("billing", "billing.charged")
+
+	refused := &driver.Error{Driver: d.Name(), Op: "ensure_topology", K: driver.KindFatal, Err: errors.New("precondition failed")}
+	d.mu.Lock()
+	d.refuseTopology = func(spec driver.TopologySpec) error {
+		for _, destination := range spec.Destinations {
+			if strings.Contains(destination.Name, "billing") {
+				return refused
+			}
+		}
+		return nil
+	}
+	d.mu.Unlock()
+
+	if err := client.requestReconnect(errors.New("transient"), 0); err != nil {
+		t.Fatalf("requestReconnect = %v, want nil", err)
+	}
+	select {
+	case token := <-recorded.sleepStarted:
+		<-token
+	case <-clock.NewReal().Timer(2 * time.Second).C:
+		t.Fatal("reconnect sleep did not start")
+	}
+	fake.Advance(0)
+	waitReconnectCondition(t, func() bool { return !client.isReconnecting() })
+
+	d.mu.Lock()
+	connections := append([]*reconnectTestConn(nil), d.connections...)
+	d.mu.Unlock()
+	if len(connections) != 2 {
+		t.Fatalf("driver connections after the reconnect = %d, want 2", len(connections))
+	}
+	client.mu.Lock()
+	installed := client.current.conn == driver.Conn(connections[1])
+	epoch := client.current.epoch
+	want := subscriptionTopologySpecs(client.effective, client.source, orders.subscription)
+	client.mu.Unlock()
+	if !installed || epoch != 2 {
+		t.Fatalf("installed replacement = %v at epoch %d, want the replacement at epoch 2", installed, epoch)
+	}
+	if connections[1].closed.Load() {
+		t.Fatal("the replacement connection was closed after one subscription's topology was refused")
+	}
+	ensured := connections[1].admin.ensuredDestinations()
+	for _, destination := range want.Destinations {
+		if _, ok := ensured[destination.Name]; !ok {
+			t.Fatalf("replacement connection is missing the orders destination %q", destination.Name)
+		}
+	}
+}
+
+// TestConsumerOpenCapsOnlyTheDestinationsItDeclares pins that the open sizes
+// each destination's cap from the capabilities it read with the connection. A
+// capability change that lands during the open's topology call must not key
+// the caps on destinations the consumer was never given.
+func TestConsumerOpenCapsOnlyTheDestinationsItDeclares(t *testing.T) {
+	d := &reconnectTestDriver{created: make(chan *reconnectTestConsumer, 4)}
+	client := newReconnectTestClient(t, d, clock.NewReal(), 0)
+	runner, err := client.Subscribe(context.Background(), Subscription{
+		Name:           "orders",
+		Topics:         []string{"orders.created"},
+		HandlerTimeout: 10 * time.Millisecond,
+		Retry:          RetryConfig{MaxAttempts: 2, InitialInterval: 250 * time.Millisecond},
+		Handlers: map[string]Handler{
+			"orders.created": HandlerFunc(func(context.Context, *Event) error { return nil }),
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	d.mu.Lock()
+	admin := d.connections[0].admin
+	d.mu.Unlock()
+	admin.refuse = func(driver.TopologySpec) error {
+		client.mu.Lock()
+		client.effective.Fanout = driver.FanoutAtPublish
+		client.mu.Unlock()
+		return nil
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	runDone := make(chan error, 1)
+	go func() { runDone <- runner.Run(ctx) }()
+	openTimer := clock.NewReal().Timer(time.Second)
+	defer openTimer.Stop()
+	select {
+	case <-d.created:
+	case <-openTimer.C:
+		t.Fatal("consumer did not open")
+	}
+	cancel()
+	<-runDone
+
+	d.mu.Lock()
+	cfg := d.consumerConfigs[0]
+	d.mu.Unlock()
+	declared := make(map[string]bool, len(cfg.Destinations))
+	for _, destination := range cfg.Destinations {
+		declared[destination] = true
+	}
+	for destination := range cfg.PerDestination {
+		if !declared[destination] {
+			t.Fatalf("cap keyed on %q, which is not among the declared destinations %v", destination, cfg.Destinations)
+		}
+	}
+}
+
+// TestSchedulerLanesUseTheDestinationsTheConsumerDeclares pins that the
+// scheduler and the deadline-promotion table are built from the plan the
+// consumer open established. A capability change that lands during the open's
+// topology call must not hand the pipeline a lane for a destination that
+// consumer was never given.
+func TestSchedulerLanesUseTheDestinationsTheConsumerDeclares(t *testing.T) {
+	d := &reconnectTestDriver{created: make(chan *reconnectTestConsumer, 4)}
+	client := newReconnectTestClient(t, d, clock.NewReal(), 0)
+	runner, err := client.Subscribe(context.Background(), Subscription{
+		Name:           "orders",
+		Topics:         []string{"orders.created"},
+		Priorities:     []Priority{PriorityHigh, PriorityLow},
+		HandlerTimeout: 10 * time.Millisecond,
+		Retry:          RetryConfig{MaxAttempts: 2, InitialInterval: 250 * time.Millisecond},
+		Handlers: map[string]Handler{
+			"orders.created": HandlerFunc(func(context.Context, *Event) error { return nil }),
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	d.mu.Lock()
+	admin := d.connections[0].admin
+	d.mu.Unlock()
+	admin.refuse = func(driver.TopologySpec) error {
+		client.mu.Lock()
+		client.effective.Fanout = driver.FanoutAtPublish
+		client.mu.Unlock()
+		return nil
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	runDone := make(chan error, 1)
+	go func() { runDone <- runner.Run(ctx) }()
+	openTimer := clock.NewReal().Timer(time.Second)
+	defer openTimer.Stop()
+	select {
+	case <-d.created:
+	case <-openTimer.C:
+		t.Fatal("consumer did not open")
+	}
+
+	d.mu.Lock()
+	cfg := d.consumerConfigs[0]
+	d.mu.Unlock()
+	declared := make(map[string]bool, len(cfg.Destinations))
+	for _, destination := range cfg.Destinations {
+		declared[destination] = true
+	}
+	plan := runnerLanePlan(runner)
+	if len(plan) == 0 {
+		t.Fatal("the runner has no lane plan after the open")
+	}
+	scheduler, err := newRunnerScheduler(runner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, lane := range plan {
+		if !declared[lane.destination] {
+			t.Fatalf("lane %s feeds destination %q, which is not among the declared destinations %v", lane.id, lane.destination, cfg.Destinations)
+		}
+		if err := scheduler.Enqueue(lane.id, sched.Item{}); err != nil {
+			t.Fatalf("scheduler does not carry lane %s: %v", lane.id, err)
+		}
+	}
+	for id, lane := range newPromotionLimiter(runner).lanes {
+		if !declared[lane.destination] {
+			t.Fatalf("promotion lane %s feeds destination %q, which is not among the declared destinations %v", id, lane.destination, cfg.Destinations)
+		}
+	}
+	cancel()
+	<-runDone
+}
+
+// TestPublishStartedDuringReconnectIsRefusedAtEntry pins that a publish that
+// begins while a reconnect waits for in-flight publishes is refused before it
+// is counted. Counted, it would hold the wait open, and callers retrying in a
+// loop could keep the reconnect from ever replacing the connection.
+func TestPublishStartedDuringReconnectIsRefusedAtEntry(t *testing.T) {
+	codecFixture := blockingCodec{
+		encodeStarted:     make(chan struct{}),
+		encodeStartedOnce: make(chan struct{}),
+		encodeRelease:     make(chan struct{}),
+	}
+	fake := clock.NewFake(time.Unix(160, 0))
+	recorded := &recordingClock{Fake: fake}
+	d := &reconnectTestDriver{created: make(chan *reconnectTestConsumer, 8)}
+	client := newReconnectTestClient(t, d, recorded, 0, WithCodec(codecFixture))
+	client.reconnectRandom = func() float64 { return 1 }
+
+	firstDone := make(chan error, 1)
+	go func() {
+		_, err := client.Publisher().Publish(context.Background(), "orders.created", map[string]string{"value": "first"})
+		firstDone <- err
+	}()
+	encodeTimer := clock.NewReal().Timer(time.Second)
+	defer encodeTimer.Stop()
+	select {
+	case <-codecFixture.encodeStarted:
+	case <-encodeTimer.C:
+		t.Fatal("first publish did not reach the codec")
+	}
+	if err := client.requestReconnect(errors.New("transient"), 0); err != nil {
+		t.Fatal(err)
+	}
+
+	secondDone := make(chan error, 1)
+	go func() {
+		_, err := client.Publisher().Publish(context.Background(), "orders.created", map[string]string{"value": "second"})
+		secondDone <- err
+	}()
+	timer := clock.NewReal().Timer(time.Second)
+	defer timer.Stop()
+	select {
+	case err := <-secondDone:
+		if !errors.Is(err, errClientReconnecting) {
+			t.Fatalf("Publish() during reconnect = %v, want errClientReconnecting", err)
+		}
+	case <-timer.C:
+		close(codecFixture.encodeRelease)
+		t.Fatal("a publish started during the reconnect was admitted and held the in-flight wait")
+	}
+
+	close(codecFixture.encodeRelease)
+	if err := <-firstDone; !errors.Is(err, errClientReconnecting) {
+		t.Fatalf("first Publish() = %v, want errClientReconnecting", err)
+	}
+	waitReconnectCondition(t, func() bool { return recorded.sleepCount() == 1 })
 }

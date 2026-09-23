@@ -39,6 +39,37 @@ func TestConsumerHoldRuleRefusesSecondRecordOfPartition(t *testing.T) {
 	}
 }
 
+// TestConsumerRestorePendingHeadKeepsARequeueBehindTheRefusedRecord pins the two
+// shapes the head restore meets. A queue that is still the one the admission
+// pass narrowed gets its head back, and a queue a requeue moved onto the
+// partition while the record was out keeps the requeue, with the refused record
+// in front of it, which is the order the two are delivered in.
+func TestConsumerRestorePendingHeadKeepsARequeueBehindTheRefusedRecord(t *testing.T) {
+	c, key := newHoldRuleConsumer(t, holdRuleBudget)
+	refused := holdRuleRecord(key, 0)
+	behind := holdRuleRecord(key, 1)
+	requeued := holdRuleRecord(key, 2)
+
+	// The queue as the admission pass reads it, before it narrows past the head.
+	queue := []*kgo.Record{refused, behind}
+	c.mu.Lock()
+	c.pending[key] = queue[1:]
+	c.mu.Unlock()
+	c.restorePendingHeadLocked(key, refused)
+	if got := queuedRecords(c, key); len(got) != 2 || got[0] != refused || got[1] != behind {
+		t.Fatalf("restored queue = %v, want the refused record in front of %v", got, behind)
+	}
+
+	// The same pass, with a requeue landing between the removal and the restore.
+	c.mu.Lock()
+	c.pending[key] = []*kgo.Record{requeued, behind}
+	c.mu.Unlock()
+	c.restorePendingHeadLocked(key, refused)
+	if got := queuedRecords(c, key); len(got) != 3 || got[0] != refused || got[1] != requeued || got[2] != behind {
+		t.Fatalf("restored queue = %v, want the refused record in front of the requeue %v", got, requeued)
+	}
+}
+
 func TestConsumerHoldRuleKeepsARequeuePendingPartitionOffTheHold(t *testing.T) {
 	c, key := newHoldRuleConsumer(t, holdRuleBudget)
 	limit := c.readAheadLimit(key.destination)
@@ -159,4 +190,43 @@ func holdRuleDelivery(t *testing.T, c *consumer) driver.InboundMessage {
 		t.Fatal("timed out waiting for hold-rule delivery")
 		return driver.InboundMessage{}
 	}
+}
+
+// TestSettlementDoesNotRaceADrainingRevoke settles a delivery while a revoke
+// of its partition lands during drain. The revoke clears the settler's
+// tracker under the consumer lock, so the settlement must read it under the
+// same lock; run with -race.
+func TestSettlementDoesNotRaceADrainingRevoke(t *testing.T) {
+	for range 20 {
+		c, key := newHoldRuleConsumer(t, holdRuleBudget)
+		record := holdRuleRecord(key, 0)
+		c.tagRecord(record)
+		seedQueuedRecords(c, record)
+		if !c.flushPending() {
+			t.Fatal("flushPending returned false")
+		}
+		delivery := holdRuleDelivery(t, c)
+		c.mu.Lock()
+		c.draining = true
+		c.mu.Unlock()
+		ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+		started := make(chan struct{})
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			close(started)
+			_ = delivery.Settle.Ack(ctx)
+		}()
+		<-started
+		c.dropTracker(key.destination, key.partition)
+		<-done
+		cancel()
+	}
+}
+
+// tagRecord is tagRecordLocked for a test that does not hold c.mu.
+func (c *consumer) tagRecord(record *kgo.Record) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.tagRecordLocked(record)
 }

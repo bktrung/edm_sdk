@@ -124,14 +124,14 @@ func runDeferred(group *groupContext) {
 			t.Fatalf("first delivery destination=%q, want control %q", controlMessage.Destination, control)
 		}
 		ackMessage(t, group, controlMessage)
-		assertNoDelivery(t, group, consumer, "deferred message before its due time")
+		assertNoDeliveryBefore(t, group, consumer, due, "deferred message before its due time")
 		advanceDeferredTo(group, due)
 		message := receiveBefore(t, group, consumer, due.Add(deferredLateBound), "deferred message at its due time")
 		if message.Destination != deferred || message.ReceivedAt.Before(due) {
 			t.Fatalf("delivery=%+v, want destination %q at or after %s", message, deferred, due)
 		}
 		ackMessage(t, group, message)
-		group.vector.Add(BehaviorEvent{ID: "deferred-never-early", Outcome: "on-time", FinalDestination: deferred})
+		group.vector.add(BehaviorEvent{ID: "deferred-never-early", Outcome: "on-time", FinalDestination: deferred})
 	})
 
 	group.Check("deferred delivery is bounded in lateness", func(t *testing.T) {
@@ -150,7 +150,7 @@ func runDeferred(group *groupContext) {
 			t.Fatalf("ReceivedAt=%s, want between %s and %s", message.ReceivedAt, due, due.Add(deferredLateBound))
 		}
 		ackMessage(t, group, message)
-		group.vector.Add(BehaviorEvent{ID: "deferred-bounded-late", Outcome: "bounded", FinalDestination: name})
+		group.vector.add(BehaviorEvent{ID: "deferred-bounded-late", Outcome: "bounded", FinalDestination: name})
 	})
 
 	group.Check("each in-band due time is delivered", func(t *testing.T) {
@@ -207,7 +207,7 @@ func runDeferred(group *groupContext) {
 		if len(dues) != 0 {
 			t.Fatalf("undelivered in-band messages: %v", dues)
 		}
-		group.vector.Add(BehaviorEvent{ID: "deferred-band", Outcome: "all-delivered", FinalDestination: name})
+		group.vector.add(BehaviorEvent{ID: "deferred-band", Outcome: "all-delivered", FinalDestination: name})
 	})
 
 	group.Check("a nearer due time published after a farther one is delivered in due order", func(t *testing.T) {
@@ -299,7 +299,7 @@ func runDeferred(group *groupContext) {
 			t.Fatalf("body %q arrived at %s and body %q at %s: deliveries arrived in publish order, not due order",
 				"nearer", nearer.ReceivedAt, "farther", farther.ReceivedAt)
 		}
-		group.vector.Add(BehaviorEvent{ID: "deferred-due-order", Outcome: "due-order", FinalDestination: name})
+		group.vector.add(BehaviorEvent{ID: "deferred-due-order", Outcome: "due-order", FinalDestination: name})
 	})
 
 	group.Check("destination delay delivers a destination's messages in publish order", func(t *testing.T) {
@@ -343,7 +343,7 @@ func runDeferred(group *groupContext) {
 			}
 			ackMessage(t, group, message)
 		}
-		group.vector.Add(BehaviorEvent{ID: "deferred-publish-order", Outcome: "in-order", FinalDestination: name})
+		group.vector.add(BehaviorEvent{ID: "deferred-publish-order", Outcome: "in-order", FinalDestination: name})
 	})
 
 	group.Check("destination delay supplies a zero due time", func(t *testing.T) {
@@ -364,15 +364,15 @@ func runDeferred(group *groupContext) {
 			t.Fatalf("first delivery destination=%q, want control %q", controlMessage.Destination, control)
 		}
 		ackMessage(t, group, controlMessage)
-		assertNoDelivery(t, group, consumer, "zero due time before destination delay")
 		due := publishedAt.Add(deferredDelay)
+		assertNoDeliveryBefore(t, group, consumer, due, "zero due time before destination delay")
 		advanceDeferredTo(group, due)
 		message := receiveBefore(t, group, consumer, due.Add(deferredLateBound), "destination-delay delivery")
 		if message.ReceivedAt.Before(due) {
 			t.Fatalf("ReceivedAt=%s, want at or after %s", message.ReceivedAt, due)
 		}
 		ackMessage(t, group, message)
-		group.vector.Add(BehaviorEvent{ID: "deferred-destination-delay", Outcome: "nominal-delay", FinalDestination: name})
+		group.vector.add(BehaviorEvent{ID: "deferred-destination-delay", Outcome: "nominal-delay", FinalDestination: name})
 	})
 
 	group.Check("zero destination delay and zero due time deliver immediately", func(t *testing.T) {
@@ -394,7 +394,7 @@ func runDeferred(group *groupContext) {
 			t.Fatalf("zero-value delivery at %s, want no later than %s", message.ReceivedAt, publishedAt.Add(deferredMargin))
 		}
 		ackMessage(t, group, message)
-		group.vector.Add(BehaviorEvent{ID: "deferred-zero", Outcome: "immediate", FinalDestination: name})
+		group.vector.add(BehaviorEvent{ID: "deferred-zero", Outcome: "immediate", FinalDestination: name})
 	})
 
 	group.Check("Auxiliary counts not-yet-due messages separately", func(t *testing.T) {
@@ -415,7 +415,7 @@ func runDeferred(group *groupContext) {
 			return view.Auxiliary == 1 && controlView.Ready == 1,
 				fmt.Sprintf("deferred=%+v control=%+v", view, controlView)
 		})
-		group.vector.Add(BehaviorEvent{ID: "deferred-auxiliary", Outcome: "counted", FinalDestination: name})
+		group.vector.add(BehaviorEvent{ID: "deferred-auxiliary", Outcome: "counted", FinalDestination: name})
 	})
 
 	group.Check("Ready excludes Auxiliary messages and preserves total depth", func(t *testing.T) {
@@ -436,7 +436,7 @@ func runDeferred(group *groupContext) {
 			return view.Ready == 0 && view.Ready+view.Auxiliary == 1 && controlView.Ready == 1,
 				fmt.Sprintf("deferred=%+v control=%+v", view, controlView)
 		})
-		group.vector.Add(BehaviorEvent{ID: "deferred-ready", Outcome: "excludes-auxiliary", FinalDestination: name})
+		group.vector.add(BehaviorEvent{ID: "deferred-ready", Outcome: "excludes-auxiliary", FinalDestination: name})
 	})
 
 	group.Check("Auxiliary messages become Ready at their due time", func(t *testing.T) {
@@ -464,7 +464,7 @@ func runDeferred(group *groupContext) {
 			view := inspectDestination(t, group, name)
 			return view.Ready == 1 && view.Auxiliary == 0 && view.Ready+view.Auxiliary == 1, fmt.Sprintf("view=%+v", view)
 		})
-		group.vector.Add(BehaviorEvent{ID: "deferred-release", Outcome: "ready", FinalDestination: name})
+		group.vector.add(BehaviorEvent{ID: "deferred-release", Outcome: "ready", FinalDestination: name})
 	})
 
 	group.Check("parked delivery does not consume an ack deadline", func(t *testing.T) {
@@ -511,7 +511,7 @@ func runDeferred(group *groupContext) {
 		if err := producer.Publish(group.ctx, driver.OutboundMessage{Destination: name, Body: []byte("parked"), DelayUntil: due}); err != nil {
 			t.Fatal(err)
 		}
-		assertNoDelivery(t, group, consumer, "parked message during ack deadline")
+		assertNoDeliveryBefore(t, group, consumer, due, "parked message during ack deadline")
 		advanceDeferredTo(group, due)
 		message := receiveBefore(t, group, consumer, due.Add(deferredLateBound), "parked delivery after due time")
 		if message.Destination != name || message.ReceivedAt.Before(due) {
@@ -524,7 +524,7 @@ func runDeferred(group *groupContext) {
 		}
 		ackMessage(t, group, message)
 		assertNoDelivery(t, group, consumer, "parked message redelivered after ack deadline")
-		group.vector.Add(BehaviorEvent{ID: "deferred-deadline", Outcome: "not-consumed", FinalDestination: name})
+		group.vector.add(BehaviorEvent{ID: "deferred-deadline", Outcome: "not-consumed", FinalDestination: name})
 	})
 }
 
@@ -622,7 +622,24 @@ func assertDeferredBand(t *testing.T, publishedAt, due time.Time) {
 
 func assertNoDelivery(t *testing.T, group *groupContext, consumer driver.Consumer, what string) {
 	t.Helper()
-	waitForStable(t, group, what, func() (bool, string) {
+	assertNoDeliveryFor(t, group, consumer, stabilityWindow, what)
+}
+
+// assertNoDeliveryBefore asserts silence until due, for at most the stability
+// window. The window ends at due: a delivery after due is on time, and a slow
+// Publish that spends part of the delay must not turn it into an early one.
+func assertNoDeliveryBefore(t *testing.T, group *groupContext, consumer driver.Consumer, due time.Time, what string) {
+	t.Helper()
+	window := min(stabilityWindow, due.Sub(deferredNow(group)))
+	if window <= 0 {
+		return
+	}
+	assertNoDeliveryFor(t, group, consumer, window, what)
+}
+
+func assertNoDeliveryFor(t *testing.T, group *groupContext, consumer driver.Consumer, window time.Duration, what string) {
+	t.Helper()
+	waitForStableFor(t, group, what, window, func() (bool, string) {
 		select {
 		case message, ok := <-consumer.Messages():
 			if !ok {

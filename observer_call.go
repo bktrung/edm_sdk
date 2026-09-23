@@ -86,10 +86,10 @@ func (c *Client) recordObserverPanic(kind ObserverKind, phase string, recovered 
 //
 //	guard := c.newObserverGuard(kind, token)
 //	defer guard.abandon()
-//	guard.finish(ObserverOutcomeOK, "")
+//	guard.finishWith(FinishEvent{Outcome: ObserverOutcomeOK})
 //
 // abandon has a pointer receiver, so the defer takes &guard at the defer
-// statement and sees a later finish. A closure works too but is needless.
+// statement and sees a later finishWith. A closure works too but is needless.
 type observerFinishGuard struct {
 	client   *Client
 	kind     ObserverKind
@@ -100,12 +100,6 @@ type observerFinishGuard struct {
 // newObserverGuard returns the guard for one started stage.
 func (c *Client) newObserverGuard(kind ObserverKind, token Token) observerFinishGuard {
 	return observerFinishGuard{client: c, kind: kind, token: token}
-}
-
-// finish emits one Finish with the given outcome and class. A second call
-// does nothing, so the deferred abandon after an explicit finish is a no-op.
-func (g *observerFinishGuard) finish(outcome ObserverOutcome, class ErrorClass) {
-	g.finishWith(FinishEvent{Outcome: outcome, ErrorClass: class})
 }
 
 // finishWith emits one Finish carrying the caller-built fields. It fills
@@ -142,13 +136,21 @@ func (g *observerFinishGuard) abandon() {
 }
 
 // errorClassOf maps err to the bounded ErrorClass carried on events. Nil
-// gives the empty class. A driver.Classify classified error gives
-// driver_<kind>. IsTerminal gives f1_terminal and IsDropped gives
-// f1_dropped. Anything else gives _OTHER. Death reasons ride on later
-// consume-path events, not here.
+// gives the empty class. It tests the handler's own classification first, in
+// the same order processOutcome uses: IsTerminal gives f1_terminal and
+// IsDropped gives f1_dropped, and an error carrying both a driver kind and one
+// of those markers reports the marker wherever it appears. Otherwise a
+// driver.Classify classified error gives driver_<kind>, and anything else
+// gives _OTHER. Death reasons ride on later consume-path events, not here.
 func errorClassOf(err error) ErrorClass {
 	if err == nil {
 		return ""
+	}
+	if IsTerminal(err) {
+		return ErrorClassTerminal
+	}
+	if IsDropped(err) {
+		return ErrorClassDropped
 	}
 	if kind, classified := driver.Classify(err); classified {
 		switch kind {
@@ -165,12 +167,6 @@ func errorClassOf(err error) ErrorClass {
 		default:
 			return ErrorClassDriverTransient
 		}
-	}
-	if IsTerminal(err) {
-		return ErrorClassTerminal
-	}
-	if IsDropped(err) {
-		return ErrorClassDropped
 	}
 	return ErrorClassOther
 }

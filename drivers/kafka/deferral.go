@@ -168,7 +168,12 @@ func (c *consumer) resumePartitionIfFreeLocked(key partitionKey) {
 func (c *consumer) syncReadAheadPauses() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	counts := make(map[partitionKey]int, len(c.pending))
+	counts := c.readAheadCounts
+	if counts == nil {
+		counts = make(map[partitionKey]int, len(c.pending))
+		c.readAheadCounts = counts
+	}
+	clear(counts)
 	for key, records := range c.pending {
 		counts[key] = len(records)
 	}

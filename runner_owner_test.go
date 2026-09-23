@@ -394,7 +394,7 @@ func TestLateSettlementAfterTheDrainDeadlineIsRefused(t *testing.T) {
 	// The drain's own wait runs on the fake clock and is never advanced here,
 	// so the runner stays in its drain while the settlement window, which is
 	// real time, expires underneath it.
-	run.runner.inflight.Add(driver.InboundMessage{})
+	run.runner.inflight.Add()
 	go func() { _ = run.runner.Drain(context.Background()) }()
 
 	cancelled, cancelCancelled := context.WithCancel(context.Background())
@@ -424,7 +424,7 @@ func TestLateSettlementAfterTheDrainDeadlineIsRefused(t *testing.T) {
 
 	settler := &ownerProbeSettler{}
 	message := ownerProbeMessage(t, settler)
-	processDelivery(run.runner, cancelled, delivery{id: run.runner.inflight.Add(message), message: message})
+	processDelivery(run.runner, cancelled, delivery{id: run.runner.inflight.Add(), message: message})
 
 	ctxErr, settled := settler.record()
 	if !errors.Is(ctxErr, context.DeadlineExceeded) {

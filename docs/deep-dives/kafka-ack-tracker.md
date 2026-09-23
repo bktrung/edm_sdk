@@ -1,154 +1,113 @@
-# One in-flight record, one committed cursor: the Kafka ack tracker
+# One in-flight record, one committed offset
 
-*By F1 maintainers, September 2026.*
+*By trungbk.*
 
-Kafka stores one committed offset per partition. F1's Kafka driver admits one
-delivery per partition at a time, so the record being settled is the next record
-at that partition's cursor. The ack tracker turns that settlement into the next
-Kafka offset and refuses a settlement through a tracker after its assignment is
-revoked; a renewed assignment gets a fresh tracker seeded from owed records.
+Suppose records 10, 11, and 12 of one partition were handled at the same time, and the handler for 12 finished first. If I committed 13 for it, a crash right then would make the next owner start at 13, and records 10 and 11 would never be handled. Kafka commits one offset per partition, not one ack per record, so a commit says "everything below this is done". I only commit past a record once every record before it that Kafka delivered is done, and I refuse to commit for a partition after Kafka has taken it away from this consumer.
+
+I treat the committed offset as the partition's promise: every offset below it is done, and the committed offset itself is the next one a new owner must read.
 
 ## Background
 
-A Kafka topic is split into partitions. Each partition is an append-only log
-with offsets 0, 1, 2, and so on. A consumer group stores one committed offset
-per partition. That offset means "the next offset to read"; after a restart or
-a rebalance, reading resumes there.
+A Kafka topic is split into append-only partitions. A consumer group stores one committed position per partition. That position means "the next offset to read", so a restart or rebalance resumes there.
 
-Kafka has no per-message acknowledgement. Committing offset N tells Kafka that
-every record below N is done, so a commit always represents a contiguous prefix
-of the partition log. F1 calls finishing a delivery settlement: an ack commits
-it, a discard also commits it, and a requeue leaves it unsettled for redelivery.
+Kafka itself would accept a commit of 15 while 14 is unfinished; the gap is F1's to prevent. F1 therefore lets in one delivery per partition at a time, so a commit never skips a record that is still being handled. When Kafka never delivered some offsets, for example after compaction, the delivery after them commits past them. An ack and a discard move the committed offset forward; a requeue leaves it where it is so the record can be delivered again.
 
-## The cursor
+## The committed offset
 
-The driver gives each owned partition one tracker. Its state is deliberately
-small:
+For each partition it owns, F1 keeps the next uncommitted offset and whether that ownership has ended ([how assignments change](/deep-dives/kafka-lane-balancer)). The commit request itself carries Kafka's group generation, Kafka's number for the current assignment, so Kafka refuses a commit from a member whose assignment has changed. An ack from the delivery that the current ownership let in commits the offset after it, even when Kafka skipped offsets before it. An ack from an earlier ownership, after the partition was lost and regained, must name the current offset; any other offset, later or older, is refused rather than allowed to skip a record.
 
-- `base` is the next offset not committed by the current ownership generation.
-- `revoked` records that the partition left this ownership, so a late settlement
-  through this tracker returns `ErrRevoked`.
-- `commitMu` serializes the broker commit and any rollback for that partition.
+The figure traces why a stale ack for any offset other than the current one is refused. The refused acks in it come from a delivery whose ownership has ended; a delivery of the current ownership never sends them.
 
-The hold rule in the consumer admits at most one delivery from a partition until
-that delivery settles. As a result, the tracker does not need an out-of-order
-ack set or an acknowledgement-gap limit. The next valid settlement is the
-record at `base`.
+<F1KafkaCursorStepper />
 
-When `ackTracker.Ack` receives that offset, it advances the in-memory cursor to
-`offset + 1`, then commits that next offset to Kafka. The cursor is not advanced
-for an older or non-current offset; the driver reports it as already settled.
-The commit point is the offset Kafka will resume from after a restart or a
-rebalance.
+<details>
+<summary>The same steps as a table</summary>
 
-The cursor sequence is pinned by [`TestAckTrackerInOrderAcks`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/drivers/kafka/acktracker_test.go):
+| Step | Attempt | Result | Committed position |
+| ---: | --- | --- | ---: |
+| 1 | offset 10, Ack | moves the committed offset forward | 11 |
+| 2 | offset 12, stale Ack from an earlier ownership | refused, 11 is still current | 11 |
+| 3 | offset 11, Requeue | leaves the record not yet acked | 11 |
+| 4 | offset 11, Ack | moves the committed offset forward | 12 |
+| 5 | offset 12, Ack | moves the committed offset forward | 13 |
+| 6 | offset 13, Nack without requeue | moves the committed offset forward, like an ack | 14 |
+| 7 | offset 15, stale Ack from an earlier ownership | refused, 14 is still current | 14 |
+| 8 | offset 14, Ack | moves the committed offset forward | 15 |
+| 9 | offset 15, Ack | moves the committed offset forward | 16 |
 
-| Settled offset | Cursor before | Cursor after |
-| --- | ---: | ---: |
-| 0 | 0 | 1 |
-| 1 | 1 | 2 |
-| 2 | 2 | 3 |
+</details>
 
-There is no separate higher-offset acknowledgement to hold above a slow base:
-the next record on the partition cannot be admitted until the current one is
-settled. A crash can still redeliver the current record when its settlement did
-not reach Kafka, which is the at-least-once guarantee and why handler effects
-must be idempotent.
+The committed position is always the next offset Kafka should deliver. A crash before a successful commit can deliver the current record again, which is the [at-least-once](/learn/glossary#at-least-once-delivery) guarantee and why handler effects must be idempotent.
 
-## Commits stay ordered
+## Why commits stay ordered
 
-`mu` protects the cursor and revocation state. `commitMu` covers the full
-advance-and-commit sequence, including the broker callback. The two locks have
-different jobs: ordinary state inspection does not wait on broker I/O, while two
-settlements cannot send commits out of order.
+F1 first moves its in-memory offset forward, then sends the commit to Kafka, and does both for one partition one at a time. Without that, commits can arrive out of order. One ack could move to 11 and begin `commit(11)`. A second could move to 12 and begin `commit(12)`. If Kafka receives 12 before 11, its position moves backwards.
 
-Without `commitMu`, the following interleaving could regress the broker's
-committed offset:
+```mermaid
+sequenceDiagram
+    participant A as ack offset 10
+    participant B as ack offset 11
+    participant K as Kafka
+    Note over A,K: Without ordering
+    A->>K: commit(11) sent
+    B->>K: commit(12) sent
+    Note over K: 12 arrives first, then 11
+    Note over K: position moves back to 11
+    Note over A,K: F1: one move-and-commit at a time
+    A->>K: commit(11)
+    K-->>A: committed
+    B->>K: commit(12)
+    K-->>B: committed
+```
 
-1. Goroutine A advances the cursor to 1, releases `mu`, and starts `commit(1)`.
-2. Goroutine B advances it to 2, releases `mu`, and starts `commit(2)`.
-3. Kafka receives `commit(2)` first and then `commit(1)`.
-4. The committed offset moves backwards to 1.
+The driver releases its ordinary lock before waiting on the broker, but a second lock, held for the whole move-and-commit, makes the next one wait until the first returns. Other code can still read the state while the commit is running, and it sees the offset already moved forward.
 
-With `commitMu`, B cannot start its advance until A's commit returns, so Kafka
-sees 1 and then 2.
+A failed commit moves the in-memory offset back when the partition is still owned. F1 treats a commit error as not committed; if Kafka did store it, the cost is only that the same offset is committed again later. If Kafka takes the partition away while the commit call is running, the old offset is not restored for the lost partition. A successful commit stays successful even if the partition is taken away right after.
 
-If a commit fails after the in-memory advance, `Ack` restores the old cursor
-unless the partition was revoked during the broker call. The next attempt can
-then settle the same record. If the commit fails after `Drop` revokes the
-tracker, `Ack` returns `ErrRevoked`; if the commit succeeds after `Drop`, `Ack`
-returns nil because Kafka already owns that offset, and the commit is not undone.
+## Requeue is a local redelivery
 
-`Drop` takes only `mu` and does not wait for an in-flight commit. The revoke path
-can therefore detach the tracker while broker I/O is outstanding. If the
-partition moves to another member, a late ack or discard through the old
-tracker is rejected; a requeue is completed without committing so the next
-owner can redeliver it. If the partition returns to this consumer, the
-settlement path uses the new tracker, whose base includes records still owed.
+A handler error normally creates a retry copy and acks the original. Requeue is for work the driver gives back without creating a copy. It leaves the committed position unchanged and puts the record ahead of later records for that partition on the current consumer.
 
-## Requeue means local redelivery
+If the partition moves before the requeued record is acked, the next member starts from Kafka's unchanged committed position and can deliver it again. An offset below the committed offset is already done and is skipped; an offset not seen before is let in as the next current record.
 
-A handler error normally publishes a retry copy and acknowledges the original.
-A requeue is reserved for work the driver hands back without creating a
-successor. `settler.Nack` marks the current delivery for redelivery and keeps
-its partition charge. The current consumer's next read takes the local pending
-copy before the partition's other records, so it does not admit a second
-independent delivery first.
-
-`requeueLocked` prepends the record to this consumer's pending queue. The
-committed cursor does not move because the record is still unsettled, and the
-poll loop delivers that local copy before the partition's other pending records.
-If the consumer leaves before the redelivery settles, the next owner reads from
-the unchanged committed cursor and Kafka redelivers it.
-
-The consumer uses the partition cursor and current ownership to decide what
-happens to records it encounters after a requeue:
-
-- the requeued offset is delivered from the local pending queue;
-- an offset below the cursor is already committed and is skipped;
-- an offset still represented by the current delivery is not duplicated; and
-- an offset the tracker has not seen is admitted as the next delivery.
-
-A nack without requeue is a discard. It uses the same cursor advance as an ack
-and logs the topic, partition, and offset. Classic Kafka groups do not expose a
-per-message delivery count, so F1's `CountAsFailure` option has no Kafka-native
-counter to update.
+A discard moves the committed offset forward like an ack. Kafka's consumer groups do not expose a per-message delivery count, so an F1 failure count cannot become a counter inside Kafka.
 
 ## When the partition moves
 
-A rebalance changes which member owns a partition. The revoke callback waits up
-to `lifecycle.rebalanceDrainTimeout` for the one in-flight delivery. When the
-partition leaves, `Drop` marks its tracker revoked and the consumer detaches it.
-A late settlement or requeue from that ownership cannot settle through the
-new member.
+A rebalance changes the member that owns a partition. F1 waits up to `lifecycle.rebalanceDrainTimeout` for the in-flight delivery, then marks the old ownership as revoked and detaches it.
 
-If the partition returns, the consumer creates a tracker for the new generation.
-It does not reuse the revoked tracker because settlers from the old generation
-still point at it. The new cursor starts at the lowest offset this consumer
-still owes after its assignment and any records already in hand. Starting at a
-later delivered offset would let a held record look committed and lose it.
+```mermaid
+sequenceDiagram
+    participant O as old member
+    participant K as Kafka group
+    participant N as new member
+    K->>O: revoke partition
+    Note over O: wait up to rebalanceDrainTimeout
+    Note over O: mark ownership revoked
+    K->>N: assign partition
+    N->>K: read from committed position
+    Note over O: late ack is rejected
+```
 
-The next owner reads from Kafka's committed cursor. If the old owner did not
-commit the record before revoke, redelivery is expected. If it did commit, the
-new owner starts after it. This is why cooperative rebalancing reduces moved
-partitions without promising duplicate-free handoff.
+A late ack or discard is rejected when another member now owns the partition. If this same consumer gets the partition back, a late ack can still succeed, but only for the offset that is current again. That is safe: the ack says the same record is done, and the ack cannot name any other offset.
+
+A late requeue does not commit and cannot be finished through the new member. If the partition comes back, F1 builds a new offset tracker for it, starting from the lowest offset this consumer still owes, instead of reusing the old tracker that old deliveries still point to.
+
+The old tracker stays marked as ended, so an ack sent through it is refused.
+
+The new owner starts at Kafka's committed position. If the old owner did not commit before losing the partition, a redelivery is expected. If it committed, the new owner starts after that offset. Cooperative rebalancing moves fewer partitions, but it does not promise that no message is delivered twice.
 
 ## Limits and trade-offs
 
-- One slow record pauses that partition, because the next record cannot pass its
-  cursor.
-- A crash or revoke before a successful commit can redeliver the current record.
-- A requeue keeps the cursor unchanged and prepends a local redelivery. If
-  ownership leaves before it settles, the next owner redelivers from Kafka's
-  committed cursor.
-- A late settlement from a revoked ownership fails with `ErrRevoked` instead of
-  committing through the old assignment.
-- The partition count, not an acknowledgement-gap setting, is the Kafka
-  parallelism lever. Increasing it can remap keys and cannot be undone.
+- One slow record pauses its partition, because the next record cannot pass the current offset.
+- A crash or a lost partition before a successful commit can deliver the current record again.
+- A requeue keeps the committed offset where it is and gives the current consumer the record again first.
+- A partition that moved to another member rejects late acks instead of committing through the old assignment.
+- Partition count is how you get more parallelism on Kafka; F1 never lets a later ack pass an unfinished offset. Adding partitions moves some keys to other partitions, and Kafka cannot lower a topic's partition count afterwards.
 
-## Read the code
+## Go further
 
-- [`ackTracker.Ack`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/drivers/kafka/acktracker.go) - cursor advance, commit ordering, and rollback.
-- [`acktracker_test.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/drivers/kafka/acktracker_test.go) - cursor, commit, revoke, and timing behavior.
-- [`settler.Ack` and `settler.Nack`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/drivers/kafka/consumer.go) - settlement, discard, and requeue paths.
-- [`trackerForLocked` and `trackerBaseLocked`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/drivers/kafka/consumer.go) - generation ownership and the starting cursor.
+- [Driver contract](/development/driver-contract) - the ack and ownership contract every driver implements.
+- [Kafka lane balancer](/deep-dives/kafka-lane-balancer) - how partition ownership changes during a rebalance.
+- [Drivers and capabilities](/drivers-and-capabilities) - Kafka configuration and limits.
+- [Source-reading guide](/development/source-reading-guide) - the maintainer route through the implementation.

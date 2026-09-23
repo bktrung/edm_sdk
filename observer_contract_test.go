@@ -12,8 +12,6 @@ import (
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/f1test"
 )
 
-type observerClientFactory func(*testing.T, f1.Observer) *f1test.Client
-
 type observerScenario struct {
 	name  string
 	run   func(*testing.T, *f1test.Client, *f1test.Recorder)

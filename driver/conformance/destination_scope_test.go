@@ -91,7 +91,7 @@ func TestRunReclaimsEveryDestinationItCreates(t *testing.T) {
 				}
 				consumer := newConsumer(t, group, destination, 1)
 				ackMessage(t, group, receiveMessage(t, group, consumer))
-				group.vector.Add(BehaviorEvent{ID: "reclaim-created", Outcome: "published", FinalDestination: "reclaim.created"})
+				group.vector.add(BehaviorEvent{ID: "reclaim-created", Outcome: "published", FinalDestination: "reclaim.created"})
 			})
 		},
 	})
@@ -176,7 +176,7 @@ func TestRunReclaimsADestinationItDidNotRecord(t *testing.T) {
 				}); err != nil {
 					t.Fatalf("EnsureTopology(%q) on the private connection: %v", unrecorded, err)
 				}
-				group.vector.Add(BehaviorEvent{ID: "reclaim-unrecorded", Outcome: "published", FinalDestination: "reclaim.unrecorded"})
+				group.vector.add(BehaviorEvent{ID: "reclaim-unrecorded", Outcome: "published", FinalDestination: "reclaim.unrecorded"})
 			})
 		},
 	})

@@ -16,7 +16,7 @@ func init() {
 
 func runPublish(group *groupContext) {
 	group.Check("confirmed publish is visible in the destination", func(t *testing.T) {
-		producer := newProducer(t, group, profileDestination(group, "publish.visible"), driver.ProducerConfig{RequireDurableAck: true, Effective: group.effective})
+		producer := newProducer(t, group, profileDestination(group, "publish.visible"), driver.ProducerConfig{Effective: group.effective})
 		publish := driver.OutboundMessage{Destination: "publish.visible", Body: []byte("visible")}
 		if err := producer.Publish(group.ctx, publish); err != nil {
 			t.Fatalf("Publish() error = %v", err)
@@ -25,7 +25,7 @@ func runPublish(group *groupContext) {
 		if view.Ready != 1 {
 			t.Fatalf("Ready = %d, want 1", view.Ready)
 		}
-		group.vector.Add(BehaviorEvent{ID: "confirmed-visible", Outcome: "ok", FinalDestination: "publish.visible"})
+		group.vector.add(BehaviorEvent{ID: "confirmed-visible", Outcome: "ok", FinalDestination: "publish.visible"})
 	})
 
 	group.Check("zero-value publish config accepts a normal message", func(t *testing.T) {
@@ -36,7 +36,7 @@ func runPublish(group *groupContext) {
 		if got := inspectDestination(t, group, "publish.zero").Ready; got != 1 {
 			t.Fatalf("Ready = %d, want 1", got)
 		}
-		group.vector.Add(BehaviorEvent{ID: "zero-value", Outcome: "ok", FinalDestination: "publish.zero"})
+		group.vector.add(BehaviorEvent{ID: "zero-value", Outcome: "ok", FinalDestination: "publish.zero"})
 	})
 
 	group.Check("canceled Producer creation returns transient without a producer", func(t *testing.T) {
@@ -55,7 +55,7 @@ func runPublish(group *groupContext) {
 		if err := next.Close(group.ctx); err != nil {
 			t.Fatalf("Producer.Close() after cancelled construction = %v", err)
 		}
-		group.vector.Add(BehaviorEvent{ID: "cancel-producer", Outcome: "cancelled", FinalDestination: "producer"})
+		group.vector.add(BehaviorEvent{ID: "cancel-producer", Outcome: "cancelled", FinalDestination: "producer"})
 	})
 
 	group.Check("cancelled producer Close returns transient and leaves the producer usable", func(t *testing.T) {
@@ -70,11 +70,11 @@ func runPublish(group *groupContext) {
 		if got := inspectDestination(t, group, name).Ready; got != 1 {
 			t.Fatalf("Ready after cancelled producer Close = %d, want 1", got)
 		}
-		group.vector.Add(BehaviorEvent{ID: "cancel-producer-close", Outcome: "cancelled", FinalDestination: name})
+		group.vector.add(BehaviorEvent{ID: "cancel-producer-close", Outcome: "cancelled", FinalDestination: name})
 	})
 
 	group.Check("partial publish reports only the missing message", func(t *testing.T) {
-		producer := newProducer(t, group, profileDestination(group, "publish.partial"), driver.ProducerConfig{RequireDurableAck: true, Effective: group.effective})
+		producer := newProducer(t, group, profileDestination(group, "publish.partial"), driver.ProducerConfig{Effective: group.effective})
 		err := producer.Publish(group.ctx,
 			driver.OutboundMessage{Destination: "publish.partial", Body: []byte("accepted")},
 			driver.OutboundMessage{Destination: "publish.missing", Body: []byte("rejected")},
@@ -86,17 +86,24 @@ func runPublish(group *groupContext) {
 		if len(publishErr.Failed) != 1 {
 			t.Fatalf("failed messages = %d, want 1", len(publishErr.Failed))
 		}
-		if _, ok := publishErr.Failed[1]; !ok {
-			t.Fatalf("failed indexes = %v, want index 1", publishErr.Failed)
+		cause, ok := publishErr.Failed[1]
+		if !ok || cause == nil {
+			t.Fatalf("failed indexes = %v, want index 1 with its cause", publishErr.Failed)
+		}
+		if !errors.Is(cause, driver.ErrDestinationMissing) {
+			t.Fatalf("Failed[1] = %v, want ErrDestinationMissing", cause)
+		}
+		if kind, classified := driver.Classify(cause); !classified || kind != driver.KindNotFound {
+			t.Fatalf("Failed[1] classification = (%v, %t), want (not_found, true)", kind, classified)
 		}
 		if got := inspectDestination(t, group, "publish.partial").Ready; got != 1 {
 			t.Fatalf("accepted Ready = %d, want 1", got)
 		}
-		group.vector.Add(BehaviorEvent{ID: "partial-failure", Outcome: "partial", FinalDestination: "publish.partial"})
+		group.vector.add(BehaviorEvent{ID: "partial-failure", Outcome: "partial", FinalDestination: "publish.partial"})
 	})
 
 	group.Check("publishing only to a missing destination is classified", func(t *testing.T) {
-		producer := newProducer(t, group, profileDestination(group, "publish.missing-only"), driver.ProducerConfig{RequireDurableAck: true, Effective: group.effective})
+		producer := newProducer(t, group, profileDestination(group, "publish.missing-only"), driver.ProducerConfig{Effective: group.effective})
 		err := producer.Publish(group.ctx, driver.OutboundMessage{Destination: "publish.no-such-destination"})
 		if err == nil {
 			t.Fatal("Publish() error = nil, want missing-destination error")
@@ -107,11 +114,11 @@ func runPublish(group *groupContext) {
 		if kind, classified := driver.Classify(err); !classified || kind != driver.KindNotFound {
 			t.Fatalf("Publish() classification = (%v, %t), want (not found, true)", kind, classified)
 		}
-		group.vector.Add(BehaviorEvent{ID: "missing-destination", Outcome: "not_found", FinalDestination: "publish.no-such-destination"})
+		group.vector.add(BehaviorEvent{ID: "missing-destination", Outcome: "not_found", FinalDestination: "publish.no-such-destination"})
 	})
 
 	group.Check("total publish failure reports every message", func(t *testing.T) {
-		producer := newProducer(t, group, profileDestination(group, "publish.total"), driver.ProducerConfig{RequireDurableAck: true, Effective: group.effective})
+		producer := newProducer(t, group, profileDestination(group, "publish.total"), driver.ProducerConfig{Effective: group.effective})
 		err := producer.Publish(group.ctx,
 			driver.OutboundMessage{Destination: "publish.total.missing-a"},
 			driver.OutboundMessage{Destination: "publish.total.missing-b"},
@@ -131,22 +138,22 @@ func runPublish(group *groupContext) {
 				t.Fatalf("failed[%d] classification = (%v, %t), want (not found, true)", index, kind, classified)
 			}
 		}
-		group.vector.Add(BehaviorEvent{ID: "total-failure", Outcome: "failed", FinalDestination: "publish.total"})
+		group.vector.add(BehaviorEvent{ID: "total-failure", Outcome: "failed", FinalDestination: "publish.total"})
 	})
 
 	group.Check("empty publish is a no-op", func(t *testing.T) {
-		producer := newProducer(t, group, profileDestination(group, "publish.empty"), driver.ProducerConfig{RequireDurableAck: true, Effective: group.effective})
+		producer := newProducer(t, group, profileDestination(group, "publish.empty"), driver.ProducerConfig{Effective: group.effective})
 		if err := producer.Publish(group.ctx); err != nil {
 			t.Fatalf("empty Publish() error = %v", err)
 		}
 		if got := inspectDestination(t, group, "publish.empty").Ready; got != 0 {
 			t.Fatalf("Ready after empty Publish = %d, want 0", got)
 		}
-		group.vector.Add(BehaviorEvent{ID: "empty-publish", Outcome: "ok", FinalDestination: "publish.empty"})
+		group.vector.add(BehaviorEvent{ID: "empty-publish", Outcome: "ok", FinalDestination: "publish.empty"})
 	})
 
 	group.Check("cancelled context prevents publishing", func(t *testing.T) {
-		producer := newProducer(t, group, profileDestination(group, "publish.cancelled"), driver.ProducerConfig{RequireDurableAck: true, Effective: group.effective})
+		producer := newProducer(t, group, profileDestination(group, "publish.cancelled"), driver.ProducerConfig{Effective: group.effective})
 		ctx, cancel := context.WithCancel(group.ctx)
 		cancel()
 		err := producer.Publish(ctx, driver.OutboundMessage{Destination: "publish.cancelled"})
@@ -159,11 +166,11 @@ func runPublish(group *groupContext) {
 		if got := inspectDestination(t, group, "publish.cancelled").Ready; got != 0 {
 			t.Fatalf("Ready after cancelled Publish = %d, want 0", got)
 		}
-		group.vector.Add(BehaviorEvent{ID: "cancelled", Outcome: "cancelled", FinalDestination: "publish.cancelled"})
+		group.vector.add(BehaviorEvent{ID: "cancelled", Outcome: "cancelled", FinalDestination: "publish.cancelled"})
 	})
 
 	group.Check("body bytes survive publish", func(t *testing.T) {
-		producer := newProducer(t, group, profileDestination(group, "publish.body"), driver.ProducerConfig{RequireDurableAck: true, Effective: group.effective})
+		producer := newProducer(t, group, profileDestination(group, "publish.body"), driver.ProducerConfig{Effective: group.effective})
 		body := []byte{0, 1, 2, 255}
 		if err := producer.Publish(group.ctx, driver.OutboundMessage{Destination: "publish.body", Body: body}); err != nil {
 			t.Fatalf("Publish() error = %v", err)
@@ -174,11 +181,11 @@ func runPublish(group *groupContext) {
 			t.Fatalf("Body = %v, want %v", message.Body, body)
 		}
 		ackMessage(t, group, message)
-		group.vector.Add(BehaviorEvent{ID: "body-fidelity", Outcome: "ok", FinalDestination: "publish.body"})
+		group.vector.add(BehaviorEvent{ID: "body-fidelity", Outcome: "ok", FinalDestination: "publish.body"})
 	})
 
 	group.Check("headers survive publish", func(t *testing.T) {
-		producer := newProducer(t, group, profileDestination(group, "publish.headers"), driver.ProducerConfig{RequireDurableAck: true, Effective: group.effective})
+		producer := newProducer(t, group, profileDestination(group, "publish.headers"), driver.ProducerConfig{Effective: group.effective})
 		headers := []driver.Header{{Key: "x-trace", Value: []byte("trace-1")}, {Key: "x-empty", Value: nil}}
 		if err := producer.Publish(group.ctx, driver.OutboundMessage{Destination: "publish.headers", Headers: headers}); err != nil {
 			t.Fatalf("Publish() error = %v", err)
@@ -197,11 +204,11 @@ func runPublish(group *groupContext) {
 			t.Fatalf("x-empty value length = %d, want 0", len(empty.Value))
 		}
 		ackMessage(t, group, message)
-		group.vector.Add(BehaviorEvent{ID: "header-fidelity", Outcome: "ok", FinalDestination: "publish.headers"})
+		group.vector.add(BehaviorEvent{ID: "header-fidelity", Outcome: "ok", FinalDestination: "publish.headers"})
 	})
 
 	group.Check("routing key survives publish", func(t *testing.T) {
-		producer := newProducer(t, group, profileDestination(group, "publish.key"), driver.ProducerConfig{RequireDurableAck: true, Effective: group.effective})
+		producer := newProducer(t, group, profileDestination(group, "publish.key"), driver.ProducerConfig{Effective: group.effective})
 		key := []byte("order-42")
 		if err := producer.Publish(group.ctx, driver.OutboundMessage{Destination: "publish.key", Key: key}); err != nil {
 			t.Fatalf("Publish() error = %v", err)
@@ -212,11 +219,11 @@ func runPublish(group *groupContext) {
 			t.Fatalf("Key = %q, want %q", message.Key, key)
 		}
 		ackMessage(t, group, message)
-		group.vector.Add(BehaviorEvent{ID: "key-fidelity", Outcome: "ok", FinalDestination: "publish.key"})
+		group.vector.add(BehaviorEvent{ID: "key-fidelity", Outcome: "ok", FinalDestination: "publish.key"})
 	})
 
 	group.Check("message and header inputs are not mutated by publish", func(t *testing.T) {
-		producer := newProducer(t, group, profileDestination(group, "publish.clone"), driver.ProducerConfig{RequireDurableAck: true, Effective: group.effective})
+		producer := newProducer(t, group, profileDestination(group, "publish.clone"), driver.ProducerConfig{Effective: group.effective})
 		message := driver.OutboundMessage{
 			Destination: "publish.clone",
 			Key:         []byte("original-key"),
@@ -237,19 +244,19 @@ func runPublish(group *groupContext) {
 			t.Fatalf("published message = %q, want %q", actual, want)
 		}
 		ackMessage(t, group, got)
-		group.vector.Add(BehaviorEvent{ID: "input-copy", Outcome: "ok", FinalDestination: "publish.clone"})
+		group.vector.add(BehaviorEvent{ID: "input-copy", Outcome: "ok", FinalDestination: "publish.clone"})
 	})
 
 	group.Check("over-limit publish is rejected", func(t *testing.T) {
 		caps := group.effective
-		producer := newProducer(t, group, profileDestination(group, "publish.limits"), driver.ProducerConfig{RequireDurableAck: true, Effective: group.effective})
+		producer := newProducer(t, group, profileDestination(group, "publish.limits"), driver.ProducerConfig{Effective: group.effective})
 		if caps.MaxMessageBytes > 0 {
 			err := producer.Publish(group.ctx, driver.OutboundMessage{
 				Destination: "publish.limits",
 				Body:        make([]byte, caps.MaxMessageBytes+1),
 			})
 			assertTooLargePublish(t, err, 0)
-			group.vector.Add(BehaviorEvent{ID: "message-too-large", Outcome: "too_large", FinalDestination: "publish.limits"})
+			group.vector.add(BehaviorEvent{ID: "message-too-large", Outcome: "too_large", FinalDestination: "publish.limits"})
 		}
 		if caps.MaxHeaderBytes > 0 {
 			err := producer.Publish(group.ctx, driver.OutboundMessage{
@@ -257,14 +264,14 @@ func runPublish(group *groupContext) {
 				Headers:     []driver.Header{{Key: "x-over-limit", Value: make([]byte, caps.MaxHeaderBytes+1)}},
 			})
 			assertTooLargePublish(t, err, 0)
-			group.vector.Add(BehaviorEvent{ID: "headers-too-large", Outcome: "too_large", FinalDestination: "publish.limits"})
+			group.vector.add(BehaviorEvent{ID: "headers-too-large", Outcome: "too_large", FinalDestination: "publish.limits"})
 		}
 		if got := inspectDestination(t, group, "publish.limits").Ready; got != 0 {
 			t.Fatalf("Ready after rejected publishes = %d, want 0", got)
 		}
 	})
 	group.Check("concurrent publishes are all confirmed", func(t *testing.T) {
-		producer := newProducer(t, group, profileDestination(group, "publish.concurrent"), driver.ProducerConfig{RequireDurableAck: true, Effective: group.effective})
+		producer := newProducer(t, group, profileDestination(group, "publish.concurrent"), driver.ProducerConfig{Effective: group.effective})
 		const count = 8
 		var wg sync.WaitGroup
 		start := make(chan struct{})
@@ -294,7 +301,7 @@ func runPublish(group *groupContext) {
 		if got := inspectDestination(t, group, "publish.concurrent").Ready; got != count {
 			t.Fatalf("Ready = %d, want %d", got, count)
 		}
-		group.vector.Add(BehaviorEvent{ID: "concurrent-publish", Outcome: "ok", FinalDestination: "publish.concurrent"})
+		group.vector.add(BehaviorEvent{ID: "concurrent-publish", Outcome: "ok", FinalDestination: "publish.concurrent"})
 	})
 }
 

@@ -4,9 +4,9 @@ import "time"
 
 // ExchangeSpec describes a routing point.
 type ExchangeSpec struct {
-	Name    string // broker routing-point name
-	Kind    string // "direct" | "topic" | "fanout"
-	Durable bool   // whether the routing point survives broker restart
+	Name    string // Name is the broker routing-point name.
+	Kind    string // Kind is the broker routing-point kind, such as "direct", "topic", or "fanout".
+	Durable bool   // Durable reports whether the routing point survives a broker restart.
 }
 
 // DestKind classifies a core-owned destination.
@@ -25,26 +25,26 @@ const (
 
 // DestinationSpec describes one destination the core needs.
 type DestinationSpec struct {
-	Name          string        // resolved by the core's naming function
-	Kind          DestKind      // Main | Retry | DLQ | BackstopDLQ
-	Durable       bool          // whether the destination survives restart
-	Partitions    int           // Kafka; ignored elsewhere
-	Delay         time.Duration // non-zero marks a deferred destination
-	FixedDelay    bool          // every message is due exactly Delay after its publish, so a driver may park all of them in one queue
-	DeadLetter    *Route        // explicit broker-side backstop route
-	DeliveryLimit int           // broker backstop counter; <= 0 means none
+	Name          string        // Name is the resolved broker destination name.
+	Kind          DestKind      // Kind identifies the destination's role.
+	Durable       bool          // Durable reports whether the destination survives a broker restart.
+	Partitions    int           // Partitions sets the partition count on brokers that support partitions; other drivers ignore it.
+	Delay         time.Duration // Delay is the destination's declared delivery delay; zero means no destination delay.
+	FixedDelay    bool          // FixedDelay means each message is due exactly Delay after publish.
+	DeadLetter    *Route        // DeadLetter is the explicit broker-side backstop route, if any.
+	DeliveryLimit int           // DeliveryLimit is the broker backstop count; values at or below zero mean no limit.
 }
 
 // Route identifies a broker-side dead-letter route.
 type Route struct {
-	Exchange string // empty on brokers without a routing layer
-	Key      string // broker routing key; ignored when no routing layer exists
+	Exchange string // Exchange is the routing point, or empty when the broker has no routing layer.
+	Key      string // Key is the broker routing key; drivers without a routing layer ignore it.
 }
 
 // BindingSpec joins a publish entry point to a destination that receives a copy.
 type BindingSpec struct {
-	Source      string // exchange name, from TopologySpec.Exchanges
-	Destination string // destination name, from TopologySpec.Destinations
+	Source      string // Source names an exchange listed in TopologySpec.Exchanges.
+	Destination string // Destination names a destination listed in TopologySpec.Destinations.
 }
 
 // TopologyPolicy selects how a driver handles the topology in a spec.
@@ -61,9 +61,12 @@ const (
 
 // TopologySpec is the declarative description of broker topology.
 type TopologySpec struct {
-	Exchanges    []ExchangeSpec
+	// Exchanges lists the routing points required by the topology.
+	Exchanges []ExchangeSpec
+	// Destinations lists the destinations required by the topology.
 	Destinations []DestinationSpec
-	Bindings     []BindingSpec
+	// Bindings lists the routes from publish entry points to receiving destinations.
+	Bindings []BindingSpec
 	// Policy selects whether the driver creates, verifies, or skips topology.
 	Policy TopologyPolicy
 	// Scope lists prefixes the driver may scan for core-owned orphans. An empty
@@ -85,12 +88,18 @@ type TopologyState struct {
 
 // TopologyDiff reports topology changes and orphaned destinations.
 type TopologyDiff struct {
-	CreatedExchanges     []string
-	CreatedDestinations  []string
-	CreatedBindings      []BindingSpec
-	ExistingExchanges    []string
+	// CreatedExchanges lists routing points created by this call.
+	CreatedExchanges []string
+	// CreatedDestinations lists destinations created by this call.
+	CreatedDestinations []string
+	// CreatedBindings lists bindings created by this call.
+	CreatedBindings []BindingSpec
+	// ExistingExchanges lists requested routing points that already existed.
+	ExistingExchanges []string
+	// ExistingDestinations lists requested destinations that already existed.
 	ExistingDestinations []string
-	ExistingBindings     []BindingSpec
+	// ExistingBindings lists requested bindings that already existed.
+	ExistingBindings []BindingSpec
 	// Orphaned lists core-owned destinations that exist but are absent from the
 	// spec. Include auxiliary message counts in their parent; report an
 	// auxiliary by name when its parent is absent.
@@ -98,12 +107,9 @@ type TopologyDiff struct {
 	// OrphanScanError explains why orphan scanning did not run. When non-empty,
 	// Orphaned is incomplete.
 	OrphanScanError string
-	// Drifted lists destinations whose broker-side arguments no longer match
-	// the spec, populated under TopologyVerify. A driver whose passive
-	// existence check cannot see argument values on its own MUST use another
-	// channel (for RabbitMQ, the management API) to compare them, or MUST
-	// leave Drifted empty and fail the call outright rather than report a
-	// clean diff it did not actually verify.
+	// Drifted lists destinations whose broker-side arguments do not match the
+	// spec under TopologyVerify. If a driver cannot inspect the relevant values,
+	// it must return an error rather than report a clean diff.
 	Drifted []ArgumentDrift
 }
 
@@ -112,14 +118,19 @@ type TopologyDiff struct {
 // only arguments the spec sets are checked, so broker-added arguments the
 // spec never mentioned are never reported as drift.
 type ArgumentDrift struct {
-	Name     string // destination name
-	Argument string // the argument key that differs, e.g. "x-delivery-limit"
-	Want     string // the spec's value, formatted for display
-	Got      string // the broker's actual value, formatted for display; "<absent>" when the key is missing entirely
+	// Name is the destination whose argument differs.
+	Name string
+	// Argument is the differing broker argument key, such as "x-delivery-limit".
+	Argument string
+	// Want is the spec value formatted for display.
+	Want string
+	// Got is the broker value formatted for display, or "<absent>" when the key is missing.
+	Got string
 }
 
 // OrphanedDestination is a broker destination absent from the current spec.
 type OrphanedDestination struct {
+	// Name is the broker destination absent from the current spec.
 	Name string
 	// Messages includes anything held in driver-internal auxiliaries.
 	Messages int64
@@ -127,7 +138,9 @@ type OrphanedDestination struct {
 
 // PruneResult reports whether one destination was deleted.
 type PruneResult struct {
-	Name    string
+	// Name is the destination requested for pruning.
+	Name string
+	// Deleted reports whether the destination was deleted.
 	Deleted bool
 	// Reason explains why a destination was not deleted.
 	Reason string

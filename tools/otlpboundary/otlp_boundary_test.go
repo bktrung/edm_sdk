@@ -313,6 +313,12 @@ func driveInMemoryScenarios(t *testing.T, client *f1test.Client, recorder *f1tes
 	for range 8 {
 		client.Deliver(t, "wait.created.v1", map[string]string{"id": "high-queued"}, f1.WithPriority(f1.PriorityHigh))
 	}
+	// The runner takes deliveries into its lanes on its own goroutine, and a
+	// lane stamps a delivery's wait clock when it enters. Advancing the fake
+	// clock before the low delivery is in its lane leaves it not yet overdue,
+	// so it is picked by weight and never jumps the queue. Nothing observable
+	// marks lane entry, so give the intake a real-time moment first.
+	time.Sleep(100 * time.Millisecond)
 	client.Advance(2 * time.Second)
 	close(release)
 	waitForSignal(t, lowHandled, "low-priority handler did not run")

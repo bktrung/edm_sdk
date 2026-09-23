@@ -6,12 +6,17 @@ import (
 	"time"
 
 	f1 "fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk"
+	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/version"
 
 	"github.com/stretchr/testify/require"
+	"go.opentelemetry.io/otel/metric"
+	metricnoop "go.opentelemetry.io/otel/metric/noop"
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	"go.opentelemetry.io/otel/sdk/trace/tracetest"
+	"go.opentelemetry.io/otel/trace"
+	tracenoop "go.opentelemetry.io/otel/trace/noop"
 )
 
 func TestObserverNoOpValuesAcceptEveryEvent(t *testing.T) {
@@ -125,4 +130,42 @@ func TestMetricsOnlyFinishHasNoExemplar(t *testing.T) {
 	require.True(t, ok)
 	require.Len(t, histogram.DataPoints, 1)
 	require.Empty(t, histogram.DataPoints[0].Exemplars)
+}
+
+type scopeRecordingMeterProvider struct {
+	metricnoop.MeterProvider
+	name    string
+	version string
+}
+
+func (p *scopeRecordingMeterProvider) Meter(name string, opts ...metric.MeterOption) metric.Meter {
+	p.name, p.version = name, metric.NewMeterConfig(opts...).InstrumentationVersion()
+	return p.MeterProvider.Meter(name, opts...)
+}
+
+type scopeRecordingTracerProvider struct {
+	tracenoop.TracerProvider
+	name    string
+	version string
+}
+
+func (p *scopeRecordingTracerProvider) Tracer(name string, opts ...trace.TracerOption) trace.Tracer {
+	config := trace.NewTracerConfig(opts...)
+	p.name, p.version = name, config.InstrumentationVersion()
+	return p.TracerProvider.Tracer(name, opts...)
+}
+
+// TestNewStampsTheSDKVersionOnItsInstrumentationScope pins that the meter and
+// tracer carry the SDK version, so exported telemetry says which release produced it.
+func TestNewStampsTheSDKVersionOnItsInstrumentationScope(t *testing.T) {
+	meters := &scopeRecordingMeterProvider{}
+	tracers := &scopeRecordingTracerProvider{}
+	_, err := New(WithMeterProvider(meters), WithTracerProvider(tracers))
+	require.NoError(t, err)
+
+	require.Equal(t, instrumentationName, meters.name)
+	require.Equal(t, version.SDK(), meters.version)
+	require.Equal(t, instrumentationName, tracers.name)
+	require.Equal(t, version.SDK(), tracers.version)
+	require.NotEmpty(t, version.SDK())
 }

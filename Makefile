@@ -36,7 +36,7 @@ KAFKA_PORT ?= 19092
 KAFKA_PROJECT ?= docker
 KAFKA_COMPOSE := KAFKA_PORT=$(KAFKA_PORT) docker compose --project-name "$(KAFKA_PROJECT)" -f docker/docker-compose.yml
 
-.PHONY: build format format-check test-fast test lint vulncheck probe-tests otlp-boundary verify-agnostic verify-self-contained check-fixture check-doc-source-links check-observer-events check-api-surface check-api-surface-codec check-api-surface-driver check-api-surface-f1test check-api-surface-f1otel check-api-diff record-api-diff-baseline
+.PHONY: build format format-check test-fast coverage-split test lint vulncheck probe-tests otlp-boundary verify-agnostic verify-self-contained check-fixture check-doc-source-links check-observer-events check-api-surface check-api-surface-codec check-api-surface-driver check-api-surface-f1test check-api-surface-f1otel check-api-diff record-api-diff-baseline
 
 ## build: compile all packages with reproducible build flags.
 build:
@@ -48,6 +48,26 @@ build:
 test-fast:
 	go test -race -coverprofile=coverage.out ./...
 	go tool cover -func=coverage.out | tail -1
+
+## coverage-split: report broker-free coverage first, then the additional
+## coverage reached by the broker-backed suites. The profiles remain separate
+## so the per-block difference is visible instead of hidden in one percentage.
+coverage-split: kafka-up broker-up broker-smoke
+	@rm -f coverage-broker-free.out coverage-broker-backed.out
+	go test -race -coverprofile=coverage-broker-free.out ./...
+	F1_KAFKA_ENDPOINT=$${F1_KAFKA_ENDPOINT:-localhost:$(KAFKA_PORT)} \
+	F1_ACCEPTANCE_ENDPOINT=$${F1_ACCEPTANCE_ENDPOINT:-localhost:$(KAFKA_PORT)} \
+	$(RABBITMQ_TEST_ENV) \
+	go test -race -count=1 -p 1 -tags integration -coverprofile=coverage-broker-backed.out -timeout 20m ./...
+	@set -e; \
+	free=$$(mktemp); \
+	backed=$$(mktemp); \
+	trap 'rm -f "$$free" "$$backed"' EXIT; \
+	awk 'NR > 1 && $$3 > 0 { print $$1 }' coverage-broker-free.out | sort -u >"$$free"; \
+	awk 'NR > 1 && $$3 > 0 { print $$1 }' coverage-broker-backed.out | sort -u >"$$backed"; \
+	printf 'coverage broker-free: '; go tool cover -func=coverage-broker-free.out | tail -1; \
+	printf 'coverage broker-backed: '; go tool cover -func=coverage-broker-backed.out | tail -1; \
+	printf 'broker-backed-only blocks: %s\n' "$$(comm -13 "$$free" "$$backed" | wc -l)"
 
 ## test: run the same broker-free suite without the race detector and without
 ## coverage. Nothing here reads a broker. See docs/development/testing.md.
@@ -108,6 +128,9 @@ verify-agnostic: $(GOLANGCI_LINT)
 # future maintainer - cannot follow a decision or task identifier into a tree
 # they do not have, so an unresolvable citation is worse than none. State the
 # rule the citation stands for instead.
+# The compatibility guide and this test's local recorder stages describe
+# repository-owned concepts, not unresolved project process. Exempt only those
+# files from the process-language scan; citation IDs remain checked everywhere.
 verify-self-contained:
 	@set -o pipefail; \
 	citation_pattern='(^|[^[:alnum:]_-])(ADR-[0-9]{4}|F-[0-9]{4}|A-[0-9]{4}|F-P[0-9]+|M1-[0-9]+)($$|[^[:alnum:]_-])'; \
@@ -119,6 +142,17 @@ verify-self-contained:
 	if [ "$$citation_status" -eq 0 ]; then \
 		printf '%s\n' "$$matches"; \
 		echo "verify-self-contained: citation above cannot be resolved from this repository"; \
+		exit 1; \
+	fi; \
+	process_pattern='(^|[^[:alnum:]_-])(phase[[:space:]]+[0-9]+[[:alpha:]]?|owner[[:space:]]+(approval|$$)|without[[:space:]]+owner[[:space:]]*$$|draft[[:space:]]+(API|$$)|is[[:space:]]+a[[:space:]]+draft[[:space:]]*$$)($$|[^[:alnum:]_-])'; \
+	process_matches=$$(git grep -nIE "$$process_pattern" -- . ':!Makefile' ':!docs/development/api-compatibility.md' ':!observer_publish_test.go'); \
+	process_status=$$?; \
+	if [ "$$process_status" -gt 1 ]; then \
+		exit "$$process_status"; \
+	fi; \
+	if [ "$$process_status" -eq 0 ]; then \
+		printf '%s\n' "$$process_matches"; \
+		echo "verify-self-contained: process-language citation above cannot be resolved from this repository"; \
 		exit 1; \
 	fi; \
 	paths=$$(git ls-files --cached --others --exclude-standard); \

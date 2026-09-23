@@ -12,6 +12,7 @@ import (
 
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/driver"
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/clock"
+	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/lifecycle"
 )
 
 // TestUnservedRequestReleasesTheWaitersWithItsOwnError pins what a caller
@@ -115,17 +116,24 @@ func TestReconnectAttemptRefusedByAClosingClientClosesItsConnection(t *testing.T
 		t.Fatal("the replacement attempt never reached the driver")
 	}
 
+	// Close joins the supervisor, so it returns once the held attempt is let
+	// through and gives its connection back.
 	closed := make(chan error, 1)
 	go func() { closed <- client.Close(context.Background()) }()
+	waitReconnectCondition(t, func() bool {
+		client.mu.Lock()
+		defer client.mu.Unlock()
+		return client.lifecycleLocked() != lifecycle.Ready
+	})
+	release()
 	select {
 	case err := <-closed:
 		if err != nil {
 			t.Fatalf("Close() while an attempt was in the driver = %v, want nil", err)
 		}
 	case <-clock.NewReal().Timer(2 * time.Second).C:
-		t.Fatal("Close did not return while an attempt was held in the driver")
+		t.Fatal("Close did not return after the held attempt was released")
 	}
-	release()
 	waitReconnectCondition(t, func() bool { return !client.isReconnecting() })
 
 	opened := d.opened()

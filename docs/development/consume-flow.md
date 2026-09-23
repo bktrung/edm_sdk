@@ -1,7 +1,7 @@
 # Consume flow
 
-This page is the canonical maintainer trace for one subscription's delivery
-lifecycle. It follows the path from `Client.Subscribe` through runner startup,
+F1 carries each subscription's deliveries from runner startup through handling,
+acks, drain, and reconnect. This maintainer trace follows the path from `Client.Subscribe` through runner startup,
 broker intake, scheduling, middleware and handler execution, delivery decisions,
 settlement, drain, and reconnect.
 
@@ -12,7 +12,7 @@ primitives, and the driver port.
 ## End-to-end path
 
 ```mermaid
-%%{init: {"flowchart": {"nodeSpacing": 24, "rankSpacing": 32, "padding": 10}}}%%
+%%{init: {"flowchart": {"nodeSpacing": 24, "rankSpacing": 32, "padding": 10, "subGraphTitleMargin": {"top": 6, "bottom": 10}}}}%%
 flowchart TB
     subgraph S1[Subscribe]
         direction LR
@@ -42,7 +42,11 @@ flowchart TB
         ACK --> LEFT[Delivery leaves the<br/>in-flight registry]
         REQUEUE --> LEFT
     end
-    S1 --> S2 --> S3 --> S4 --> S5 --> S6
+    RUNNER --> RUN
+    CONSUMER --> FETCH
+    CHANNEL --> SCHED
+    PROCESS --> DECODE
+    HANDLER --> OUTCOME
 ```
 
 Each row is one stage, read left to right; the stages run top to bottom. The last node of a stage
@@ -95,11 +99,13 @@ A generation owns one consumer, fetcher, dispatch pipeline, and consumer-error
 watcher, plus the connection epoch its consumer was opened on. The epoch is the
 client's connection incarnation: the client installs a connection and its number
 as one value, so a number that has moved means the connection the runner opened
-on was replaced under it. The runner's reconnect work reads that one value
-instead of keeping its own copy of the connection: an open returns the epoch it
-read together with the consumer, admission of a new consumer compares that epoch
-under the client lock, and a generation that finds the epoch moved releases its
-consumer and opens again on the replacement.
+on was replaced under it.
+
+The runner's reconnect work reads that one value instead of keeping its own copy
+of the connection: an open returns the epoch it read together with the consumer,
+admission of a new consumer compares that epoch under the client lock, and a
+generation that finds the epoch moved releases its consumer and opens again on
+the replacement.
 
 This separation lets an application construct subscriptions before deciding
 which goroutine owns their run loop, and lets reconnect rebuild a generation
@@ -123,11 +129,10 @@ publish entry point.
 
 Every policy goes through the admin, `TopologyNone` included: the runner passes
 a `driver.TopologySpec` carrying the selected policy to
-`driver.Admin.EnsureTopology`, and under `TopologyNone` the driver does no
-broker work but still records what the spec said. The spec includes the
-main, retry, dead-letter, and capability-dependent broker backstop objects.
-Missing or drifted topology fails consumer startup according to the selected
-policy.
+`driver.Admin.EnsureTopology`, and the spec includes the main, retry,
+dead-letter, and capability-dependent broker backstop objects. What each
+policy asks of the driver is in
+[Driver contract](/development/driver-contract#driver-admin-and-topology).
 
 The runner then creates one `driver.Consumer` with:
 
@@ -175,7 +180,8 @@ already yielded by the consumer, and requeues a delivery that cannot be
 accepted locally. It does not silently discard a message that crossed the
 driver boundary.
 
-The consumer contract requires that `Messages` closes only after `Stop`, while
+The consumer contract requires that `Messages` stays open until `Stop` or
+`Release` completes, while
 transient failures are reported through `Errors`. The core therefore treats a
 closed message channel, a transient error, and a fatal error as different
 generation outcomes.
@@ -231,6 +237,8 @@ traffic.
 The scheduler implementation is in
 [`internal/sched/scheduler.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/internal/sched/scheduler.go) and the
 runner's lane construction is in [`newRunnerScheduler`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/worker.go).
+
+For the design and trade-offs behind these lanes, see [how F1 schedules deliveries](/deep-dives/scheduler).
 
 When a lane is full, `runDispatchPipeline` keeps one pending delivery and waits
 for worker capacity. It does not grow an unbounded in-memory queue. This is the
@@ -346,6 +354,7 @@ Retry and dead-letter routing are successor handoffs, not in-place mutations of
 the source delivery:
 
 ```mermaid
+%%{init: {"sequence": {"actorMargin": 24, "width": 110}}}%%
 sequenceDiagram
     participant W as Worker
     participant P as Shared producer
@@ -360,11 +369,9 @@ sequenceDiagram
     S->>B: Remove original delivery
 ```
 
-The source is acknowledged only after the successor publish returns success.
-If the successor publish or source settlement is uncertain, the original stays
-eligible for redelivery. A crash after successor confirmation and before the
-ack can duplicate the successor; at-least-once delivery means handlers must
-remain idempotent.
+F1 confirms the successor before acknowledging the source; uncertain handoffs
+can redeliver or duplicate it, so handlers must be idempotent; see [Life of a
+delivery](/deep-dives/life-of-a-delivery) for the failure cases.
 
 The implementation is in [`retryAndSettle`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/worker.go),
 [`deadLetterAndSettle`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/worker.go), and
@@ -386,7 +393,8 @@ the in-flight set.
 - recovers a panic that escaped the middleware wrapper and attempts a DLQ path;
 - requeues an abandoned delivery when no settlement was attempted;
 - retries the last ack or nack operation for a bounded number of rounds;
-- falls back from a failed ack to a requeue nack during cleanup; and
+- falls back from a failed ack to a requeue nack within a round, and tries the
+  ack again in the next round; and
 - removes the delivery from the in-flight registry once its settlement path
   finished.
 
@@ -426,17 +434,29 @@ stateDiagram-v2
 ```
 
 For a normal runner drain, `drainAfterRun` waits for the in-flight registry to
-reach zero under `Lifecycle.DrainTimeout`, then releases the consumer under
-`Lifecycle.CloseTimeout`. A wait that fails still releases the consumer, on a
-context detached from the canceled run context, and ends the runner `Aborted`;
-a release error also ends `Aborted`; success ends `Closed`; and a runner that
-is already `Failed` stays `Failed` and returns nil. If `Stop` refuses because
-the driver still owns outstanding deliveries, the runner uses `Release` so
-those deliveries can be redelivered. `Release` is not a retry disposition; it
-returns broker-owned work without claiming that the message was handled.
+reach zero under `Lifecycle.DrainTimeout`, then stops the consumer under
+`Lifecycle.CloseTimeout`. A wait that fails still attempts `Stop` on a context
+detached from the canceled run context. If `Stop` returns any error, including
+a refusal because the driver still owns outstanding deliveries, the runner calls
+`Release` so the consumer does not stay registered; after a timeout or
+cancellation, `Release` uses a fresh context bounded by `Lifecycle.CloseTimeout`.
 
-`Client.Close` drains all registered runners before waiting for publish
-quiescence and closing shared producer/connection resources. The lifecycle
+A failed wait or a `Stop`/`Release` error ends the runner `Aborted`; success ends
+`Closed`; a runner that is already `Failed` stays `Failed` and returns nil.
+`Release` is not a retry disposition: it returns broker-owned work without
+claiming that the message was handled.
+
+A `Release` that failed leaves the consumer registered on the driver, and a
+driver refuses to close the connection that still carries one. The client keeps
+that consumer with the connection it was opened on, so the release it owes is
+attempted again before the connection is closed: by a later `Client.Close` for
+the live connection, and by the swap that retires the connection on the way out
+of a reconnect. Each attempt is bounded by `Lifecycle.CloseTimeout`, and a
+release that succeeds drops the consumer from the client.
+
+`Client.Close` drains all registered runners, waits for publish quiescence,
+waits up to `Lifecycle.CloseTimeout` for a reconnect in progress to stop, and
+only then closes the shared producer/connection resources. The lifecycle
 package holds the state machine only, with runner integration in
 [`Runner.Drain`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/worker.go),
 [`drainAfterRun`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/reconnect.go), and [`Client.Close`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/client.go).
@@ -450,6 +470,8 @@ User-visible shutdown behavior is documented in
 - notification errors are reported without ending the generation;
 - transient or unclassified errors record a reconnect cause and cancel the
   generation;
+- not-found, too-large and permission errors are reported without ending the
+  generation, and the reader keeps watching for a later fatal error;
 - fatal errors mark the runner failed, and any error that ends a started
   runner is recorded in client health, except after the caller's cancel, a
   drain, or the start of client shutdown; the record stays until a runner
@@ -461,16 +483,18 @@ The runner may first repair a consumer generation. If the connection itself
 must be rebuilt, it asks the client for one and waits on its own goroutine. The
 ask and the wait are one call, `awaitRebuild`: it sends the request when the
 caller's epoch is still current and no attempt is in flight, and otherwise only
-waits, which is what a runner that arrived during a rebuild does. A wait parks
-only where something will release it. An attempt in flight releases the wake
-captured with the epoch, and a request this call sends is served by the attempt
-it starts or dropped by the swap that answered it; with neither, nothing would
-ever release the park, so the state is read instead. That is the caller that
-arrived after the change it would have waited for had already happened.
+waits, which is what a runner that arrived during a rebuild does.
+
+A wait parks only where something will release it. An attempt in flight releases
+the wake captured with the epoch, and a request this call sends is served by the
+attempt it starts or dropped by the swap that answered it; with neither, nothing
+would ever release the park, so the state is read instead. That is the caller
+that arrived after the change it would have waited for had already happened.
 
 [`Runner.abandonForReconnect`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/reconnect.go)
 is how the attempt takes a runner that is still on the old connection: it
-cancels the generation and calls `Consumer.Release`, deliberately leaving
+cancels the generation and calls `Consumer.Release` under
+`Lifecycle.CloseTimeout`, deliberately leaving
 unsettled deliveries for broker redelivery rather than classifying them as
 application retries, and reports the abandon to the owner loop as an event. The
 open that the abandon cancelled is not a failure of the runner's: it waits for
@@ -482,6 +506,7 @@ the live connection under the next epoch, and retires the producer and the
 connection the swap replaced. Every runner waiting on the previous epoch is
 released by that one swap. The complete connection path is in
 [`reconnect.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/reconnect.go).
+
 A runner that starts, or opens a new generation, while an attempt is in flight
 waits for it inside `openRunnerConsumerWith` and opens on the replacement
 connection. A consumer that was opened on the old connection as the attempt
@@ -515,6 +540,8 @@ When changing consume behavior, follow this order:
 8. Root, `f1test`, conformance, and provider tests before changing a port or
    lifecycle contract.
 
-The former root-level consume, scheduling, and settlement documents are now
-consolidated here. They can be removed after inbound links are migrated; this
-development page is the canonical maintainer route.
+## Go further
+
+- [Publish flow](/development/publish-flow) - the outbound message path;
+- [Failure handling](/advanced-topics/failure-handling) - retry and dead-letter policy;
+- [Life of a delivery](/deep-dives/life-of-a-delivery) - successor ordering and redelivery.

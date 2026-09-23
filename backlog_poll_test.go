@@ -48,12 +48,6 @@ func (o *backlogRecordingObserver) backlogPoints() []PointEvent {
 	return out
 }
 
-func (o *backlogRecordingObserver) pointCount() int {
-	o.mu.Lock()
-	defer o.mu.Unlock()
-	return len(o.points)
-}
-
 // backlogLagConsumer is a probe consumer in the shape of the drain and owner
 // probes: blocked message and error streams, immediate Drain, counted Stop
 // and Release, and a Lag with a call counter and an injectable error.
@@ -141,7 +135,6 @@ type backlogReaderConsumer struct {
 	*backlogLagConsumer
 	backlogCalls int
 	backlogMap   map[string]driver.BacklogSample
-	backlogErr   error
 }
 
 func newBacklogReaderConsumer(samples map[string]driver.BacklogSample) *backlogReaderConsumer {
@@ -155,9 +148,6 @@ func (c *backlogReaderConsumer) Backlog(context.Context) (map[string]driver.Back
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.backlogCalls++
-	if c.backlogErr != nil {
-		return nil, c.backlogErr
-	}
 	out := make(map[string]driver.BacklogSample, len(c.backlogMap))
 	for k, v := range c.backlogMap {
 		out[k] = v
@@ -175,12 +165,6 @@ func (c *backlogReaderConsumer) setBacklogMap(m map[string]driver.BacklogSample)
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.backlogMap = m
-}
-
-func (c *backlogReaderConsumer) setBacklogErr(err error) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.backlogErr = err
 }
 
 type inmemBacklogObserverClient struct {
@@ -837,21 +821,10 @@ func (c *panicLagConn) Consumer(ctx context.Context, cfg driver.ConsumerConfig) 
 
 type panicLagConsumer struct {
 	driver.Consumer
-	mu    sync.Mutex
-	calls int
 }
 
 func (c *panicLagConsumer) Lag(context.Context) (map[string]int64, error) {
-	c.mu.Lock()
-	c.calls++
-	c.mu.Unlock()
 	panic("backlog poll test panic")
-}
-
-func (c *panicLagConsumer) lagCalls() int {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.calls
 }
 
 func TestBacklogPollLagPanicKeepsGoing(t *testing.T) {

@@ -190,11 +190,11 @@ func TestSuccessorTopicPrefersTheConsumingFamily(t *testing.T) {
 	client, runner := newRetryBridgeRunner(t, &dispatchProducer{}, "orders.created")
 	defer func() { _ = client.Close(context.Background()) }()
 	envelope, message := divergentBridgeMessage(t, &dispatchSettler{})
-	if got := successorTopic(runner, envelope, message); got != "orders.created" {
+	if got := resolveDeliveryTopic(runner, envelope, message); got != "orders.created" {
 		t.Fatalf("successorTopic(consuming family) = %q, want orders.created", got)
 	}
 	message.Destination = "outside.declared.family"
-	if got := successorTopic(runner, envelope, message); got != "payments.charged" {
+	if got := resolveDeliveryTopic(runner, envelope, message); got != "payments.charged" {
 		t.Fatalf("successorTopic(fallback) = %q, want payments.charged", got)
 	}
 }

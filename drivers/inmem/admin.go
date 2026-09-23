@@ -19,18 +19,22 @@ var (
 	_ driver.Maintenance = (*adminOperations)(nil)
 )
 
+// EnsureTopology applies the requested topology policy and returns the resulting diff.
 func (a *admin) EnsureTopology(ctx context.Context, spec driver.TopologySpec) (driver.TopologyDiff, error) {
 	return a.operations.EnsureTopology(ctx, spec)
 }
 
+// DescribeTopology returns the current queued depth for each requested destination.
 func (a *admin) DescribeTopology(ctx context.Context, names []string) (driver.TopologyState, error) {
 	return a.operations.DescribeTopology(ctx, names)
 }
 
+// Purge removes queued messages from name and returns the count removed. The destination remains present.
 func (a *admin) Purge(ctx context.Context, name string) (int64, error) {
 	return a.operations.Purge(ctx, name)
 }
 
+// Prune deletes requested destinations that are empty and have no attached consumer.
 func (a *admin) Prune(ctx context.Context, names []string) ([]driver.PruneResult, error) {
 	return a.operations.Prune(ctx, names)
 }
@@ -48,6 +52,7 @@ func (a *adminOperations) begin(ctx context.Context, operation string) error {
 	return nil
 }
 
+// EnsureTopology applies the requested topology policy and returns the resulting diff.
 func (a *adminOperations) EnsureTopology(ctx context.Context, spec driver.TopologySpec) (driver.TopologyDiff, error) {
 	if err := a.begin(ctx, "ensure_topology"); err != nil {
 		return driver.TopologyDiff{}, err
@@ -141,6 +146,7 @@ func destinationArgumentDrift(want, got driver.DestinationSpec) []driver.Argumen
 	return drifted
 }
 
+// DescribeTopology returns the current queued depth for each requested destination.
 func (a *adminOperations) DescribeTopology(ctx context.Context, names []string) (driver.TopologyState, error) {
 	if err := a.begin(ctx, "describe_topology"); err != nil {
 		return driver.TopologyState{}, err
@@ -158,6 +164,7 @@ func (a *adminOperations) DescribeTopology(ctx context.Context, names []string) 
 	return state, nil
 }
 
+// Purge removes queued messages from name and returns the count removed. The destination remains present.
 func (a *adminOperations) Purge(ctx context.Context, name string) (int64, error) {
 	if err := a.begin(ctx, "purge"); err != nil {
 		return 0, err
@@ -175,6 +182,7 @@ func (a *adminOperations) Purge(ctx context.Context, name string) (int64, error)
 	return n, nil
 }
 
+// Prune deletes requested destinations that are empty and have no attached consumer.
 func (a *adminOperations) Prune(ctx context.Context, names []string) ([]driver.PruneResult, error) {
 	if err := a.begin(ctx, "prune"); err != nil {
 		return nil, err

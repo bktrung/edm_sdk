@@ -1,7 +1,9 @@
 # Source-reading guide
 
-This is the canonical reading order for maintainers and AI collaborators who
-need to understand the F1 repository before changing it. It starts with public
+F1's contracts are easiest to learn in a fixed order: public vocabulary and
+ports first, then the code that uses them. This guide gives that order to
+maintainers and AI collaborators who need to understand the repository before
+changing it. It starts with public
 vocabulary and ports, then follows construction, runtime primitives, concrete
 drivers, and verification. Do not begin in `worker.go`: the worker coordinates
 contracts that are defined elsewhere.
@@ -30,6 +32,8 @@ import boundaries, [Publish flow](/development/publish-flow) for the outbound pa
 [Consume flow](/development/consume-flow) for delivery, dispatch, settlement, drain, and
 reconnect. Use [Testing strategy](/development/testing) to choose which tests should
 accompany a change.
+
+Use [Writing style](/development/writing-style) when adding or revising documentation.
 
 ## Pass 1: public vocabulary
 
@@ -196,26 +200,27 @@ Publisher.Publish
   -> buildOutbound
   -> codec encode and topic validation
   -> Envelope.EncodeHeaders
-  -> publishMessages
+  -> sharedProducer
   -> driver.Producer.Publish
 ```
 
 Start at [`Publisher.Publish`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/publisher.go), which delegates to
 `PublishBatch`. Then follow `buildOutbound` in the same file for codec
 selection, event identity, envelope fields, routing, allowlists, and headers.
-Follow `publishMessages` in [`client.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/client.go) for producer
-admission, reconnection, and the close barrier. The final durable publication
-contract is the `driver.Producer` implementation in the selected adapter.
+Follow `sharedProducer` in [`client.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/client.go)
+for shared-producer admission and the close barrier. The final durable
+publication contract is the `driver.Producer` implementation in the selected
+adapter.
 
 The short form is:
 
 ```text
-Publisher.Publish -> buildOutbound -> Envelope.EncodeHeaders
-  -> publishMessages -> driver.Producer.Publish
+Publisher.Publish -> Publisher.PublishBatch -> buildOutbound
+  -> Envelope.EncodeHeaders -> sharedProducer -> driver.Producer.Publish
 ```
 
 Use [Publish flow](/development/publish-flow) when the question concerns batch partial
-failure, successor publication, or reconnect behavior.
+failure, retry and dead-letter successor publication, or reconnect behavior.
 
 ## Trace a consume
 
@@ -281,9 +286,44 @@ When a test fails, use the lowest owning layer to diagnose it: a primitive
 invariant in `internal`, a public orchestration rule in the root package, a
 port rule in conformance, or a broker translation in the provider suite.
 
+## Code behind the deep dives
+
+The deep dives explain mechanisms without naming internals. This is where each
+one lives in the code.
+
+- **Reconnect and generations**: `reconnect.go` (`reconnectSupervisor`,
+  `requestReconnect`, `reconnectOnce`, `awaitRebuild`, `claimReplaced`,
+  `abandonRunners`, `publishQuiescence`, `retireConnection`,
+  `Runner.abandonForReconnect`); `client.go` (the `Client` fields and their
+  comments, `requestReconnectOnTransient`, `sharedProducer`, `beginPublish`,
+  `endPublish`); `admission.go` (`admit`, `connStateLocked`, `staleClaimLocked`);
+  `publisher.go` (`Publisher.PublishBatch` and its captured epoch); `worker.go`
+  (generation opening, consumer admission, repair after a connection error).
+- **One owner per runner**: `worker.go` (`runnerEvent` and its kinds,
+  `runnerOwner`, `pumpUntil`, `handle`, `startOpen`, `startRebuild`,
+  `releaseConsumer`, `requestDrain`, `startDrain`, `Runner.Run`, `Runner.Drain`,
+  the source goroutines' deferred reports); `reconnect.go` (the supervisor's
+  abandon); `runner_owner_test.go`.
+- **Retries and dead letters**: `worker.go` (`dispatchMessage`,
+  `classifyRetryError`, `retryAndSettle`, `deadLetterAndSettle`, `deadLetter`,
+  `startSuccessorPublish`); `internal/retry/ladder.go` (`DelayFor`,
+  `ResolveTier`, `ResolveRetryAfter`); `internal/retry/sanity.go`
+  (`CounterRunaway`); `deathreason.go`.
+- **Ordered by key**: `internal/dispatch/pool.go` (`NewPool`, `queueIndex`,
+  `Submit`, `start`, `release`); `subscription.go` and `config.go` (ordered-mode
+  admission, parsing, buffer validation); `limits.go` (the `ordered_by_key`
+  feature status); `worker.go` (ordered consumer admission and retry handoff);
+  `driver/capability.go`.
+
 ## Keep the route current
 
-This development page is the canonical maintainer route and should be updated
+Update this guide
 when package ownership or the source-reading order changes. Keep source links
 close to the decision they explain, and let source, tests, fixtures, API
 manifests, and the Makefile remain authoritative for mutable details.
+
+## Go further
+
+- [Architecture](/development/architecture) - the package map this route walks.
+- [Consume flow](/development/consume-flow) and [Publish flow](/development/publish-flow) - the runtime traces.
+- [Testing](/development/testing) - how to protect a change once you understand it.

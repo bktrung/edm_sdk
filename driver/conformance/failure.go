@@ -24,14 +24,14 @@ func runFailure(group *groupContext) {
 			_ = conn.Close(group.ctx)
 			t.Fatal("Driver.Open() returned a connection after cancellation")
 		}
-		group.vector.Add(BehaviorEvent{ID: "cancel-open", Outcome: "cancelled", FinalDestination: "driver"})
+		group.vector.add(BehaviorEvent{ID: "cancel-open", Outcome: "cancelled", FinalDestination: "driver"})
 	})
 
 	group.Check("cancelled Ping returns transient", func(t *testing.T) {
 		ctx, cancel := context.WithCancel(group.ctx)
 		cancel()
 		assertCancelled(t, "Ping", group.conn.Ping(ctx))
-		group.vector.Add(BehaviorEvent{ID: "cancel-ping", Outcome: "cancelled", FinalDestination: "connection"})
+		group.vector.add(BehaviorEvent{ID: "cancel-ping", Outcome: "cancelled", FinalDestination: "connection"})
 	})
 
 	group.Check("cancelled Conn Close returns transient and leaves admission open", func(t *testing.T) {
@@ -53,7 +53,7 @@ func runFailure(group *groupContext) {
 		if err := conn.Close(group.ctx); err != nil {
 			t.Fatalf("Conn.Close() cleanup = %v", err)
 		}
-		group.vector.Add(BehaviorEvent{ID: "cancel-conn-close", Outcome: "cancelled", FinalDestination: "connection"})
+		group.vector.add(BehaviorEvent{ID: "cancel-conn-close", Outcome: "cancelled", FinalDestination: "connection"})
 	})
 
 	group.Check("failed Close keeps admission closed and remains retryable", func(t *testing.T) {
@@ -62,7 +62,7 @@ func runFailure(group *groupContext) {
 
 		conn, inject = newPrivateFailureConnection(t, group)
 		assertPrivateCloseFailure(t, group, conn, inject, profileDestination(group, privateCloseDestination), 0, group.ctx)
-		group.vector.Add(BehaviorEvent{ID: "failure-close-admission", Outcome: "closed-and-retryable", FinalDestination: "failure.close"})
+		group.vector.add(BehaviorEvent{ID: "failure-close-admission", Outcome: "closed-and-retryable", FinalDestination: "failure.close"})
 	})
 
 	group.Check("rejected Close leaves admission open", func(t *testing.T) {
@@ -97,7 +97,7 @@ func runFailure(group *groupContext) {
 		if err := conn.Close(group.ctx); err != nil {
 			t.Fatalf("Close() after resources closed: %v", err)
 		}
-		group.vector.Add(BehaviorEvent{ID: "failure-close-precondition", Outcome: "admission-open", FinalDestination: "failure.close"})
+		group.vector.add(BehaviorEvent{ID: "failure-close-precondition", Outcome: "admission-open", FinalDestination: "failure.close"})
 	})
 
 	group.Check("transient publish failure is classified", func(t *testing.T) {
@@ -106,7 +106,7 @@ func runFailure(group *groupContext) {
 		injectFailure(t, group, FaultPublishFailure)
 		err := producer.Publish(group.ctx, driver.OutboundMessage{Destination: name})
 		assertFaultError(t, err, driver.KindTransient)
-		group.vector.Add(BehaviorEvent{ID: "failure-publish-transient", Outcome: "transient", FinalDestination: name})
+		group.vector.add(BehaviorEvent{ID: "failure-publish-transient", Outcome: "transient", FinalDestination: name})
 	})
 
 	group.Check("publish recovers after a transient outage", func(t *testing.T) {
@@ -122,7 +122,7 @@ func runFailure(group *groupContext) {
 		if got := inspectDestination(t, group, name).Ready; got != 1 {
 			t.Fatalf("Ready after recovery = %d, want 1", got)
 		}
-		group.vector.Add(BehaviorEvent{ID: "failure-publish-recovery", Outcome: "recovered", FinalDestination: name})
+		group.vector.add(BehaviorEvent{ID: "failure-publish-recovery", Outcome: "recovered", FinalDestination: name})
 	})
 
 	group.Check("failed publish leaves no phantom message", func(t *testing.T) {
@@ -136,7 +136,7 @@ func runFailure(group *groupContext) {
 			view := inspectDestination(t, group, name)
 			return view.Ready == 0 && view.Unsettled == 0, fmt.Sprintf("view=%+v", view)
 		})
-		group.vector.Add(BehaviorEvent{ID: "failure-publish-no-phantom", Outcome: "absent", FinalDestination: name})
+		group.vector.add(BehaviorEvent{ID: "failure-publish-no-phantom", Outcome: "absent", FinalDestination: name})
 	})
 
 	group.Check("connection fault reports a transient error", func(t *testing.T) {
@@ -146,7 +146,7 @@ func runFailure(group *groupContext) {
 		injectFailure(t, group, FaultConnectionDrop)
 		err := receiveFailureError(t, group, consumer)
 		assertFaultError(t, err, driver.KindTransient)
-		group.vector.Add(BehaviorEvent{ID: "failure-errors-classified", Outcome: "transient", FinalDestination: name})
+		group.vector.add(BehaviorEvent{ID: "failure-errors-classified", Outcome: "transient", FinalDestination: name})
 	})
 
 	group.Check("transient error does not close Errors", func(t *testing.T) {
@@ -158,7 +158,7 @@ func runFailure(group *groupContext) {
 		injectFailure(t, group, FaultConnectionDrop)
 		second := receiveFailureError(t, group, consumer)
 		assertFaultError(t, second, driver.KindTransient)
-		group.vector.Add(BehaviorEvent{ID: "failure-errors-open", Outcome: "open", FinalDestination: name})
+		group.vector.add(BehaviorEvent{ID: "failure-errors-open", Outcome: "open", FinalDestination: name})
 	})
 
 	group.Check("transient error does not close Messages", func(t *testing.T) {
@@ -174,7 +174,7 @@ func runFailure(group *groupContext) {
 			t.Fatalf("body=%q, want control", message.Body)
 		}
 		ackMessage(t, group, message)
-		group.vector.Add(BehaviorEvent{ID: "failure-messages-open", Outcome: "delivered", FinalDestination: name})
+		group.vector.add(BehaviorEvent{ID: "failure-messages-open", Outcome: "delivered", FinalDestination: name})
 	})
 
 	group.Check("unread Errors do not block delivery", func(t *testing.T) {
@@ -187,7 +187,7 @@ func runFailure(group *groupContext) {
 		}
 		message := receiveMessage(t, group, consumer)
 		ackMessage(t, group, message)
-		group.vector.Add(BehaviorEvent{ID: "failure-errors-unread", Outcome: "unblocked", FinalDestination: name})
+		group.vector.add(BehaviorEvent{ID: "failure-errors-unread", Outcome: "unblocked", FinalDestination: name})
 	})
 
 	group.Check("connection drop redelivers an unsettled message", func(t *testing.T) {
@@ -204,7 +204,7 @@ func runFailure(group *groupContext) {
 			t.Fatalf("redelivery body=%q, want %q", second.Body, first.Body)
 		}
 		ackMessage(t, group, second)
-		group.vector.Add(BehaviorEvent{ID: "failure-redelivery-once", Outcome: "redelivered", AttemptCount: 2, FinalDestination: name})
+		group.vector.add(BehaviorEvent{ID: "failure-redelivery-once", Outcome: "redelivered", AttemptCount: 2, FinalDestination: name})
 	})
 
 	group.Check("delivery failure causes no duplicate after recovery", func(t *testing.T) {
@@ -226,7 +226,7 @@ func runFailure(group *groupContext) {
 			return view.Ready == 0 && view.Unsettled == 0, fmt.Sprintf("view=%+v", view)
 		})
 		assertNoDelivery(t, group, consumer, "duplicate delivery after recovery")
-		group.vector.Add(BehaviorEvent{ID: "failure-redelivery-no-duplicate", Outcome: "at-least-once", FinalDestination: name})
+		group.vector.add(BehaviorEvent{ID: "failure-redelivery-no-duplicate", Outcome: "at-least-once", FinalDestination: name})
 	})
 
 	group.Check("delivery count survives a delivery fault", func(t *testing.T) {
@@ -247,7 +247,7 @@ func runFailure(group *groupContext) {
 			t.Fatalf("DeliveryCount=%d, want -1 when unavailable", second.DeliveryCount)
 		}
 		ackMessage(t, group, second)
-		group.vector.Add(BehaviorEvent{ID: "failure-redelivery-count", Outcome: "advanced", FinalDestination: name})
+		group.vector.add(BehaviorEvent{ID: "failure-redelivery-count", Outcome: "advanced", FinalDestination: name})
 	})
 
 	group.Check("stale settlement after connection drop is fatal", func(t *testing.T) {
@@ -262,7 +262,7 @@ func runFailure(group *groupContext) {
 		err := first.Settle.Ack(group.ctx)
 		assertFaultError(t, err, driver.KindFatal)
 		ackMessage(t, group, receiveMessage(t, group, consumer))
-		group.vector.Add(BehaviorEvent{ID: "failure-settlement-fatal", Outcome: "fatal", FinalDestination: name})
+		group.vector.add(BehaviorEvent{ID: "failure-settlement-fatal", Outcome: "fatal", FinalDestination: name})
 	})
 
 	group.Check("recovered delivery remains settleable", func(t *testing.T) {
@@ -282,7 +282,7 @@ func runFailure(group *groupContext) {
 			view := inspectDestination(t, group, name)
 			return view.Ready == 0 && view.Unsettled == 0, fmt.Sprintf("view=%+v", view)
 		})
-		group.vector.Add(BehaviorEvent{ID: "failure-settlement-recovered", Outcome: "settled", FinalDestination: name})
+		group.vector.add(BehaviorEvent{ID: "failure-settlement-recovered", Outcome: "settled", FinalDestination: name})
 	})
 
 	group.Check("fatal publish failure is non-retryable", func(t *testing.T) {
@@ -291,7 +291,7 @@ func runFailure(group *groupContext) {
 		injectFailure(t, group, FaultFatalPublish)
 		err := producer.Publish(group.ctx, driver.OutboundMessage{Destination: name})
 		assertFaultError(t, err, driver.KindFatal)
-		group.vector.Add(BehaviorEvent{ID: "failure-publish-fatal", Outcome: "fatal", FinalDestination: name})
+		group.vector.add(BehaviorEvent{ID: "failure-publish-fatal", Outcome: "fatal", FinalDestination: name})
 	})
 
 	group.Check("stale settlement preserves its sentinel", func(t *testing.T) {
@@ -308,7 +308,7 @@ func runFailure(group *groupContext) {
 			t.Fatalf("stale settlement error=%v, want ErrAlreadySettled", err)
 		}
 		ackMessage(t, group, receiveMessage(t, group, consumer))
-		group.vector.Add(BehaviorEvent{ID: "failure-settlement-sentinel", Outcome: "wrapped", FinalDestination: name})
+		group.vector.add(BehaviorEvent{ID: "failure-settlement-sentinel", Outcome: "wrapped", FinalDestination: name})
 	})
 
 	group.Check("repeating a fault sequence is deterministic", func(t *testing.T) {
@@ -317,7 +317,7 @@ func runFailure(group *groupContext) {
 		if first != second {
 			t.Fatalf("fault sequence outcomes differ: first=%q second=%q", first, second)
 		}
-		group.vector.Add(BehaviorEvent{ID: "failure-deterministic", Outcome: "stable", FinalDestination: "failure.deterministic"})
+		group.vector.add(BehaviorEvent{ID: "failure-deterministic", Outcome: "stable", FinalDestination: "failure.deterministic"})
 	})
 
 	group.Check("lane channel closure reports a transient error", func(t *testing.T) {
@@ -327,7 +327,7 @@ func runFailure(group *groupContext) {
 		err := receiveFailureError(t, group, consumer)
 		assertFaultError(t, err, driver.KindTransient)
 		assertLaneClosed(t, group, producer, consumer, first)
-		group.vector.Add(BehaviorEvent{ID: "failure-lane-close-errors", Outcome: "transient", FinalDestination: first})
+		group.vector.add(BehaviorEvent{ID: "failure-lane-close-errors", Outcome: "transient", FinalDestination: first})
 	})
 
 	group.Check("lane channel closure leaves Messages open", func(t *testing.T) {
@@ -346,7 +346,7 @@ func runFailure(group *groupContext) {
 		}
 		ackMessage(t, group, message)
 		assertNoDelivery(t, group, consumer, "lane close Messages after surviving delivery")
-		group.vector.Add(BehaviorEvent{ID: "failure-lane-close-messages", Outcome: "open-survivor", FinalDestination: second})
+		group.vector.add(BehaviorEvent{ID: "failure-lane-close-messages", Outcome: "open-survivor", FinalDestination: second})
 	})
 
 	group.Check("lane channel closure permits clean Stop", func(t *testing.T) {
@@ -365,7 +365,7 @@ func runFailure(group *groupContext) {
 		if _, ok := <-consumer.Errors(); ok {
 			t.Fatal("lane close Errors remained open after Stop")
 		}
-		group.vector.Add(BehaviorEvent{ID: "failure-lane-close-stop", Outcome: "stopped", FinalDestination: first})
+		group.vector.add(BehaviorEvent{ID: "failure-lane-close-stop", Outcome: "stopped", FinalDestination: first})
 	})
 }
 

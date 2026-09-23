@@ -12,7 +12,6 @@ import (
 
 	"gopkg.in/yaml.v3"
 
-	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/dispatch"
 	kafkarules "fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/kafka"
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/retry"
 )
@@ -22,8 +21,9 @@ import (
 // the request into its opposite.
 const maxPrefetch = 65535
 
-// Config is the fully resolved configuration used to construct a Client.
-// LoadConfig validates YAML and environment values before returning it.
+// Config contains the SDK settings used to construct a Client. LoadConfig
+// returns a normalized, validated Config; New also normalizes and validates
+// values constructed directly in Go.
 type Config struct {
 	Env        string `yaml:"env"`
 	Service    string `yaml:"service"`
@@ -36,26 +36,27 @@ type Config struct {
 	Subscriptions map[string]SubscriptionConfig `yaml:"subscriptions"`
 }
 
-// TopologyConfig configures the destinations a Client verifies or creates.
+// TopologyConfig controls which broker destinations a Client creates or
+// verifies at startup. With no override, AutoCreate selects creation,
+// VerifyOnStart selects verification, and neither selects no topology check.
 type TopologyConfig struct {
 	AutoCreate    bool       `yaml:"autoCreate"`
 	VerifyOnStart bool       `yaml:"verifyOnStart"`
 	Priorities    []Priority `yaml:"priorities"`
 }
 
-// CodecConfig configures the codec selection and envelope size limits.
+// CodecConfig selects the default codec and sets envelope header and body
+// limits. New supplies defaults for zero fields.
 type CodecConfig struct {
 	Default        string `yaml:"default"`
-	ContentMode    string `yaml:"contentMode"`
 	MaxHeaderBytes int    `yaml:"maxHeaderBytes"`
 	MaxBodyBytes   int    `yaml:"maxBodyBytes"`
 }
 
-// LifecycleConfig configures the timing of graceful client shutdown. A zero
-// field selects the package default, so a Go caller that leaves one out
-// behaves the same as a YAML config that omits it; negative values are
-// invalid. ConsumerDrainTimeout is the one exception, where zero means no
-// bound at all.
+// LifecycleConfig sets the time limits used while a Client shuts down. Zero
+// selects the package default for each field except ConsumerDrainTimeout, where
+// zero disables that bound and leaves the caller's context as the limit.
+// Negative values are invalid.
 type LifecycleConfig struct {
 	DrainTimeout time.Duration `yaml:"drainTimeout"`
 	HandlerGrace time.Duration `yaml:"handlerGrace"`
@@ -69,7 +70,8 @@ type LifecycleConfig struct {
 	RebalanceDrainTimeout time.Duration `yaml:"rebalanceDrainTimeout"`
 }
 
-// Mode selects whether a Subscription preserves per-key delivery order.
+// Mode selects whether a Subscription preserves per-key delivery order. Its
+// zero value, Unordered, makes no ordering guarantee.
 type Mode int
 
 const (
@@ -83,7 +85,8 @@ const (
 	OrderedByKey
 )
 
-// UnmatchedPolicy selects the action for an event with no matching handler.
+// UnmatchedPolicy selects how an event with no matching handler is settled.
+// Its zero value, Ignore, acknowledges the event without retaining a copy.
 type UnmatchedPolicy int
 
 const (
@@ -93,7 +96,8 @@ const (
 	DeadLetter
 )
 
-// FairnessConfig configures fairness among a Subscription's delivery lanes.
+// FairnessConfig sets lane weights and wait budgets for a Subscription.
+// Omitted values use the SDK defaults when the Subscription is resolved.
 type FairnessConfig struct {
 	Weights            map[Priority]int
 	Budgets            map[Priority]time.Duration
@@ -105,7 +109,9 @@ type FairnessConfig struct {
 	DisableDeadlinePromotion bool
 }
 
-// RetryConfig configures a Subscription's retry ladder.
+// RetryConfig sets retry delays and attempt limits for a Subscription. A
+// non-empty Tiers slice takes precedence over the exponential delay fields.
+// Zero fields use SDK defaults when the Subscription is resolved.
 type RetryConfig struct {
 	MaxAttempts     int
 	InitialInterval time.Duration
@@ -114,21 +120,38 @@ type RetryConfig struct {
 	Tiers           []time.Duration
 }
 
-// DelayFor returns the retry delay for a one-based retry number. It
-// delegates to internal/retry so the two consumers of this ladder - the
-// message due-time calculation and the retry destination's queue TTL - never
-// disagree.
-func (r RetryConfig) DelayFor(attempt int) time.Duration {
+// ladder converts the subscription retry configuration into the decision
+// package's ladder data. Every retry decision in the core reads the ladder
+// through this conversion, so the two shapes cannot drift.
+func (r RetryConfig) ladder() retry.Config {
 	return retry.Config{
 		MaxAttempts:     r.MaxAttempts,
 		InitialInterval: r.InitialInterval,
 		Multiplier:      r.Multiplier,
 		MaxInterval:     r.MaxInterval,
 		Tiers:           r.Tiers,
-	}.DelayFor(attempt)
+	}
 }
 
-// SubscriptionConfig carries every Subscription field that YAML can set.
+// DelayFor returns the nominal delay for a one-based retry attempt. Attempts
+// below one use the first retry. A non-empty Tiers slice selects its matching
+// entry and reuses its last entry for later attempts. Otherwise InitialInterval
+// defaults to one second, Multiplier defaults to five, and a positive
+// MaxInterval caps the result.
+func (r RetryConfig) DelayFor(attempt int) time.Duration {
+	return r.ladder().DelayFor(attempt)
+}
+
+// tierCount returns the number of retry tiers the configured ladder has: the
+// declared Tiers when set, otherwise one per attempt after the first. The lane
+// plan, the destination tables and the default prefetch all derive from it, so
+// a retry lane and its destination cannot disagree about how many exist.
+func (r RetryConfig) tierCount() int {
+	return r.ladder().TierCount()
+}
+
+// SubscriptionConfig contains the delivery settings that can be loaded from
+// YAML. Handlers and lifecycle callbacks are supplied on Subscription.
 type SubscriptionConfig struct {
 	Topics          []string        `yaml:"topics"`
 	Mode            Mode            `yaml:"mode"`
@@ -171,11 +194,18 @@ func LoadConfig(path string) (Config, error) {
 	return cfg, nil
 }
 
+// defaultBrokerPrefetch is the prefetch a subscription falls back to when
+// neither its own configuration nor Broker.DefaultPrefetch names one. It is
+// the same number defaultConfig puts in Broker.DefaultPrefetch, so a
+// programmatic Config that leaves that field zero resolves to the documented
+// default.
+const defaultBrokerPrefetch = 64
+
 func defaultConfig() Config {
 	return Config{
-		Broker:        BrokerConfig{ConnectTimeout: 30 * time.Second, DefaultPrefetch: 64},
+		Broker:        BrokerConfig{ConnectTimeout: 30 * time.Second, DefaultPrefetch: defaultBrokerPrefetch},
 		Topology:      TopologyConfig{VerifyOnStart: true, Priorities: []Priority{PriorityHigh, PriorityMedium, PriorityLow}},
-		Codec:         CodecConfig{Default: "json", ContentMode: "binary", MaxHeaderBytes: CoreMaxHeaderBytes, MaxBodyBytes: 1024 * 1024},
+		Codec:         CodecConfig{Default: "json", MaxHeaderBytes: CoreMaxHeaderBytes, MaxBodyBytes: 1024 * 1024},
 		Lifecycle:     LifecycleConfig{DrainTimeout: time.Minute, HandlerGrace: 5 * time.Second, CloseTimeout: 10 * time.Second, RebalanceDrainTimeout: 25 * time.Second},
 		Subscriptions: map[string]SubscriptionConfig{},
 	}
@@ -199,16 +229,13 @@ func resolvePrefetch(prefetch, brokerDefault int) int {
 	if brokerDefault != 0 {
 		return brokerDefault
 	}
-	return defaultConfig().Broker.DefaultPrefetch
+	return defaultBrokerPrefetch
 }
 
 func normalizeConfig(cfg Config) Config {
 	defaults := defaultConfig()
 	if cfg.Codec.Default == "" {
 		cfg.Codec.Default = defaults.Codec.Default
-	}
-	if cfg.Codec.ContentMode == "" {
-		cfg.Codec.ContentMode = defaults.Codec.ContentMode
 	}
 	if cfg.Codec.MaxBodyBytes == 0 {
 		cfg.Codec.MaxBodyBytes = defaults.Codec.MaxBodyBytes
@@ -305,6 +332,27 @@ func applyEnvironment(cfg *Config) {
 	}
 }
 
+// isNameSegment reports whether name can stand as one segment of a
+// destination name: letters, digits, '-' and '_'. Destination names join the
+// environment, topic, subscription and priority with dots and read the
+// environment back as the first segment, so a dot or a slash inside the
+// environment or a subscription name would let two different configurations
+// name the same queue: "prod/us" would share "prod"'s destinations while
+// skipping its production checks.
+func isNameSegment(name string) bool {
+	if name == "" {
+		return false
+	}
+	for _, r := range name {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '-', r == '_':
+		default:
+			return false
+		}
+	}
+	return true
+}
+
 var productionEnvironmentAliases = map[string]struct{}{
 	"prod":       {},
 	"production": {},
@@ -314,6 +362,9 @@ var productionEnvironmentAliases = map[string]struct{}{
 func validateConfig(cfg Config, driverName string) error {
 	if cfg.Env == "" {
 		return fmt.Errorf("f1: env must not be empty")
+	}
+	if !isNameSegment(cfg.Env) {
+		return fmt.Errorf("f1: env %q must contain only letters, digits, '-' and '_'", cfg.Env)
 	}
 	if cfg.Service == "" {
 		return fmt.Errorf("f1: service must not be empty")
@@ -367,9 +418,6 @@ func validateConfig(cfg Config, driverName string) error {
 	if cfg.Env == "prod" && driverName == "rabbitmq" && cfg.Broker.DriverOptions["rabbitmq.queueType"] != "quorum" {
 		return fmt.Errorf("f1: broker.rabbitmq.queueType must be quorum in prod")
 	}
-	if cfg.Codec.ContentMode != "binary" {
-		return fmt.Errorf("f1: codec.contentMode %q is unsupported", cfg.Codec.ContentMode)
-	}
 	if cfg.Codec.MaxBodyBytes <= 0 {
 		return fmt.Errorf("f1: codec.maxBodyBytes must be positive")
 	}
@@ -382,36 +430,16 @@ func validateConfig(cfg Config, driverName string) error {
 	if err := validatePriorityList("topology.priorities", cfg.Topology.Priorities); err != nil {
 		return err
 	}
+	if driverName == "rabbitmq" {
+		// A malformed value must fail at load even with no subscription to
+		// compare it against; validateSubscription checks the bound itself.
+		if _, err := durationOption(cfg.Broker.DriverOptions, "rabbitmq.consumerTimeout", 90*time.Second); err != nil {
+			return err
+		}
+	}
 	for name, subscription := range cfg.Subscriptions {
-		if len(subscription.Topics) == 0 {
-			return fmt.Errorf("f1: subscriptions.%s.topics must not be empty", name)
-		}
-		if err := validatePriorityList("subscriptions."+name+".priorities", subscription.Priorities); err != nil {
+		if err := validateSubscription(cfg, driverName, name, subscription); err != nil {
 			return err
-		}
-		if subscription.Concurrency < 1 || subscription.Concurrency > 1024 {
-			return fmt.Errorf("f1: subscriptions.%s.concurrency must be between 1 and 1024", name)
-		}
-		if err := validateSubscriptionModeAndPolicy(name, subscription.Mode, subscription.UnmatchedPolicy); err != nil {
-			return err
-		}
-		if err := validateRetryConfig("subscriptions."+name+".retry", subscription.Retry); err != nil {
-			return err
-		}
-		lanes := subscriptionLaneCount(len(subscription.Topics), len(subscription.Priorities), subscription.Retry)
-		if err := validatePrefetch(name, subscription.Prefetch, lanes); err != nil {
-			return err
-		}
-		if subscription.Mode == OrderedByKey && subscription.Concurrency > dispatch.MaxOrderedBufferEntries/subscription.Prefetch {
-			return fmt.Errorf("f1: subscriptions.%s: ordered mode needs concurrency x prefetch at most %d, got %d x %d", name, dispatch.MaxOrderedBufferEntries, subscription.Concurrency, subscription.Prefetch)
-		}
-		for priority, weight := range subscription.Fairness.Weights {
-			if !priority.Valid() || weight < 1 {
-				return fmt.Errorf("f1: subscriptions.%s.fairness.weights.%s must be at least 1", name, priority)
-			}
-		}
-		if cfg.Lifecycle.DrainTimeout <= subscription.HandlerTimeout {
-			return fmt.Errorf("f1: lifecycle.drainTimeout must exceed subscriptions.%s.handlerTimeout", name)
 		}
 	}
 	if driverName == "kafka" {
@@ -439,18 +467,6 @@ func validateConfig(cfg Config, driverName string) error {
 				rebalanceTimeout,
 				sessionTimeout,
 			)
-		}
-	}
-	if driverName == "rabbitmq" {
-		// Keep these fallback values synchronized with the RabbitMQ driver when it lands.
-		consumerTimeout, err := durationOption(cfg.Broker.DriverOptions, "rabbitmq.consumerTimeout", 90*time.Second)
-		if err != nil {
-			return err
-		}
-		for name, subscription := range cfg.Subscriptions {
-			if consumerTimeout < subscription.HandlerTimeout*3 {
-				return fmt.Errorf("f1: broker.rabbitmq.consumerTimeout must be at least subscriptions.%s.handlerTimeout x 3", name)
-			}
 		}
 	}
 	return nil
@@ -507,9 +523,24 @@ func validateRetryConfig(path string, retry RetryConfig) error {
 		if tier <= 0 {
 			return fmt.Errorf("f1: %s.tiers[%d] must be positive", path, i)
 		}
+		if tier > maxRetryDelay {
+			return fmt.Errorf("f1: %s.tiers[%d] %s exceeds the longest retry delay, %s", path, i, tier, maxRetryDelay)
+		}
+	}
+	for attempt := 1; attempt < retry.MaxAttempts; attempt++ {
+		if delay := retry.DelayFor(attempt); delay > maxRetryDelay {
+			return fmt.Errorf("f1: %s retry delay %s after attempt %d exceeds the longest retry delay, %s", path, delay, attempt, maxRetryDelay)
+		}
 	}
 	return nil
 }
+
+// maxRetryDelay is the longest retry delay a subscription may configure. A
+// RabbitMQ per-message expiration is a 32-bit count of milliseconds, so a
+// longer delay would be cut short and the copy released early; the same limit
+// applies to every driver so a configuration does not change meaning when the
+// broker does.
+const maxRetryDelay = math.MaxInt32 * time.Millisecond
 
 func validateLifecycleConfig(lifecycle LifecycleConfig) error {
 	// drainTimeout is not part of the general zero-means-unset rule: the
@@ -548,18 +579,11 @@ func durationOption(options map[string]string, key string, fallback time.Duratio
 	return duration, nil
 }
 
-func retryTiers(retry RetryConfig) int {
-	if len(retry.Tiers) > 0 {
-		return len(retry.Tiers)
-	}
-	return retry.MaxAttempts - 1
-}
-
 // subscriptionLaneCount is the number of delivery lanes a subscription feeds:
 // one per topic, priority and retry tier. The default prefetch and both
 // prefetch validations derive from it, so the three cannot drift.
-func subscriptionLaneCount(topics, priorities int, retry RetryConfig) int {
-	return topics * priorities * (1 + retryTiers(retry))
+func subscriptionLaneCount(topics, priorities int, retryCfg RetryConfig) int {
+	return topics * priorities * (1 + retryCfg.tierCount())
 }
 
 type rawConfig struct {

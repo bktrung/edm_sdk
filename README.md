@@ -1,9 +1,16 @@
 # F1 - Event-Driven Messaging SDK
 
-F1 is a single Go SDK that every service in the estate uses to publish and consume events. A
-service author writes handlers and event structs; F1 owns envelope construction, delivery
-guarantees, acknowledgement, retry ladders, dead-letter routing, poison-message containment,
-priority scheduling, zero-loss shutdown, and observability. The message broker is a pluggable
+F1 is a Go SDK for publishing and consuming events without writing broker code.
+
+An HTTP handler never reads a request off a socket; `net/http` does that for it. F1 does the same job
+for message brokers. The RabbitMQ and Kafka client libraries hand you raw deliveries and leave the
+hard parts to you: when to ack, how to retry after a delay, where a message that keeps failing goes,
+and how to shut down without dropping what is in flight. F1 solves those once, the same way on every
+supported broker.
+
+A service author writes handlers and event structs. F1 handles envelope construction, delivery
+guarantees, acknowledgement, retry delays, dead-letter routing, poison-message, priorities,
+zero-loss shutdown, and observability. The message broker is a pluggable
 driver, swapped by configuration.
 
 This file states what must be true of F1: the guarantees it owes a service author, and the things it
@@ -11,10 +18,9 @@ deliberately does not do. For the code tour, start with [`docs/`](docs/index.md)
 
 ## Guarantees
 
-Each of these is testable. The default CI pipeline runs the build, unit, lint, API-surface,
-API-diff, import-boundary, and self-contained gates listed in [`.gitlab-ci.yml`](.gitlab-ci.yml).
-Broker-backed jobs remain available there and run when `RUN_BROKER_TESTS=1` is set; the
-[Makefile](Makefile) owns the corresponding local command set.
+Each of these is testable. A GitLab pipeline is defined in [`.gitlab-ci.yml`](.gitlab-ci.yml),
+but no runner executes it yet. The gates run locally from the [Makefile](Makefile) are the evidence
+for each guarantee. Broker-backed jobs remain opt-in behind `RUN_BROKER_TESTS=1`.
 
 <!-- #region guarantees -->
 - **At-least-once delivery, with a stable message identity.** Transport redelivers during failures
@@ -22,15 +28,17 @@ Broker-backed jobs remain available there and run when `RUN_BROKER_TESTS=1` is s
   idempotency key by default, and preserves that key across every retry, dead-letter and
   redelivery copy of the same message. F1 does not deduplicate handler effects and keeps no store of
   seen keys: a service reads `Event.IdempotencyKey()` and makes its own effect safe to apply twice.
-- **Zero-loss graceful shutdown.** A drain protocol settles every in-flight message before the
-  process exits; nothing accepted is dropped on a rolling restart or `SIGTERM`.
-- **Automatic retry to a dead-letter queue.** Retryable failures move through a tiered backoff
-  ladder; exhausted or terminal failures dead-letter with a recorded death reason and error. That
-  holds for every entry F1 itself writes. The broker-side backstop queue is a separate destination,
+- **Zero-loss graceful shutdown.** On a rolling restart or `SIGTERM`, a drain finishes the messages
+  already accepted within the configured time limits. A message that cannot finish in time is not
+  dropped; the broker delivers it again, and `Drain` returns an error.
+- **Automatic retry to a dead-letter queue.** Retryable failures move through retry steps with
+  growing delays; exhausted or terminal failures dead-letter with a recorded death reason and error. That
+  holds for every entry F1 itself writes. The broker's own dead-letter queue is a separate destination,
   reached only when the broker's own delivery limit kills a message F1 never routed, and its entries
   carry no F1 death reason by construction - a non-zero depth there is the alert, not the norm.
-- **Starvation-free priority handling.** Low-priority messages have a bounded maximum wait under
-  sustained high-priority load; that bound is measured, not assumed.
+- **Starvation-free priority handling.** Every priority keeps a weighted share of the workers, and
+  an overdue low-priority lane can jump the queue under sustained high-priority load. F1 does not
+  promise a maximum wait.
 - **Poison-message safety.** A message that cannot be decoded, or a handler that panics, is
   quarantined rather than retried forever or taken down with the process.
 - **Ordering, where declared.** Per-key ordering is available and preserved end to end when a
@@ -49,13 +57,13 @@ Broker-backed jobs remain available there and run when `RUN_BROKER_TESTS=1` is s
 Attach `f1otel` with one `f1.WithObserver` option for standard OpenTelemetry
 metrics without adding instrumentation to handlers. The adapter uses an
 application-owned `MeterProvider` and records publish, receive, process,
-settlement, retry, dead-letter, backlog, and scheduler metrics. It is safe for
+ack, retry, dead-letter, backlog, and scheduler metrics. It is safe for
 concurrent calls and uses F1 event timestamps. See the [observability
 guide](docs/advanced-topics/observability.md) for the adapter contract, metric
 attributes, enqueue-time sources, and broker settings.
 
 
-## Non-goals for v1
+## Non-goals for v0.1
 
 <!-- #region non-goals -->
 - Exactly-once *transport* (Kafka transactions), and exactly-once *effects*. At-least-once delivery
@@ -68,28 +76,35 @@ attributes, enqueue-time sources, and broker settings.
 - Global ordering across partitions/queues. Per-key ordering only.
 - Cross-region replication and DR topology. Owned by the platform team.
 - Request/reply over messaging. Use gRPC.
-- Schema registry integration. v1 uses JSON plus a versioned envelope; the codec port has hooks for
-  Avro/Protobuf, but no registry client ships in v1.
+- Schema registry integration. v0.1 uses JSON plus a versioned envelope; the codec port has hooks for
+  Avro/Protobuf, but no registry client ships in v0.1.
 - NATS JetStream / Pulsar drivers. The port is designed to accommodate them; neither is present.
-- Kafka native per-message acknowledgement, native delivery counts, and scaling independent of the
-  partition count. The adapter consumes with consumer groups, settles by offset, and exposes the
-  core-emulated paths for delay, delivery count, and dead-letter behavior.
+- Per-message acknowledgement and delivery counts done by Kafka itself, and scaling independent of the
+  partition count. The adapter consumes with consumer groups, commits offsets, and uses F1's own
+  implementation of delay, delivery count, and dead-letter behavior.
 - Multiple broker versions per broker. The RabbitMQ adapter targets one stable broker family.
 <!-- #endregion non-goals -->
 
 ## Install
 
 ```
-go get fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk
+go get fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk@v0.1.0
 ```
 
 ```go
 import f1 "fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk"
 ```
 
-Set `GOPRIVATE=fgit.zapps.vn` before the first `go get` of this module - it lives on an internal
-host, and without this the Go toolchain will try the public checksum database and proxy, which
-cannot see it.
+This module requires Go 1.26 or newer. The drivers are tested against RabbitMQ 4.3.4 and Kafka 4.2.1.
+
+Set `GOPRIVATE=fgit.zapps.vn` before the first `go get` of this module. `GOPRIVATE` skips the
+public proxy and checksum database but does not authenticate; `go get` also needs Git credentials
+for `fgit.zapps.vn`.
+Provide credentials with a `~/.netrc` entry or configure Git to rewrite HTTPS module URLs to SSH:
+
+```sh
+git config --global url."git@fgit.zapps.vn:".insteadOf "https://fgit.zapps.vn/"
+```
 
 ## Local documentation site
 

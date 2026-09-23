@@ -69,7 +69,7 @@ func TestProducerHeldChannelDoesNotBlockPublish(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("EnsureTopology: %v", err)
 	}
-	rawProducer, err := conn.Producer(ctx, driver.ProducerConfig{RequireDurableAck: true})
+	rawProducer, err := conn.Producer(ctx, driver.ProducerConfig{})
 	if err != nil {
 		t.Fatalf("Producer: %v", err)
 	}
@@ -122,7 +122,7 @@ func TestProducerPublishesBeyondPoolSize(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("EnsureTopology: %v", err)
 	}
-	rawProducer, err := conn.Producer(ctx, driver.ProducerConfig{RequireDurableAck: true})
+	rawProducer, err := conn.Producer(ctx, driver.ProducerConfig{})
 	if err != nil {
 		t.Fatalf("Producer: %v", err)
 	}
@@ -193,7 +193,7 @@ func TestProducerDiscardedChannelIsClosedAndReplaced(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("EnsureTopology: %v", err)
 	}
-	rawProducer, err := conn.Producer(ctx, driver.ProducerConfig{RequireDurableAck: true})
+	rawProducer, err := conn.Producer(ctx, driver.ProducerConfig{})
 	if err != nil {
 		t.Fatalf("Producer: %v", err)
 	}

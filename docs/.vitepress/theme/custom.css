@@ -155,3 +155,103 @@
     animation-iteration-count: 1 !important;
   }
 }
+
+/* Static timeline figures drawn as inline SVG in a page. Bars use the brand
+   colour while a message waits for its due time and amber once it is late. */
+.f1-timeline {
+  --f1-late: #d97706;
+  margin: 1.5rem 0;
+  padding: 12px 14px 8px;
+  border: 1px solid var(--vp-c-divider);
+  border-radius: 12px;
+  background: var(--vp-c-bg-soft);
+  overflow-x: auto;
+}
+
+.dark .f1-timeline {
+  --f1-late: #fbbf24;
+}
+
+.f1-timeline svg {
+  display: block;
+  width: 100%;
+  min-width: 520px;
+  height: auto;
+}
+
+.f1-timeline__section {
+  fill: var(--vp-c-text-1);
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.f1-timeline__row {
+  fill: var(--vp-c-text-2);
+  font-size: 12px;
+}
+
+.f1-timeline__due {
+  fill: color-mix(in srgb, var(--vp-c-brand-1) 30%, transparent);
+  stroke: var(--vp-c-brand-1);
+}
+
+.f1-timeline__late {
+  fill: color-mix(in srgb, var(--f1-late) 30%, transparent);
+  stroke: var(--f1-late);
+  stroke-dasharray: 4 3;
+}
+
+.f1-timeline__in,
+.f1-timeline__out {
+  fill: var(--vp-c-text-1);
+  font-size: 12px;
+}
+
+.f1-timeline__axis {
+  stroke: var(--vp-c-text-3);
+}
+
+.f1-timeline__tick {
+  fill: var(--vp-c-text-3);
+  font-family: var(--vp-font-family-mono);
+  font-size: 11px;
+}
+
+.vp-doc .f1-timeline__legend {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin: 4px 0 0;
+  color: var(--vp-c-text-2);
+  font-size: 12px;
+  line-height: 1.4;
+}
+
+.f1-timeline__key {
+  display: inline-block;
+  width: 14px;
+  height: 10px;
+  border: 1px solid;
+  border-radius: 2px;
+}
+
+.f1-timeline__key--due {
+  border-color: var(--vp-c-brand-1);
+  background: color-mix(in srgb, var(--vp-c-brand-1) 30%, transparent);
+}
+
+.f1-timeline__key--late {
+  margin-left: 10px;
+  border-color: var(--f1-late);
+  border-style: dashed;
+  background: color-mix(in srgb, var(--f1-late) 30%, transparent);
+}
+
+/* Long identifiers (metric names, destination names, config keys) would
+   otherwise force a table wider than the content column on desktop. Dotted
+   identifiers break after a dot (see plugins/code-breaks.ts); code in the
+   descriptive columns may also wrap anywhere. The first column names the
+   row, so it only breaks at those dots. */
+.vp-doc td:not(:first-child) code {
+  overflow-wrap: anywhere;
+}

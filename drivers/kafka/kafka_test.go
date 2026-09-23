@@ -8,7 +8,6 @@ import (
 	"testing"
 	"time"
 
-	//nolint:depguard // this boundary test exercises core validation against the Kafka driver's fallback.
 	f1 "fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk"
 )
 
@@ -127,5 +126,25 @@ func TestValidateKafkaDrainTimeoutChecksBothGroupTimeouts(t *testing.T) {
 		"kafka.rebalanceTimeout": "50s",
 	}, 31*time.Second); err == nil || !strings.Contains(err.Error(), "kafka.rebalanceTimeout") {
 		t.Fatalf("validateKafkaDrainTimeout(custom, 31s) error = %v, want rebalance timeout bound", err)
+	}
+}
+
+// TestKafkaSoftwareVersionFitsTheBrokerPattern pins the version sent in
+// ApiVersions to Kafka's accepted pattern: a broker refuses the whole request
+// for "(devel)", which a test binary and a working-tree build report.
+func TestKafkaSoftwareVersionFitsTheBrokerPattern(t *testing.T) {
+	for _, test := range []struct {
+		version string
+		want    string
+	}{
+		{version: "(devel)", want: "devel"},
+		{version: "v0.1.0", want: "v0.1.0"},
+		{version: "v0.0.0-20260923120000-abcdef123456", want: "v0.0.0-20260923120000-abcdef123456"},
+		{version: "v1.2.3+dirty", want: "v1.2.3-dirty"},
+		{version: "", want: "unknown"},
+	} {
+		if got := kafkaSoftwareVersion(test.version); got != test.want {
+			t.Fatalf("kafkaSoftwareVersion(%q) = %q, want %q", test.version, got, test.want)
+		}
 	}
 }

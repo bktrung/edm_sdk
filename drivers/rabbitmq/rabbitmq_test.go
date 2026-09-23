@@ -1,9 +1,11 @@
 package rabbitmq
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net"
 	"slices"
 	"strings"
@@ -20,8 +22,8 @@ func TestDriverCapabilities(t *testing.T) {
 	if !caps.PerMessageAck || caps.NativeDelay || !caps.NativeDLQ {
 		t.Fatalf("capabilities = %#v, want per-message ack, no native delay, and native DLQ", caps)
 	}
-	if caps.NativePriority != driver.PriorityStrict || caps.NativePriorityLevels != 32 {
-		t.Fatalf("priority capabilities = %#v, want strict 32 levels", caps)
+	if caps.NativePriority != driver.PriorityNone || caps.NativePriorityLevels != 0 {
+		t.Fatalf("priority capabilities = %#v, want none: the driver applies no AMQP priority", caps)
 	}
 	if caps.Fanout != driver.FanoutAtPublish || !caps.OrderedByKey {
 		t.Fatalf("routing capabilities = %#v, want publish fanout and ordered keys", caps)
@@ -87,6 +89,33 @@ func TestQueueKindCapabilities(t *testing.T) {
 	}
 	if classic.NativeDLQ {
 		t.Fatal("classic capabilities NativeDLQ = true, want false")
+	}
+}
+
+// TestQuorumQueueKindReportsDurabilityUpgrade proves the upgrade a quorum
+// queue kind forces on a non-durable destination is visible. Quorum queues are
+// durable by definition, so the declare cannot honor a non-durable request, and
+// the connection reports the difference instead of leaving the caller to
+// discover it from the broker: once per destination, naming it.
+func TestQuorumQueueKindReportsDurabilityUpgrade(t *testing.T) {
+	if declared, _, _ := queueFlags(false, queueKindQuorum); !declared {
+		t.Fatal("queueFlags(non-durable, quorum) is not durable, want the kind to force durability")
+	}
+
+	var logged bytes.Buffer
+	c := &conn{queueKind: queueKindQuorum, logger: slog.New(slog.NewTextHandler(&logged, nil))}
+	c.reportDurabilityUpgrade("orders")
+	c.reportDurabilityUpgrade("orders")
+	c.reportDurabilityUpgrade("payments")
+
+	lines := strings.Split(strings.TrimSpace(logged.String()), "\n")
+	if len(lines) != 2 {
+		t.Fatalf("durability upgrade reported %d times, want one per destination: %q", len(lines), logged.String())
+	}
+	for index, destination := range []string{"orders", "payments"} {
+		if !strings.Contains(lines[index], destination) {
+			t.Fatalf("durability upgrade for %q = %q, want the destination named", destination, lines[index])
+		}
 	}
 }
 
@@ -165,13 +194,24 @@ func TestOpenAllowsAmqpsEndpoint(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			listener, accepted := listenerForOpenAttempt(t)
 			endpoint := fmt.Sprintf("amqps://0.0.0.0:%d/", listener.Addr().(*net.TCPAddr).Port)
-			ctx, cancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
+			opened := make(chan struct{})
+			go func() {
+				defer close(opened)
+				_, _ = (Driver{}).Open(ctx, driver.Config{Endpoints: []string{endpoint}, TLS: test.tls})
+			}()
 
-			_, _ = (Driver{}).Open(ctx, driver.Config{Endpoints: []string{endpoint}, TLS: test.tls})
-			if !receivedOpenAttempt(accepted) {
-				t.Fatal("Open() refused the amqps endpoint before dialing")
+			// The dial is the proof; stop the handshake retries once it lands.
+			select {
+			case <-accepted:
+			case <-opened:
+				if !receivedOpenAttempt(accepted) {
+					t.Fatal("Open() refused the amqps endpoint before dialing")
+				}
 			}
+			cancel()
+			<-opened
 		})
 	}
 }

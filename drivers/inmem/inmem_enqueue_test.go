@@ -21,7 +21,7 @@ func openEnqueueTest(t *testing.T, fake *clock.Fake, specs ...driver.Destination
 	require.NoError(t, err)
 	_, err = conn.Admin().EnsureTopology(ctx, driver.TopologySpec{Destinations: specs})
 	require.NoError(t, err)
-	producer, err := conn.Producer(ctx, driver.ProducerConfig{RequireDurableAck: true})
+	producer, err := conn.Producer(ctx, driver.ProducerConfig{})
 	require.NoError(t, err)
 	return ctx, conn, producer
 }

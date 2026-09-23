@@ -1,156 +1,153 @@
-# Life of a delivery
+# F1 tracks every message from intake to its final ack
 
 *By trungbk.*
 
-The order service publishes one message: type `orders.placed.v1`, key `o-42`, topic `orders.placed`. The broker hands a copy to the `order-projector` subscription, and from this moment the message belongs to F1. Everything that can go wrong happens here.
+A message becomes F1's responsibility when the driver hands it to the subscription; from that moment F1 records it as in flight. I follow one message, `o-42`, from broker delivery through the handler to the moment F1 [finishes it](/learn/glossary#settlement) with an ack or a nack, including the branches that give it back to the broker.
 
-The process can be asked to shut down while o-42 is still in a queue. The connection to the broker can drop. The handler can hang and never return. The publish that carries the retry copy can fail after the original was already read. None of those endings lose the message. Once a message crosses from the driver into F1, F1 either settles it, telling the broker it is finished, or gives it back to the broker. It never drops one silently.
+A shutdown, connection drop, hung handler, or temporary failure to publish a retry copy does not lose the message. F1 either finishes the original, or leaves it unacked so the broker can deliver it again. The exception is a poison message with no usable dead-letter route, or a dead-letter copy that cannot be encoded. F1 reports that drop as an observer event and through `WithErrorHandler`, or logs it when no error handler is configured. It is visible, never silent.
 
 ## The map
 
+The dashed edges give a delivery back to the broker: a nack with requeue (the broker puts the delivery back to be delivered again), or releasing the consumer after the retry copy could not be published. Releasing closes that consumer, and the broker redelivers every message the consumer held but had not acked.
+
 ```mermaid
-flowchart LR
-    B[broker] --> I[intake<br/>registered]
-    I --> C[bounded<br/>channel]
-    C --> L[lanes and<br/>scheduler]
+flowchart TB
+    B[(broker)] --> I[intake]
+    I --> C[bounded channel]
+    C --> L[lanes and scheduler]
     L --> P[worker pool]
-    P --> H[handler]
-    H --> S[settle]
+    P --> H([handler])
+    H --> D{handler result}
+    D --> A[ack original]
+    D --> S[publish retry or dead-letter copy]
+    S --> A
     I -.->|requeue| B
-    P -.->|abandoned| B
-    H -.->|stuck| B
-    S -.->|released| B
+    P -.->|nack, requeue| B
+    S -.->|release| B
+    A --> B
 ```
 
-Follow the top row left to right and o-42 reaches an ending; the dashed edges are the same message handed back to the broker, which is what keeps the guarantee true when something fails.
+The interactive figure below is a guided illustration of these branches, not a second scheduler or timing model.
 
 <F1DeliveryPath />
 
-A generation is one broker consumer plus three goroutines: the fetch side reads messages from the driver, the dispatch side schedules and dispatches them, and the error watcher reads the driver's error stream. A reconnect builds a new generation; the subscription above it and the runner stay the same, and so does F1's record of deliveries in flight.
+Each runner has a [current consumer](/learn/glossary#reconnect-generation) with its own fetch, dispatch, and error-reading goroutines. Optional backlog polling and the handler pool run separately. A reconnect replaces that consumer and its goroutines while the subscription, the runner, and F1's record of in-flight messages stay.
 
-Those three hand each other the channels they read. A goroutine that died without cancelling the generation would leave the others waiting on a close that never arrives, so each of them is started in a way that turns an error return and a panic alike into a cancellation of the whole generation. Every branch this page skips is traced in [consume flow](/development/consume-flow).
+If one of those goroutines returns an error or panics, F1 stops all of them. That matters because they hand each other channels: if dispatch stopped while fetch was blocked on a full channel, fetch would otherwise wait for a reader that no longer exists. Stopping them together lets every goroutine finish and lets the runner open a new consumer or drain.
 
 ## Counted before it moves
 
-I register o-42 before I move it. The fetch side takes the message off the driver's channel, records it in F1's record of deliveries in flight, and only then puts it on the dispatch channel. Registering first is what lets a shutdown count a message it cannot yet hand to a worker: if the drain starts while that channel is full, the message is already visible to the drain instead of hiding in a channel nobody is reading.
+I record `o-42` as in flight before moving it to the dispatch channel. If shutdown starts while that channel is full, the delivery is already visible to the drain instead of hiding in a buffer nobody is reading.
 
-The dispatch channel holds as many messages as the subscription has workers, which is `Concurrency`, sixteen for `order-projector`. Once a delivery is in it, the fetch side's job for that message is done.
+The channel holds as many deliveries as the subscription has workers. Once a delivery enters it, the fetch side has finished its part. If shutdown stops the hand-over before the delivery enters the channel, F1 nacks it with requeue and the broker delivers it again later.
 
-A full channel with a cancelled generation is where a message is easiest to lose, and it is not dropped: the fetch side nacks it with requeue, and the broker redelivers it later. On cancellation the fetch side also drains the driver's consumer within the drain timeout, forwards whatever the driver had already yielded, and closes the channel, so the dispatch side ends on a closed channel rather than on a message it never saw.
-
-A delivery leaves F1's record of deliveries in flight only when its outcome is known or the bounded cleanup budget is spent. `Runner.Drain` waits for that record to reach zero, which is how a shutdown proves that nothing it accepted is still unaccounted for.
+A delivery leaves F1's in-flight record when its outcome is known or the limited cleanup time runs out. `Runner.Drain` waits for that record to reach zero. This proves that F1 has stopped tracking accepted work, not that every broker call succeeded.
 
 ## Waiting for a worker
 
-The dispatch channel is the first buffer; the lanes are the second. Every delivery goes into a lane chosen by its topic, its priority, and its retry tier: one main lane for fresh traffic, one lane per retry tier. o-42 goes into the main lane for `orders.placed` at its priority.
+The dispatch channel is the first buffer. [Lanes](/learn/glossary#lane), the bounded queues inside F1, are the second. F1 chooses a lane from the topic, priority, and retry step: fresh traffic uses a main lane, and each retry step has its own lane.
 
-I use smooth weighted round robin for the pick: on every pick each non-empty lane gains its weight, the lane with the highest running total wins, and the winner gives the total weight in play back. Retry lanes carry a halved weight, clamped at the lowest weight a lane can hold, and a lane that has waited past its deadline can be promoted ahead of that order. The knobs are in [ordering and scheduling](/advanced-topics/ordering-and-scheduling).
+A worker that frees up takes the next message by [weighted picks](/deep-dives/scheduler): each group of lanes gets a share of picks in proportion to its weight, and retry lanes share one group with a reduced weight. A lane whose oldest message has waited at least its [wait limit](/learn/glossary#lane-budget) can [jump the queue](/learn/glossary#deadline-promotion), but the jump goes to the lane furthest past its limit rather than promising a maximum wait. [How F1 picks the next message](/deep-dives/scheduler) walks through the algorithm with scores, and the settings are in [ordering and scheduling](/advanced-topics/ordering-and-scheduling).
 
-A lane's capacity is its weighted share of the concurrency, raised to a small floor when the share would be narrower, then multiplied by a small prefetch factor. The floor matters when the share is narrow: without it a worker waits on the broker round trip behind its own acknowledgement.
+A lane's capacity limits how many messages wait in it. It grows with `Concurrency` and the lane's weight; the scheduler page gives the exact formula. When a lane is full, the broker holds later messages for that destination. Time spent at the broker does not count toward the lane's wait limit.
 
-The worker pool is one goroutine per unit of concurrency, and the dispatch loop asks the scheduler for its next pick only while the pool can take work. A loop that drained the scheduler into a queue in front of the workers would freeze the choice at read time, where it could no longer follow lanes filling and draining.
-
-That is the backpressure chain: when every worker is busy the loop stops picking, lanes fill, a full lane stops taking deliveries for its destination, and the driver, whose prefetch is capped at the sum of the lane capacities, stops fetching a destination at its cap. Every buffer on the path is bounded, and the furthest-upstream one stops the broker.
-
-By default every worker takes from one shared queue. In `OrderedByKey` mode each worker has its own queue, and a delivery goes to the queue its key hashes to, so two messages for o-42 always hash to the same worker and never run at once. Different keys still run in parallel.
-
-The pool runs accepted work on a context whose cancellation has been removed from the generation's, so a delivery the pool already took is not cancelled when the generation ends for a reconnect. That is also how a delivery can reach a handler whose generation is already gone.
+The dispatch loop asks for a pick only while the worker pool can accept work. With unordered delivery, accepted work enters a shared queue. With the `OrderedByKey` subscription mode, equal keys always go to the same worker queue, so messages with one key run one at a time; different keys can run in parallel.
 
 ## Running the handler
 
-Before any handler runs, the message has to pass a short inspection. The headers must decode into an envelope, a codec must exist for the declared content type, the attempt counter must not be runaway, the body must be inside the configured size limit, the event must not have expired, and a handler must match the event type. A message that fails any of those checks goes to the dead-letter path. One exception: an event type with no handler, under the ignore policy, is acked and reported as discarded, because a subscription that does not care about a type has nothing to dead-letter.
+Before a handler runs, F1 checks the envelope, codec, attempt count, body size, and expiry. A failed check goes to the dead-letter path. F1 then looks for a handler registered for the event type. An event with no handler follows the subscription's unmatched policy: `f1.Ignore`, the default, acks it and reports it as discarded, and `f1.DeadLetter` sends it to the dead-letter path.
 
-Middleware wraps the handler with the first middleware outermost, and panic recovery wraps the whole chain. Ack and nack happen in the dispatch side that called the chain, outside it, so a middleware that returns the wrong error cannot settle a message by accident.
+Middleware wraps the handler, and panic recovery covers the whole chain. The ack or nack happens outside the chain, so middleware cannot accidentally ack or requeue the delivery.
 
-The handler runs on its own goroutine with a context that expires after the handler timeout, thirty seconds by default. The dispatch side does not wait on it forever. At twice the timeout it logs a stuck-worker warning; twice again after that it gives up, marks the delivery abandoned, and stops waiting. If nothing settled the delivery in the meantime, the cleanup nacks it with requeue.
+The handler runs on its own goroutine with a timeout, `HandlerTimeout`, thirty seconds by default, measured from the moment the handler starts. At the timeout F1 cancels the handler context. Cancellation alone does not fail the delivery; the handler's return value still decides what happens: an error takes the normal error path below, and a `nil` returned after the cancel is acked.
 
-Giving up is not stopping. Go has no way to kill a goroutine from outside, so when F1 gives up it cancels the handler's context and returns to its own work, while the handler goroutine keeps running until the handler itself returns. A handler that ignores its context can outlive the delivery it was handling.
+A handler that keeps running is logged as stuck at twice the timeout, and at four times the timeout F1 stops waiting, gives up on the delivery, and nacks it with requeue so the broker can deliver it again. The attempt count does not change.
+
+Go cannot kill a goroutine from outside, so a handler that ignores its context keeps running after F1 gave up on it. Its worker takes the next delivery, so the process can run more handlers than `Concurrency`, and each stuck one holds its goroutine and whatever it opened. The redelivered copy can run while the stuck one is still working on the same message.
 
 ## Deciding what happens
 
-The handler's result decides the original message's ending, and the decision is made in one place so that nothing wrapped around the handler can take it.
+The handler result chooses the original message's outcome in one place.
 
-| What the handler returns | The original message |
+| What the handler returns | What happens to the original |
 | --- | --- |
-| nil | acked |
-| a dropped error, `f1.Drop` | acked and reported as discarded |
-| a terminal error, `f1.Terminal`, or a panic | dead-lettered |
-| any other error, with attempts left | retried through a successor |
-| any other error on the last attempt | dead-lettered |
+| nil | F1 acks it |
+| `f1.Drop` | F1 acks it and reports it as discarded |
+| `f1.Terminal` or a panic | F1 publishes a dead-letter copy, then acks the original |
+| another error with attempts left | F1 publishes a retry copy, then acks the original |
+| another error on the last attempt | F1 publishes a dead-letter copy, then acks the original |
 
-The full table, including decode failures, expiry and poison messages, is in [consume flow](/development/consume-flow#delivery-decisions).
-
-Two of those rows reach the broker through a successor copy rather than through the original, and that handoff is where the ordering in the next section applies.
+Decode failures, expiry, and other poison cases use the dead-letter policy described in [consume flow](/development/consume-flow#delivery-decisions). A copy that temporarily cannot be published leaves the original unacked. A copy that can never be encoded or accepted follows the visible poison-drop path instead.
 
 ## Ack last
 
-Retry and dead-letter both mean a new message. The original is not requeued and not modified in place: F1 copies the body and the key, adds one to the attempt counter, sets a due time, and publishes the copy to the retry destination for its tier. Only after that publish is confirmed does F1 ack the original. Dead-lettering has the same shape, with the dead-letter destination in place of the retry one.
+Retry and dead-letter copies are new messages. F1 copies the body and key into each one and sets its destination. A retry copy also gets the next attempt number and a due time; a dead-letter copy keeps the attempt number and adds the death reason and last error. F1 waits for the broker to confirm the copy. Only then does it ack the original.
 
-I publish a copy for portability. A broker's own requeue cannot carry a delay or an updated attempt count, and on Kafka there is no per-message negative acknowledgement at all. A new message on a retry destination behaves the same on every broker F1 supports.
+Publishing a copy works the same on every broker. A broker requeue cannot carry a delay or an updated attempt count, and Kafka has no per-message nack. A new message on a retry or dead-letter destination gives every driver the same path.
 
 ```mermaid
 sequenceDiagram
     participant W as worker
     participant P as producer
     participant B as broker
-    participant O as original delivery
+    participant O as original
 
-    W->>P: publish successor
+    W->>P: publish copy
+    P->>B: write copy
     alt publish confirmed
-        P->>B: write retry copy
         B-->>W: confirmed
         W->>O: ack original
-    else publish fails
-        W->>O: release, unsettled
-        O->>B: broker redelivers
+    else temporary publish failure
+        W->>B: release consumer
+        B-->>O: redeliver original
     end
 ```
 
-The ack is the last step in both branches, and when the successor cannot be published the original is never settled, so the broker still owns it.
+A copy that temporarily fails to publish is different from one that can never be published. The driver's error says which: a lost connection or a timeout is temporary, while a copy the broker refuses as too large, or whose headers cannot be encoded, can never be published.
 
-The successor publish gets a few quick retries with a short pause between them. If it still fails, the original is not acked: F1 releases the consumer, leaving the message unsettled so the broker redelivers it, exactly as it would after a crash. That budget is small on purpose, because the whole chain of publish and settle has to fit inside the broker's consumer-liveness window, and every extra attempt spends part of it.
+In the temporary case, F1 first retries the publish a few times within the time left for acking. If it still fails, F1 releases the consumer and leaves the original unacked, so the broker can deliver it again. In the never case, the poison path can ack the original after reporting why its copy could not be made.
 
-Acking last costs duplicates. If the process dies after the successor is confirmed and before the original is acked, the broker redelivers the original and the retry runs a second time. F1 is an at-least-once system, and handlers have to be idempotent.
+Acking last can duplicate work. If the process dies after the copy is confirmed but before the original is acked, the broker delivers the original again and the copy runs again too. F1 is at least once, so handlers must make their effects idempotent.
 
-## When the ack itself fails
+## When the ack fails
 
-The ack or nack call can fail too. The cleanup that runs at the end of every delivery retries the last settlement operation for a few more rounds with a short pause between them, and a failed ack falls back to a requeue nack within the same round.
+An ack or nack can fail after the handler result is known. F1 retries it a limited number of times. A failed ack can fall back to a nack with requeue in the same round, and the next round tries the ack again.
 
-Two separate facts decide when a delivery can leave F1's record of deliveries in flight: which call F1 decided to make, and whether the broker accepted it. A driver call that returned an error leaves the broker-side result unknown, so the entry stays until a later round settles it or the budget runs out. Drain waits for that record to reach zero, and the bounded budget is what keeps that wait finite.
+A driver error leaves the broker-side result unknown. F1 keeps the delivery in its in-flight record until a later try succeeds or `Lifecycle.DrainTimeout` runs out, even if the caller cancels.
 
-During a drain every round is also bounded by the drain timeout, so a settlement that keeps failing ends with it rather than holding a shutdown open indefinitely.
+This limit is separate from how long `Client.Close` waits for runners to drain:
+
+| Wait | Setting |
+| --- | --- |
+| Retrying one ack or nack, and keeping the delivery in the in-flight record | `Lifecycle.DrainTimeout`, one minute by default |
+| `Runner.Drain` finishing in-flight messages | `Lifecycle.DrainTimeout`, counted from the start of the drain |
+| `Client.Close` waiting for all runners to drain | `Lifecycle.ConsumerDrainTimeout`; zero leaves the caller's context as the only limit |
 
 ## Two races the path guards against
 
-### A generation that would never end
+### Goroutines that would never end
 
-The dispatch side can return an error, and the interesting part is what happens to the fetch side next. Say the dispatch side fails while the fetch side is blocked handing a message to the dispatch channel. If that failure did not cancel the generation, nobody would read that channel again, the fetch side would wait for a reader that no longer exists, and the generation would never end.
+Suppose dispatch fails while fetch is blocked handing a delivery to a full channel. Without stopping the goroutines together, dispatch would have stopped reading and fetch would wait forever. F1 stops all of them on the first error or panic, so fetch ends, the runner can open a new consumer, and accepted deliveries still reach the drain.
 
-An error or a panic from any source cancels the generation, so the fetch side's context ends, it stops, and the runner can rebuild the consumer or return. A delivery for a lane that does not exist is the other half of this guard: the scheduler refuses the lane, and the dispatch side routes the delivery to a fallback lane with a warning instead of ending the run over it.
+A delivery for an unknown lane is handled in a fallback lane with a warning instead of ending the run. That keeps a configuration or topology mismatch visible without leaving the runner stuck.
 
-### A handler whose generation is gone
+### A handler whose consumer is gone
 
-The pool lets queued work outlive its generation, so a delivery can reach the handler path after the generation was cancelled for a reconnect. Follow the interleaving. The dispatch loop has already submitted the delivery to the pool when the reconnect cancels the generation. The pool's context does not carry that cancellation, so a worker picks the delivery up anyway and runs it.
-
-That worker reads the generation's context, finds it finished, and checks whether the runner is draining. It is not, so F1 does not start the handler. The delivery comes back as abandoned, and the cleanup nacks it with requeue, which is the same ending it would have had if the fetch side had never accepted it.
-
-During a drain the handler does run, because a drain exists to finish work the runner already accepted.
+The pool can already hold accepted work when a reconnect stops the runner's consumer. That work is not cancelled along with the consumer, so a worker may still pick the delivery up. It checks whether the runner is draining before calling the handler. If the runner is not draining, the consumer went away because of a reconnect, so the worker gives up on the delivery and nacks it with requeue, and the broker delivers it again. If the runner is draining, the worker runs the handler so accepted work can finish.
 
 ## Trade-offs
 
-- Acking last can duplicate a retry when the process dies in the gap between a confirmed successor and the ack, so handlers have to be idempotent.
-- A handler that ignores its context keeps running after F1 has stopped waiting, and nothing in the runtime can end it.
-- Settlement retries are bounded, so a delivery can end with its broker-side outcome unknown rather than settled or requeued.
-- A busy pool stops intake for every lane, so pressure in one lane slows the others.
-
-## What I would change
-
-<!-- TODO(trungbk): what you would change about this path, in your own words. -->
+- Acking last can duplicate a retry copy when the process dies between the confirm and the original ack.
+- A handler that ignores its context can outlive the delivery F1 stopped waiting for.
+- `Lifecycle.DrainTimeout` can run out with the broker-side outcome unknown; F1 reports the failure rather than claiming the ack went through.
+- A busy worker pool stops intake for every lane, so pressure in one lane slows the others.
+- A poison message with no usable dead-letter route, or a dead-letter copy that cannot be encoded, can be dropped. F1 emits the poison observer event and sends the error to `WithErrorHandler`, or logs it without an error handler.
 
 ## Go further
 
-- [Consume flow](/development/consume-flow) - the code map for every branch this page skips.
-- [Ordering and scheduling](/advanced-topics/ordering-and-scheduling) - lanes, weights, and deadline promotion.
-- [Failure handling](/advanced-topics/failure-handling) - the retry and dead-letter policy an application configures.
-- [Lifecycle and shutdown](/advanced-topics/lifecycle-and-shutdown) - what a drain and a close promise the caller.
-- [How F1 picks the next message](/deep-dives/scheduler) - what happens when a worker is free and several lanes have work.
+- [Consume flow](/development/consume-flow) - the code map for delivery, acking, drain, and reconnect.
+- [Ordering and scheduling](/advanced-topics/ordering-and-scheduling) - lanes, weights, capacity, and jumping the queue when overdue.
+- [Failure handling](/advanced-topics/failure-handling) - retry and dead-letter policy.
+- [Lifecycle and shutdown](/advanced-topics/lifecycle-and-shutdown) - drain and close behavior.
+- [How F1 picks the next message](/deep-dives/scheduler) - weighted picks and overdue lanes.
+- [Source-reading guide](/development/source-reading-guide) - the maintainer route through the implementation.

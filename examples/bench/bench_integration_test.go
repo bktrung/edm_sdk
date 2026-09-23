@@ -5,8 +5,11 @@ package bench_test
 import (
 	"context"
 	"fmt"
+	"net"
+	"net/url"
 	"os"
 	"strconv"
+	"sync"
 	"testing"
 	"time"
 
@@ -372,6 +375,60 @@ func kafkaPartitions() int {
 	return value
 }
 
+var benchBrokerProbes struct {
+	sync.Mutex
+	results map[string]string
+}
+
+func requireBenchBroker(b *testing.B, drv driver.Driver, endpoint string) {
+	b.Helper()
+	key := drv.Name() + "\x00" + endpoint
+	benchBrokerProbes.Lock()
+	if benchBrokerProbes.results == nil {
+		benchBrokerProbes.results = make(map[string]string)
+	}
+	reason, checked := benchBrokerProbes.results[key]
+	if !checked {
+		reason = benchBrokerFailure(drv, endpoint)
+		benchBrokerProbes.results[key] = reason
+	}
+	benchBrokerProbes.Unlock()
+	if reason != "" {
+		b.Skip(reason)
+	}
+}
+
+func benchBrokerFailure(drv driver.Driver, endpoint string) string {
+	brokerName, envName, address := "Kafka", "F1_KAFKA_ENDPOINT", endpoint
+	if drv.Name() == "rabbitmq" {
+		brokerName, envName, address = "RabbitMQ", "F1_RABBITMQ_ENDPOINT", benchRabbitMQAddress(endpoint)
+	}
+	if address == "" {
+		return fmt.Sprintf("%s broker is unavailable; set %s to a reachable broker", brokerName, envName)
+	}
+	conn, err := net.DialTimeout("tcp", address, 2*time.Second)
+	if err != nil {
+		return fmt.Sprintf("%s broker is unavailable (%v); set %s to a reachable broker", brokerName, err, envName)
+	}
+	_ = conn.Close()
+	return ""
+}
+
+func benchRabbitMQAddress(endpoint string) string {
+	parsed, err := url.Parse(endpoint)
+	if err != nil || parsed.Hostname() == "" {
+		return ""
+	}
+	port := parsed.Port()
+	if port == "" {
+		port = "5672"
+		if parsed.Scheme == "amqps" {
+			port = "5671"
+		}
+	}
+	return net.JoinHostPort(parsed.Hostname(), port)
+}
+
 func kafkaEndpoint() string {
 	return benchEnv("F1_KAFKA_ENDPOINT", defaultKafkaEndpoint)
 }
@@ -389,6 +446,7 @@ func benchEnv(key, fallback string) string {
 
 func newBench(b *testing.B, drv driver.Driver, cfg bench.Config) *bench.Harness {
 	b.Helper()
+	requireBenchBroker(b, drv, cfg.Endpoint)
 	h, err := bench.New(drv, cfg)
 	if err != nil {
 		b.Fatalf("bench.New for %s at %s: %v", drv.Name(), cfg.Endpoint, err)

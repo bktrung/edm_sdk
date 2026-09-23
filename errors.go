@@ -4,6 +4,8 @@ import (
 	"errors"
 	"slices"
 	"time"
+
+	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/wire"
 )
 
 // classifiedError carries one handler outcome through wrapped error chains.
@@ -69,7 +71,7 @@ func WithDetails(err error, details map[string]string) error {
 			continue
 		}
 		valid[key] = value
-		encodedBytes += len("f1detail") + len(key) + len(value)
+		encodedBytes += len(wire.DetailPrefix) + len(key) + len(value)
 	}
 	if len(valid) > maxDeathDetailKeys || encodedBytes > maxDeathDetailBytes {
 		discarded = make([]string, 0, len(details))
@@ -141,7 +143,8 @@ func (e *classifiedError) Unwrap() error {
 	return e.err
 }
 
-// Terminal marks err as permanently failed. A terminal error bypasses retries.
+// Terminal marks err as permanently failed so the message bypasses retries.
+// It returns nil when err is nil.
 func Terminal(err error) error {
 	if err == nil {
 		return nil
@@ -149,9 +152,9 @@ func Terminal(err error) error {
 	return &classifiedError{err: err, terminal: true}
 }
 
-// RetryAfter marks err as retryable and asks for delay on the next attempt.
-// The runtime routes delay to the nearest retry tier and uses that tier's
-// nominal delay, so delay selects a tier rather than the exact wait.
+// RetryAfter marks err as retryable and requests a delay for its next attempt.
+// The requested delay selects the nearest retry tier, whose nominal delay is
+// used. It returns nil when err is nil.
 func RetryAfter(err error, delay time.Duration) error {
 	if err == nil {
 		return nil
@@ -159,7 +162,8 @@ func RetryAfter(err error, delay time.Duration) error {
 	return &classifiedError{err: err, retryDelay: delay, hasDelay: true}
 }
 
-// Drop marks err as handled and prevents another delivery attempt.
+// Drop marks err as handled so the message is acknowledged without another
+// delivery attempt. It returns nil when err is nil.
 func Drop(err error) error {
 	if err == nil {
 		return nil
@@ -185,13 +189,15 @@ func IsTerminal(err error) bool {
 	return false
 }
 
-// IsDropped reports the dropped flag on the first classified error errors.As finds in err's error tree.
+// IsDropped reports whether the first classified error in err's error tree is
+// marked dropped.
 func IsDropped(err error) bool {
 	var classified *classifiedError
 	return errors.As(err, &classified) && classified.dropped
 }
 
-// RetryDelay reports the explicit delay on the first classified error errors.As finds in err's error tree.
+// RetryDelay reports the explicit delay on the first classified error in err's
+// error tree. The boolean is false when no explicit delay is present.
 func RetryDelay(err error) (time.Duration, bool) {
 	var classified *classifiedError
 	if !errors.As(err, &classified) || !classified.hasDelay {

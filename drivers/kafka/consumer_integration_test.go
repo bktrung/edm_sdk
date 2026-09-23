@@ -49,7 +49,7 @@ func TestConsumerRequeueRedeliversInRun(t *testing.T) {
 	cleanupKafkaTopics(t, admin, topic)
 	cleanupKafkaGroups(t, admin, group)
 	createKafkaTopic(t, admin, ctx, topic, 1)
-	producer, err := connection.Producer(ctx, driver.ProducerConfig{RequireDurableAck: true, Effective: connection.Capabilities()})
+	producer, err := connection.Producer(ctx, driver.ProducerConfig{Effective: connection.Capabilities()})
 	if err != nil {
 		t.Fatalf("Producer: %v", err)
 	}
@@ -167,7 +167,7 @@ func TestConsumerLoneDeferredRecordArrivesAtDueTime(t *testing.T) {
 	group := kafkaTestTopic(t, "consumer-deferred-lone-group")
 	cleanupKafkaTopics(t, admin, topic)
 	cleanupKafkaGroups(t, admin, group)
-	const delay = 25 * time.Second
+	const delay = 2 * time.Second
 	if _, err := connection.Admin().EnsureTopology(ctx, driver.TopologySpec{
 		Destinations: []driver.DestinationSpec{{Name: topic, Delay: delay}},
 		Effective:    connection.Capabilities(),
@@ -309,7 +309,7 @@ func TestConsumerCommittedPrefixRestartsAtBase(t *testing.T) {
 	cleanupKafkaTopics(t, admin, topic)
 	cleanupKafkaGroups(t, admin, group)
 	createKafkaTopic(t, admin, ctx, topic, 1)
-	producer, err := firstConnection.Producer(ctx, driver.ProducerConfig{RequireDurableAck: true, Effective: firstConnection.Capabilities()})
+	producer, err := firstConnection.Producer(ctx, driver.ProducerConfig{Effective: firstConnection.Capabilities()})
 	if err != nil {
 		t.Fatalf("Producer: %v", err)
 	}
@@ -373,7 +373,7 @@ func TestConsumerIntake(t *testing.T) {
 	cleanupKafkaGroups(t, admin, group)
 	createKafkaTopic(t, admin, ctx, topic, 1)
 
-	producer, err := connection.Producer(ctx, driver.ProducerConfig{RequireDurableAck: true, Effective: connection.Capabilities()})
+	producer, err := connection.Producer(ctx, driver.ProducerConfig{Effective: connection.Capabilities()})
 	if err != nil {
 		t.Fatalf("Producer: %v", err)
 	}
@@ -1459,74 +1459,56 @@ func waitForKafkaConsumerState(t *testing.T, consumer *consumer, description str
 }
 
 func TestConsumerStaticMembershipOptionInspection(t *testing.T) {
-	conn := &conn{
-		clientOpts: []kgo.Opt{noDialKafkaOption()},
-	}
 	cfg := driver.ConsumerConfig{Group: "group", Destinations: []string{"topic"}}
-
-	t.Run("static membership true with non-empty instance id", func(t *testing.T) {
-		conn.staticMembership = true
-		conn.instanceID = "worker-1"
-		opts, err := consumerClientOpts(conn, cfg, "group", nil)
-		if err != nil {
-			t.Fatalf("consumerClientOpts error = %v", err)
-		}
-		cl, err := kgo.NewClient(opts...)
-		if err != nil {
-			t.Fatalf("NewClient error = %v", err)
-		}
-		defer cl.Close()
-		vals := cl.OptValues(kgo.InstanceID)
-		if len(vals) != 2 || vals[0] != "worker-1" || vals[1] != true {
-			t.Fatalf("kgo.InstanceID = %v, want [worker-1 true]", vals)
-		}
-	})
-
-	t.Run("static membership false with non-empty instance id", func(t *testing.T) {
-		conn.staticMembership = false
-		conn.instanceID = "worker-1"
-		opts, err := consumerClientOpts(conn, cfg, "group", nil)
-		if err != nil {
-			t.Fatalf("consumerClientOpts error = %v", err)
-		}
-		cl, err := kgo.NewClient(opts...)
-		if err != nil {
-			t.Fatalf("NewClient error = %v", err)
-		}
-		defer cl.Close()
-		vals := cl.OptValues(kgo.InstanceID)
-		if len(vals) == 2 && vals[1] == true {
-			t.Fatalf("kgo.InstanceID unexpectedly enabled when staticMembership is false: %v", vals)
-		}
-	})
-
-	t.Run("static membership true with empty instance id", func(t *testing.T) {
-		conn.staticMembership = true
-		conn.instanceID = ""
-		opts, err := consumerClientOpts(conn, cfg, "group", nil)
-		if err != nil {
-			t.Fatalf("consumerClientOpts error = %v", err)
-		}
-		cl, err := kgo.NewClient(opts...)
-		if err != nil {
-			t.Fatalf("NewClient error = %v", err)
-		}
-		defer cl.Close()
-		vals := cl.OptValues(kgo.InstanceID)
-		if len(vals) == 2 && vals[1] == true {
-			t.Fatalf("kgo.InstanceID unexpectedly enabled when instanceID is empty: %v", vals)
-		}
-	})
+	for _, test := range []struct {
+		name       string
+		static     bool
+		instanceID string
+		enabled    bool
+	}{
+		{name: "static membership true with non-empty instance id", static: true, instanceID: "worker-1", enabled: true},
+		{name: "static membership false with non-empty instance id", instanceID: "worker-1"},
+		{name: "static membership true with empty instance id", static: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			conn := &conn{
+				clientOpts:       []kgo.Opt{noDialKafkaOption()},
+				staticMembership: test.static,
+				instanceID:       test.instanceID,
+			}
+			opts, err := consumerClientOpts(conn, cfg, "group", nil)
+			if err != nil {
+				t.Fatalf("consumerClientOpts error = %v", err)
+			}
+			cl, err := kgo.NewClient(opts...)
+			if err != nil {
+				t.Fatalf("NewClient error = %v", err)
+			}
+			defer cl.Close()
+			vals := cl.OptValues(kgo.InstanceID)
+			if test.enabled {
+				if len(vals) != 2 || vals[0] != test.instanceID || vals[1] != true {
+					t.Fatalf("kgo.InstanceID = %v, want [%s true]", vals, test.instanceID)
+				}
+				return
+			}
+			if len(vals) == 2 && vals[1] == true {
+				t.Fatalf("kgo.InstanceID unexpectedly enabled: %v", vals)
+			}
+		})
+	}
 }
 
-func TestConsumerRevokeWaitsForSettlerInsideBound(t *testing.T) {
+// newRevokeTestConsumer returns a consumer that owns partition 0 of "topic"
+// with one unsettled delivery charged to it, for the revoke tests to drain.
+func newRevokeTestConsumer(t *testing.T, errorCapacity int, drainTimeout time.Duration) (*consumer, partitionKey, *ackTracker) {
+	t.Helper()
 	key := partitionKey{destination: "topic", partition: 0}
 	tracker := newAckTracker(0)
-
 	c := &consumer{
 		client:                newRevokeTestConsumerClient(t),
-		errors:                make(chan error, 1),
-		rebalanceDrainTimeout: 500 * time.Millisecond,
+		errors:                make(chan error, errorCapacity),
+		rebalanceDrainTimeout: drainTimeout,
 		clock:                 clock.NewReal(),
 		trackers:              map[partitionKey]*ackTracker{key: tracker},
 		owned:                 map[partitionKey]bool{key: true},
@@ -1536,6 +1518,26 @@ func TestConsumerRevokeWaitsForSettlerInsideBound(t *testing.T) {
 		budgets:               map[string]int{"topic": 1},
 		pauseReasons:          make(map[string]pauseReasonSet),
 	}
+	return c, key, tracker
+}
+
+// newAdmissionTestConsumer returns a consumer that owns no partition, for the
+// admission tests that seed records and flush them.
+func newAdmissionTestConsumer(messageCapacity, budget int) *consumer {
+	return &consumer{
+		trackers:     make(map[partitionKey]*ackTracker),
+		owned:        make(map[partitionKey]bool),
+		settlers:     make(map[*settler]struct{}),
+		messages:     make(chan driver.InboundMessage, messageCapacity),
+		budgets:      map[string]int{"topic": budget},
+		unsettled:    map[string]int{"topic": 0},
+		pauseReasons: make(map[string]pauseReasonSet),
+		clock:        clock.NewFake(time.Unix(0, 0)),
+	}
+}
+
+func TestConsumerRevokeWaitsForSettlerInsideBound(t *testing.T) {
+	c, key, tracker := newRevokeTestConsumer(t, 1, 500*time.Millisecond)
 	s := &settler{
 		owner:   c,
 		record:  &kgo.Record{Topic: "topic", Partition: 0, Offset: 0},
@@ -1582,22 +1584,7 @@ func TestConsumerRevokeWaitsForSettlerInsideBound(t *testing.T) {
 }
 
 func TestConsumerRevokeTombstonesAfterBound(t *testing.T) {
-	key := partitionKey{destination: "topic", partition: 0}
-	tracker := newAckTracker(0)
-
-	c := &consumer{
-		client:                newRevokeTestConsumerClient(t),
-		errors:                make(chan error, 1),
-		rebalanceDrainTimeout: 60 * time.Millisecond,
-		clock:                 clock.NewReal(),
-		trackers:              map[partitionKey]*ackTracker{key: tracker},
-		owned:                 map[partitionKey]bool{key: true},
-		settlers:              make(map[*settler]struct{}),
-		settlerCh:             make(chan struct{}, 1),
-		unsettled:             map[string]int{"topic": 1},
-		budgets:               map[string]int{"topic": 1},
-		pauseReasons:          make(map[string]pauseReasonSet),
-	}
+	c, key, tracker := newRevokeTestConsumer(t, 1, 60*time.Millisecond)
 	s := &settler{
 		owner:   c,
 		record:  &kgo.Record{Topic: "topic", Partition: 0, Offset: 0},
@@ -1762,22 +1749,7 @@ func TestWaitForSettlersTimesOutOnFakeClock(t *testing.T) {
 }
 
 func TestConsumerLostDropsImmediatelyWithoutWaiting(t *testing.T) {
-	key := partitionKey{destination: "topic", partition: 0}
-	tracker := newAckTracker(0)
-
-	c := &consumer{
-		client:                newRevokeTestConsumerClient(t),
-		errors:                make(chan error, 2),
-		rebalanceDrainTimeout: 5 * time.Second,
-		clock:                 clock.NewReal(),
-		trackers:              map[partitionKey]*ackTracker{key: tracker},
-		owned:                 map[partitionKey]bool{key: true},
-		settlers:              make(map[*settler]struct{}),
-		settlerCh:             make(chan struct{}, 1),
-		unsettled:             map[string]int{"topic": 1},
-		budgets:               map[string]int{"topic": 1},
-		pauseReasons:          make(map[string]pauseReasonSet),
-	}
+	c, key, tracker := newRevokeTestConsumer(t, 2, 5*time.Second)
 	s := &settler{
 		owner:   c,
 		record:  &kgo.Record{Topic: "topic", Partition: 0, Offset: 0},
@@ -1822,16 +1794,7 @@ func TestConsumerLostDropsImmediatelyWithoutWaiting(t *testing.T) {
 // the partition's next owner is the copy that remains.
 func TestConsumerBufferedRecordFencedAfterReassignment(t *testing.T) {
 	key := partitionKey{destination: "topic", partition: 0}
-	c := &consumer{
-		trackers:     make(map[partitionKey]*ackTracker),
-		owned:        make(map[partitionKey]bool),
-		settlers:     make(map[*settler]struct{}),
-		messages:     make(chan driver.InboundMessage, 10),
-		budgets:      map[string]int{"topic": 10},
-		unsettled:    map[string]int{"topic": 0},
-		pauseReasons: make(map[string]pauseReasonSet),
-		clock:        clock.NewFake(time.Unix(0, 0)),
-	}
+	c := newAdmissionTestConsumer(10, 10)
 
 	// 1. The partition is this consumer's when the loop takes the record.
 	c.onPartitionsAssigned(context.Background(), nil, map[string][]int32{"topic": {0}})
@@ -1865,51 +1828,10 @@ func TestConsumerBufferedRecordFencedAfterReassignment(t *testing.T) {
 	}
 }
 
-func TestConsumerUnassignedRecordIsDiscarded(t *testing.T) {
-	key := partitionKey{destination: "topic", partition: 0}
-	c := &consumer{
-		trackers:     make(map[partitionKey]*ackTracker),
-		owned:        make(map[partitionKey]bool),
-		settlers:     make(map[*settler]struct{}),
-		messages:     make(chan driver.InboundMessage, 1),
-		budgets:      map[string]int{"topic": 10},
-		unsettled:    map[string]int{"topic": 0},
-		pauseReasons: make(map[string]pauseReasonSet),
-		clock:        clock.NewFake(time.Unix(0, 0)),
-	}
-	record := &kgo.Record{Topic: key.destination, Partition: key.partition, Offset: 7, Value: []byte("unassigned")}
-	c.tagRecord(record)
-	if !c.isRecordStale(record) {
-		t.Fatal("record of a partition this consumer does not own is not stale")
-	}
-	seedQueuedRecords(c, record)
-	if !c.flushPending() {
-		t.Fatal("flushPending returned false")
-	}
-	if queued := queuedRecords(c, key); len(queued) != 0 {
-		t.Fatalf("queued records = %d, want 0 for unassigned record", len(queued))
-	}
-	if len(c.trackers) != 0 {
-		t.Fatalf("trackers = %d, want 0 for unassigned record", len(c.trackers))
-	}
-	if len(c.messages) != 0 {
-		t.Fatalf("delivered messages = %d, want 0 for unassigned record", len(c.messages))
-	}
-}
-
 func TestConsumerUnassignedRecordCannotReviveAfterAssignment(t *testing.T) {
 	key := partitionKey{destination: "topic", partition: 0}
 	record := &kgo.Record{Topic: key.destination, Partition: key.partition, Offset: 7, Value: []byte("unassigned")}
-	c := &consumer{
-		trackers:     make(map[partitionKey]*ackTracker),
-		owned:        make(map[partitionKey]bool),
-		settlers:     make(map[*settler]struct{}),
-		messages:     make(chan driver.InboundMessage, 1),
-		budgets:      map[string]int{"topic": 1},
-		unsettled:    map[string]int{"topic": 0},
-		pauseReasons: make(map[string]pauseReasonSet),
-		clock:        clock.NewFake(time.Unix(0, 0)),
-	}
+	c := newAdmissionTestConsumer(1, 1)
 	c.tagRecord(record)
 	if !c.isRecordStale(record) {
 		t.Fatal("record of a partition this consumer does not own is not stale")
@@ -2582,4 +2504,21 @@ func TestConsumerBudgetRefusedRecordsResumeOnAck(t *testing.T) {
 	if err := consumerValue.Stop(ctx); err != nil {
 		t.Fatalf("Stop: %v", err)
 	}
+}
+
+// requestLeaveAndWait asks the leave loop to leave the group and returns the
+// leave's error alone. A caller whose decision also depends on whether the
+// leave finished, rather than on the wait being abandoned, uses waitForLeave;
+// the tests that assert only the error a leave reached settle for this.
+func (c *consumer) requestLeaveAndWait(ctx context.Context) error {
+	_, err := c.waitForLeave(ctx)
+	return err
+}
+
+// isRecordStale is the locked staleness check with the lock taken, for a test
+// that reads a record's staleness without holding the consumer's lock.
+func (c *consumer) isRecordStale(record *kgo.Record) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.isRecordStaleLocked(record)
 }

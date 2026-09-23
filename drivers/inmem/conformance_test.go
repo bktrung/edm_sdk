@@ -209,6 +209,7 @@ func TestInspectorSeparatesDeferredMessages(t *testing.T) {
 }
 
 func TestConformance(t *testing.T) {
+	t.Parallel()
 	var output bytes.Buffer
 	// The whole suite shares this fake clock so deferred checks can advance broker
 	// time deterministically. Its origin is arbitrary now that receiveBefore spends
@@ -231,6 +232,7 @@ func TestConformance(t *testing.T) {
 // not produce, and that the check this model adds passes on a driver that also
 // owes the exact due time it was handed.
 func TestConformanceDestinationDelay(t *testing.T) {
+	t.Parallel()
 	fake := clock.NewFake(clock.NewReal().Now())
 	report := runConformance(t, Driver{clock: fake}, conformance.DeferralDestinationDelay)
 	assertDeferredSkips(t, report,
@@ -240,6 +242,7 @@ func TestConformanceDestinationDelay(t *testing.T) {
 }
 
 func TestConformanceMinimalCapabilities(t *testing.T) {
+	t.Parallel()
 	fake := clock.NewFake(clock.NewReal().Now())
 	// This named fixture only weakens native declarations and removes limits;
 	// ScalingPartitionBound is the one preserved declaration needed to execute

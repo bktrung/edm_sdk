@@ -47,5 +47,7 @@ type BacklogSample struct {
 // BacklogReader is an optional Consumer extension that reports lag and the
 // head enqueue time per destination. A nil BacklogReader provides no sample.
 type BacklogReader interface {
+	// Backlog returns samples keyed by destination name, or an error if the
+	// backlog cannot be read.
 	Backlog(ctx context.Context) (map[string]BacklogSample, error)
 }

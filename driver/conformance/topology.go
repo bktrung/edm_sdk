@@ -46,7 +46,7 @@ func runTopology(group *groupContext) {
 		// FinalDestination is the profile-independent label: the two profile
 		// passes must record identical vectors, while the broker name stays
 		// profile-scoped on the shared Conn.
-		group.vector.Add(BehaviorEvent{ID: "topology-create", Outcome: "created", FinalDestination: "topology.create"})
+		group.vector.add(BehaviorEvent{ID: "topology-create", Outcome: "created", FinalDestination: "topology.create"})
 	})
 
 	group.Check("EnsureTopology is idempotent on a repeat call", func(t *testing.T) {
@@ -85,7 +85,7 @@ func runTopology(group *groupContext) {
 			view := inspectDestination(t, group, name)
 			return view.Ready == 1, fmt.Sprintf("view=%+v", view)
 		})
-		group.vector.Add(BehaviorEvent{ID: "topology-idempotent", Outcome: "existing", FinalDestination: name})
+		group.vector.add(BehaviorEvent{ID: "topology-idempotent", Outcome: "existing", FinalDestination: name})
 	})
 
 	group.Check("EnsureTopology reports created and existing destinations together in one call", func(t *testing.T) {
@@ -119,7 +119,7 @@ func runTopology(group *groupContext) {
 		if !containsName(diff.CreatedDestinations, created) {
 			t.Fatalf("CreatedDestinations=%v, want %q", diff.CreatedDestinations, created)
 		}
-		group.vector.Add(BehaviorEvent{ID: "topology-mixed-diff", Outcome: "mixed", FinalDestination: "topology.mixed.created"})
+		group.vector.add(BehaviorEvent{ID: "topology-mixed-diff", Outcome: "mixed", FinalDestination: "topology.mixed.created"})
 	})
 
 	group.Check("EnsureTopology reports a destination dropped from the spec but still in scope", func(t *testing.T) {
@@ -156,7 +156,7 @@ func runTopology(group *groupContext) {
 		if _, ok := findOrphan(diff.Orphaned, dropped); !ok {
 			t.Fatalf("Orphaned=%v, want %q", diff.Orphaned, dropped)
 		}
-		group.vector.Add(BehaviorEvent{ID: "topology-orphan-under-report", Outcome: "orphaned", FinalDestination: dropped})
+		group.vector.add(BehaviorEvent{ID: "topology-orphan-under-report", Outcome: "orphaned", FinalDestination: dropped})
 	})
 
 	group.Check("EnsureTopology does not report a destination outside the requested scope", func(t *testing.T) {
@@ -198,7 +198,7 @@ func runTopology(group *groupContext) {
 		if _, ok := findOrphan(diff.Orphaned, siblingOutsideScope); ok {
 			t.Fatalf("Orphaned=%v, sibling %q outside scope must not be reported", diff.Orphaned, siblingOutsideScope)
 		}
-		group.vector.Add(BehaviorEvent{ID: "topology-orphan-over-report", Outcome: "excluded", FinalDestination: siblingOutsideScope})
+		group.vector.add(BehaviorEvent{ID: "topology-orphan-over-report", Outcome: "excluded", FinalDestination: siblingOutsideScope})
 	})
 
 	group.Check("EnsureTopology scope prefix matches only at a component boundary", func(t *testing.T) {
@@ -255,7 +255,7 @@ func runTopology(group *groupContext) {
 		if _, ok := findOrphan(unbounded.Orphaned, continuation); !ok {
 			t.Fatalf("Orphaned=%v, want %q reported under a scope without a trailing separator", unbounded.Orphaned, continuation)
 		}
-		group.vector.Add(BehaviorEvent{ID: "topology-orphan-boundary", Outcome: "excluded", FinalDestination: continuation})
+		group.vector.add(BehaviorEvent{ID: "topology-orphan-boundary", Outcome: "excluded", FinalDestination: continuation})
 	})
 
 	group.Check("EnsureTopology with an empty scope disables orphan scanning", func(t *testing.T) {
@@ -306,7 +306,7 @@ func runTopology(group *groupContext) {
 		if len(diff.Orphaned) != 0 {
 			t.Fatalf("Orphaned=%v, want none reported when scanning is disabled", diff.Orphaned)
 		}
-		group.vector.Add(BehaviorEvent{ID: "topology-orphan-scan-disabled", Outcome: "skipped", FinalDestination: dropped})
+		group.vector.add(BehaviorEvent{ID: "topology-orphan-scan-disabled", Outcome: "skipped", FinalDestination: dropped})
 	})
 
 	group.Check("EnsureTopology folds deferred messages into an orphaned destination's message count", func(t *testing.T) {
@@ -360,7 +360,7 @@ func runTopology(group *groupContext) {
 		if orphan.Messages != 2 {
 			t.Fatalf("Orphaned %q Messages=%d, want 2 (ready + deferred)", dropped, orphan.Messages)
 		}
-		group.vector.Add(BehaviorEvent{ID: "topology-orphan-auxiliary", Outcome: "counted", FinalDestination: dropped})
+		group.vector.add(BehaviorEvent{ID: "topology-orphan-auxiliary", Outcome: "counted", FinalDestination: dropped})
 	})
 
 	group.Check("DescribeTopology reports depth including deferred messages", func(t *testing.T) {
@@ -390,7 +390,7 @@ func runTopology(group *groupContext) {
 		if !ok || depth != 3 {
 			t.Fatalf("Depth[%q]=(%d,%t), want (3,true) (ready + deferred)", name, depth, ok)
 		}
-		group.vector.Add(BehaviorEvent{ID: "topology-describe-depth", Outcome: "counted", FinalDestination: "topology.describe.depth"})
+		group.vector.add(BehaviorEvent{ID: "topology-describe-depth", Outcome: "counted", FinalDestination: "topology.describe.depth"})
 	})
 
 	group.Check("Prune refuses a destination that still holds ready messages", func(t *testing.T) {
@@ -432,7 +432,7 @@ func runTopology(group *groupContext) {
 			t.Fatalf("Prune(%q)=%+v, want deleted", eligible, deleted)
 		}
 		// newProducer already registered a Purge cleanup for nonEmpty.
-		group.vector.Add(BehaviorEvent{ID: "topology-prune-ready-guard", Outcome: "refused", FinalDestination: nonEmpty})
+		group.vector.add(BehaviorEvent{ID: "topology-prune-ready-guard", Outcome: "refused", FinalDestination: nonEmpty})
 	})
 
 	group.Check("Prune refuses an empty destination whose park still holds messages", func(t *testing.T) {
@@ -474,7 +474,7 @@ func runTopology(group *groupContext) {
 			t.Fatalf("Prune(%q)=%+v, want deleted", eligible, deleted)
 		}
 		// newProducer already registered a Purge cleanup for parked.
-		group.vector.Add(BehaviorEvent{ID: "topology-prune-park-guard", Outcome: "refused", FinalDestination: parked})
+		group.vector.add(BehaviorEvent{ID: "topology-prune-park-guard", Outcome: "refused", FinalDestination: parked})
 	})
 
 	group.Check("Prune refuses a destination with an attached consumer", func(t *testing.T) {
@@ -506,7 +506,7 @@ func runTopology(group *groupContext) {
 		if !deleted.Deleted {
 			t.Fatalf("Prune(%q)=%+v, want deleted", eligible, deleted)
 		}
-		group.vector.Add(BehaviorEvent{ID: "topology-prune-consumer-guard", Outcome: "refused", FinalDestination: attached})
+		group.vector.add(BehaviorEvent{ID: "topology-prune-consumer-guard", Outcome: "refused", FinalDestination: attached})
 	})
 
 	group.Check("Prune on an unknown destination reports not-deleted without erroring", func(t *testing.T) {
@@ -520,7 +520,7 @@ func runTopology(group *groupContext) {
 		if result.Deleted || result.Reason == "" {
 			t.Fatalf("Prune(%q)=%+v, want not deleted with a reason", name, result)
 		}
-		group.vector.Add(BehaviorEvent{ID: "topology-prune-missing", Outcome: "refused", FinalDestination: name})
+		group.vector.add(BehaviorEvent{ID: "topology-prune-missing", Outcome: "refused", FinalDestination: name})
 	})
 
 	group.Check("Purge empties a destination and keeps it", func(t *testing.T) {
@@ -566,7 +566,7 @@ func runTopology(group *groupContext) {
 			view := inspectDestination(t, group, name)
 			return view.Ready == 1, fmt.Sprintf("view=%+v", view)
 		})
-		group.vector.Add(BehaviorEvent{ID: "topology-purge", Outcome: "emptied", FinalDestination: name})
+		group.vector.add(BehaviorEvent{ID: "topology-purge", Outcome: "emptied", FinalDestination: name})
 	})
 
 	group.Check("cancelled context prevents topology admin calls without a partial effect", func(t *testing.T) {
@@ -639,7 +639,7 @@ func runTopology(group *groupContext) {
 			depth, ok := state.Depth[name]
 			return ok && depth == 1, fmt.Sprintf("Depth[%q]=(%d,%t), want (1,true)", name, depth, ok)
 		})
-		group.vector.Add(BehaviorEvent{ID: "topology-cancel", Outcome: "cancelled", FinalDestination: name})
+		group.vector.add(BehaviorEvent{ID: "topology-cancel", Outcome: "cancelled", FinalDestination: name})
 	})
 }
 
@@ -789,7 +789,7 @@ func runTopologyPolicyChecks(group *groupContext) {
 		if _, inspectErr := group.inspect(group.ctx, profileDestination(group, second)); inspectErr == nil {
 			t.Fatalf("TopologyVerify created %q", second)
 		}
-		group.vector.Add(BehaviorEvent{ID: "topology-verify-missing", Outcome: "not-found", FinalDestination: "topology.verify.missing"})
+		group.vector.add(BehaviorEvent{ID: "topology-verify-missing", Outcome: "not-found", FinalDestination: "topology.verify.missing"})
 	})
 
 	group.Check("TopologyVerify reports argument drift or fails verification", func(t *testing.T) {
@@ -851,7 +851,7 @@ func runTopologyPolicyChecks(group *groupContext) {
 			Effective:    group.effective,
 		})
 		if err != nil {
-			group.vector.Add(BehaviorEvent{ID: "topology-argument-drift", Outcome: "failed", FinalDestination: "topology.verify.drift"})
+			group.vector.add(BehaviorEvent{ID: "topology-argument-drift", Outcome: "failed", FinalDestination: "topology.verify.drift"})
 			return
 		}
 		var found bool
@@ -864,7 +864,7 @@ func runTopologyPolicyChecks(group *groupContext) {
 		if !found {
 			t.Fatalf("TopologyVerify returned clean successful diff=%+v for changed delivery limit", diff)
 		}
-		group.vector.Add(BehaviorEvent{ID: "topology-argument-drift", Outcome: "reported", FinalDestination: "topology.verify.drift"})
+		group.vector.add(BehaviorEvent{ID: "topology-argument-drift", Outcome: "reported", FinalDestination: "topology.verify.drift"})
 	})
 
 	group.Check("FanoutAtConsume ignores bindings", func(t *testing.T) {
@@ -922,7 +922,7 @@ func runTopologyPolicyChecks(group *groupContext) {
 			t.Fatalf("FanoutAtConsume body=%q, want consume-fanout", message.Body)
 		}
 		ackMessage(t, group, message)
-		group.vector.Add(BehaviorEvent{ID: "topology-fanout-consume", Outcome: "ignored", FinalDestination: "topology.consume-fanout"})
+		group.vector.add(BehaviorEvent{ID: "topology-fanout-consume", Outcome: "ignored", FinalDestination: "topology.consume-fanout"})
 	})
 
 	group.Check("TopologyNone leaves missing topology untouched", func(t *testing.T) {
@@ -954,6 +954,6 @@ func runTopologyPolicyChecks(group *groupContext) {
 		} else if kind, ok := driver.Classify(err); !ok || kind != driver.KindNotFound {
 			t.Fatalf("Publish(%q) classification = %v,%t, want not_found,true", name, kind, ok)
 		}
-		group.vector.Add(BehaviorEvent{ID: "topology-none", Outcome: "untouched", FinalDestination: "topology.none"})
+		group.vector.add(BehaviorEvent{ID: "topology-none", Outcome: "untouched", FinalDestination: "topology.none"})
 	})
 }

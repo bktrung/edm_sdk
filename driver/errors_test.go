@@ -2,6 +2,7 @@ package driver
 
 import (
 	"errors"
+	"fmt"
 	"testing"
 )
 
@@ -31,6 +32,40 @@ func TestPublishError_FatalOutranksEveryOtherKind(t *testing.T) {
 	}
 	if err.Retryable() {
 		t.Fatal("fatal partial publish was marked retryable")
+	}
+}
+
+func TestPublishError_NotificationOnlyIsNotRetryable(t *testing.T) {
+	t.Parallel()
+
+	notification := func() error {
+		return &Error{K: KindNotification, Err: errors.New("consumer cancelled")}
+	}
+	err := &PublishError{Failed: map[int]error{0: notification(), 1: notification()}}
+	if got := err.Kind(); got != KindNotification {
+		t.Fatalf("notification-only PublishError.Kind() = %v, want %v", got, KindNotification)
+	}
+	if err.Retryable() {
+		t.Fatal("notification-only PublishError was marked retryable")
+	}
+
+	mixed := &PublishError{Failed: map[int]error{
+		0: notification(),
+		1: &Error{K: KindTransient, Err: errors.New("connection reset")},
+	}}
+	if got := mixed.Kind(); got != KindTransient {
+		t.Fatalf("PublishError.Kind() with one transient cause = %v, want %v", got, KindTransient)
+	}
+	if !mixed.Retryable() {
+		t.Fatal("PublishError with one transient cause was not retryable")
+	}
+
+	nilCause := &PublishError{Failed: map[int]error{0: nil}}
+	if got := nilCause.Kind(); got != KindTransient {
+		t.Fatalf("PublishError.Kind() with a nil cause = %v, want %v", got, KindTransient)
+	}
+	if !nilCause.Retryable() {
+		t.Fatal("PublishError with a nil cause was not retryable")
 	}
 }
 
@@ -163,5 +198,23 @@ func TestError_FormatsUnwrapsAndClassifies(t *testing.T) {
 		if err.Kind() != kind || err.Retryable() {
 			t.Errorf("Error with kind %v has Kind()=%v Retryable()=%t", kind, err.Kind(), err.Retryable())
 		}
+	}
+}
+
+// TestClassifyToleratesATypedNilError pins that a typed-nil *Error, which a
+// driver can return by mistake, classifies as transient instead of panicking
+// in the core goroutine that reads it.
+func TestClassifyToleratesATypedNilError(t *testing.T) {
+	var typed *Error
+	err := fmt.Errorf("wrap: %w", typed)
+	kind, classified := Classify(err)
+	if !classified || kind != KindTransient {
+		t.Fatalf("Classify(typed nil) = %v, %t, want transient, true", kind, classified)
+	}
+	if errors.Is(err, ErrDestinationMissing) {
+		t.Fatal("a typed nil matched an unrelated sentinel")
+	}
+	if !typed.Retryable() || typed.Error() == "" {
+		t.Fatal("a typed nil must read as a retryable error with text")
 	}
 }

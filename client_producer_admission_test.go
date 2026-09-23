@@ -107,15 +107,17 @@ func TestPublishProducerBuildDoesNotHoldClientLock(t *testing.T) {
 	publishDone := make(chan error, 1)
 	var releaseOnce sync.Once
 	releaseBuild := func() { releaseOnce.Do(func() { close(buildRelease) }) }
+	publishFinished := make(chan struct{})
 	t.Cleanup(func() {
 		releaseBuild()
 		select {
-		case <-publishDone:
+		case <-publishFinished:
 		case <-clock.NewReal().Timer(time.Second).C:
 		}
 		_ = client.Close(context.Background())
 	})
 	go func() {
+		defer close(publishFinished)
 		publishDone <- publishMessages(client, context.Background(), driver.OutboundMessage{Destination: "orders.created"})
 	}()
 	waitForSignal(t, buildStarted, "producer construction")
@@ -179,19 +181,22 @@ func TestConcurrentFirstPublishesInstallOneProducerAndCloseLoser(t *testing.T) {
 	results := make(chan error, 2)
 	var releaseOnce sync.Once
 	releaseBuild := func() { releaseOnce.Do(func() { close(release) }) }
+	var publishers sync.WaitGroup
 	t.Cleanup(func() {
 		releaseBuild()
-		for range 2 {
-			select {
-			case <-results:
-			case <-clock.NewReal().Timer(time.Second).C:
-				return
-			}
+		finished := make(chan struct{})
+		go func() { publishers.Wait(); close(finished) }()
+		select {
+		case <-finished:
+		case <-clock.NewReal().Timer(time.Second).C:
+			return
 		}
 		_ = client.Close(context.Background())
 	})
 	for range 2 {
+		publishers.Add(1)
 		go func() {
+			defer publishers.Done()
 			results <- publishMessages(client, context.Background(), driver.OutboundMessage{Destination: "orders.created"})
 		}()
 	}
@@ -363,15 +368,17 @@ func TestPublishBatchProducerBuildDoesNotHoldClientLock(t *testing.T) {
 	batchDone := make(chan error, 1)
 	var releaseOnce sync.Once
 	releaseBuild := func() { releaseOnce.Do(func() { close(buildRelease) }) }
+	batchFinished := make(chan struct{})
 	t.Cleanup(func() {
 		releaseBuild()
 		select {
-		case <-batchDone:
+		case <-batchFinished:
 		case <-clock.NewReal().Timer(time.Second).C:
 		}
 		_ = client.Close(context.Background())
 	})
 	go func() {
+		defer close(batchFinished)
 		_, err := client.Publisher().PublishBatch(context.Background(), []Message{
 			{EventType: "orders.created", Payload: "payload"},
 		})
@@ -475,19 +482,22 @@ func TestConcurrentFirstBatchPublishesInstallOneProducerAndCloseLoser(t *testing
 	}, 2)
 	var releaseOnce sync.Once
 	releaseBuild := func() { releaseOnce.Do(func() { close(release) }) }
+	var publishers sync.WaitGroup
 	t.Cleanup(func() {
 		releaseBuild()
-		for range 2 {
-			select {
-			case <-results:
-			case <-clock.NewReal().Timer(time.Second).C:
-				return
-			}
+		finished := make(chan struct{})
+		go func() { publishers.Wait(); close(finished) }()
+		select {
+		case <-finished:
+		case <-clock.NewReal().Timer(time.Second).C:
+			return
 		}
 		_ = client.Close(context.Background())
 	})
 	for range 2 {
+		publishers.Add(1)
 		go func() {
+			defer publishers.Done()
 			result, err := client.Publisher().PublishBatch(context.Background(), []Message{
 				{EventType: "orders.created", Payload: "concurrent"},
 			})

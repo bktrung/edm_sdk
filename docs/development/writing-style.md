@@ -21,6 +21,14 @@ turns into option tables belongs in Development.
 
 ## Rules for every page
 
+### Per concept
+
+Define each concept in one plain sentence. Follow it with a picture or a
+concrete example, then at most three short paragraphs. Aim for about 60 words
+per paragraph; none may exceed 100 words. Add an admonition only for a real
+gotcha.
+
+
 ### ASCII only
 
 The rule in `CLAUDE.md` covers docs too. No em or en dash: use
@@ -41,6 +49,40 @@ Prefer `is`, `has` and `does` over `serves as`,
 unless they carry a technical meaning in the sentence: `canonical`, `ensure`,
 `robust`, `seamless`, `leverage`, `crucial`, `key` as an adjective, `delve`.
 A technical use stays: "the canonical topic" names a real derived value.
+
+### Plain words first, link the term
+
+Outside `development/`, write the plain phrase a Go developer already knows and
+link it to the glossary the first time it appears on a page: "F1
+[finishes the message](/learn/glossary#settlement) only after the retry copy is
+confirmed", not "F1 settles the original after the successor handoff". The
+project's own words stay in the glossary, in code, and in config keys, so a
+reader can still match a log line or a field name to the page.
+
+| Term | Write instead |
+| --- | --- |
+| settle, settlement, settled, unsettled | finish the message (ack or nack), finished, not yet finished or not yet acked |
+| successor, successor publish | retry copy or dead-letter copy, publishing the retry copy |
+| epoch | connection number |
+| generation | the runner's current consumer |
+| admission, admit | allowed to start, let in |
+| backstop | the broker's own dead-letter queue |
+| handoff | handing the copy to the broker |
+| deadline promotion, promotion | jumping the queue when overdue |
+| lane budget | wait limit |
+| retry tier, retry ladder | retry step, the list of retry delays |
+| cursor (Kafka) | committed offset |
+| native, emulated | done by the broker, done by F1 |
+| partition-bound, free scaling | limited by partition count, not limited by partitions |
+| capability report | the list of features the connected broker supports |
+| abandon (a delivery) | give up on |
+| physical destination, logical topic | broker queue or topic name, topic name in your code |
+
+Common messaging words stay as they are: ack, nack, requeue, redelivery,
+prefetch, partition, consumer group, dead letter, idempotency, envelope, codec,
+confirm, quorum queue, poison message, in-flight, drain, rebalance, revoke, and
+parking queue. Avoid one-off formal words such as quiescence, incarnation,
+interleaving, or invariant; say what happens instead.
 
 ### Keep sentences uneven
 
@@ -90,16 +132,45 @@ and task identifiers a reader cannot follow. State the rule instead.
 Do not write "Phase 4", a plan id, an audit label or a finding code in a page,
 a code comment, or a generated artifact. State the behaviour.
 
-### Diagrams earn their place
+### Diagrams and tables
 
-Use Mermaid when the reader needs to see an
-order of events or a structure that prose makes hard to hold. Keep labels
-short; one diagram per idea.
+Use one diagram per core idea that is an order of events, a state machine or a
+structure. Use tables for comparisons and worked traces.
+
+### Mermaid vocabulary
+
+The broker is a cylinder `B[(broker)]`; the application handler is a stadium
+`H([handler])`; an F1 step is a plain rectangle; a decision is a diamond; a
+dashed edge means the message goes back to the broker. Node labels at most three
+words. No `classDef` colors and no `style` lines: the site theme handles light
+and dark mode.
 
 ### Code examples compile
 
 Every example builds against the current API. When the API changes, the
 example changes in the same commit.
+
+### Algorithms
+
+Algorithms use a static worked trace, table or timeline, checked against the
+code. An interactive figure is allowed only when stepping adds understanding,
+and only over a trace taken from the Go code, never a second implementation in
+the docs.
+
+### Configuration examples
+
+Use VitePress `code-group` tabs for equivalent configuration across brokers.
+
+### Page endings
+
+Every page ends with a short "Go further" list.
+
+### Signs of AI writing
+
+Read every page against Wikipedia's
+[Signs of AI writing](https://en.wikipedia.org/wiki/Wikipedia:Signs_of_AI_writing)
+list and cut filler openers, "it's not X, it's Y", rule-of-three lists that are
+not three things, and summary sentences that repeat the paragraph.
 
 ## Deep dives
 
@@ -171,11 +242,12 @@ the reasons; the Development pages hold the code map.
 
 ### Before merging a deep dive
 
-1. Read the draft against Wikipedia's
-   [Signs of AI writing](https://en.wikipedia.org/wiki/Wikipedia:Signs_of_AI_writing)
-   list and rewrite what matches. Keep the page in present tense; do not add a
-   design-history narrative.
-2. Ask someone who did not write the page to read it cold and mark where they
+1. Ask someone who did not write the page to read it cold and mark where they
    got lost.
-3. Check every claim against the current code, and follow every link.
-4. Run `npm run docs:build` and `make verify-self-contained`.
+2. Check every claim against the current code, and follow every link.
+3. Run `npm run docs:build` and `make verify-self-contained`.
+
+## Go further
+
+- [Source-reading guide](/development/source-reading-guide) - choose evidence before editing.
+- [Documentation home](/) - follow the reader paths through the site.

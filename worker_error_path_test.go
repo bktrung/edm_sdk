@@ -88,7 +88,7 @@ func TestProcessDeliveryRecoversDispatchPanic(t *testing.T) {
 		Body:        []byte(`{}`),
 		Settle:      settler,
 	}
-	id := runner.inflight.Add(message)
+	id := runner.inflight.Add()
 	panicClock.panicNext.Store(true)
 	processDelivery(runner, context.Background(), delivery{id: id, message: message})
 	releaseHandler()
@@ -189,7 +189,7 @@ func TestProcessDeliveryKeepsPhaseTwoDrainUntilStuck(t *testing.T) {
 		Body:        []byte(`{}`),
 		Settle:      settler,
 	}
-	id := runner.inflight.Add(message)
+	id := runner.inflight.Add()
 	parent, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	done := make(chan struct{})
@@ -211,7 +211,9 @@ func TestProcessDeliveryKeepsPhaseTwoDrainUntilStuck(t *testing.T) {
 	runner.draining = true
 	runner.mu.Unlock()
 	cancel()
-	guard := clock.NewReal().Timer(time.Second)
+	// A runner that obeyed the cancellation would settle as soon as it saw it,
+	// so a short real window is enough to catch it.
+	guard := clock.NewReal().Timer(100 * time.Millisecond)
 	select {
 	case <-settled:
 		guard.Stop()

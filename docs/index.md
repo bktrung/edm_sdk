@@ -20,11 +20,11 @@ features:
     link: /advanced-topics/failure-handling
     linkText: Failure handling
   - title: Zero-loss shutdown
-    details: A drain protocol settles every in-flight message before the process exits. Nothing accepted is dropped on a rolling restart or SIGTERM.
+    details: A drain finishes every in-flight message before the process exits. Nothing accepted is dropped on a rolling restart or SIGTERM.
     link: /advanced-topics/lifecycle-and-shutdown
     linkText: Lifecycle and shutdown
-  - title: Retry ladder to a dead-letter queue
-    details: Retryable failures move through tiered backoff. Exhausted or terminal failures dead-letter with a recorded death reason and error.
+  - title: Retry steps to a dead-letter queue
+    details: Retryable failures move through growing retry delays. Exhausted or terminal failures dead-letter with a recorded death reason and error.
     link: /advanced-topics/failure-handling
     linkText: Failure handling
   - title: Starvation-free priority, ordering by key
@@ -44,7 +44,7 @@ features:
 ## At a glance
 
 The driver is chosen once, when the client is built. Everything after that line is broker-free:
-publish an event, handle it, and let F1 settle, retry, or dead-letter it.
+publish an event, handle it, and let F1 ack, retry, or dead-letter it.
 
 ```go
 client, err := f1.New(ctx, cfg, f1.WithDriver(rabbitmq.Driver{}))
@@ -94,7 +94,7 @@ return runner.Run(ctx)
   <a class="f1-path" href="/development/architecture">
     <span class="f1-path__eyebrow">Understand the runtime</span>
     <strong class="f1-path__title">Follow a message end to end</strong>
-    <span class="f1-path__body">How a message travels from Publish to settlement, and which package owns each step of the way.</span>
+    <span class="f1-path__body">How a message travels from Publish to its final ack, and which package owns each step of the way.</span>
     <span class="f1-path__cta">Architecture map -&gt;</span>
   </a>
   <a class="f1-path" href="/development/driver-contract">
@@ -120,3 +120,9 @@ flowchart TB
     PORT --> RABBIT[drivers/rabbitmq]
     PORT --> KAFKA[drivers/kafka]
 ```
+
+## Go further
+
+- [Getting started](/learn/getting-started) - connect a driver and run a service.
+- [Message](/basics/message) - understand events, envelopes, and delivery identity.
+- [Driver contract](/development/driver-contract) - implement or review a broker adapter.

@@ -147,14 +147,14 @@ func publishConsumeOne(t *testing.T, client *Client, ctx context.Context, payloa
 		if err != nil {
 			t.Fatalf("PublishBatch() error = %v", err)
 		}
-		if len(result.Failed()) == 0 {
+		if len(failedIndexes(result)) == 0 {
 			return result.Results[0].ID
 		}
 		tick := clock.NewReal().Timer(10 * time.Millisecond)
 		select {
 		case <-deadline.C:
 			tick.Stop()
-			t.Fatalf("publish did not reach the topology: %v", result.Results[result.Failed()[0]].Err)
+			t.Fatalf("publish did not reach the topology: %v", result.Results[failedIndexes(result)[0]].Err)
 			return ""
 		case <-tick.C:
 			tick.Stop()
@@ -682,10 +682,10 @@ func TestObserverConsumeSettleRetry(t *testing.T) {
 	failErr := &driver.Error{Driver: "test", Op: "ack", K: driver.KindTransient, Err: errors.New("flaky")}
 	settler := &flakyConsumeSettler{failErr: failErr}
 	message := driver.InboundMessage{Destination: "orders.in", Settle: settler}
-	if ackDeliveryAs(runner, context.Background(), message, true) {
+	if ackDeliveryAs(runner, context.Background(), message, true, &deliveryState{}) {
 		t.Fatal("first ack settled, want failure")
 	}
-	if !ackDeliveryAs(runner, context.Background(), message, true) {
+	if !ackDeliveryAs(runner, context.Background(), message, true, &deliveryState{}) {
 		t.Fatal("second ack did not settle")
 	}
 	starts, finishes := rec.settlePairs()

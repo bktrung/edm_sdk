@@ -33,7 +33,7 @@ func TestEnsureTopologyIgnoresBindings(t *testing.T) {
 		Bindings:     []driver.BindingSpec{{Source: "orders.exchange", Destination: "orders"}},
 	})
 	require.NoError(t, err)
-	producer, err := conn.Producer(ctx, driver.ProducerConfig{RequireDurableAck: true})
+	producer, err := conn.Producer(ctx, driver.ProducerConfig{})
 	require.NoError(t, err)
 	consumer, err := conn.Consumer(ctx, driver.ConsumerConfig{Destinations: []string{"orders"}})
 	require.NoError(t, err)
@@ -51,7 +51,7 @@ func openTest(t *testing.T, clk clock.Clock, specs ...driver.DestinationSpec) (c
 	require.NoError(t, err)
 	_, err = conn.Admin().EnsureTopology(ctx, driver.TopologySpec{Destinations: specs})
 	require.NoError(t, err)
-	producer, err := conn.Producer(ctx, driver.ProducerConfig{RequireDurableAck: true})
+	producer, err := conn.Producer(ctx, driver.ProducerConfig{})
 	require.NoError(t, err)
 	return ctx, conn, producer
 }
@@ -203,6 +203,7 @@ func TestStopRejectsOutstandingUntilSettled(t *testing.T) {
 	require.True(t, classified)
 	require.Equal(t, driver.KindFatal, kind)
 	require.ErrorContains(t, err, "outstanding messages")
+	require.ErrorIs(t, err, driver.ErrResourcesOutstanding)
 	require.NoError(t, message.Settle.Ack(ctx))
 	closeTest(t, ctx, conn, producer, consumer)
 }

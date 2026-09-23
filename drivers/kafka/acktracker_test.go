@@ -17,10 +17,10 @@ func TestAckTrackerInOrderAcks(t *testing.T) {
 	}
 }
 
-func TestAckTrackerRejectsOutOfOrderAck(t *testing.T) {
+func TestAckTrackerRoutedAckRejectsGap(t *testing.T) {
 	tracker := newAckTracker(10)
-	if err := tracker.Ack(11, nil); !errors.Is(err, errAckTrackerAlreadySettled) {
-		t.Fatalf("Ack(11) = %v, want cursor error", err)
+	if err := tracker.Ack(12, nil); !errors.Is(err, errAckTrackerAlreadySettled) {
+		t.Fatalf("Ack(12) = %v, want cursor error", err)
 	}
 	if got := tracker.CommitPoint(); got != 10 {
 		t.Fatalf("CommitPoint after rejected Ack = %d, want 10", got)
@@ -75,5 +75,73 @@ func TestAckTrackerRevocationWinsFailedCommit(t *testing.T) {
 	}
 	if got := tracker.CommitPoint(); got != 1 {
 		t.Fatalf("CommitPoint after revoked commit failure = %d, want 1", got)
+	}
+}
+
+func TestAckTrackerOwnAckAdvancesAcrossGap(t *testing.T) {
+	tracker := newAckTracker(10)
+	var committed int64
+	if err := tracker.AckOwn(12, func(offset int64) error {
+		committed = offset
+		return nil
+	}); err != nil {
+		t.Fatalf("AckOwn(12) = %v, want success across the own-tracker gap", err)
+	}
+	if committed != 13 {
+		t.Fatalf("committed offset = %d, want 13", committed)
+	}
+	if got := tracker.CommitPoint(); got != 13 {
+		t.Fatalf("CommitPoint after AckOwn(12) = %d, want 13", got)
+	}
+}
+
+func TestAckTrackerRejectsSettledOffsetOnBothPaths(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		ack  func(*ackTracker) error
+	}{
+		{name: "routed", ack: func(tracker *ackTracker) error { return tracker.Ack(9, nil) }},
+		{name: "own", ack: func(tracker *ackTracker) error { return tracker.AckOwn(9, nil) }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			tracker := newAckTracker(10)
+			if err := tc.ack(tracker); !errors.Is(err, errAckTrackerAlreadySettled) {
+				t.Fatalf("ack below base = %v, want cursor error", err)
+			}
+			if got := tracker.CommitPoint(); got != 10 {
+				t.Fatalf("CommitPoint after rejected ack = %d, want 10", got)
+			}
+		})
+	}
+}
+
+func TestAckTrackerOwnAckRollbackOnGapCommitFailure(t *testing.T) {
+	tracker := newAckTracker(10)
+	commitErr := errors.New("commit failed")
+	var attempted int64
+	if err := tracker.AckOwn(12, func(offset int64) error {
+		attempted = offset
+		return commitErr
+	}); !errors.Is(err, commitErr) {
+		t.Fatalf("AckOwn(12) = %v, want commit failure", err)
+	}
+	if attempted != 13 {
+		t.Fatalf("failed commit offset = %d, want 13", attempted)
+	}
+	if got := tracker.CommitPoint(); got != 10 {
+		t.Fatalf("CommitPoint after failed gap commit = %d, want 10", got)
+	}
+	var committed int64
+	if err := tracker.AckOwn(12, func(offset int64) error {
+		committed = offset
+		return nil
+	}); err != nil {
+		t.Fatalf("retry AckOwn(12): %v", err)
+	}
+	if committed != 13 {
+		t.Fatalf("retry committed offset = %d, want 13", committed)
+	}
+	if got := tracker.CommitPoint(); got != 13 {
+		t.Fatalf("CommitPoint after retry = %d, want 13", got)
 	}
 }

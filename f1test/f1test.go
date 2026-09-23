@@ -1,12 +1,11 @@
-// Package f1test provides deterministic handler tests backed by the in-memory
-// driver and a manually advanced clock.
+// Package f1test provides deterministic handler-test helpers backed by an
+// in-memory client, a manually advanced clock, and an observer recorder.
 package f1test
 
 import (
 	"context"
 	"errors"
 	"fmt"
-	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -18,17 +17,16 @@ import (
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/testhook"
 )
 
-// Client wraps an f1.Client backed by the in-memory driver and a fake clock.
-// The embedded client exposes the normal Subscribe and Runner APIs; the
-// methods declared here provide deterministic publishing and observation
-// helpers for handler tests.
+// Client wraps an f1.Client backed by the in-memory driver and a fake clock. It
+// embeds f1.Client and adds deterministic delivery, capture, and fake-time
+// helpers for handler tests. Create clients with [NewClient]; the zero value is
+// not initialized.
 type Client struct {
 	*f1.Client
 
-	clock     *clock.Fake
-	timer20ms <-chan struct{}
-	captures  *captureStore
-	state     *captureState
+	clock    *clock.Fake
+	captures *captureStore
+	state    *captureState
 }
 
 // Captured is one message accepted by the in-memory driver's producer.
@@ -40,8 +38,9 @@ type Captured struct {
 	Headers   map[string]string
 }
 
-// NewClient returns a Client backed by the in-memory driver with a fake clock.
-// The client is closed automatically through t.Cleanup.
+// NewClient returns a Client backed by the in-memory driver with a fake clock
+// and registers cleanup to close it when t completes. It fails the test if
+// initialization fails or closing the client fails during cleanup.
 func NewClient(t *testing.T, opts ...f1.Option) *Client {
 	t.Helper()
 
@@ -63,12 +62,11 @@ func closeClient(client *Client) error {
 
 func newClient(opts ...f1.Option) (*Client, error) {
 	fake := clock.NewFake(time.Unix(0, 0))
-	timer20ms := make(chan struct{})
-	observedClock := &observedClock{Fake: fake, delay: 20 * time.Millisecond, armed: timer20ms}
 	captures := &captureStore{signal: make(chan struct{})}
 	state := &captureState{
 		destinations: make(map[string]chan struct{}),
 		ready:        make(map[string]bool),
+		kinds:        make(map[string]driver.DestKind),
 		waiting:      make(chan string, 16),
 		released:     make(chan struct{}, 16),
 	}
@@ -76,14 +74,14 @@ func newClient(opts ...f1.Option) (*Client, error) {
 	// These options are last so every helper always observes the same fake
 	// clock that the in-memory driver's deferred-delivery queue uses.
 	options = append(options,
-		f1.WithDriver(captureDriver{inner: testhook.Driver(observedClock).(inmem.Driver), captures: captures, state: state}),
-		testhook.ClientOption(observedClock).(f1.Option),
+		f1.WithDriver(captureDriver{inner: testhook.Driver(fake).(inmem.Driver), captures: captures, state: state}),
+		testhook.ClientOption(fake).(f1.Option),
 	)
 	core, err := f1.New(context.Background(), testConfig(), options...)
 	if err != nil {
 		return nil, err
 	}
-	return &Client{Client: core, clock: fake, timer20ms: timer20ms, captures: captures, state: state}, nil
+	return &Client{Client: core, clock: fake, captures: captures, state: state}, nil
 }
 
 func testConfig() f1.Config {
@@ -103,7 +101,6 @@ func testConfig() f1.Config {
 		},
 		Codec: f1.CodecConfig{
 			Default:        "json",
-			ContentMode:    "binary",
 			MaxHeaderBytes: f1.CoreMaxHeaderBytes,
 			MaxBodyBytes:   1 << 20,
 		},
@@ -117,11 +114,11 @@ func testConfig() f1.Config {
 	}
 }
 
-// Deliver waits for the event's destination to be created, then publishes an
-// event through the in-memory broker. A subscription returned by
-// Client.Subscribe must be running for its handler to receive it. The call
-// fails the test when the destination is not ready or the message is not
-// accepted by the driver.
+// Deliver waits up to one second for the event's destination to become ready,
+// then publishes the event through the in-memory broker. A running subscription
+// is required for its handler to receive the event; Deliver does not wait for
+// the handler to process it. Deliver fails the test if the destination is not
+// ready before the deadline or publishing fails.
 func (c *Client) Deliver(t *testing.T, eventType string, payload any, opts ...f1.PublishOption) {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
@@ -142,7 +139,7 @@ func deliver(c *Client, ctx context.Context, eventType string, payload any, opts
 }
 
 // Published returns and clears messages accepted by the in-memory driver that
-// were not sent to a dead-letter destination.
+// were not sent to a dead-letter destination. A nil receiver returns nil.
 func (c *Client) Published() []Captured {
 	if c == nil || c.captures == nil {
 		return nil
@@ -151,7 +148,7 @@ func (c *Client) Published() []Captured {
 }
 
 // DLQ returns and clears messages accepted by the in-memory driver whose
-// destination is a dead-letter destination.
+// destination is a dead-letter destination. A nil receiver returns nil.
 func (c *Client) DLQ() []Captured {
 	if c == nil || c.captures == nil {
 		return nil
@@ -159,16 +156,23 @@ func (c *Client) DLQ() []Captured {
 	return c.captures.take(true)
 }
 
-// Advance moves the fake clock and releases due deferred messages from the
-// in-memory driver before returning. The same concrete clock is supplied to
-// the core and driver, so both sides observe the new instant.
+// Advance adds d to the fake clock and releases deferred messages due at the
+// resulting time before returning. A nil receiver is a no-op.
 func (c *Client) Advance(d time.Duration) {
 	if c == nil || c.clock == nil {
 		return
 	}
 	c.clock.Advance(d)
-	if c.state != nil && c.state.releaseDue != nil {
-		c.state.releaseDue()
+	if c.state == nil {
+		return
+	}
+	// A reconnect reopens the driver and replaces releaseDue, so it is read
+	// under the lock the Open hook writes it under.
+	c.state.mu.Lock()
+	releaseDue := c.state.releaseDue
+	c.state.mu.Unlock()
+	if releaseDue != nil {
+		releaseDue()
 	}
 }
 
@@ -176,6 +180,7 @@ type captureState struct {
 	mu           sync.Mutex
 	destinations map[string]chan struct{}
 	ready        map[string]bool
+	kinds        map[string]driver.DestKind
 	waiting      chan string
 	releaseDue   func()
 	released     chan struct{}
@@ -196,10 +201,15 @@ func (s *captureState) destinationGate(name string) (chan struct{}, bool) {
 	return gate, ready
 }
 
+// markReady records the spec's destinations as ready to receive and remembers
+// the kind the core declared for each one, which is what tells a dead-letter
+// destination from a published one: a topic is free to spell "dlq" in its name
+// without becoming a dead-letter destination.
 func (s *captureState) markReady(specs []driver.DestinationSpec) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for _, spec := range specs {
+		s.kinds[spec.Name] = spec.Kind
 		gate := s.destinations[spec.Name]
 		if gate == nil {
 			gate = make(chan struct{})
@@ -210,6 +220,22 @@ func (s *captureState) markReady(specs []driver.DestinationSpec) {
 		}
 		s.ready[spec.Name] = true
 		close(gate)
+	}
+}
+
+// deadLetterDestination reports whether the core declared name as a
+// dead-letter destination, one that holds messages no other destination
+// accepted. A destination the core never declared is not one: without a
+// declared kind the capture has nothing but the name to go on, and a name is
+// not a kind.
+func (s *captureState) deadLetterDestination(name string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	switch s.kinds[name] {
+	case driver.DestDLQ, driver.DestBackstopDLQ:
+		return true
+	default:
+		return false
 	}
 }
 
@@ -240,7 +266,11 @@ type captureStore struct {
 	signal chan struct{}
 }
 
-func (s *captureStore) add(messages []driver.OutboundMessage, err error) {
+// add records the messages a producer accepted, separating those the core
+// declared as dead-letter destinations from the published ones. state supplies
+// the declared kind of each destination; a message to a destination with no
+// declared kind is published.
+func (s *captureStore) add(state *captureState, messages []driver.OutboundMessage, err error) {
 	if s == nil {
 		return
 	}
@@ -260,12 +290,12 @@ func (s *captureStore) add(messages []driver.OutboundMessage, err error) {
 			continue
 		}
 		captured := captureMessage(message)
-		if strings.Contains(message.Destination, ".dlq.") {
+		if state != nil && state.deadLetterDestination(message.Destination) {
 			s.dlq = append(s.dlq, captured)
-		} else {
-			s.published = append(s.published, captured)
-			published = true
+			continue
 		}
+		s.published = append(s.published, captured)
+		published = true
 	}
 	if published && s.signal != nil {
 		select {
@@ -342,6 +372,7 @@ func (d captureDriver) Open(ctx context.Context, cfg driver.Config) (driver.Conn
 		return nil, err
 	}
 	if advancer, ok := conn.(interface{ ReleaseDue() }); ok && d.state != nil {
+		d.state.mu.Lock()
 		d.state.releaseDue = func() {
 			advancer.ReleaseDue()
 			select {
@@ -349,6 +380,7 @@ func (d captureDriver) Open(ctx context.Context, cfg driver.Config) (driver.Conn
 			default:
 			}
 		}
+		d.state.mu.Unlock()
 	}
 	return &captureConn{Conn: conn, captures: d.captures, state: d.state}, nil
 }
@@ -412,29 +444,28 @@ type captureProducer struct {
 	state    *captureState
 }
 
+// destinationWait bounds how long a publish waits for its destination to be
+// declared. A test often publishes right after starting Run, before the
+// runner's topology exists, so the publish waits for it; a destination that
+// nothing declares is not coming, and the publish then reaches the driver and
+// returns its error instead of waiting for the caller's context to end.
+const destinationWait = time.Second
+
 func (p *captureProducer) Publish(ctx context.Context, messages ...driver.OutboundMessage) error {
 	if p.state != nil {
+		waitCtx, cancel := context.WithTimeout(ctx, destinationWait)
 		for _, message := range messages {
-			if err := p.state.waitDestination(ctx, message.Destination); err != nil {
-				return err
+			if err := p.state.waitDestination(waitCtx, message.Destination); err != nil {
+				if ctx.Err() != nil {
+					cancel()
+					return err
+				}
+				break
 			}
 		}
+		cancel()
 	}
 	err := p.Producer.Publish(ctx, messages...)
-	p.captures.add(messages, err)
+	p.captures.add(p.state, messages, err)
 	return err
-}
-
-type observedClock struct {
-	*clock.Fake
-	delay time.Duration
-	armed chan struct{}
-	once  sync.Once
-}
-
-func (c *observedClock) Timer(d time.Duration) clock.Timer {
-	if d == c.delay {
-		c.once.Do(func() { close(c.armed) })
-	}
-	return c.Fake.Timer(d)
 }

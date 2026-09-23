@@ -120,6 +120,63 @@ func TestKafkaBacklogHeadSelection(t *testing.T) {
 	}
 }
 
+// TestKafkaBacklogHeadSelectionSharesOneBatch pins the selection over the shape
+// a real probe has: every partition of one read is probed with the same fetch
+// batch, which can carry several destinations, so a partition entry has to stay
+// reachable through the probes that follow the one that walked it and it has to
+// stay the entry of its own destination. The head is the oldest unread record
+// across all of them.
+func TestKafkaBacklogHeadSelectionSharesOneBatch(t *testing.T) {
+	t.Parallel()
+	oldest := time.Date(2026, time.January, 2, 3, 4, 5, 0, time.UTC)
+	newer := oldest.Add(time.Second)
+
+	batch := append(
+		kafkaTestFetches(t, "orders", 0, 0,
+			kafkaTestRecord(t, "orders", 0, 0, newer, 0, false)),
+		kafkaTestFetches(t, "events", 0, 0,
+			kafkaTestRecord(t, "events", 0, 0, oldest, 1, false))...,
+	)
+	probes := []backlogPartitionProbe{
+		{destination: "orders", partition: 0, lag: 1, committed: 0, fetches: batch},
+		{destination: "events", partition: 0, lag: 1, committed: 0, fetches: batch},
+	}
+
+	gotAt, gotSource, gotKnown := selectKafkaBacklogHead(probes)
+	if !gotKnown {
+		t.Fatal("shared-batch head is unknown")
+	}
+	if !gotAt.Equal(oldest) || gotSource != driver.EnqueueSourceBroker {
+		t.Fatalf("head = %v/%v, want %v/%v", gotAt, gotSource, oldest, driver.EnqueueSourceBroker)
+	}
+}
+
+// TestKafkaBacklogHeadSelectionTakesTheFirstPartitionEntry pins which entry of
+// a batch answers when the batch carries the same partition more than once: the
+// one a walk of the batch reaches first, so the second entry never overrides
+// the head the first one establishes.
+func TestKafkaBacklogHeadSelectionTakesTheFirstPartitionEntry(t *testing.T) {
+	t.Parallel()
+	first := time.Date(2026, time.January, 2, 3, 4, 5, 0, time.UTC)
+	second := first.Add(time.Second)
+
+	batch := append(
+		kafkaTestFetches(t, "orders", 0, 0,
+			kafkaTestRecord(t, "orders", 0, 0, first, 0, false)),
+		kafkaTestFetches(t, "orders", 0, 0,
+			kafkaTestRecord(t, "orders", 0, 0, second, 0, false))...,
+	)
+	probes := []backlogPartitionProbe{{destination: "orders", partition: 0, lag: 1, committed: 0, fetches: batch}}
+
+	gotAt, _, gotKnown := selectKafkaBacklogHead(probes)
+	if !gotKnown {
+		t.Fatal("head is unknown")
+	}
+	if !gotAt.Equal(first) {
+		t.Fatalf("head = %v, want the first entry's %v", gotAt, first)
+	}
+}
+
 func TestPollKafkaBacklogStopsOnPartitionError(t *testing.T) {
 	t.Parallel()
 	const (

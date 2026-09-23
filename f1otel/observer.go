@@ -6,6 +6,7 @@ import (
 	"sync/atomic"
 
 	f1 "fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk"
+	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/version"
 
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/metric"
@@ -46,6 +47,9 @@ type startState struct {
 	parentSpan trace.Span
 }
 
+// instrumentationName names the meter and tracer this package creates.
+const instrumentationName = "fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/f1otel"
+
 // New returns an Observer configured with application-owned providers. New
 // creates no exporter, never reads a global provider, and reports instrument
 // creation errors through otel.Handle while returning the usable Observer.
@@ -62,10 +66,10 @@ func New(opts ...Option) (*Observer, error) {
 		createSpans: cfg.createSpans,
 	}
 	if cfg.meterProvider != nil {
-		observer.metrics = newMetrics(cfg.meterProvider.Meter("fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/f1otel"))
+		observer.metrics = newMetrics(cfg.meterProvider.Meter(instrumentationName, metric.WithInstrumentationVersion(version.SDK())))
 	}
 	if cfg.tracerProvider != nil {
-		observer.tracer = cfg.tracerProvider.Tracer("fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/f1otel")
+		observer.tracer = cfg.tracerProvider.Tracer(instrumentationName, trace.WithInstrumentationVersion(version.SDK()))
 	}
 	if observer.tracer != nil {
 		observer.starts = make(map[uint64]startState)
@@ -73,9 +77,12 @@ func New(opts ...Option) (*Observer, error) {
 	return observer, nil
 }
 
-// Start records the start timestamp for a metric-bearing stage and creates a
-// span for a span-bearing stage. Process spans are roots linked to inbound
-// trace context; the returned context carries the new span for handler work.
+// Start returns a token when the event starts a metric-bearing or span-bearing
+// stage; otherwise it returns a zero token. It starts spans for publish,
+// message_built, process, and settle events when a tracer is configured, except
+// that message_built spans can be disabled with [WithCreateSpans]. The returned
+// context carries a span when one is started. Process spans are roots linked
+// to valid inbound trace context. A nil receiver returns ctx and a zero token.
 func (o *Observer) Start(ctx context.Context, event f1.StartEvent) (context.Context, f1.Token) {
 	if o == nil {
 		return ctx, f1.Token{}
@@ -114,10 +121,14 @@ func (o *Observer) Start(ctx context.Context, event f1.StartEvent) (context.Cont
 	return next, token
 }
 
-// Finish records metrics and ends a matching span. Span-enabled observers
-// remove any state for token.Handle before ignoring missing, foreign, or
-// mismatched-kind tokens. A metrics-only observer records any token with a
-// non-zero handle and start time whose kind matches the finish event.
+// Finish records configured metrics for supported kinds and ends a span
+// associated with a matching token. With metrics but no tracing, a nonzero
+// handle, nonzero start time, and matching kind make publish, process, and
+// settle finishes eligible for metric recording. With tracing, the token must
+// identify a start recorded by this Observer; tokens without a recorded start
+// are ignored. The first Finish call that finds a recorded start consumes it,
+// even if its kind mismatches; a mismatched span is then dropped without being
+// ended, so it is never exported, and no metric is recorded.
 func (o *Observer) Finish(token f1.Token, event f1.FinishEvent) {
 	if o == nil || token.Handle == 0 {
 		return
@@ -180,15 +191,23 @@ func (o *Observer) Finish(token f1.Token, event f1.FinishEvent) {
 	o.finishSpan(token, event, start)
 }
 
-// Record records a point metric. Unknown kinds and fields are ignored, and no
-// metric is emitted when the required event timestamp source is unavailable.
+// Record emits metrics for supported point events when metrics are configured.
+// Driver-selection events update the endpoint data that metrics and spans
+// carry, with or without metrics. Missing broker enqueue time
+// metadata omits the broker-wait histogram but not the delivery count. For
+// backlog samples, missing broker enqueue time or an unknown head age omits
+// only the age histogram, not the backlog message gauge.
 func (o *Observer) Record(event f1.PointEvent) {
-	if o == nil || o.metrics == nil {
+	if o == nil {
 		return
 	}
-
+	// The endpoint is recorded whether or not metrics are configured: spans
+	// read it for server.address and server.port too.
 	if event.Kind == f1.ObserverDriverSelected {
 		o.recordDriver(event)
+		return
+	}
+	if o.metrics == nil {
 		return
 	}
 

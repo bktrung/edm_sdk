@@ -93,93 +93,62 @@ func codecSelectionEnvelope(contentType string) Envelope {
 	}
 }
 
-func TestDispatchSelectsJSONByContentType(t *testing.T) {
-	cfg := testClientConfig(t)
-	client, runner, _ := newCodecSelectionRunner(t, cfg, WithCodec(&registryTestCodec{reject: true}))
-	defer func() { _ = client.Close(context.Background()) }()
+func TestDispatchUsesDefaultCodecForEmptyContentType(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		marker bool
+		config func(*testing.T) Config
+	}{
+		{
+			name:   "configured default",
+			marker: true,
+			config: testClientConfig,
+		},
+		{
+			name: "hand-built config uses JSON",
+			config: func(*testing.T) Config {
+				cfg := Config{Env: "test", Service: "orders", Broker: BrokerConfig{Driver: "inmem"}}
+				cfg.Topology.AutoCreate = true
+				return cfg
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			cfg := test.config(t)
+			var options []Option
+			marker := &registryTestCodec{decodeCalls: new(atomic.Int32)}
+			if test.marker {
+				cfg.Codec.Default = marker.Name()
+				options = append(options, WithCodec(marker))
+			}
+			client, runner, _ := newCodecSelectionRunner(t, cfg, options...)
+			defer func() { _ = client.Close(context.Background()) }()
 
-	var got struct {
-		Value string `json:"value"`
-	}
-	var decodeErr error
-	runner.subscription.Handlers = map[string]Handler{
-		"orders.created.v1": HandlerFunc(func(_ context.Context, event *Event) error {
-			decodeErr = event.Decode(&got)
-			return decodeErr
-		}),
-	}
-	settler := &dispatchSettler{}
-	message := codecSelectionMessage(t, codecSelectionEnvelope("application/json"), []byte(`{"value":"json"}`), settler)
-	if !dispatchMessage(runner, context.Background(), message, &Envelope{}, new(bool)) {
-		t.Fatal("JSON message was not settled")
-	}
-	if decodeErr != nil {
-		t.Fatalf("JSON decode error = %v", decodeErr)
-	}
-	if got.Value != "json" {
-		t.Fatalf("decoded value = %q, want json", got.Value)
-	}
-}
-
-func TestDispatchUsesConfiguredDefaultForEmptyContentType(t *testing.T) {
-	marker := &registryTestCodec{decodeCalls: new(atomic.Int32)}
-	cfg := testClientConfig(t)
-	cfg.Codec.Default = marker.Name()
-	client, runner, _ := newCodecSelectionRunner(t, cfg, WithCodec(marker))
-	defer func() { _ = client.Close(context.Background()) }()
-
-	var got struct {
-		Value string `json:"value"`
-	}
-	var decodeErr error
-	runner.subscription.Handlers = map[string]Handler{
-		"orders.created.v1": HandlerFunc(func(_ context.Context, event *Event) error {
-			decodeErr = event.Decode(&got)
-			return decodeErr
-		}),
-	}
-	settler := &dispatchSettler{}
-	message := codecSelectionMessage(t, codecSelectionEnvelope(""), []byte(`{"value":"default"}`), settler)
-	if !dispatchMessage(runner, context.Background(), message, &Envelope{}, new(bool)) {
-		t.Fatal("default-codec message was not settled")
-	}
-	if decodeErr != nil {
-		t.Fatalf("default codec decode error = %v", decodeErr)
-	}
-	if got.Value != "default" {
-		t.Fatalf("decoded value = %q, want default", got.Value)
-	}
-	if got := marker.decodeCalls.Load(); got != 1 {
-		t.Fatalf("alternate codec decode calls = %d, want 1", got)
-	}
-}
-
-func TestHandBuiltConfigUsesJSONDefaultForEmptyContentType(t *testing.T) {
-	cfg := Config{Env: "test", Service: "orders", Broker: BrokerConfig{Driver: "inmem"}}
-	cfg.Topology.AutoCreate = true
-	client, runner, _ := newCodecSelectionRunner(t, cfg)
-	defer func() { _ = client.Close(context.Background()) }()
-
-	var got struct {
-		Value string `json:"value"`
-	}
-	var decodeErr error
-	runner.subscription.Handlers = map[string]Handler{
-		"orders.created.v1": HandlerFunc(func(_ context.Context, event *Event) error {
-			decodeErr = event.Decode(&got)
-			return decodeErr
-		}),
-	}
-	settler := &dispatchSettler{}
-	message := codecSelectionMessage(t, codecSelectionEnvelope(""), []byte(`{"value":"hand-built"}`), settler)
-	if !dispatchMessage(runner, context.Background(), message, &Envelope{}, new(bool)) {
-		t.Fatal("hand-built config message was not settled")
-	}
-	if decodeErr != nil {
-		t.Fatalf("hand-built config decode error = %v", decodeErr)
-	}
-	if got.Value != "hand-built" {
-		t.Fatalf("decoded value = %q, want hand-built", got.Value)
+			var got struct {
+				Value string `json:"value"`
+			}
+			var decodeErr error
+			runner.subscription.Handlers = map[string]Handler{
+				"orders.created.v1": HandlerFunc(func(_ context.Context, event *Event) error {
+					decodeErr = event.Decode(&got)
+					return decodeErr
+				}),
+			}
+			settler := &dispatchSettler{}
+			message := codecSelectionMessage(t, codecSelectionEnvelope(""), []byte(`{"value":"default"}`), settler)
+			if !dispatchMessage(runner, context.Background(), message, &Envelope{}, new(bool), &deliveryState{}) {
+				t.Fatal("empty-content-type message was not settled")
+			}
+			if decodeErr != nil {
+				t.Fatalf("default codec decode error = %v", decodeErr)
+			}
+			if got.Value != "default" {
+				t.Fatalf("decoded value = %q, want default", got.Value)
+			}
+			if test.marker && marker.decodeCalls.Load() != 1 {
+				t.Fatalf("alternate codec decode calls = %d, want 1", marker.decodeCalls.Load())
+			}
+		})
 	}
 }
 
@@ -197,7 +166,7 @@ func TestUnknownContentTypeDeadLettersBeforeHandler(t *testing.T) {
 	}
 	settler := &dispatchSettler{}
 	message := codecSelectionMessage(t, codecSelectionEnvelope("application/unknown"), []byte(`{"value":"unknown"}`), settler)
-	if !dispatchMessage(runner, context.Background(), message, &Envelope{}, new(bool)) {
+	if !dispatchMessage(runner, context.Background(), message, &Envelope{}, new(bool), &deliveryState{}) {
 		t.Fatal("unknown-content-type message was not settled")
 	}
 	if handled {
@@ -241,6 +210,22 @@ func TestWithCodecRequiresAtLeastOneCodec(t *testing.T) {
 	}
 }
 
+func TestWithCodecRejectsTwoCodecsForOneContentType(t *testing.T) {
+	first := &registryTestCodec{name: "first", contentType: "application/json"}
+	second := &registryTestCodec{name: "second", contentType: "application/json"}
+	client, err := New(context.Background(), testClientConfig(t),
+		WithDriver(&dispatchDriver{conn: &dispatchConn{producer: &dispatchProducer{}}}),
+		WithCodec(first, second),
+	)
+	if err == nil {
+		_ = client.Close(context.Background())
+		t.Fatal("WithCodec() accepted two codecs for one content type, which would publish with the first and read with the second")
+	}
+	if !strings.Contains(err.Error(), "application/json") {
+		t.Fatalf("WithCodec() error = %v, want the shared content type named", err)
+	}
+}
+
 func TestJSONRemainsRegisteredWithAlternateCodec(t *testing.T) {
 	cfg := testClientConfig(t)
 	marker := &registryTestCodec{decodeCalls: new(atomic.Int32), reject: true}
@@ -259,7 +244,7 @@ func TestJSONRemainsRegisteredWithAlternateCodec(t *testing.T) {
 	}
 	settler := &dispatchSettler{}
 	message := codecSelectionMessage(t, codecSelectionEnvelope("application/json"), []byte(`{"value":"json"}`), settler)
-	if !dispatchMessage(runner, context.Background(), message, &Envelope{}, new(bool)) {
+	if !dispatchMessage(runner, context.Background(), message, &Envelope{}, new(bool), &deliveryState{}) {
 		t.Fatal("JSON message was not settled")
 	}
 	if decodeErr != nil {
@@ -301,7 +286,7 @@ func TestWithCodecUsesFirstForPublishAndRegistersAllForRead(t *testing.T) {
 	}
 	settler := &dispatchSettler{}
 	message := codecSelectionMessage(t, codecSelectionEnvelope(second.ContentType()), []byte(`{"value":"second"}`), settler)
-	if !dispatchMessage(runner, context.Background(), message, &Envelope{}, new(bool)) {
+	if !dispatchMessage(runner, context.Background(), message, &Envelope{}, new(bool), &deliveryState{}) {
 		t.Fatal("second-codec message was not settled")
 	}
 	if decodeErr != nil {

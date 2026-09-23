@@ -389,3 +389,25 @@ func spanAttributes(span tracetest.SpanStub) map[string]string {
 	}
 	return attrs
 }
+
+func TestTraceOnlyObserverPutsTheEndpointOnSpans(t *testing.T) {
+	exporter := tracetest.NewInMemoryExporter()
+	provider := sdktrace.NewTracerProvider(sdktrace.WithSyncer(exporter))
+	t.Cleanup(func() { require.NoError(t, provider.Shutdown(context.Background())) })
+	observer, err := New(WithTracerProvider(provider))
+	require.NoError(t, err)
+
+	base := time.Unix(100, 0)
+	observer.Record(f1.PointEvent{Kind: f1.ObserverDriverSelected, At: base, DriverName: "kafka", ServerAddress: "127.0.0.1", ServerPort: 9092})
+	_, token := observer.Start(context.Background(), f1.StartEvent{Kind: f1.ObserverPublish, At: base, Topic: "orders.created", Priority: f1.PriorityHigh})
+	observer.Finish(token, f1.FinishEvent{Kind: f1.ObserverPublish, At: base.Add(time.Second), Topic: "orders.created", Priority: f1.PriorityHigh, Outcome: f1.ObserverOutcomeOK})
+
+	spans := exporter.GetSpans()
+	require.Len(t, spans, 1)
+	attrs := map[string]string{}
+	for _, attr := range spans[0].Attributes {
+		attrs[string(attr.Key)] = attr.Value.String()
+	}
+	require.Equal(t, "127.0.0.1", attrs["server.address"], "a trace-only observer must still carry the broker endpoint")
+	require.Equal(t, "9092", attrs["server.port"])
+}

@@ -6,7 +6,6 @@ import (
 	"testing"
 	"time"
 
-	//nolint:depguard // integration tests exercise the SDK through the in-memory driver
 	f1 "fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk"
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/driver"
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/clock"
@@ -124,7 +123,6 @@ func successorFamilyConfig() f1.Config {
 		},
 		Codec: f1.CodecConfig{
 			Default:        "json",
-			ContentMode:    "binary",
 			MaxHeaderBytes: f1.CoreMaxHeaderBytes,
 			MaxBodyBytes:   1 << 20,
 		},

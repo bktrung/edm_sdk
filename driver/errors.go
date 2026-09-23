@@ -5,13 +5,27 @@ import (
 	"fmt"
 )
 
-// Sentinel errors returned by drivers for portable failure handling.
 var (
-	ErrUnsupported          = errors.New("f1/driver: unsupported operation")
-	ErrAlreadySettled       = errors.New("f1/driver: message already settled")
-	ErrDrainTimeout         = errors.New("f1/driver: drain did not complete in time")
+	// ErrUnsupported reports that a driver does not support the requested operation
+	// or feature.
+	ErrUnsupported = errors.New("f1/driver: unsupported operation")
+
+	// ErrAlreadySettled reports that a delivery was acknowledged or rejected
+	// after it had already been settled.
+	ErrAlreadySettled = errors.New("f1/driver: message already settled")
+
+	// ErrDrainTimeout reports that consumer draining or finalization exceeded its
+	// context deadline.
+	ErrDrainTimeout = errors.New("f1/driver: drain did not complete in time")
+
+	// ErrResourcesOutstanding reports that a producer or consumer operation is
+	// blocked by connection resource state, including open resources during close
+	// or a closed or closing connection.
 	ErrResourcesOutstanding = errors.New("f1/driver: producers or consumers still open")
-	ErrDestinationMissing   = errors.New("f1/driver: destination does not exist")
+
+	// ErrDestinationMissing reports that a requested physical destination does not
+	// exist.
+	ErrDestinationMissing = errors.New("f1/driver: destination does not exist")
 )
 
 // Kind classifies an error for retry and health logic.
@@ -33,7 +47,8 @@ const (
 	KindNotification
 )
 
-// String returns the stable wire name of the error kind.
+// String returns the stable wire name of the error kind. Unknown values return
+// "transient".
 func (k Kind) String() string {
 	switch k {
 	case KindFatal:
@@ -55,6 +70,7 @@ func (k Kind) String() string {
 // not implement it are treated as transient by Classify.
 type ClassifiedError interface {
 	error
+	// Kind returns the portable classification of the error.
 	Kind() Kind
 }
 
@@ -72,28 +88,40 @@ type Error struct {
 	Err error
 }
 
-// Error returns the formatted driver error.
+// Error returns the formatted driver error. A nil *Error, which a driver can
+// return by mistake as a typed nil, is safe to call through all methods and
+// reads as a transient error.
 func (e *Error) Error() string {
+	if e == nil {
+		return "f1/driver: nil error (transient)"
+	}
 	return fmt.Sprintf("f1/%s: %s: %v (%s)", e.Driver, e.Op, e.Err, e.K)
 }
 
 // Unwrap returns the underlying driver error.
 func (e *Error) Unwrap() error {
+	if e == nil {
+		return nil
+	}
 	return e.Err
 }
 
 // Kind returns the portable classification.
 func (e *Error) Kind() Kind {
+	if e == nil {
+		return KindTransient
+	}
 	return e.K
 }
 
 // Retryable reports whether the error should be retried.
 func (e *Error) Retryable() bool {
-	return e.K == KindTransient
+	return e.Kind() == KindTransient
 }
 
-// Classify returns err's kind and whether it implements ClassifiedError.
-// Unclassified errors return KindTransient and false; Classify does not log.
+// Classify returns err's kind and whether its error chain contains a
+// ClassifiedError. Unclassified errors, including nil, return KindTransient
+// and false. It does not log.
 func Classify(err error) (Kind, bool) {
 	if classified, ok := errors.AsType[ClassifiedError](err); ok {
 		return classified.Kind(), true
@@ -101,18 +129,17 @@ func Classify(err error) (Kind, bool) {
 	return KindTransient, false
 }
 
-// PublishError reports partial publish results. Failed contains the errors for
-// messages that were not acknowledged.
+// PublishError reports the messages a producer did not acknowledge.
 type PublishError struct {
+	// Failed maps each unacknowledged message index to its error.
 	Failed map[int]error
 }
 
-// Error returns the number of failed messages followed by the cause at the
-// lowest failed index. Entries holding no error are skipped, so an all-nil
-// Failed renders the count alone. Only one cause is named however many
-// messages failed; the count says how many more there are. The text is stable
-// for the same failure because the cause is chosen by index, not by range
-// order over the map.
+// Error returns a summary of the failed-message count and, when present, the
+// cause at the lowest index with a non-nil error. Nil causes are skipped, so
+// an all-nil Failed map renders only the count. Choosing the lowest index makes
+// the text stable across map iteration; the summary reports all failures even
+// though the message names at most one cause.
 func (e *PublishError) Error() string {
 	if e == nil || len(e.Failed) == 0 {
 		return "f1/driver: publish error has no failed messages"
@@ -157,30 +184,42 @@ func (e *PublishError) Unwrap() []error {
 	return causes
 }
 
-// Kind returns the most severe classification among failed messages. A cause a
-// driver did not classify is counted as KindTransient, so a batch whose causes
-// are all untranslated reports KindTransient. That worst-of default is a retry
-// hint for the caller - an application the driver told nothing is better served
-// publishing again than being told the failure is fatal - and not a signal that
-// the connection is unhealthy.
+// Kind returns the most severe classification among failed messages. This is
+// a retry hint, not a report of connection health.
+//
+// Unclassified causes count as [KindTransient]. A nil or empty PublishError
+// returns [KindFatal]. A notification reports a routine lifecycle event rather
+// than a failure, so an error whose causes are all notifications reports
+// [KindNotification] instead of the retrying default; a single cause that is a
+// real failure decides the result on its own.
 func (e *PublishError) Kind() Kind {
 	if e == nil || len(e.Failed) == 0 {
 		return KindFatal
 	}
 	worst := KindTransient
+	onlyNotifications := true
 	for _, err := range e.Failed {
 		kind, classified := Classify(err)
 		if !classified {
 			kind = KindTransient
 		}
+		if kind == KindNotification {
+			continue
+		}
+		onlyNotifications = false
 		if errorSeverity(kind) > errorSeverity(worst) {
 			worst = kind
 		}
 	}
+	if onlyNotifications {
+		return KindNotification
+	}
 	return worst
 }
 
-// Retryable reports whether every failed message is retryable.
+// Retryable reports whether Failed is non-empty and its aggregate
+// classification is [KindTransient]. A nil receiver or an empty Failed map is
+// not retryable.
 func (e *PublishError) Retryable() bool {
 	return e != nil && len(e.Failed) > 0 && e.Kind() == KindTransient
 }

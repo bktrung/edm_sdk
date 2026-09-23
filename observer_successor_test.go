@@ -159,7 +159,7 @@ func TestObserverSuccessorRetryHop(t *testing.T) {
 	message := retryBridgeMessage(t, envelope, &dispatchSettler{})
 	var abandoned bool
 	var out Envelope
-	if !dispatchMessage(runner, context.Background(), message, &out, &abandoned) {
+	if !dispatchMessage(runner, context.Background(), message, &out, &abandoned, &deliveryState{}) {
 		t.Fatal("dispatchMessage did not settle")
 	}
 	_, finishes, records, order := rec.snapshot()
@@ -265,7 +265,7 @@ func TestObserverSuccessorTerminalDeadLetter(t *testing.T) {
 	message := retryBridgeMessage(t, envelope, &dispatchSettler{})
 	var abandoned bool
 	var out Envelope
-	if !dispatchMessage(runner, context.Background(), message, &out, &abandoned) {
+	if !dispatchMessage(runner, context.Background(), message, &out, &abandoned, &deliveryState{}) {
 		t.Fatal("dispatchMessage did not settle")
 	}
 	_, _, records, _ := rec.snapshot()
@@ -437,7 +437,7 @@ func TestObserverSuccessorPoisonWithoutRoute(t *testing.T) {
 	defer func() { _ = client.Close(context.Background()) }()
 	settler := &dispatchSettler{}
 	message := retryBridgeMessage(t, poisonEnvelope(), settler)
-	if !dispatchMessage(runner, context.Background(), message, &Envelope{}, new(bool)) {
+	if !dispatchMessage(runner, context.Background(), message, &Envelope{}, new(bool), &deliveryState{}) {
 		t.Fatal("poison message was not settled")
 	}
 	rec.mu.Lock()
@@ -473,7 +473,7 @@ func TestObserverSuccessorSeesProcessContext(t *testing.T) {
 	message := retryBridgeMessage(t, envelope, &dispatchSettler{})
 	var abandoned bool
 	var out Envelope
-	if !dispatchMessage(runner, context.Background(), message, &out, &abandoned) {
+	if !dispatchMessage(runner, context.Background(), message, &out, &abandoned, &deliveryState{}) {
 		t.Fatal("dispatchMessage did not settle")
 	}
 	rec.mu.Lock()
@@ -495,7 +495,7 @@ func TestObserverSuccessorDeadLetterTrace(t *testing.T) {
 	message := retryBridgeMessage(t, envelope, &dispatchSettler{})
 	var abandoned bool
 	var out Envelope
-	if !dispatchMessage(runner, context.Background(), message, &out, &abandoned) {
+	if !dispatchMessage(runner, context.Background(), message, &out, &abandoned, &deliveryState{}) {
 		t.Fatal("dispatchMessage did not settle")
 	}
 	producer.mu.Lock()
@@ -591,7 +591,7 @@ func TestObserverSuccessorRetryClassMatchesProcess(t *testing.T) {
 	message := retryBridgeMessage(t, envelope, &dispatchSettler{})
 	var abandoned bool
 	var out Envelope
-	if !dispatchMessage(runner, context.Background(), message, &out, &abandoned) {
+	if !dispatchMessage(runner, context.Background(), message, &out, &abandoned, &deliveryState{}) {
 		t.Fatal("dispatchMessage did not settle")
 	}
 	_, finishes, records, _ := rec.snapshot()

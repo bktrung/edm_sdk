@@ -19,7 +19,7 @@ func TestRoundTrip_PublishThenConsume(t *testing.T) {
 		Destinations: []driver.DestinationSpec{{Name: "orders"}},
 	})
 	require.NoError(t, err)
-	producer, err := conn.Producer(ctx, driver.ProducerConfig{RequireDurableAck: true})
+	producer, err := conn.Producer(ctx, driver.ProducerConfig{})
 	require.NoError(t, err)
 	consumer, err := conn.Consumer(ctx, driver.ConsumerConfig{Destinations: []string{"orders"}, Prefetch: 1})
 	require.NoError(t, err)
@@ -52,7 +52,7 @@ func BenchmarkDispatchBacklog(b *testing.B) {
 	if err != nil {
 		b.Fatal(err)
 	}
-	producer, err := opened.Producer(ctx, driver.ProducerConfig{RequireDurableAck: true})
+	producer, err := opened.Producer(ctx, driver.ProducerConfig{})
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -159,7 +159,7 @@ func benchmarkDispatchDueBacklog(b *testing.B, resetCursor bool) {
 	if err != nil {
 		b.Fatal(err)
 	}
-	producer, err := opened.Producer(ctx, driver.ProducerConfig{RequireDurableAck: true})
+	producer, err := opened.Producer(ctx, driver.ProducerConfig{})
 	if err != nil {
 		b.Fatal(err)
 	}

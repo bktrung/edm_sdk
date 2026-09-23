@@ -13,10 +13,7 @@ import (
 	"testing"
 )
 
-// driverOptionsPage is the document the accepted key lists must agree with.
-const driverOptionsPage = "docs/drivers-and-capabilities.md"
-
-// documentedOptionKey matches the key cell of a row in that page's tables. The
+// documentedOptionKey matches the key cell of a row in a driver page's tables. The
 // page writes a key the way an operator writes it, under the broker section it
 // belongs to.
 var documentedOptionKey = regexp.MustCompile(`^broker\.(kafka|rabbitmq)\.([A-Za-z]+)$`)
@@ -63,13 +60,13 @@ func acceptedOptionKeys(t *testing.T, function string) []string {
 	return keys
 }
 
-// documentedOptionKeys returns the keys the page documents, grouped by driver
-// and in the order the page lists them.
-func documentedOptionKeys(t *testing.T) map[string][]string {
+// documentedOptionKeys returns the keys page documents, grouped by driver and
+// in the order the page lists them.
+func documentedOptionKeys(t *testing.T, page string) map[string][]string {
 	t.Helper()
-	content, err := os.ReadFile(driverOptionsPage)
+	content, err := os.ReadFile(page) //nolint:gosec // page is a repository docs path from the test table
 	if err != nil {
-		t.Fatalf("read %s: %v", driverOptionsPage, err)
+		t.Fatalf("read %s: %v", page, err)
 	}
 	documented := make(map[string][]string)
 	seen := make(map[string]bool)
@@ -90,30 +87,31 @@ func documentedOptionKeys(t *testing.T) map[string][]string {
 	return documented
 }
 
-// TestDriverOptionsDocumented fails when the page and the whitelist disagree in
+// TestDriverOptionsDocumented fails when a driver's page and its whitelist disagree in
 // either direction: a key the switch accepts that the page omits, or a key the
 // page lists that the switch refuses. Each direction matters on its own, since
 // a documented key the driver rejects fails at startup and an accepted key the
 // page omits is discoverable only by guessing it.
 func TestDriverOptionsDocumented(t *testing.T) {
-	documented := documentedOptionKeys(t)
 	for _, driver := range []struct {
 		name     string
 		function string
+		page     string
 	}{
-		{name: "kafka", function: "validKafkaOption"},
-		{name: "rabbitmq", function: "validRabbitMQOption"},
+		{name: "kafka", function: "validKafkaOption", page: "docs/drivers/kafka.md"},
+		{name: "rabbitmq", function: "validRabbitMQOption", page: "docs/drivers/rabbitmq.md"},
 	} {
 		t.Run(driver.name, func(t *testing.T) {
+			documented := documentedOptionKeys(t, driver.page)
 			accepted := acceptedOptionKeys(t, driver.function)
 			for _, key := range accepted {
 				if !slices.Contains(documented[driver.name], key) {
-					t.Errorf("broker.%s.%s is accepted by %s and is absent from %s", driver.name, key, driver.function, driverOptionsPage)
+					t.Errorf("broker.%s.%s is accepted by %s and is absent from %s", driver.name, key, driver.function, driver.page)
 				}
 			}
 			for _, key := range documented[driver.name] {
 				if !slices.Contains(accepted, key) {
-					t.Errorf("broker.%s.%s is documented in %s and is refused by %s", driver.name, key, driverOptionsPage, driver.function)
+					t.Errorf("broker.%s.%s is documented in %s and is refused by %s", driver.name, key, driver.page, driver.function)
 				}
 			}
 		})

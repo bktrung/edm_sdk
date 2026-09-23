@@ -444,7 +444,6 @@ func TestDLQ_UnknownReasonSurvivesReplay(t *testing.T) {
 	e, err := f1.DecodeHeaders(headers)
 	require.NoError(t, err, "an unrecognised death reason must not fail the decode")
 	require.Equal(t, f1.DeathReason("a_reason_this_build_predates"), e.DeathReason)
-	require.False(t, e.DeathReason.Valid())
 
 	replayed, err := e.EncodeHeaders(0)
 	require.NoError(t, err)
@@ -551,6 +550,7 @@ func TestEnvelope_HeaderSizeGuardShedsExtensionsThenTruncatesDeathError(t *testi
 	_, hasExtB := h["ext-b"]
 	require.False(t, hasExtA)
 	require.False(t, hasExtB, "Extensions must be shed first, before DeathError is touched")
+	require.Equal(t, "boom", h["f1deatherror"], "DeathError must be untouched once dropping Extensions alone fits")
 
 	// An unachievable cap reports that the mandatory and non-sheddable headers cannot fit.
 	e.DeathError = "a very long terminal error string that will need truncating to fit under the cap"
@@ -562,28 +562,6 @@ func TestEnvelope_HeaderSizeGuardShedsExtensionsThenTruncatesDeathError(t *testi
 	tight, err := e.EncodeHeaders(small)
 	require.NoError(t, err)
 	require.LessOrEqual(t, len(tight["f1deatherror"]), len("a very long terminal error string that will need truncating to fit under the cap"))
-}
-
-func TestEnvelope_HeaderSizeGuardExtensionsAloneIsEnough(t *testing.T) {
-	t.Parallel()
-
-	withoutExt := fullEnvelope()
-	baseline, err := withoutExt.EncodeHeaders(0)
-	require.NoError(t, err)
-	baselineBytes := headerBytesOf(baseline)
-
-	e := fullEnvelope()
-	e.Extensions = map[string]string{"ext-a": "aaaaaaaaaa"}
-	withExt, err := e.EncodeHeaders(0)
-	require.NoError(t, err)
-	require.Greater(t, headerBytesOf(withExt), baselineBytes, "test setup: the extension must add bytes")
-
-	limit := baselineBytes + 5 // fits without Extensions, not with them
-	h, err := e.EncodeHeaders(limit)
-	require.NoError(t, err)
-	_, hasExt := h["ext-a"]
-	require.False(t, hasExt)
-	require.Equal(t, "boom", h["f1deatherror"], "DeathError must be untouched once dropping Extensions alone fits")
 }
 
 func TestEnvelope_SizeGuardRetainsDetailsAfterErrorFloor(t *testing.T) {
@@ -684,18 +662,6 @@ func TestEnvelope_SizeGuardDeathErrorEmptyStopsShrinking(t *testing.T) {
 	e := fullEnvelope()
 	e.DeathError = ""
 	require.NotPanics(t, func() { _, _ = e.EncodeHeaders(1) })
-}
-
-func TestDeathReason_ValidIsTrueForEachOfTheSevenReasons(t *testing.T) {
-	t.Parallel()
-
-	for _, r := range []f1.DeathReason{
-		f1.ReasonMaxAttempts, f1.ReasonTerminal, f1.ReasonPanic, f1.ReasonDecode,
-		f1.ReasonExpired, f1.ReasonPoison, f1.ReasonUnmatched,
-	} {
-		require.True(t, r.Valid(), r)
-	}
-	require.False(t, f1.ReasonUnspecified.Valid())
 }
 
 func TestEnvelope_DecodeHeadersRejectsMalformedValues(t *testing.T) {

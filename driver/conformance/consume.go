@@ -43,7 +43,7 @@ func runConsume(group *groupContext) {
 			t.Fatalf("delivery metadata = settle:%v ref:%+v received:%v", message.Settle != nil, message.Ref, message.ReceivedAt)
 		}
 		ackMessage(t, group, message)
-		group.vector.Add(BehaviorEvent{ID: "identity", Outcome: "ok", FinalDestination: "consume.identity"})
+		group.vector.add(BehaviorEvent{ID: "identity", Outcome: "ok", FinalDestination: "consume.identity"})
 	})
 
 	group.Check("delivery count uses minus one when unavailable", func(t *testing.T) {
@@ -60,7 +60,7 @@ func runConsume(group *groupContext) {
 			t.Fatalf("DeliveryCount = %d, want -1 when unavailable", message.DeliveryCount)
 		}
 		ackMessage(t, group, message)
-		group.vector.Add(BehaviorEvent{ID: "delivery-count", Outcome: "ok", FinalDestination: "consume.delivery-count"})
+		group.vector.add(BehaviorEvent{ID: "delivery-count", Outcome: "ok", FinalDestination: "consume.delivery-count"})
 	})
 
 	group.Check("one consumer receives every configured destination", func(t *testing.T) {
@@ -84,7 +84,7 @@ func runConsume(group *groupContext) {
 		if !seen["consume.dest-a"] || !seen["consume.dest-b"] {
 			t.Fatalf("destinations received = %v, want both destinations", seen)
 		}
-		group.vector.Add(BehaviorEvent{ID: "multi-destination", Outcome: "ok", FinalDestination: "consume.dest-a,consume.dest-b"})
+		group.vector.add(BehaviorEvent{ID: "multi-destination", Outcome: "ok", FinalDestination: "consume.dest-a,consume.dest-b"})
 	})
 
 	group.Check("prefetch saturates at the subscription budget", func(t *testing.T) {
@@ -111,7 +111,7 @@ func runConsume(group *groupContext) {
 			return true, fmt.Sprintf("unsettled by destination=%#v", views)
 		})
 		ackAll(t, group, consumer, 8)
-		group.vector.Add(BehaviorEvent{ID: "prefetch-total", Outcome: "ok", FinalDestination: "consume.prefetch-total"})
+		group.vector.add(BehaviorEvent{ID: "prefetch-total", Outcome: "ok", FinalDestination: "consume.prefetch-total"})
 	})
 
 	group.Check("prefetch applies each destination share", func(t *testing.T) {
@@ -129,7 +129,7 @@ func runConsume(group *groupContext) {
 				fmt.Sprintf("unsettled by destination=%d/%d", views[0].Unsettled, views[1].Unsettled)
 		})
 		ackAll(t, group, consumer, 8)
-		group.vector.Add(BehaviorEvent{ID: "prefetch-share", Outcome: "ok", FinalDestination: "consume.prefetch-share"})
+		group.vector.add(BehaviorEvent{ID: "prefetch-share", Outcome: "ok", FinalDestination: "consume.prefetch-share"})
 	})
 
 	group.Check("pause stops only the requested destination", func(t *testing.T) {
@@ -167,7 +167,7 @@ func runConsume(group *groupContext) {
 			t.Fatalf("Resume(a) error = %v", err)
 		}
 		ackMessage(t, group, receiveMessage(t, group, consumer))
-		group.vector.Add(BehaviorEvent{ID: "pause-isolated", Outcome: "ok", FinalDestination: "consume.pause-a,consume.pause-b"})
+		group.vector.add(BehaviorEvent{ID: "pause-isolated", Outcome: "ok", FinalDestination: "consume.pause-a,consume.pause-b"})
 	})
 
 	group.Check("empty pause stops every destination and resume restarts delivery", func(t *testing.T) {
@@ -208,7 +208,7 @@ func runConsume(group *groupContext) {
 		if !seen["consume.pause-all-a"] || !seen["consume.pause-all-b"] {
 			t.Fatalf("destinations after Resume() = %v, want both destinations", seen)
 		}
-		group.vector.Add(BehaviorEvent{ID: "pause-all", Outcome: "ok", FinalDestination: "consume.pause-all-a,consume.pause-all-b"})
+		group.vector.add(BehaviorEvent{ID: "pause-all", Outcome: "ok", FinalDestination: "consume.pause-all-a,consume.pause-all-b"})
 	})
 
 	group.Check("repeated pause is idempotent", func(t *testing.T) {
@@ -249,7 +249,7 @@ func runConsume(group *groupContext) {
 			t.Fatalf("Resume() error = %v", err)
 		}
 		ackMessage(t, group, receiveMessage(t, group, consumer))
-		group.vector.Add(BehaviorEvent{ID: "pause-idempotent", Outcome: "ok", FinalDestination: "consume.pause-repeat-a,consume.pause-repeat-b"})
+		group.vector.add(BehaviorEvent{ID: "pause-idempotent", Outcome: "ok", FinalDestination: "consume.pause-repeat-a,consume.pause-repeat-b"})
 	})
 
 	group.Check("resume delivers every message that arrived while paused", func(t *testing.T) {
@@ -266,7 +266,7 @@ func runConsume(group *groupContext) {
 		if got := inspectDestination(t, group, "consume.resume").Ready; got != 0 {
 			t.Fatalf("Ready after resume = %d, want 0", got)
 		}
-		group.vector.Add(BehaviorEvent{ID: "resume-lossless", Outcome: "ok", FinalDestination: "consume.resume"})
+		group.vector.add(BehaviorEvent{ID: "resume-lossless", Outcome: "ok", FinalDestination: "consume.resume"})
 	})
 
 	group.Check("paused destination stays within its prefetch share", func(t *testing.T) {
@@ -293,7 +293,7 @@ func runConsume(group *groupContext) {
 		if err := second.Settle.Ack(group.ctx); err != nil {
 			t.Fatalf("Ack(second) error = %v", err)
 		}
-		group.vector.Add(BehaviorEvent{ID: "pause-bound", Outcome: "ok", FinalDestination: "consume.pause-bound"})
+		group.vector.add(BehaviorEvent{ID: "pause-bound", Outcome: "ok", FinalDestination: "consume.pause-bound"})
 	})
 
 	group.Check("errors remains open across lifecycle controls", func(t *testing.T) {
@@ -322,7 +322,7 @@ func runConsume(group *groupContext) {
 			}
 		default:
 		}
-		group.vector.Add(BehaviorEvent{ID: "errors-open", Outcome: "ok", FinalDestination: "consume.errors"})
+		group.vector.add(BehaviorEvent{ID: "errors-open", Outcome: "ok", FinalDestination: "consume.errors"})
 	})
 
 	group.Check("StartEarliest includes retained messages for a new group", func(t *testing.T) {
@@ -343,7 +343,7 @@ func runConsume(group *groupContext) {
 			t.Fatalf("StartEarliest body = %q, want retained", message.Body)
 		}
 		ackMessage(t, group, message)
-		group.vector.Add(BehaviorEvent{ID: "start-earliest", Outcome: "ok", FinalDestination: "consume.earliest"})
+		group.vector.add(BehaviorEvent{ID: "start-earliest", Outcome: "ok", FinalDestination: "consume.earliest"})
 	})
 
 	group.Check("StartAt does not reposition an existing group", func(t *testing.T) {
@@ -376,7 +376,7 @@ func runConsume(group *groupContext) {
 			t.Fatalf("existing group was repositioned to body %q", second.Body)
 		}
 		ackMessage(t, group, second)
-		group.vector.Add(BehaviorEvent{ID: "start-existing", Outcome: "ok", FinalDestination: "consume.existing-group"})
+		group.vector.add(BehaviorEvent{ID: "start-existing", Outcome: "ok", FinalDestination: "consume.existing-group"})
 	})
 
 	group.Check("two groups on one destination each receive every message", func(t *testing.T) {
@@ -416,7 +416,7 @@ func runConsume(group *groupContext) {
 		for _, message := range held {
 			ackMessage(t, group, message)
 		}
-		group.vector.Add(BehaviorEvent{ID: "two-groups", Outcome: "ok", FinalDestination: destination})
+		group.vector.add(BehaviorEvent{ID: "two-groups", Outcome: "ok", FinalDestination: destination})
 	})
 
 	group.Check("a detached group receives a message acked while it was away", func(t *testing.T) {
@@ -452,7 +452,7 @@ func runConsume(group *groupContext) {
 			t.Fatalf("rejoined consumer body = %q, want while-away", message.Body)
 		}
 		ackMessage(t, group, message)
-		group.vector.Add(BehaviorEvent{ID: "detached-group", Outcome: "ok", FinalDestination: destination})
+		group.vector.add(BehaviorEvent{ID: "detached-group", Outcome: "ok", FinalDestination: destination})
 	})
 
 	group.Check("zero-value consumer configuration delivers", func(t *testing.T) {
@@ -466,7 +466,7 @@ func runConsume(group *groupContext) {
 			t.Fatalf("zero-value consumer body = %q, want default", message.Body)
 		}
 		ackMessage(t, group, message)
-		group.vector.Add(BehaviorEvent{ID: "zero-value", Outcome: "ok", FinalDestination: "consume.zero"})
+		group.vector.add(BehaviorEvent{ID: "zero-value", Outcome: "ok", FinalDestination: "consume.zero"})
 	})
 
 	group.Check("canceled consumer creation returns context cancellation", func(t *testing.T) {
@@ -484,7 +484,7 @@ func runConsume(group *groupContext) {
 		publishCount(t, group, producer, "consume.cancel-create", 3)
 		consumer := newConsumer(t, group, profileDestination(group, "consume.cancel-create"), 1)
 		ackAll(t, group, consumer, 3)
-		group.vector.Add(BehaviorEvent{ID: "cancel-consumer", Outcome: "cancelled", FinalDestination: "consume.cancel-create"})
+		group.vector.add(BehaviorEvent{ID: "cancel-consumer", Outcome: "cancelled", FinalDestination: "consume.cancel-create"})
 	})
 
 	group.Check("canceled Drain returns without changing consumer state", func(t *testing.T) {
@@ -501,7 +501,7 @@ func runConsume(group *groupContext) {
 			t.Fatalf("message after canceled Drain() = %q, want %q", message.Body, "after-cancel")
 		}
 		ackMessage(t, group, message)
-		group.vector.Add(BehaviorEvent{ID: "cancel-drain", Outcome: "cancelled", FinalDestination: "consume.cancel-drain"})
+		group.vector.add(BehaviorEvent{ID: "cancel-drain", Outcome: "cancelled", FinalDestination: "consume.cancel-drain"})
 	})
 
 	group.Check("canceled Lag returns context cancellation", func(t *testing.T) {
@@ -511,7 +511,7 @@ func runConsume(group *groupContext) {
 		cancel()
 		_, err := consumer.Lag(ctx)
 		assertCancelled(t, "Lag", err)
-		group.vector.Add(BehaviorEvent{ID: "cancel-lag", Outcome: "cancelled", FinalDestination: "consume.cancel-lag"})
+		group.vector.add(BehaviorEvent{ID: "cancel-lag", Outcome: "cancelled", FinalDestination: "consume.cancel-lag"})
 	})
 
 	group.Check("canceled Stop returns context cancellation", func(t *testing.T) {
@@ -528,7 +528,7 @@ func runConsume(group *groupContext) {
 			t.Fatalf("message after canceled Stop() = %q, want %q", message.Body, "after-cancel")
 		}
 		ackMessage(t, group, message)
-		group.vector.Add(BehaviorEvent{ID: "cancel-stop", Outcome: "cancelled", FinalDestination: "consume.cancel-stop"})
+		group.vector.add(BehaviorEvent{ID: "cancel-stop", Outcome: "cancelled", FinalDestination: "consume.cancel-stop"})
 	})
 	group.Check("canceled Release returns transient and leaves consumer usable", func(t *testing.T) {
 		name := "consume.cancel-release"
@@ -545,7 +545,7 @@ func runConsume(group *groupContext) {
 			t.Fatalf("message after cancelled Release() = %q, want %q", message.Body, "after-cancel")
 		}
 		ackMessage(t, group, message)
-		group.vector.Add(BehaviorEvent{ID: "cancel-release", Outcome: "cancelled", FinalDestination: name})
+		group.vector.add(BehaviorEvent{ID: "cancel-release", Outcome: "cancelled", FinalDestination: name})
 	})
 }
 

@@ -12,6 +12,8 @@ linters:
     - govet
     - staticcheck
     - errcheck
+    # Unused unexported code, test helpers included.
+    - unused
     # Naming, package comments, and exported-symbol docs.
     - revive
     # Import boundaries between core, ports, and drivers.
@@ -136,38 +138,66 @@ linters:
             - pkg: $all
               desc: "f1test may import only the SDK, in-memory driver, clock, test hook, test assertions, and metric reader"
 
+        # Driver production files use strict allowlists. Test files are a separate
+        # lax rule: tests may import the SDK and their own driver, but the broad
+        # driver deny keeps cross-driver imports visible.
         drivers-kafka:
           files:
             - "**/drivers/kafka/**"
+            - "!$test"
           allow:
             - $gostd
             - github.com/twmb/franz-go
             - fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/driver
             - fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/clock
             - fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/kafka
+            - fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/version
           deny:
             - pkg: fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/drivers
               desc: "a driver must not import another driver"
             - pkg: $all
               desc: "a driver may import the standard library, its own broker client, and shared SDK support packages"
 
+        drivers-kafka-tests:
+          list-mode: lax
+          files:
+            - "**/drivers/kafka/*_test.go"
+          allow:
+            - fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/drivers/kafka
+          deny:
+            - pkg: fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/drivers
+              desc: "a Kafka test must not import another driver"
+
         drivers-rabbitmq:
           files:
             - "**/drivers/rabbitmq/**"
+            - "!$test"
           allow:
             - $gostd
             - github.com/rabbitmq/amqp091-go
             - fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/driver
             - fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/clock
+            - fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/wire
           deny:
             - pkg: fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/drivers
               desc: "a driver must not import another driver"
             - pkg: $all
-              desc: "a driver may import the standard library, its own broker client, and the shared clock"
+              desc: "a driver may import the standard library, its own broker client, the shared clock, and the wire header names"
+
+        drivers-rabbitmq-tests:
+          list-mode: lax
+          files:
+            - "**/drivers/rabbitmq/*_test.go"
+          allow:
+            - fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/drivers/rabbitmq
+          deny:
+            - pkg: fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/drivers
+              desc: "a RabbitMQ test must not import another driver"
 
         drivers-inmem:
           files:
             - "**/drivers/inmem/**"
+            - "!$test"
           allow:
             - $gostd
             - fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/driver
@@ -179,6 +209,16 @@ linters:
               desc: "a driver must not import another driver"
             - pkg: $all
               desc: "the in-memory driver may import only the standard library, port, clock, test hook, and test assertions"
+
+        drivers-inmem-tests:
+          list-mode: lax
+          files:
+            - "**/drivers/inmem/*_test.go"
+          allow:
+            - fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/drivers/inmem
+          deny:
+            - pkg: fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/drivers
+              desc: "an in-memory test must not import another driver"
 
     # The forbidden list replaces the defaults, so list every blocked API.
     forbidigo:

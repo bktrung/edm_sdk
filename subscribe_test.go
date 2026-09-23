@@ -75,43 +75,61 @@ func TestSubscribeAcceptsOrderedByKeyWhenNative(t *testing.T) {
 	}
 }
 
-func TestSubscribeRejectsPrefetchBelowLaneCount(t *testing.T) {
+func TestSubscribeRejectsNamedPrefetchBelowLaneCount(t *testing.T) {
 	t.Parallel()
-	client := newPublishClient(t, &recordingProducer{})
-	_, err := client.Subscribe(context.Background(), Subscription{
-		Name:     "orders",
-		Topics:   []string{"orders.created"},
-		Prefetch: 11,
-	})
-	if err == nil || !strings.Contains(err.Error(), "prefetch 11") || !strings.Contains(err.Error(), "lane count 12") || !strings.Contains(err.Error(), "topics x priorities x (1 + retryTiers)") {
-		t.Fatalf("Subscribe() error = %v, want lane-floor validation", err)
+	for _, test := range []struct {
+		name     string
+		topics   []string
+		prefetch int
+		want     []string
+	}{
+		{name: "one topic", topics: []string{"orders.created"}, prefetch: 11, want: []string{"prefetch 11", "lane count 12", "topics x priorities x (1 + retryTiers)"}},
+		{name: "six topics", topics: prefetchDefaultSixTopics, prefetch: 64, want: []string{"prefetch 64", "lane count 72"}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			client := newPublishClient(t, &recordingProducer{})
+			_, err := client.Subscribe(context.Background(), Subscription{
+				Name:     "orders",
+				Topics:   test.topics,
+				Prefetch: test.prefetch,
+			})
+			if err == nil {
+				t.Fatal("Subscribe() error = nil, want lane-floor validation")
+			}
+			for _, fragment := range test.want {
+				if !strings.Contains(err.Error(), fragment) {
+					t.Fatalf("Subscribe() error = %v, want it to contain %q", err, fragment)
+				}
+			}
+		})
 	}
 }
 
-func TestSubscribeRejectsPrefetchAboveCeilingFromExplicitConfig(t *testing.T) {
-	t.Parallel()
-	client := newPublishClient(t, &recordingProducer{})
-	_, err := client.Subscribe(context.Background(), Subscription{
-		Name:     "orders",
-		Topics:   []string{"orders.created"},
-		Prefetch: 65536,
-	})
-	want := "f1: subscriptions.orders.prefetch 65536 must be at most 65535"
-	if err == nil || err.Error() != want {
-		t.Fatalf("Subscribe() error = %v, want %q", err, want)
-	}
-}
-
-func TestSubscribeRejectsPrefetchAboveCeilingFromEnvironment(t *testing.T) {
-	t.Setenv("F1_SUBSCRIPTIONS_ORDERS_PREFETCH", "65536")
-	client := newPublishClient(t, &recordingProducer{})
-	_, err := client.Subscribe(context.Background(), Subscription{
-		Name:   "orders",
-		Topics: []string{"orders.created"},
-	})
-	want := "f1: subscriptions.orders.prefetch 65536 must be at most 65535"
-	if err == nil || err.Error() != want {
-		t.Fatalf("Subscribe() error = %v, want %q", err, want)
+func TestSubscribeRejectsPrefetchAboveCeiling(t *testing.T) {
+	for _, test := range []struct {
+		name     string
+		env      string
+		prefetch int
+	}{
+		{name: "explicit config", prefetch: 65536},
+		{name: "environment", env: "65536"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if test.env != "" {
+				t.Setenv("F1_SUBSCRIPTIONS_ORDERS_PREFETCH", test.env)
+			}
+			client := newPublishClient(t, &recordingProducer{})
+			_, err := client.Subscribe(context.Background(), Subscription{
+				Name:     "orders",
+				Topics:   []string{"orders.created"},
+				Prefetch: test.prefetch,
+			})
+			want := "f1: subscriptions.orders.prefetch 65536 must be at most 65535"
+			if err == nil || err.Error() != want {
+				t.Fatalf("Subscribe() error = %v, want %q", err, want)
+			}
+		})
 	}
 }
 

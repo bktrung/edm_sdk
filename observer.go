@@ -5,79 +5,49 @@ import (
 	"time"
 )
 
-// Observer receives typed lifecycle events from a Client. This is a draft
-// API: it lands with its fixture and baseline recorded but without owner
-// approval, so nothing about it is final.
+// Observer receives lifecycle and point events from a Client.
 //
-// Concurrency: every method may be called concurrently from any goroutine,
-// for different messages, across all subscriptions of one client and from
-// concurrent publishers. Implementations must be safe for concurrent use and
-// must not use goroutine-local state.
+// F1 calls observer methods synchronously and may call them concurrently across
+// publishers and subscriptions. Implementations must be safe for concurrent
+// use, must not depend on goroutine-local state, and should return promptly.
+// Start precedes its matching Finish; no order is guaranteed between different
+// stages. A stage may have no Start if a message never reaches it.
 //
-// Ordering: for one message a Start call happens before its own Finish and
-// nothing else is ordered. A Finish for one message may run before or
-// concurrently with a Start for another, and a Start and its Finish may run
-// on different goroutines.
+// A panic is recovered and logged once per ObserverKind without changing the
+// message outcome. F1 calls no observer method while holding Client or Runner
+// locks, so implementations may call back into the Client.
 //
-// Non-blocking: F1 calls the observer synchronously on the message path, so
-// a method must not block. A slow method stalls intake, dispatch,
-// settlement, successor publication, drain or the dispatch loop depending on
-// the event, and a stall on the settlement path spends the broker consumer
-// liveness window. F1 applies no timeout because a watchdog would cost a
-// goroutine or timer per message.
+// Start's returned context reaches the handler only for ObserverProcess; other
+// returned contexts do not control settlement or successor publication. Event
+// values are passed by value. Do not retain or mutate FinishEvent.Results after
+// Finish returns. Timestamps use the Client clock; derive durations from event
+// timestamps. Errors are represented by bounded ErrorClass values, not raw
+// error strings or Go type names.
 //
-// Panic containment: a panic in any method is recovered, logged once per
-// kind through the client logger, and the message outcome is unchanged. A
-// recovered panic is an observability defect, not a delivery failure.
+// For metric dimensions, use logical topics, subscriptions, and consumer groups;
+// avoid physical destinations and message identities.
 //
-// Context: the context returned by Start of ObserverProcess reaches the
-// handler. Nothing else is promised: settlement and successor publication
-// may run on a drain-time window with a different context, so cross-hop
-// propagation travels on the message rather than on the context.
-//
-// Locking: no method is called while F1 holds a client or runner lock, so an
-// implementation may call back into the client. Calling the observer while
-// holding a core lock would be a defect in the core.
-//
-// Nil observer: a nil observer means zero cost. Every call site checks for
-// nil before constructing an event, so nothing is emitted, nothing can
-// panic, and no event struct is built.
-//
-// Payload lifetime: events pass by value. An implementation must not retain
-// or mutate Results after the call returns; the core may reuse the storage.
-//
-// Timestamps: every timestamp on an event comes from the client clock. An
-// implementation must never call time.Now and must derive durations from the
-// event timestamps so a fake-clock test observes exact values.
-//
-// Cardinality: an implementation must not use a physical destination or a
-// message identity as a metric dimension. The logical topic, subscription
-// and consumer group are the low-cardinality dimensions.
-//
-// Error classes: the event carries a bounded ErrorClass value, never a raw
-// error string or Go type name. Adapters map it to their own catalogue.
-//
-// Finish guarantee: every Start gets exactly one Finish. On abnormal exit
-// the Finish carries ObserverOutcomeAbandoned: a panic past recovery,
-// shutdown with work in flight, or a lost delivery. A stage may also have
-// no Start at all when the message never reaches it.
-//
-// Unknown kinds and unknown fields are ignored: an implementation must not
-// fail on a kind it does not know or a field it does not read.
+// F1 calls Finish once for each Start, with outcome ObserverOutcomeAbandoned if
+// a stage exits abnormally. A nil Observer disables callbacks. Ignore unknown
+// kinds and fields so additions remain compatible.
 type Observer interface {
+	// Start begins an observed stage and returns its context and observer-owned
+	// token. For ObserverProcess, F1 passes the returned context to the handler; a
+	// nil context falls back to the caller's context.
 	Start(context.Context, StartEvent) (context.Context, Token)
+	// Finish ends the stage identified by token. F1 calls it once for each Start.
 	Finish(Token, FinishEvent)
+	// Record receives a point event that has no matching Finish.
 	Record(PointEvent)
 }
 
-// TraceInjector is an optional second interface an Observer may implement.
-// New checks for it once by type assertion and stores the result on the
-// Client next to the observer. After Start of ObserverMessageBuilt and of a
-// republish ObserverPublish, the core calls InjectTrace with the returned
-// context and writes the two strings into the envelope. Extraction needs no
-// hook: the inbound values ride on StartEvent. Strings return by value so an
-// observer that does not implement this interface costs nothing.
+// TraceInjector optionally supplies trace context for outbound messages
+// published through an observed Client. Inbound trace values are available in
+// StartEvent; no separate extraction method is called. Implementations must be
+// safe for concurrent calls.
 type TraceInjector interface {
+	// InjectTrace returns the traceparent and tracestate values to attach to an
+	// outbound message built with ctx.
 	InjectTrace(ctx context.Context) (traceParent, traceState string)
 }
 
@@ -85,55 +55,59 @@ type TraceInjector interface {
 type ObserverKind string
 
 const (
-	// ObserverPublish is a paired kind. The publisher emits Start and Finish around
-	// one PublishBatch call at admission and after the producer returns.
+	// ObserverPublish is a paired kind. The publisher emits Start at admission and
+	// Finish after the producer returns for a primary PublishBatch call. The worker
+	// emits another pair for each retry or dead-letter successor publish. Route is
+	// PublishRoutePrimary for the first path and PublishRouteRetry or
+	// PublishRouteDeadLetter for successor paths.
 	ObserverPublish ObserverKind = "publish"
-	// ObserverMessageBuilt is a paired kind. The publisher emits Start and Finish
-	// around one outbound message build inside PublishBatch.
+	// ObserverMessageBuilt is a paired kind around building one outbound message
+	// in a PublishBatch call.
 	ObserverMessageBuilt ObserverKind = "message_built"
-	// ObserverProcess is a paired kind. The worker emits Start and Finish around
-	// one handler invocation on a pool worker.
+	// ObserverProcess is a paired kind around one handler invocation.
 	ObserverProcess ObserverKind = "process"
-	// ObserverSettle is a paired kind. The worker emits Start and Finish around
-	// one acknowledgement or negative acknowledgement.
+	// ObserverSettle is a paired kind around one acknowledgement or negative
+	// acknowledgement.
 	ObserverSettle ObserverKind = "settle"
-	// ObserverDrain is a paired kind. The runner emits Start and Finish around
-	// one Runner Drain.
+	// ObserverDrain is a paired kind around one Runner.Drain call.
 	ObserverDrain ObserverKind = "drain"
-	// ObserverDeliveryReceived is a point kind. The worker emits it once per
-	// delivery admitted to dispatch.
+	// ObserverDeliveryReceived is a point kind emitted once for each delivery
+	// admitted to dispatch.
 	ObserverDeliveryReceived ObserverKind = "delivery_received"
-	// ObserverRetryScheduled is a point kind. The worker emits it when a retry
-	// successor is confirmed.
+	// ObserverRetryScheduled is a point kind emitted when a retry successor is
+	// confirmed.
 	ObserverRetryScheduled ObserverKind = "retry_scheduled"
-	// ObserverDeadLetterDecided is a point kind. The worker emits it when the
-	// dead-letter decision is taken, before the confirm.
+	// ObserverDeadLetterDecided is a point kind emitted when a dead-letter
+	// decision is made, before the copy is confirmed.
 	ObserverDeadLetterDecided ObserverKind = "dead_letter_decided"
-	// ObserverDeadLetterPublished is a point kind. The worker emits it when the
-	// dead-letter publish is confirmed by the driver.
+	// ObserverDeadLetterPublished is a point kind emitted when a dead-letter
+	// copy is confirmed.
 	ObserverDeadLetterPublished ObserverKind = "dead_letter_published"
-	// ObserverDeadLetterFailed is a point kind. The worker emits it when the
-	// dead-letter publish fails.
+	// ObserverDeadLetterFailed is a point kind emitted when publishing a
+	// dead-letter copy fails.
 	ObserverDeadLetterFailed ObserverKind = "dead_letter_failed"
-	// ObserverPoisonRejected is a point kind. The worker emits it when a decode,
-	// poison, expired or unmatched delivery is dropped.
+	// ObserverPoisonRejected is a point kind emitted after a dead-letter publish
+	// fails and the delivery is dropped because its reason is poison with no
+	// dead-letter route, or because the copy cannot be published due to broker
+	// size limits or an encoding error. A confirmed copy emits
+	// ObserverDeadLetterPublished.
 	ObserverPoisonRejected ObserverKind = "poison_rejected"
-	// ObserverBacklogSampled is a point kind. The backlog poller emits it from the
-	// backlog poll loop once per sampled destination.
+	// ObserverBacklogSampled is a point kind emitted once for each sampled
+	// destination.
 	ObserverBacklogSampled ObserverKind = "backlog_sampled"
-	// ObserverConnectionLost is a point kind. The reconnect supervisor emits it
-	// when it observes a lost connection.
+	// ObserverConnectionLost is a point kind emitted when F1 observes a lost
+	// connection.
 	ObserverConnectionLost ObserverKind = "connection_lost"
-	// ObserverConnectionRestored is a point kind. The reconnect supervisor emits
-	// it when it swaps in a new connection.
+	// ObserverConnectionRestored is a point kind emitted when F1 installs a
+	// replacement connection.
 	ObserverConnectionRestored ObserverKind = "connection_restored"
-	// ObserverDriverSelected is a point kind. The client emits it once per
-	// client in New after the driver is opened.
+	// ObserverDriverSelected is a point kind emitted once after New opens the
+	// driver.
 	ObserverDriverSelected ObserverKind = "driver_selected"
-	// ObserverDeadlinePromoted is a point kind. The worker emits it after the
-	// scheduler promotes a lane head past its deadline, rate limited to one
-	// event per lane per window. Suppressed carries the promotions the limit
-	// dropped since the last recorded event.
+	// ObserverDeadlinePromoted is a point kind emitted when the scheduler
+	// promotes a lane head after its deadline. Events are rate-limited per lane;
+	// Suppressed counts promotions omitted since the previous event for that
+	// lane.
 	ObserverDeadlinePromoted ObserverKind = "deadline_promoted"
 )
 
@@ -170,7 +144,8 @@ const (
 	ErrorClassUnmatched ErrorClass = "f1_unmatched"
 	// ErrorClassMaxAttempts means the retry limit was exhausted.
 	ErrorClassMaxAttempts ErrorClass = "f1_max_attempts"
-	// ErrorClassPoison means the message repeatedly crashed its worker.
+	// ErrorClassPoison means the envelope attempt count exceeded configured
+	// maxAttempts by more than 10 and is treated as retry-counter runaway.
 	ErrorClassPoison ErrorClass = "f1_poison"
 	// ErrorClassDriverTransient means the driver reported a transient error.
 	ErrorClassDriverTransient ErrorClass = "driver_transient"
@@ -188,15 +163,16 @@ const (
 	ErrorClassOther ErrorClass = "_OTHER"
 )
 
-// PublishRoute identifies which route a publish takes.
+// PublishRoute identifies the path used for a publish. Its zero value is empty
+// and means no route was recorded.
 type PublishRoute string
 
 const (
-	// PublishRoutePrimary means the application primary publish path.
+	// PublishRoutePrimary identifies an application-originated publish.
 	PublishRoutePrimary PublishRoute = "primary"
-	// PublishRouteRetry means the internal retry successor publish path.
+	// PublishRouteRetry identifies a retry successor publish.
 	PublishRouteRetry PublishRoute = "retry"
-	// PublishRouteDeadLetter means the internal dead-letter publish path.
+	// PublishRouteDeadLetter identifies a dead-letter successor publish.
 	PublishRouteDeadLetter PublishRoute = "dead_letter"
 )
 
@@ -237,130 +213,138 @@ type Token struct {
 // DrainCounts carries drain progress. Zero value means the kind does not
 // report drain progress.
 type DrainCounts struct {
-	// InFlight counts deliveries in flight. Set for drain starts and finishes.
+	// InFlight counts deliveries in flight. F1 sets it on drain starts and finishes.
 	InFlight int
-	// Queued counts deliveries queued behind the drain. Set for drain starts and finishes.
-	Queued int
-	// Drained counts deliveries drained. Set for drain finishes.
+	// Drained counts deliveries drained. F1 sets it on drain finishes.
 	Drained int
-	// Remaining counts deliveries still held after the drain. Set for drain finishes.
+	// Remaining counts deliveries still held after the drain. F1 sets it on drain
+	// finishes.
 	Remaining int
-	// Timeout bounds the drain. Set for drain starts and finishes when a bound applies.
+	// Timeout bounds the drain. F1 sets it on drain starts and finishes when a
+	// bound applies.
 	Timeout time.Duration
 }
 
-// StartEvent describes the beginning of an observer stage. All structs pass
-// by value with no pointers and no maps. A field a kind does not set holds
-// its zero value.
+// StartEvent describes the beginning of an observer stage. All structs pass by
+// value with no pointers and no maps. F1 sets fields according to the stage;
+// a field a kind does not set holds its zero value.
 type StartEvent struct {
-	// Kind identifies the stage. Set for every Start kind.
+	// Kind identifies the stage. F1 sets it for every Start kind.
 	Kind ObserverKind
-	// At is the client clock time. Set for every Start kind.
+	// At is the client clock time. F1 sets it for every Start kind.
 	At time.Time
-	// Topic is the logical topic. Set for message built, process and settle.
-	// Primary publish Start is emitted before message resolution and leaves
-	// this zero; drain and starts without a message also leave it zero.
+	// Topic is the logical topic. F1 sets it for message-built, process, settle
+	// and successor-publish Starts. Primary-publish and drain Starts leave it zero.
 	Topic string
-	// Subscription names the subscription. Set for process and settle; zero
-	// for publish, message built and drain.
+	// Subscription names the subscription. F1 sets it for process and settle
+	// Starts; it is zero for publish, message-built and drain Starts.
 	Subscription string
-	// ConsumerGroup names the consumer group. Set for process and settle;
-	// zero otherwise.
+	// ConsumerGroup names the consumer group. F1 sets it for process and settle
+	// Starts; it is zero otherwise.
 	ConsumerGroup string
-	// EventType is the event type. Set for publish, message built, process
-	// and settle; zero for drain.
+	// EventType is the event type. F1 sets it for message-built, process and
+	// successor-publish Starts; it is zero for primary-publish, settle and drain.
 	EventType string
-	// Priority is the delivery lane. Set for message built, process and settle.
-	// Primary publish Start is emitted before message resolution and leaves
-	// this zero; drain and starts without a message also leave it zero.
+	// Priority is the delivery lane. F1 sets it for message-built, process, settle
+	// and successor-publish Starts; primary-publish and drain Starts leave it zero.
 	Priority Priority
-	// Attempt is the one-based attempt. Set for process and settle; zero for
-	// publish, message built and drain.
+	// Attempt is the one-based attempt. F1 sets it for message-built, process and
+	// successor-publish Starts; it is zero for primary-publish, settle and drain.
 	Attempt int
-	// Destination is the physical destination. Set for publish, message
-	// built, process and settle; zero for drain.
+	// Destination is the physical destination. F1 sets it for message-built,
+	// process, settle and successor-publish Starts; it is zero for primary-publish
+	// and drain.
 	Destination string
-	// MessageID is the envelope ID. Set for publish, message built, process
-	// and settle; zero for drain.
+	// MessageID is the envelope ID. F1 sets it for message-built, process and
+	// successor-publish Starts; it is zero for primary-publish, settle and drain.
 	MessageID string
-	// CorrelationID is the workflow correlation ID. Set for publish, message
-	// built, process and settle; zero for drain.
+	// CorrelationID is the workflow correlation ID. F1 sets it for message-built,
+	// process and successor-publish Starts; it is zero for primary-publish, settle
+	// and drain.
 	CorrelationID string
-	// Route identifies the publish path. Set for publish; zero otherwise.
+	// Route identifies the publish path. F1 sets it for primary and successor
+	// publish Starts; it is zero otherwise.
 	Route PublishRoute
-	// BatchSize counts messages in the call. Set for publish; zero otherwise.
+	// BatchSize counts messages in the call. F1 sets it for primary and successor
+	// publish Starts; it is zero otherwise.
 	BatchSize int
-	// Operation identifies the settlement. Set for settle; zero otherwise.
+	// Operation identifies the settlement. F1 sets it for settle Starts; it is zero
+	// otherwise.
 	Operation SettleOperation
-	// DeliveryCount counts broker deliveries. Set for process and settle;
+	// DeliveryCount counts broker deliveries. F1 sets it for process Starts; it is
 	// zero otherwise.
 	DeliveryCount int
-	// EnqueuedAt is the broker enqueue time. Set for process when known;
-	// zero otherwise.
+	// EnqueuedAt is the broker enqueue time. F1 sets it for process Starts when
+	// known; it is zero otherwise.
 	EnqueuedAt time.Time
-	// EnqueuedAtSource names the EnqueuedAt source. Set for process when
-	// EnqueuedAt is set; unknown otherwise.
+	// EnqueuedAtSource names the EnqueuedAt source. F1 sets it for process Starts
+	// when EnqueuedAt is set; it is unknown otherwise.
 	EnqueuedAtSource EnqueuedAtSource
-	// TraceParent carries the inbound traceparent for extraction. Set for
-	// process when the inbound headers carry it; empty otherwise.
+	// TraceParent carries the inbound traceparent for extraction. F1 sets it for
+	// process Starts when the inbound headers carry it; it is empty otherwise.
 	TraceParent string
-	// TraceState carries the inbound tracestate for extraction. Set for
-	// process when the inbound headers carry it; empty otherwise.
+	// TraceState carries the inbound tracestate for extraction. F1 sets it for
+	// process Starts when the inbound headers carry it; it is empty otherwise.
 	TraceState string
-	// Drain carries drain progress. Set for drain; zero otherwise.
+	// Drain carries drain progress. F1 sets it for drain Starts; it is zero
+	// otherwise.
 	Drain DrainCounts
 }
 
 // FinishEvent describes the end of an observer stage. All structs pass by
-// value with no maps and no pointers except Results. A field a kind does not
-// set holds its zero value.
+// value with no maps and no pointers except Results. F1 sets fields according
+// to the stage; a field a kind does not set holds its zero value.
 type FinishEvent struct {
-	// Kind identifies the stage. Set for every Finish kind.
+	// Kind identifies the stage. F1 sets it for every Finish kind.
 	Kind ObserverKind
-	// At is the client clock time. Set for every Finish kind.
+	// At is the client clock time. F1 sets it for every Finish kind.
 	At time.Time
-	// Topic is the logical topic. Set for message built, process and settle;
-	// set for publish when every message in the call resolves to the same topic;
-	// zero for mixed calls, failures before all messages resolve and drain.
+	// Topic is the logical topic. F1 sets it for message-built, process, settle
+	// and successor-publish Finishes. A primary-publish Finish gets it only when
+	// every message resolves to one topic; mixed or early-failure and drain
+	// Finishes leave it zero.
 	Topic string
-	// Subscription names the subscription. Set for process and settle; zero
-	// otherwise.
+	// Subscription names the subscription. F1 sets it for process and settle
+	// Finishes; it is zero otherwise.
 	Subscription string
-	// ConsumerGroup names the consumer group. Set for process and settle;
-	// zero otherwise.
+	// ConsumerGroup names the consumer group. F1 sets it for process and settle
+	// Finishes; it is zero otherwise.
 	ConsumerGroup string
-	// EventType is the event type. Set for publish, message built, process
-	// and settle; zero for drain.
+	// EventType is the event type. F1 sets it for message-built, process and
+	// successor-publish Finishes; it is zero for primary-publish, settle and drain.
 	EventType string
-	// Priority is the delivery lane. Set for message built, process and settle;
-	// set for publish when every message in the call resolves to the same
-	// priority; the zero value, PriorityMedium, for mixed calls, failures
-	// before all messages resolve and drain.
+	// Priority is the delivery lane. F1 sets it for message-built, process, settle
+	// and successor-publish Finishes. A primary-publish Finish gets it only when
+	// every message resolves to one priority; mixed and drain Finishes use the
+	// zero value, PriorityMedium.
 	Priority Priority
-	// Attempt is the one-based attempt. Set for process and settle; zero
-	// otherwise.
+	// Attempt is the one-based attempt. F1 sets it for message-built, process and
+	// successor-publish Finishes; it is zero otherwise.
 	Attempt int
-	// Destination is the physical destination. Set for publish, message
-	// built, process and settle; zero for drain.
+	// Destination is the physical destination. F1 sets it for message-built,
+	// process, settle and successor-publish Finishes; it is zero otherwise.
 	Destination string
-	// MessageID is the envelope ID. Set for publish, message built, process
-	// and settle; zero for drain.
+	// MessageID is the envelope ID. F1 sets it for message-built, process and
+	// successor-publish Finishes; it is zero for primary-publish, settle and drain.
 	MessageID string
-	// CorrelationID is the workflow correlation ID. Set for publish, message
-	// built, process and settle; zero for drain.
+	// CorrelationID is the workflow correlation ID. F1 sets it for message-built,
+	// process and successor-publish Finishes; it is zero for primary-publish,
+	// settle and drain.
 	CorrelationID string
-	// Outcome identifies how the stage ended. Set for every Finish kind.
+	// Outcome identifies how the stage ended. F1 sets it for every Finish kind.
 	Outcome ObserverOutcome
-	// ErrorClass classifies the failure. Set when Outcome is error; empty
-	// otherwise.
+	// ErrorClass classifies the failure. F1 sets it when Outcome is error; it is
+	// empty otherwise.
 	ErrorClass ErrorClass
-	// Terminal reports the settlement ends the delivery. Set for process;
-	// false otherwise.
+	// Terminal reports whether processing ended the delivery. F1 sets it for
+	// process Finishes; it is false otherwise.
 	Terminal bool
-	// Results carries per-index publish outcomes. Set for publish; nil
-	// otherwise. The implementation must not retain or mutate it.
+	// Results carries per-index primary-publish outcomes. F1 sets it for primary
+	// publish Finishes; it is nil for successor-publish and other Finishes. The
+	// implementation must not retain or mutate it.
 	Results []MessageResult
-	// Drain carries drain progress. Set for drain; zero otherwise.
+	// Drain carries drain progress. F1 sets it for drain Finishes; it is zero
+	// otherwise.
 	Drain DrainCounts
 }
 
@@ -373,11 +357,11 @@ type PointEvent struct {
 	// At is the client clock time. Set for every point kind.
 	At time.Time
 	// Topic is the logical topic. Set for delivery received when its
-	// destination is known to the consumer generation, including entries with
-	// ambiguous priority; set for retry scheduled, dead-letter decided,
-	// dead-letter published, dead-letter failed, poison rejected, backlog
-	// sampled and deadline promoted; zero for unknown destinations, connection
-	// lost, connection restored and driver selected.
+	// destination is known to the consumer generation; set for retry
+	// scheduled, dead-letter decided, dead-letter published, dead-letter
+	// failed, poison rejected, backlog sampled and deadline promoted; zero for
+	// unknown destinations, connection lost, connection restored and driver
+	// selected.
 	Topic string
 	// Subscription names the subscription. Set for delivery received, retry
 	// scheduled, dead-letter kinds, poison rejected, backlog sampled and
@@ -392,8 +376,8 @@ type PointEvent struct {
 	// Priority is the delivery lane. Set for delivery received when its
 	// destination maps to one priority; set for retry scheduled, dead-letter
 	// kinds, poison rejected, backlog sampled and deadline promoted; the zero
-	// value, PriorityMedium, for ambiguous or unknown destinations, connection
-	// lost, connection restored and driver selected.
+	// value, PriorityMedium, for unknown destinations, connection lost,
+	// connection restored and driver selected.
 	Priority Priority
 	// Attempt is the one-based attempt. Set for delivery received, retry
 	// scheduled, dead-letter kinds and poison rejected; zero otherwise.
@@ -454,9 +438,10 @@ type PointEvent struct {
 	Downtime time.Duration
 	// DriverName names the driver. Set for driver selected; empty otherwise.
 	DriverName string
-	// DriverVersion versions the driver. Set for driver selected; empty
+	// SDKVersion is the SDK release in use, from the build information, or
+	// "(devel)" when the build records none. Set for driver selected; empty
 	// otherwise.
-	DriverVersion string
+	SDKVersion string
 	// ServerAddress names the broker host. Set for connection lost, connection
 	// restored and driver selected when known; empty otherwise.
 	ServerAddress string

@@ -15,6 +15,7 @@ import (
 
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/driver"
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/clock"
+	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/wire"
 )
 
 // partitionKeyHeader carries OutboundMessage.Key across the wire. A fanout
@@ -34,7 +35,10 @@ type consumer struct {
 	byName               map[string]*lane
 	messages             chan driver.InboundMessage
 	errors               chan error
-	stoppedC             chan struct{}
+	// errorsMu serializes senders on errors, so a severe error's eviction and
+	// send are one step that another sender cannot interleave with.
+	errorsMu sync.Mutex
+	stoppedC chan struct{}
 	// Drain releases local forwarders; stoppedC remains the completed-teardown signal.
 	forwarderStopC chan struct{}
 	// forwarderExitHook is a test-only synchronization seam. It remains nil in
@@ -47,9 +51,14 @@ type consumer struct {
 	// production and does not change the driver behavior.
 	cancelHook func()
 
-	mu          sync.Mutex
-	draining    bool
-	stopped     bool
+	mu       sync.Mutex
+	draining bool
+	stopped  bool
+	// released is closed when a Release has removed the consumer from its
+	// connection. It is nil until a Release starts, so a later Release can wait
+	// for the one in progress instead of reporting a release that has not
+	// happened yet.
+	released    chan struct{}
 	outstanding int
 	settlers    map[*settler]struct{}
 
@@ -65,9 +74,10 @@ type lane struct {
 	destination string
 	channel     *amqp.Channel
 	// channelMu serializes channel RPCs because AMQP does not correlate
-	// requests with their replies. Channel.Close deliberately does not take it
-	// because closing releases a stuck RPC. It also guards tag, which changes
-	// each time a server-initiated cancel is re-established.
+	// requests with their replies. closeLanes waits for it only up to
+	// closeLockWait, so a stuck RPC cannot hold Channel.Close back for long.
+	// It also guards tag, which changes each time a server-initiated cancel is
+	// re-established.
 	channelMu sync.Mutex
 	tag       string
 	prefetch  int
@@ -216,7 +226,7 @@ func validateBrokerPrefetch(cfg driver.ConsumerConfig, brokerPrefetch int) error
 		return nil
 	}
 	for index, destination := range cfg.Destinations {
-		coreWindow := destinationPrefetch(cfg, destination, index)
+		coreWindow := cfg.DestinationPrefetch(index)
 		if brokerPrefetch < coreWindow {
 			return fmt.Errorf(
 				"rabbitmq: invalid %s %d for destination %q: must be at least core window %d",
@@ -231,28 +241,41 @@ func effectivePrefetch(cfg driver.ConsumerConfig, destination string, index, bro
 	if brokerPrefetch > 0 {
 		return brokerPrefetch
 	}
-	return destinationPrefetch(cfg, destination, index)
+	return cfg.DestinationPrefetch(index)
 }
 
-func destinationPrefetch(cfg driver.ConsumerConfig, destination string, index int) int {
-	if value := cfg.PerDestination[destination]; value > 0 {
-		return value
-	}
-	if cfg.Prefetch > 0 && len(cfg.Destinations) > 0 {
-		base := cfg.Prefetch / len(cfg.Destinations)
-		if index < cfg.Prefetch%len(cfg.Destinations) {
-			base++
-		}
-		if base > 0 {
-			return base
-		}
-	}
-	return 1
-}
+// closeLockWait bounds how long closeLanes waits, across all lanes, for an
+// in-flight channel RPC to finish before it closes the channel anyway.
+const closeLockWait = time.Second
 
+// closeLanes closes every lane's channel. Close is itself an RPC, and AMQP
+// does not correlate replies, so a Close that overlaps an in-flight Cancel can
+// have its close-ok taken by the Cancel and then wait forever. Each Close
+// therefore runs under the lane's RPC lock when the lock comes free before one
+// shared deadline. Past that deadline the in-flight RPC is treated as stuck and
+// the channel is closed without the lock, as a stuck RPC needs.
 func (c *consumer) closeLanes() {
+	deadline := c.clock.Now().Add(closeLockWait)
 	for _, lane := range c.lanes {
+		locked := lockBefore(c.clock, &lane.channelMu, deadline)
 		_ = lane.channel.Close()
+		if locked {
+			lane.channelMu.Unlock()
+		}
+	}
+}
+
+// lockBefore takes mu if it comes free before deadline and reports whether it
+// did. sync.Mutex has no timed lock, so it polls; it runs only on teardown.
+func lockBefore(clk clock.Clock, mu *sync.Mutex, deadline time.Time) bool {
+	for wait := time.Millisecond; ; wait = min(2*wait, 20*time.Millisecond) {
+		if mu.TryLock() {
+			return true
+		}
+		if !clk.Now().Before(deadline) {
+			return false
+		}
+		<-clk.Timer(wait).C
 	}
 }
 
@@ -263,8 +286,11 @@ func (c *consumer) rollbackConstruction() error {
 	return c.stopAndWait(true, nil)
 }
 
+// Messages returns the channel of delivered messages. The channel closes when Stop or Release completes.
 func (c *consumer) Messages() <-chan driver.InboundMessage { return c.messages }
-func (c *consumer) Errors() <-chan error                   { return c.errors }
+
+// Errors returns asynchronous consumer errors. The channel closes when Stop or Release completes.
+func (c *consumer) Errors() <-chan error { return c.errors }
 
 // nextConsumerTag returns a fresh consumer tag for an attach. Every attach
 // needs a new one: RabbitMQ answers a reuse of a cancelled tag with
@@ -547,6 +573,16 @@ func (c *consumer) reestablish(lane *lane) {
 	}
 	c.sendError(classify("consumer", driver.KindNotification, fmt.Errorf("rabbitmq: broker cancelled the consumer for destination %q", lane.destination)))
 	lane.channelMu.Lock()
+	// Drain marks the consumer draining before it cancels, and cancels under
+	// this lock, so reading the mark here orders the two: either Drain has not
+	// begun and cancels the tag attached below, or it has and no tag is
+	// attached. Checked only above, a Drain in between would cancel the old tag
+	// and leave the new one holding deliveries nobody reads.
+	if c.ending() {
+		lane.channelMu.Unlock()
+		c.attachReplacement(lane, nil)
+		return
+	}
 	tag := nextConsumerTag()
 	deliveries, err := lane.channel.Consume(lane.destination, tag, false, c.cfg.Exclusive, false, false, nil)
 	if err == nil {
@@ -563,9 +599,32 @@ func (c *consumer) reestablish(lane *lane) {
 	c.attachReplacement(lane, deliveries)
 }
 
+// sendError reports err without blocking. A full buffer drops a transient
+// error or a notification, which the errors already queued stand for. A severe
+// error, one that ends a lane for good, evicts the oldest queued error instead,
+// unless that one is fatal: a failed re-attach may be the only report that a
+// lane stopped, and a burst of consumer cancels must not crowd it out.
 func (c *consumer) sendError(err error) {
 	if err == nil {
 		return
+	}
+	c.errorsMu.Lock()
+	defer c.errorsMu.Unlock()
+	select {
+	case c.errors <- err:
+		return
+	default:
+	}
+	kind, classified := driver.Classify(err)
+	if !classified || kind == driver.KindTransient || kind == driver.KindNotification {
+		return
+	}
+	select {
+	case evicted := <-c.errors:
+		if evictedKind, evictedClassified := driver.Classify(evicted); evictedClassified && evictedKind == driver.KindFatal && kind != driver.KindFatal {
+			err = evicted
+		}
+	default:
 	}
 	select {
 	case c.errors <- err:
@@ -657,10 +716,12 @@ func timestampInMilliseconds(value any) (int64, bool) {
 	}
 }
 
+// Lag returns the backlog count for each destination assigned to this consumer.
 func (c *consumer) Lag(ctx context.Context) (map[string]int64, error) {
 	return c.readLag(ctx, "lag")
 }
 
+// Backlog reports the queued count and, for classic queues when available, the enqueue time of the oldest message.
 func (c *consumer) Backlog(ctx context.Context) (map[string]driver.BacklogSample, error) {
 	lag, err := c.readLag(ctx, "backlog")
 	if err != nil {
@@ -809,10 +870,12 @@ func headerValue(value any) []byte {
 	}
 }
 
+// Pause pauses delivery from the listed destinations. With no destinations, it pauses all subscribed destinations.
 func (c *consumer) Pause(destinations ...string) error {
 	return c.setPaused(destinations, true)
 }
 
+// Resume resumes delivery from the listed destinations. With no destinations, it resumes all subscribed destinations.
 func (c *consumer) Resume(destinations ...string) error {
 	return c.setPaused(destinations, false)
 }
@@ -847,6 +910,7 @@ func (c *consumer) setPaused(destinations []string, paused bool) error {
 	return nil
 }
 
+// Drain stops new deliveries while keeping outstanding messages settleable.
 func (c *consumer) Drain(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
 		return classify("drain", driver.KindTransient, err)
@@ -952,6 +1016,8 @@ func cancelConsumer(ctx context.Context, lane *lane) error {
 	}
 }
 
+// Stop drains the consumer and closes its channels after every delivered message has been settled.
+// It returns an error while messages remain unsettled.
 func (c *consumer) Stop(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
 		if errors.Is(err, context.DeadlineExceeded) {
@@ -994,18 +1060,31 @@ func (c *consumer) Stop(ctx context.Context) error {
 	return nil
 }
 
+// Release abandons unsettled deliveries, closes the consumer, and lets RabbitMQ redeliver them.
 func (c *consumer) Release(ctx context.Context) error {
 	c.mu.Lock()
 	if c.stopped {
+		released := c.released
 		c.mu.Unlock()
-		return nil
+		if released == nil {
+			return nil
+		}
+		select {
+		case <-released:
+			return nil
+		case <-ctx.Done():
+			return classify("release", driver.KindTransient, ctx.Err())
+		}
 	}
 	if err := ctx.Err(); err != nil {
 		c.mu.Unlock()
 		return classify("release", driver.KindTransient, err)
 	}
 	c.stopped = true
+	c.released = make(chan struct{})
+	released := c.released
 	c.mu.Unlock()
+	defer close(released)
 
 	// Closing the AMQP channels requeues their unacked deliveries. Do this
 	// before waiting for local goroutines so a blocked forwarder can observe
@@ -1056,12 +1135,12 @@ func amqpHeaders(delivery amqp.Delivery) []driver.Header {
 		}
 		values[key] = []byte(value)
 	}
-	setProperty("id", delivery.MessageId)
-	setProperty("type", delivery.Type)
-	setProperty("datacontenttype", delivery.ContentType)
-	setProperty("f1correlationid", delivery.CorrelationId)
+	setProperty(wire.ID, delivery.MessageId)
+	setProperty(wire.Type, delivery.Type)
+	setProperty(wire.DataContentType, delivery.ContentType)
+	setProperty(wire.CorrelationID, delivery.CorrelationId)
 	if !delivery.Timestamp.IsZero() {
-		setProperty("time", delivery.Timestamp.Format(time.RFC3339Nano))
+		setProperty(wire.Time, delivery.Timestamp.Format(time.RFC3339Nano))
 	}
 	keys := make([]string, 0, len(values))
 	for key := range values {

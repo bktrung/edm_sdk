@@ -82,55 +82,10 @@ func divergentBridgeMessage(t *testing.T, settler driver.Settler) (Envelope, dri
 	return envelope, message
 }
 
-func TestRetrySuccessorStaysInTheConsumingTopicFamily(t *testing.T) {
-	producer := &dispatchProducer{}
-	client, runner := newRetryBridgeRunner(t, producer, "orders.created")
-	defer func() { _ = client.Close(context.Background()) }()
-
-	settler := &dispatchSettler{}
-	envelope, message := divergentBridgeMessage(t, settler)
-	if !retryAndSettle(runner, context.Background(), message, envelope, errors.New("temporary")) {
-		t.Fatal("retry successor was not published and settled")
-	}
-	if len(producer.messages) != 1 {
-		t.Fatalf("retry copies = %d, want 1", len(producer.messages))
-	}
-	want := "f1.test.orders.created.orders.high.retry.1"
-	foreign := retryDestinationFor(client.source, topicFor(envelope.Type), PriorityHigh, 1, runner.subscription.Name)
-	if got := producer.messages[0].Destination; got != want {
-		t.Fatalf("retry successor destination = %q, want %q; deriving from event type would have produced %q", got, want, foreign)
-	}
-}
-
-func TestDeadLetterSuccessorStaysInTheConsumingTopicFamily(t *testing.T) {
-	producer := &dispatchProducer{}
-	client, runner := newRetryBridgeRunner(t, producer, "orders.created")
-	defer func() { _ = client.Close(context.Background()) }()
-
-	settler := &dispatchSettler{}
-	envelope, message := divergentBridgeMessage(t, settler)
-	if !deadLetterAndSettle(runner, context.Background(), message, envelope, ReasonTerminal, errors.New("terminal")) {
-		t.Fatal("dead-letter successor was not published and settled")
-	}
-	if len(producer.messages) != 1 {
-		t.Fatalf("dead-letter copies = %d, want 1", len(producer.messages))
-	}
-	want := "f1.test.orders.created.dlq.orders"
-	foreign := deadLetterDestinationFor(client.source, topicFor(envelope.Type), runner.subscription.Name)
-	if got := producer.messages[0].Destination; got != want {
-		t.Fatalf("dead-letter successor destination = %q, want %q; deriving from event type would have produced %q", got, want, foreign)
-	}
-}
-
-// TestSuccessorNamesAreUnchangedWhenTopicMatchesDerivedType pins the
-// compatibility consequence: when the consuming topic is also
-// what the event type derives to, both successor names stay byte-identical
-// to the pre-ADR derivations.
-func TestSuccessorNamesAreUnchangedWhenTopicMatchesDerivedType(t *testing.T) {
-	producer := &dispatchProducer{}
-	client, runner := newRetryBridgeRunner(t, producer, "orders.created")
-	defer func() { _ = client.Close(context.Background()) }()
-
+// matchingBridgeMessage returns a delivery whose consuming topic is also what
+// its event type derives to.
+func matchingBridgeMessage(t *testing.T, settler driver.Settler) (Envelope, driver.InboundMessage) {
+	t.Helper()
 	envelope := Envelope{
 		SpecVersion: "1.0",
 		ID:          "matching-topic-and-type",
@@ -147,26 +102,69 @@ func TestSuccessorNamesAreUnchangedWhenTopicMatchesDerivedType(t *testing.T) {
 		Destination: publishEntryPoint("/test/orders", topicFor(envelope.Type), PriorityHigh),
 		Headers:     headerSlice(headers),
 		Body:        []byte("{}"),
-		Settle:      &dispatchSettler{},
+		Settle:      settler,
 	}
-	if !retryAndSettle(runner, context.Background(), message, envelope, errors.New("temporary")) {
-		t.Fatal("retry successor was not published and settled")
-	}
-	want := "f1.test.orders.created.orders.high.retry.1"
-	if got := producer.messages[0].Destination; got != want {
-		t.Fatalf("retry successor destination = %q, want byte-identical %q", got, want)
-	}
+	return envelope, message
+}
 
-	deathProducer := &dispatchProducer{}
-	deathClient, deathRunner := newRetryBridgeRunner(t, deathProducer, "orders.created")
-	defer func() { _ = deathClient.Close(context.Background()) }()
-	message.Settle = &dispatchSettler{}
-	if !deadLetterAndSettle(deathRunner, context.Background(), message, envelope, ReasonTerminal, errors.New("terminal")) {
-		t.Fatal("dead-letter successor was not published and settled")
-	}
-	want = "f1.test.orders.created.dlq.orders"
-	if got := deathProducer.messages[0].Destination; got != want {
-		t.Fatalf("dead-letter successor destination = %q, want byte-identical %q", got, want)
+// TestSuccessorStaysInTheConsumingTopicFamily pins retry and dead-letter
+// successors to the consuming topic's family. When the event type derives to
+// another topic, the successor must not follow it; when the consuming topic is
+// also what the event type derives to, both names stay byte-identical to the
+// pre-ADR derivations.
+func TestSuccessorStaysInTheConsumingTopicFamily(t *testing.T) {
+	for _, delivery := range []struct {
+		name    string
+		message func(*testing.T, driver.Settler) (Envelope, driver.InboundMessage)
+	}{
+		{name: "type derives to another topic", message: divergentBridgeMessage},
+		{name: "topic matches derived type", message: matchingBridgeMessage},
+	} {
+		for _, successor := range []struct {
+			name    string
+			send    func(*Runner, driver.InboundMessage, Envelope) bool
+			want    string
+			foreign func(*Client, *Runner, Envelope) string
+		}{
+			{
+				name: "retry",
+				send: func(runner *Runner, message driver.InboundMessage, envelope Envelope) bool {
+					return retryAndSettle(runner, context.Background(), message, envelope, errors.New("temporary"), &deliveryState{})
+				},
+				want: "f1.test.orders.created.orders.high.retry.1",
+				foreign: func(client *Client, runner *Runner, envelope Envelope) string {
+					return retryDestinationFor(client.source, topicFor(envelope.Type), PriorityHigh, 1, runner.subscription.Name)
+				},
+			},
+			{
+				name: "dead letter",
+				send: func(runner *Runner, message driver.InboundMessage, envelope Envelope) bool {
+					return deadLetterAndSettle(runner, context.Background(), message, envelope, ReasonTerminal, errors.New("terminal"), &deliveryState{})
+				},
+				want: "f1.test.orders.created.dlq.orders",
+				foreign: func(client *Client, runner *Runner, envelope Envelope) string {
+					return deadLetterDestinationFor(client.source, topicFor(envelope.Type), runner.subscription.Name)
+				},
+			},
+		} {
+			t.Run(delivery.name+"/"+successor.name, func(t *testing.T) {
+				producer := &dispatchProducer{}
+				client, runner := newRetryBridgeRunner(t, producer, "orders.created")
+				defer func() { _ = client.Close(context.Background()) }()
+
+				envelope, message := delivery.message(t, &dispatchSettler{})
+				if !successor.send(runner, message, envelope) {
+					t.Fatalf("%s successor was not published and settled", successor.name)
+				}
+				if len(producer.messages) != 1 {
+					t.Fatalf("%s copies = %d, want 1", successor.name, len(producer.messages))
+				}
+				if got := producer.messages[0].Destination; got != successor.want {
+					t.Fatalf("%s successor destination = %q, want %q; deriving from event type would have produced %q",
+						successor.name, got, successor.want, successor.foreign(client, runner, envelope))
+				}
+			})
+		}
 	}
 }
 
@@ -208,7 +206,7 @@ func TestSuccessorFamilyHoldsUnderPublishTimeFanout(t *testing.T) {
 		Body:        []byte("{}"),
 		Settle:      &dispatchSettler{},
 	}
-	if !retryAndSettle(runner, context.Background(), message, envelope, errors.New("temporary")) {
+	if !retryAndSettle(runner, context.Background(), message, envelope, errors.New("temporary"), &deliveryState{}) {
 		t.Fatal("retry successor was not published and settled")
 	}
 	if len(producer.messages) != 1 {
@@ -224,7 +222,7 @@ func TestSuccessorFamilyHoldsUnderPublishTimeFanout(t *testing.T) {
 	deathClient, deathRunner := newPublishFanoutRunner(t, deathProducer, "orders.created")
 	defer func() { _ = deathClient.Close(context.Background()) }()
 	message.Settle = &dispatchSettler{}
-	if !deadLetterAndSettle(deathRunner, context.Background(), message, envelope, ReasonTerminal, errors.New("terminal")) {
+	if !deadLetterAndSettle(deathRunner, context.Background(), message, envelope, ReasonTerminal, errors.New("terminal"), &deliveryState{}) {
 		t.Fatal("dead-letter successor was not published and settled")
 	}
 	if len(deathProducer.messages) != 1 {
@@ -234,5 +232,25 @@ func TestSuccessorFamilyHoldsUnderPublishTimeFanout(t *testing.T) {
 	foreign = deadLetterDestinationFor(deathClient.source, topicFor(envelope.Type), deathRunner.subscription.Name)
 	if got := deathProducer.messages[0].Destination; got != want {
 		t.Fatalf("dead-letter successor destination = %q, want %q; deriving from event type would have produced %q", got, want, foreign)
+	}
+}
+
+// TestSuccessorTopicIgnoresHeaderPriority pins that the consuming family comes
+// from the destination alone. Headers that did not decode leave a zero
+// envelope, whose priority is medium; a delivery from the high destination must
+// still resolve to its topic, so its dead-letter copy goes to the topic's
+// dead-letter destination and not to the unknown one.
+func TestSuccessorTopicIgnoresHeaderPriority(t *testing.T) {
+	client, runner := newRetryBridgeRunner(t, &dispatchProducer{}, "orders.created")
+	defer func() { _ = client.Close(context.Background()) }()
+	_, message := divergentBridgeMessage(t, &dispatchSettler{})
+	if got := resolveDeliveryTopic(runner, Envelope{}, message); got != "orders.created" {
+		t.Fatalf("resolveDeliveryTopic(undecoded headers on the high destination) = %q, want orders.created", got)
+	}
+	runner.destinationMetadata = map[string]destinationMetadata{
+		message.Destination: {topic: "orders.created", priority: PriorityHigh},
+	}
+	if got := resolveDeliveryTopic(runner, Envelope{Type: "payments.charged.v1", Priority: PriorityLow}, message); got != "orders.created" {
+		t.Fatalf("resolveDeliveryTopic(mismatched header priority) = %q, want orders.created", got)
 	}
 }

@@ -39,6 +39,16 @@ function siteThemeVariables(dark: boolean) {
     clusterBkg: cssVar('--vp-c-bg-alt'),
     clusterBorder: cssVar('--vp-c-divider'),
     edgeLabelBackground: cssVar('--vp-c-bg'),
+    // Sequence diagrams: without these, notes keep Mermaid's bright yellow.
+    noteBkgColor: cssVar('--vp-c-default-soft'),
+    noteBorderColor: cssVar('--vp-c-divider'),
+    noteTextColor: cssVar('--vp-c-text-1'),
+    actorBkg: cssVar('--vp-c-bg-soft'),
+    actorBorder: cssVar('--vp-c-brand-1'),
+    actorTextColor: cssVar('--vp-c-text-1'),
+    actorLineColor: cssVar('--vp-c-divider'),
+    signalColor: cssVar('--vp-c-text-2'),
+    signalTextColor: cssVar('--vp-c-text-1'),
   }
 }
 
@@ -73,11 +83,25 @@ async function renderDiagram() {
     const { svg } = await mermaid.render(createMermaidId(), source)
     if (version === renderVersion && diagramRef.value) {
       diagramRef.value.innerHTML = svg
-      // Mermaid records the natural width as an inline max-width.
       const element = diagramRef.value.querySelector('svg')
-      const natural = parseFloat(element?.style.maxWidth ?? '')
-      if (element && natural > 0) {
-        element.style.minWidth = `${Math.min(natural, minReadableWidth)}px`
+      if (element) {
+        // Mermaid's flowchart viewBox can come out several times larger than
+        // the drawing, which scales every label down to a few pixels. Fit the
+        // viewBox to the painted content so the diagram renders at its size.
+        const box = element.getBBox()
+        const padding = 8
+        if (box.width > 0 && box.height > 0) {
+          element.setAttribute(
+            'viewBox',
+            `${box.x - padding} ${box.y - padding} ${box.width + 2 * padding} ${box.height + 2 * padding}`,
+          )
+          element.style.maxWidth = `${box.width + 2 * padding}px`
+        }
+        // The natural width is now the inline max-width.
+        const natural = parseFloat(element.style.maxWidth)
+        if (natural > 0) {
+          element.style.minWidth = `${Math.min(natural, minReadableWidth)}px`
+        }
       }
     }
   } catch (error) {

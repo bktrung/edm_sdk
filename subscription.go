@@ -13,11 +13,13 @@ import (
 	"golang.org/x/sync/errgroup"
 
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/driver"
+	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/dispatch"
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/lifecycle"
 )
 
-// Subscription declares one consumer group, its delivery policy, and the
-// handlers and lifecycle notifications attached to it.
+// Subscription declares one consumer group, its topics and delivery policy,
+// handlers, and lifecycle callbacks. Client.Subscribe validates it and returns
+// a Runner that has not started consuming.
 type Subscription struct {
 	Name            string
 	Topics          []string
@@ -34,7 +36,8 @@ type Subscription struct {
 	Handlers        map[string]Handler
 }
 
-// DeadLettered describes one message whose confirmed copy reached a DLQ.
+// DeadLettered carries the message data passed to OnDeadLetter after its
+// dead-letter copy is confirmed.
 type DeadLettered struct {
 	Envelope Envelope
 	// Body is an independent copy of the message payload, safe to read after
@@ -46,8 +49,8 @@ type DeadLettered struct {
 	Destination string
 }
 
-// Discarded describes one message acknowledged without applying its effect or
-// retaining a copy.
+// Discarded carries the message data passed to OnDiscarded after the message
+// is acknowledged without applying its effect or retaining a copy.
 type Discarded struct {
 	Envelope Envelope
 	// Body is an independent copy of the message payload, safe to read after
@@ -57,8 +60,8 @@ type Discarded struct {
 	Err    error
 }
 
-// DiscardReason identifies why a message was acknowledged without a retained
-// copy.
+// DiscardReason identifies why an event without a retained copy was
+// acknowledged. Its zero value means no reason was recorded.
 type DiscardReason string
 
 const (
@@ -72,17 +75,20 @@ func discardUnmatched(envelope Envelope, body []byte) Discarded {
 	return Discarded{Envelope: envelope, Body: body, Reason: DiscardUnmatched}
 }
 
-// Runner owns a validated subscription. Construction and notifications live
-// in subscription.go; dispatch and settlement live in worker.go; client-side
-// failure recording, abandon, and drain-after-run ownership live in client.go,
-// reconnect.go, and worker.go.
+// Runner executes the validated Subscription returned by Client.Subscribe.
+// Call Run once to start delivery and Drain to stop it gracefully. Its zero
+// value is not usable.
 type Runner struct {
 	client       *Client
 	subscription Subscription
 	config       SubscriptionConfig
 	mu           sync.Mutex
 	consumer     driver.Consumer
-	group        *errgroup.Group
+	// consumerEpoch is the connection incarnation the stored consumer was
+	// opened on. A failed Release keeps the consumer against that connection,
+	// because that is the one the driver still carries it on.
+	consumerEpoch uint64
+	group         *errgroup.Group
 	// asyncGroup owns handler and terminal-callback goroutines. finishRunner
 	// cancels their contexts but does not wait: a non-cooperative handler or
 	// callback cannot be force-stopped, and waiting would violate drain's bound.
@@ -115,11 +121,16 @@ type Runner struct {
 	// so a runner records at most once. The exit record reads it in the same
 	// critical section that decides whether the entry it would replace is still
 	// this runner's.
-	recordedFailure       bool
-	inflight              *inflightRegistry
-	retryDestinationTiers map[string]int
-	destinationMetadata   map[string]destinationMetadata
-	lifecycle             *lifecycle.Machine
+	recordedFailure     bool
+	inflight            *inflightRegistry
+	destinationMetadata map[string]destinationMetadata
+	// lanePlan is the lane plan the runner's consumer open established: its
+	// destinations are the ones that open declared and its capacities are the
+	// ones the driver's per-destination caps were keyed on. It is nil until the
+	// first open, so a runner that has not opened derives a plan from the
+	// client's live capabilities instead.
+	lanePlan  []runnerLane
+	lifecycle *lifecycle.Machine
 
 	// prefetchConfigured records whether the caller named an in-flight budget
 	// on this subscription, as opposed to taking the broker default. A cap on
@@ -244,8 +255,9 @@ func notifyOwned(parent context.Context, callback func(context.Context), group *
 	})
 }
 
-// Subscribe validates sub after applying the subscription-specific config
-// precedence and returns a runner ready for the worker phase.
+// Subscribe validates and registers sub, then returns a Runner that has not
+// started consuming. Loaded configuration and environment values are applied
+// before non-zero fields in sub override them.
 func (c *Client) Subscribe(ctx context.Context, sub Subscription) (*Runner, error) {
 	if c == nil {
 		return nil, errors.New("f1: client is not connected")
@@ -273,12 +285,6 @@ func (c *Client) Subscribe(ctx context.Context, sub Subscription) (*Runner, erro
 	if resolved.Mode == OrderedByKey && !effectiveCapabilities.OrderedByKey {
 		return nil, fmt.Errorf("f1: subscription %s requests ordered_by_key, but feature is unavailable", sub.Name)
 	}
-	c.mu.Lock()
-	if err := c.admit(workSubscribe, 0); err != nil {
-		c.mu.Unlock()
-		return nil, err
-	}
-	c.mu.Unlock()
 	effective := sub
 	effective.Topics = append([]string(nil), resolved.Topics...)
 	effective.Mode = resolved.Mode
@@ -356,9 +362,7 @@ func overlayLoadedSubscription(dst *SubscriptionConfig, src SubscriptionConfig) 
 	if p.Concurrency || src.Concurrency != 0 {
 		dst.Concurrency = src.Concurrency
 	}
-	if p.Prefetch {
-		dst.Prefetch = src.Prefetch
-	} else if src.Prefetch != 0 {
+	if p.Prefetch || src.Prefetch != 0 {
 		dst.Prefetch = src.Prefetch
 	}
 	if p.Priorities || len(src.Priorities) > 0 {
@@ -421,17 +425,29 @@ func overlayExplicitSubscription(dst *SubscriptionConfig, src Subscription) {
 	}
 }
 
+// validateSubscription checks one subscription's settings. Config loading and
+// Subscribe both call it, so a subscription that loads is one that subscribes.
 func validateSubscription(cfg Config, driverName, name string, sub SubscriptionConfig) error {
 	if name == "" {
 		return errors.New("f1: subscription name must not be empty")
 	}
+	if !isNameSegment(name) {
+		return fmt.Errorf("f1: subscription name %q must contain only letters, digits, '-' and '_'", name)
+	}
 	if len(sub.Topics) == 0 {
 		return fmt.Errorf("f1: subscriptions.%s.topics must not be empty", name)
 	}
+	topics := make(map[string]string, len(sub.Topics))
 	for _, topic := range sub.Topics {
 		if strings.TrimSpace(topic) == "" {
 			return fmt.Errorf("f1: subscriptions.%s.topics must not contain an empty topic", name)
 		}
+		// Two entries naming one topic would share its lanes while the
+		// prefetch floor below counted them twice.
+		if first, ok := topics[topicFor(topic)]; ok {
+			return fmt.Errorf("f1: subscriptions.%s.topics %q and %q name the same topic", name, first, topic)
+		}
+		topics[topicFor(topic)] = topic
 	}
 	if sub.Concurrency < 1 || sub.Concurrency > 1024 {
 		return fmt.Errorf("f1: subscriptions.%s.concurrency must be between 1 and 1024", name)
@@ -439,18 +455,8 @@ func validateSubscription(cfg Config, driverName, name string, sub SubscriptionC
 	if err := validateSubscriptionModeAndPolicy(name, sub.Mode, sub.UnmatchedPolicy); err != nil {
 		return err
 	}
-	if len(sub.Priorities) == 0 {
-		return fmt.Errorf("f1: subscriptions.%s.priorities must not be empty", name)
-	}
-	seen := make(map[Priority]struct{}, len(sub.Priorities))
-	for _, priority := range sub.Priorities {
-		if !priority.Valid() {
-			return fmt.Errorf("f1: subscriptions.%s.priorities contains invalid priority %q", name, priority)
-		}
-		if _, ok := seen[priority]; ok {
-			return fmt.Errorf("f1: subscriptions.%s.priorities contains duplicate %s", name, priority)
-		}
-		seen[priority] = struct{}{}
+	if err := validatePriorityList("subscriptions."+name+".priorities", sub.Priorities); err != nil {
+		return err
 	}
 	if err := validateRetryConfig("subscriptions."+name+".retry", sub.Retry); err != nil {
 		return err
@@ -458,6 +464,9 @@ func validateSubscription(cfg Config, driverName, name string, sub SubscriptionC
 	lanes := subscriptionLaneCount(len(sub.Topics), len(sub.Priorities), sub.Retry)
 	if err := validatePrefetch(name, sub.Prefetch, lanes); err != nil {
 		return err
+	}
+	if sub.Mode == OrderedByKey && sub.Concurrency > dispatch.MaxOrderedBufferEntries/sub.Prefetch {
+		return fmt.Errorf("f1: subscriptions.%s: ordered mode needs concurrency x prefetch at most %d, got %d x %d", name, dispatch.MaxOrderedBufferEntries, sub.Concurrency, sub.Prefetch)
 	}
 	if sub.HandlerTimeout <= 0 {
 		return fmt.Errorf("f1: subscriptions.%s.handlerTimeout must be positive", name)
@@ -474,6 +483,14 @@ func validateSubscription(cfg Config, driverName, name string, sub SubscriptionC
 		if !priority.Valid() || budget < 0 {
 			return fmt.Errorf("f1: subscriptions.%s.fairness.budgets.%s must not be negative", name, priority)
 		}
+	}
+	// Zero leaves the default in place; a negative value is a typo the lane
+	// plan would otherwise replace with the default without a word.
+	if sub.Fairness.RetryWeightDivisor < 0 {
+		return fmt.Errorf("f1: subscriptions.%s.fairness.retryWeightDivisor must not be negative", name)
+	}
+	if sub.Fairness.PrefetchFactor < 0 {
+		return fmt.Errorf("f1: subscriptions.%s.fairness.prefetchFactor must not be negative", name)
 	}
 	if driverName == "rabbitmq" {
 		consumerTimeout, err := durationOption(cfg.Broker.DriverOptions, "rabbitmq.consumerTimeout", 90*time.Second)

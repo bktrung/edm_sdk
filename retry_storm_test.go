@@ -29,7 +29,7 @@ func TestRunnerSchedulerPreservesRetryStormFairness(t *testing.T) {
 		t.Fatal(err)
 	}
 	freshIDs, laneIDs := retryStormLaneIDs(subscription)
-	if got, want := len(laneIDs), len(subscription.Priorities)*(1+retryTiers(subscription.Retry)); got != want {
+	if got, want := len(laneIDs), len(subscription.Priorities)*(1+subscription.Retry.tierCount()); got != want {
 		t.Fatalf("scheduler lanes = %d, want %d", got, want)
 	}
 	for _, id := range laneIDs {
@@ -102,12 +102,12 @@ func retryStormSubscription() Subscription {
 func retryStormLaneIDs(subscription Subscription) (map[string]struct{}, []string) {
 	topic := topicFor(subscription.Topics[0])
 	freshIDs := make(map[string]struct{}, len(subscription.Priorities))
-	laneIDs := make([]string, 0, len(subscription.Priorities)*(1+retryTiers(subscription.Retry)))
+	laneIDs := make([]string, 0, len(subscription.Priorities)*(1+subscription.Retry.tierCount()))
 	for _, priority := range subscription.Priorities {
 		mainID := schedulerLaneID(topic, priority, 0)
 		freshIDs[mainID] = struct{}{}
 		laneIDs = append(laneIDs, mainID)
-		for tier := 1; tier <= retryTiers(subscription.Retry); tier++ {
+		for tier := 1; tier <= subscription.Retry.tierCount(); tier++ {
 			laneIDs = append(laneIDs, schedulerLaneID(topic, priority, tier))
 		}
 	}

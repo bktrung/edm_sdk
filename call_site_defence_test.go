@@ -92,7 +92,7 @@ func TestDispatchSettlesHandlerAfterParentCancellationDuringDrain(t *testing.T) 
 		Settle:      settler,
 	}
 	done := make(chan bool, 1)
-	go func() { done <- dispatchMessage(runner, parent, message, &Envelope{}, new(bool)) }()
+	go func() { done <- dispatchMessage(runner, parent, message, &Envelope{}, new(bool), &deliveryState{}) }()
 
 	wait := client.options.clock.Timer(time.Second)
 	defer wait.Stop()

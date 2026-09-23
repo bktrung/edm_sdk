@@ -15,6 +15,7 @@ import (
 
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/driver"
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/clock"
+	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/wire"
 )
 
 // publishChannelPoolSize is the number of confirm-mode channels one producer
@@ -172,11 +173,8 @@ func (p *producer) openChannel(ctx context.Context) (*publishChannel, error) {
 	return channel, nil
 }
 
-// Publish takes one channel for the whole call and runs every window of the
-// call on it, so a batch keeps the order its messages were given in and no
-// caller's messages are split across channels. Concurrent calls take separate
-// channels and overlap: a publish waits for a free channel, not for the
-// producer.
+// Publish sends messages in argument order and waits for broker confirmations.
+// Concurrent calls may overlap while preserving the order within each call.
 func (p *producer) Publish(ctx context.Context, msgs ...driver.OutboundMessage) error {
 	if err := ctx.Err(); err != nil {
 		return classify("publish", driver.KindTransient, err)
@@ -780,22 +778,22 @@ func amqpPublishing(message driver.OutboundMessage) (amqp.Publishing, error) {
 	for _, header := range message.Headers {
 		value := string(header.Value)
 		switch header.Key {
-		case "id":
+		case wire.ID:
 			publishing.MessageId = value
 			headers["cloudEvents:id"] = value
-		case "time":
+		case wire.Time:
 			parsed, err := time.Parse(time.RFC3339Nano, value)
 			if err != nil {
 				return amqp.Publishing{}, fmt.Errorf("invalid time header: %w", err)
 			}
 			publishing.Timestamp = parsed
 			headers["cloudEvents:time"] = value
-		case "type":
+		case wire.Type:
 			publishing.Type = value
 			headers["cloudEvents:type"] = value
-		case "datacontenttype":
+		case wire.DataContentType:
 			publishing.ContentType = value
-		case "f1correlationid":
+		case wire.CorrelationID:
 			publishing.CorrelationId = value
 		default:
 			headers["cloudEvents:"+header.Key] = value
@@ -804,18 +802,8 @@ func amqpPublishing(message driver.OutboundMessage) (amqp.Publishing, error) {
 	return publishing, nil
 }
 
-// Close stops the producer: new publishes are refused, every channel it holds
-// is closed, and the connection stops listing it.
-//
-// Its order matters. The producer is marked closed first, so a publish that
-// arrives while this runs is refused rather than handed a channel. Then the
-// publishes in flight are waited for, so the channels closed next are all the
-// producer has. Then every channel's close is started, and only then is the
-// producer dropped from the connection: the wait a channel close registers is
-// ordered before the connection stops listing this producer, so a conn.Close
-// that saw no producers left has already registered every one of these. The
-// closes are awaited last, for as long as ctx allows, so a caller that has run
-// out of time is not held to the broker's pace.
+// Close stops new publishes, waits for active work, and closes the producer's
+// channels. The context bounds these waits.
 func (p *producer) Close(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
 		return classify("producer.close", driver.KindTransient, err)

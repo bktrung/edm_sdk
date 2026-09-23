@@ -98,16 +98,6 @@ func (c *Client) connStateLocked() connState {
 	}
 }
 
-// epochLocked returns the connection incarnation the client is on and the wake
-// that is released when that incarnation changes or when a reconnect attempt
-// ends. The caller holds c.mu, so the pair is one view: the epoch names the
-// connection the wake belongs to. Read c.attemptErr under the same lock after
-// the wake fires, and it carries the outcome of the attempt that released the
-// waiter.
-func (c *Client) epochLocked() (uint64, <-chan struct{}) {
-	return c.current.epoch, c.wakeLocked()
-}
-
 // staleClaimLocked reports whether the connection a caller captured is no
 // longer the client's. The caller holds c.mu.
 //
@@ -137,6 +127,8 @@ func (c *Client) staleClaimLocked(epoch uint64) bool {
 //
 //	kind             refuses when                              with
 //	workPublishEntry lifecycle is not Ready, or no connection   "f1: client is closed"
+//	workPublishEntry the connection failed                     the retained reconnect error
+//	workPublishEntry the connection is reconnecting            the reconnecting error
 //	workPublish      lifecycle is Closed, the producer is
 //	                 torn down, or no connection               "f1: client is closed"
 //	workPublish      the connection failed                     the retained reconnect error
@@ -177,6 +169,16 @@ func (c *Client) admit(kind workKind, epoch uint64) error {
 	case workPublishEntry:
 		if life != lifecycle.Ready || conn == connNone {
 			return errors.New("f1: client is closed")
+		}
+		// The producer check would refuse these later with the same errors.
+		// Refusing here keeps them out of the in-flight count, which a
+		// reconnect waits to drain before it replaces the connection: callers
+		// retrying in a loop would otherwise hold that count above zero.
+		if conn == connFailed {
+			return c.reconnectErr
+		}
+		if conn == connReconnecting {
+			return c.reconnectingError("publish")
 		}
 	case workPublish:
 		if life == lifecycle.Closed || c.producerTeardown || conn == connNone {

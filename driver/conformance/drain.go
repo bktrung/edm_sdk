@@ -39,7 +39,7 @@ func runDrain(group *groupContext) {
 			t.Fatal("Drain() waited for outstanding work")
 		}
 		ackMessage(t, group, message)
-		group.vector.Add(BehaviorEvent{ID: "drain-prompt", Outcome: "ok", FinalDestination: "drain.prompt"})
+		group.vector.add(BehaviorEvent{ID: "drain-prompt", Outcome: "ok", FinalDestination: "drain.prompt"})
 	})
 
 	group.Check("drained consumer receives no new messages", func(t *testing.T) {
@@ -62,7 +62,7 @@ func runDrain(group *groupContext) {
 				return true, "no delivery to drained consumer"
 			}
 		})
-		group.vector.Add(BehaviorEvent{ID: "drain-no-new", Outcome: "withheld", FinalDestination: "drain.no-new"})
+		group.vector.add(BehaviorEvent{ID: "drain-no-new", Outcome: "withheld", FinalDestination: "drain.no-new"})
 	})
 
 	group.Check("outstanding delivery remains settleable after drain", func(t *testing.T) {
@@ -76,7 +76,7 @@ func runDrain(group *groupContext) {
 			t.Fatal(err)
 		}
 		ackMessage(t, group, message)
-		group.vector.Add(BehaviorEvent{ID: "drain-settleable", Outcome: "acked", FinalDestination: "drain.settleable"})
+		group.vector.add(BehaviorEvent{ID: "drain-settleable", Outcome: "acked", FinalDestination: "drain.settleable"})
 	})
 
 	group.Check("drain leaves Messages open", func(t *testing.T) {
@@ -101,7 +101,7 @@ func runDrain(group *groupContext) {
 				return true, "Messages channel open without delivery"
 			}
 		})
-		group.vector.Add(BehaviorEvent{ID: "drain-messages-open", Outcome: "open", FinalDestination: "drain.messages-open"})
+		group.vector.add(BehaviorEvent{ID: "drain-messages-open", Outcome: "open", FinalDestination: "drain.messages-open"})
 	})
 
 	group.Check("settlement clears broker unsettled count after drain", func(t *testing.T) {
@@ -123,7 +123,7 @@ func runDrain(group *groupContext) {
 			view := inspectDestination(t, group, "drain.unsettled")
 			return view.Unsettled == 0, fmt.Sprintf("view=%+v", view)
 		})
-		group.vector.Add(BehaviorEvent{ID: "drain-unsettled", Outcome: "cleared", FinalDestination: "drain.unsettled"})
+		group.vector.add(BehaviorEvent{ID: "drain-unsettled", Outcome: "cleared", FinalDestination: "drain.unsettled"})
 	})
 
 	group.Check("drain cycle accounts for every published message", func(t *testing.T) {
@@ -144,7 +144,7 @@ func runDrain(group *groupContext) {
 			view := inspectDestination(t, group, "drain.accounting")
 			return view.Ready == 1 && view.Unsettled == 0, fmt.Sprintf("view=%+v", view)
 		})
-		group.vector.Add(BehaviorEvent{ID: "drain-accounting", Outcome: "lossless", FinalDestination: "drain.accounting"})
+		group.vector.add(BehaviorEvent{ID: "drain-accounting", Outcome: "lossless", FinalDestination: "drain.accounting"})
 	})
 
 	group.Check("stop refuses outstanding work as a fatal error", func(t *testing.T) {
@@ -158,6 +158,9 @@ func runDrain(group *groupContext) {
 		if err == nil || errors.Is(err, driver.ErrDrainTimeout) {
 			t.Fatalf("Stop() error = %v, want fatal refusal distinct from ErrDrainTimeout", err)
 		}
+		if !errors.Is(err, driver.ErrResourcesOutstanding) {
+			t.Fatalf("Stop() error = %v, want it to wrap ErrResourcesOutstanding", err)
+		}
 		if kind, classified := driver.Classify(err); !classified || kind != driver.KindFatal {
 			t.Fatalf("Stop() classification = (%v, %t), want (fatal, true)", kind, classified)
 		}
@@ -165,7 +168,7 @@ func runDrain(group *groupContext) {
 			t.Fatalf("Stop() error = %v, want operation name", err)
 		}
 		ackMessage(t, group, message)
-		group.vector.Add(BehaviorEvent{ID: "drain-stop-refusal", Outcome: "fatal", FinalDestination: "drain.refusal"})
+		group.vector.add(BehaviorEvent{ID: "drain-stop-refusal", Outcome: "fatal", FinalDestination: "drain.refusal"})
 	})
 
 	group.Check("expired stop deadline returns drain timeout", func(t *testing.T) {
@@ -184,7 +187,7 @@ func runDrain(group *groupContext) {
 		if kind, classified := driver.Classify(err); !classified || kind != driver.KindTransient {
 			t.Fatalf("Stop() classification = (%v, %t), want (transient, true)", kind, classified)
 		}
-		group.vector.Add(BehaviorEvent{ID: "drain-timeout", Outcome: "timeout", FinalDestination: "drain.timeout"})
+		group.vector.add(BehaviorEvent{ID: "drain-timeout", Outcome: "timeout", FinalDestination: "drain.timeout"})
 	})
 
 	group.Check("stop refusal and timeout remain distinguishable", func(t *testing.T) {
@@ -203,7 +206,7 @@ func runDrain(group *groupContext) {
 			t.Fatalf("Stop() errors refusal=%v timeout=%v, want distinct timeout sentinel", refusal, timeout)
 		}
 		ackMessage(t, group, message)
-		group.vector.Add(BehaviorEvent{ID: "drain-errors-distinct", Outcome: "distinct", FinalDestination: "drain.distinguishable"})
+		group.vector.add(BehaviorEvent{ID: "drain-errors-distinct", Outcome: "distinct", FinalDestination: "drain.distinguishable"})
 	})
 
 	group.Check("drain is idempotent", func(t *testing.T) {
@@ -215,7 +218,7 @@ func runDrain(group *groupContext) {
 		if err := consumer.Drain(group.ctx); err != nil {
 			t.Fatalf("second Drain() error = %v", err)
 		}
-		group.vector.Add(BehaviorEvent{ID: "drain-idempotent", Outcome: "ok", FinalDestination: "drain.idempotent"})
+		group.vector.add(BehaviorEvent{ID: "drain-idempotent", Outcome: "ok", FinalDestination: "drain.idempotent"})
 	})
 
 	group.Check("stop is idempotent", func(t *testing.T) {
@@ -227,7 +230,7 @@ func runDrain(group *groupContext) {
 		if err := consumer.Stop(group.ctx); err != nil {
 			t.Fatalf("second Stop() error = %v", err)
 		}
-		group.vector.Add(BehaviorEvent{ID: "drain-stop-idempotent", Outcome: "ok", FinalDestination: "drain.stop-idempotent"})
+		group.vector.add(BehaviorEvent{ID: "drain-stop-idempotent", Outcome: "ok", FinalDestination: "drain.stop-idempotent"})
 	})
 
 	group.Check("stop completes a settled drain cycle", func(t *testing.T) {
@@ -244,7 +247,7 @@ func runDrain(group *groupContext) {
 		if err := consumer.Stop(group.ctx); err != nil {
 			t.Fatalf("Stop() error = %v", err)
 		}
-		group.vector.Add(BehaviorEvent{ID: "drain-stop", Outcome: "stopped", FinalDestination: "drain.stop"})
+		group.vector.add(BehaviorEvent{ID: "drain-stop", Outcome: "stopped", FinalDestination: "drain.stop"})
 	})
 
 	group.Check("successful stop closes Messages", func(t *testing.T) {
@@ -261,7 +264,7 @@ func runDrain(group *groupContext) {
 				return false, "Messages channel remains open"
 			}
 		})
-		group.vector.Add(BehaviorEvent{ID: "drain-messages-closed", Outcome: "closed", FinalDestination: "drain.messages-closed"})
+		group.vector.add(BehaviorEvent{ID: "drain-messages-closed", Outcome: "closed", FinalDestination: "drain.messages-closed"})
 	})
 
 	group.Check("release redelivers outstanding work", func(t *testing.T) {
@@ -280,7 +283,7 @@ func runDrain(group *groupContext) {
 			t.Fatalf("redelivered body = %q, want %q", redelivered.Body, message.Body)
 		}
 		ackMessage(t, group, redelivered)
-		group.vector.Add(BehaviorEvent{ID: "drain-release-redelivery", Outcome: "redelivered", FinalDestination: "drain.release"})
+		group.vector.add(BehaviorEvent{ID: "drain-release-redelivery", Outcome: "redelivered", FinalDestination: "drain.release"})
 
 		// An acknowledged message must not carry an outstanding earlier one
 		// away with it. Release hands back every delivery it did not settle,
@@ -323,7 +326,7 @@ func runDrain(group *groupContext) {
 		if !returned {
 			t.Fatalf("release did not return the unsettled body %q to the group", outstanding.Body)
 		}
-		group.vector.Add(BehaviorEvent{ID: "drain-release-after-ack", Outcome: "redelivered", FinalDestination: ordered})
+		group.vector.add(BehaviorEvent{ID: "drain-release-after-ack", Outcome: "redelivered", FinalDestination: ordered})
 	})
 
 	group.Check("release with no outstanding work closes Messages", func(t *testing.T) {
@@ -340,7 +343,7 @@ func runDrain(group *groupContext) {
 				return false, "Messages channel remains open"
 			}
 		})
-		group.vector.Add(BehaviorEvent{ID: "drain-release-closed", Outcome: "closed", FinalDestination: "drain.release-closed"})
+		group.vector.add(BehaviorEvent{ID: "drain-release-closed", Outcome: "closed", FinalDestination: "drain.release-closed"})
 	})
 
 	group.Check("release is idempotent", func(t *testing.T) {
@@ -362,6 +365,6 @@ func runDrain(group *groupContext) {
 		if err := stopped.Release(group.ctx); err != nil {
 			t.Fatalf("Release() after Stop error = %v", err)
 		}
-		group.vector.Add(BehaviorEvent{ID: "drain-release-idempotent", Outcome: "ok", FinalDestination: "drain.release-idempotent"})
+		group.vector.add(BehaviorEvent{ID: "drain-release-idempotent", Outcome: "ok", FinalDestination: "drain.release-idempotent"})
 	})
 }
