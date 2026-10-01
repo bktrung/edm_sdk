@@ -6,17 +6,14 @@
 
 ## Background: why a lock is not enough
 
-A runner is many goroutines at once: one that fetches from the broker, a dispatch pipeline, one that reads the consumer's errors, the pool workers, and the handlers, plus callers from outside such as `Drain` and the reconnect supervisor. Each of them learns facts the runner must act on:
+A runner has fetch and dispatch goroutines, a consumer error reader, pool workers,
+and callers such as `Drain` and the reconnect supervisor. They can discover a
+failure or request a stop independently, but the deadline for finishing messages
+must be one decision.
 
-| Fact | Learned by |
-| --- | --- |
-| A drain has started, and the deadline for finishing messages | `Drain`, `Close`, a reconnect, the end of `Run` |
-| The first error of the run | the fetch goroutine, the error reader, the pool workers |
-| Why the consumer failed, and whether a new consumer could fix it | the error reader |
-| Whether any message was handled successfully | the pool workers |
-| Whether a reconnect released the consumer | the reconnect supervisor |
-
-Suppose those facts were fields that each goroutine writes under a mutex. The lock keeps every single read and write whole, but a decision takes a read and then a write, and another goroutine can run in between:
+Suppose each goroutine writes shared fields under a mutex. The lock keeps each
+read and write whole, but a decision takes a read and then a write, and another
+goroutine can run in between:
 
 ```mermaid
 sequenceDiagram
@@ -30,11 +27,16 @@ sequenceDiagram
     Note over S: two drains. Acks that start after the second write use B, earlier ones use A
 ```
 
-Each step is safe on its own, and the result is still wrong. The usual repair is a rule such as "the first writer wins", and every later change has to be checked against every order in which the writers can arrive. With several facts and five kinds of writer, that check stops fitting in anyone's head.
+Each step is safe on its own, and the result is still wrong. A larger critical
+section could protect the whole decision, but it would still require every
+caller to follow the same transition rules. A single owner puts that choice in
+one place.
 
 ## The owner loop
 
-In `Run` I create one unbuffered event channel, and the goroutine running `Run` is the only one that reads it. I call that goroutine the owner. The other goroutines keep their shape, but instead of changing a shared fact they send an event, and the owner applies it.
+The goroutine running `Run` reads an unbuffered event channel. The other
+goroutines report facts through that mailbox rather than independently deciding
+when to replace a consumer or start the drain.
 
 ```mermaid
 flowchart LR
@@ -48,19 +50,22 @@ flowchart LR
     O --> T[runner decisions]
 ```
 
-| Event | Sent by | What the owner does |
-| --- | --- | --- |
-| a goroutine finished | the fetch goroutine, the dispatch pipeline, the error reader | counts it down and keeps the first error a goroutine ended with |
-| a message was handled | a pool worker, after acking a handled message | marks the consumer healthy, which resets the count of failed repairs |
-| a consumer error | the error reader | records the cause, and whether the driver called it transient, meaning a new consumer may fix it |
-| an error | any of the runner's goroutines | keeps the first failure of the whole run; `Drain` returns it |
-| a consumer opened, the connection was rebuilt, a consumer was released | helper goroutines | takes the result of a broker call the owner itself started |
-| a reconnect released the consumer | the reconnect supervisor | records that the supervisor, not the owner, released the consumer because it is replacing the connection |
-| drain requested, drain finished | `Runner.Drain`, the drain helper | starts the one drain, then takes its result |
+An ended goroutine and a reported consumer error are different facts. A fetch or
+pipeline failure does not by itself request connection recovery. On the
+consumer error stream, a fatal error ends the runner; not-found, too-large, and
+permission errors are reported without stopping the consumer. The error reader
+keeps watching, so a later fatal error is not missed. Routine notifications do
+not trigger recovery either.
 
-A "finished" event carries the error that ended that one goroutine, and that error decides whether the current consumer has to be replaced. For example, when the consumer's delivery stream fails, the fetch goroutine ends and sends "finished" with that error; the owner then repairs the consumer or, for an error the driver does not call transient, ends the run and keeps the error as the one `Drain` returns. An "error" event is a failure of the run as a whole, and the first one is what `Drain` reports.
+A transient consumer error asks for repair on the same connection. An
+unclassified error asks for connection replacement instead: there is no
+classification supporting the smaller repair. Repeated replacement consumers
+that fail before finishing a message also escalate to connection replacement.
+The distinction is about the failed transport, not the handler's retry policy.
 
-Repair works like this. When the error reader reports a transient error, the owner opens a new consumer on the same connection. If two replacement consumers in a row fail before handling a single message, it stops repairing and asks the reconnect supervisor to rebuild the connection. One handled message resets that count. An error the driver does not call transient ends the run.
+The executable decisions are in
+[`worker.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/worker.go);
+[Consume flow](/development/consume-flow) maps the error reader and owner loop.
 
 Handling an event records a fact and, at most, starts work: canceling the context the runner's goroutines run on, or a helper goroutine that reports back with another event. The owner never waits inside an event.
 
@@ -80,27 +85,34 @@ One small piece of state stays outside the owner on purpose. A `Drain` caller mo
 
 `Close`, a reconnect, and the end of `Run` can all ask the runner to stop at the same moment. The drain can only run once: the first request the owner reads starts it, and every later request joins it: each `Drain` caller waits for the same runner to end and gets the same error, unless its own context ends first.
 
-I set the drain deadline in the same place. When the owner reads the first drain request, it computes the deadline for finishing messages and installs it before it stops the runner's goroutines. Each ack reads the current deadline when it starts. Stopping the goroutines cancels the context handlers run on, so a handler can return right away and its worker acks. Because the deadline is installed first, that ack runs on the drain's deadline instead of taking a fresh one of its own. One goroutine decides, at one moment, instead of whichever goroutine gets there first.
+The owner installs the drain's deadline before canceling the runner's
+goroutines. Otherwise a handler returning because of that cancellation could
+start its ack before the drain's time limit existed. Installing the deadline
+first lets those newly started calls use the same drain window. Calls already
+in progress keep the context they started with.
 
 ## Compared with the client
 
 The client solves the same problem differently, with one mutex, a [connection number](/learn/glossary#connection-epoch) that goes up each time the connection is replaced, and a supervisor that alone replaces the connection ([who owns what](/deep-dives/reconnect-and-generations#who-owns-what)). The two fit different shapes.
 
-Client state is read by every publish, right away, and a lock with a number check keeps that read cheap. Runner state changes on events in the runner's life, such as a goroutine ending, an error, or a drain, and the runner already has one natural owner sitting in `Run`, so a mailbox costs little and removes the question of order entirely.
+Client state is read by concurrent publishes, so a lock and connection-number
+check fit that access pattern. The runner already has a natural owner in `Run`;
+its mailbox serializes lifecycle decisions without giving every reporter a copy
+of the transition rules.
 
 Go does not prefer one tool everywhere. The Go wiki's [mutex or channel](https://go.dev/wiki/MutexOrChannel) guidance is to use whichever is simpler for the case: a mutex for state that many goroutines read often, a channel for handing over ownership or reporting events. The client and the runner follow that split.
 
 ## Limits and trade-offs
 
-- Events are handled one at a time. The loop stays fast because handling an event only records a fact and hands slow work to helpers; an event that did real work there would delay every other one.
-- The channel is unbuffered, so a sender waits until the owner reads. Every handled ack sends one event, which makes the owner a single point every ack passes through. It keeps up because receiving and setting a flag is cheap, but it is a cost a shared field would not have.
+- Events are handled one at a time. Slow broker work belongs in helpers because doing it inside an event would delay every other decision.
+- The channel is unbuffered, so a sender waits until the owner reads. Each handled ack reports through it; that is a serialization cost, not evidence of throughput. Measurements belong in [Benchmarks](/development/benchmarks).
 - Messages themselves do not pass through the owner. They flow from the fetch goroutine through the [lanes](/learn/glossary#lane), F1's per-priority queues, to the pool directly; only facts about the runner's life go through the loop.
-- A handler's context ends at its timeout, or when `Run`'s context is canceled. If that happens before a drain starts, the worker's ack has no live context, so it takes a fresh deadline of `Lifecycle.DrainTimeout` (one minute by default) from that moment. From the drain on, every ack uses the deadline the owner set.
+- Finishing a message normally uses its live caller context unless a runner window is active. `Lifecycle.DrainTimeout` bounds the drain or a rescue window when the caller's context has already ended; it is not a fresh timeout for every healthy ack.
 - The owner removes races on the runner's own decisions, not on the broker's. Whether a message was acked is still decided by the broker call and its result.
 
 ## Go further
 
-- [Reconnecting without mixing up connections](/deep-dives/reconnect-and-generations) - the client's lock-and-number approach and its ownership table.
+- [Reconnecting without mixing up connections](/deep-dives/reconnect-and-generations) - the client's lock-and-number approach.
 - [Lifecycle and shutdown](/advanced-topics/lifecycle-and-shutdown) - what a drain promises to callers.
 - [Consume flow](/development/consume-flow) - the maintainer trace of a runner from `Subscribe` to drain.
 - [Source-reading guide](/development/source-reading-guide#code-behind-the-deep-dives) - where this lives in the code.

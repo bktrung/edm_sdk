@@ -119,7 +119,7 @@ func runCapability(group *groupContext) {
 		producer := newDeferredProducer(t, group, profileDestination(group, name), deferredDelay)
 		consumer := deferredConsumer(t, group, []string{name}, map[string]time.Duration{name: deferredDelay}, 1)
 		due := deferredNow(group).Add(deferredDelay)
-		if err := producer.Publish(group.ctx, driver.OutboundMessage{Destination: name, Body: []byte("delayed"), DelayUntil: due}); err != nil {
+		if err := producer.Publish(group.ctx, driver.OutboundMessage{Destination: name, Body: []byte("delayed")}); err != nil {
 			t.Fatal(err)
 		}
 		assertNoDeliveryBefore(t, group, consumer, due, "delayed capability message before due time")
@@ -129,7 +129,7 @@ func runCapability(group *groupContext) {
 			t.Fatalf("delivery body=%q at %s, want delayed at or after %s", message.Body, message.ReceivedAt, due)
 		}
 		ackMessage(t, group, message)
-		group.capability("NativeDelay/delivery", strconv.FormatBool(group.effective.NativeDelay), capabilityBoolStatus(group.effective.NativeDelay), "DelayUntil was honored with the declared native or portable path")
+		group.capability("NativeDelay/delivery", strconv.FormatBool(group.effective.NativeDelay), capabilityBoolStatus(group.effective.NativeDelay), "the destination delay was honored with the declared native or portable path")
 	})
 
 	group.Check("delivery count reports first delivery and redelivery distinctly", func(t *testing.T) {

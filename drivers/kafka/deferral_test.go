@@ -226,6 +226,7 @@ func requeueRevokeConsumer(t *testing.T, key partitionKey, tracker *ackTracker) 
 		messages:        make(chan driver.InboundMessage, 1),
 		errors:          make(chan error, 1),
 		unsettled:       map[string]int{key.destination: 1},
+		admitted:        1,
 		outstanding:     map[partitionKey]int{key: 1},
 		inHand:          make(map[*kgo.Record]struct{}),
 		settlerCh:       make(chan struct{}, 1),
@@ -288,6 +289,7 @@ func TestConsumerRequeueAfterReassignmentQueuesNoOldCopy(t *testing.T) {
 	consumer.mu.Lock()
 	consumer.trackers[key] = reassigned
 	consumer.unsettled[key.destination] = 1
+	consumer.admitted = 1
 	consumer.outstanding[key] = 1
 	consumer.mu.Unlock()
 
@@ -315,10 +317,14 @@ func TestConsumerRequeueAfterReassignmentQueuesNoOldCopy(t *testing.T) {
 // partition's next owner redelivers the record; a charge kept for a redelivery
 // this consumer will never make would shrink the destination's window for the
 // rest of its life.
+//
+// The destination is paused by the caller, which is the state that keeps a
+// requeue queued: without it the Nack hands the redelivery over at once.
 func TestConsumerRevokeReleasesAQueuedRequeueCharge(t *testing.T) {
 	key := partitionKey{destination: "topic", partition: 0}
 	tracker := newAckTracker(4)
 	consumer, settler := requeueRevokeConsumer(t, key, tracker)
+	consumer.pauseReasons[key.destination] = pauseReasonSet{pauseReasonUserPaused: {}}
 
 	if err := settler.Nack(context.Background(), driver.NackOptions{Requeue: true}); err != nil {
 		t.Fatalf("Nack(requeue) on an owned partition = %v, want nil", err)
@@ -338,5 +344,36 @@ func TestConsumerRevokeReleasesAQueuedRequeueCharge(t *testing.T) {
 	}
 	if got := consumer.requeued[key]; got != 0 {
 		t.Fatalf("requeued = %d after the revoke, want 0", got)
+	}
+}
+
+// TestConsumerRequeueHandsTheRedeliveryOver proves a requeue on an owned,
+// unpaused partition is redelivered by the Nack itself, without a poll loop:
+// the redelivery is on Messages when Nack returns, as a reuse of the charges
+// its delivery held, and a revoke after it releases those charges through the
+// buffered delivery it discards.
+func TestConsumerRequeueHandsTheRedeliveryOver(t *testing.T) {
+	key := partitionKey{destination: "topic", partition: 0}
+	tracker := newAckTracker(4)
+	consumer, settler := requeueRevokeConsumer(t, key, tracker)
+
+	if err := settler.Nack(context.Background(), driver.NackOptions{Requeue: true}); err != nil {
+		t.Fatalf("Nack(requeue) on an owned partition = %v, want nil", err)
+	}
+	if got := len(consumer.messages); got != 1 {
+		t.Fatalf("Messages holds %d deliveries after the requeue, want the redelivery", got)
+	}
+	if got := consumer.requeued[key]; got != 0 {
+		t.Fatalf("requeued = %d after the handoff, want the redelivery taken", got)
+	}
+	if got, want := consumer.unsettled[key.destination], 1; got != want {
+		t.Fatalf("unsettled = %d after the handoff, want %d: the redelivery reuses the charge", got, want)
+	}
+	consumer.dropTracker(key.destination, key.partition)
+	if got := consumer.unsettled[key.destination]; got != 0 {
+		t.Fatalf("unsettled = %d after the revoke discarded the buffered redelivery, want 0", got)
+	}
+	if got := consumer.outstanding[key]; got != 0 {
+		t.Fatalf("outstanding = %d after the revoke discarded the buffered redelivery, want 0", got)
 	}
 }

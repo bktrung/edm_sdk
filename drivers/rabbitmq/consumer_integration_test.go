@@ -146,6 +146,16 @@ func TestConsumerDrainAfterCreationContextCancellation(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("EnsureTopology: %v", err)
 	}
+	t.Cleanup(func() {
+		management, err := newManagementClient(defaultEndpoint, driver.Config{})
+		if err != nil {
+			t.Errorf("cleanup %q: newManagementClient: %v", queue, err)
+			return
+		}
+		if _, err := management.deleteQueue(context.Background(), queue); err != nil {
+			t.Errorf("cleanup %q: delete queue: %v", queue, err)
+		}
+	})
 
 	consumer, err := conn.Consumer(ctx, driver.ConsumerConfig{Destinations: []string{queue}, Prefetch: 1})
 	if err != nil {
@@ -223,7 +233,7 @@ func TestStopReleasesReaderBlockedOnFullLane(t *testing.T) {
 		built.messages <- driver.InboundMessage{}
 	}
 	for deliveryTag := range cap(consumerLane.pending) {
-		consumerLane.pending <- amqp.Delivery{DeliveryTag: uint64(deliveryTag + 1)}
+		consumerLane.pending <- laneDelivery{Delivery: amqp.Delivery{DeliveryTag: uint64(deliveryTag + 1)}, generation: 1}
 	}
 	waitForwarderState(t, "paused forwarder", func() bool {
 		consumerLane.mu.Lock()
@@ -634,13 +644,13 @@ func TestNewConsumerRollsBackAfterLateFailure(t *testing.T) {
 	for range cap(built.messages) {
 		built.messages <- driver.InboundMessage{}
 	}
-	firstLane.pending <- amqp.Delivery{DeliveryTag: 1001}
+	firstLane.pending <- laneDelivery{Delivery: amqp.Delivery{DeliveryTag: 1001}, generation: 1}
 	waitForwarderState(t, "paused first-lane forwarder", func() bool {
 		firstLane.mu.Lock()
 		defer firstLane.mu.Unlock()
 		return firstLane.emitting == 1
 	})
-	firstLane.pending <- amqp.Delivery{DeliveryTag: 1002}
+	firstLane.pending <- laneDelivery{Delivery: amqp.Delivery{DeliveryTag: 1002}, generation: 1}
 
 	raw, err := amqp.Dial(defaultEndpoint)
 	if err != nil {

@@ -254,3 +254,25 @@ func TestSuccessorTopicIgnoresHeaderPriority(t *testing.T) {
 		t.Fatalf("resolveDeliveryTopic(mismatched header priority) = %q, want orders.created", got)
 	}
 }
+
+// TestSuccessorOutsideEveryDeclaredFamilyDerivesFromTheEventType pins the
+// fallback: a delivery whose destination belongs to no topic the subscription
+// declares has no consuming family to stay in, so its retry copy is routed by
+// the event type's own topic.
+func TestSuccessorOutsideEveryDeclaredFamilyDerivesFromTheEventType(t *testing.T) {
+	producer := &dispatchProducer{}
+	client, runner := newRetryBridgeRunner(t, producer, "orders.created")
+	defer func() { _ = client.Close(context.Background()) }()
+
+	envelope, message := divergentBridgeMessage(t, &dispatchSettler{})
+	message.Destination = "outside.declared.family"
+	if !retryAndSettle(runner, context.Background(), message, envelope, errors.New("temporary"), &deliveryState{}) {
+		t.Fatal("retry successor was not published and settled")
+	}
+	if len(producer.messages) != 1 {
+		t.Fatalf("retry copies = %d, want 1", len(producer.messages))
+	}
+	if got, want := producer.messages[0].Destination, "f1.test.payments.charged.orders.high.retry.1"; got != want {
+		t.Fatalf("retry successor destination = %q, want %q", got, want)
+	}
+}

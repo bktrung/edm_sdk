@@ -22,9 +22,16 @@ runner, err := client.Subscribe(ctx, f1.Subscription{
 })
 ```
 
-Equal message keys are handled one at a time. Different keys may run concurrently. F1 does not provide one global order across topics, priorities, keys, or consumer instances.
+Equal message keys serialize in scheduler dispatch order, not arrival order.
+A newer high-priority delivery can be selected before an older low-priority
+delivery with the same key. F1 does not provide one global order across topics,
+priorities, keys, or consumer instances.
 
-This guarantee ends at a retry. Once the retry copy is stored, the failed original is acknowledged and releases the key. A later message with that key can run before the retry returns. If a key must never be handled out of order, set `RetryConfig{MaxAttempts: 1}` so failure goes directly to dead-letter, or make the handler tolerate the reorder.
+A delayed retry can run after a later same-key message. Setting
+`RetryConfig{MaxAttempts: 1}` removes delayed retries, but does not create
+arrival ordering across lanes or prevent transport redelivery. Use
+application-owned sequence checks when the business rule requires those
+stronger guarantees.
 
 The connected driver must advertise [`ordered_by_key`](/drivers-and-capabilities#capability-report). F1 rejects an ordered subscription when the capability is unavailable. Check `client.Limits()` during startup when deployment portability matters.
 
@@ -43,9 +50,27 @@ _, err := client.Publisher().Publish(
 
 `WithKey` sets the routing key explicitly. `WithSubject` supplies a stable default when no explicit key is present. With neither option, F1 falls back to the generated event ID, which is safe but does not create a useful per-order relationship.
 
+## Hash collisions and abandoned handlers
+
+Ordered mode hashes each key to one worker queue. Different keys run
+concurrently only when they map to different workers; a collision makes
+unrelated entities wait behind one another. More concurrency creates more
+queues, but cannot split one hot key.
+
+For example, if orders A and C share a worker and order B uses another, a slow
+update for A holds up C while B keeps running. The hash gives stable affinity,
+not fairness between entities.
+
+This serialization depends on handlers honoring cancellation. F1 eventually
+stops waiting for a stuck handler and returns its delivery for redelivery, but
+Go cannot kill that handler's goroutine. Its worker can start another same-key
+delivery while the abandoned handler still runs. See
+[Running the handler](/development/consume-flow#running-the-handler) for this
+failure boundary.
+
 ## See what a retry does to key order
 
-A failed delivery releases its key as soon as the [retry copy](/learn/glossary#successor-publish) is stored. The next same-key message can therefore run before the retry is eligible again.
+A failed delivery releases its worker after the [retry copy](/learn/glossary#successor-publish) is confirmed and the source settlement path finishes. The next same-key message can therefore run before the retry is eligible again.
 
 ```mermaid
 sequenceDiagram
@@ -79,15 +104,14 @@ flowchart TB
     W --> H([handler])
 ```
 
-`Concurrency` is the number of handler workers. `Prefetch` is the subscription's in-flight limit, not a promise that the broker hands over that many messages at once. In ordered mode, lane capacity also bounds the dispatch queue. When a stage is full, F1 waits for capacity instead of growing an unbounded in-memory queue.
+`Concurrency` is the number of handler workers. `Prefetch` is the SDK-admitted unsettled limit, not a transport-buffer or broker-credit limit. Choose automatic sizing unless the application needs a smaller total backlog budget; see [prefetch resolution](/advanced-topics/configuration#prefetch-resolution) for precedence and validation.
 
 On a driver whose [parallelism is limited by partition count](/learn/glossary#partition-bound-scaling), F1 lets in one delivery per partition owned by a consumer. Its effective parallelism is the smaller of `Concurrency` and the assigned partition count. Raising `Prefetch` or priority weights above that count does not raise the ceiling. See [Kafka driver](/drivers/kafka#kafka-parallelism-and-partitions) for the warning and the `broker.kafka.maxExpectedInstances` setting.
-On a driver whose [parallelism is not limited by partitions](/learn/glossary#free-scaling), a subscription's effective `Prefetch` is the smaller
-of its configured prefetch and the sum of its lane capacities.
+The same total admission contract applies to every driver. Destination lane windows remain independent ceilings; a larger total does not let a hot lane borrow unused capacity from another lane.
 
 Use `Concurrency` that matches safe handler parallelism and downstream capacity. Set `Prefetch` high enough to keep those workers supplied, but not so high that a slow dependency creates an unnecessarily large in-flight backlog. Tune one setting at a time while watching handler latency, dependency saturation, redelivery, and drain time. [Why lane capacity stays small](/deep-dives/scheduler#why-lane-capacity-stays-small) explains what a deeper buffer costs.
 
-A named `Prefetch` must cover every topic, priority, and retry lane. Four attempts give three [retry steps](/learn/glossary#retry-tier). With one topic, three priorities, and four attempts, the minimum is 12, so `32` passes. An unnamed `Prefetch` is raised to the lane count automatically.
+A positive `Prefetch` may be smaller than the lane count: it limits total admitted work without shrinking lane windows. The explicit budget `32` below is an application backlog choice, not a lane-count requirement. Leave it zero or omitted to use the broker fallback or automatic sizing.
 
 ```go
 runner, err := client.Subscribe(ctx, f1.Subscription{
@@ -146,7 +170,7 @@ Retry timing and ready-work scheduling are separate decisions:
 1. `RetryConfig` decides when a failed event becomes eligible.
 2. `FairnessConfig` decides how that ready retry competes with fresh work.
 
-F1 gives retry lanes their own scheduling groups and normally reduces their weight with `RetryWeightDivisor`. A retry storm therefore does not consume all handler capacity, while a retry lane that has waited past its wait limit can still jump the queue. Returning `f1.RetryAfter` changes eligibility time, not priority after the retry is ready.
+F1 gives retry lanes their own scheduling groups and normally reduces their weight with `RetryWeightDivisor`. A retry storm therefore does not consume all handler capacity, while a retry lane that has waited past its wait limit can still jump the queue.
 
 ## Tune in this order
 

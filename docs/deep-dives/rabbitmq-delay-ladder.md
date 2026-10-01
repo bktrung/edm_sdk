@@ -2,31 +2,31 @@
 
 *By trungbk.*
 
-I park a retry due in 25 s and, a moment later, one due in 1 s. If both sat in one queue with a different expiry on each message, the 1 s retry would wait the full 25 s, because RabbitMQ only expires the message at the head of a queue.
+A retry due in 25 s can hold up one due in 1 s if both share a parking queue. Under RabbitMQ's head-of-queue expiration model, the short-delay copy behind the long-delay copy is not eligible for dead-lettering until the head can expire.
 
-RabbitMQ has no built-in delayed delivery, so F1 parks a retry copy in an ordinary queue until it is due, and I give each [retry step](/learn/glossary#retry-tier) its own [parking queue](/learn/glossary#parking-queue) whose queue-level TTL is that step's delay. With the default steps of 1 s, 5 s and 25 s, each subscription, topic, and priority gets three such queues, one per step, and each step also has a fallback queue that uses a per-message expiry.
+F1 gives each [retry step](/learn/glossary#retry-tier) its own [parking queue](/learn/glossary#parking-queue) to avoid that cross-step head-of-line blocking. Copies on the same step normally carry the same delay, so an earlier copy does not have a later expiration than the copies behind it.
 
-Every copy in a step's queue waits the same time, so RabbitMQ expires them in the order they arrived. A copy is released once its delay has passed and never waits behind a copy due later. The delay sets the earliest release time, not an exact one.
+Expiration makes a copy eligible to leave the parking queue; it does not promise when dead-letter routing completes or when a consumer runs the handler. The delay is a minimum wait, not an end-to-end completion bound.
 
-The timeline shows two retry copies parked at the same moment: A on the 25 s step and B on the 1 s step.
+The timeline compares copies A and B parked at the same moment with illustrative delays of 25 s and 1 s. It shows expiration eligibility, not measured delivery times.
 
 <div class="f1-timeline">
-<svg viewBox="0 0 640 232" role="img" aria-label="Two copies parked at 0 s. In one shared queue, B, due at 1 s, leaves with A at 25 s. With one queue per retry step, B leaves at 1 s and A at 25 s.">
-<text class="f1-timeline__section" x="10" y="22">One shared per-message TTL queue</text>
+<svg viewBox="0 0 640 232" role="img" aria-label="Illustrative expiration eligibility: in a shared queue B waits behind A until 25 s. With separate retry-step queues B is eligible at 1 s and A at 25 s. Actual dead-letter routing and consumption can finish later.">
+<text class="f1-timeline__section" x="10" y="22">One queue shared by every step</text>
 <text class="f1-timeline__row" x="10" y="51">A, due 25 s</text>
 <rect class="f1-timeline__due" x="150" y="36" width="350" height="22" rx="4" />
-<text class="f1-timeline__in" x="158" y="51">waits, leaves at 25 s</text>
+<text class="f1-timeline__in" x="158" y="51">eligible at 25 s</text>
 <text class="f1-timeline__row" x="10" y="79">B, due 1 s</text>
 <rect class="f1-timeline__due" x="150" y="64" width="14" height="22" rx="4" />
 <rect class="f1-timeline__late" x="164" y="64" width="336" height="22" rx="4" />
-<text class="f1-timeline__in" x="172" y="79">stuck behind A, leaves at 25 s, 24 s late</text>
+<text class="f1-timeline__in" x="172" y="79">behind A until 25 s, past its 1 s expiry</text>
 <text class="f1-timeline__section" x="10" y="122">One queue per retry step</text>
 <text class="f1-timeline__row" x="10" y="151">A, due 25 s</text>
 <rect class="f1-timeline__due" x="150" y="136" width="350" height="22" rx="4" />
-<text class="f1-timeline__in" x="158" y="151">park.fixed-25000ms, leaves at 25 s, not held back</text>
+<text class="f1-timeline__in" x="158" y="151">separate queue, eligible at 25 s</text>
 <text class="f1-timeline__row" x="10" y="179">B, due 1 s</text>
 <rect class="f1-timeline__due" x="150" y="164" width="14" height="22" rx="4" />
-<text class="f1-timeline__out" x="172" y="179">park.fixed-1000ms, leaves at 1 s, not held back</text>
+<text class="f1-timeline__out" x="172" y="179">separate queue, eligible at 1 s</text>
 <line class="f1-timeline__axis" x1="150" y1="200" x2="598" y2="200" />
 <line class="f1-timeline__axis" x1="150" y1="197" x2="150" y2="203" />
 <text class="f1-timeline__tick" x="150" y="220" text-anchor="middle">0 s</text>
@@ -44,68 +44,41 @@ The timeline shows two retry copies parked at the same moment: A on the 25 s ste
 
 ## Background
 
-A parking queue has a queue-level TTL and a dead-letter route to its destination, here the retry step's own queue, not the original topic's queue. When the TTL expires, RabbitMQ dead-letters the copy to its default exchange, which delivers a message to the queue whose name equals the routing key; F1 sets that key to the retry step's queue name.
+A parking queue dead-letters expired copies to the retry destination, not the original topic queue. The extra queue lets the broker hold the copy without tying up a handler or keeping the original delivery unacked for the entire delay.
 
-F1 declares every retry step as a fixed-delay destination: a destination where every message waits the same delay, the step's delay from the retry policy, counted from when it is published. The driver can therefore park all of the step's messages in one queue.
-
-Every publish is mandatory and uses publisher confirms. An unroutable copy comes back as a return before the confirmation, so a missing parking queue is an explicit publish error rather than a silent drop.
+The [RabbitMQ driver reference](/drivers/rabbitmq#delayed-and-retried-messages-need-per-destination-parking-queues) owns provisioning policy, durability, expiration rounding, limits, and queue settings. The executable owners are [topology construction](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/drivers/rabbitmq/topology.go) and [publish routing](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/drivers/rabbitmq/producer.go).
 
 ## One retry, step by step
 
-1. The handler returns a retryable error. F1 picks the retry step for this attempt, or for a `RetryAfter` the step whose delay is closest to the requested one, which can be shorter than asked. It sets the due time to the moment it builds the copy plus that step's delay.
-2. It publishes the copy to the step's retry destination, for example `f1.<env>.orders.<subscription>.high.retry.2`, with that due time. The source delivery is acked only after the copy is confirmed.
-3. The driver compares the remaining delay with the step's delay. Within it, the copy goes to `<destination>.park.fixed-<delay>ms` and carries no per-message expiration.
-4. The queue's TTL expires, RabbitMQ dead-letters the copy to the retry destination, and the runner consumes it through the step's retry lane.
+1. The handler returns a retryable error. F1 picks the retry step for this attempt and records the copy's due time: the moment it builds the copy plus that step's delay.
+2. It publishes the copy to the step's retry destination, for example `f1.<env>.orders.<subscription>.high.retry.2`. The source delivery is acked only after the copy is confirmed.
+3. The driver routes every message for that destination to `<destination>.park` and sets the step's delay as the message's expiration.
+4. Once expired and at the queue head, the copy is eligible for dead-letter routing to the retry destination. Routing and later consumption are separate steps and can take longer.
 
 ```mermaid
 flowchart TB
-    R[retry copy] --> W{remaining delay within the step delay?}
-    W -->|yes| Q[fixed parking queue for the step]
-    W -->|no| P[per-message parking queue]
-    Q --> D[retry destination queue]
-    P --> D
+    R[Retry copy] --> Q[Parking queue]
+    Q -->|Expired at head| D[Retry destination]
 ```
 
-The copy is published a few milliseconds after its due time is set, so by then its remaining delay is slightly less than the step's delay, and it always fits the step's queue. F1's retry path never sends a copy to the per-message queue; that queue is only a safety net for a due time longer than the step's delay.
-
-Each retry step declares two parking queues:
-
-| Queue | Expiry behavior | Used for |
-| --- | --- | --- |
-| `<destination>.park.fixed-<delay>ms` | queue-level TTL equal to the step's delay | every retry copy on that step |
-| `<destination>.park` | per-message TTL | a remaining delay longer than the step's delay |
-
-The delay is written into the fixed queue's name in whole milliseconds, so changing a step's delay declares a new queue rather than conflicting with the old queue's TTL.
-
-## Delays that are not retry steps
-
-The driver also accepts a message that carries its own due time. F1's retries and publish API never produce one; the driver port offers it, and the driver conformance suite tests it. The driver parks such a message in one of eight queues with fixed TTLs from 500 ms to 64 s, rounding the remaining delay up so the message is never released early, and uses the per-message `<destination>.park` queue for anything over 64 s, where head-of-line delay can return.
-
-Rounding up costs lateness: a 5 s delay waits in the 8 s queue. Two messages parked at different moments can also leave out of due-time order, because each one is rounded from its own remaining delay. A retry step pays neither cost, since its queue's TTL is exactly its delay.
-
-## What the driver reports
-
-`Client.Limits()` reports how late such delays can be, counting only the rounding to a fixed delay; publish time and the time until a runner picks the message up come on top: a delay below 500 ms can be late by up to 500 ms, a delay up to 64 s can be late by as much as the requested delay, and a delay above 64 s has no limit on lateness. These limits cover every delayed destination. A retry step's own fixed queue is late only by the time its publish took, well inside them.
+The delay stays on each message rather than in the queue's name or TTL arguments. This lets a policy change reuse the queue instead of requiring new broker topology. The trade-off appears when the delay decreases: a new short-delay copy can sit behind an older long-delay copy in that step's queue. Rolling deployments can produce the same mixture.
 
 ## Dead-letter safety
 
-Quorum parking queues are declared with four arguments that work together: `x-dead-letter-exchange` set to the default exchange, `x-dead-letter-routing-key` set to the destination, `x-dead-letter-strategy=at-least-once`, and `x-overflow=reject-publish`. RabbitMQ honours at-least-once dead-lettering only when the overflow mode is `reject-publish`; without it, or without the strategy, the broker quietly falls back to at-most-once and a parked retry can be lost with no error.
+Confirming the copy in the parking queue protects the first publish, not the later dead-letter transfer. F1 can already have acked the original when that transfer happens, so loss on the parking-to-destination route would lose the retry.
 
-Classic queues cannot provide that at-least-once dead-lettering mode, so their delay path remains at-most-once. The queue type is therefore a delivery guarantee, not only a storage preference.
-
-Topology policy decides who creates the parking queues. `TopologyDeclare` creates them, `TopologyVerify` requires matching queues, and `TopologyNone` leaves provisioning to the operator.
+Quorum parking queues use at-least-once dead-lettering with reject-publish overflow because the dead-letter strategy depends on that overflow mode. A dead-letter route alone is not enough. Classic parking queues cannot provide that mode, leaving the transfer at-most-once even when the initial publish was confirmed. Queue type therefore changes the failure boundary, not just the storage choice; the driver reference holds the exact declaration settings.
 
 ## Limits and trade-offs
 
-- A retry step needs two parking queues: its fixed queue and the per-message fallback.
-- Changing a step's delay declares a new fixed queue; the old one keeps draining into the destination.
-- A delay that is not a retry step uses eight fixed-TTL queues plus the queue above 64 s, can be late, and can leave out of due-time order.
-- On the per-message queue, a message can wait behind another message due later.
-- Classic queues make the delay path at-most-once because their dead-lettering mode cannot be upgraded to at-least-once.
+- Separating retry steps avoids cross-step head-of-line blocking at the cost of an extra queue per delayed destination.
+- Reusing a queue across delay changes avoids topology churn but permits mixed-delay head-of-line blocking within that step.
+- Expiration supplies no maximum for dead-letter transfer, consumer pickup, or handler completion.
 
 ## Go further
 
-- [Drivers and capabilities](/drivers-and-capabilities) - parking queues, topology policy, and provider limits.
+- [RabbitMQ driver](/drivers/rabbitmq#delayed-and-retried-messages-need-per-destination-parking-queues) - topology, durability, expiration rounding, and settings.
 - [Failure handling](/advanced-topics/failure-handling) - retry delays and dead-letter policy.
-- [Life of a delivery](/deep-dives/life-of-a-delivery) - where retry copies are created and acked.
+- [Consume flow](/development/consume-flow) - where retry copies are created and acked.
+- [Kafka retry delays](/deep-dives/kafka-retry-delays) - the same retry steps on a broker with no parking queue.
 - [Source-reading guide](/development/source-reading-guide) - the maintainer route through the implementation.

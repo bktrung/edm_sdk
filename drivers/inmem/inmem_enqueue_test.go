@@ -50,14 +50,13 @@ func TestInboundMessage_EnqueuedAtUsesPublishTime(t *testing.T) {
 func TestInboundMessage_DeferredKeepsPublishTime(t *testing.T) {
 	publishAt := time.Date(2026, time.February, 3, 4, 5, 6, 7, time.UTC)
 	fake := clock.NewFake(publishAt)
-	ctx, conn, producer := openEnqueueTest(t, fake, driver.DestinationSpec{Name: "orders"})
+	ctx, conn, producer := openEnqueueTest(t, fake, driver.DestinationSpec{Name: "orders", Delay: time.Hour})
 	consumer, err := conn.Consumer(ctx, driver.ConsumerConfig{Destinations: []string{"orders"}, Effective: testCaps()})
 	require.NoError(t, err)
 
 	dueAt := publishAt.Add(time.Hour)
 	require.NoError(t, producer.Publish(ctx, driver.OutboundMessage{
 		Destination: "orders",
-		DelayUntil:  dueAt,
 		Body:        []byte("later"),
 	}))
 	fake.BlockUntil(1)

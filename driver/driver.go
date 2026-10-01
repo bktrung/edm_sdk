@@ -220,14 +220,14 @@ type ConsumerConfig struct {
 	Group        string   // Group is the consumer group or queue-set identity.
 	Destinations []string // Destinations lists this subscription's main and retry destinations.
 
-	// Prefetch is the subscription-wide in-flight budget. The core caps it by
-	// the sum of lane capacities and passes those capacities in PerDestination.
-	// Prefetch below the lane count is rejected by the core rather than silently
-	// changing the budget.
+	// Prefetch bounds total SDK-admitted unsettled deliveries across all
+	// destinations when positive. The core always supplies a positive budget:
+	// automatic sizing uses the sum of lane capacities, and explicit budgets
+	// are capped by that sum. Broker/client transport read-ahead is separate.
 	// In ordered mode, the effective prefetch is also the worker queue depth.
 	Prefetch int
-	// PerDestination gives the in-flight capacity for each destination, keyed
-	// by its physical name.
+	// PerDestination gives an additional admission ceiling for each physical
+	// destination. Its entries may sum above Prefetch; both bounds apply.
 	PerDestination map[string]int
 
 	// Delays maps physical destination names to their declared delays. A
@@ -257,9 +257,8 @@ type ConsumerConfig struct {
 // its PerDestination entry when that is positive, otherwise an even share of
 // Prefetch with the remainder going to the first destinations. index must be
 // in range. It is never less than 1, so when Prefetch is smaller than the
-// number of destinations the shares add up to more than Prefetch. The Kafka
-// and RabbitMQ adapters size each destination's window with it, so they split
-// a subscription's budget the way the core counts it.
+// number of destinations the windows add up to more than Prefetch. These
+// destination ceilings do not replace the positive aggregate Prefetch cap.
 func (c ConsumerConfig) DestinationPrefetch(index int) int {
 	if index >= 0 && index < len(c.Destinations) {
 		if value := c.PerDestination[c.Destinations[index]]; value > 0 {

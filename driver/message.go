@@ -25,19 +25,6 @@ type OutboundMessage struct {
 	// Priority is an optional broker-priority hint. The core does not depend on
 	// broker priority for correctness.
 	Priority uint8
-
-	// DelayUntil is when a deferred message becomes eligible for delivery. Zero
-	// means deliver immediately.
-	//
-	// A driver may instead use the destination's declared delay. In that model,
-	// delivery is eligible at publish time plus the destination delay, regardless
-	// of DelayUntil, and must not occur earlier. Deferred messages within one
-	// partition are delivered in publish order; for a single-partition destination
-	// this is destination order.
-	//
-	// The core sets DelayUntil to the time it builds a retry copy plus that
-	// retry tier's delay, unless the application requests a custom retry delay.
-	DelayUntil time.Time
 }
 
 // InboundMessage is a message received from a broker.

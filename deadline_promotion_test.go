@@ -188,10 +188,10 @@ func TestPromotionLimiterIgnoresNonPromotionAndUnknownLane(t *testing.T) {
 	}
 }
 
-// TestPromotionDispatchLoopNoObserverEmitsNothing is the worker-path half of
-// the old nil-limiter assertion: with no observer the dispatch loop builds no
-// limiter, records nothing, and promotions on the hot path must not panic.
-func TestPromotionDispatchLoopNoObserverEmitsNothing(t *testing.T) {
+// TestPromotionDispatchLoopWithoutObserverStillDrains runs the promotion path
+// with no observer, where the dispatch loop builds no limiter: a promotion on
+// the hot path must not panic or stall, so the whole backlog is handled.
+func TestPromotionDispatchLoopWithoutObserverStillDrains(t *testing.T) {
 	rig := newPromotionDispatchRig(t, nil)
 	const highBacklog = 8
 	gate := make(chan struct{})

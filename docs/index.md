@@ -20,7 +20,7 @@ features:
     link: /advanced-topics/failure-handling
     linkText: Failure handling
   - title: Zero-loss shutdown
-    details: A drain finishes every in-flight message before the process exits. Nothing accepted is dropped on a rolling restart or SIGTERM.
+    details: A drain lets accepted deliveries finish within configured time limits. Unfinished deliveries remain available for broker redelivery, and Drain reports failure.
     link: /advanced-topics/lifecycle-and-shutdown
     linkText: Lifecycle and shutdown
   - title: Retry steps to a dead-letter queue
@@ -28,7 +28,7 @@ features:
     link: /advanced-topics/failure-handling
     linkText: Failure handling
   - title: Starvation-free priority, ordering by key
-    details: Low-priority work has a bounded wait under sustained high-priority load. Per-key order is preserved when a subscription asks for it.
+    details: Weighted scheduling and overdue-lane promotion keep low-priority work moving without promising a maximum wait. Ordered mode serializes equal-key handlers, but delayed retries can run after later messages.
     link: /advanced-topics/ordering-and-scheduling
     linkText: Ordering and scheduling
   - title: Poison-message safety

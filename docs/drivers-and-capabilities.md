@@ -88,6 +88,9 @@ the `fairness` fields (`prefetchFactor`, `retryWeightDivisor`,
 subscription's prefix that matches none of them fails `Subscribe`, so a
 misspelled key is an error rather than a silent no-op.
 
+For prefetch zero-clearing and broker fallback precedence, see
+[prefetch resolution](/advanced-topics/configuration#prefetch-resolution).
+
 For a subscription named `ORDERS`, the fairness overrides are:
 
 | Setting | Environment variable |
@@ -220,7 +223,7 @@ The report lists these rows, in this order:
 | `per_message_ack` | `native` or `emulated` | `driver.Capabilities.PerMessageAck` selects the mode. Native: the broker acks each message on its own, so a slow message does not hold its lane's in-flight slots. Emulated: the core finishes each message itself in its own order, so a slow message holds its lane's in-flight slots. |
 | `ordered_by_key` | `native` or `unavailable` | `driver.Capabilities.OrderedByKey` selects the mode. Native means ordering is guaranteed for equal keys. Unavailable means a subscription requesting ordered mode is rejected. |
 | `priority_fairness` | `emulated` | The core's scheduler uses weighted lanes instead, so fairness is per lane and not per broker. Broker priority, when declared through `driver.Capabilities.NativePriority`, does not replace this core scheduling contract. |
-| `native_delay` | `native` or `emulated` | `driver.Capabilities.NativeDelay` selects the mode. The connected `driver.DelayAccuracy` is rendered as the lateness bound; its zero value is reported as `delay accuracy not declared by this driver`. A driver can report `emulated` while still declaring accuracy for its own delay path. |
+| `native_delay` | `native` or `emulated` | `driver.Capabilities.NativeDelay` selects the mode. Either way a message on a delayed destination is held for that destination's delay: by the broker when native, and by the driver, in a parking queue or on the consumer, when emulated. |
 | `delivery_count` | `native` or `emulated` | `driver.Capabilities.NativeDeliveryCount` selects the mode. Native: the broker supplies a redelivery count to observer events, but handler code reads the core's one-based attempt count instead. Emulated: the core counts handler attempts in the envelope; retry copies increment that count, broker redeliveries do not, and a new publish resets it to one. |
 | `dlq_backstop` | `native` or `unavailable` | `driver.Capabilities.NativeDLQ` selects the mode. Native: the broker has [its own dead-letter queue](/learn/glossary#backstop) for a message it gives up on; the core also publishes its own dead-letter copies, but this row reports only the broker's routing. Unavailable: the broker has no dead-letter queue of its own, and the core's dead-letter path still publishes a copy and acks the original after the copy is confirmed. |
 | `lag_metrics` | `native` or `unavailable` | `driver.Capabilities.LagQueryable` selects the mode. Native means the broker exposes a backlog query; unavailable means it does not. No additional detail is emitted for this status. |

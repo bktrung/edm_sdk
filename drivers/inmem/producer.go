@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"time"
 
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/driver"
 )
@@ -52,8 +53,8 @@ func (p *producer) Publish(ctx context.Context, messages ...driver.OutboundMessa
 			failed[i] = classify("publish", driver.KindNotFound, driver.ErrDestinationMissing)
 			continue
 		}
-		due := message.DelayUntil
-		if due.IsZero() && dest.spec.Delay > 0 {
+		var due time.Time
+		if dest.spec.Delay > 0 {
 			due = p.conn.clock.Now().Add(dest.spec.Delay)
 		}
 		queued := &queuedMessage{

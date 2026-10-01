@@ -114,6 +114,36 @@ func runConsume(group *groupContext) {
 		group.vector.add(BehaviorEvent{ID: "prefetch-total", Outcome: "ok", FinalDestination: "consume.prefetch-total"})
 	})
 
+	group.Check("prefetch caps admitted deliveries below destination capacity sum", func(t *testing.T) {
+		const destinationA = "consume.prefetch-cap-a"
+		const destinationB = "consume.prefetch-cap-b"
+		producerA := newPlacedProducer(t, group, destinationA, driver.ProducerConfig{Effective: group.effective})
+		producerB := newPlacedProducer(t, group, destinationB, driver.ProducerConfig{Effective: group.effective})
+		consumer := newConsumerFor(t, group, driver.ConsumerConfig{
+			Destinations: []string{destinationA, destinationB}, Prefetch: 2,
+			PerDestination: map[string]int{destinationA: 2, destinationB: 2}, Effective: group.effective,
+		})
+		publishPlacedCount(t, group, producerA, destinationA, 4)
+		publishPlacedCount(t, group, producerB, destinationB, 4)
+		held := []driver.InboundMessage{
+			receiveMessage(t, group, consumer),
+			receiveMessage(t, group, consumer),
+		}
+		// Broker transport credit may exceed SDK admission, so only
+		// Messages and the settlers held by the caller prove this cap.
+		assertNoDelivery(t, group, consumer, "delivery beyond aggregate Prefetch=2")
+		for range 6 {
+			ackMessage(t, group, held[0])
+			held[0] = held[1]
+			held[1] = receiveMessage(t, group, consumer)
+			assertNoDelivery(t, group, consumer, "delivery beyond aggregate Prefetch=2 after ACK/refill")
+		}
+		for _, message := range held {
+			ackMessage(t, group, message)
+		}
+		group.vector.add(BehaviorEvent{ID: "prefetch-admission-cap", Outcome: "ok", FinalDestination: destinationA + "," + destinationB})
+	})
+
 	group.Check("prefetch applies each destination share", func(t *testing.T) {
 		producerA := newPlacedProducer(t, group, "consume.prefetch-share-a", driver.ProducerConfig{Effective: group.effective})
 		producerB := newPlacedProducer(t, group, "consume.prefetch-share-b", driver.ProducerConfig{Effective: group.effective})

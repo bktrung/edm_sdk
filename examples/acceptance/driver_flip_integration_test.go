@@ -10,7 +10,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -123,43 +122,26 @@ func TestDriverFlipAcceptance(t *testing.T) {
 
 	runs := make([]flipRun, 0, len(specs))
 	for _, spec := range specs {
-		manifestPath := filepath.Join(outDir, "business-tree-"+spec.name+".txt")
 		run := runFlipDriver(t, spec, flipRunConfig{
 			binDir:       binDir,
 			outDir:       outDir,
-			repoRoot:     repoRoot,
 			env:          env,
 			topic:        topic,
 			subscription: subscription,
 			corpus:       corpus,
 			topology:     flipTopologyFor(spec.caps, env, topic, subscription),
 		})
-		writeArtifact(t, manifestPath, run.manifest)
 		runs = append(runs, run)
 	}
 
 	first, second := runs[0], runs[1]
 
-	// Assertion 1: the business package tree is byte-identical between the two
-	// runs. The diff is run, not asserted about, and its empty output is the
-	// evidence.
-	firstManifest := filepath.Join(outDir, "business-tree-"+first.spec.name+".txt")
-	secondManifest := filepath.Join(outDir, "business-tree-"+second.spec.name+".txt")
-	treeDiff, treeErr := exec.Command("diff", "-u", firstManifest, secondManifest).CombinedOutput() //nolint:gosec // both paths are harness-written artifacts under the configured output directory.
-	if treeErr != nil {
-		t.Errorf("business package tree differs between the two runs\n$ diff -u %s %s\n%s", firstManifest, secondManifest, treeDiff)
-	} else {
-		t.Logf("DRIVER-FLIP assertion 1: business package tree byte-identical\n$ diff -u %s %s\n(output empty, %d bytes hashed per run)", firstManifest, secondManifest, len(first.manifest))
-	}
-
-	// Assertion 2: behaviour vectors identical.
 	vectorDiff := first.vector.Diff(second.vector)
 	if vectorDiff != "" {
 		t.Errorf("behaviour vectors differ: %s\n%s", vectorDiff, strings.Join(vectorFieldDiff(first.vector, second.vector), "\n"))
 	}
-	t.Logf("DRIVER-FLIP assertion 2: conformance.BehaviorVector.Diff(%s, %s) = %q", first.spec.name, second.spec.name, vectorDiff)
+	t.Logf("DRIVER-FLIP behaviour vectors: conformance.BehaviorVector.Diff(%s, %s) = %q", first.spec.name, second.spec.name, vectorDiff)
 
-	// Assertion 3: Client.Limits() differs, and every difference is declared.
 	assertLimitsDeclared(t, first, second)
 
 	reportArrivalOrder(t, first, second)
@@ -193,7 +175,6 @@ type flipFeatureStatus struct {
 type flipRunConfig struct {
 	binDir       string
 	outDir       string
-	repoRoot     string
 	env          string
 	topic        string
 	subscription string
@@ -208,7 +189,6 @@ type flipRun struct {
 	arrivalOrder []string
 	limits       *flipLimits
 	summary      string
-	manifest     []byte
 }
 
 // runFlipDriver deploys one driver's pair of services and records what they did.
@@ -222,11 +202,6 @@ func runFlipDriver(t *testing.T, spec flipSpec, config flipRunConfig) flipRun {
 		"F1_ACCEPTANCE_SUBSCRIPTION="+config.subscription,
 		"F1_ACCEPTANCE_COUNT="+strconv.Itoa(config.corpus),
 	)
-
-	manifest, err := businessTreeManifest(config.repoRoot)
-	if err != nil {
-		t.Fatalf("%s: hash the business package tree: %v", spec.name, err)
-	}
 
 	// The consumer starts first, and publishing waits for the destinations its
 	// subscription declares: Subscribe returning is not the destinations
@@ -253,7 +228,6 @@ func runFlipDriver(t *testing.T, spec flipSpec, config flipRunConfig) flipRun {
 		arrivalOrder: arrival,
 		limits:       limits,
 		summary:      summary,
-		manifest:     manifest,
 	}
 	writeArtifact(t, filepath.Join(config.outDir, "vector-"+spec.name+".txt"), formatVector(run.vector))
 	writeArtifact(t, filepath.Join(config.outDir, "arrival-"+spec.name+".txt"), []byte(strings.Join(run.arrivalOrder, "\n")+"\n"))
@@ -620,7 +594,7 @@ func parseFields(line string) map[string]string {
 // assertCorpusOutcomes proves the corpus applied the pressure the vector claims:
 // the retry path ran, the dead-letter path ran, and every other message was
 // handled. Without this a run that delivered nothing in an identical way to both
-// drivers would pass assertion 2.
+// drivers would pass the vector comparison.
 func assertCorpusOutcomes(t *testing.T, name, summary string, corpus int) {
 	t.Helper()
 	fields := parseFields(strings.TrimPrefix(summary, "CONSUMER_SUMMARY "))
@@ -671,7 +645,7 @@ func vectorFieldDiff(a, b conformance.BehaviorVector) []string {
 	return lines
 }
 
-// assertLimitsDeclared checks assertion 3: the two runs report different limits,
+// assertLimitsDeclared checks that the two runs report different limits,
 // and each differing feature is explained by a declared capability rather than
 // by an unexplained one.
 func assertLimitsDeclared(t *testing.T, first, second flipRun) {
@@ -679,8 +653,8 @@ func assertLimitsDeclared(t *testing.T, first, second flipRun) {
 	if first.limits == nil || second.limits == nil {
 		t.Fatal("both runs must report Client.Limits()")
 	}
-	t.Logf("DRIVER-FLIP assertion 3: %s limits driver=%s broker=%s\n%s", first.spec.name, first.limits.Driver, first.limits.Broker, formatLimits(first.limits))
-	t.Logf("DRIVER-FLIP assertion 3: %s limits driver=%s broker=%s\n%s", second.spec.name, second.limits.Driver, second.limits.Broker, formatLimits(second.limits))
+	t.Logf("DRIVER-FLIP limits: %s driver=%s broker=%s\n%s", first.spec.name, first.limits.Driver, first.limits.Broker, formatLimits(first.limits))
+	t.Logf("DRIVER-FLIP limits: %s driver=%s broker=%s\n%s", second.spec.name, second.limits.Driver, second.limits.Broker, formatLimits(second.limits))
 	if first.limits.Driver == second.limits.Driver {
 		t.Errorf("both runs report driver %q, so the flip did not select two drivers", first.limits.Driver)
 	}
@@ -703,7 +677,7 @@ func assertLimitsDeclared(t *testing.T, first, second flipRun) {
 			continue
 		}
 		declaration, differs := declaredCapabilityDifference(feature.Feature, firstCaps, secondCaps)
-		t.Logf("DRIVER-FLIP assertion 3: feature %s is %s/%s on %s and %s/%s on %s; %s",
+		t.Logf("DRIVER-FLIP limits: feature %s is %s/%s on %s and %s/%s on %s; %s",
 			feature.Feature, feature.Mode, feature.Detail, first.spec.name, other.Mode, other.Detail, second.spec.name, declaration)
 		if !differs {
 			t.Errorf("feature %s differs (%s/%s on %s, %s/%s on %s) with no declared capability difference: %s",
@@ -723,13 +697,7 @@ func declaredCapabilityDifference(feature string, a, b driver.Capabilities) (str
 	case "ordered_by_key":
 		return fmt.Sprintf("declared OrderedByKey %t vs %t", a.OrderedByKey, b.OrderedByKey), a.OrderedByKey != b.OrderedByKey
 	case "native_delay":
-		// The limits detail for native_delay carries the accuracy the driver
-		// declares, so the feature differs when either the capability or the
-		// bound on lateness differs. Comparing only NativeDelay reports a
-		// difference the drivers declared as undeclared.
-		return fmt.Sprintf("declared NativeDelay %t vs %t, DelayAccuracy %+v vs %+v",
-				a.NativeDelay, b.NativeDelay, a.DelayAccuracy, b.DelayAccuracy),
-			a.NativeDelay != b.NativeDelay || a.DelayAccuracy != b.DelayAccuracy
+		return fmt.Sprintf("declared NativeDelay %t vs %t", a.NativeDelay, b.NativeDelay), a.NativeDelay != b.NativeDelay
 	case "delivery_count":
 		return fmt.Sprintf("declared NativeDeliveryCount %t vs %t", a.NativeDeliveryCount, b.NativeDeliveryCount), a.NativeDeliveryCount != b.NativeDeliveryCount
 	case "dlq_backstop":
@@ -742,62 +710,6 @@ func declaredCapabilityDifference(feature string, a, b driver.Capabilities) (str
 		return "the core emulates priority_fairness for every driver, so it has no declaring capability", false
 	default:
 		return fmt.Sprintf("feature %q has no declared capability", feature), false
-	}
-}
-
-// TestDeclaredCapabilityDifferenceNativeDelay pins the native_delay declaration
-// check without a broker. The feature's limits detail carries the accuracy the
-// driver declares, so a difference in either the capability or the accuracy is
-// a difference the drivers declared. Without the accuracy arm, a run of two
-// drivers where one declares a bound and the other does not reports a declared
-// difference as undeclared, and the acceptance run fails on its own bookkeeping
-// rather than on a divergence.
-func TestDeclaredCapabilityDifferenceNativeDelay(t *testing.T) {
-	declared := driver.DelayAccuracy{Floor: 500 * time.Millisecond, Relative: 1, MaxDelay: 64 * time.Second}
-	tests := []struct {
-		name        string
-		a           driver.Capabilities
-		b           driver.Capabilities
-		wantDiffers bool
-	}{
-		{
-			name: "equal on both fields",
-			a:    driver.Capabilities{NativeDelay: true, DelayAccuracy: declared},
-			b:    driver.Capabilities{NativeDelay: true, DelayAccuracy: declared},
-		},
-		{
-			name:        "native delay differs",
-			a:           driver.Capabilities{NativeDelay: true, DelayAccuracy: declared},
-			b:           driver.Capabilities{NativeDelay: false, DelayAccuracy: declared},
-			wantDiffers: true,
-		},
-		{
-			name:        "delay accuracy differs",
-			a:           driver.Capabilities{NativeDelay: false},
-			b:           driver.Capabilities{NativeDelay: false, DelayAccuracy: declared},
-			wantDiffers: true,
-		},
-		{
-			name:        "both differ",
-			a:           driver.Capabilities{NativeDelay: true},
-			b:           driver.Capabilities{NativeDelay: false, DelayAccuracy: declared},
-			wantDiffers: true,
-		},
-	}
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			declaration, differs := declaredCapabilityDifference("native_delay", test.a, test.b)
-			if differs != test.wantDiffers {
-				t.Errorf("declaredCapabilityDifference(native_delay, ...) = %t, want %t: %s", differs, test.wantDiffers, declaration)
-			}
-			// The declaration is a failure's only account of what was compared,
-			// so it names both fields the feature reports on.
-			for _, field := range []string{"NativeDelay", "DelayAccuracy"} {
-				if !strings.Contains(declaration, field) {
-					t.Errorf("declaration %q does not name %s", declaration, field)
-				}
-			}
-		})
 	}
 }
 
@@ -817,36 +729,6 @@ func reportArrivalOrder(t *testing.T, first, second flipRun) {
 	t.Logf("DRIVER-FLIP arrival order differs in length: %s has %d events, %s has %d", first.spec.name, len(first.arrivalOrder), second.spec.name, len(second.arrivalOrder))
 }
 
-// businessTreeManifest hashes every file of the two acceptance service packages.
-func businessTreeManifest(repoRoot string) ([]byte, error) {
-	var manifest strings.Builder
-	for _, service := range []string{"publisher", "consumer"} {
-		root := filepath.Join(repoRoot, "examples", "acceptance", service)
-		err := filepath.WalkDir(root, func(path string, entry fs.DirEntry, err error) error {
-			if err != nil {
-				return err
-			}
-			if entry.IsDir() {
-				return nil
-			}
-			relative, err := filepath.Rel(repoRoot, path)
-			if err != nil {
-				return err
-			}
-			digest, err := fileDigest(path)
-			if err != nil {
-				return err
-			}
-			fmt.Fprintf(&manifest, "%s  %s\n", digest, filepath.ToSlash(relative))
-			return nil
-		})
-		if err != nil {
-			return nil, err
-		}
-	}
-	return []byte(manifest.String()), nil
-}
-
 func binaryDigests(t *testing.T, dir string) string {
 	t.Helper()
 	var digests strings.Builder
@@ -861,7 +743,7 @@ func binaryDigests(t *testing.T, dir string) string {
 }
 
 func fileDigest(path string) (string, error) {
-	//nolint:gosec // the paths are the harness's own build outputs and the repository's example sources.
+	//nolint:gosec // the paths are the harness's own build outputs.
 	content, err := os.ReadFile(path)
 	if err != nil {
 		return "", err

@@ -28,65 +28,60 @@ flowchart LR
     MR --> P
 ```
 
-For one topic, the production group order is high main, high retry, low main, low retry, medium main, and medium retry. That is simply alphabetical order of the lane names (high, low, medium), not a ranking. It matters only for ties: equal scores keep the earlier group, so low main wins a tie against medium main.
-
-## The default lane sizes
-
-The default subscription has concurrency 16, priority weights 8, 4, and 1, a retry divisor of 2, a prefetch factor of 2, and four total attempts. The retry policy therefore adds three lanes to each retry group.
-
-| Lane group | Lanes in the group | Weight | Wait limit | Capacity per lane |
-| --- | --- | ---: | ---: | ---: |
-| High main | one fresh lane | 8 | 5 s | 14 |
-| High retry | three retry lanes | 4 | 10 s | 8 |
-| Low main | one fresh lane | 1 | 2 min | 6 |
-| Low retry | three retry lanes | 1 | 4 min | 6 |
-| Medium main | one fresh lane | 4 | 30 s | 8 |
-| Medium retry | three retry lanes | 2 | 1 min | 6 |
-
-Each lane's capacity is `max(ceil(Concurrency x group weight / total group weight), 3) x PrefetchFactor`. For high main at the defaults: 16 x 8 / 20 = 6.4, rounded up to 7, above the floor of 3, times 2 = 14. The six group weights total 20, so the capacities above are the bounded depth for one topic at concurrency 16.
-
 ## Why lane capacity stays small
 
-Capacity is not throughput. `Concurrency` decides how many handlers run at once; a lane only holds the messages waiting for the next free worker. The formula therefore sizes each lane to its weighted share of the workers, doubled by the prefetch factor so the next batch is already in hand while the current one runs.
+Capacity is not throughput. `Concurrency` decides how many handlers run at
+once; a lane holds messages waiting for the next free worker. Weighted sizing
+and a small minimum window keep work ready during broker round trips without
+turning every lane into a large process-local backlog.
 
-The weights shape capacity only once the shares are larger than the floor. With 4 workers and three fresh lanes weighted 8, 4, and 1, the shares are 3, 2, and 1 workers, the floor of 3 wins everywhere, and every lane holds 6. At the default concurrency of 16 the same weights give 14, 8, and 6. More workers mean bigger lanes, in proportion to the weights.
-
-The floor of 3 exists for fast handlers at low concurrency. With a lane capacity of only 2, the broker sends the next message only after an ack frees a slot, so a handler that finishes before that round trip does sits idle waiting for the next message. A third slot keeps one message ready during the round trip.
+At low concurrency the minimum window dominates, so unequal weights can
+produce equal capacities. Above that floor, weighted shares shape the lane
+windows. The [prefetch contract](/advanced-topics/configuration#prefetch-resolution)
+and its shared sizing implementation determine the actual limits; scheduling
+weights are not reserved worker counts.
 
 A larger buffer would not make handlers faster, and it costs in four places:
 
 - **Load sharing.** A message the broker still holds can go to any instance. A message already fetched into one process waits for that process, even while another instance is idle.
-- **Redelivery.** Every fetched message that is not yet acked is redelivered after a crash, reconnect, or revoke, so a deeper buffer means more duplicate work.
+- **Redelivery.** Fetched work that was not acked can return after a crash, reconnect, or revoke, so a deeper buffer increases the work exposed to redelivery.
 - **Drain time.** A drain dispatches everything already in the lanes, so a deeper buffer needs more of `DrainTimeout`.
 - **Hidden backlog.** Messages age inside the process while the broker's queue depth looks healthy.
 
 On Kafka, one record per partition is outstanding at a time, so a larger lane mostly stays empty; the partition count is the parallelism lever.
 
-The same capacity also bounds the driver. Each destination, the broker queue or topic behind one lane, may have only that lane's capacity outstanding, and the subscription's effective prefetch is capped at the sum of all its lanes. For one topic at the defaults that is 14 + 6 + 8 for the main lanes plus three lanes each of 8, 6, and 6 for retries, 88 in all. When a lane is full, its destination has spent its credit and new messages stay at the broker. Nothing is nacked or redelivered. The two drivers stop the flow in different places:
+Lane capacity is deliberately a destination ceiling, not a statically divided
+share of a smaller total budget. Keeping full destination windows avoids
+unnecessary per-destination throughput limits while the aggregate admission
+ceiling bounds SDK-unsettled work. The [prefetch contract](/advanced-topics/configuration#prefetch-resolution)
+owns automatic sizing and explicit totals.
 
-- **RabbitMQ: the broker holds back.** Each destination's channel is opened with a prefetch (`basic.qos`) equal to its lane capacity. Once that many deliveries are unacknowledged, RabbitMQ stops pushing to the consumer, and each ack or nack lets it send one more. F1 does nothing active.
-- **Kafka: the driver holds back.** Kafka is pull-based and has no unacknowledged limit, so the driver counts records not yet acked per destination. When the count reaches the lane capacity, it pauses fetching that topic, and it resumes when an ack or nack brings the count below the capacity. Records fetched before the pause stay in the client's buffer and are delivered after it, not fetched again. A record counts toward the lane capacity only once the driver hands it to F1, so buffered records are not counted; the buffer has its own per-partition bound, and the driver pauses a partition whose buffer reaches it. Separately, only one record per partition is outstanding at a time, which usually binds first when a topic has few partitions.
-
-| | RabbitMQ | Kafka |
-| --- | --- | --- |
-| Who stops the flow | The broker, through the channel prefetch | The driver, by pausing the topic's fetches |
-| The limit | Unacknowledged deliveries per destination | Records not yet acked per destination, and one per partition |
-| Flow resumes on | Each ack or nack | An ack or nack that brings the count below the capacity |
-| A lane can still fill | With `brokerPrefetch`, or on the fallback lane | On the fallback lane |
-
-A lane can still fill in the two cases in the last row: `broker.rabbitmq.brokerPrefetch` lets RabbitMQ send more than the lane holds, and the fallback lane takes deliveries from any destination it cannot map.
+Transport buffering is a separate trade-off: RabbitMQ broker credit and Kafka
+fetch buffers may retain work that has not been SDK-admitted. Raising
+`broker.rabbitmq.brokerPrefetch` cannot bypass either SDK admission ceiling.
+Read the [RabbitMQ options](/drivers/rabbitmq#rabbitmq-options) and
+[Kafka delayed records](/drivers/kafka#kafka-delayed-records) for transport
+constraints; the admission owners are the consumers in
+[`drivers/rabbitmq`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/tree/main/drivers/rabbitmq)
+and [`drivers/kafka`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/tree/main/drivers/kafka).
 
 The [fallback lane](/learn/glossary#lane) takes a delivery whose destination F1 cannot map to a lane; it is the main lane of the subscription's first topic and priority. F1 then holds the one delivery that did not fit, outside any lane, and stops reading new deliveries for the whole subscription until a worker frees a slot in that lane. It never holds more than one.
 
 The delivery is kept, not requeued, but one full lane slows intake for the whole subscription.
 
-To buffer more, raise `Concurrency` first. Raise `PrefetchFactor` only when the broker round trip is long compared with the handler time, and expect more redelivery and a longer drain in the same proportion.
+Choose `Concurrency` from safe handler parallelism, not a desired buffer size.
+Raise `PrefetchFactor` only when measurements show workers waiting on broker
+round trips; a deeper buffer also increases drain work and redelivery exposure.
 
 ## The weighted pick
 
 Smooth weighted round robin gives each non-empty group its weight as running score. The highest score wins, and that winner gives back the total active weight, the sum of the weights of the groups that have work right now. An empty group resets its score instead of banking credit for a later burst.
 
-The following trace uses three saturated main lanes with weights 8, 4, and 1. The scores are the values after each pick. The columns are in weight order; the alphabetical group order only breaks ties. The thirteen picks return the scores to zero and give eight picks to high, four to medium, and one to low.
+The following trace uses three saturated main lanes with weights 8, 4, and 1.
+The scores are the values after each pick. Equal scores keep the earlier group
+in the scheduler's stable group order; the columns here are in weight order.
+The thirteen picks return the scores to zero and give eight picks to high,
+four to medium, and one to low.
 
 <F1SchedulerStepper scenario="weighted" />
 
@@ -134,7 +129,9 @@ Watch the jump leave the non-empty groups' scores unchanged even as the low lane
 
 Jumping the queue is an escape hatch for overdue lanes, not a cap on waiting. Another lane can be further past its limit on every check. Capacity limits how many messages wait in a lane, not how long: a full lane waits at the broker, where the wait clock does not run.
 
-`DisableDeadlinePromotion` turns this rule off. Its zero value leaves it on. Each jump is reported to the observer, at most once per lane in a 15-second window. Jumps inside a window that already reported are counted, and the count rides on the lane's next reported jump. The event fields are in [Observer](/basics/observer).
+`DisableDeadlinePromotion` turns this rule off. Its zero value leaves it on.
+Observer reports are rate-limited per lane; suppressed jumps are counted in a
+later report. See [Observer](/basics/observer) for the event contract.
 
 ## Trade-offs
 
@@ -147,7 +144,7 @@ Jumping the queue is an escape hatch for overdue lanes, not a cap on waiting. An
 ## Go further
 
 - [Ordering and scheduling](/advanced-topics/ordering-and-scheduling) - the public fairness settings and their limits.
-- [Life of a delivery](/deep-dives/life-of-a-delivery) - how a fetched message reaches a lane and a handler.
+- [Consume flow](/development/consume-flow) - how a fetched message reaches a lane and a handler.
 - [Benchmarks](/development/benchmarks) - measured scheduler and delivery behavior.
 - [Observer](/basics/observer) - queue-jump, retry, and ack events.
 - [Source-reading guide](/development/source-reading-guide) - the maintainer route through the implementation.

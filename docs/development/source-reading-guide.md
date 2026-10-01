@@ -1,12 +1,9 @@
 # Source-reading guide
 
-F1's contracts are easiest to learn in a fixed order: public vocabulary and
-ports first, then the code that uses them. This guide gives that order to
-maintainers and AI collaborators who need to understand the repository before
-changing it. It starts with public
-vocabulary and ports, then follows construction, runtime primitives, concrete
-drivers, and verification. Do not begin in `worker.go`: the worker coordinates
-contracts that are defined elsewhere.
+Read F1's public vocabulary and driver ports before the orchestration that uses
+them. The route then follows construction, runtime primitives, consumption,
+concrete drivers, and verification. Do not begin in `worker.go`: the worker
+coordinates contracts defined elsewhere.
 
 The links below are navigation, not a second source of implementation detail.
 When a claim matters, open the linked source, its nearest tests, and the
@@ -159,6 +156,16 @@ Read adapters in this order:
 4. [`drivers/kafka/`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/tree/main/drivers/kafka) - classic consumer groups,
    partition-bound scaling, offsets, deferral, lag, and rebalance ownership.
 
+For Kafka operations, follow
+[`topology.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/drivers/kafka/topology.go)
+for declaration, verification, and partition floors;
+[`admin.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/drivers/kafka/admin.go)
+for purge/prune ownership guards; and
+[`backlog.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/drivers/kafka/backlog.go)
+for offset snapshots and optional head probes. The
+[Kafka driver guide](/drivers/kafka) explains the operator-owned topic-policy
+and maintenance boundaries.
+
 Read the adapter source beside its tests. The in-memory implementation shows
 the port contract with fewer external moving parts; RabbitMQ and Kafka then
 show which details must remain inside a provider. Do not transfer a broker
@@ -307,13 +314,35 @@ one lives in the code.
 - **Retries and dead letters**: `worker.go` (`dispatchMessage`,
   `classifyRetryError`, `retryAndSettle`, `deadLetterAndSettle`, `deadLetter`,
   `startSuccessorPublish`); `internal/retry/ladder.go` (`DelayFor`,
-  `ResolveTier`, `ResolveRetryAfter`); `internal/retry/sanity.go`
+  `ResolveTier`); `internal/retry/sanity.go`
   (`CounterRunaway`); `deathreason.go`.
-- **Ordered by key**: `internal/dispatch/pool.go` (`NewPool`, `queueIndex`,
-  `Submit`, `start`, `release`); `subscription.go` and `config.go` (ordered-mode
-  admission, parsing, buffer validation); `limits.go` (the `ordered_by_key`
-  feature status); `worker.go` (ordered consumer admission and retry handoff);
-  `driver/capability.go`.
+- **Scheduling**: `internal/sched/scheduler.go` (`Next`, `mostOverdue`);
+  `internal/sched/doc_trace_test.go` checks the committed interactive trace;
+  `prefetch.go` and `worker.go` share lane sizing and dispatch admission.
+- **Kafka ack tracker**: `drivers/kafka/acktracker.go` (`Ack`, `AckOwn`,
+  `Drop`, `CommitPoint`); `drivers/kafka/committer.go` batches confirmed
+  settlement points; `drivers/kafka/consumer.go` routes late settlements.
+- **Kafka rebalance ownership**: `drivers/kafka/balancer.go` selects the
+  protocol; `drivers/kafka/consumer.go` (`assignmentWarningsLocked`,
+  `revokeTrackers`, `commitSettledPrefix`) handles assignment and teardown.
+- **RabbitMQ retry parking**: `drivers/rabbitmq/topology.go`
+  (`parkArguments`, `parkDelayMillis`); `drivers/rabbitmq/producer.go`
+  (`target`) translates a delayed destination into parking publication.
+- **Kafka retry delays**: `drivers/kafka/deferral.go` (`dueTime`,
+  `admissionLocked`, `setHeadHoldLocked`, `syncHeadTimerLocked`,
+  `headHoldLoop`); `drivers/kafka/consumer.go` (the poll loop's head admission,
+  `completeSettlement`); `driver/driver.go` (`ConsumerConfig.Delays`).
+- **RabbitMQ publish channels**: `drivers/rabbitmq/producer.go`
+  (`publishChannelCount`, `publishSegment`, `reserve`, `channelIn`, `write`,
+  `decide`, `sizeRefusalKinds`, `Close`); `drivers/rabbitmq/publish_watcher.go`
+  (`publishWatcher`, `answer`, `registerIDs`).
+- **Header size cap**: `envelope.go` (`CoreMaxHeaderBytes`, `EncodeHeaders`,
+  `shrinkDeathErrorTo`); `config.go` (`effectiveHeaderLimit`); `worker.go`
+  (`deadLetter`, `truncateError`, `successorNeverPublishable`, the retry copy's
+  encode fallback); `errors.go` (`WithDetails`).
+- **Consumer repair**: `worker.go` (`Runner.Run`'s repair decision,
+  `failedRepairCycles`, `repairCycleActive`, `runnerEventHandledDelivery`,
+  `ackDeliveryAs`, `consumeRunnerErrors`).
 
 ## Keep the route current
 

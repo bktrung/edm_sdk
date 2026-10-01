@@ -3,18 +3,15 @@ package f1
 import (
 	"errors"
 	"slices"
-	"time"
 
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/wire"
 )
 
 // classifiedError carries one handler outcome through wrapped error chains.
 type classifiedError struct {
-	err        error
-	terminal   bool
-	dropped    bool
-	retryDelay time.Duration
-	hasDelay   bool
+	err      error
+	terminal bool
+	dropped  bool
 }
 
 const (
@@ -57,7 +54,7 @@ func (e *detailsError) DeathDetails() map[string]string {
 // keys or 1 KiB encoded, is discarded and reported when the message is
 // dead-lettered rather than failing the message. Returns nil for a nil err, so
 // "return f1.WithDetails(doWork(), d)" is safe on the success path. Composes
-// in either direction with the three classification helpers.
+// in either direction with Terminal and Drop.
 func WithDetails(err error, details map[string]string) error {
 	if err == nil {
 		return nil
@@ -152,16 +149,6 @@ func Terminal(err error) error {
 	return &classifiedError{err: err, terminal: true}
 }
 
-// RetryAfter marks err as retryable and requests a delay for its next attempt.
-// The requested delay selects the nearest retry tier, whose nominal delay is
-// used. It returns nil when err is nil.
-func RetryAfter(err error, delay time.Duration) error {
-	if err == nil {
-		return nil
-	}
-	return &classifiedError{err: err, retryDelay: delay, hasDelay: true}
-}
-
 // Drop marks err as handled so the message is acknowledged without another
 // delivery attempt. It returns nil when err is nil.
 func Drop(err error) error {
@@ -194,14 +181,4 @@ func IsTerminal(err error) bool {
 func IsDropped(err error) bool {
 	var classified *classifiedError
 	return errors.As(err, &classified) && classified.dropped
-}
-
-// RetryDelay reports the explicit delay on the first classified error in err's
-// error tree. The boolean is false when no explicit delay is present.
-func RetryDelay(err error) (time.Duration, bool) {
-	var classified *classifiedError
-	if !errors.As(err, &classified) || !classified.hasDelay {
-		return 0, false
-	}
-	return classified.retryDelay, true
 }

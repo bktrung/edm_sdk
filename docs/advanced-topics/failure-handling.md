@@ -10,7 +10,7 @@ Return the result that matches the business meaning of the failure.
 
 | Outcome | Trigger and delivery result |
 | --- | --- |
-| Retryable | An ordinary error or `RetryAfter` publishes a retry copy, then acks the original, until the attempt limit is reached. |
+| Retryable | An ordinary error publishes a retry copy, then acks the original, until the attempt limit is reached. |
 | Terminal | `f1.Terminal` or the last allowed attempt publishes a dead-letter copy, then acks the original. |
 | Dropped | `f1.Drop` acknowledges without applying the effect or retaining a dead-letter copy. |
 | Unmatched | No handler matches; `f1.Ignore` acknowledges it, while `f1.DeadLetter` publishes a dead-letter copy. |
@@ -25,7 +25,7 @@ func handleOrder(ctx context.Context, event *f1.Event) error {
 		return f1.Terminal(fmt.Errorf("decode order: %w", err))
 	}
 	if err := reserveInventory(ctx, order); err != nil {
-		return f1.RetryAfter(err, 30*time.Second)
+		return fmt.Errorf("reserve inventory: %w", err)
 	}
 	return nil
 }
@@ -35,7 +35,7 @@ Returning `nil` after logging a failure acknowledges the delivery. Return the er
 
 ## Keep classification through context
 
-Classification helpers work through wrapped errors. Add context with `%w` so F1 can still find `Terminal`, `Drop`, or `RetryAfter` in the error chain.
+Classification helpers work through wrapped errors. Add context with `%w` so F1 can still find `Terminal` or `Drop` in the error chain.
 
 ```go
 if err := validateOrder(order); err != nil {
@@ -68,9 +68,9 @@ runner, err := client.Subscribe(ctx, f1.Subscription{
 })
 ```
 
-The effective attempt limit is the smaller of the event's `WithMaxAttempts` value and the subscription policy. `MaxAttempts` includes the first delivery, and `Event.Attempt()` is one-based. Once the current attempt reaches that cap, an ordinary or `RetryAfter` error follows the dead-letter path with `ReasonMaxAttempts`.
+The effective attempt limit is the smaller of the event's `WithMaxAttempts` value and the subscription policy. `MaxAttempts` includes the first delivery, and `Event.Attempt()` is one-based. Once the current attempt reaches that cap, an ordinary error follows the dead-letter path with `ReasonMaxAttempts`.
 
-When `Tiers` is not set, F1 works out the [retry steps](/learn/glossary#retry-tier) from `InitialInterval`, `Multiplier`, and `MaxInterval`. `RetryAfter` picks the delay of the nearest configured step. It does not park the event for an arbitrary duration or bypass the attempt cap. No retry step may be longer than 2,147,483,647 ms (about 24.8 days), the longest delay a RabbitMQ message can carry; a longer step is rejected at startup rather than released early.
+When `Tiers` is not set, F1 works out the [retry steps](/learn/glossary#retry-tier) from `InitialInterval`, `Multiplier`, and `MaxInterval`. A handler cannot choose its own delay: every retry waits the delay of the step for its attempt. No retry step may be longer than 2,147,483,647 ms (about 24.8 days), the longest delay a RabbitMQ message can carry; a longer step is rejected at startup rather than released early.
 
 ## Follow a failed delivery
 

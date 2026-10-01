@@ -54,13 +54,30 @@ type consumer struct {
 	mu       sync.Mutex
 	draining bool
 	stopped  bool
-	// released is closed when a Release has removed the consumer from its
-	// connection. It is nil until a Release starts, so a later Release can wait
-	// for the one in progress instead of reporting a release that has not
-	// happened yet.
-	released    chan struct{}
+	// released is the completion channel of the Release attempt that is running,
+	// or of the last attempt that failed. It is made fresh for every attempt and
+	// closed when that attempt returns, so a concurrent Release waits on the
+	// attempt that is actually running rather than on one that already failed. It
+	// is nil until the first Release starts.
+	released chan struct{}
+	// releasing is true while a Release attempt is running, which is what tells a
+	// concurrent Release to wait on released instead of starting a second teardown
+	// over the same lanes.
+	releasing bool
+	// releaseFinished is true once the attempt that removed the consumer from its
+	// connection and closed Messages and Errors has returned. A failed attempt
+	// leaves it false, so the next Release retries the teardown instead of
+	// reporting a release that never happened.
+	releaseFinished bool
+
 	outstanding int
 	settlers    map[*settler]struct{}
+	// admitted counts the settlers that hold a place in cfg.Prefetch: the
+	// deliveries the broker still charges to one of this consumer's windows.
+	// It differs from outstanding once the broker cancels a consumer, because
+	// the broker takes that consumer's unsettled deliveries back while their
+	// handlers may still be running; see attachReplacement.
+	admitted int
 
 	readers           sync.WaitGroup
 	forward           sync.WaitGroup
@@ -96,12 +113,24 @@ type lane struct {
 	// replacedC carries one token per attachment, waking a reader waiting on a
 	// deliveries channel that has closed.
 	replacedC chan struct{}
-	pending   chan amqp.Delivery
+	pending   chan laneDelivery
 	resume    chan struct{}
 	emitting  int
+	// Admission state is guarded by owner.mu; wake is reused across settlements.
+	admissionLimit int
+	admitted       int
+	admissionWake  chan struct{}
 
 	mu     sync.Mutex
 	paused bool
+}
+
+// laneDelivery is a delivery with the generation of the consumer it came from,
+// which is what tells admission whether the broker still counts it against the
+// lane's window.
+type laneDelivery struct {
+	amqp.Delivery
+	generation uint64
 }
 
 var _ driver.Consumer = (*consumer)(nil)
@@ -175,19 +204,26 @@ func newConsumer(conn *conn, cfg driver.ConsumerConfig) (*consumer, error) {
 			return rollback(classifyAMQP("consumer", driver.KindNotFound, err))
 		}
 		lane := &lane{
-			owner:       c,
-			destination: destination,
-			channel:     channel,
-			tag:         tag,
-			prefetch:    prefetch,
-			deliveries:  deliveries,
-			generation:  1,
-			replacedC:   make(chan struct{}, 1),
-			pending:     make(chan amqp.Delivery, prefetch),
-			resume:      make(chan struct{}),
+			owner:          c,
+			destination:    destination,
+			channel:        channel,
+			tag:            tag,
+			prefetch:       prefetch,
+			admissionLimit: cfg.DestinationPrefetch(index),
+			admissionWake:  make(chan struct{}, 1),
+			deliveries:     deliveries,
+			generation:     1,
+			replacedC:      make(chan struct{}, 1),
+			pending:        make(chan laneDelivery, prefetch),
+			resume:         make(chan struct{}),
 		}
+		if cfg.Prefetch <= 0 {
+			lane.admissionLimit = 0
+		}
+		c.mu.Lock()
 		c.lanes = append(c.lanes, lane)
 		c.byName[destination] = lane
+		c.mu.Unlock()
 		c.readers.Add(1)
 		c.forward.Add(1)
 		c.events.Add(2)
@@ -214,6 +250,9 @@ func totalPrefetch(cfg driver.ConsumerConfig, brokerPrefetch int) int {
 	total := 0
 	for index, destination := range cfg.Destinations {
 		total += effectivePrefetch(cfg, destination, index, brokerPrefetch)
+	}
+	if cfg.Prefetch > 0 && cfg.Prefetch < total {
+		total = cfg.Prefetch
 	}
 	if total < 1 {
 		return 1
@@ -279,11 +318,20 @@ func lockBefore(clk clock.Clock, mu *sync.Mutex, deadline time.Time) bool {
 	}
 }
 
+// rollbackConstruction tears down a consumer whose construction failed partway.
+// It joins without a bound rather than going through stopAndWait, because
+// construction has no caller context to honour and its only caller discards the
+// error, so a context here would only name a cancellation nobody can deliver.
 func (c *consumer) rollbackConstruction() error {
 	c.mu.Lock()
 	c.stopped = true
 	c.mu.Unlock()
-	return c.stopAndWait(true, nil)
+	c.stopSignals()
+	c.closeLanes()
+	c.readers.Wait()
+	c.forward.Wait()
+	c.events.Wait()
+	return nil
 }
 
 // Messages returns the channel of delivered messages. The channel closes when Stop or Release completes.
@@ -331,10 +379,55 @@ func (c *consumer) attachReplacement(lane *lane, deliveries <-chan amqp.Delivery
 	lane.deliveries = deliveries
 	lane.generation++
 	lane.deliveriesMu.Unlock()
+	c.releaseCancelledAdmissionsLocked(lane)
 	c.mu.Unlock()
 	select {
 	case lane.replacedC <- struct{}{}:
 	default:
+	}
+}
+
+// releaseCancelledAdmissionsLocked gives back the window places held by the
+// lane's deliveries from consumers older than its current generation. The
+// broker cancelled those consumers and took their unsettled deliveries back, so
+// it charges none of them to the replacement; counting them would hold the
+// replacement's window shut until handlers the broker already gave up on
+// return. With a prefetch of 1 and a handler past the broker's consumer
+// timeout, that is every delivery, the redelivered one included, until the
+// handler ends.
+//
+// The settlers themselves stay: their handlers are still running, and Stop and
+// Drain wait for them as before. Walk the two orders a delivery of the old
+// consumer can take: admitted before the attachment, it is counted, and the
+// sweep here stops counting it; still in lane.pending at the attachment,
+// emitMessages finds its generation behind the lane's and never counts it.
+// Both read and move the generation under c.mu, so neither order counts it.
+// The caller holds c.mu.
+func (c *consumer) releaseCancelledAdmissionsLocked(lane *lane) {
+	released := false
+	for s := range c.settlers {
+		if s.counted && s.destination == lane.destination && s.generation < lane.generation {
+			s.counted = false
+			c.admitted--
+			lane.admitted--
+			released = true
+		}
+	}
+	if released {
+		c.wakeAdmissionsLocked()
+	}
+}
+
+// wakeAdmissionsLocked wakes every lane waiting for a window place. Every
+// destination may be waiting on the shared cap, and a single shared token could
+// wake a destination whose own window is still full and strand another. The
+// caller holds c.mu.
+func (c *consumer) wakeAdmissionsLocked() {
+	for _, lane := range c.lanes {
+		select {
+		case lane.admissionWake <- struct{}{}:
+		default:
+		}
 	}
 }
 
@@ -397,7 +490,7 @@ func (c *consumer) readDeliveries(lane *lane) {
 				c.readerSendHook(lane)
 			}
 			select {
-			case lane.pending <- delivery:
+			case lane.pending <- laneDelivery{Delivery: delivery, generation: drained}:
 			case <-c.stoppedC:
 				return
 			}
@@ -414,11 +507,11 @@ func (c *consumer) emitMessages(lane *lane) {
 	}()
 	for {
 		var (
-			delivery amqp.Delivery
-			ok       bool
+			item laneDelivery
+			ok   bool
 		)
 		select {
-		case delivery, ok = <-lane.pending:
+		case item, ok = <-lane.pending:
 			if !ok {
 				return
 			}
@@ -467,29 +560,67 @@ func (c *consumer) emitMessages(lane *lane) {
 				return
 			}
 		}
-		settler := &settler{owner: c, destination: lane.destination, delivery: delivery}
-		c.mu.Lock()
-		if c.draining || c.stopped {
-			c.mu.Unlock()
+		var admitted *settler
+		for admitted == nil {
+			c.mu.Lock()
+			if c.draining || c.stopped {
+				c.mu.Unlock()
+				lane.mu.Lock()
+				lane.emitting--
+				lane.mu.Unlock()
+				return
+			}
 			lane.mu.Lock()
-			lane.emitting--
+			paused := lane.paused
+			var resume <-chan struct{}
+			if paused {
+				resume = lane.resume
+			}
 			lane.mu.Unlock()
-			return
+			// A delivery from a consumer the broker has since cancelled was
+			// taken back with that consumer, so it holds no place in any
+			// window and is admitted without one. lane.generation is read
+			// under c.mu, which attachReplacement also holds to move it.
+			stale := item.generation < lane.generation
+			if !paused && (stale || ((c.cfg.Prefetch <= 0 || c.admitted < c.cfg.Prefetch) &&
+				(lane.admissionLimit <= 0 || lane.admitted < lane.admissionLimit))) {
+				admitted = &settler{owner: c, destination: lane.destination, delivery: item.Delivery, generation: item.generation, counted: !stale}
+				c.settlers[admitted] = struct{}{}
+				c.outstanding++
+				if !stale {
+					c.admitted++
+					lane.admitted++
+				}
+			}
+			c.mu.Unlock()
+			if admitted == nil {
+				select {
+				case <-lane.admissionWake:
+				case <-resume:
+				case <-c.forwarderStopC:
+					lane.mu.Lock()
+					lane.emitting--
+					lane.mu.Unlock()
+					return
+				case <-c.stoppedC:
+					lane.mu.Lock()
+					lane.emitting--
+					lane.mu.Unlock()
+					return
+				}
+			}
 		}
-		c.settlers[settler] = struct{}{}
-		c.outstanding++
-		c.mu.Unlock()
 		lane.mu.Lock()
 		lane.emitting--
 		lane.mu.Unlock()
-		message := c.inboundMessage(lane.destination, delivery, settler, c.nativeDeliveryCount(), c.trustBrokerTimestamp)
+		message := c.inboundMessage(lane.destination, item.Delivery, admitted, c.nativeDeliveryCount(), c.trustBrokerTimestamp)
 		select {
 		case c.messages <- message:
 		case <-c.forwarderStopC:
-			c.release(settler)
+			c.release(admitted)
 			return
 		case <-c.stoppedC:
-			c.release(settler)
+			c.release(admitted)
 			return
 		}
 	}
@@ -947,55 +1078,57 @@ func (c *consumer) stopSignals() {
 	c.stoppedOnce.Do(func() { close(c.stoppedC) })
 }
 
-func (c *consumer) stopAndWait(closeLanes bool, wait func() error) error {
+// stopAndWait stops delivery, optionally closes the lanes, and joins the reader,
+// forwarder and watcher goroutines under ctx. op names the operation for error
+// classification, and a "stop" deadline surfaces as ErrDrainTimeout. Closing the
+// lanes before the joins is what requeues their unacked deliveries and what lets
+// a blocked forwarder observe forwarderStopC and stoppedC instead of waiting for
+// the application to consume an abandoned message.
+func (c *consumer) stopAndWait(ctx context.Context, op string, closeLanes bool) error {
 	c.stopSignals()
 	if closeLanes {
 		c.closeLanes()
 	}
-	if wait != nil {
-		if err := wait(); err != nil {
-			return err
-		}
-	} else {
-		c.readers.Wait()
-		c.forward.Wait()
+	if err := c.waitReaders(ctx, op); err != nil {
+		return err
 	}
-	c.events.Wait()
-	return nil
+	if err := c.waitForwarders(ctx, op); err != nil {
+		return err
+	}
+	return c.waitEvents(ctx, op)
+}
+
+// waitFor joins wg under ctx. It is the one place the three teardown joins
+// (readers, forwarders, watchers) are bounded, so their cancellation behaviour
+// cannot drift apart. A "stop" deadline surfaces as ErrDrainTimeout; every other
+// wait reports the context error under op.
+func waitFor(ctx context.Context, op string, wg *sync.WaitGroup) error {
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		if op == "stop" && errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			return classify("stop", driver.KindTransient, fmt.Errorf("%w: %w", driver.ErrDrainTimeout, ctx.Err()))
+		}
+		return classify(op, driver.KindTransient, ctx.Err())
+	}
 }
 
 func (c *consumer) waitReaders(ctx context.Context, op string) error {
-	done := make(chan struct{})
-	go func() {
-		c.readers.Wait()
-		close(done)
-	}()
-	select {
-	case <-done:
-		return nil
-	case <-ctx.Done():
-		if op == "stop" && errors.Is(ctx.Err(), context.DeadlineExceeded) {
-			return classify("stop", driver.KindTransient, fmt.Errorf("%w: %w", driver.ErrDrainTimeout, ctx.Err()))
-		}
-		return classify(op, driver.KindTransient, ctx.Err())
-	}
+	return waitFor(ctx, op, &c.readers)
 }
 
 func (c *consumer) waitForwarders(ctx context.Context, op string) error {
-	done := make(chan struct{})
-	go func() {
-		c.forward.Wait()
-		close(done)
-	}()
-	select {
-	case <-done:
-		return nil
-	case <-ctx.Done():
-		if op == "stop" && errors.Is(ctx.Err(), context.DeadlineExceeded) {
-			return classify("stop", driver.KindTransient, fmt.Errorf("%w: %w", driver.ErrDrainTimeout, ctx.Err()))
-		}
-		return classify(op, driver.KindTransient, ctx.Err())
-	}
+	return waitFor(ctx, op, &c.forward)
+}
+
+func (c *consumer) waitEvents(ctx context.Context, op string) error {
+	return waitFor(ctx, op, &c.events)
 }
 
 func cancelConsumer(ctx context.Context, lane *lane) error {
@@ -1032,13 +1165,7 @@ func (c *consumer) Stop(ctx context.Context) error {
 		}
 		return drainErr
 	}
-	wait := func() error {
-		if err := c.waitReaders(ctx, "stop"); err != nil {
-			return err
-		}
-		return c.waitForwarders(ctx, "stop")
-	}
-	if err := c.stopAndWait(false, wait); err != nil {
+	if err := c.stopAndWait(ctx, "stop", false); err != nil {
 		return err
 	}
 	c.mu.Lock()
@@ -1062,49 +1189,82 @@ func (c *consumer) Stop(ctx context.Context) error {
 
 // Release abandons unsettled deliveries, closes the consumer, and lets RabbitMQ redeliver them.
 func (c *consumer) Release(ctx context.Context) error {
-	c.mu.Lock()
-	if c.stopped {
-		released := c.released
-		c.mu.Unlock()
-		if released == nil {
+	for {
+		c.mu.Lock()
+		// Stop closes the consumer without a Release, and a finished Release has
+		// already done so. Either way there is nothing left to abandon.
+		if c.releaseFinished || (c.stopped && c.released == nil) {
+			c.mu.Unlock()
 			return nil
 		}
-		select {
-		case <-released:
-			return nil
-		case <-ctx.Done():
-			return classify("release", driver.KindTransient, ctx.Err())
+		if c.releasing {
+			attempt := c.released
+			c.mu.Unlock()
+			select {
+			case <-attempt:
+				// Re-inspect rather than assume success: the attempt may have
+				// failed on its context, and then this caller drives the teardown
+				// the consumer is still waiting for.
+				continue
+			case <-ctx.Done():
+				return classify("release", driver.KindTransient, ctx.Err())
+			}
 		}
-	}
-	if err := ctx.Err(); err != nil {
+		if err := ctx.Err(); err != nil {
+			c.mu.Unlock()
+			return classify("release", driver.KindTransient, err)
+		}
+		c.stopped = true
+		c.releasing = true
+		attempt := make(chan struct{})
+		c.released = attempt
 		c.mu.Unlock()
-		return classify("release", driver.KindTransient, err)
-	}
-	c.stopped = true
-	c.released = make(chan struct{})
-	released := c.released
-	c.mu.Unlock()
-	defer close(released)
 
-	// Closing the AMQP channels requeues their unacked deliveries. Do this
-	// before waiting for local goroutines so a blocked forwarder can observe
-	// forwarderStopC and stoppedC rather than waiting for the application to
-	// consume an abandoned message.
-	if err := c.stopAndWait(true, nil); err != nil {
-		return err
+		// Closing the AMQP channels requeues their unacked deliveries. Do this
+		// before waiting for local goroutines so a blocked forwarder can observe
+		// forwarderStopC and stoppedC rather than waiting for the application to
+		// consume an abandoned message.
+		err := c.stopAndWait(ctx, "release", true)
+		if err != nil {
+			// The teardown did not finish. The consumer stays stopped but
+			// registered on its connection with Messages and Errors open, so this
+			// Release reports the failure and the next one - the client retries a
+			// Release it was told failed - finishes the work. Only an attempt that
+			// got all the way here closes those channels, so two Releases cannot
+			// close them twice.
+			c.mu.Lock()
+			c.releasing = false
+			c.mu.Unlock()
+			close(attempt)
+			return err
+		}
+		c.conn.removeConsumer(c)
+		close(c.messages)
+		close(c.errors)
+		c.mu.Lock()
+		c.releaseFinished = true
+		c.releasing = false
+		c.mu.Unlock()
+		close(attempt)
+		return nil
 	}
-	c.conn.removeConsumer(c)
-	close(c.messages)
-	close(c.errors)
-	return nil
 }
 
 func (c *consumer) release(settler *settler) {
 	c.mu.Lock()
-	delete(c.settlers, settler)
-	if c.outstanding > 0 {
-		c.outstanding--
+	if _, exists := c.settlers[settler]; !exists {
+		c.mu.Unlock()
+		return
 	}
+	delete(c.settlers, settler)
+	c.outstanding--
+	if settler.counted {
+		c.admitted--
+		if lane := c.byName[settler.destination]; lane != nil {
+			lane.admitted--
+		}
+	}
+	c.wakeAdmissionsLocked()
 	c.mu.Unlock()
 }
 

@@ -351,7 +351,7 @@ func TestCloseDrainsRunnerBeforeWaitingForPublishIdle(t *testing.T) {
 		Tiers:           []time.Duration{time.Second},
 	}
 	subscription.Handlers["orders.created"] = HandlerFunc(func(context.Context, *Event) error {
-		return RetryAfter(errors.New("retry during drain"), 0)
+		return errors.New("retry during drain")
 	})
 	runner, err := client.Subscribe(context.Background(), subscription)
 	if err != nil {

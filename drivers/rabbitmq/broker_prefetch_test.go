@@ -53,7 +53,7 @@ func TestBrokerPrefetchValidation(t *testing.T) {
 	}
 }
 
-func TestBrokerPrefetchOverridesEachDestinationAndMessageBuffer(t *testing.T) {
+func TestBrokerPrefetchOverridesTransportWindows(t *testing.T) {
 	cfg := driver.ConsumerConfig{
 		Destinations: []string{"orders", "orders.retry"},
 		Prefetch:     10,
@@ -67,11 +67,5 @@ func TestBrokerPrefetchOverridesEachDestinationAndMessageBuffer(t *testing.T) {
 	}
 	if got := effectivePrefetch(cfg, "orders", 0, 64); got != 64 {
 		t.Fatalf("effectivePrefetch(set) = %d, want 64", got)
-	}
-	if got := totalPrefetch(cfg, 0); got != 10 {
-		t.Fatalf("totalPrefetch(unset) = %d, want 10", got)
-	}
-	if got := totalPrefetch(cfg, 64); got != 128 {
-		t.Fatalf("totalPrefetch(set) = %d, want 128", got)
 	}
 }

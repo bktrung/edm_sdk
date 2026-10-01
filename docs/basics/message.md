@@ -98,6 +98,8 @@ subject and trace state. The fields F1 needs to deliver, retry, and deduplicate
 are never dropped; if the envelope is still too large, the publish fails. Keep
 extension headers small and do not rely on them arriving when the envelope is
 near the cap.
+The full order, and what happens to a dead-letter copy that grows past the cap,
+is in [Header size cap](/deep-dives/header-budget).
 
 ## Publish a batch
 
@@ -246,11 +248,11 @@ func handleOrder(ctx context.Context, event *f1.Event) error {
 }
 ```
 
-Return when the context is done. At the handler timeout F1 cancels it, and a handler
-that stops then is retried as usual. F1 can stop waiting for a handler, but it
-cannot stop one: a handler that ignores its context keeps running while the
-broker redelivers the message, so the same work can run twice at once
-([what happens to a stuck handler](/deep-dives/life-of-a-delivery#running-the-handler)).
+Return when the context is done. At the handler timeout F1 cancels it; the
+handler's return value still chooses ack or retry. F1 can stop waiting for a
+handler, but it cannot stop one: a handler that ignores its context can keep
+running while a redelivered copy executes, so the same work can overlap
+([what happens to a stuck handler](/development/consume-flow#running-the-handler)).
 
 Do not save the handler context for later work. Start asynchronous work only
 when the application owns its lifecycle and can define what delivery
@@ -266,7 +268,6 @@ decision:
 | --- | --- |
 | `nil` | Acknowledge the delivery as handled. |
 | Ordinary error | Apply the subscription retry policy. |
-| `f1.RetryAfter(err, delay)` | Retry at the [retry step](/learn/glossary#retry-tier) nearest the requested delay. |
 | `f1.Terminal(err)` | Stop retrying and dead-letter the event. |
 | `f1.Drop(err)` | Acknowledge the event without applying its effect or retaining a copy. |
 

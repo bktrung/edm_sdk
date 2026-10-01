@@ -204,7 +204,7 @@ func TestRunReclaimsADestinationItDidNotRecord(t *testing.T) {
 // case and its residue would otherwise accumulate at the run rate forever.
 func TestFailedGroupCleanupDeletesTheGroupDestinations(t *testing.T) {
 	raw := &runTestConn{
-		queues:    make(map[string][]driver.OutboundMessage),
+		queues:    make(map[string][]runTestMessage),
 		unsettled: make(map[string]int),
 		specs:     make(map[string]driver.DestinationSpec),
 	}

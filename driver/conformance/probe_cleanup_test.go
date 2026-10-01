@@ -15,7 +15,7 @@ func TestInspectProbeSurvivesADirtyBroker(t *testing.T) {
 	withoutConformanceGroups(t)
 	conn := newProbeTestConn()
 	for _, profile := range []Profile{ProfileFull, ProfileStrictPortability} {
-		conn.queues["conformance.inspect."+profile.String()+".probe"] = []driver.OutboundMessage{{Body: []byte("old residue")}}
+		conn.queues["conformance.inspect."+profile.String()+".probe"] = []runTestMessage{{message: driver.OutboundMessage{Body: []byte("old residue")}}}
 	}
 
 	Run(t, Suite{
@@ -52,7 +52,7 @@ func TestInspectProbeReclaimsItsDestination(t *testing.T) {
 	const destination = "conformance.inspect.reclaim-test-run.full.probe"
 
 	if !t.Run("completed profile", func(t *testing.T) {
-		runProfile(t, context.Background(), conn, probeTestInspect(conn), runID, ProfileFull, driver.Capabilities{}, nil, nil, &Report{}, probeTestDriver{conn: conn}, driver.Config{}, nil, DeferralExact)
+		runProfile(t, context.Background(), conn, probeTestInspect(conn), runID, ProfileFull, driver.Capabilities{}, nil, nil, &Report{}, probeTestDriver{conn: conn}, driver.Config{}, nil)
 	}) {
 		t.Fatal("completed profile failed")
 	}
@@ -215,7 +215,7 @@ func (c *probeRetryBudgetContext) Deadline() (time.Time, bool) {
 func TestInspectProbeTeardownSurvivesARefusedStop(t *testing.T) {
 	conn := newProbeTestConn()
 	const destination = "conformance.inspect.refused-stop.probe"
-	conn.queues[destination] = []driver.OutboundMessage{{Body: []byte("unsettled")}}
+	conn.queues[destination] = []runTestMessage{{message: driver.OutboundMessage{Body: []byte("unsettled")}}}
 	consumer := &refusingProbeConsumer{events: &conn.events, conn: conn.runTestConn, destination: destination, attached: &conn.attached}
 	producer := &recordingProbeProducer{events: &conn.events}
 
@@ -288,7 +288,7 @@ type probeTestConn struct {
 
 func newProbeTestConn() *probeTestConn {
 	return &probeTestConn{runTestConn: &runTestConn{
-		queues:    make(map[string][]driver.OutboundMessage),
+		queues:    make(map[string][]runTestMessage),
 		unsettled: make(map[string]int),
 		specs:     make(map[string]driver.DestinationSpec),
 	}}
@@ -401,7 +401,7 @@ func (c *refusingProbeConsumer) Stop(context.Context) error {
 func (c *refusingProbeConsumer) Release(context.Context) error {
 	*c.events = append(*c.events, "release")
 	*c.attached = false
-	c.conn.queues[c.destination] = append(c.conn.queues[c.destination], driver.OutboundMessage{Body: []byte("released")})
+	c.conn.queues[c.destination] = append(c.conn.queues[c.destination], runTestMessage{message: driver.OutboundMessage{Body: []byte("released")}})
 	return nil
 }
 func (*refusingProbeConsumer) Lag(context.Context) (map[string]int64, error) { return nil, nil }

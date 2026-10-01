@@ -12,7 +12,7 @@ See [Delivery identity and redelivery](/basics/message#delivery-identity-and-red
 
 ### Backlog lag
 
-Backlog lag is the queued message count reported by a driver; unlike oldest age, it does not require a broker enqueue timestamp.
+Backlog lag is the queued message count reported by a driver. It does not require a broker enqueue timestamp.
 
 See [Enqueue-time backlog and oldest age](/advanced-topics/observability#use-enqueue-timestamps-correctly).
 
@@ -24,7 +24,7 @@ See [RabbitMQ's own dead-letter queue](/advanced-topics/running-in-production#ra
 
 ### Broker enqueue time
 
-Broker enqueue time is the trusted timestamp used to measure broker wait; unlike backlog lag, it is unavailable when the broker does not supply it.
+Broker enqueue time is the trusted timestamp used to measure broker wait. It is unavailable when the broker does not supply it.
 
 See [Use enqueue timestamps correctly](/advanced-topics/observability#use-enqueue-timestamps-correctly).
 
@@ -42,13 +42,13 @@ See [Close in ack-last order](/advanced-topics/lifecycle-and-shutdown#close-in-a
 
 ### Codec
 
-A codec encodes outbound payloads and decodes inbound payloads selected by content type; unlike the event body, it defines how the payload crosses the wire.
+A codec encodes outbound payloads and decodes inbound payloads selected by content type.
 
 See [Publish a message](/basics/message#publish-a-message).
 
 ### Concurrency
 
-Concurrency is the number of handler workers; unlike prefetch, it controls processing workers and cannot bypass a lower worker, broker, or partition limit.
+Concurrency is the number of handler workers. Raising it cannot bypass a lower broker or partition limit.
 
 See [Configure execution capacity](/advanced-topics/ordering-and-scheduling#configure-execution-capacity).
 
@@ -60,13 +60,13 @@ See [Connection numbers reject stale work](/deep-dives/reconnect-and-generations
 
 ### Consumer group
 
-A consumer group is the driver ownership scope identified by a subscription name; unlike a consumer timeout, it is not a broker queue cancellation setting.
+A consumer group is the driver ownership scope identified by a subscription name.
 
 See [Declare and run a subscription](/basics/pubsub#declare-and-run-a-subscription).
 
 ### Consumer timeout
 
-A consumer timeout is RabbitMQ's queue setting that cancels a consumer holding one delivery too long; unlike a consumer group, its argument is fixed when the queue is created.
+A consumer timeout is RabbitMQ's queue setting that cancels a consumer holding one delivery too long. Its argument is fixed when the queue is created.
 
 See [RabbitMQ options](/drivers/rabbitmq#rabbitmq-options).
 
@@ -90,15 +90,15 @@ See [Follow a failed delivery](/advanced-topics/failure-handling#follow-a-failed
 
 ### Delivery attempt
 
-A delivery attempt is a one-based handler invocation count carried in the envelope; unlike a stable identity, it helps with policy and diagnostics and the configured maximum includes the first delivery.
+A delivery attempt is the one-based attempt number carried in the envelope. Retry copies increment it; broker redeliveries do not. The configured maximum includes the first attempt.
 
 See [Delivery identity and redelivery](/basics/message#delivery-identity-and-redelivery).
 
 ### Delivery count
 
-Delivery count is the number of earlier broker redeliveries when the selected broker supplies that value; unlike delivery attempt, it is `-1` when the broker does not.
+Delivery count is broker delivery history, or `-1` when unavailable. RabbitMQ acquisition history can include messages fetched but never handled; it is not a handler-invocation or business-effect count.
 
-See [Read the connected feature list](/advanced-topics/topology-and-capabilities#read-the-connected-feature-list).
+See [RabbitMQ delivery counts](/drivers/rabbitmq#delivery-counts).
 
 ### Discarded event
 
@@ -120,13 +120,13 @@ See [Choose the outcome](/advanced-topics/failure-handling#choose-the-outcome).
 
 ### Emulated
 
-An emulated capability is a feature F1 does itself, the same way on every broker; unlike a native capability, the broker does not need to provide it.
+An emulated capability is a feature F1 provides without requiring the broker to implement it.
 
 See [Read the connected feature list](/advanced-topics/topology-and-capabilities#read-the-connected-feature-list).
 
 ### Envelope
 
-An envelope is F1's standard message metadata, sent as headers separately from the payload body; unlike the header size cap, it describes message content rather than a limit.
+An envelope is F1's standard message metadata, sent as headers separately from the payload body.
 
 See [Metadata and the envelope](/basics/message#metadata-and-the-envelope).
 
@@ -138,13 +138,13 @@ See [Publish a message](/basics/message#publish-a-message).
 
 ### Fairness weight
 
-A fairness weight is a relative share of scheduling opportunities for a lane group; unlike strict execution precedence, it allows an overdue lane to be served while a high-weight lane waits.
+A fairness weight gives a lane group a relative share of scheduling opportunities. It does not impose strict priority.
 
 See [Use priorities as fair lanes](/advanced-topics/ordering-and-scheduling#use-priorities-as-fair-lanes).
 
 ### Free scaling
 
-Free scaling means the driver's parallelism is not limited by partitions; unlike partition-bound scaling, concurrency is not capped by assigned partitions.
+Free scaling means the driver's parallelism is not limited by assigned partitions.
 
 See [Kafka parallelism and partitions](/drivers/kafka#kafka-parallelism-and-partitions).
 
@@ -156,25 +156,25 @@ See [Handler results decide the ack](/basics/pubsub#handler-results-decide-the-a
 
 ### Header size cap
 
-A header size cap bounds encoded envelope metadata; unlike envelope fields, it is a limit, so optional extensions are shed before mandatory fields and encoding fails if the remainder is still too large.
+A header size cap bounds encoded envelope metadata. Optional extensions are shed before mandatory fields; encoding fails if the remainder is still too large.
 
 See [Metadata and the envelope](/basics/message#metadata-and-the-envelope).
 
 ### Idempotency key
 
-An idempotency key identifies the business effect that may be deduplicated across deliveries; unlike an event ID, it may be supplied by the producer and defaults to the event ID when omitted.
+An idempotency key identifies the business effect that may be deduplicated across deliveries. The producer can supply it; otherwise it defaults to the event ID.
 
 See [Publish a message](/basics/message#publish-a-message).
 
 ### Lane
 
-A lane is a bounded queue inside F1, chosen by topic, priority, and retry step; unlike a partition key, it controls scheduler routing.
+A lane is a bounded queue inside F1, chosen by topic, priority, and retry step.
 
 See [Use priorities as fair lanes](/advanced-topics/ordering-and-scheduling#use-priorities-as-fair-lanes).
 
 ### Lane budget
 
-A lane budget is a lane's wait limit, the longest its oldest message should wait before the lane counts as overdue; unlike broker wait, it measures time inside F1.
+A lane budget is the time its oldest message waits inside F1 before the lane counts as overdue. It triggers promotion eligibility, not a maximum-wait guarantee.
 
 See [Configure execution capacity](/advanced-topics/ordering-and-scheduling#configure-execution-capacity).
 
@@ -186,7 +186,7 @@ See [Understand generated resources](/advanced-topics/topology-and-capabilities#
 
 ### Native
 
-A native capability is a feature the connected broker does itself; unlike an emulated capability, F1 does not have to provide it.
+A native capability is a feature the connected broker implements.
 
 See [Read the connected feature list](/advanced-topics/topology-and-capabilities#read-the-connected-feature-list).
 
@@ -198,7 +198,7 @@ See [Choose the ordering guarantee](/advanced-topics/ordering-and-scheduling#cho
 
 ### Parking queue
 
-A parking queue is a RabbitMQ delay queue with a fixed TTL and a dead-letter route back to the destination; F1 uses it because RabbitMQ has no built-in delayed delivery.
+A parking queue is a RabbitMQ delay queue whose messages each expire after their destination's delay and dead-letter back to the destination; F1 uses it because RabbitMQ has no built-in delayed delivery.
 
 See [RabbitMQ retry parking](/deep-dives/rabbitmq-delay-ladder).
 
@@ -210,13 +210,13 @@ See [Kafka parallelism and partitions](/drivers/kafka#kafka-parallelism-and-part
 
 ### Partition key
 
-A partition key keeps related events together for driver routing and per-key ordering; unlike a lane, F1 carries it separately from free-form headers.
+A partition key keeps related events together for driver routing and per-key ordering. F1 carries it separately from free-form headers.
 
 See [Publish a stable key](/advanced-topics/ordering-and-scheduling#publish-a-stable-key).
 
 ### Physical destination
 
-A physical destination is the broker queue or topic name F1 builds from the topic, priority, retry policy, and subscription; unlike a logical topic, applications should not build this name themselves.
+A physical destination is the broker queue or topic name F1 builds from the topic, priority, retry policy, and subscription. Applications should not build this name themselves.
 
 See [Understand generated resources](/advanced-topics/topology-and-capabilities#understand-generated-resources).
 
@@ -230,31 +230,31 @@ See [Dead letters and discarded events](/advanced-topics/failure-handling#dead-l
 
 ### Prefetch
 
-Prefetch is how many messages a subscription may hold in flight across its destinations; unlike concurrency, it also counts messages waiting for a worker.
+Prefetch is the total SDK-admitted unsettled window across a subscription's destinations, including work waiting for or running in a handler; unlike transport buffering, it is bounded by both the subscription total and destination windows.
 
 See [Configure execution capacity](/advanced-topics/ordering-and-scheduling#configure-execution-capacity).
 
 ### Prefetch factor
 
-The prefetch factor scales the bounded capacity assigned to each scheduling lane from its weighted share of concurrency; unlike a broker limit, it cannot bypass worker, broker, or partition limits.
+The prefetch factor scales the bounded capacity assigned to each scheduling lane from its weighted share of concurrency. It cannot bypass worker, broker, or partition limits.
 
 See [Use priorities as fair lanes](/advanced-topics/ordering-and-scheduling#use-priorities-as-fair-lanes).
 
 ### Priority lane
 
-A priority lane is the high, medium, or low scheduling lane selected by publish metadata; unlike strict execution precedence, its labels provide fair scheduling opportunity.
+A priority lane is the high, medium, or low scheduling lane selected by publish metadata. Its weight controls a fair share of scheduling opportunities.
 
 See [Use priorities as fair lanes](/advanced-topics/ordering-and-scheduling#use-priorities-as-fair-lanes).
 
 ### Rebalance timeout
 
-A rebalance timeout is Kafka's coordinator window for completing partition revocation and reassignment; unlike a handler timeout, it bounds group-membership work.
+A rebalance timeout is Kafka's coordinator window for completing partition revocation and reassignment.
 
 See [Kafka rebalancing](/drivers/kafka#kafka-rebalancing).
 
 ### Reconnect generation
 
-A reconnect generation is a runner's current consumer, with its fetch, dispatch, and error-reading goroutines, tied to one [connection epoch](/learn/glossary#connection-epoch); unlike a duplicate subscription, a reconnect replaces it on the existing runner.
+A reconnect generation is a runner's current consumer, with its fetch, dispatch, and error-reading goroutines, tied to one [connection epoch](/learn/glossary#connection-epoch). Reconnect replaces it on the existing runner.
 
 See [Reconnect behavior](/development/consume-flow#reconnect-behavior).
 
@@ -270,12 +270,6 @@ A retry publishes a copy of the message to a retry destination, waits for the br
 
 See [Follow a failed delivery](/advanced-topics/failure-handling#follow-a-failed-delivery).
 
-### Retry-after
-
-`RetryAfter` marks a failure retryable and picks the nearest configured retry step; it does not create an arbitrary delay when no step matches.
-
-See [Configure the retry delays](/advanced-topics/failure-handling#configure-the-retry-delays).
-
 ### Retry ladder
 
 A retry ladder is the list of retry delays: the subscription policy that combines an attempt limit with the delays between handler attempts.
@@ -284,7 +278,7 @@ See [Configure the retry delays](/advanced-topics/failure-handling#configure-the
 
 ### Retry tier
 
-A retry tier is one retry step: one delay in the list of retry delays, with its own retry destination; RabbitMQ parks messages for that destination in a fixed-delay queue.
+A retry tier is one retry step: one delay in the list of retry delays, with its own retry destination; RabbitMQ parks messages for that destination in its parking queue.
 
 See [Kafka retry timing](/drivers/kafka#kafka-retry-timing).
 
@@ -320,7 +314,7 @@ See [Select a topology policy](/advanced-topics/topology-and-capabilities#select
 
 ### Unavailable
 
-An unavailable capability means the connected client cannot provide the requested behavior; unlike a feature F1 does itself, an operation that depends on it can be rejected instead of silently weakening its contract.
+An unavailable capability means the connected client cannot provide the requested behavior. An operation that depends on it can be rejected instead of silently weakening its contract.
 
 See [Read the connected feature list](/advanced-topics/topology-and-capabilities#read-the-connected-feature-list).
 

@@ -11,9 +11,9 @@ rewriting a page under `docs/`.
 | Learn | `learn/` | Second person, task first: "Create a subscription, then call `Run`." |
 | Basics | `basics/` | Neutral explanation of what F1 does and why an application cares. |
 | Advanced | `advanced-topics/` | The same neutral voice, for decisions that need a capacity or failure plan. |
-| Drivers | `drivers-and-capabilities.md` | Neutral and exact. Configuration and provider-specific behavior. |
+| Drivers | `drivers/`, `drivers-and-capabilities.md` | Neutral and exact. Configuration and provider-specific behavior. |
 | Development | `development/` | Neutral and exact. Reference for maintainers and driver authors. |
-| Deep dives | `deep-dives/` | First person singular. How a part works inside and the reasons behind it, in present tense. |
+| Deep dives | `deep-dives/` | Explain the mechanism and its reasons in present tense. Use first person for an author's decisions or observations. |
 
 Keep the voice of the section a page lives in. A Learn page that drifts into
 mechanism and the reasoning behind it belongs in a deep dive; a deep dive that
@@ -31,7 +31,7 @@ gotcha.
 
 ### ASCII only
 
-The rule in `CLAUDE.md` covers docs too. No em or en dash: use
+The rule in `AGENTS.md` covers docs too. No em or en dash: use
 a comma, a colon, parentheses, or a new sentence. Straight quotes only. Write
 an arrow as `->`.
 
@@ -163,14 +163,16 @@ Use VitePress `code-group` tabs for equivalent configuration across brokers.
 
 ### Page endings
 
-Every page ends with a short "Go further" list.
+Authored guides end with a short "Go further" list when related reading helps.
+Generated references keep their generator's format; do not hand-edit them.
 
 ### Signs of AI writing
 
-Read every page against Wikipedia's
-[Signs of AI writing](https://en.wikipedia.org/wiki/Wikipedia:Signs_of_AI_writing)
-list and cut filler openers, "it's not X, it's Y", rule-of-three lists that are
-not three things, and summary sentences that repeat the paragraph.
+Cut staged openers and summary sentences that repeat the paragraph. State the
+subject directly. Keep a contrast when it distinguishes real alternatives or
+corrects a likely misunderstanding; remove comparisons between unrelated concepts.
+Lists need distinct items, not a fixed count. Preserve technical caveats and
+concrete examples rather than simplifying away the contract.
 
 ## Deep dives
 
@@ -182,14 +184,15 @@ Internals for what the feature does, and spends its length on how and why.
 
 ### Voice
 
-- Write as "I", the first person singular. The author is named at the top of the
-  page, in the header `*By <author>.*`.
+- Use neutral prose for mechanisms. First person is useful for an author's
+  decision, measurement, or opinion; attributed essays name the author in
+  the header `*By <author>.*`.
 - Opinions are welcome when they read as opinions: "I think this is the
   weakest part of the design."
 - State uncertainty plainly: "I have not measured this under load."
 - Prefer the concrete case: real numbers, a real sequence of events. A race is
   explained by its interleaving, which goroutine is where and what the other one
-  does in between, as `CLAUDE.md` asks of code comments.
+  does in between, as `AGENTS.md` asks of code comments.
 - Pages explain the mechanism and the reasoning as it stands today, in present
   tense. Do not write a design-history narrative or an account of what an
   earlier version did.

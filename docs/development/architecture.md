@@ -294,8 +294,8 @@ releases, and process restarts may redeliver a message with its stable identity.
 F1 does not deduplicate application effects.
 
 See [Failure handling](/advanced-topics/failure-handling) and
-[Life of a delivery](/deep-dives/life-of-a-delivery) for the user-facing
-trade-offs and failure cases.
+[Consume flow](/development/consume-flow#settle-last-ordering) for the
+settlement boundaries and failure cases.
 
 ### Handlers must be idempotent
 
@@ -303,8 +303,8 @@ Handlers must tolerate the same event more than once because F1 does not own the
 application's effect store or deduplication policy.
 
 See [Failure handling](/advanced-topics/failure-handling) and
-[Life of a delivery](/deep-dives/life-of-a-delivery) for the user-facing
-trade-offs and failure cases.
+[Ordering and scheduling](/advanced-topics/ordering-and-scheduling#hash-collisions-and-abandoned-handlers)
+for equal-key execution limits.
 
 ### Capabilities may be reduced at runtime
 

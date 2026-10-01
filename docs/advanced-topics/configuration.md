@@ -40,7 +40,7 @@ f1:
       - amqp://guest:guest@localhost:5672/
     connectTimeout: 30s
     maxReconnectAttempts: 0     # 0 = no limit
-    defaultPrefetch: 64
+    defaultPrefetch: 0          # automatic lane-derived sizing
     tls:
       enabled: false
       caFile: ""
@@ -80,7 +80,7 @@ f1:
       topics: [orders.created]  # required
       mode: unordered
       concurrency: 16
-      # prefetch: 64            # default: broker.defaultPrefetch, raised to the lane count
+      # prefetch: 0             # positive broker fallback, otherwise automatic
       priorities: [high, medium, low]
       handlerTimeout: 30s
       unmatchedPolicy: ignore
@@ -114,7 +114,7 @@ f1:
 | `broker.endpoints` | none | List of endpoints | Required for `kafka` (`host:port`) and `rabbitmq` (`amqp://` or `amqps://`). |
 | `broker.connectTimeout` | `30s` | Duration | Bounds each `Open`, including reconnects. |
 | `broker.maxReconnectAttempts` | `0` | Integer, 0 or more | `0` means no limit. See [reconnects](/deep-dives/reconnect-and-generations). |
-| `broker.defaultPrefetch` | `64` | Integer | Prefetch for a subscription that names none. |
+| `broker.defaultPrefetch` | `0` | Integer, 0 to 65535 | Positive subscription fallback; `0` or omission selects automatic sizing. See [prefetch resolution](#prefetch-resolution). |
 | `broker.tls.*` | TLS off | See the driver page | `enabled`, `caFile`, `certFile`, `keyFile`, `serverName`, `insecureSkipVerify`. [Kafka TLS](/drivers/kafka#kafka-tls), [RabbitMQ TLS](/drivers/rabbitmq#rabbitmq-tls). |
 | `broker.sasl.*` | SASL off | See the driver page | `mechanism`, `username`, `password`. In `prod`, SASL needs TLS. [Kafka SASL](/drivers/kafka#kafka-sasl), [RabbitMQ SASL](/drivers/rabbitmq#rabbitmq-sasl). |
 
@@ -183,12 +183,40 @@ use only letters, digits, `-` and `_`.
 | Key | Default | Accepts | Notes |
 | --- | --- | --- | --- |
 | `topics` | none, required | Non-empty topic names | Two entries naming the same topic are refused. |
-| `mode` | `unordered` | `unordered`, `orderedByKey` | [Ordered by key](/deep-dives/ordered-by-key). In ordered mode, `concurrency` x `prefetch` is at most 2,097,152. |
+| `mode` | `unordered` | `unordered`, `orderedByKey` | [Ordering guarantee](/advanced-topics/ordering-and-scheduling#choose-the-ordering-guarantee). In ordered mode, `concurrency` x `prefetch` is at most 2,097,152. |
 | `concurrency` | `16` | 1 to 1024 | Handlers running at once. On Kafka, also capped by the partitions the member holds. |
-| `prefetch` | `broker.defaultPrefetch` | From the lane count to 65535 | The lane count is topics x priorities x (1 + retry steps). An unset prefetch is raised to it. |
+| `prefetch` | `0` | Integer, 0 to 65535 | `0` or omission uses a positive broker fallback, otherwise automatic sizing. See [prefetch resolution](#prefetch-resolution). |
 | `priorities` | `[high, medium, low]` | `high`, `medium`, `low`, no duplicates | The priority lanes this subscription reads. |
 | `handlerTimeout` | `30s` | Positive duration | Shorter than `lifecycle.drainTimeout`. |
 | `unmatchedPolicy` | `ignore` | `ignore`, `deadletter` | What happens to an event no handler matches. |
+
+### Prefetch resolution
+
+Automatic sizing uses the sum of resolved lane capacities, not a fixed budget.
+A positive subscription value overrides a positive `broker.defaultPrefetch`;
+subscription zero or omission uses that fallback when set, otherwise automatic
+sizing. An environment prefetch of `0` clears the lower-priority subscription
+value before fallback resolution; a positive Go `Subscription.Prefetch` still
+has higher priority.
+Positive totals from `1` to `65535` are valid even below the lane count; a small
+total limits concurrent SDK admission without shrinking destination windows.
+
+The effective total bounds SDK-admitted unsettled deliveries across all
+destinations, including work waiting for or running in a handler. Broker credit,
+poll results, and client transport buffers are separate. Each destination keeps
+its full lane window, but every adapter must enforce both that window and the
+total. A positive total above the lane-capacity sum is effectively lower; it
+does not enlarge lanes or let a hot lane borrow another lane's capacity.
+
+The executable owners are `resolvePrefetch` and subscription validation in
+[`config.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/config.go),
+`resolveSubscription` in
+[`subscription.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/subscription.go),
+and `runnerLanePlan` / `runnerConsumerPrefetch` in
+[`worker.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/worker.go).
+Resolved automatic sizing remains subject to prefetch and ordered-buffer
+validation. This admission contract does not change acknowledgement timing or
+ordered-key behavior.
 
 ### Retry
 
@@ -207,7 +235,7 @@ handling](/advanced-topics/failure-handling#configure-the-retry-delays).
 
 | Key | Default | Accepts | Notes |
 | --- | --- | --- | --- |
-| `fairness.weights` | `{high: 8, medium: 4, low: 1}` | Integer, 1 or more, per priority | Relative share of handler slots. |
+| `fairness.weights` | `{high: 8, medium: 4, low: 1}` | Integer from 1 to 65535, per priority | Relative share of handler slots. |
 | `fairness.budgets` | `{high: 5s, medium: 30s, low: 2m}` | Duration, 0 or more, per priority | How long a lane's oldest message may wait before it jumps the queue. |
 | `fairness.retryWeightDivisor` | `2` | Integer, 0 or more | Divides a retry lane's weight. `0` keeps the default. |
 | `fairness.prefetchFactor` | `2` | Integer, 0 or more | Scales each lane's capacity. `0` keeps the default. |

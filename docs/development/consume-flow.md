@@ -138,8 +138,8 @@ The runner then creates one `driver.Consumer` with:
 
 - the subscription name as the consumer group or queue-set identity;
 - all main and retry destinations owned by the subscription;
-- the effective total prefetch budget, capped by the sum of lane capacities;
-- the per-destination lane capacities;
+- the resolved positive SDK admission total ([prefetch resolution](/advanced-topics/configuration#prefetch-resolution));
+- the full per-destination lane capacities, not a split of that total;
 - exclusive/ordered mode when ordered-by-key is requested;
 - the effective capability profile; and
 - the current core-selected starting position for a new group (`StartEarliest`).
@@ -163,6 +163,10 @@ After a consumer is ready, `Runner.Run` starts three coordinated activities:
 All three belong to one generation and are cancelled with it. The fetcher reads
 the consumer that generation admitted, so a repair cancels the fetch of the
 consumer it is replacing and never the fetch of a newer generation.
+
+If dispatch exits while fetch is blocked on a full channel, fetch cannot make
+progress without its reader. Canceling the generation's sources together
+breaks that wait, so repair or drain can proceed.
 
 The driver owns transport delivery. Each `driver.InboundMessage` carries the
 physical destination, key, headers, body, broker reference, delivery count,
@@ -217,22 +221,20 @@ execution. `newRunnerScheduler` creates a lane for each topic, priority, and
 retry tier. Retry tiers share a retry group so retry pressure can be weighted
 below fresh traffic without losing per-tier visibility.
 
-- bounded lane capacity derived from subscription concurrency, fairness weights,
-  and the prefetch factor: each lane holds at least its weighted share of the
-  concurrency, and the total prefetch the driver may hold is capped by the sum
-  of those capacities;
+- bounded lane capacity owned by `runnerLanePlan` in
+  [`worker.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/worker.go); automatic and explicit totals share those destination windows;
 - smooth weighted round-robin selection across groups; every weighted pick scans all slots to accrue weights and choose the highest deficit; and
 - optional deadline promotion when a lane exceeds its configured budget.
 
-The scheduler applies earliest-deadline-first over overdue lanes. A budget
-starts when `enqueuePendingDelivery` constructs the `sched.Item` with
-`EnqueuedAt: r.client.options.clock.Now()`, so it measures wait inside the SDK;
-backlog still in the broker is invisible.
+Deadline promotion chooses the lane furthest past its budget, not the lane with
+the earliest absolute deadline. `runDispatchPipeline` timestamps a delivery
+when it leaves the fetch channel; `enqueuePendingDelivery` preserves that
+timestamp while waiting for lane space. Broker backlog and time still in the
+fetch channel are outside this clock.
 
-Retry lanes normally receive a reduced weight and a larger budget. Weights, not
-deadline promotion, ensure the lowest-weight group continues to receive its
-configured share, while the larger budget keeps retry pressure below fresh
-traffic.
+Retry lanes normally receive a reduced weight and a larger budget. Weights
+share normal picks among non-empty groups; overdue picks are additional
+opportunities, not a maximum-wait guarantee.
 
 The scheduler implementation is in
 [`internal/sched/scheduler.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/internal/sched/scheduler.go) and the
@@ -250,17 +252,17 @@ second backpressure boundary after driver prefetch.
 
 - unordered mode uses a shared worker queue;
 - ordered-by-key mode hashes each message key to one worker queue;
-- equal keys therefore cannot execute concurrently within the pool; and
+- equal-key work items serialize within the pool, subject to the handler
+  abandonment boundary below; and
 - different keys may execute concurrently when they map to different workers.
 
 `Subscription.Concurrency` controls the worker count and the dispatch budget.
-`Subscription.Prefetch` caps the amount of transport work admitted across the
-destination set. The core passes a per-destination allocation to the driver,
-while the scheduler and pool enforce their own bounded queues. A driver may
-admit less than that allocation when its own transport bounds it lower, which
-is what the Kafka driver does: it admits one delivery per partition, so the
-admitted amount for a destination is capped by the number of partitions
-assigned to the consumer, which can be lower than the allocation it was given.
+For total SDK admission and destination ceilings, use the
+[prefetch contract](/advanced-topics/configuration#prefetch-resolution) and
+[`ConsumerConfig`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/driver/driver.go).
+These ceilings are distinct from transport buffering and may be reduced by a
+driver's physical limits; [Kafka partition limits](/drivers/kafka#kafka-parallelism-and-partitions)
+explain the operational consequence.
 
 Ordered mode is a portability contract, not a broker hint. `Subscribe` checks
 the effective capability before accepting it, and `ConsumerConfig.Exclusive`
@@ -297,6 +299,23 @@ recognizes a non-cooperative handler as stuck after its bounded thresholds. A
 stuck handler is not allowed to hold the runner indefinitely; the surrounding
 `processDelivery` cleanup decides how the unsettled delivery is returned.
 
+### Running the handler
+
+The handler runs on its own goroutine. Its timeout cancels its context, but
+cancellation does not itself choose a delivery outcome: a handler that returns
+nil after cancellation can still be acknowledged.
+
+If the handler ignores cancellation, `invokeHandlerMessage` eventually stops
+waiting and marks the delivery abandoned. Deferred `processDelivery` cleanup
+attempts a requeue without incrementing the attempt. Go cannot stop the
+application goroutine, so the worker can accept another delivery while that
+goroutine still runs. This can exceed configured handler concurrency and
+overlap equal-key effects even in ordered mode.
+
+Cancellation must reach downstream work. Neither a worker slot nor an
+idempotency key can undo an effect still executing after its delivery was
+abandoned.
+
 The handler and middleware contracts are in [`handler.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/handler.go).
 The user-facing message and middleware model is documented in
 [Message](/basics/message) and [Middleware](/basics/middleware).
@@ -319,6 +338,11 @@ settled:
 | Successor publication cannot be confirmed | Stop settling the original | Release for broker redelivery |
 | Handler or settlement remains incomplete during shutdown | Preserve broker ownership where possible | Requeue, release, unknown, or abandoned outcome |
 
+The interactive figure illustrates the outcome branches, not scheduler timing
+or broker behavior:
+
+<F1DeliveryPath />
+
 The decision tree is implemented by
 [`dispatchMessage`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/worker.go), with error categories in
 [`errors.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/errors.go), classification in
@@ -330,8 +354,9 @@ The decision tree is implemented by
 `retryAndSettle` carries the already-received body forward, increments the
 attempt, resolves the retry tier and delay, encodes the updated envelope, and
 publishes to the retry destination. The destination topology supplies the
-configured delay; the outbound message also carries `DelayUntil` for drivers
-that implement deferred delivery through the port.
+configured delay. Its timing boundary depends on the driver; see
+[RabbitMQ retry parking](/deep-dives/rabbitmq-delay-ladder) and
+[Kafka retry delays](/deep-dives/kafka-retry-delays).
 
 Dead-letter copies preserve the original body and add death metadata. Decode
 failures that cannot produce an envelope use the stable `unknown` dead-letter
@@ -369,9 +394,10 @@ sequenceDiagram
     S->>B: Remove original delivery
 ```
 
-F1 confirms the successor before acknowledging the source; uncertain handoffs
-can redeliver or duplicate it, so handlers must be idempotent; see [Life of a
-delivery](/deep-dives/life-of-a-delivery) for the failure cases.
+F1 confirms the successor before acknowledging the source. If the process
+stops between confirmation and the source ack, the source can be redelivered
+while the confirmed copy also exists. This deliberately prefers duplicates to
+loss; handler effects must be idempotent.
 
 The implementation is in [`retryAndSettle`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/worker.go),
 [`deadLetterAndSettle`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/worker.go), and
@@ -384,9 +410,14 @@ must not be applied more than once by a driver.
 The runtime tracks one fact for each accepted delivery: whether it is still in
 flight. The in-flight registry (root `registry.go`, backed by
 `internal/dispatch.Registry`) registers a delivery before dispatch and
-removes it once its settlement path finished, or when the bounded cleanup
-budget runs out. `WaitZero` is the runner's proof that accepted work has left
+removes it once its settlement path finished, or when bounded cleanup ends
+without a confirmed settlement. `WaitZero` is the runner's proof that accepted work has left
 the in-flight set.
+
+Registration precedes the dispatch-channel send. If shutdown starts while the
+channel is full, the delivery is already visible to cleanup rather than hidden
+between owners. A zero registry means tracking has ended; it does not prove
+that every broker settlement succeeded.
 
 `processDelivery` owns the final cleanup defer. It:
 
@@ -399,12 +430,20 @@ the in-flight set.
   finished.
 
 When a driver call returns an error the broker-side settlement is unknown, so
-the entry stays in the registry until the delivery settles or the bounded
-cleanup budget runs out. The registry is in
+the entry stays in the registry while bounded cleanup retries it. Cleanup can
+end without a confirmed settlement. The registry is in
 [`internal/dispatch/registry.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/internal/dispatch/registry.go).
 Settlement behavior is covered by [`settlement_state_test.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/settlement_state_test.go),
 [`worker_settlement_test.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/worker_settlement_test.go), and the driver
 settlement suites.
+
+### Work selected after its consumer is gone
+
+A reconnect can cancel intake while the pool still holds accepted work.
+`dispatchMessage` checks cancellation and drain state before invoking a
+handler. During a reconnect it abandons not-yet-started work for deferred
+requeue; during drain it keeps processing accepted work. Using cancellation
+alone as the decision would discard work a graceful drain owes.
 
 ## Drain and shutdown
 
@@ -544,4 +583,4 @@ When changing consume behavior, follow this order:
 
 - [Publish flow](/development/publish-flow) - the outbound message path;
 - [Failure handling](/advanced-topics/failure-handling) - retry and dead-letter policy;
-- [Life of a delivery](/deep-dives/life-of-a-delivery) - successor ordering and redelivery.
+- [Retries and dead letters](/deep-dives/retries-and-dead-letters) - copy-before-ack reasoning and failed publication.

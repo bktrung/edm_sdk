@@ -159,7 +159,7 @@ const scenarios: { id: string; label: string; outcome: string; steps: Step[] }[]
       { station: 'intake', caption: 'F1 records the delivery in flight before it goes on the channel.' },
       { station: 'channel', caption: 'The dispatch channel holds as many messages as the subscription has workers.' },
       { station: 'lanes', caption: 'The scheduler places the delivery in a lane for its topic, priority and retry step.' },
-      { station: 'pool', caption: 'Unordered work enters a shared queue; messages with the same key wait in one worker queue, and different keys run in parallel.' },
+      { station: 'pool', caption: 'Unordered work uses a shared queue. Ordered work hashes keys to worker queues, so unequal keys can collide; a stuck handler can outlive the work its queue tracks.' },
       { station: 'handler', caption: 'The handler runs on its own goroutine with a context bounded by the handler timeout.' },
       { station: 'settle', caption: 'The handler returns nil, so F1 acks the original and the broker is told it is finished.', edge: 'ack', tone: 'ok' },
     ],

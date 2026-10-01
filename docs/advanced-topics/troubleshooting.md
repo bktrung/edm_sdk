@@ -90,13 +90,12 @@ f1: subscription %s requests ordered_by_key, but feature is unavailable
 ### Prefetch does not provide the expected window
 
 ```text
-f1: subscriptions.%s.prefetch %d must be at least lane count %d (topics x priorities x (1 + retryTiers))
 f1 configured prefetch exceeds the destination windows
 ```
 
-**Why** The configured value is either below the number of lanes or above the sum of effective destination windows. The smaller effective window decides how many messages are let in.
+**Why** A configured total above the sum of destination windows is effectively capped. A smaller positive total is valid, even below the lane count, and deliberately limits SDK admission.
 
-**Fix** Raise explicit prefetch to the reported lane count, or review concurrency, fairness lane capacity, prefetch factor, and driver limits instead of raising prefetch alone. See [Configure execution capacity](/advanced-topics/ordering-and-scheduling#configure-execution-capacity).
+**Fix** Review the chosen total, concurrency, lane capacities, and driver limits instead of raising prefetch alone. Use automatic sizing when no smaller application backlog budget is needed. See [Configure execution capacity](/advanced-topics/ordering-and-scheduling#configure-execution-capacity).
 
 ## Messages arrive late or out of order
 

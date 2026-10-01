@@ -17,10 +17,13 @@ type BrokerConfig struct {
 	Endpoints            []string
 	ConnectTimeout       time.Duration
 	MaxReconnectAttempts int
-	DefaultPrefetch      int
-	TLS                  driver.TLSConfig
-	SASL                 driver.SASLConfig
-	DriverOptions        map[string]string
+	// DefaultPrefetch is the fallback total admission cap for subscriptions
+	// without a positive prefetch override. Zero selects automatic sizing from
+	// each subscription's resolved lane capacities.
+	DefaultPrefetch int
+	TLS             driver.TLSConfig
+	SASL            driver.SASLConfig
+	DriverOptions   map[string]string
 }
 
 type rawBroker BrokerConfig

@@ -21,6 +21,13 @@ import (
 // the request into its opposite.
 const maxPrefetch = 65535
 
+// maxFairnessWeight is the largest fairness weight a priority may have.
+// Weights are only ratios, and 65535:1 is already past any share a scheduler
+// can express with at most 1024 handler slots; the bound is what lets the
+// automatic prefetch compute a lane's share of the slots exactly, with no
+// intermediate product able to overflow.
+const maxFairnessWeight = 65535
+
 // Config contains the SDK settings used to construct a Client. LoadConfig
 // returns a normalized, validated Config; New also normalizes and validates
 // values constructed directly in Go.
@@ -153,9 +160,11 @@ func (r RetryConfig) tierCount() int {
 // SubscriptionConfig contains the delivery settings that can be loaded from
 // YAML. Handlers and lifecycle callbacks are supplied on Subscription.
 type SubscriptionConfig struct {
-	Topics          []string        `yaml:"topics"`
-	Mode            Mode            `yaml:"mode"`
-	Concurrency     int             `yaml:"concurrency"`
+	Topics      []string `yaml:"topics"`
+	Mode        Mode     `yaml:"mode"`
+	Concurrency int      `yaml:"concurrency"`
+	// Prefetch is a total SDK admission cap. Zero retains automatic sizing
+	// unless Broker.DefaultPrefetch supplies a positive fallback.
 	Prefetch        int             `yaml:"prefetch"`
 	Priorities      []Priority      `yaml:"priorities"`
 	Fairness        FairnessConfig  `yaml:"fairness"`
@@ -194,16 +203,9 @@ func LoadConfig(path string) (Config, error) {
 	return cfg, nil
 }
 
-// defaultBrokerPrefetch is the prefetch a subscription falls back to when
-// neither its own configuration nor Broker.DefaultPrefetch names one. It is
-// the same number defaultConfig puts in Broker.DefaultPrefetch, so a
-// programmatic Config that leaves that field zero resolves to the documented
-// default.
-const defaultBrokerPrefetch = 64
-
 func defaultConfig() Config {
 	return Config{
-		Broker:        BrokerConfig{ConnectTimeout: 30 * time.Second, DefaultPrefetch: defaultBrokerPrefetch},
+		Broker:        BrokerConfig{ConnectTimeout: 30 * time.Second},
 		Topology:      TopologyConfig{VerifyOnStart: true, Priorities: []Priority{PriorityHigh, PriorityMedium, PriorityLow}},
 		Codec:         CodecConfig{Default: "json", MaxHeaderBytes: CoreMaxHeaderBytes, MaxBodyBytes: 1024 * 1024},
 		Lifecycle:     LifecycleConfig{DrainTimeout: time.Minute, HandlerGrace: 5 * time.Second, CloseTimeout: 10 * time.Second, RebalanceDrainTimeout: 25 * time.Second},
@@ -229,7 +231,7 @@ func resolvePrefetch(prefetch, brokerDefault int) int {
 	if brokerDefault != 0 {
 		return brokerDefault
 	}
-	return defaultBrokerPrefetch
+	return 0
 }
 
 func normalizeConfig(cfg Config) Config {
@@ -274,13 +276,8 @@ func normalizeConfig(cfg Config) Config {
 		if subscription.Retry.MaxAttempts == 0 {
 			subscription.Retry.MaxAttempts = subDefaults.Retry.MaxAttempts
 		}
-		if !subscription.presence.Prefetch {
-			named := subscription.Prefetch != 0
-			subscription.Prefetch = resolvePrefetch(subscription.Prefetch, cfg.Broker.DefaultPrefetch)
-			if !named {
-				subscription.Prefetch = max(subscription.Prefetch, subscriptionLaneCount(len(subscription.Topics), len(subscription.Priorities), subscription.Retry))
-			}
-		}
+		subscription.Fairness = mergeFairness(subDefaults.Fairness, subscription.Fairness)
+		subscription.Prefetch = resolvePrefetch(subscription.Prefetch, cfg.Broker.DefaultPrefetch)
 		if subscription.HandlerTimeout == 0 {
 			subscription.HandlerTimeout = subDefaults.HandlerTimeout
 		}
@@ -394,6 +391,9 @@ func validateConfig(cfg Config, driverName string) error {
 	if cfg.Broker.MaxReconnectAttempts < 0 {
 		return fmt.Errorf("f1: broker.maxReconnectAttempts must not be negative")
 	}
+	if cfg.Broker.DefaultPrefetch < 0 || cfg.Broker.DefaultPrefetch > maxPrefetch {
+		return fmt.Errorf("f1: broker.defaultPrefetch must be between 0 and %d", maxPrefetch)
+	}
 	if cfg.Env == "prod" && cfg.Broker.SASL.Mechanism != "" && !cfg.Broker.TLS.Enabled {
 		return fmt.Errorf("f1: broker.sasl.mechanism requires broker.tls.enabled in prod")
 	}
@@ -472,9 +472,9 @@ func validateConfig(cfg Config, driverName string) error {
 	return nil
 }
 
-func validatePrefetch(name string, prefetch, lanes int) error {
-	if prefetch < lanes {
-		return fmt.Errorf("f1: subscriptions.%s.prefetch %d must be at least lane count %d (topics x priorities x (1 + retryTiers))", name, prefetch, lanes)
+func validatePrefetch(name string, prefetch int) error {
+	if prefetch < 0 {
+		return fmt.Errorf("f1: subscriptions.%s.prefetch must be zero for automatic sizing or positive", name)
 	}
 	if prefetch > maxPrefetch {
 		return fmt.Errorf("f1: subscriptions.%s.prefetch %d must be at most %d", name, prefetch, maxPrefetch)
@@ -536,10 +536,9 @@ func validateRetryConfig(path string, retry RetryConfig) error {
 }
 
 // maxRetryDelay is the longest retry delay a subscription may configure. A
-// RabbitMQ per-message expiration is a 32-bit count of milliseconds, so a
-// longer delay would be cut short and the copy released early; the same limit
-// applies to every driver so a configuration does not change meaning when the
-// broker does.
+// RabbitMQ message expiration is a 32-bit count of milliseconds, so a longer
+// tier would release its copies early; the same limit applies to every driver
+// so a configuration does not change meaning when the broker does.
 const maxRetryDelay = math.MaxInt32 * time.Millisecond
 
 func validateLifecycleConfig(lifecycle LifecycleConfig) error {
@@ -577,13 +576,6 @@ func durationOption(options map[string]string, key string, fallback time.Duratio
 		return 0, fmt.Errorf("f1: %s %q must be a duration: %w", key, value, err)
 	}
 	return duration, nil
-}
-
-// subscriptionLaneCount is the number of delivery lanes a subscription feeds:
-// one per topic, priority and retry tier. The default prefetch and both
-// prefetch validations derive from it, so the three cannot drift.
-func subscriptionLaneCount(topics, priorities int, retryCfg RetryConfig) int {
-	return topics * priorities * (1 + retryCfg.tierCount())
 }
 
 type rawConfig struct {

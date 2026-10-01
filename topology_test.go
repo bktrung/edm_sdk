@@ -2,6 +2,7 @@ package f1
 
 import (
 	"reflect"
+	"slices"
 	"sort"
 	"testing"
 	"time"
@@ -185,7 +186,10 @@ func destinationNames(destinations []driver.DestinationSpec) []string {
 	return result
 }
 
-func TestSubscriptionTopologyRetryTiersAreFixedDelay(t *testing.T) {
+// TestSubscriptionTopologyRetryTiersCarryTheirDelay proves each retry tier is
+// declared with its own delay, which is how a driver parks every copy for
+// exactly that tier's delay, and that no other destination is declared delayed.
+func TestSubscriptionTopologyRetryTiersCarryTheirDelay(t *testing.T) {
 	source := "/prod/orders"
 	sub := Subscription{
 		Name:       "order-worker",
@@ -198,21 +202,19 @@ func TestSubscriptionTopologyRetryTiersAreFixedDelay(t *testing.T) {
 	}
 	effective := driver.Capabilities{Fanout: driver.FanoutAtPublish, NativeDLQ: true}
 	spec := subscriptionTopologySpecs(effective, source, sub)
-	retryCount := 0
+	var retryDelays []time.Duration
 	for _, destination := range spec.Destinations {
 		if destination.Kind == driver.DestRetry {
-			retryCount++
-			if !destination.FixedDelay {
-				t.Errorf("retry destination %q FixedDelay = false, want true", destination.Name)
-			}
+			retryDelays = append(retryDelays, destination.Delay)
 			continue
 		}
-		if destination.FixedDelay {
-			t.Errorf("destination %q kind %v FixedDelay = true, want false", destination.Name, destination.Kind)
+		if destination.Delay != 0 {
+			t.Errorf("destination %q kind %v Delay = %s, want 0", destination.Name, destination.Kind, destination.Delay)
 		}
 	}
-	if retryCount != 3 {
-		t.Fatalf("retry destinations = %d, want 3", retryCount)
+	slices.Sort(retryDelays)
+	if want := []time.Duration{time.Second, 5 * time.Second, 25 * time.Second}; !slices.Equal(retryDelays, want) {
+		t.Fatalf("retry destination delays = %v, want %v", retryDelays, want)
 	}
 }
 

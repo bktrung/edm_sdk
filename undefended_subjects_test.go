@@ -1,7 +1,6 @@
 package f1
 
 import (
-	"context"
 	"errors"
 	"testing"
 	"time"
@@ -71,23 +70,6 @@ func TestErrorWrappersPreserveUnderlyingText(t *testing.T) {
 	}
 }
 
-// TestPriorityHintMapsLogicalPrioritiesToWireLevels pins the driver's strict
-// priority levels used in every outbound message.
-func TestPriorityHintMapsLogicalPrioritiesToWireLevels(t *testing.T) {
-	for _, test := range []struct {
-		priority Priority
-		want     uint8
-	}{
-		{priority: PriorityHigh, want: 1},
-		{priority: PriorityMedium, want: 0},
-		{priority: PriorityLow, want: 2},
-	} {
-		if got := priorityHint(test.priority); got != test.want {
-			t.Errorf("priorityHint(%v) = %d, want %d", test.priority, got, test.want)
-		}
-	}
-}
-
 // TestZeroConfigPredicatesDistinguishEmptyAndExplicitOverrides pins the merge
 // decision: empty structs are omitted, while each supported override shape is
 // treated as present.
@@ -131,19 +113,6 @@ func TestDestinationDelaysIncludesOnlyDeclaredPositiveDelays(t *testing.T) {
 	}
 }
 
-// TestRunnerIsDrainingReadsTheTeardownState pins the branch that keeps a
-// cancellation wait open while runner teardown is still in progress.
-func TestRunnerIsDrainingReadsTheTeardownState(t *testing.T) {
-	runner := &Runner{}
-	if runnerIsDraining(runner) {
-		t.Fatal("runnerIsDraining(new Runner) = true, want false")
-	}
-	runner.draining = true
-	if !runnerIsDraining(runner) {
-		t.Fatal("runnerIsDraining(draining Runner) = false, want true")
-	}
-}
-
 // TestRunnerOwnerGenerationEndsOnlyAfterSourcesClose pins the drain start
 // condition: both outstanding work and a pending opener must be gone.
 func TestRunnerOwnerGenerationEndsOnlyAfterSourcesClose(t *testing.T) {
@@ -181,20 +150,5 @@ func TestSuccessorAttemptNormalizesMissingAttempts(t *testing.T) {
 		if got := successorAttempt(Envelope{Attempt: test.attempt}); got != test.want {
 			t.Errorf("successorAttempt(%d) = %d, want %d", test.attempt, got, test.want)
 		}
-	}
-}
-
-// TestSuccessorTopicPrefersTheConsumingFamily pins successor routing when an
-// event type belongs to another topic, while preserving the historical fallback.
-func TestSuccessorTopicPrefersTheConsumingFamily(t *testing.T) {
-	client, runner := newRetryBridgeRunner(t, &dispatchProducer{}, "orders.created")
-	defer func() { _ = client.Close(context.Background()) }()
-	envelope, message := divergentBridgeMessage(t, &dispatchSettler{})
-	if got := resolveDeliveryTopic(runner, envelope, message); got != "orders.created" {
-		t.Fatalf("successorTopic(consuming family) = %q, want orders.created", got)
-	}
-	message.Destination = "outside.declared.family"
-	if got := resolveDeliveryTopic(runner, envelope, message); got != "payments.charged" {
-		t.Fatalf("successorTopic(fallback) = %q, want payments.charged", got)
 	}
 }

@@ -10,8 +10,9 @@ Choose the smallest scope that matches the operation. Do not close a shared clie
 stateDiagram-v2
     [*] --> Starting: Subscribe + Run
     Starting --> Ready: consumer ready
-    Ready --> Reconnecting: transient driver failure
-    Reconnecting --> Ready: consumer repaired
+    Ready --> Ready: consumer repaired on the same connection
+    Ready --> Reconnecting: connection replaced
+    Reconnecting --> Ready: consumer reopened
     Ready --> Draining: Runner.Drain or Run context cancel
     Reconnecting --> Draining: Client.Close
     Draining --> Closed: work finished and consumer released
@@ -155,7 +156,7 @@ Notification callbacks are not shutdown barriers either. Keep `OnDeadLetter`, `O
 
 ## Reconnection is not shutdown
 
-A transient driver failure can move a runner to `Reconnecting`. F1 first tries to repair the consumer, then rebuilds the connection when needed. It waits for in-flight publishes to finish, installs the replacement, and lets waiting runners open consumers on it. Keep the existing runner and do not create a duplicate subscription.
+A transient consumer error first repairs the runner's consumer on the same connection, and the runner stays `Ready`. When the repair fails twice in a row, or the connection itself has to be replaced, the runner moves to `Reconnecting`. F1 waits for in-flight publishes to finish, installs the replacement, and lets waiting runners open consumers on it. Keep the existing runner and do not create a duplicate subscription.
 Reconnect attempts use jittered exponential backoff and stop after `broker.maxReconnectAttempts` when that limit is set; the retained error then shows in `Health`.
 
 Once `Client.Close` begins, shutdown wins over reconnect: new reconnect work is not started and the supervisor is canceled. Report a reconnect failure through the runtime or runner error path, then continue through the close path.

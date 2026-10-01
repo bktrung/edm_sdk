@@ -389,6 +389,8 @@ drivers, never as a threshold.
 `examples/acceptance` services once, runs the identical binaries against Kafka
 and RabbitMQ with one corpus, and diffs the behaviour vectors. It needs both
 brokers, takes a few minutes, and writes its artifacts to `.cache/driver-flip`.
+Artifacts include binary digests in the test log, service logs, behaviour vectors,
+arrival order, and reported limits; the harness does not emit source-tree manifests.
 Size the corpus with `F1_DRIVER_FLIP_CORPUS` (default 10 000). It is not a
 required gate; run it deliberately. Each broker run has a 60-second
 no-progress detector, so a stall fails the run with the count consumed so far

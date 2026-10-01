@@ -12,12 +12,19 @@ state, delayed delivery on a fake clock, [consumer groups](/learn/glossary#consu
 delivery counters, redelivery, topology administration, and injectable test
 failures. Messages with the same key go to the same consumer within a group.
 
-Two limits matter when you pick it for tests. Delays have zero lateness: a
-delayed message is released in the same step that the driver's clock reaches its
-due time. A consumer group that attaches from the earliest message after every
-other consumer has left can replay only the newest 10,000 messages of each
-destination; older ones are dropped, as a real broker with limited retention
-would.
+Do not use the in-memory adapter to model broker delay lateness or durable
+retention. Its fake-clock delays are deterministic, and its replay history is
+bounded, evicting the oldest entries at the cap. The last consumer detaching
+from a destination clears that destination's history, so a later earliest-start
+group cannot rely on replaying messages from before it went idle.
+
+[`inmem.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/drivers/inmem/inmem.go),
+at `maxDestinationHistory`, `recordHistoryLocked`, and `replayHistoryLocked`,
+owns the replay cap and selection.
+[`consumer.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/drivers/inmem/consumer.go),
+at `detachLocked`, owns idle-history clearing. These rules apply to replay
+history; they are not a promise to purge pending deliveries when a consumer
+leaves.
 
 Start with [`drivers/inmem/inmem.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/drivers/inmem/inmem.go), then read its
 producer, consumer, admin, ack, and conformance tests. It is the best

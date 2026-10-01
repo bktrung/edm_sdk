@@ -4,7 +4,9 @@ import (
 	"bytes"
 	"context"
 	"errors"
-	"slices"
+	"os"
+	"os/exec"
+	"strings"
 	"testing"
 	"time"
 
@@ -189,10 +191,17 @@ func TestInspectorSeparatesDeferredMessages(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = producer.Close(ctx) }()
-	if err := producer.Publish(ctx,
-		driver.OutboundMessage{Destination: destination},
-		driver.OutboundMessage{Destination: destination, DelayUntil: time.Date(2100, time.January, 1, 0, 0, 0, 0, time.UTC)},
-	); err != nil {
+	if err := producer.Publish(ctx, driver.OutboundMessage{Destination: destination}); err != nil {
+		t.Fatal(err)
+	}
+	// Redeclared with a delay, so the second message parks while the first
+	// stays ready on the same destination.
+	if _, err := raw.Admin().EnsureTopology(ctx, driver.TopologySpec{
+		Destinations: []driver.DestinationSpec{{Name: destination, Delay: time.Hour}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := producer.Publish(ctx, driver.OutboundMessage{Destination: destination}); err != nil {
 		t.Fatal(err)
 	}
 	inspect, err := newInspector(raw)
@@ -215,30 +224,12 @@ func TestConformance(t *testing.T) {
 	// time deterministically. Its origin is arbitrary now that receiveBefore spends
 	// its own waitTimeout budget instead of time.Until of a fixture instant.
 	fake := clock.NewFake(clock.NewReal().Now())
-	report := runConformance(t, Driver{clock: fake}, conformance.DeferralExact)
-	assertDeferredSkips(t, report, "destination delay delivers a destination's messages in publish order")
+	report := runConformance(t, Driver{clock: fake})
+	assertNoDeferredSkips(t, report)
 	if err := report.WriteMarkdown(&output); err != nil {
 		t.Fatal(err)
 	}
 	t.Log(output.String())
-}
-
-// TestConformanceDestinationDelay runs the same suite again under the model in
-// which a driver owes a deferred message its publish instant plus its
-// destination's declared delay, whatever due time the message carries. The
-// in-memory driver honours exact due times, so the run proves the declared model
-// reaches the group, that the group registers its eleven checks under either
-// model, that it records exactly the two skips whose due times this model would
-// not produce, and that the check this model adds passes on a driver that also
-// owes the exact due time it was handed.
-func TestConformanceDestinationDelay(t *testing.T) {
-	t.Parallel()
-	fake := clock.NewFake(clock.NewReal().Now())
-	report := runConformance(t, Driver{clock: fake}, conformance.DeferralDestinationDelay)
-	assertDeferredSkips(t, report,
-		"each in-band due time is delivered",
-		"a nearer due time published after a farther one is delivered in due order",
-	)
 }
 
 func TestConformanceMinimalCapabilities(t *testing.T) {
@@ -247,10 +238,10 @@ func TestConformanceMinimalCapabilities(t *testing.T) {
 	// This named fixture only weakens native declarations and removes limits;
 	// ScalingPartitionBound is the one preserved declaration needed to execute
 	// that capability's branch, and the check uses one consumer accordingly.
-	runConformance(t, Driver{clock: fake, minimal: true}, conformance.DeferralExact)
+	runConformance(t, Driver{clock: fake, minimal: true})
 }
 
-func runConformance(t *testing.T, candidate Driver, model conformance.DeferralModel) conformance.Report {
+func runConformance(t *testing.T, candidate Driver) conformance.Report {
 	t.Helper()
 	return conformance.Run(t, conformance.Suite{
 		Driver:             candidate,
@@ -258,17 +249,15 @@ func runConformance(t *testing.T, candidate Driver, model conformance.DeferralMo
 		NewInspector:       newInspector,
 		NewFaultInjector:   newFaultInjector,
 		NewDeadlineFixture: newDeadlineFixture,
-		DeferralModel:      model,
 	})
 }
 
-// assertDeferredSkips requires the deferred group to have recorded exactly the
-// named skips, in both profiles, each carrying its reason. A check that should
-// have run and was skipped instead leaves the group green, so the names are the
-// only thing that tells a deliberate skip from a hole.
-func assertDeferredSkips(t *testing.T, report conformance.Report, names ...string) {
+// assertNoDeferredSkips requires the deferred group to have skipped nothing in
+// either profile. A check that should have run and was skipped instead leaves
+// the group green, so the skip list is the only thing that tells a full run
+// from one with a hole in it.
+func assertNoDeferredSkips(t *testing.T, report conformance.Report) {
 	t.Helper()
-	want := slices.Sorted(slices.Values(names))
 	if len(report.Profiles) != 2 {
 		t.Fatalf("conformance ran %d profiles, want 2", len(report.Profiles))
 	}
@@ -279,15 +268,134 @@ func assertDeferredSkips(t *testing.T, report conformance.Report, names ...strin
 				skipped = group.Skipped
 			}
 		}
-		got := make([]string, 0, len(skipped))
-		for _, skip := range skipped {
-			if skip.Reason == "" {
-				t.Fatalf("profile %s recorded skip %q with no reason", profile.Profile, skip.Name)
-			}
-			got = append(got, skip.Name)
-		}
-		if !slices.Equal(slices.Sorted(slices.Values(got)), want) {
-			t.Fatalf("profile %s skipped %v, want %v", profile.Profile, got, want)
+		if len(skipped) != 0 {
+			t.Fatalf("profile %s skipped deferred checks %+v, want none", profile.Profile, skipped)
 		}
 	}
+}
+
+// Run the real bounded check in a child because testing.T failures from a
+// deliberately early or late adapter must be observed without failing its parent.
+func TestConformanceBoundedTiming(t *testing.T) {
+	t.Parallel()
+	for _, mode := range []string{"publication-latency", "early", "late"} {
+		t.Run(mode, func(t *testing.T) {
+			cmd := exec.Command(os.Args[0], "-test.run=^TestConformanceBoundedTimingHelper$/^(full|strict)$/^deferred$/.*bounded.*", "-test.v") //nolint:gosec // intentionally re-executes the test binary.
+			cmd.Env = append(os.Environ(), "INMEM_BOUNDED_TIMING_MODE="+mode)
+			output, err := cmd.CombinedOutput()
+			if mode == "publication-latency" {
+				if err != nil {
+					t.Fatalf("correct delayed publication failed: %v\n%s", err, output)
+				}
+			} else {
+				if err == nil {
+					t.Fatalf("%s delivery passed conformance:\n%s", mode, output)
+				}
+				if !strings.Contains(string(output), "ReceivedAt=") {
+					t.Fatalf("%s failed without rejecting its delivery timestamp:\n%s", mode, output)
+				}
+			}
+			status := "PASS"
+			if mode != "publication-latency" {
+				status = "FAIL"
+			}
+			for _, profile := range []string{"full", "strict"} {
+				want := "--- " + status + ": TestConformanceBoundedTimingHelper/" + profile + "/deferred/deferred_delivery_is_bounded_in_lateness"
+				if !strings.Contains(string(output), want) {
+					t.Fatalf("missing %s result for %s:\n%s", status, profile, output)
+				}
+			}
+		})
+	}
+}
+
+func TestConformanceBoundedTimingHelper(t *testing.T) {
+	mode := os.Getenv("INMEM_BOUNDED_TIMING_MODE")
+	if mode == "" {
+		return
+	}
+	fake := clock.NewFake(clock.NewReal().Now())
+	conformance.Run(t, conformance.Suite{
+		Driver: boundedTimingDriver{Driver: Driver{clock: fake}, mode: mode, fake: fake},
+		NewInspector: func(raw driver.Conn) (conformance.Inspect, error) {
+			return newInspector(raw.(*boundedTimingConn).conn)
+		},
+		NewDeadlineFixture: func(raw driver.Conn) (conformance.DeadlineFixture, error) {
+			fixture, err := newDeadlineFixture(raw.(*boundedTimingConn).conn)
+			if err != nil {
+				return nil, err
+			}
+			return boundedTimingFixture{DeadlineFixture: fixture, mode: mode}, nil
+		},
+	})
+}
+
+type boundedTimingDriver struct {
+	Driver
+	mode string
+	fake *clock.Fake
+}
+
+func (d boundedTimingDriver) Open(ctx context.Context, cfg driver.Config) (driver.Conn, error) {
+	raw, err := d.Driver.Open(ctx, cfg)
+	if err != nil {
+		return nil, err
+	}
+	return &boundedTimingConn{conn: raw.(*conn), mode: d.mode, fake: d.fake}, nil
+}
+
+type boundedTimingConn struct {
+	*conn
+	mode string
+	fake *clock.Fake
+}
+
+func (c *boundedTimingConn) Producer(ctx context.Context, cfg driver.ProducerConfig) (driver.Producer, error) {
+	producer, err := c.conn.Producer(ctx, cfg)
+	if err != nil {
+		return nil, err
+	}
+	return boundedTimingProducer{Producer: producer, conn: c}, nil
+}
+
+type boundedTimingProducer struct {
+	driver.Producer
+	conn *boundedTimingConn
+}
+
+func (p boundedTimingProducer) Publish(ctx context.Context, messages ...driver.OutboundMessage) error {
+	for _, message := range messages {
+		if !strings.HasSuffix(message.Destination, ".bounded-late") {
+			continue
+		}
+		switch p.conn.mode {
+		case "publication-latency":
+			// The broker accepts after publication spends one second. Its actual
+			// deferred due time is therefore one second later than the first sample.
+			p.conn.fake.Advance(time.Second)
+		case "early":
+			p.conn.mu.Lock()
+			p.conn.destinations[message.Destination].spec.Delay = 0
+			p.conn.mu.Unlock()
+		case "late":
+			p.conn.mu.Lock()
+			p.conn.destinations[message.Destination].spec.Delay = 1250 * time.Millisecond
+			p.conn.mu.Unlock()
+		}
+	}
+	return p.Producer.Publish(ctx, messages...)
+}
+
+type boundedTimingFixture struct {
+	conformance.DeadlineFixture
+	mode string
+}
+
+func (f boundedTimingFixture) Advance(duration time.Duration) {
+	// Release the intentionally late adapter's delivery beyond the upper bound
+	// so the real check rejects its ReceivedAt, rather than merely timing out.
+	if f.mode == "late" {
+		duration += time.Second
+	}
+	f.DeadlineFixture.Advance(duration)
 }

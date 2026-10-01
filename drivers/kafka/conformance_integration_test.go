@@ -33,7 +33,6 @@ func TestConformance(t *testing.T) {
 			// retry.
 			RebalanceDrainTimeout: time.Second,
 		},
-		DeferralModel:      conformance.DeferralDestinationDelay,
 		NewInspector:       kafkaInspector,
 		NewFaultInjector:   kafkaFaultInjector,
 		NewDeadlineFixture: newDeadlineFixture,
@@ -227,11 +226,11 @@ func countDeferredRecords(ctx context.Context, connection *conn, destination str
 		}
 		for _, record := range records {
 			// A record's own publish instant decides which delay deferred it:
-			// the port's destination-delay model defers a record by the delay
-			// its destination declares, and a destination that declared none
-			// until after this record was published did not defer it. A record
-			// the connection has no declaration for falls back to a live
-			// consumer's config, and one with neither is ready as it stands.
+			// a destination defers a record by the delay it declares, and a
+			// destination that declared none until after this record was
+			// published did not defer it. A record the connection has no
+			// declaration for falls back to a live consumer's config, and one
+			// with neither is ready as it stands.
 			delay, known := connection.destinationDelayAt(destination, record.Timestamp)
 			if !known {
 				delay, known = fallback, hasFallback

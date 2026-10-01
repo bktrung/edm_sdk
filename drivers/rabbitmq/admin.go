@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"sort"
 	"strings"
 
 	amqp "github.com/rabbitmq/amqp091-go"
@@ -49,7 +48,7 @@ func (a *admin) DescribeTopology(ctx context.Context, names []string) (driver.To
 	return a.operations.DescribeTopology(ctx, names)
 }
 
-// Purge removes messages from a destination and its parking queues, and returns the number removed.
+// Purge removes messages from a destination and its parking queue, and returns the number removed.
 func (a *admin) Purge(ctx context.Context, destination string) (int64, error) {
 	return a.operations.Purge(ctx, destination)
 }
@@ -96,12 +95,9 @@ func (a *adminOperations) DescribeTopology(ctx context.Context, names []string) 
 			return driver.TopologyState{}, classifyAMQP("describe_topology", driver.KindTransient, err)
 		}
 		depth[name] = int64(ready)
-		for _, parkName := range a.conn.parkingOf(name) {
+		if parkName, isDeferred := a.conn.parkingOf(name); isDeferred {
 			parked, parkErr := a.inspectQueue(ctx, parkName)
-			if parkErr != nil {
-				if isNotFound(parkErr) {
-					continue
-				}
+			if parkErr != nil && !isNotFound(parkErr) {
 				return driver.TopologyState{}, classifyAMQP("describe_topology", driver.KindTransient, parkErr)
 			}
 			depth[name] += int64(parked)
@@ -110,7 +106,7 @@ func (a *adminOperations) DescribeTopology(ctx context.Context, names []string) 
 	return driver.TopologyState{Depth: depth}, nil
 }
 
-// Purge removes messages from a destination and its parking queues, and returns the number removed.
+// Purge removes messages from a destination and its parking queue, and returns the number removed.
 func (a *adminOperations) Purge(ctx context.Context, destination string) (int64, error) {
 	if err := a.admission(ctx, "purge"); err != nil {
 		return 0, err
@@ -127,34 +123,21 @@ func (a *adminOperations) Purge(ctx context.Context, destination string) (int64,
 		}
 		return 0, classifyAMQP("purge", driver.KindTransient, err)
 	}
-	parking := a.conn.parkingOf(destination)
-	if len(parking) == 0 {
+	parkName, isDeferred := a.conn.parkingOf(destination)
+	if !isDeferred {
 		return int64(count), nil
 	}
-	total := int64(count)
-	for _, parkName := range parking {
-		parkChannel, openErr := a.openChannel(ctx)
-		if openErr != nil {
-			return total, openErr
+	purged, err := channel.QueuePurge(parkName, false)
+	if err != nil {
+		// A parking queue that is not there holds nothing: under TopologyNone
+		// the operator may not have provisioned it yet, and Purge of the
+		// destination is still the operation an application calls to empty it.
+		if isNotFound(err) {
+			return int64(count), nil
 		}
-		purged, err := parkChannel.QueuePurge(parkName, false)
-		_ = parkChannel.Close()
-		if err != nil {
-			// A parking queue that is not there holds nothing, which is the
-			// state an upgraded deployment starts in: the rung queues are
-			// created by the topology pass, and Purge of the destination is
-			// still the operation an application calls to empty it. Each park
-			// is purged on its own channel because a 404 closes the AMQP
-			// channel it arrives on, and a reused channel would fail the next
-			// queue with 504.
-			if isNotFound(err) {
-				continue
-			}
-			return total, classifyAMQP("purge", driver.KindTransient, err)
-		}
-		total += int64(purged)
+		return int64(count), classifyAMQP("purge", driver.KindTransient, err)
 	}
-	return total, nil
+	return int64(count) + int64(purged), nil
 }
 
 // Prune processes each requested name and reports whether it was deleted or why it was retained.
@@ -376,42 +359,17 @@ func (a *adminOperations) pruneGuard(ctx context.Context, destination string, au
 	return ""
 }
 
-// existingParkQueues lists the parking queues of a destination that the broker
-// has right now: the destination's own parking shape in declare order, then any
-// other parking queue of the destination sorted by name, which is where a fixed
-// queue of another delay and a rung queue of a destination that no longer
-// declares a delay are found. A parking queue that is not there holds nothing
-// and needs no guard; one whose rung queue an application drained by hand needs
-// no refusal either.
+// existingParkQueues lists the parking queue of a destination when the broker
+// has it right now. The name depends only on the destination, so it is checked
+// whether or not this connection declared a delay for it: a queue left by an
+// earlier declaration still guards the destination. A parking queue that is not
+// there holds nothing and needs no guard.
 func (a *adminOperations) existingParkQueues(queues []managementQueue, destination string) []string {
-	known := a.conn.parkingOf(destination)
-	if len(known) == 0 {
-		// Nothing this connection declared describes the destination, so its
-		// shape is unknown: every parking queue name the broker has is checked
-		// against it by name rather than against a shape.
-		known = parkQueueNames(destination)
+	parkName := parkQueueName(destination)
+	if _, found := findQueue(queues, parkName); found {
+		return []string{parkName}
 	}
-	present := make([]string, 0, len(known)+1)
-	for _, parkName := range known {
-		if _, found := findQueue(queues, parkName); found {
-			present = append(present, parkName)
-		}
-	}
-	seen := make(map[string]struct{}, len(present))
-	for _, name := range present {
-		seen[name] = struct{}{}
-	}
-	var extra []string
-	for _, queue := range queues {
-		if _, ok := seen[queue.Name]; ok {
-			continue
-		}
-		if parent, _, ok := parkQueueParts(queue.Name); ok && parent == destination {
-			extra = append(extra, queue.Name)
-		}
-	}
-	sort.Strings(extra)
-	return append(present, extra...)
+	return nil
 }
 
 func (a *adminOperations) consumerCount(destination string) int64 {
@@ -495,7 +453,6 @@ func (a *adminOperations) deleteQueue(ctx context.Context, name string, auxiliar
 
 	a.conn.mu.Lock()
 	delete(a.conn.deferred, name)
-	delete(a.conn.fixed, name)
 	a.conn.mu.Unlock()
 	return true, nil
 }
