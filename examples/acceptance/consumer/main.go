@@ -149,7 +149,6 @@ func serviceConfig(service string) f1.Config {
 		},
 		Codec: f1.CodecConfig{
 			Default:        "json",
-			ContentMode:    "binary",
 			MaxHeaderBytes: 8192,
 			MaxBodyBytes:   1 << 20,
 		},

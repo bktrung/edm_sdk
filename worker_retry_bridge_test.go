@@ -106,7 +106,7 @@ func TestDispatchDropsPoisonWithoutDLQRoute(t *testing.T) {
 
 	settler := &dispatchSettler{}
 	message := retryBridgeMessage(t, poisonEnvelope(), settler)
-	if !dispatchMessage(runner, context.Background(), message, &Envelope{}, new(bool)) {
+	if !dispatchMessage(runner, context.Background(), message, &Envelope{}, new(bool), &deliveryState{}) {
 		t.Fatal("poison message was not settled as handled")
 	}
 	if !settler.acked || settler.nacked {
@@ -132,36 +132,35 @@ func TestDispatchDropsPoisonWithoutDLQRoute(t *testing.T) {
 	}
 }
 
-func TestDispatchDropsPoisonForClassifiedMissingRoute(t *testing.T) {
-	producer := &missingRouteProducer{kindOnly: true}
-	client, runner := noRoutePoisonRunner(t, producer)
-	defer func() { _ = client.Close(context.Background()) }()
-
-	settler := &dispatchSettler{}
-	if !dispatchMessage(runner, context.Background(), retryBridgeMessage(t, poisonEnvelope(), settler), &Envelope{}, new(bool)) {
-		t.Fatal("classified missing-route poison was not settled as handled")
-	}
-	if !settler.acked || settler.nacked {
-		t.Fatalf("classified missing-route settlement = acked %t nacked %t, want ack only", settler.acked, settler.nacked)
-	}
-}
-
+// TestDispatchPoisonNoRouteDoesNotRedeliver drops a poison message on its
+// first delivery whether the missing route is reported as a sentinel or only
+// by its classification.
 func TestDispatchPoisonNoRouteDoesNotRedeliver(t *testing.T) {
-	producer := &missingRouteProducer{}
-	client, runner := noRoutePoisonRunner(t, producer)
-	defer func() { _ = client.Close(context.Background()) }()
+	for _, test := range []struct {
+		name     string
+		kindOnly bool
+	}{
+		{name: "sentinel missing route"},
+		{name: "classified missing route", kindOnly: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			producer := &missingRouteProducer{kindOnly: test.kindOnly}
+			client, runner := noRoutePoisonRunner(t, producer)
+			defer func() { _ = client.Close(context.Background()) }()
 
-	settler := &dispatchSettler{}
-	message := retryBridgeMessage(t, poisonEnvelope(), settler)
-	deliveries := 0
-	for deliveries < maxSuccessorPublishAttempts+1 {
-		deliveries++
-		if dispatchMessage(runner, context.Background(), message, &Envelope{}, new(bool)) {
-			break
-		}
-	}
-	if deliveries != 1 || !settler.acked {
-		t.Fatalf("poison deliveries = %d acked=%t, want one handled delivery", deliveries, settler.acked)
+			settler := &dispatchSettler{}
+			message := retryBridgeMessage(t, poisonEnvelope(), settler)
+			deliveries := 0
+			for deliveries < maxSuccessorPublishAttempts+1 {
+				deliveries++
+				if dispatchMessage(runner, context.Background(), message, &Envelope{}, new(bool), &deliveryState{}) {
+					break
+				}
+			}
+			if deliveries != 1 || !settler.acked || settler.nacked {
+				t.Fatalf("poison deliveries = %d acked=%t nacked=%t, want one handled delivery settled by ack only", deliveries, settler.acked, settler.nacked)
+			}
+		})
 	}
 }
 
@@ -171,7 +170,7 @@ func TestDispatchPoisonNoRouteUsesLastResortLogger(t *testing.T) {
 	client, runner := noRoutePoisonRunner(t, producer, WithLogger(slog.New(slog.NewTextHandler(&logs, nil))))
 	defer func() { _ = client.Close(context.Background()) }()
 
-	if !dispatchMessage(runner, context.Background(), retryBridgeMessage(t, poisonEnvelope(), &dispatchSettler{}), &Envelope{}, new(bool)) {
+	if !dispatchMessage(runner, context.Background(), retryBridgeMessage(t, poisonEnvelope(), &dispatchSettler{}), &Envelope{}, new(bool), &deliveryState{}) {
 		t.Fatal("poison message was not settled as handled")
 	}
 	output := logs.String()
@@ -211,7 +210,7 @@ func TestDispatchDiscardedDeathDetailsUsesConfiguredLogger(t *testing.T) {
 		Priority:    PriorityHigh,
 		Attempt:     1,
 	}
-	if !dispatchMessage(runner, context.Background(), retryBridgeMessage(t, envelope, &dispatchSettler{}), &Envelope{}, new(bool)) {
+	if !dispatchMessage(runner, context.Background(), retryBridgeMessage(t, envelope, &dispatchSettler{}), &Envelope{}, new(bool), &deliveryState{}) {
 		t.Fatal("terminal message was not settled")
 	}
 
@@ -266,7 +265,7 @@ func TestDispatchDiscardedDeathDetailsUsesProcessDefaultWithoutLogger(t *testing
 		Priority:    PriorityHigh,
 		Attempt:     1,
 	}
-	if !dispatchMessage(runner, context.Background(), retryBridgeMessage(t, envelope, &dispatchSettler{}), &Envelope{}, new(bool)) {
+	if !dispatchMessage(runner, context.Background(), retryBridgeMessage(t, envelope, &dispatchSettler{}), &Envelope{}, new(bool), &deliveryState{}) {
 		t.Fatal("terminal message was not settled")
 	}
 
@@ -311,7 +310,7 @@ func TestDispatchCustomDeathDetailsValidatesKeys(t *testing.T) {
 		Priority:    PriorityHigh,
 		Attempt:     1,
 	}
-	if !dispatchMessage(runner, context.Background(), retryBridgeMessage(t, envelope, &dispatchSettler{}), &Envelope{}, new(bool)) {
+	if !dispatchMessage(runner, context.Background(), retryBridgeMessage(t, envelope, &dispatchSettler{}), &Envelope{}, new(bool), &deliveryState{}) {
 		t.Fatal("custom carrier message was not settled")
 	}
 	if got := headerValue(producer.messages[0].Headers, "f1detailtenant"); got != "acme" {
@@ -352,7 +351,7 @@ func TestDispatchValidDeathDetailsDoNotWarn(t *testing.T) {
 		Priority:    PriorityHigh,
 		Attempt:     1,
 	}
-	if !dispatchMessage(runner, context.Background(), retryBridgeMessage(t, envelope, &dispatchSettler{}), &Envelope{}, new(bool)) {
+	if !dispatchMessage(runner, context.Background(), retryBridgeMessage(t, envelope, &dispatchSettler{}), &Envelope{}, new(bool), &deliveryState{}) {
 		t.Fatal("terminal message was not settled")
 	}
 	if output := configuredOutput.String(); strings.Contains(output, "f1 death details discarded") {
@@ -372,7 +371,7 @@ func TestDispatchLadderExhaustionKeepsMaxAttemptsReason(t *testing.T) {
 	runner.subscription.Handlers = map[string]Handler{
 		"orders.created.v1": HandlerFunc(func(context.Context, *Event) error { return errors.New("temporary") }),
 	}
-	if !dispatchMessage(runner, context.Background(), retryBridgeMessage(t, envelope, &dispatchSettler{}), &Envelope{}, new(bool)) {
+	if !dispatchMessage(runner, context.Background(), retryBridgeMessage(t, envelope, &dispatchSettler{}), &Envelope{}, new(bool), &deliveryState{}) {
 		t.Fatal("ladder-exhausted message was not settled")
 	}
 	if got := headerValue(producer.messages[0].Headers, "f1deathreason"); got != ReasonMaxAttempts.String() {
@@ -407,7 +406,7 @@ func TestDispatchTerminalCarriesDetailsAndUntouchedCallbackError(t *testing.T) {
 		Priority:    PriorityHigh,
 		Attempt:     1,
 	}
-	if !dispatchMessage(runner, context.Background(), retryBridgeMessage(t, envelope, &dispatchSettler{}), &Envelope{}, new(bool)) {
+	if !dispatchMessage(runner, context.Background(), retryBridgeMessage(t, envelope, &dispatchSettler{}), &Envelope{}, new(bool), &deliveryState{}) {
 		t.Fatal("terminal message was not settled")
 	}
 	if got := headerValue(producer.messages[0].Headers, "f1deathreason"); got != ReasonTerminal.String() {
@@ -449,7 +448,7 @@ func TestDispatchMaxAttemptsCarriesHandlerDetails(t *testing.T) {
 		Attempt:     1,
 		MaxAttempts: 1,
 	}
-	if !dispatchMessage(runner, context.Background(), retryBridgeMessage(t, envelope, &dispatchSettler{}), &Envelope{}, new(bool)) {
+	if !dispatchMessage(runner, context.Background(), retryBridgeMessage(t, envelope, &dispatchSettler{}), &Envelope{}, new(bool), &deliveryState{}) {
 		t.Fatal("max-attempts message was not settled")
 	}
 	if got := headerValue(producer.messages[0].Headers, "f1deathreason"); got != ReasonMaxAttempts.String() {
@@ -480,7 +479,7 @@ func TestDispatchRetryCapUsesSubscriptionCeiling(t *testing.T) {
 		Attempt:     2,
 		MaxAttempts: 100,
 	}
-	if !dispatchMessage(runner, context.Background(), retryBridgeMessage(t, envelope, &dispatchSettler{}), &Envelope{}, new(bool)) {
+	if !dispatchMessage(runner, context.Background(), retryBridgeMessage(t, envelope, &dispatchSettler{}), &Envelope{}, new(bool), &deliveryState{}) {
 		t.Fatal("retry-cap ceiling message was not settled")
 	}
 	if got := headerValue(producer.messages[0].Headers, "f1deathreason"); got != ReasonMaxAttempts.String() {
@@ -507,7 +506,7 @@ func TestDispatchRetryCapCanLowerSubscriptionPolicy(t *testing.T) {
 		Attempt:     1,
 		MaxAttempts: 1,
 	}
-	if !dispatchMessage(runner, context.Background(), retryBridgeMessage(t, envelope, &dispatchSettler{}), &Envelope{}, new(bool)) {
+	if !dispatchMessage(runner, context.Background(), retryBridgeMessage(t, envelope, &dispatchSettler{}), &Envelope{}, new(bool), &deliveryState{}) {
 		t.Fatal("retry-cap lowering message was not settled")
 	}
 	if got := headerValue(producer.messages[0].Headers, "f1deathreason"); got != ReasonMaxAttempts.String() {
@@ -535,7 +534,7 @@ func TestDispatchRetryCopyCarriesEffectiveRetryCap(t *testing.T) {
 		Attempt:     1,
 		MaxAttempts: 100,
 	}
-	if !dispatchMessage(runner, context.Background(), retryBridgeMessage(t, envelope, &dispatchSettler{}), &Envelope{}, new(bool)) {
+	if !dispatchMessage(runner, context.Background(), retryBridgeMessage(t, envelope, &dispatchSettler{}), &Envelope{}, new(bool), &deliveryState{}) {
 		t.Fatal("retry-cap propagation message was not settled")
 	}
 	if got := headerValue(producer.messages[0].Headers, "f1maxattempts"); got != "2" {
@@ -566,7 +565,7 @@ func TestDispatchHandlerSeesSubscriptionRetryCap(t *testing.T) {
 		MaxAttempts: 100,
 	}
 	var dispatched Envelope
-	if !dispatchMessage(runner, context.Background(), retryBridgeMessage(t, envelope, &dispatchSettler{}), &dispatched, new(bool)) {
+	if !dispatchMessage(runner, context.Background(), retryBridgeMessage(t, envelope, &dispatchSettler{}), &dispatched, new(bool), &deliveryState{}) {
 		t.Fatal("handler retry-cap message was not settled")
 	}
 	if got != 2 {
@@ -599,7 +598,7 @@ func TestDispatchHandlerSeesLowerEventRetryCap(t *testing.T) {
 		Attempt:     1,
 		MaxAttempts: 1,
 	}
-	if !dispatchMessage(runner, context.Background(), retryBridgeMessage(t, envelope, &dispatchSettler{}), &Envelope{}, new(bool)) {
+	if !dispatchMessage(runner, context.Background(), retryBridgeMessage(t, envelope, &dispatchSettler{}), &Envelope{}, new(bool), &deliveryState{}) {
 		t.Fatal("lower handler retry-cap message was not settled")
 	}
 	if got != 1 {
@@ -628,7 +627,7 @@ func TestDispatchHandlerUsesPolicyWhenEventRetryCapAbsent(t *testing.T) {
 		Priority:    PriorityHigh,
 		Attempt:     1,
 	}
-	if !dispatchMessage(runner, context.Background(), retryBridgeMessage(t, envelope, &dispatchSettler{}), &Envelope{}, new(bool)) {
+	if !dispatchMessage(runner, context.Background(), retryBridgeMessage(t, envelope, &dispatchSettler{}), &Envelope{}, new(bool), &deliveryState{}) {
 		t.Fatal("absent handler retry-cap message was not settled")
 	}
 	if got != 3 {
@@ -654,7 +653,7 @@ func TestEventFromDeliveryUsesEffectiveRetryCap(t *testing.T) {
 		MaxAttempts: 100,
 	}
 	message := retryBridgeMessage(t, envelope, &retryBridgeSettler{})
-	if retryAndSettle(runner, context.Background(), message, envelope, errors.New("temporary")) {
+	if retryAndSettle(runner, context.Background(), message, envelope, errors.New("temporary"), &deliveryState{}) {
 		t.Fatal("failed retry successor hand-off was reported as successful")
 	}
 	recorder.waitForCall(t, time.Second)
@@ -685,7 +684,7 @@ func TestRetryExhaustionCarriesHandlerDetails(t *testing.T) {
 		Attempt:     1,
 	}
 	err := WithDetails(errors.New("temporary"), map[string]string{"tenant": "acme"})
-	if !retryAndSettle(runner, context.Background(), retryBridgeMessage(t, envelope, &dispatchSettler{}), envelope, err) {
+	if !retryAndSettle(runner, context.Background(), retryBridgeMessage(t, envelope, &dispatchSettler{}), envelope, err, &deliveryState{}) {
 		t.Fatal("retry-exhaustion message was not settled")
 	}
 	if got := headerValue(producer.messages[0].Headers, "f1deathreason"); got != ReasonMaxAttempts.String() {
@@ -714,7 +713,7 @@ func TestDispatchPanicDoesNotCarryHandlerDetails(t *testing.T) {
 		Priority:    PriorityHigh,
 		Attempt:     1,
 	}
-	if !dispatchMessage(runner, context.Background(), retryBridgeMessage(t, envelope, &dispatchSettler{}), &Envelope{}, new(bool)) {
+	if !dispatchMessage(runner, context.Background(), retryBridgeMessage(t, envelope, &dispatchSettler{}), &Envelope{}, new(bool), &deliveryState{}) {
 		t.Fatal("panic message was not settled")
 	}
 	if got := headerValue(producer.messages[0].Headers, "f1deathreason"); got != ReasonPanic.String() {
@@ -746,7 +745,7 @@ func TestDispatchNonHandlerDeathsDoNotCarryDetails(t *testing.T) {
 						message.Headers[i].Value = []byte("not-a-time")
 					}
 				}
-				if !dispatchMessage(runner, context.Background(), message, &Envelope{}, new(bool)) {
+				if !dispatchMessage(runner, context.Background(), message, &Envelope{}, new(bool), &deliveryState{}) {
 					t.Fatal("decode message was not settled")
 				}
 				assertNoDeathDetailHeaders(t, producer.messages[0].Headers)
@@ -766,7 +765,7 @@ func TestDispatchNonHandlerDeathsDoNotCarryDetails(t *testing.T) {
 					Expiry:       &expiry,
 					DeathDetails: map[string]string{"tenant": "acme"},
 				}
-				if !dispatchMessage(runner, context.Background(), retryBridgeMessage(t, envelope, &dispatchSettler{}), &Envelope{}, new(bool)) {
+				if !dispatchMessage(runner, context.Background(), retryBridgeMessage(t, envelope, &dispatchSettler{}), &Envelope{}, new(bool), &deliveryState{}) {
 					t.Fatal("expired message was not settled")
 				}
 				assertNoDeathDetailHeaders(t, producer.messages[0].Headers)
@@ -785,7 +784,7 @@ func TestDispatchNonHandlerDeathsDoNotCarryDetails(t *testing.T) {
 					Attempt:      1,
 					DeathDetails: map[string]string{"tenant": "acme"},
 				}
-				if !dispatchMessage(runner, context.Background(), retryBridgeMessage(t, envelope, &dispatchSettler{}), &Envelope{}, new(bool)) {
+				if !dispatchMessage(runner, context.Background(), retryBridgeMessage(t, envelope, &dispatchSettler{}), &Envelope{}, new(bool), &deliveryState{}) {
 					t.Fatal("unmatched message was not settled")
 				}
 				assertNoDeathDetailHeaders(t, producer.messages[0].Headers)
@@ -821,7 +820,7 @@ func TestDispatchPlainErrorPreservesDeathError(t *testing.T) {
 		Attempt:     1,
 		MaxAttempts: 1,
 	}
-	if !dispatchMessage(runner, context.Background(), retryBridgeMessage(t, envelope, &dispatchSettler{}), &Envelope{}, new(bool)) {
+	if !dispatchMessage(runner, context.Background(), retryBridgeMessage(t, envelope, &dispatchSettler{}), &Envelope{}, new(bool), &deliveryState{}) {
 		t.Fatal("plain-error message was not settled")
 	}
 	if got := headerValue(producer.messages[0].Headers, "f1deatherror"); got != "plain temporary failure" {
@@ -853,7 +852,7 @@ func TestDispatchDeadLettersRunawayCounter(t *testing.T) {
 		Attempt:     15,
 	}
 	message := retryBridgeMessage(t, envelope, settler)
-	if !dispatchMessage(runner, context.Background(), message, &Envelope{}, new(bool)) {
+	if !dispatchMessage(runner, context.Background(), message, &Envelope{}, new(bool), &deliveryState{}) {
 		t.Fatal("runaway message was not settled")
 	}
 	if !settler.acked {
@@ -867,7 +866,7 @@ func TestDispatchDeadLettersRunawayCounter(t *testing.T) {
 	}
 }
 
-func TestRetryAfterClampCarriesTier(t *testing.T) {
+func TestRetryCopyLaneFollowsDestinationTier(t *testing.T) {
 	producer := &dispatchProducer{}
 	client, runner := newRetryBridgeRunner(t, producer, "orders.retry.created")
 	defer func() { _ = client.Close(context.Background()) }()
@@ -875,18 +874,21 @@ func TestRetryAfterClampCarriesTier(t *testing.T) {
 	settler := &dispatchSettler{}
 	envelope := Envelope{
 		SpecVersion: "1.0",
-		ID:          "clamped",
+		ID:          "second-attempt",
 		Source:      "/test/orders",
 		Type:        "orders.retry.created.v1",
 		Priority:    PriorityHigh,
-		Attempt:     1,
+		Attempt:     2,
 	}
 	message := retryBridgeMessage(t, envelope, settler)
-	if !retryAndSettle(runner, context.Background(), message, envelope, RetryAfter(errors.New("slow"), 5*time.Minute)) {
+	if !retryAndSettle(runner, context.Background(), message, envelope, errors.New("slow"), &deliveryState{}) {
 		t.Fatal("retry successor was not published and settled")
 	}
 	retryDestination := producer.messages[0].Destination
-	runner.retryDestinationTiers = map[string]int{retryDestination: 2}
+	if want := "f1.test.orders.retry.created.orders.high.retry.2"; retryDestination != want {
+		t.Fatalf("retry destination = %q, want the tier-2 destination %q", retryDestination, want)
+	}
+	runner.destinationMetadata = map[string]destinationMetadata{retryDestination: {topic: "orders.retry.created", priority: PriorityHigh, tier: 2}}
 	inbound := driver.InboundMessage{
 		Destination: retryDestination,
 		Headers:     producer.messages[0].Headers,
@@ -894,7 +896,7 @@ func TestRetryAfterClampCarriesTier(t *testing.T) {
 	if got, want := deliveryLane(runner, inbound), schedulerLaneID("orders.retry.created", PriorityHigh, 2); got != want {
 		t.Fatalf("delivery lane = %q, want %q", got, want)
 	}
-	runner.retryDestinationTiers[retryDestination] = 1
+	runner.destinationMetadata[retryDestination] = destinationMetadata{topic: "orders.retry.created", priority: PriorityHigh, tier: 1}
 	if got, want := deliveryLane(runner, inbound), schedulerLaneID("orders.retry.created", PriorityHigh, 1); got != want {
 		t.Fatalf("wrong destination tier lane = %q, want %q", got, want)
 	}
@@ -915,7 +917,7 @@ func TestRetryAndSettleIncrementsAttempt(t *testing.T) {
 		Attempt:     1,
 	}
 	message := retryBridgeMessage(t, envelope, settler)
-	if !retryAndSettle(runner, context.Background(), message, envelope, errors.New("temporary")) {
+	if !retryAndSettle(runner, context.Background(), message, envelope, errors.New("temporary"), &deliveryState{}) {
 		t.Fatal("ordinary retry was not published and settled")
 	}
 	if len(producer.messages) != 1 {
@@ -944,7 +946,7 @@ func TestRetryCopyDropsDeathDetails(t *testing.T) {
 		Attempt:      1,
 		DeathDetails: map[string]string{"tenant": "acme"},
 	}
-	if !retryAndSettle(runner, context.Background(), retryBridgeMessage(t, envelope, &dispatchSettler{}), envelope, errors.New("temporary")) {
+	if !retryAndSettle(runner, context.Background(), retryBridgeMessage(t, envelope, &dispatchSettler{}), envelope, errors.New("temporary"), &deliveryState{}) {
 		t.Fatal("ordinary retry was not published and settled")
 	}
 	if len(producer.messages) != 1 {
@@ -1007,16 +1009,16 @@ func TestOpenRunnerConsumerBuildsRetryDestinationTiers(t *testing.T) {
 		},
 		config: SubscriptionConfig{Prefetch: 1},
 	}
-	if _, err := openRunnerConsumer(runner, context.Background()); err != nil {
+	if _, err := openRunnerConsumerForTest(runner, context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	wantDestination := retryDestinationFor(client.source, "orders.created", PriorityHigh, 2, "orders")
-	if got := runner.retryDestinationTiers[wantDestination]; got != 2 {
+	wantDestination := "f1.test.orders.created.orders.high.retry.2"
+	if got := runner.destinationMetadata[wantDestination].tier; got != 2 {
 		t.Fatalf("retry tier for %q = %d, want 2", wantDestination, got)
 	}
 }
 
-func TestRetryDestinationTierMapMatchesSubscriptionDestinations(t *testing.T) {
+func TestDestinationMetadataMapCarriesEveryRetryDestinationTier(t *testing.T) {
 	source := "/test/orders"
 	sub := Subscription{
 		Name:       "orders",
@@ -1026,24 +1028,23 @@ func TestRetryDestinationTierMapMatchesSubscriptionDestinations(t *testing.T) {
 			Tiers: []time.Duration{time.Second, 2 * time.Second},
 		},
 	}
-	effective := driver.Capabilities{Fanout: driver.FanoutAtConsume}
-	destinations := subscriptionDestinations(effective, source, sub)
-
-	mainDestinations := make(map[string]struct{})
-	for _, topic := range sub.Topics {
-		logical := topicFor(topic)
-		for _, priority := range sub.Priorities {
-			mainDestinations[consumeDestination(effective, source, logical, priority, sub.Name)] = struct{}{}
-		}
-	}
-	wantRetry := make(map[string]struct{})
-	for _, destination := range destinations {
-		if _, ok := mainDestinations[destination]; !ok {
-			wantRetry[destination] = struct{}{}
-		}
+	wantRetry := map[string]struct{}{
+		"f1.test.orders.created.orders.high.retry.1":     {},
+		"f1.test.orders.created.orders.high.retry.2":     {},
+		"f1.test.orders.created.orders.medium.retry.1":   {},
+		"f1.test.orders.created.orders.medium.retry.2":   {},
+		"f1.test.payments.created.orders.high.retry.1":   {},
+		"f1.test.payments.created.orders.high.retry.2":   {},
+		"f1.test.payments.created.orders.medium.retry.1": {},
+		"f1.test.payments.created.orders.medium.retry.2": {},
 	}
 
-	gotRetry := retryDestinationTierMap(source, sub)
+	gotRetry := make(map[string]int)
+	for destination, metadata := range buildDestinationMetadataMap(driver.Capabilities{}, source, sub) {
+		if metadata.tier > 0 {
+			gotRetry[destination] = metadata.tier
+		}
+	}
 	if len(gotRetry) != len(wantRetry) {
 		t.Fatalf("retry destination count = %d, want %d", len(gotRetry), len(wantRetry))
 	}
@@ -1080,60 +1081,6 @@ func (s *retryBridgeSettler) Ack(context.Context) error {
 func (s *retryBridgeSettler) Nack(_ context.Context, options driver.NackOptions) error {
 	s.nacks = append(s.nacks, options)
 	return nil
-}
-
-// TestFailedSuccessorHandoffsDoNotBareRequeue is a preservation guard: it
-// asserts a failed retry or dead-letter hand-off never gives the original
-// back to the broker uncounted (a "bare requeue", Requeue: true with no
-// failure accounting - the one sanctioned bare requeue is the drain phase,
-// not this path). It says nothing about whether the original is
-// discarded, which is a separate invariant covered by
-// TestFailedSuccessorHandoffLeavesOriginalUnsettled.
-func TestFailedSuccessorHandoffsDoNotBareRequeue(t *testing.T) {
-	cases := []struct {
-		name    string
-		handOff func(*Runner, context.Context, driver.InboundMessage, Envelope, *deliveryState) bool
-	}{
-		{
-			name: "retry",
-			handOff: func(r *Runner, ctx context.Context, message driver.InboundMessage, envelope Envelope, state *deliveryState) bool {
-				return retryAndSettle(r, ctx, message, envelope, errors.New("temporary"), state)
-			},
-		},
-		{
-			name: "dead-letter",
-			handOff: func(r *Runner, ctx context.Context, message driver.InboundMessage, envelope Envelope, state *deliveryState) bool {
-				return deadLetterAndSettle(r, ctx, message, envelope, ReasonTerminal, errors.New("terminal"), state)
-			},
-		},
-	}
-	for _, testCase := range cases {
-		t.Run(testCase.name, func(t *testing.T) {
-			producer := &dispatchProducer{}
-			client, runner := newRetryBridgeRunner(t, producer, "orders.created")
-			defer func() { _ = client.Close(context.Background()) }()
-			client.producerHandle = &retryBridgeFailingProducer{}
-			settler := &retryBridgeSettler{}
-			envelope := Envelope{
-				SpecVersion: "1.0",
-				ID:          "handoff-failure",
-				Source:      "/test/orders",
-				Type:        "orders.created.v1",
-				Priority:    PriorityHigh,
-				Attempt:     1,
-			}
-			message := retryBridgeMessage(t, envelope, settler)
-			state := &deliveryState{}
-			if testCase.handOff(runner, context.Background(), message, envelope, state) {
-				t.Fatal("failed successor hand-off was reported as successful")
-			}
-			for _, nack := range settler.nacks {
-				if nack.Requeue {
-					t.Fatalf("bare requeue occurred: %+v", nack)
-				}
-			}
-		})
-	}
 }
 
 // TestFailedSuccessorHandoffLeavesOriginalUnsettled proves the consume-side
@@ -1268,6 +1215,97 @@ func TestRunnerReleasesDeliveryAfterSuccessorPublishExhaustsBudget(t *testing.T)
 	}
 	if !consumer.stopped {
 		t.Fatal("consumer was not closed after Release")
+	}
+}
+
+// successorRepublishRunner builds the runner a successor publish serves: one
+// subscription with one retry tier, over a client whose connection the caller
+// controls, with the client's reconnect requests observable through its logger.
+func successorRepublishRunner(t *testing.T, conn *publishConn, logs *logSink) (*Client, *Runner) {
+	t.Helper()
+	client := newPublishClientWithConn(t, conn, WithLogger(slog.New(slog.NewTextHandler(logs, nil))))
+	return client, &Runner{
+		client: client,
+		subscription: Subscription{
+			Name:           "orders",
+			Topics:         []string{"orders.created"},
+			Priorities:     []Priority{PriorityHigh},
+			Retry:          RetryConfig{MaxAttempts: 3, Tiers: []time.Duration{time.Second}},
+			HandlerTimeout: time.Second,
+		},
+	}
+}
+
+func successorRepublishEnvelope(id string) Envelope {
+	return Envelope{
+		SpecVersion: "1.0",
+		ID:          id,
+		Source:      "/test/orders",
+		Type:        "orders.created.v1",
+		Priority:    PriorityHigh,
+		Attempt:     1,
+	}
+}
+
+// TestRetryRepublishProducerCreationFailureRequestsReconnect pins the reconnect
+// trigger a retry republish carries for the producer it cannot create: a
+// transient refusal there is evidence the connection is unhealthy, so the
+// republish must ask the client to rebuild it. The request is observed through
+// the client's existing reconnect helper, which reads the supervisor's queue
+// and the supervisor's own log line, so the test needs no new seam.
+func TestRetryRepublishProducerCreationFailureRequestsReconnect(t *testing.T) {
+	t.Parallel()
+	var logs logSink
+	cause := &driver.Error{Driver: "test", Op: "producer", K: driver.KindTransient, Err: errors.New("broker closed the channel")}
+	conn := &publishConn{
+		producer:    &recordingProducer{},
+		producerErr: cause,
+		info:        driver.BrokerInfo{Kind: "test", Version: "1"},
+	}
+	client, runner := successorRepublishRunner(t, conn, &logs)
+	envelope := successorRepublishEnvelope("successor-producer-creation")
+	message := retryBridgeMessage(t, envelope, &retryBridgeSettler{})
+	if retryAndSettle(runner, context.Background(), message, envelope, errors.New("temporary"), &deliveryState{}) {
+		t.Fatal("retry republish reported success while the successor producer could not be created")
+	}
+	quiescePublishClient(t, client)
+	conn.mu.Lock()
+	producerCalls := conn.producerCalls
+	conn.mu.Unlock()
+	if producerCalls == 0 {
+		t.Fatal("the retry republish never asked the connection for a successor producer")
+	}
+	if !reconnectRequested(client, logs.String()) {
+		t.Fatalf("a successor producer creation the driver classified transient did not request a reconnect; logs=%s", logs.String())
+	}
+}
+
+// TestRetryRepublishPublishFailureRequestsReconnect pins the same trigger one
+// step later, on the successor publish itself: a batch the producer refused
+// with a transient classification is also evidence the connection is unhealthy,
+// and the republish must ask for a reconnect rather than only hand the error
+// back to the settle path.
+func TestRetryRepublishPublishFailureRequestsReconnect(t *testing.T) {
+	t.Parallel()
+	var logs logSink
+	cause := &driver.Error{Driver: "test", Op: "publish", K: driver.KindTransient, Err: errors.New("broker reset the connection")}
+	producer := &recordingProducer{publishErr: cause}
+	conn := &publishConn{producer: producer, info: driver.BrokerInfo{Kind: "test", Version: "1"}}
+	client, runner := successorRepublishRunner(t, conn, &logs)
+	envelope := successorRepublishEnvelope("successor-publish-failure")
+	message := retryBridgeMessage(t, envelope, &retryBridgeSettler{})
+	if retryAndSettle(runner, context.Background(), message, envelope, errors.New("temporary"), &deliveryState{}) {
+		t.Fatal("retry republish reported success while the successor publish failed")
+	}
+	quiescePublishClient(t, client)
+	producer.mu.Lock()
+	published := len(producer.messages)
+	producer.mu.Unlock()
+	if published == 0 {
+		t.Fatal("the retry republish never reached the successor producer")
+	}
+	if !reconnectRequested(client, logs.String()) {
+		t.Fatalf("a successor publish the driver classified transient did not request a reconnect; logs=%s", logs.String())
 	}
 }
 

@@ -61,7 +61,7 @@ func TestTerminalCallbackBodiesCarryExactPayload(t *testing.T) {
 		body := []byte("unmatched-payload")
 		envelope := Envelope{SpecVersion: "1.0", ID: "unmatched", Source: "/test/orders", Type: "orders.unmatched.v1", Priority: PriorityHigh, Attempt: 1}
 		message := terminalBodyMessage(t, &envelope, nil, body, &dispatchSettler{})
-		if !dispatchMessage(runner, context.Background(), message, &Envelope{}, new(bool)) {
+		if !dispatchMessage(runner, context.Background(), message, &Envelope{}, new(bool), &deliveryState{}) {
 			t.Fatal("unmatched message was not settled")
 		}
 		waitForTerminalBody(t, done, &got, body, "Discarded")
@@ -85,7 +85,7 @@ func TestTerminalCallbackBodiesCarryExactPayload(t *testing.T) {
 		body := []byte("dropped-payload")
 		envelope := Envelope{SpecVersion: "1.0", ID: "dropped", Source: "/test/orders", Type: "orders.dropped.v1", Priority: PriorityHigh, Attempt: 1}
 		message := terminalBodyMessage(t, &envelope, nil, body, &dispatchSettler{})
-		if !dispatchMessage(runner, context.Background(), message, &Envelope{}, new(bool)) {
+		if !dispatchMessage(runner, context.Background(), message, &Envelope{}, new(bool), &deliveryState{}) {
 			t.Fatal("dropped message was not settled")
 		}
 		waitForTerminalBody(t, done, &got, body, "Discarded")
@@ -103,7 +103,7 @@ func TestTerminalCallbackBodiesCarryExactPayload(t *testing.T) {
 		}
 		body := []byte("decode-failure-payload")
 		message := terminalBodyMessage(t, nil, map[string]string{"time": "not-a-valid-time"}, body, &dispatchSettler{})
-		if !dispatchMessage(runner, context.Background(), message, &Envelope{}, new(bool)) {
+		if !dispatchMessage(runner, context.Background(), message, &Envelope{}, new(bool), &deliveryState{}) {
 			t.Fatal("decode-failure message was not settled")
 		}
 		waitForTerminalBody(t, done, &got, body, "DeadLettered")
@@ -122,7 +122,7 @@ func TestTerminalCallbackBodiesCarryExactPayload(t *testing.T) {
 		body := []byte("runaway-payload")
 		envelope := Envelope{SpecVersion: "1.0", ID: "runaway", Source: "/test/orders", Type: "orders.runaway.v1", Priority: PriorityHigh, Attempt: 15}
 		message := terminalBodyMessage(t, &envelope, nil, body, &dispatchSettler{})
-		if !dispatchMessage(runner, context.Background(), message, &Envelope{}, new(bool)) {
+		if !dispatchMessage(runner, context.Background(), message, &Envelope{}, new(bool), &deliveryState{}) {
 			t.Fatal("runaway message was not settled")
 		}
 		waitForTerminalBody(t, done, &got, body, "DeadLettered")
@@ -151,7 +151,7 @@ func TestTerminalCallbackBodyIsCopiedNotAliased(t *testing.T) {
 	settler := &dispatchSettler{}
 	message := terminalBodyMessage(t, &envelope, nil, body, settler)
 
-	if !dispatchMessage(runner, context.Background(), message, &Envelope{}, new(bool)) {
+	if !dispatchMessage(runner, context.Background(), message, &Envelope{}, new(bool), &deliveryState{}) {
 		t.Fatal("runaway message was not settled")
 	}
 	waitForTerminalBody(t, done, &got, []byte("original-payload"), "DeadLettered")

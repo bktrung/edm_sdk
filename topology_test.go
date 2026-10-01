@@ -2,6 +2,7 @@ package f1
 
 import (
 	"reflect"
+	"slices"
 	"sort"
 	"testing"
 	"time"
@@ -183,6 +184,38 @@ func destinationNames(destinations []driver.DestinationSpec) []string {
 	}
 	sort.Strings(result)
 	return result
+}
+
+// TestSubscriptionTopologyRetryTiersCarryTheirDelay proves each retry tier is
+// declared with its own delay, which is how a driver parks every copy for
+// exactly that tier's delay, and that no other destination is declared delayed.
+func TestSubscriptionTopologyRetryTiersCarryTheirDelay(t *testing.T) {
+	source := "/prod/orders"
+	sub := Subscription{
+		Name:       "order-worker",
+		Topics:     []string{"order.created"},
+		Priorities: []Priority{PriorityHigh},
+		Retry: RetryConfig{
+			MaxAttempts: 4,
+			Tiers:       []time.Duration{time.Second, 5 * time.Second, 25 * time.Second},
+		},
+	}
+	effective := driver.Capabilities{Fanout: driver.FanoutAtPublish, NativeDLQ: true}
+	spec := subscriptionTopologySpecs(effective, source, sub)
+	var retryDelays []time.Duration
+	for _, destination := range spec.Destinations {
+		if destination.Kind == driver.DestRetry {
+			retryDelays = append(retryDelays, destination.Delay)
+			continue
+		}
+		if destination.Delay != 0 {
+			t.Errorf("destination %q kind %v Delay = %s, want 0", destination.Name, destination.Kind, destination.Delay)
+		}
+	}
+	slices.Sort(retryDelays)
+	if want := []time.Duration{time.Second, 5 * time.Second, 25 * time.Second}; !slices.Equal(retryDelays, want) {
+		t.Fatalf("retry destination delays = %v, want %v", retryDelays, want)
+	}
 }
 
 func exchangeNames(exchanges []driver.ExchangeSpec) []string {

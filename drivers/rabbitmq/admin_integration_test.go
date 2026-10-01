@@ -5,6 +5,8 @@ package rabbitmq
 import (
 	"context"
 	"fmt"
+	"io"
+	"net/http"
 	"strings"
 	"sync"
 	"testing"
@@ -15,6 +17,27 @@ import (
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/driver"
 )
 
+// deleteQueue removes one queue through the management API, leaving a queue
+// that is already gone alone. The driver deletes queues only through Prune,
+// which uses its own AMQP channel and guards every precondition, so this lives
+// with the tests that declare fixtures directly and have to clean up after
+// themselves.
+func (m *managementClient) deleteQueue(ctx context.Context, name string) (bool, error) {
+	response, err := m.do(ctx, http.MethodDelete, m.queuePath(name))
+	if err != nil {
+		return false, err
+	}
+	defer response.Body.Close()
+	if response.StatusCode == http.StatusNotFound {
+		return false, nil
+	}
+	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
+		body, _ := io.ReadAll(io.LimitReader(response.Body, 4096))
+		return false, fmt.Errorf("management API DELETE queue %q: %s: %s", name, response.Status, strings.TrimSpace(string(body)))
+	}
+	return true, nil
+}
+
 func setupPruneTest(t *testing.T, kind queueKind, specs ...driver.DestinationSpec) (context.Context, *conn, *admin) {
 	t.Helper()
 	requireBroker(t)
@@ -24,11 +47,11 @@ func setupPruneTest(t *testing.T, kind queueKind, specs ...driver.DestinationSpe
 		cancel()
 		t.Fatalf("newManagementClient: %v", err)
 	}
-	names := make([]string, 0, len(specs)*(len(parkRungs)+2))
+	names := make([]string, 0, len(specs)*2)
 	for _, spec := range specs {
 		names = append(names, spec.Name)
 		if spec.Delay > 0 {
-			names = append(names, parkQueueNames(spec.Name)...)
+			names = append(names, parkQueueName(spec.Name))
 		}
 	}
 	for _, name := range names {
@@ -64,6 +87,51 @@ func setupPruneTest(t *testing.T, kind queueKind, specs ...driver.DestinationSpe
 	return ctx, rabbitConn.(*conn), facade
 }
 
+func setupPruneExchangeTest(t *testing.T, spec driver.TopologySpec) (context.Context, *conn, *admin) {
+	t.Helper()
+	requireBroker(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	management, err := newManagementClient(defaultEndpoint, driver.Config{})
+	if err != nil {
+		cancel()
+		t.Fatalf("newManagementClient: %v", err)
+	}
+	for _, destination := range spec.Destinations {
+		if _, err := management.deleteQueue(ctx, destination.Name); err != nil {
+			cancel()
+			t.Fatalf("deleteQueue(%q): %v", destination.Name, err)
+		}
+	}
+	for _, exchange := range spec.Exchanges {
+		if _, err := management.deleteExchange(ctx, exchange.Name); err != nil {
+			cancel()
+			t.Fatalf("deleteExchange(%q): %v", exchange.Name, err)
+		}
+	}
+	rabbitConn, err := (Driver{}).Open(ctx, driver.Config{Endpoints: []string{defaultEndpoint}})
+	if err != nil {
+		cancel()
+		t.Fatalf("Open: %v", err)
+	}
+	facade := rabbitConn.Admin().(*admin)
+	if _, err := facade.EnsureTopology(ctx, spec); err != nil {
+		_ = rabbitConn.Close(context.Background())
+		cancel()
+		t.Fatalf("EnsureTopology: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = rabbitConn.Close(context.Background())
+		for _, destination := range spec.Destinations {
+			_, _ = management.deleteQueue(context.Background(), destination.Name)
+		}
+		for _, exchange := range spec.Exchanges {
+			_, _ = management.deleteExchange(context.Background(), exchange.Name)
+		}
+		cancel()
+	})
+	return ctx, rabbitConn.(*conn), facade
+}
+
 func openPrunePublisher(t *testing.T) (*amqp.Channel, <-chan amqp.Confirmation) {
 	t.Helper()
 	raw, err := amqp.Dial(defaultEndpoint)
@@ -82,8 +150,10 @@ func openPrunePublisher(t *testing.T) (*amqp.Channel, <-chan amqp.Confirmation) 
 	}
 	confirmations := channel.NotifyPublish(make(chan amqp.Confirmation, 1))
 	t.Cleanup(func() {
-		_ = channel.Close()
-		_ = raw.Close()
+		deadline := time.Now().Add(3 * time.Second) //nolint:forbidigo // the close deadline bounds cleanup around a live broker.
+		// Closing the connection also closes its channels, while the deadline
+		// prevents a blocked broker from wedging test cleanup.
+		_ = raw.CloseDeadline(deadline)
 	})
 	return channel, confirmations
 }
@@ -187,6 +257,80 @@ func assertPruneQueuePresent(t *testing.T, ctx context.Context, facade *admin, n
 	_, present := findQueue(queues, name)
 	if present != want {
 		t.Fatalf("queue %q present = %t, want %t (queues = %+v)", name, present, want, queues)
+	}
+}
+
+func assertPruneExchangePresent(t *testing.T, ctx context.Context, facade *admin, name string, want bool) {
+	t.Helper()
+	exchanges, err := facade.operations.conn.management.listExchanges(ctx)
+	if err != nil {
+		t.Fatalf("listExchanges: %v", err)
+	}
+	_, present := findExchange(exchanges, name)
+	if present != want {
+		t.Fatalf("exchange %q present = %t, want %t (exchanges = %+v)", name, present, want, exchanges)
+	}
+}
+
+func TestPruneDeletesUnboundExchange(t *testing.T) {
+	const exchange = "rabbitmq-driver-prune-unbound-exchange"
+	ctx, _, facade := setupPruneExchangeTest(t, driver.TopologySpec{
+		Exchanges: []driver.ExchangeSpec{{Name: exchange, Kind: "fanout", Durable: true}},
+	})
+	assertPruneExchangePresent(t, ctx, facade, exchange, true)
+
+	results, err := facade.Prune(ctx, []string{exchange})
+	if err != nil {
+		t.Fatalf("Prune: %v", err)
+	}
+	if len(results) != 1 || results[0].Name != exchange || !results[0].Deleted || results[0].Reason != "" {
+		t.Fatalf("Prune result = %+v, want a deleted exchange without a reason", results)
+	}
+	assertPruneExchangePresent(t, ctx, facade, exchange, false)
+}
+
+func TestPruneRefusesBoundExchange(t *testing.T) {
+	const exchange = "rabbitmq-driver-prune-bound-exchange"
+	const destination = "rabbitmq-driver-prune-bound-exchange-queue"
+	const otherExchange = "rabbitmq-driver-prune-unrelated-exchange"
+	const otherDestination = "rabbitmq-driver-prune-unrelated-exchange-queue"
+	ctx, _, facade := setupPruneExchangeTest(t, driver.TopologySpec{
+		Exchanges: []driver.ExchangeSpec{
+			{Name: exchange, Kind: "fanout", Durable: true},
+			{Name: otherExchange, Kind: "fanout", Durable: true},
+		},
+		Destinations: []driver.DestinationSpec{
+			{Name: destination, Durable: true},
+			{Name: otherDestination, Durable: true},
+		},
+		Bindings: []driver.BindingSpec{
+			{Source: exchange, Destination: destination},
+			{Source: otherExchange, Destination: otherDestination},
+		},
+	})
+	assertPruneExchangePresent(t, ctx, facade, exchange, true)
+
+	results, err := facade.Prune(ctx, []string{exchange})
+	if err != nil {
+		t.Fatalf("Prune: %v", err)
+	}
+	wantReason := fmt.Sprintf("exchange %q has binding to destination %q", exchange, destination)
+	if len(results) != 1 || results[0].Name != exchange || results[0].Deleted || results[0].Reason != wantReason {
+		t.Fatalf("Prune result = %+v, want refusal with reason %q", results, wantReason)
+	}
+	assertPruneExchangePresent(t, ctx, facade, exchange, true)
+}
+
+func TestPruneReportsUnknownBuiltInNameAsMissing(t *testing.T) {
+	const name = "amq.not-created-by-rabbitmq-driver"
+	ctx, _, facade := setupPruneExchangeTest(t, driver.TopologySpec{})
+
+	results, err := facade.Prune(ctx, []string{name})
+	if err != nil {
+		t.Fatalf("Prune: %v", err)
+	}
+	if len(results) != 1 || results[0].Name != name || results[0].Deleted || results[0].Reason != "destination does not exist" {
+		t.Fatalf("Prune result = %+v, want missing destination reason", results)
 	}
 }
 
@@ -361,7 +505,7 @@ func TestPruneDoesNotDeleteParkingQueueThatGainedAMessage(t *testing.T) {
 	for _, kind := range []queueKind{queueKindClassic, queueKindQuorum} {
 		t.Run(string(kind), func(t *testing.T) {
 			destination := "rabbitmq-driver-prune-parking-message-" + string(kind)
-			parking := destination + ".park"
+			parking := parkQueueName(destination)
 			ctx, _, facade := setupPruneTest(t, kind, driver.DestinationSpec{
 				Name:    destination,
 				Durable: true,
@@ -395,69 +539,6 @@ func TestPruneDoesNotDeleteParkingQueueThatGainedAMessage(t *testing.T) {
 			}
 			assertPruneQueuePresent(t, ctx, facade, destination, true)
 			assertPruneQueuePresent(t, ctx, facade, parking, true)
-		})
-	}
-}
-
-// TestPruneRefusesEveryParkingRung proves the prune guard reads the whole
-// ladder: a message parked in a rung queue, with the destination's own queue
-// empty, refuses the deletion and the refusal names the queue holding it.
-// Before the ladder there was one parking queue, so a guard that reads only the
-// beyond-the-ladder queue would delete a destination whose deferred work is
-// sitting in a rung, and those messages would dead-letter into a destination
-// that no longer exists.
-func TestPruneRefusesEveryParkingRung(t *testing.T) {
-	for _, rung := range parkRungs {
-		t.Run(parkRungTags[rung], func(t *testing.T) {
-			destination := "rabbitmq-driver-prune-rung-" + parkRungTags[rung]
-			ctx, rabbitConn, facade := setupPruneTest(t, queueKindQuorum, driver.DestinationSpec{
-				Name:    destination,
-				Durable: true,
-				Delay:   rung,
-			})
-			producer, err := rabbitConn.Producer(ctx, driver.ProducerConfig{RequireDurableAck: true})
-			if err != nil {
-				t.Fatalf("Producer: %v", err)
-			}
-			defer func() { _ = producer.Close(context.Background()) }()
-			due := time.Now().Add(rung) //nolint:forbidigo // a live delayed publish needs a future due time
-			if err := producer.Publish(ctx, driver.OutboundMessage{
-				Destination: destination,
-				DelayUntil:  due,
-				Body:        []byte("parked"),
-			}); err != nil {
-				t.Fatalf("Publish: %v", err)
-			}
-
-			// Which queue holds it is read from the broker rather than assumed:
-			// the rung is a function of the delay left when the publish lands,
-			// and a mis-routed message has to fail here rather than pass by
-			// refusing for the wrong queue.
-			held := make([]string, 0, 1)
-			for _, parkName := range parkQueueNames(destination) {
-				ready, err := facade.operations.inspectQueue(ctx, parkName)
-				if err != nil {
-					t.Fatalf("inspectQueue(%q): %v", parkName, err)
-				}
-				if ready > 0 {
-					held = append(held, parkName)
-				}
-			}
-			want := parkQueueName(destination, rung)
-			if len(held) != 1 || held[0] != want {
-				t.Fatalf("parking queues holding a message = %v, want exactly [%q]", held, want)
-			}
-
-			results, err := facade.Prune(ctx, []string{destination})
-			if err != nil {
-				t.Fatalf("Prune: %v", err)
-			}
-			wantReason := fmt.Sprintf("auxiliary %q holds 1 ready message(s)", want)
-			if len(results) != 1 || results[0].Deleted || results[0].Reason != wantReason {
-				t.Fatalf("Prune result = %+v, want a refusal with reason %q", results, wantReason)
-			}
-			assertPruneQueuePresent(t, ctx, facade, destination, true)
-			assertPruneQueuePresent(t, ctx, facade, want, true)
 		})
 	}
 }
@@ -580,6 +661,11 @@ func TestConcurrentAdminOperationsDoNotCrossReplies(t *testing.T) {
 	}
 	names := []string{firstDestination, secondDestination}
 	reverseNames := []string{secondDestination, firstDestination}
+	// 1,600 describes through the management API can outlast the 15 s setup
+	// budget on a busy machine, so the loop has its own bound. The test checks
+	// that concurrent replies are not crossed, not how fast they arrive.
+	loopCtx, cancelLoop := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancelLoop()
 	for iteration := range iterations {
 		start := make(chan struct{})
 		ready := make(chan struct{}, operationsPerIteration)
@@ -595,7 +681,7 @@ func TestConcurrentAdminOperationsDoNotCrossReplies(t *testing.T) {
 				defer operations.Done()
 				ready <- struct{}{}
 				<-start
-				state, err := facade.DescribeTopology(ctx, targets)
+				state, err := facade.DescribeTopology(loopCtx, targets)
 				results <- describeResult{state: state, err: err}
 			}(targets)
 		}
@@ -657,72 +743,153 @@ func TestRabbitMQAdminPruneRefusesNonEmptyParking(t *testing.T) {
 	requireBroker(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
+	const destination = "rabbitmq-driver-admin-prune-parking"
+	management, err := newManagementClient(defaultEndpoint, driver.Config{})
+	if err != nil {
+		t.Fatalf("newManagementClient: %v", err)
+	}
 	conn, err := (Driver{}).Open(ctx, driver.Config{Endpoints: []string{defaultEndpoint}})
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
+	t.Cleanup(func() {
+		if err := conn.Close(context.Background()); err != nil {
+			t.Errorf("cleanup connection: %v", err)
+		}
+		for _, name := range []string{destination, parkQueueName(destination)} {
+			if _, err := management.deleteQueue(context.Background(), name); err != nil {
+				t.Errorf("cleanup deleteQueue(%q): %v", name, err)
+			}
+		}
+	})
 	admin := conn.Admin()
 	maintenance, ok := admin.(driver.Maintenance)
 	if !ok {
-		_ = conn.Close(ctx)
 		t.Fatal("Admin does not implement driver.Maintenance")
 	}
-	const destination = "rabbitmq-driver-admin-prune-parking"
 	if _, err := admin.EnsureTopology(ctx, driver.TopologySpec{
 		Destinations: []driver.DestinationSpec{{Name: destination, Durable: true, Delay: time.Hour}},
 	}); err != nil {
-		_ = conn.Close(ctx)
 		t.Fatalf("EnsureTopology: %v", err)
 	}
 	producer, err := conn.Producer(ctx, driver.ProducerConfig{})
 	if err != nil {
-		_ = conn.Close(ctx)
 		t.Fatalf("Producer: %v", err)
 	}
+	t.Cleanup(func() {
+		if err := producer.Close(context.Background()); err != nil {
+			t.Errorf("cleanup producer: %v", err)
+		}
+	})
 	if err := producer.Publish(ctx, driver.OutboundMessage{
 		Destination: destination,
 		Body:        []byte("parked"),
 	}); err != nil {
-		_ = producer.Close(ctx)
-		_ = conn.Close(ctx)
 		t.Fatalf("Publish: %v", err)
 	}
 	if err := producer.Close(ctx); err != nil {
-		_ = conn.Close(ctx)
 		t.Fatalf("Close producer: %v", err)
 	}
 	results, err := maintenance.Prune(ctx, []string{destination})
 	if err != nil {
-		_, _ = maintenance.Purge(ctx, destination)
-		_ = conn.Close(ctx)
 		t.Fatalf("Prune: %v", err)
 	}
 	if len(results) != 1 || results[0].Deleted || !strings.Contains(results[0].Reason, ".park") {
-		_, _ = maintenance.Purge(ctx, destination)
-		_ = conn.Close(ctx)
 		t.Fatalf("Prune result = %+v, want a named non-empty parking auxiliary refusal", results)
 	}
 	state, err := admin.DescribeTopology(ctx, []string{destination})
 	if err != nil {
-		_, _ = maintenance.Purge(ctx, destination)
-		_ = conn.Close(ctx)
 		t.Fatalf("DescribeTopology: %v", err)
 	}
 	if state.Depth[destination] != 1 {
-		_, _ = maintenance.Purge(ctx, destination)
-		_ = conn.Close(ctx)
 		t.Fatalf("Depth[%q] = %d, want 1 while the park holds the message", destination, state.Depth[destination])
 	}
 	purged, err := maintenance.Purge(ctx, destination)
 	if err != nil {
-		_ = conn.Close(ctx)
 		t.Fatalf("Purge: %v", err)
 	}
 	if purged != 1 {
-		_ = conn.Close(ctx)
 		t.Fatalf("Purge count = %d, want 1", purged)
 	}
-	if err := conn.Close(ctx); err != nil {
-		t.Fatalf("Close: %v", err)
+}
+
+func TestPruneRefusesParkingQueueWithAMessage(t *testing.T) {
+	const destination = "rabbitmq-driver-prune-fixed-queue"
+	spec := driver.DestinationSpec{Name: destination, Durable: true, Delay: 5 * time.Second}
+	parkQueue := parkQueueName(destination)
+	ctx, rabbitConn, facade := setupPruneTest(t, queueKindQuorum, spec)
+	producer, err := rabbitConn.Producer(ctx, driver.ProducerConfig{})
+	if err != nil {
+		t.Fatalf("Producer: %v", err)
+	}
+	defer func() { _ = producer.Close(context.Background()) }()
+	if err := producer.Publish(ctx, driver.OutboundMessage{
+		Destination: destination,
+		Body:        []byte("parked"),
+	}); err != nil {
+		t.Fatalf("Publish: %v", err)
+	}
+	ready, err := facade.operations.inspectQueue(ctx, parkQueue)
+	if err != nil {
+		t.Fatalf("inspectQueue(%q): %v", parkQueue, err)
+	}
+	if ready != 1 {
+		t.Fatalf("parking queue %q ready = %d, want 1", parkQueue, ready)
+	}
+	results, err := facade.Prune(ctx, []string{destination})
+	if err != nil {
+		t.Fatalf("Prune: %v", err)
+	}
+	wantReason := fmt.Sprintf("auxiliary %q holds 1 ready message(s)", parkQueue)
+	if len(results) != 1 || results[0].Deleted || results[0].Reason != wantReason {
+		t.Fatalf("Prune result = %+v, want a refusal with reason %q", results, wantReason)
+	}
+	assertPruneQueuePresent(t, ctx, facade, destination, true)
+	assertPruneQueuePresent(t, ctx, facade, parkQueue, true)
+}
+
+func TestParkingQueueCountsInDescribeAndPurge(t *testing.T) {
+	const destination = "rabbitmq-driver-fixed-describe-purge"
+	spec := driver.DestinationSpec{Name: destination, Durable: true, Delay: 5 * time.Second}
+	parkQueue := parkQueueName(destination)
+	ctx, rabbitConn, facade := setupPruneTest(t, queueKindQuorum, spec)
+	producer, err := rabbitConn.Producer(ctx, driver.ProducerConfig{})
+	if err != nil {
+		t.Fatalf("Producer: %v", err)
+	}
+	defer func() { _ = producer.Close(context.Background()) }()
+	if err := producer.Publish(ctx, driver.OutboundMessage{
+		Destination: destination,
+		Body:        []byte("parked"),
+	}); err != nil {
+		t.Fatalf("Publish: %v", err)
+	}
+	ready, err := facade.operations.inspectQueue(ctx, parkQueue)
+	if err != nil {
+		t.Fatalf("inspectQueue(%q): %v", parkQueue, err)
+	}
+	if ready != 1 {
+		t.Fatalf("parking queue %q ready = %d, want 1", parkQueue, ready)
+	}
+	state, err := facade.DescribeTopology(ctx, []string{destination})
+	if err != nil {
+		t.Fatalf("DescribeTopology: %v", err)
+	}
+	if state.Depth[destination] != 1 {
+		t.Fatalf("Depth[%q] = %d, want 1", destination, state.Depth[destination])
+	}
+	purged, err := facade.Purge(ctx, destination)
+	if err != nil {
+		t.Fatalf("Purge: %v", err)
+	}
+	if purged != 1 {
+		t.Fatalf("Purge count = %d, want 1", purged)
+	}
+	after, err := facade.operations.inspectQueue(ctx, parkQueue)
+	if err != nil {
+		t.Fatalf("inspectQueue(%q): %v", parkQueue, err)
+	}
+	if after != 0 {
+		t.Fatalf("parking queue %q ready = %d, want 0 after Purge", parkQueue, after)
 	}
 }

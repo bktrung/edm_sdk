@@ -79,7 +79,7 @@ func TestPublishAndRetryUseOneEffectiveHeaderCap(t *testing.T) {
 		Body:        append([]byte(nil), published.Body...),
 		Settle:      settler,
 	}
-	if !dispatchMessage(runner, context.Background(), message, &envelope, new(bool)) {
+	if !dispatchMessage(runner, context.Background(), message, &envelope, new(bool), &deliveryState{}) {
 		t.Fatal("dispatchMessage() did not complete retry settlement")
 	}
 	if !settler.acked || settler.nacked {

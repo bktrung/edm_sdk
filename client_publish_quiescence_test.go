@@ -10,6 +10,7 @@ import (
 
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/driver"
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/clock"
+	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/lifecycle"
 )
 
 // flightCountingProducer counts publishes between admission and completion,
@@ -84,7 +85,7 @@ func waitClientClosing(t *testing.T, client *Client) {
 	defer timer.Stop()
 	for {
 		client.mu.Lock()
-		closing := client.closing
+		closing := client.lifecycleLocked() == lifecycle.Draining
 		client.mu.Unlock()
 		if closing {
 			return
@@ -133,7 +134,7 @@ func TestCloseDoesNotCloseProducerWhileSuccessorPublishInFlight(t *testing.T) {
 
 	publishDone := make(chan error, 1)
 	go func() {
-		publishDone <- publishMessages(client, context.Background(), true, driver.OutboundMessage{Destination: "orders.created", Body: []byte("{}")})
+		publishDone <- publishMessages(client, context.Background(), driver.OutboundMessage{Destination: "orders.created", Body: []byte("{}")})
 	}()
 	timer := clock.NewReal().Timer(2 * time.Second)
 	defer timer.Stop()
@@ -209,16 +210,16 @@ func TestWaitForPublishesSpansLateGenerationsAndBarsTeardownAdmission(t *testing
 	if !barricaded {
 		t.Fatal("producer teardown barrier was not set when the wait observed zero")
 	}
-	if err := publishMessages(client, context.Background(), true, driver.OutboundMessage{Destination: "orders.created"}); err == nil {
+	if err := publishMessages(client, context.Background(), driver.OutboundMessage{Destination: "orders.created"}); err == nil {
 		t.Fatal("successor publish was admitted after producer teardown began")
 	}
 }
 
-// TestWaitPublishIdleSpansLateGenerations pins the same property for the
+// TestPublishQuiescenceSpansLateGenerations pins the same property for the
 // reconnect path: waiting for publish quiescence before retiring the old
 // producer may not report idle while a newer publish generation is live,
 // even one that began after the wait started.
-func TestWaitPublishIdleSpansLateGenerations(t *testing.T) {
+func TestPublishQuiescenceSpansLateGenerations(t *testing.T) {
 	client, err := New(context.Background(), testClientConfig(t), WithDriver(&publishDriver{conn: &publishConn{info: driver.BrokerInfo{Kind: "test", Version: "1"}}}))
 	if err != nil {
 		t.Fatal(err)
@@ -231,7 +232,7 @@ func TestWaitPublishIdleSpansLateGenerations(t *testing.T) {
 	client.mu.Unlock()
 
 	waitDone := make(chan error, 1)
-	go func() { waitDone <- client.waitPublishIdle(context.Background()) }()
+	go func() { waitDone <- client.publishQuiescence(context.Background(), nil) }()
 
 	// Same settle delay as the Close-path generation test: it only
 	// strengthens mutation detection, never the correctness of the assertion.
@@ -242,11 +243,11 @@ func TestWaitPublishIdleSpansLateGenerations(t *testing.T) {
 	client.publishIdle = make(chan struct{})
 	client.mu.Unlock()
 
-	assertNotDone(t, waitDone, "waitPublishIdle")
+	assertNotDone(t, waitDone, "publish quiescence")
 
 	endPublish(client)
 	if err := <-waitDone; err != nil {
-		t.Fatalf("waitPublishIdle() = %v, want nil", err)
+		t.Fatalf("publishQuiescence() = %v, want nil", err)
 	}
 }
 
@@ -276,17 +277,16 @@ func TestFailedCloseKeepsProducerTeardownBarrierSet(t *testing.T) {
 
 	client.mu.Lock()
 	barrier := client.producerTeardown
-	closing := client.closing
-	closed := client.closed
+	life := client.lifecycleLocked()
 	client.mu.Unlock()
 	if !barrier {
 		t.Fatal("producer teardown barrier not set although Close reached the publish-idle wait")
 	}
-	if closing || closed {
-		t.Fatalf("closing = %v, closed = %v, want a failed Close to leave the client retryable", closing, closed)
+	if life != lifecycle.Aborted {
+		t.Fatalf("lifecycle = %s, want a failed Close to leave the client retryable", life)
 	}
 
-	if err := publishMessages(client, context.Background(), true, driver.OutboundMessage{Destination: "orders.created"}); err == nil || !strings.Contains(err.Error(), "client is closed") {
+	if err := publishMessages(client, context.Background(), driver.OutboundMessage{Destination: "orders.created"}); err == nil || !strings.Contains(err.Error(), "client is closed") {
 		t.Fatalf("successor publish after a failed Close = %v, want refused with client is closed: the barrier must survive the failure", err)
 	}
 

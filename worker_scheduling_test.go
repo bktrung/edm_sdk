@@ -1,11 +1,8 @@
 package f1_test
 
 import (
-	"bytes"
 	"context"
 	"errors"
-	"log/slog"
-	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -36,49 +33,49 @@ const (
 	// which lane fills first. The pre-change pipeline measured 64:36 here, which
 	// stays outside the band.
 	schedulingShareTolerance = 5
-	// schedulingAgeMargin is the clock step the ageing test applies per handled
-	// message: larger than the low priority's budget and far smaller than the
-	// high priority's, so exactly the low item can be promoted.
-	schedulingAgeMargin = 200 * time.Millisecond
-	// schedulingAgeBound is how many dispatches the aged low item may sit
-	// behind: the pick after the advance that ages it is the dispatch after
-	// next, and the feed can take up to two dispatches to place it in a lane.
+	// schedulingPromotionAdvance is the clock step the deadline promotion test
+	// applies per handled message: larger than the low priority's budget and far
+	// smaller than the high priority's, so exactly the low item can be promoted.
+	schedulingPromotionAdvance = 200 * time.Millisecond
+	// schedulingPromotionBound is how many dispatches the overdue low item may sit
+	// behind: the pick after the advance that makes it overdue is the dispatch
+	// after next, and the feed can take up to two dispatches to place it in a lane.
 	// Measured 3-4 over 40 runs with promotion, against 9-10 without it, where
 	// the item waits for the high slot's 8-pick deficit round instead.
-	schedulingAgeBound = 6
+	schedulingPromotionBound = 6
 )
 
 func TestRunnerSchedulerWeightedShare(t *testing.T) {
-	first := runPriorityShare(t, map[f1.Priority]int{
-		f1.PriorityHigh: 8,
-		f1.PriorityLow:  1,
-	})
-	high := countPriority(first, f1.PriorityHigh)
-	low := countPriority(first, f1.PriorityLow)
-	const wantHigh = 89
-	if high < wantHigh-schedulingShareTolerance || high > wantHigh+schedulingShareTolerance || high+low != schedulingWindow {
-		t.Fatalf("first %d priorities = high:%d low:%d, want high:%d +/- %d", schedulingWindow, high, low, wantHigh, schedulingShareTolerance)
+	for _, test := range []struct {
+		name     string
+		weights  map[f1.Priority]int
+		favoured f1.Priority
+	}{
+		{name: "high 8 low 1", weights: map[f1.Priority]int{f1.PriorityHigh: 8, f1.PriorityLow: 1}, favoured: f1.PriorityHigh},
+		{name: "high 1 low 8", weights: map[f1.Priority]int{f1.PriorityHigh: 1, f1.PriorityLow: 8}, favoured: f1.PriorityLow},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			first := runPriorityShare(t, test.weights)
+			high := countPriority(first, f1.PriorityHigh)
+			low := countPriority(first, f1.PriorityLow)
+			favoured := countPriority(first, test.favoured)
+			const want = 89
+			if favoured < want-schedulingShareTolerance || favoured > want+schedulingShareTolerance || high+low != schedulingWindow {
+				t.Fatalf("first %d priorities = high:%d low:%d, want %s:%d +/- %d", schedulingWindow, high, low, test.favoured, want, schedulingShareTolerance)
+			}
+		})
 	}
 }
 
-func TestRunnerSchedulerWeightedShareReversed(t *testing.T) {
-	first := runPriorityShare(t, map[f1.Priority]int{
-		f1.PriorityHigh: 1,
-		f1.PriorityLow:  8,
-	})
-	high := countPriority(first, f1.PriorityHigh)
-	low := countPriority(first, f1.PriorityLow)
-	const wantLow = 89
-	if low < wantLow-schedulingShareTolerance || low > wantLow+schedulingShareTolerance || high+low != schedulingWindow {
-		t.Fatalf("first %d priorities = high:%d low:%d, want low:%d +/- %d", schedulingWindow, high, low, wantLow, schedulingShareTolerance)
-	}
-}
-
-func TestRunnerSchedulerAgesLowPriorityWork(t *testing.T) {
+func TestRunnerSchedulerPromotesOverdueLowPriorityWork(t *testing.T) {
 	fake := clock.NewFake(time.Unix(0, 0))
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	client, err := f1.New(ctx, schedulingConfig(), f1.WithDriver(testhook.Driver(fake)), testhook.ClientOption(fake).(f1.Option))
+	lowQueued := make(chan struct{})
+	client, err := f1.New(ctx, schedulingConfig(), f1.WithDriver(&promotionDriver{
+		Driver:    testhook.Driver(fake),
+		lowQueued: lowQueued,
+	}), testhook.ClientOption(fake).(f1.Option))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -87,7 +84,9 @@ func TestRunnerSchedulerAgesLowPriorityWork(t *testing.T) {
 	const highBacklog = 32
 	started := make(chan struct{})
 	release := make(chan struct{})
-	dispatched := make(chan f1.Priority, schedulingAgeBound)
+	allHighHandled := make(chan struct{})
+	var allHighOnce sync.Once
+	dispatched := make(chan f1.Priority, schedulingPromotionBound)
 	var highHandled atomic.Int64
 	var position atomic.Int64
 	var firstOnce sync.Once
@@ -96,25 +95,27 @@ func TestRunnerSchedulerAgesLowPriorityWork(t *testing.T) {
 		f1.PriorityLow:  1,
 	}, map[f1.Priority]time.Duration{
 		f1.PriorityHigh: time.Hour,
-		f1.PriorityLow:  schedulingAgeMargin / 2,
+		f1.PriorityLow:  schedulingPromotionAdvance / 2,
 	}, func(_ context.Context, event *f1.Event) error {
 		firstOnce.Do(func() {
 			close(started)
-			// Held until the backlog below is published, so the low item is
-			// already in a lane when the clock moves past its budget.
+			// Held until the low item is in the scheduler lane and the backlog
+			// below is published, so the clock move ages the queued low item.
 			<-release
 		})
 		if event.Priority() == f1.PriorityHigh {
-			highHandled.Add(1)
+			handled := highHandled.Add(1)
+			if handled >= highBacklog+1 {
+				allHighOnce.Do(func() { close(allHighHandled) })
+			}
 		}
-		if position.Add(1) <= schedulingAgeBound {
+		if position.Add(1) <= schedulingPromotionBound {
 			dispatched <- event.Priority()
 		}
 		// The runner stamps EnqueuedAt from this clock, and the pick for the
 		// next dispatch happens after this handler returns. Advancing here
-		// therefore ages whatever is already queued before that pick, whichever
-		// way the publish-to-lane race falls.
-		fake.Advance(schedulingAgeMargin)
+		// therefore makes the low item overdue after it is queued, before that pick.
+		fake.Advance(schedulingPromotionAdvance)
 		return nil
 	})
 	// Lane capacity 8 covers the high slot's whole deficit round, so an
@@ -130,30 +131,143 @@ func TestRunnerSchedulerAgesLowPriorityWork(t *testing.T) {
 
 	publishPriorityBatch(t, client, ctx, []f1.Priority{f1.PriorityHigh})
 	waitSchedulingSignalOrRunner(t, started, runDone, "first high-priority handler did not start")
-	publishPriorityBatch(t, client, ctx, append([]f1.Priority{f1.PriorityLow}, repeatPriority(f1.PriorityHigh, highBacklog)...))
+	publishPriorityBatch(t, client, ctx, []f1.Priority{f1.PriorityLow})
+	publishPriorityBatch(t, client, ctx, repeatPriority(f1.PriorityHigh, highBacklog))
+	waitSchedulingSignalOrRunner(t, lowQueued, runDone, "low-priority item did not reach its scheduler lane")
 	close(release)
 
 	timer := clock.NewReal().Timer(5 * time.Second)
 	defer timer.Stop()
-	for range schedulingAgeBound {
+	for range schedulingPromotionBound {
 		select {
 		case got := <-dispatched:
 			if got != f1.PriorityLow {
 				continue
 			}
 			if remaining := highBacklog - int(highHandled.Load()); remaining <= 0 {
-				t.Fatalf("high backlog had %d items unhandled when the aged low item ran, want the low item ahead of backlogged %d-item high work", remaining, highBacklog)
+				t.Fatalf("high backlog had %d items unhandled when the overdue low item ran, want the low item ahead of backlogged %d-item high work", remaining, highBacklog)
 			}
+			waitSchedulingSignal(t, allHighHandled, "high backlog did not drain after overdue low item ran")
 			cancel()
 			waitRunnerDone(t, runDone)
 			return
 		case err := <-runDone:
-			t.Fatalf("aged low item: Runner.Run() error = %v", err)
+			t.Fatalf("overdue low item: Runner.Run() error = %v", err)
 		case <-timer.C:
-			t.Fatal("aged item was not dispatched")
+			t.Fatal("overdue item was not dispatched")
 		}
 	}
-	t.Fatalf("aged low item was not dispatched within the first %d dispatches, want it ahead of the %d-item high backlog", schedulingAgeBound, highBacklog)
+	t.Fatalf("overdue low item was not dispatched within the first %d dispatches, want it ahead of the %d-item high backlog", schedulingPromotionBound, highBacklog)
+}
+
+type promotionDriver struct {
+	driver.Driver
+	lowQueued chan struct{}
+}
+
+func (d *promotionDriver) Open(ctx context.Context, cfg driver.Config) (driver.Conn, error) {
+	conn, err := d.Driver.Open(ctx, cfg)
+	if err != nil {
+		return nil, err
+	}
+	return &promotionConn{Conn: conn, lowQueued: d.lowQueued}, nil
+}
+
+type promotionConn struct {
+	driver.Conn
+	lowQueued chan struct{}
+}
+
+func (c *promotionConn) Consumer(ctx context.Context, cfg driver.ConsumerConfig) (driver.Consumer, error) {
+	consumer, err := c.Conn.Consumer(ctx, cfg)
+	if err != nil {
+		return nil, err
+	}
+	return &promotionConsumer{
+		Consumer:  consumer,
+		lowQueued: c.lowQueued,
+		stopRelay: make(chan struct{}),
+		relayDone: make(chan struct{}),
+	}, nil
+}
+
+type promotionConsumer struct {
+	driver.Consumer
+	lowQueued     chan struct{}
+	lowSeen       atomic.Bool
+	highAfterLow  atomic.Int32
+	stopRelay     chan struct{}
+	relayDone     chan struct{}
+	stopRelayOnce sync.Once
+}
+
+func (c *promotionConsumer) Messages() <-chan driver.InboundMessage {
+	messages := make(chan driver.InboundMessage)
+	go func() {
+		defer close(messages)
+		defer close(c.relayDone)
+		for {
+			select {
+			case <-c.stopRelay:
+				c.drainInner()
+				return
+			case message, ok := <-c.Consumer.Messages():
+				if !ok {
+					return
+				}
+				low := strings.HasSuffix(message.Destination, ".low")
+				high := strings.HasSuffix(message.Destination, ".high")
+				select {
+				case messages <- message:
+					if low {
+						c.lowSeen.Store(true)
+					}
+					// Three following handoffs force the pipeline to enqueue the low item before it can receive the second following high item.
+					if high && c.lowSeen.Load() && c.highAfterLow.Add(1) == 3 {
+						close(c.lowQueued)
+					}
+				case <-c.stopRelay:
+					if message.Settle != nil {
+						_ = message.Settle.Nack(context.Background(), driver.NackOptions{Requeue: true})
+					}
+					c.drainInner()
+					return
+				}
+			}
+		}
+	}()
+	return messages
+}
+
+func (c *promotionConsumer) Stop(ctx context.Context) error {
+	if err := c.Drain(ctx); err != nil {
+		return err
+	}
+	c.stopRelayOnce.Do(func() { close(c.stopRelay) })
+	<-c.relayDone
+	return c.Consumer.Stop(ctx)
+}
+
+func (c *promotionConsumer) Release(ctx context.Context) error {
+	c.stopRelayOnce.Do(func() { close(c.stopRelay) })
+	<-c.relayDone
+	return c.Consumer.Release(ctx)
+}
+
+func (c *promotionConsumer) drainInner() {
+	for {
+		select {
+		case message, ok := <-c.Consumer.Messages():
+			if !ok {
+				return
+			}
+			if message.Settle != nil {
+				_ = message.Settle.Nack(context.Background(), driver.NackOptions{Requeue: true})
+			}
+		default:
+			return
+		}
+	}
 }
 
 func TestRunnerSchedulerPreservesOrderedKeys(t *testing.T) {
@@ -331,7 +445,7 @@ func schedulingSubscriptionWithMode(mode f1.Mode, weights map[f1.Priority]int, b
 		Concurrency:    1,
 		Prefetch:       64,
 		Priorities:     []f1.Priority{f1.PriorityHigh, f1.PriorityLow},
-		Fairness:       f1.FairnessConfig{Weights: weights, Budgets: budgets, DisableAging: budgets == nil, PrefetchFactor: 2},
+		Fairness:       f1.FairnessConfig{Weights: weights, Budgets: budgets, DisableDeadlinePromotion: budgets == nil, PrefetchFactor: 2},
 		Retry:          f1.RetryConfig{MaxAttempts: 1},
 		HandlerTimeout: time.Second,
 		Handlers:       map[string]f1.Handler{"orders.created": handler},
@@ -350,7 +464,7 @@ func schedulingConfig() f1.Config {
 		Env: "test", Service: "scheduler", InstanceID: "worker-scheduling",
 		Broker:    f1.BrokerConfig{Driver: "inmem", DefaultPrefetch: 64},
 		Topology:  f1.TopologyConfig{AutoCreate: true, VerifyOnStart: true, Priorities: []f1.Priority{f1.PriorityHigh, f1.PriorityLow}},
-		Codec:     f1.CodecConfig{Default: "json", ContentMode: "binary", MaxHeaderBytes: f1.CoreMaxHeaderBytes, MaxBodyBytes: 1 << 20},
+		Codec:     f1.CodecConfig{Default: "json", MaxHeaderBytes: f1.CoreMaxHeaderBytes, MaxBodyBytes: 1 << 20},
 		Lifecycle: f1.LifecycleConfig{DrainTimeout: 10 * time.Second, HandlerGrace: time.Second, CloseTimeout: time.Second},
 	}
 }
@@ -382,7 +496,12 @@ func publishMessages(t *testing.T, client *f1.Client, ctx context.Context, messa
 		if err != nil {
 			t.Fatalf("publish batch: %v", err)
 		}
-		failed := result.Failed()
+		failed := make([]int, 0)
+		for index, message := range result.Results {
+			if message.Err != nil {
+				failed = append(failed, index)
+			}
+		}
 		if len(failed) == 0 {
 			return
 		}
@@ -463,228 +582,5 @@ func waitRunnerDone(t *testing.T, done <-chan error) {
 		}
 	case <-timer.C:
 		t.Fatal("Runner.Run() did not return")
-	}
-}
-
-// windowDriver records the consumer configuration the core hands the driver.
-// The destination windows are the contract with the driver: they are what it
-// may hold outstanding for one destination, and what the core sizes to keep a
-// handler from waiting on a broker round trip. A test reads them here rather
-// than inferring them from a broker, which is what makes the window assertable
-// without one.
-type windowDriver struct {
-	driver.Driver
-	configs chan driver.ConsumerConfig
-}
-
-// Open forwards to the wrapped driver and wraps the connection, so the
-// consumer the core builds on it is the one the test observes.
-func (d *windowDriver) Open(ctx context.Context, cfg driver.Config) (driver.Conn, error) {
-	conn, err := d.Driver.Open(ctx, cfg)
-	if err != nil {
-		return nil, err
-	}
-	return &windowConn{Conn: conn, configs: d.configs}, nil
-}
-
-// windowConn records every consumer configuration built on the connection.
-type windowConn struct {
-	driver.Conn
-	configs chan driver.ConsumerConfig
-}
-
-// Consumer records cfg and then builds the consumer the wrapped driver would
-// have built without the wrapper.
-func (c *windowConn) Consumer(ctx context.Context, cfg driver.ConsumerConfig) (driver.Consumer, error) {
-	select {
-	case c.configs <- cfg:
-	default:
-	}
-	return c.Conn.Consumer(ctx, cfg)
-}
-
-// windowSubscription is the shipped shape with one priority and the shipped
-// retry ladder, which is the shape the consume measurements run: one main
-// destination and one destination per retry tier, weighted 4 against 2, so the
-// main lane's share of one handler slot is one unit.
-func windowSubscription(concurrency, prefetch int) f1.Subscription {
-	return f1.Subscription{
-		Name:           "scheduler-window-test",
-		Topics:         []string{"orders.created"},
-		Concurrency:    concurrency,
-		Prefetch:       prefetch,
-		Priorities:     []f1.Priority{f1.PriorityMedium},
-		HandlerTimeout: time.Second,
-		Handlers:       map[string]f1.Handler{"orders.created": f1.HandlerFunc(func(context.Context, *f1.Event) error { return nil })},
-	}
-}
-
-// runWindowSubscription starts sub against the in-memory driver and returns the
-// consumer configuration the core handed it, plus a sink holding the runner's
-// log output.
-func runWindowSubscription(t *testing.T, sub f1.Subscription) (driver.ConsumerConfig, *lockedLogSink) {
-	t.Helper()
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	var logs lockedLogSink
-	configs := make(chan driver.ConsumerConfig, 1)
-	client, err := f1.New(ctx, schedulingConfig(),
-		f1.WithDriver(&windowDriver{Driver: inmem.New(), configs: configs}),
-		f1.WithLogger(slog.New(slog.NewTextHandler(&logs, nil))),
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() { _ = client.Close(context.Background()) }()
-	runner, err := client.Subscribe(ctx, sub)
-	if err != nil {
-		t.Fatal(err)
-	}
-	runDone := make(chan error, 1)
-	go func() { runDone <- runner.Run(ctx) }()
-
-	timer := clock.NewReal().Timer(5 * time.Second)
-	defer timer.Stop()
-	select {
-	case cfg := <-configs:
-		cancel()
-		waitRunnerDone(t, runDone)
-		return cfg, &logs
-	case err := <-runDone:
-		t.Fatalf("Runner.Run() error = %v", err)
-	case <-timer.C:
-		t.Fatal("consumer was not created")
-	}
-	return driver.ConsumerConfig{}, nil
-}
-
-// TestRunnerSchedulerSizesDestinationWindows pins the window each destination
-// gets. At one and three handler slots the weighted share is one and two units,
-// so the floor is what the window holds, and a floor of two units left two of
-// three slots waiting a broker round trip behind their own acknowledgements
-// instead of finding work in hand. The shipped concurrency keeps the share it
-// had, which is what the same test says for the retry destinations.
-func TestRunnerSchedulerSizesDestinationWindows(t *testing.T) {
-	for _, tc := range []struct {
-		concurrency int
-		want        map[string]int
-	}{
-		{concurrency: 1, want: map[string]int{".medium": 6, ".medium.retry.1": 6, ".medium.retry.2": 6, ".medium.retry.3": 6}},
-		{concurrency: 3, want: map[string]int{".medium": 6, ".medium.retry.1": 6, ".medium.retry.2": 6, ".medium.retry.3": 6}},
-		{concurrency: 16, want: map[string]int{".medium": 22, ".medium.retry.1": 12, ".medium.retry.2": 12, ".medium.retry.3": 12}},
-	} {
-		t.Run(strconv.Itoa(tc.concurrency), func(t *testing.T) {
-			cfg, _ := runWindowSubscription(t, windowSubscription(tc.concurrency, 0))
-			for destination := range tc.want {
-				found := false
-				for _, declared := range cfg.Destinations {
-					if strings.HasSuffix(declared, destination) {
-						found = true
-						if got := cfg.PerDestination[declared]; got != tc.want[destination] {
-							t.Errorf("window for %s = %d, want %d", declared, got, tc.want[destination])
-						}
-					}
-				}
-				if !found {
-					t.Errorf("no destination ending in %q: declared %v", destination, cfg.Destinations)
-				}
-			}
-		})
-	}
-}
-
-// TestRunnerSchedulerReportsPrefetchCappedByTheLaneTotal pins what a caller
-// learns when the prefetch they configured is more than the destination
-// windows add up to. The consumer gets the lane total, which is deliberate,
-// and the warning is what keeps that from being silent: the caller named a
-// budget and the destinations carry less. A prefetch the windows can carry is
-// not reported, so the line means the cap and nothing else.
-func TestRunnerSchedulerReportsPrefetchCappedByTheLaneTotal(t *testing.T) {
-	const laneTotal = 24
-	for _, tc := range []struct {
-		name       string
-		prefetch   int
-		wantReport bool
-	}{
-		{name: "at-the-lane-total", prefetch: laneTotal},
-		{name: "above-the-lane-total", prefetch: laneTotal + 1, wantReport: true},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			cfg, logs := runWindowSubscription(t, windowSubscription(1, tc.prefetch))
-			if cfg.Prefetch != laneTotal {
-				t.Errorf("consumer prefetch = %d, want the lane total %d", cfg.Prefetch, laneTotal)
-			}
-			output := logs.String()
-			if !tc.wantReport {
-				if strings.Contains(output, "configured prefetch exceeds the destination windows") {
-					t.Fatalf("log output = %q, want no cap report for a prefetch the windows carry", output)
-				}
-				return
-			}
-			for _, want := range []string{
-				"configured prefetch exceeds the destination windows",
-				"configured=" + strconv.Itoa(tc.prefetch),
-				"effective=" + strconv.Itoa(laneTotal),
-			} {
-				if !strings.Contains(output, want) {
-					t.Fatalf("log output = %q, missing %q", output, want)
-				}
-			}
-		})
-	}
-}
-
-// lockedLogSink collects a logger's output for a test whose runner logs from
-// its own goroutine, so reading it after the runner stopped is not a race.
-type lockedLogSink struct {
-	mu     sync.Mutex
-	buffer bytes.Buffer
-}
-
-func (s *lockedLogSink) Write(p []byte) (int, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.buffer.Write(p)
-}
-
-func (s *lockedLogSink) String() string {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.buffer.String()
-}
-
-// TestRunnerSchedulerReportsOnlyAPrefetchTheCallerSet pins which subscriptions
-// hear that the lane windows cap a prefetch. A budget the caller named is
-// reported, including when the number they named happens to equal the broker
-// default; a budget nobody named is silent, because the default is not the
-// caller's decision and a line that fires on every subscription is what leaves
-// it unread when a caller's own budget is capped. The cap itself stays
-// unconditional, which the unset row pins by its budget.
-func TestRunnerSchedulerReportsOnlyAPrefetchTheCallerSet(t *testing.T) {
-	const laneTotal = 24
-	for _, tc := range []struct {
-		name       string
-		prefetch   int
-		wantBudget int
-		wantReport bool
-	}{
-		{name: "unset-takes-the-broker-default", prefetch: 0, wantBudget: laneTotal},
-		{name: "named-below-the-lane-total", prefetch: 8, wantBudget: 8},
-		{name: "named-at-the-broker-default", prefetch: 64, wantBudget: laneTotal, wantReport: true},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			cfg, logs := runWindowSubscription(t, windowSubscription(1, tc.prefetch))
-			if cfg.Prefetch != tc.wantBudget {
-				t.Fatalf("consumer prefetch = %d, want %d", cfg.Prefetch, tc.wantBudget)
-			}
-			output := logs.String()
-			reported := strings.Contains(output, "configured prefetch exceeds the destination windows")
-			if tc.wantReport && !reported {
-				t.Fatalf("log output = %q, want the cap report for a prefetch the caller named", output)
-			}
-			if !tc.wantReport && reported {
-				t.Fatalf("log output = %q, want no cap report for a prefetch nobody named", output)
-			}
-		})
 	}
 }

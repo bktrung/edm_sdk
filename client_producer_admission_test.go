@@ -11,6 +11,7 @@ import (
 
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/driver"
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/clock"
+	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/lifecycle"
 )
 
 type producerAdmissionDriver struct {
@@ -106,16 +107,18 @@ func TestPublishProducerBuildDoesNotHoldClientLock(t *testing.T) {
 	publishDone := make(chan error, 1)
 	var releaseOnce sync.Once
 	releaseBuild := func() { releaseOnce.Do(func() { close(buildRelease) }) }
+	publishFinished := make(chan struct{})
 	t.Cleanup(func() {
 		releaseBuild()
 		select {
-		case <-publishDone:
+		case <-publishFinished:
 		case <-clock.NewReal().Timer(time.Second).C:
 		}
 		_ = client.Close(context.Background())
 	})
 	go func() {
-		publishDone <- publishMessages(client, context.Background(), true, driver.OutboundMessage{Destination: "orders.created"})
+		defer close(publishFinished)
+		publishDone <- publishMessages(client, context.Background(), driver.OutboundMessage{Destination: "orders.created"})
 	}()
 	waitForSignal(t, buildStarted, "producer construction")
 
@@ -178,20 +181,23 @@ func TestConcurrentFirstPublishesInstallOneProducerAndCloseLoser(t *testing.T) {
 	results := make(chan error, 2)
 	var releaseOnce sync.Once
 	releaseBuild := func() { releaseOnce.Do(func() { close(release) }) }
+	var publishers sync.WaitGroup
 	t.Cleanup(func() {
 		releaseBuild()
-		for range 2 {
-			select {
-			case <-results:
-			case <-clock.NewReal().Timer(time.Second).C:
-				return
-			}
+		finished := make(chan struct{})
+		go func() { publishers.Wait(); close(finished) }()
+		select {
+		case <-finished:
+		case <-clock.NewReal().Timer(time.Second).C:
+			return
 		}
 		_ = client.Close(context.Background())
 	})
 	for range 2 {
+		publishers.Add(1)
 		go func() {
-			results <- publishMessages(client, context.Background(), true, driver.OutboundMessage{Destination: "orders.created"})
+			defer publishers.Done()
+			results <- publishMessages(client, context.Background(), driver.OutboundMessage{Destination: "orders.created"})
 		}()
 	}
 	waitForSignal(t, built, "first producer build")
@@ -231,7 +237,7 @@ func TestConcurrentFirstPublishesInstallOneProducerAndCloseLoser(t *testing.T) {
 		}
 	}
 
-	if err := publishMessages(client, context.Background(), true, driver.OutboundMessage{Destination: "orders.created"}); err != nil {
+	if err := publishMessages(client, context.Background(), driver.OutboundMessage{Destination: "orders.created"}); err != nil {
 		t.Fatalf("later publish = %v, want nil", err)
 	}
 	conn.mu.Lock()
@@ -251,7 +257,7 @@ func TestPublishRejectsProducerWhenCloseWinsDuringBuild(t *testing.T) {
 	conn := &producerAdmissionConn{
 		publishConn: &publishConn{info: driver.BrokerInfo{Kind: "test", Version: "1"}},
 		build: func() (driver.Producer, error) {
-			client.closed = true
+			setClientLifecycle(client, lifecycle.Closed)
 			return built, nil
 		},
 	}
@@ -262,7 +268,7 @@ func TestPublishRejectsProducerWhenCloseWinsDuringBuild(t *testing.T) {
 	}
 	defer func() { _ = client.Close(context.Background()) }()
 
-	err = publishMessages(client, context.Background(), true, driver.OutboundMessage{Destination: "orders.created"})
+	err = publishMessages(client, context.Background(), driver.OutboundMessage{Destination: "orders.created"})
 	if err == nil || err.Error() != "f1: client is closed" {
 		t.Fatalf("publish after close wins = %v, want client is closed", err)
 	}
@@ -280,7 +286,7 @@ func TestPublishRejectsProducerFromRetiredConnection(t *testing.T) {
 		publishConn: retired,
 		build: func() (driver.Producer, error) {
 			client.mu.Lock()
-			client.conn = current
+			client.current = currentConnection{conn: current, epoch: client.current.epoch + 1}
 			client.mu.Unlock()
 			return built, nil
 		},
@@ -292,7 +298,7 @@ func TestPublishRejectsProducerFromRetiredConnection(t *testing.T) {
 	}
 	defer func() { _ = client.Close(context.Background()) }()
 
-	err = publishMessages(client, context.Background(), true, driver.OutboundMessage{Destination: "orders.created"})
+	err = publishMessages(client, context.Background(), driver.OutboundMessage{Destination: "orders.created"})
 	if err == nil || !strings.Contains(err.Error(), "reconnecting") {
 		t.Fatalf("publish with retired connection = %v, want reconnecting error", err)
 	}
@@ -362,15 +368,17 @@ func TestPublishBatchProducerBuildDoesNotHoldClientLock(t *testing.T) {
 	batchDone := make(chan error, 1)
 	var releaseOnce sync.Once
 	releaseBuild := func() { releaseOnce.Do(func() { close(buildRelease) }) }
+	batchFinished := make(chan struct{})
 	t.Cleanup(func() {
 		releaseBuild()
 		select {
-		case <-batchDone:
+		case <-batchFinished:
 		case <-clock.NewReal().Timer(time.Second).C:
 		}
 		_ = client.Close(context.Background())
 	})
 	go func() {
+		defer close(batchFinished)
 		_, err := client.Publisher().PublishBatch(context.Background(), []Message{
 			{EventType: "orders.created", Payload: "payload"},
 		})
@@ -429,7 +437,7 @@ func TestPublishBatchRejectsStaleConnectionAfterProducerBuild(t *testing.T) {
 	}()
 	waitForSignal(t, buildStarted, "batch producer construction")
 	client.mu.Lock()
-	client.conn = current
+	client.current = currentConnection{conn: current, epoch: client.current.epoch + 1}
 	client.mu.Unlock()
 	releaseOnce.Do(func() { close(buildRelease) })
 	response := <-batchDone
@@ -474,19 +482,22 @@ func TestConcurrentFirstBatchPublishesInstallOneProducerAndCloseLoser(t *testing
 	}, 2)
 	var releaseOnce sync.Once
 	releaseBuild := func() { releaseOnce.Do(func() { close(release) }) }
+	var publishers sync.WaitGroup
 	t.Cleanup(func() {
 		releaseBuild()
-		for range 2 {
-			select {
-			case <-results:
-			case <-clock.NewReal().Timer(time.Second).C:
-				return
-			}
+		finished := make(chan struct{})
+		go func() { publishers.Wait(); close(finished) }()
+		select {
+		case <-finished:
+		case <-clock.NewReal().Timer(time.Second).C:
+			return
 		}
 		_ = client.Close(context.Background())
 	})
 	for range 2 {
+		publishers.Add(1)
 		go func() {
+			defer publishers.Done()
 			result, err := client.Publisher().PublishBatch(context.Background(), []Message{
 				{EventType: "orders.created", Payload: "concurrent"},
 			})
@@ -537,8 +548,10 @@ func TestPublishBatchRejectsReconnectInFlight(t *testing.T) {
 	d := &reconnectTestDriver{created: make(chan *reconnectTestConsumer, 1)}
 	client := newReconnectTestClient(t, d, recorded, 0)
 	client.reconnectRandom = func() float64 { return 1 }
-	attempt, err := client.requestReconnect(errors.New("batch reconnect"))
-	if err != nil {
+	client.mu.Lock()
+	epoch := client.current.epoch
+	client.mu.Unlock()
+	if err := client.requestReconnect(errors.New("batch reconnect"), epoch); err != nil {
 		t.Fatal(err)
 	}
 	waitReconnectCondition(t, func() bool { return recorded.sleepCount() == 1 })
@@ -554,8 +567,9 @@ func TestPublishBatchRejectsReconnectInFlight(t *testing.T) {
 	}
 	fake.BlockUntil(1)
 	fake.Advance(500 * time.Millisecond)
-	if err := client.waitReconnect(context.Background(), attempt); err != nil {
-		t.Fatalf("reconnect = %v, want nil", err)
+	waitReconnectCondition(t, func() bool { return !client.isReconnecting() })
+	if err := client.Health(context.Background()); err != nil {
+		t.Fatalf("Health() after the reconnect = %v, want nil", err)
 	}
 }
 
@@ -570,9 +584,7 @@ func TestPublishBatchPreservesClosedAndReconnectErrors(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = client.Close(context.Background()) })
 
-	client.mu.Lock()
-	client.shutdownStarted = true
-	client.mu.Unlock()
+	setClientLifecycle(client, lifecycle.Aborted)
 	result, err := client.Publisher().PublishBatch(context.Background(), []Message{
 		{EventType: "orders.created", Payload: "closed"},
 	})
@@ -583,8 +595,8 @@ func TestPublishBatchPreservesClosedAndReconnectErrors(t *testing.T) {
 		t.Fatalf("closed result = %#v, want empty result entry", result.Results)
 	}
 
+	setClientLifecycle(client, lifecycle.Ready)
 	client.mu.Lock()
-	client.shutdownStarted = false
 	reconnectErr := errors.New("stored reconnect failure")
 	client.reconnectErr = reconnectErr
 	client.mu.Unlock()

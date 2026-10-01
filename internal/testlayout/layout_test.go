@@ -9,16 +9,31 @@
 package testlayout
 
 import (
+	"go/ast"
 	"go/build/constraint"
+	"go/parser"
+	"go/token"
 	"io/fs"
+	"maps"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 )
 
 // integrationSuffix is the file-name half of the convention.
 const integrationSuffix = "_integration_test.go"
+
+// wantProbePackages names packages whose tests dial a broker and must route
+// every such test through a probe this guard can see. Remove a package only
+// when it no longer dials a broker; add each new broker package deliberately.
+var wantProbePackages = []string{"drivers/kafka", "drivers/rabbitmq"}
+
+type brokerProbePackage struct {
+	calls        int
+	declarations int
+}
 
 // TestIntegrationTagMatchesSuffix walks every test file in the module and asserts
 // the biconditional: a file carries the integration constraint if and only if its
@@ -29,7 +44,8 @@ func TestIntegrationTagMatchesSuffix(t *testing.T) {
 	root := moduleRoot(t)
 	tree := os.DirFS(root)
 
-	var testFiles, constrained int
+	var testFiles, constrained, probeCalls int
+	probePackages := make(map[string]brokerProbePackage)
 	walkErr := fs.WalkDir(tree, ".", func(rel string, entry fs.DirEntry, err error) error {
 		if err != nil {
 			return err
@@ -53,6 +69,16 @@ func TestIntegrationTagMatchesSuffix(t *testing.T) {
 		}
 		carries := carriesIntegrationTag(string(content))
 		named := strings.HasSuffix(entry.Name(), integrationSuffix)
+		fileProbeCalls, fileProbeDeclarations := brokerProbeCounts(t, rel, string(content))
+		probeCalls += fileProbeCalls
+		packageStats := probePackages[filepath.Dir(rel)]
+		packageStats.calls += fileProbeCalls
+		packageStats.declarations += fileProbeDeclarations
+		probePackages[filepath.Dir(rel)] = packageStats
+
+		if fileProbeCalls > 0 && !carries {
+			t.Errorf("%s calls requireBroker but is not constrained; constrain it and rename it to *_integration_test.go", rel)
+		}
 
 		switch {
 		case carries && !named:
@@ -68,11 +94,54 @@ func TestIntegrationTagMatchesSuffix(t *testing.T) {
 	if walkErr != nil {
 		t.Fatalf("walk test tree: %v", walkErr)
 	}
+	for _, packageDir := range slices.Sorted(maps.Keys(probePackages)) {
+		stats := probePackages[packageDir]
+		if (stats.calls == 0) != (stats.declarations == 0) {
+			t.Errorf("package %s has %d requireBroker calls and %d declarations; probe declaration and calls must both be present", packageDir, stats.calls, stats.declarations)
+		}
+	}
+	for _, packageDir := range slices.Sorted(slices.Values(wantProbePackages)) {
+		stats := probePackages[packageDir]
+		if stats.calls == 0 || stats.declarations == 0 {
+			t.Errorf("package %s must declare and call requireBroker; if it no longer dials a broker, remove it from wantProbePackages", packageDir)
+		}
+	}
 	// A guard that walks the wrong tree passes for the wrong reason, so an empty
 	// or unconstrained result is a failure rather than a quiet success.
 	if testFiles == 0 || constrained == 0 {
 		t.Fatalf("walked %d test files under %s and found %d with the integration tag; the walk did not reach the module", testFiles, root, constrained)
 	}
+	if probeCalls == 0 {
+		t.Fatalf("walked %d test files under %s but found no requireBroker calls; the probe was renamed or removed, so the guard is no longer watching anything", testFiles, root)
+	}
+	t.Logf("scanned %d test files under %s and found %d requireBroker calls", testFiles, root, probeCalls)
+}
+
+// brokerProbeCounts returns direct requireBroker calls and declarations in a test file.
+// Parsing avoids treating comments or strings as calls and ignores methods with receivers.
+func brokerProbeCounts(t *testing.T, path, content string) (calls, declarations int) {
+	t.Helper()
+	file, err := parser.ParseFile(token.NewFileSet(), path, content, 0)
+	if err != nil {
+		t.Errorf("parse %s: %v", path, err)
+		return 0, 0
+	}
+
+	ast.Inspect(file, func(node ast.Node) bool {
+		switch node := node.(type) {
+		case *ast.CallExpr:
+			identifier, ok := node.Fun.(*ast.Ident)
+			if ok && identifier.Name == "requireBroker" {
+				calls++
+			}
+		case *ast.FuncDecl:
+			if node.Name.Name == "requireBroker" && node.Recv == nil {
+				declarations++
+			}
+		}
+		return true
+	})
+	return calls, declarations
 }
 
 // moduleRoot returns the module directory by walking up from the test's working

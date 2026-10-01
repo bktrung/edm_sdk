@@ -25,17 +25,22 @@ type kafkaTopicSpec struct {
 
 type kafkaTopologyPlan struct {
 	destinations []kafkaTopicSpec
-	exchanges    []string
-	bindings     []driver.BindingSpec
 }
 
 type topicVisibility uint8
 
 const (
-	kafkaTopologyVisibilityTimeout                 = 5 * time.Second
-	kafkaTopologyVisibilityPoll                    = 10 * time.Millisecond
-	topicMustExist                 topicVisibility = iota
+	kafkaTopologyVisibilityPoll                 = 10 * time.Millisecond
+	topicMustExist              topicVisibility = iota
 	topicMustBeAbsent
+)
+
+var (
+	kafkaTopologyVisibilityTimeout             = 60 * time.Second
+	kafkaTopologyClock             clock.Clock = clock.NewReal()
+	kafkaTopologyListTopics                    = func(a *admin, ctx context.Context, operation string, names ...string) (kadm.TopicDetails, error) {
+		return a.listTopics(ctx, operation, names...)
+	}
 )
 
 func translateTopology(spec driver.TopologySpec) kafkaTopologyPlan {
@@ -183,48 +188,74 @@ func (a *admin) waitForTopicState(ctx context.Context, operation string, names [
 	if len(names) == 0 {
 		return nil
 	}
-	waitCtx, cancel := context.WithTimeout(ctx, kafkaTopologyVisibilityTimeout)
-	defer cancel()
-	ticker := clock.NewReal().Ticker(kafkaTopologyVisibilityPoll)
+	waitCtx, cancel := context.WithCancelCause(ctx)
+	defer cancel(nil)
+	timer := kafkaTopologyClock.Timer(kafkaTopologyVisibilityTimeout)
+	defer timer.Stop()
+	go func() {
+		select {
+		case <-timer.C:
+			cancel(context.DeadlineExceeded)
+		case <-waitCtx.Done():
+		}
+	}()
+	ticker := kafkaTopologyClock.Ticker(kafkaTopologyVisibilityPoll)
 	defer ticker.Stop()
 	state := "present"
 	if visibility == topicMustBeAbsent {
 		state = "absent"
 	}
-	for {
-		topics, err := a.listTopics(waitCtx, operation, names...)
-		if err != nil {
-			return err
+	waitError := func() error {
+		cause := context.Cause(waitCtx)
+		if callerErr := ctx.Err(); callerErr != nil {
+			cause = callerErr
 		}
-		visible := true
-		for _, name := range names {
-			detail, ok := topics[name]
-			present, known := false, true
-			if ok && detail.Err == nil {
-				present = visibility == topicMustBeAbsent || len(detail.Partitions) > 0
-			} else if ok && detail.Err != nil {
-				switch {
-				case errors.Is(detail.Err, kerr.UnknownTopicOrPartition),
-					errors.Is(detail.Err, kerr.UnknownTopicID):
-					present = false
-				case kafkaErrorKind(detail.Err) == driver.KindTransient:
-					known = false
-				default:
-					return classifyAdminError(operation, detail.Err)
+		if cause == nil {
+			cause = waitCtx.Err()
+		}
+		return classify(operation, driver.KindTransient, fmt.Errorf("kafka: topics %q did not become %s: %w", names, state, cause))
+	}
+	for {
+		if waitCtx.Err() != nil {
+			return waitError()
+		}
+		topics, err := kafkaTopologyListTopics(a, waitCtx, operation, names...)
+		if err != nil && waitCtx.Err() != nil {
+			return waitError()
+		}
+		if err == nil {
+			visible := true
+			for _, name := range names {
+				detail, ok := topics[name]
+				present, known := false, true
+				if ok && detail.Err == nil {
+					present = visibility == topicMustBeAbsent || len(detail.Partitions) > 0
+				} else if ok && detail.Err != nil {
+					switch {
+					case errors.Is(detail.Err, kerr.UnknownTopicOrPartition),
+						errors.Is(detail.Err, kerr.UnknownTopicID):
+						present = false
+					case kafkaErrorKind(detail.Err) == driver.KindTransient:
+						known = false
+					default:
+						return classifyAdminError(operation, detail.Err)
+					}
+				}
+				wantPresent := visibility == topicMustExist
+				if !known || present != wantPresent {
+					visible = false
+					break
 				}
 			}
-			wantPresent := visibility == topicMustExist
-			if !known || present != wantPresent {
-				visible = false
-				break
+			if visible {
+				return nil
 			}
-		}
-		if visible {
-			return nil
+		} else if kind, _ := driver.Classify(err); kind != driver.KindTransient {
+			return err
 		}
 		select {
 		case <-waitCtx.Done():
-			return classify(operation, driver.KindTransient, fmt.Errorf("kafka: topics did not become %s: %w", state, waitCtx.Err()))
+			return waitError()
 		case <-ticker.C:
 		}
 	}

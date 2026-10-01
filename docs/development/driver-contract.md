@@ -1,6 +1,7 @@
 # Driver contract
 
-This is the authoritative guide for implementing a driver for F1. The
+An F1 driver implements the broker-facing interfaces in the `driver` package,
+and this page is the guide for writing one. The
 interfaces and comments in [`driver/driver.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/driver/driver.go),
 [`driver/message.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/driver/message.go),
 [`driver/capability.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/driver/capability.go),
@@ -118,24 +119,24 @@ as provided and must not parse it, rebuild F1 names, or infer whether it is a
 publish entry point from the name. The `EntryPoint` flag is also core-owned and
 must be honored as supplied.
 
-Drivers transport the body, headers, key, optional priority hint, and optional
-`DelayUntil`. A broker that cannot implement a native hint must rely on the
-effective capability profile and the portable path selected by the core; it
-must not change the observable F1 result silently.
+Drivers transport the body, headers, key, and optional priority hint. A broker
+that cannot implement a native hint must rely on the effective capability
+profile and the portable path selected by the core; it must not change the
+observable F1 result silently.
 
-A driver may defer on its own terms rather than honour `DelayUntil`. A message
-sent to a destination that declares a delay may be delivered at that message's
-publish instant plus the declared delay, whatever due time the message carries,
-and never earlier; within one partition of a destination, the messages it
-deferred are then delivered in the order they were published. That is a property
-of the driver rather than a capability, because it describes the semantics the
-driver owes instead of an optimisation it performs, so it is declared to the
-conformance suite rather than reported by `Capabilities`.
+A message carries no due time of its own. A message sent to a destination that
+declares a `Delay` is owed delivery at its publish instant plus that delay, and
+never earlier; within one partition of a destination, delayed messages are
+delivered in the order they were published.
 
 ### `InboundMessage`
 
 An inbound message must include the physical destination, body, headers, broker
-reference, and a valid `Settler`. `DeliveryCount` is the previous broker
+reference, and a valid `Settler`. `Key` is the message key; the core uses it
+to pick the worker in ordered mode. `ReceivedAt` is when the driver received
+the delivery and must not be zero. `EnqueuedAt` is when the broker or producer
+enqueued the event, with `EnqueuedAtSource` saying which; both stay zero when
+unknown, and the conformance suite checks that they are set together. `DeliveryCount` is the previous broker
 redelivery count or `-1` when the broker cannot provide it. The core does not
 interpret provider-specific fields inside `BrokerRef`.
 
@@ -149,6 +150,8 @@ before the next delivery can mutate the storage.
 same delivery to be settled twice; subsequent calls should expose
 [`ErrAlreadySettled`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/driver/errors.go) or the equivalent documented
 portable error.
+
+For Kafka's partition cursor and commit ordering, see [the Kafka ack tracker](/deep-dives/kafka-ack-tracker).
 
 - `Ack` marks the original delivery successfully handled.
 - `Nack` asks the broker to redeliver or apply broker failure policy according
@@ -169,13 +172,10 @@ commit merely because its broker API uses a different verb.
 ### Publish durability
 
 `Producer.Publish` must not return `nil` until every message in the call has a
-durable broker acknowledgment under the requested configuration. The exact
-confirmation mechanism is provider-specific, but a local buffer write or an
-unconfirmed client enqueue is not sufficient.
-
-The core always requests `ProducerConfig.RequireDurableAck = true` in the v1
-publish path. A driver must honor that flag rather than downgrade it based on a
-provider default.
+durable broker acknowledgment. This holds for every producer a driver builds;
+there is no setting that relaxes it, and a driver must not downgrade it based
+on a provider default. The exact confirmation mechanism is provider-specific,
+but a local buffer write or an unconfirmed client enqueue is not sufficient.
 
 `Publish` accepts multiple messages and must be safe for concurrent use. It may
 return a [`PublishError`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/driver/errors.go) when only some indexes failed.
@@ -229,9 +229,9 @@ chance to observe the error and release or drain outstanding deliveries.
 delivery. An empty destination list applies the operation to all destinations
 owned by the consumer.
 
-Pause must respect the per-destination prefetch budget passed in
-`ConsumerConfig`; it must not allow an outage or paused lane to accumulate an
-unbounded local buffer.
+Pause must preserve both SDK admission ceilings in `ConsumerConfig`. Transport
+buffering is separate and must remain bounded during an outage or paused lane;
+see the [prefetch contract](/advanced-topics/configuration#prefetch-resolution).
 
 ### Drain
 
@@ -239,6 +239,12 @@ unbounded local buffer.
 settleable. When `Drain` returns, `Messages` must yield no new deliveries, but
 the driver must continue to accept settlement calls for deliveries already
 handed to the core.
+
+This boundary covers every delivery sender, including a settlement call that
+hands the next queued record to `Messages`. Stopping the fetch loop alone is
+not sufficient when settlement can deliver independently.
+The fence stops new sends; it does not discard deliveries already buffered on
+`Messages`, which remain settleable.
 
 Drain is not Stop and is not Release. It is the first phase of an orderly
 handoff: stop intake, preserve ownership of accepted work, and let the core
@@ -265,8 +271,15 @@ but did not settle.
 Release makes no durability promise about committed positions. It is the
 explicit handoff operation for connection loss, reconnect, and shutdown paths
 where the core cannot prove settlement. It must be idempotent and safe after a
-previous release or stop. A broker that cannot return unsettled work must
-return [`ErrUnsupported`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/driver/errors.go).
+previous release or stop. The core calls `Release` after any `Stop` error, and a
+driver whose `Stop` did not return within the phase budget may still receive it,
+so the two calls can overlap. A `Stop` after `Release` returns nil.
+
+A `Release` that returned an error has not released. The core keeps that
+consumer and calls `Release` again before it closes the connection, so the next
+call must finish the teardown rather than return nil for a release that never
+happened. Concurrent calls must not tear the consumer down twice. A broker
+that cannot return unsettled work must return [`ErrUnsupported`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/driver/errors.go).
 
 ### Lag
 
@@ -320,7 +333,12 @@ missing destination from an existing empty destination.
 The topology structures and their ownership rules are defined in
 [`driver/topology.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/driver/topology.go). Optional destructive
 operations are exposed separately through `driver.Maintenance`; they are not
-part of the required `Admin` contract.
+part of the required `Admin` contract. `Purge` empties a destination and keeps
+it. `Prune` is the only delete in the port: it deletes a destination only when
+it and its driver-managed auxiliary destinations are empty and no consumer is
+attached, rechecks those guards before each delete, deletes auxiliaries first,
+and reports a refusal per name, so a nil error does not mean everything was
+deleted.
 
 ## Configuration passed to a driver
 
@@ -329,10 +347,8 @@ instance identity, reconnect/drain timing, TLS, SASL, and opaque
 `DriverOptions`. Credentials must not be logged. Driver-specific options may be
 interpreted only by that driver.
 
-`ProducerConfig` carries:
-
-- `RequireDurableAck`, which is true for core-originated v1 publishing; and
-- `Effective`, the capability profile selected by the core.
+`ProducerConfig` carries `Effective`, the capability profile selected by the
+core.
 
 `ConsumerConfig` carries:
 
@@ -341,14 +357,25 @@ interpreted only by that driver.
   that defers on the consumer side. The core fills it from the same topology it
   passes to `EnsureTopology`, and a destination absent from the map has no
   delay, which is how a driver is told a destination defers nothing;
-- total prefetch and the core-calculated `PerDestination` allocation;
+- the positive resolved total prefetch and full `PerDestination` lane windows.
+  Neither ceiling may be exceeded by SDK-admitted unsettled deliveries; these
+  windows are not static shares of the total. Use
+  `ConsumerConfig.DestinationPrefetch` for each destination's window;
 - exclusive mode;
 - start position for a new group only; and
 - the same effective capability profile.
 
-Drivers must honor the effective configuration they receive. They may retain
-internal connection facts, but must not replace core-selected behavior with a
-different capability view.
+Drivers must honor the effective configuration they receive as a ceiling they
+may not exceed. They may retain internal connection facts, but must not replace
+core-selected behavior with a different capability view. Broker credit, poll
+results, and client buffers do not enlarge SDK admission.
+
+A ceiling is not a floor. A driver may hold fewer deliveries than the
+configuration allows when its own transport bounds it lower. The Kafka driver
+is the shipped case: it admits one delivery per partition, so the ceiling that
+binds a destination is the number of partitions assigned to the consumer, which
+can be below the `PerDestination` allocation even though the driver never
+exceeds it.
 
 ## Capability reporting
 
@@ -424,8 +451,9 @@ being mistaken for success, but drivers should classify known errors at the
 boundary and preserve the broker cause through `Unwrap`.
 
 `PublishError` aggregates per-message causes. Its `Kind` is the most severe
-classification among the failed indexes, and `Retryable` is true only when all
-failed messages are transient.
+classification among the failed indexes, not counting notifications, and
+`Retryable` is true only when all failed messages are transient. When every
+cause is a notification, `Kind` is `KindNotification` and `Retryable` is false.
 
 The rules are exercised by [`driver/errors_test.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/driver/errors_test.go)
 and the provider error tests.

@@ -17,12 +17,13 @@ func (JSON) ContentType() string {
 	return "application/json"
 }
 
-// Encode serializes v as JSON.
+// Encode serializes v as JSON and returns an error if v cannot be encoded.
 func (JSON) Encode(v any) ([]byte, error) {
 	return json.Marshal(v)
 }
 
-// Decode deserializes JSON into v. Unknown object fields are ignored.
+// Decode deserializes JSON into v. Unknown object fields are ignored, and
+// malformed or incompatible input returns an error.
 func (JSON) Decode(data []byte, v any) error {
 	return json.Unmarshal(data, v)
 }

@@ -7,14 +7,14 @@ import (
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/codec"
 )
 
-// Event is the message view passed to a Handler.
-// Dispatch fills its data when subscriptions are introduced.
+// Event is a read-only view of one message delivered to a Handler. Getters on a
+// nil Event return zero values; Decode returns an error when the event or its
+// codec is unavailable.
 type Event struct {
-	envelope       Envelope
-	raw            []byte
-	codec          codec.Codec
-	headers        map[string]string
-	headerMaxBytes int
+	envelope Envelope
+	raw      []byte
+	codec    codec.Codec
+	headers  map[string]string
 }
 
 // ID returns the stable event identifier from the envelope.
@@ -102,16 +102,7 @@ func (e *Event) Header(key string) (string, bool) {
 	if e == nil {
 		return "", false
 	}
-	if e.headers != nil {
-		value, ok := e.headers[key]
-		return value, ok
-	}
-	headerMaxBytes := e.headerMaxBytes
-	encoded, err := e.envelope.EncodeHeaders(headerMaxBytes)
-	if err != nil {
-		return "", false
-	}
-	value, ok := encoded[key]
+	value, ok := e.headers[key]
 	return value, ok
 }
 

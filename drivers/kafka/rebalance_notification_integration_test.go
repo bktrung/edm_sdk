@@ -11,7 +11,6 @@ import (
 	"testing"
 	"time"
 
-	//nolint:depguard // this test must exercise the public f1 API against Kafka.
 	f1 "fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk"
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/driver"
 )
@@ -187,7 +186,7 @@ func TestPublicRunnerReconnectsAfterTransientConsumerError(t *testing.T) {
 	waitForKafkaConsumerState(t, first, "initial assignment", func() bool {
 		first.mu.Lock()
 		defer first.mu.Unlock()
-		return len(first.activeGenerations) > 0
+		return len(first.owned) > 0
 	})
 	stillRunningCtx, stillRunningCancel := context.WithTimeout(context.Background(), time.Second)
 	select {
@@ -206,7 +205,7 @@ func TestPublicRunnerReconnectsAfterTransientConsumerError(t *testing.T) {
 	waitForKafkaConsumerState(t, second, "reconnected assignment", func() bool {
 		second.mu.Lock()
 		defer second.mu.Unlock()
-		return len(second.activeGenerations) > 0
+		return len(second.owned) > 0
 	})
 
 	cancel()
@@ -246,7 +245,6 @@ func kafkaPublicTestConfig() f1.Config {
 		},
 		Codec: f1.CodecConfig{
 			Default:        "json",
-			ContentMode:    "binary",
 			MaxHeaderBytes: f1.CoreMaxHeaderBytes,
 			MaxBodyBytes:   1 << 20,
 		},

@@ -31,64 +31,60 @@ func (s *observingSettler) Nack(context.Context, driver.NackOptions) error {
 
 var _ driver.Settler = (*observingSettler)(nil)
 
-// TestAckDeliveryMarksAttemptAfterCallReturns verifies failed ack calls leave an attempted unknown state.
-func TestAckDeliveryMarksAttemptAfterCallReturns(t *testing.T) {
-	state := &deliveryState{}
-	called := false
-	settler := &observingSettler{
-		ackErr: errors.New("ack unavailable"),
-		ack: func() {
-			called = true
-			if state.attempted {
-				t.Fatal("attempted set before Ack returned")
-			}
+// TestSettlementMarksAttemptAfterCallReturns verifies a failed Ack or Nack
+// leaves an attempted, unsettled state that records which call to repeat.
+func TestSettlementMarksAttemptAfterCallReturns(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		operation settlementOperation
+		settle    func(driver.InboundMessage, *deliveryState) bool
+	}{
+		{
+			name:      "Ack",
+			operation: settlementOperationAck,
+			settle: func(message driver.InboundMessage, state *deliveryState) bool {
+				return ackDelivery(nil, context.Background(), message, state)
+			},
 		},
-	}
-
-	if ackDelivery(nil, context.Background(), driver.InboundMessage{Settle: settler}, state) {
-		t.Fatal("ackDelivery returned success for a failed Ack")
-	}
-	if !called {
-		t.Fatal("Ack was not called")
-	}
-	if !state.attempted {
-		t.Fatal("attempted was not set after Ack returned")
-	}
-	if state.settled {
-		t.Fatal("failed Ack was marked settled")
-	}
-	if state.operation != settlementOperationAck {
-		t.Fatal("failed Ack did not record itself, so the retry cannot know what to repeat")
-	}
-}
-
-// TestNackDeliveryMarksAttemptAfterCallReturns verifies failed nack calls leave an attempted unknown state.
-func TestNackDeliveryMarksAttemptAfterCallReturns(t *testing.T) {
-	state := &deliveryState{}
-	called := false
-	settler := &observingSettler{
-		nackErr: errors.New("nack unavailable"),
-		nack: func() {
-			called = true
-			if state.attempted {
-				t.Fatal("attempted set before Nack returned")
-			}
+		{
+			name:      "Nack",
+			operation: settlementOperationNack,
+			settle: func(message driver.InboundMessage, state *deliveryState) bool {
+				return nackDelivery(nil, context.Background(), message, driver.NackOptions{Requeue: true}, state) == nil
+			},
 		},
-	}
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			state := &deliveryState{}
+			called := false
+			observe := func() {
+				called = true
+				if state.attempted {
+					t.Fatalf("attempted set before %s returned", test.name)
+				}
+			}
+			settler := &observingSettler{
+				ackErr:  errors.New("ack unavailable"),
+				nackErr: errors.New("nack unavailable"),
+				ack:     observe,
+				nack:    observe,
+			}
 
-	if err := nackDelivery(nil, context.Background(), driver.InboundMessage{Settle: settler}, driver.NackOptions{Requeue: true}, state); err == nil {
-		t.Fatal("nackDelivery returned success for a failed Nack")
-	}
-	if !called {
-		t.Fatal("Nack was not called")
-	}
-	if !state.attempted {
-		t.Fatal("attempted was not set after Nack returned")
-	}
-	if state.settled {
-		t.Fatal("failed Nack was marked settled")
-	}
-	if state.operation != settlementOperationNack {
-		t.Fatal("failed Nack did not record itself, so the retry cannot know what to repeat")
+			if test.settle(driver.InboundMessage{Settle: settler}, state) {
+				t.Fatalf("%s returned success for a failed call", test.name)
+			}
+			if !called {
+				t.Fatalf("%s was not called", test.name)
+			}
+			if !state.attempted {
+				t.Fatalf("attempted was not set after %s returned", test.name)
+			}
+			if state.settled {
+				t.Fatalf("failed %s was marked settled", test.name)
+			}
+			if state.operation != test.operation {
+				t.Fatalf("failed %s did not record itself, so the retry cannot know what to repeat", test.name)
+			}
+		})
 	}
 }

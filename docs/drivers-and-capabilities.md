@@ -1,213 +1,239 @@
-# Drivers and provider notes
+# Drivers and capabilities
 
-This page retains provider-specific behavior and operational differences. The
-broker-independent port contract is documented in
-[Driver contract](/development/driver-contract), and the shared portability
-checks are documented in [Driver conformance](/development/driver-conformance).
+Every F1 driver shares the same configuration, environment overrides,
+security rules, and validation, and reports [the list of features the connected broker supports](/learn/glossary#capability-report). Each driver page lists its own
+options and behavior. For every configuration key in one place, see the
+[Configuration reference](/advanced-topics/configuration).
+
+The figure shows configuration flowing through validation, driver opening, the feature list, and the broker.
+
+```mermaid
+flowchart TB
+    Config[Config and env] --> Validation[Validation] --> Open[Driver open] --> Caps[Capabilities] --> B[(broker)]
+```
+
+## Pick a driver
+
+- [In-memory driver](/drivers/inmem) - deterministic tests and local validation without a broker.
+- [RabbitMQ driver](/drivers/rabbitmq) - AMQP delivery, queue topology, and management operations.
+- [Kafka driver](/drivers/kafka) - partitioned logs, consumer groups, and offset ownership.
+
+## Driver configuration
+
+A driver accepts only the broker-specific keys listed on its driver page. The
+configuration validator checks this list during configuration validation, both
+for a file loaded with `LoadConfig` and for a `Config` built in Go and passed to
+`f1.New`. A key under another driver's prefix or a key with no driver prefix is
+refused. RabbitMQ options are listed in [RabbitMQ options](/drivers/rabbitmq#rabbitmq-options),
+Kafka options in [Kafka options](/drivers/kafka#kafka-options), and the in-memory
+driver takes no driver keys. `broker.kafka.compression` is a Kafka option and is
+refused on a RabbitMQ deployment.
+
+Options live under the driver's name, and every value in the configuration file
+is a string, whatever type the driver parses it as:
+
+```yaml
+f1:
+  broker:
+    driver: kafka
+    endpoints:
+      - localhost:19092
+    kafka:
+      compression: lz4
+      batchLinger: 5ms
+```
+
+In the option tables on the driver pages, the **Accepted values** column says what
+the driver takes, not what the broker supports. A value the driver cannot
+translate fails `Open`, and an `Open` failure is fatal, so a process never
+starts on a value that would silently do nothing. Some keys are also constrained
+earlier by configuration and subscription validation; those checks are listed in
+[Validation before the driver](#validation-before-the-driver).
+
+In the option tables on the driver pages, the **Read at** column says when an
+option takes effect. *Open* means it is resolved once when the driver opens.
+*Per consumer* means it is resolved again for each consumer the driver creates.
+*Topology* means it is read when the driver declares or verifies destinations
+rather than at connection time.
+
+### Environment overrides
+
+F1 applies these environment variables after loading the configuration file, so
+an environment value wins over the corresponding file value:
+
+| Variable | Field set | Details |
+| --- | --- | --- |
+| `F1_ENV` | `f1.env` | Replaces the environment name. |
+| `F1_SERVICE` | `f1.service` | Replaces the service name. |
+| `F1_INSTANCE_ID` | `f1.instanceId` | Replaces the instance identity. |
+| `F1_BROKER_DRIVER` | `f1.broker.driver` | Replaces the selected broker driver. |
+| `F1_BROKER_ENDPOINTS` | `f1.broker.endpoints` | Comma-separated endpoints. F1 trims surrounding blanks and drops empty items. |
+
+Each subscription also reads its own variables when `Subscribe` resolves it.
+The name is `F1_SUBSCRIPTIONS_`, then the subscription name, then the setting,
+each upper-cased with a camelCase boundary or punctuation turned into `_`:
+
+```sh
+F1_SUBSCRIPTIONS_ORDERS_CONCURRENCY=8
+F1_SUBSCRIPTIONS_ORDERS_HANDLER_TIMEOUT=45s
+F1_SUBSCRIPTIONS_ORDERS_RETRY_MAX_ATTEMPTS=5
+```
+
+The settings covered are `topics`, `mode`, `concurrency`, `prefetch`,
+`priorities`, `handlerTimeout`, `unmatchedPolicy`, the `retry` fields
+(`maxAttempts`, `initialInterval`, `maxInterval`, `multiplier`, `tiers`), and
+the `fairness` fields (`prefetchFactor`, `retryWeightDivisor`,
+`disableDeadlinePromotion`, `weights.high`, `weights.medium`, `weights.low`,
+`budgets.high`, `budgets.medium`, `budgets.low`). A variable under a
+subscription's prefix that matches none of them fails `Subscribe`, so a
+misspelled key is an error rather than a silent no-op.
+
+For prefetch zero-clearing and broker fallback precedence, see
+[prefetch resolution](/advanced-topics/configuration#prefetch-resolution).
+
+For a subscription named `ORDERS`, the fairness overrides are:
+
+| Setting | Environment variable |
+| --- | --- |
+| High, medium, low weights | `F1_SUBSCRIPTIONS_ORDERS_FAIRNESS_WEIGHTS_HIGH`, `F1_SUBSCRIPTIONS_ORDERS_FAIRNESS_WEIGHTS_MEDIUM`, `F1_SUBSCRIPTIONS_ORDERS_FAIRNESS_WEIGHTS_LOW` |
+| High, medium, low wait limits (budgets) | `F1_SUBSCRIPTIONS_ORDERS_FAIRNESS_BUDGETS_HIGH`, `F1_SUBSCRIPTIONS_ORDERS_FAIRNESS_BUDGETS_MEDIUM`, `F1_SUBSCRIPTIONS_ORDERS_FAIRNESS_BUDGETS_LOW` |
+
+Keep credentials and other driver-specific settings in the configuration file
+or the application's configuration layer.
+
+### Security
+
+For a normal deployment, enable TLS and provide a CA file so the client
+verifies the broker certificate. Add a client certificate and key when the
+broker requires mutual TLS. The shared `broker.tls` and `broker.sasl` settings
+are documented in [Kafka TLS](/drivers/kafka#kafka-tls), [Kafka SASL](/drivers/kafka#kafka-sasl),
+[RabbitMQ TLS](/drivers/rabbitmq#rabbitmq-tls), and
+[RabbitMQ SASL](/drivers/rabbitmq#rabbitmq-sasl). Each driver accepts its own
+SASL mechanisms.
+
+### Secure connection examples
+
+Kafka accepts `plain`, `scram-sha-256`, and `scram-sha-512`; RabbitMQ accepts
+`plain`, `amqplain`, and `external`.
+
+In `prod`, F1 refuses SASL unless `broker.tls.enabled` is true.
+
+::: code-group
+
+```yaml [Kafka]
+f1:
+  broker:
+    driver: kafka
+    tls:
+      enabled: true
+      caFile: /etc/service/ca.pem
+      serverName: kafka.example.internal
+    sasl:
+      mechanism: scram-sha-256
+      username: orders-service
+      password: "<set from your secret store>"
+```
+
+```yaml [RabbitMQ]
+f1:
+  broker:
+    driver: rabbitmq
+    tls:
+      enabled: true
+      caFile: /etc/service/ca.pem
+      serverName: rabbitmq.example.internal
+    sasl:
+      mechanism: plain
+      username: orders-service
+      password: "<set from your secret store>"
+```
+
+:::
+
+The configuration file is read as written, with no variable expansion. Load secrets in Go and set `cfg.Broker.SASL.Username` and `cfg.Broker.SASL.Password` before `f1.New`.
+
+## Validation before the driver
+
+Three driver keys are also constrained before any driver parses them: when the
+configuration loads, and for a subscription, also when it is created. Each
+refusal names the key.
+
+- `broker.rabbitmq.queueType` must be exactly `quorum` when `env: prod` and the
+  selected driver is `rabbitmq`. The comparison is on the raw string, so a
+  spelling that would fold and trim into `quorum`, such as `QUORUM` or
+  ` quorum `, is refused there, and leaving the key out is refused as well.
+- `broker.kafka.sessionTimeout` bounds `lifecycle.rebalanceDrainTimeout`: the
+  drain timeout must be at most 0.6 times the session timeout. The check reads
+  this key on the `kafka` driver only and uses the 45s default when the key is
+  absent.
+- `broker.rabbitmq.consumerTimeout` must be at least three times every
+  subscription's `handlerTimeout`. The check reads this key on the `rabbitmq`
+  driver only and uses the 90s default when the key is absent. The default
+  `handlerTimeout` is 30s, which that default exactly meets, so a handler
+  timeout above 30s with this key unset fails startup.
+
+For the two duration keys, a value that does not parse as a duration is refused
+by these checks too, before the driver would refuse it at `Open`. The accepted
+key list and its error are implemented in
+[`broker_config.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/broker_config.go).
 
 ## Provider boundary
 
-The core generates logical F1 routing and passes physical destination names,
-capability selections, and topology specifications through the `driver` port.
-Each adapter owns broker syntax, client objects, physical destinations,
+The core works out routing from [the topic names in your code](/learn/glossary#logical-topic) and passes
+[broker queue and topic names](/learn/glossary#physical-destination), feature choices, and topology specifications through the `driver` port.
+Each adapter owns broker syntax, client objects, broker queue and topic names,
 confirmations, offsets, management APIs, and provider-specific failure
 handling. The import boundary is enforced by
-[`make verify-agnostic`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/Makefile) and [`.golangci.yml`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/.golangci.yml).
+`make verify-agnostic` and `.golangci.yml`.
 
-## In-memory driver
+## Enqueue time and backlog
 
-The in-memory adapter is the deterministic reference implementation used by
-integration tests and [`f1test`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/tree/main/f1test). It supports isolated or shared
-state, fake-clock delayed delivery, consumer groups, per-key affinity,
-delivery counters, redelivery, topology administration, and injectable test
-failures.
+The [observability guide](/advanced-topics/observability#use-enqueue-timestamps-correctly)
+defines how these sources affect broker wait and oldest-age metrics:
 
-Start with [`drivers/inmem/inmem.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/drivers/inmem/inmem.go), then read its
-producer, consumer, admin, settlement, and conformance tests. It is the best
-adapter to read when diagnosing a port or core semantic before introducing
-broker-specific timing or management behavior.
+| Driver | Enqueue time source(s) | Backlog count | Head time | Oldest-age metric |
+| --- | --- | --- | --- | --- |
+| In-memory | The in-memory broker clock assigns the enqueue time during dispatch; source is `broker` | Number of queued messages | Earliest non-zero queued timestamp | Reported when the head timestamp is known |
+| RabbitMQ | Trusted `timestamp_in_ms` with overwrite mode is `broker`; CloudEvents time or AMQP timestamp is `producer`; otherwise `unknown` | Same value as `Lag` | Management API head for classic queues; unknown for quorum queues | Not reported: a management head is marked `producer`, and quorum has no head |
+| Kafka | `CreateTime` is `producer`; `LogAppendTime` is `broker`; absent or unknown timestamp is `unknown` | Offset lag from group commits to log ends | Earliest pending record across partitions, with its timestamp source | Reported only for a `broker` head; set `message.timestamp.type=LogAppendTime` for broker time |
 
-## RabbitMQ driver
+## Capability report
 
-The RabbitMQ adapter translates the port into AMQP and management operations.
-The provider-specific ownership is split across:
+Inspect [`Client.Limits()`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/limits.go)
+after connecting when service behavior depends on a broker feature. Each
+entry is a `FeatureStatus`
+with a mode and, where declared, a detail string. The mode `native` means
+[the broker does it](/learn/glossary#native), `emulated` means
+[F1 does it](/learn/glossary#emulated), and `unavailable` means neither does. A service that depends on a
+feature can refuse to start without it:
 
-- [`rabbitmq.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/drivers/rabbitmq/rabbitmq.go) for connection, TLS/SASL,
-  and capability reporting;
-- [`producer.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/drivers/rabbitmq/producer.go) for publishing, confirms,
-  returns, and delayed messages;
-- [`consumer.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/drivers/rabbitmq/consumer.go) for delivery lanes,
-  pause/resume, drain, and lag;
-- [`settlement.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/drivers/rabbitmq/settlement.go) for ack/nack
-  serialization;
-- [`topology.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/drivers/rabbitmq/topology.go) for exchanges, queues,
-  bindings, and backstop routes; and
-- [`management.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/drivers/rabbitmq/management.go) for inspection and
-  pruning.
+```go
+limits := client.Limits()
+for _, feature := range limits.Features {
+	if feature.Feature == "lag_metrics" && feature.Mode == f1.FeatureUnavailable {
+		return fmt.Errorf("driver %s reports no backlog; backlog alerts would stay silent", limits.Driver)
+	}
+}
+```
 
-Use the RabbitMQ suite for queue, exchange, management, confirmation,
-reconnect, TLS, and broker-specific admission behavior. Use conformance when
-the behavior is part of the shared port.
+The report lists these rows, in this order:
 
-### The management HTTP API is a deployment requirement
+| Feature | Mode | Detail |
+| --- | --- | --- |
+| `per_message_ack` | `native` or `emulated` | `driver.Capabilities.PerMessageAck` selects the mode. Native: the broker acks each message on its own, so a slow message does not hold its lane's in-flight slots. Emulated: the core finishes each message itself in its own order, so a slow message holds its lane's in-flight slots. |
+| `ordered_by_key` | `native` or `unavailable` | `driver.Capabilities.OrderedByKey` selects the mode. Native means ordering is guaranteed for equal keys. Unavailable means a subscription requesting ordered mode is rejected. |
+| `priority_fairness` | `emulated` | The core's scheduler uses weighted lanes instead, so fairness is per lane and not per broker. Broker priority, when declared through `driver.Capabilities.NativePriority`, does not replace this core scheduling contract. |
+| `native_delay` | `native` or `emulated` | `driver.Capabilities.NativeDelay` selects the mode. Either way a message on a delayed destination is held for that destination's delay: by the broker when native, and by the driver, in a parking queue or on the consumer, when emulated. |
+| `delivery_count` | `native` or `emulated` | `driver.Capabilities.NativeDeliveryCount` selects the mode. Native: the broker supplies a redelivery count to observer events, but handler code reads the core's one-based attempt count instead. Emulated: the core counts handler attempts in the envelope; retry copies increment that count, broker redeliveries do not, and a new publish resets it to one. |
+| `dlq_backstop` | `native` or `unavailable` | `driver.Capabilities.NativeDLQ` selects the mode. Native: the broker has [its own dead-letter queue](/learn/glossary#backstop) for a message it gives up on; the core also publishes its own dead-letter copies, but this row reports only the broker's routing. Unavailable: the broker has no dead-letter queue of its own, and the core's dead-letter path still publishes a copy and acks the original after the copy is confirmed. |
+| `lag_metrics` | `native` or `unavailable` | `driver.Capabilities.LagQueryable` selects the mode. Native means the broker exposes a backlog query; unavailable means it does not. No additional detail is emitted for this status. |
+| `consumer_scaling` | `native` | `driver.Capabilities.ConsumerScaling` is rendered through `driver.Scaling.String`: `partition-bound` means [parallelism is limited by partition count](/learn/glossary#partition-bound-scaling), while `free` means [it is not limited by partitions](/learn/glossary#free-scaling). |
 
-The adapter inspects broker-side state through the RabbitMQ management HTTP
-API, not through AMQP. A passive declaration confirms a queue's name and
-nothing else, so a driver that must compare the arguments a queue was declared
-with against what the broker holds has no AMQP channel for that comparison.
-The same applies to bindings, which AMQP cannot enumerate. The requirement
-therefore reaches the subscription path:
-
-| Topology policy | Management API needed to start a subscription |
-| --- | --- |
-| `TopologyDeclare` | Yes. The subscription's bindings are read before the consumer opens. |
-| `TopologyVerify` | Yes. The broker's queue arguments and the bindings are both read. |
-| `TopologyNone` | No. The adapter makes no management call, so the topology must already exist. |
-
-The endpoint defaults to the AMQP host with the AMQP port plus 10000, and uses
-the AMQP credentials unless `broker.sasl` overrides them. Set
-`broker.rabbitmq.managementPort` when the management plugin listens elsewhere.
-The endpoint's host is always the AMQP host, and only its port can be
-overridden. A managed offering that serves the management API on a separate
-hostname cannot be configured today: there is no host option, so a port setting
-does not reach it and a deployment of that shape needs the API exposed on the
-AMQP host or a proxy in front of it.
-An unreachable API fails subscription start with an error naming the endpoint,
-rather than skipping the check; a broker with the management plugin disabled,
-firewalled, or on a non-default port is the most likely cause.
-
-The local fixture (`make broker-up`) runs a `-management` image with the API on
-15672. Managed RabbitMQ offerings differ in whether that API is exposed and on
-which credentials, so check it before deploying.
-
-### Delayed and retried messages need per-destination parking queues
-
-RabbitMQ has no native delayed delivery, so the adapter emulates it with
-queue-level TTLs and a dead-letter route back to the destination.
-
-A delay of at most 64s is parked in the queue of the smallest rung of a fixed
-ladder that is at least the delay:
-
-| Rung | 500ms | 1s | 2s | 4s | 8s | 16s | 32s | 64s |
-| --- | --- | --- | --- | --- | --- | --- | --- | --- |
-
-That queue is named `<destination>.park.<rung>`, for example `orders.park.2s`,
-and it is declared with `x-message-ttl` set to its rung. The message carries no
-expiration of its own: RabbitMQ expires a per-message TTL only when the message
-reaches the head of its queue, so a message parked behind a later one waits for
-it and the delay can overrun by the distance between the two due times. With the
-TTL on the queue, every message in it expires in FIFO order, and a rung queue
-cannot construct that case at all. Rounding the delay up is what keeps a message
-from being released before its due time; the cost is lateness below one rung, so
-a 5s delay is released at about 8s.
-
-That cost is reported rather than left to folklore. `Limits()` renders
-`native_delay` for this driver as `late by at most the requested delay, or
-500ms, whichever is larger, for a delay of at most 1m4s; no bound above that`.
-Both numbers are read from the rung table rather than written down beside it:
-the floor is its first rung, where every shorter delay lands, and the ceiling is
-its last, above which the per-message path below takes over. Editing a rung
-changes what the report says, so the declaration cannot drift from the
-mechanism.
-
-A delay above 64s parks in `<destination>.park`, the queue that carries a
-per-message expiration, exactly as it always has. The deferral ceiling stays
-where it was (about 24.8 days), and the limitation of that path is unchanged: a
-due time beyond the top rung can still be released late by a message parked
-ahead of it. It is not reachable from the SDK's retry path, whose delays are
-bounded by configuration, and it is reachable by an application passing
-`DelayUntil` more than a minute out.
-
-The names are reserved: a destination name may not end in `.park`, and it may
-not end in `.park.` followed by one of the rung tags above. Both shapes belong
-to parking queues, and the adapter reads a queue name back to find the
-destination it parks for.
-
-The rung queues and the queue above the ladder are declared from the
-destination's delay, and which policy makes them exist is the same split as any
-other destination:
-
-| Topology policy | Parking queues |
-| --- | --- |
-| `TopologyDeclare` | Declared by the adapter at subscription start. |
-| `TopologyVerify` | Must exist and match their declared arguments, checked at subscription start. |
-| `TopologyNone` | Provisioned by the operator. The adapter declares and checks nothing. |
-
-The queues are durable, and their declare arguments follow the deployment's
-queue type (`broker.rabbitmq.queueType`, `quorum` by default):
-
-| Argument | Value |
-| --- | --- |
-| `x-queue-type` | `quorum`, or `classic` when the deployment selects it |
-| `x-dead-letter-exchange` | `""`, the default exchange |
-| `x-dead-letter-routing-key` | the destination name |
-| `x-dead-letter-strategy` | `at-least-once`, on quorum only |
-| `x-overflow` | `reject-publish`, on quorum only |
-| `x-message-ttl` | the rung, in milliseconds, on the rung queues only |
-
-On quorum the two strategy arguments are added because all three dead-letter
-arguments are required together for RabbitMQ's at-least-once dead-letter
-guarantee; the parking queues are the delay mechanism itself, not a failure
-path, so a message lost there is a dropped retry with no error. A classic
-deployment omits them, and its delay path is at-most-once.
-
-Upgrading from a release without the ladder needs no drain. The existing
-`<destination>.park` queue keeps dead-lettering to its destination and the
-messages parked in it leave on their own schedule, and the rung queues are
-declared by the topology pass. An application that empties a destination
-(`Purge`) empties every parking queue of it, and one that deletes a destination
-(`Prune`) is refused while any of them still holds a message.
-
-Under `TopologyNone` a missing parking queue is discovered by the publish that
-needed it. The broker returns the message (`312 NO_ROUTE`) rather than closing
-the channel, and the publish failure names the missing queue, the policy that
-obliges you to create it, and its declare arguments. The producer recovers on
-its own: creating the queue while the service runs is enough, with no restart.
-
-This obligation is RabbitMQ's alone, and it is worth knowing that the same
-topology policy does not mean the same thing on both drivers. Kafka carries the
-deferral in a record header on the destination's own topic and the consuming
-side holds the record until its due time, so a delayed or retried message needs
-no topology beyond the destination topic. RabbitMQ's emulation needs the parking
-queue, so `TopologyNone` obliges an operator to provision the destinations and
-their parking queues here, and only the topics there.
-
-Consumer delivery timeouts are a destination-queue setting rather than a
-parking-queue one, and they follow the same policy split. Setting
-`broker.rabbitmq.consumerTimeout` reaches the broker as the queue argument
-`x-consumer-timeout`, on quorum destination queues only: the broker refuses the
-argument on a classic queue, so a classic deployment never declares it, and when
-the key is absent nothing is declared and the broker's own default stays in
-force. The argument is fixed when the queue is created, which is what decides
-the upgrade path for a deployment whose destination queues already exist.
-
-A default deployment runs `TopologyVerify`. Against an existing queue the drift
-detector names the argument as `x-consumer-timeout Want:90000 Got:<absent>`, and
-startup logs that as a warning under `f1 topology argument drift` rather than
-failing; the queue keeps the broker default. Under `topology.autoCreate`
-(`TopologyDeclare`) there is no drift check at all, so the existing queue is
-found and left as it was, silently. The adapter never makes an active redeclare
-carrying the argument either way, because the broker refuses one with
-`406 PRECONDITION_FAILED`. An existing queue therefore has to be deleted and
-recreated to gain the setting, and the drift warning is the only thing that says
-so.
-
-## Kafka driver
-
-The Kafka adapter uses classic consumer groups and franz-go. Share-group mode
-is not implemented. Its connection-derived capabilities expose partition-bound
-scaling and the core-emulated paths for delay, priority, delivery count, and
-dead-letter behavior where Kafka has no native equivalent.
-
-Provider-specific behavior includes producer confirmation, partition and
-offset ownership, consumer-group rebalance, deferred records, lag queries,
-TLS, and Kafka error mapping. Start with
-[`drivers/kafka/kafka.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/drivers/kafka/kafka.go), then read its producer,
-consumer, topology, ack-tracker, rebalance, and broker-backed tests.
-
-Inspect `Client.Limits()` after connecting when service behavior depends on a
-provider capability. A capability is an optimization or physical limit, not a
-license for an adapter to change F1 semantics.
+The scheduler row is always `emulated` and the scaling row is always `native`
+because these are fixed properties of F1's feature list. Other modes can
+vary with the connected driver's live capabilities and broker configuration.
+Static declarations can be narrowed by a connected driver, so read the
+connected report instead of maintaining a hard-coded provider matrix.
 
 ## Choosing the right guide
 
@@ -215,6 +241,13 @@ license for an adapter to change F1 semantics.
   a port interface.
 - Use [Driver conformance](/development/driver-conformance) to validate
   portability across adapters and capability profiles.
-- Use this page for provider-specific behavior and broker operations.
+- Use this page for shared configuration and the feature list, and the
+  driver pages for provider-specific options and behavior.
 - Use [Topology and capabilities](/advanced-topics/topology-and-capabilities)
-  for service-facing capability and topology decisions.
+  for service-facing feature and topology decisions.
+
+## Go further
+
+- [Driver contract](/development/driver-contract) - implement the broker-neutral port.
+- [Topology and capabilities](/advanced-topics/topology-and-capabilities) - choose portable service behavior.
+- [RabbitMQ retry parking](/deep-dives/rabbitmq-delay-ladder) - one parking queue per retry step, and how other delays are parked.

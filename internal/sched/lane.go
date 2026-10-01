@@ -17,16 +17,15 @@ type LaneSpec struct {
 	Capacity int
 }
 
-// Item is one message waiting in a lane. EnqueuedAt drives aging.
+// Item is one message waiting in a lane. EnqueuedAt drives deadline promotion.
 type Item struct {
 	Value      any
 	EnqueuedAt time.Time
 }
 
 type lane struct {
-	spec    LaneSpec
-	items   []Item
-	deficit int
+	spec  LaneSpec
+	items []Item
 }
 
 func newLane(spec LaneSpec) (*lane, error) {

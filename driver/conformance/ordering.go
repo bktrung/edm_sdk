@@ -9,14 +9,34 @@ import (
 
 func init() { registerGroup("ordering", runOrdering) }
 
+// runOrdering runs the ordering group.
+//
+// Four checks here publish with an explicit key on purpose and then require
+// several of those records unsettled at once, and each derives that count from
+// the driver's declared consumer scaling rather than hard-coding it. A driver
+// declaring ScalingPartitionBound admits one unsettled delivery per partition
+// and one key reaches one partition, so the most such a check may ask of it is
+// the number of distinct keys it publishes. A driver declaring ScalingFree
+// keeps the count the checks were written with.
+//
+// The waiver is a loss and not a simplification, and the next reader must not
+// mistake it for one: on a partition-bound driver this group no longer shows
+// that same-key receipt order survives a prefetch window, because there is no
+// window to survive. What it still shows is that the records of one key arrive
+// in the order they were published, with one delivery of that key in hand at a
+// time.
 func runOrdering(group *groupContext) {
 	group.Check("initial same-key prefetch retains receipt order", func(t *testing.T) {
 		const destination = "ordering.initial"
 		producer := newProducer(t, group, profileDestination(group, destination), driver.ProducerConfig{Effective: group.effective})
 		consumer := orderingConsumer(t, group, destination, 3, false)
 		publishKeyed(t, group, producer, destination, "k", "one", "two", "three")
-		waitForSaturation(t, group, destination, 3, 0)
-		assertOrderedBodies(t, group, consumer, "one", "two", "three")
+		// One key reaches one partition, so a partition-bound driver admits one of
+		// the three records and leaves the other two ready, where a free-scaling
+		// driver takes all three.
+		outstanding := deliveryCeiling(group.factoryCapabilities, 1, 3)
+		waitForSaturation(t, group, destination, outstanding, 3-outstanding)
+		assertOrderedBodies(t, group, consumer, outstanding, "one", "two", "three")
 		addOrderingEvent(group, "ordering-initial", "one,two,three", destination)
 	})
 
@@ -24,17 +44,23 @@ func runOrdering(group *groupContext) {
 		const destination = "ordering.refill"
 		producer := newProducer(t, group, profileDestination(group, destination), driver.ProducerConfig{Effective: group.effective})
 		consumer := orderingConsumer(t, group, destination, 3, false)
-		publishKeyed(t, group, producer, destination, "k", "one", "two", "three", "four", "five", "six")
-		waitForSaturation(t, group, destination, 3, 3)
-		first := receiveMessages(t, group, consumer, 3)
-		settleMessage(t, group, first[2])
-		settleMessage(t, group, first[0])
-		settleMessage(t, group, first[1])
-		remaining := receiveMessages(t, group, consumer, 3)
-		assertBodies(t, remaining, "four", "five", "six")
-		for _, message := range remaining {
-			settleMessage(t, group, message)
-		}
+		bodies := []string{"one", "two", "three", "four", "five", "six"}
+		publishKeyed(t, group, producer, destination, "k", bodies...)
+		// One key reaches one partition, so a partition-bound driver holds one of
+		// the six records unsettled and leaves the other five ready, where a
+		// free-scaling driver holds three of each.
+		outstanding := deliveryCeiling(group.factoryCapabilities, 1, 3)
+		waitForSaturation(t, group, destination, outstanding, len(bodies)-outstanding)
+		first := receiveMessages(t, group, consumer, outstanding)
+		// Settle the newest delivery first and the rest in receipt order. The
+		// check's instrument is that a window refills irregularly and that receipt
+		// order survives the irregularity; a driver admitting one delivery per
+		// partition has no window to refill, and settling the one delivery it holds
+		// is what admits the next.
+		settleMessage(t, group, first[len(first)-1])
+		settleMessages(t, group, first[:len(first)-1])
+		remaining := receiveMessagesWithin(t, group, consumer, len(bodies)-outstanding, outstanding)
+		assertBodies(t, remaining, bodies[outstanding:]...)
 		addOrderingEvent(group, "ordering-refill", "one,two,three,four,five,six", destination)
 	})
 
@@ -44,11 +70,14 @@ func runOrdering(group *groupContext) {
 		consumer := orderingConsumer(t, group, destination, 4, false)
 		publishKeyed(t, group, producer, destination, "a", "a1", "a2")
 		publishKeyed(t, group, producer, destination, "b", "b1", "b2")
-		messages := receiveMessages(t, group, consumer, 4)
+		// Two keys reach two partitions, so a partition-bound driver holds two of
+		// the four records and cannot be handed the other two until it settles
+		// those, where a free-scaling driver holds all four.
+		outstanding := deliveryCeiling(group.factoryCapabilities, 2, 4)
+		messages := receiveMessagesWithin(t, group, consumer, 4, outstanding)
 		sequences := map[string][]string{}
 		for _, message := range messages {
 			sequences[string(message.Key)] = append(sequences[string(message.Key)], string(message.Body))
-			settleMessage(t, group, message)
 		}
 		if fmt.Sprint(sequences["a"]) != "[a1 a2]" || fmt.Sprint(sequences["b"]) != "[b1 b2]" {
 			t.Fatalf("per-key sequences=%v", sequences)
@@ -118,19 +147,21 @@ func runOrdering(group *groupContext) {
 		producer := newProducer(t, group, profileDestination(group, destination), driver.ProducerConfig{Effective: group.effective})
 		consumer := orderingConsumer(t, group, destination, 2, true)
 		publishKeyed(t, group, producer, destination, "k", "one", "two")
-		assertOrderedBodies(t, group, consumer, "one", "two")
+		// One key reaches one partition, so a partition-bound driver holds one of
+		// the two records at once and is asked for them one at a time.
+		outstanding := deliveryCeiling(group.factoryCapabilities, 1, 2)
+		assertOrderedBodies(t, group, consumer, outstanding, "one", "two")
 		addOrderingEvent(group, "ordering-exclusive", "usable", destination)
 	})
 
 	group.Check("zero-value producer configuration preserves ordered receipt", func(t *testing.T) {
 		const destination = "ordering.zero"
 		producer := newProducer(t, group, profileDestination(group, destination), driver.ProducerConfig{
-			RequireDurableAck: true,
-			Effective:         group.effective,
+			Effective: group.effective,
 		})
 		consumer := orderingConsumer(t, group, destination, 1, true)
 		publishKeyed(t, group, producer, destination, "k", "one", "two")
-		assertOrderedBodiesOneAtATime(t, group, consumer, "one", "two")
+		assertOrderedBodies(t, group, consumer, 1, "one", "two")
 		addOrderingEvent(group, "ordering-zero", "one,two", destination)
 	})
 }
@@ -177,22 +208,41 @@ func receiveMessages(t *testing.T, group *groupContext, consumer driver.Consumer
 	return messages
 }
 
-func assertOrderedBodies(t *testing.T, group *groupContext, consumer driver.Consumer, want ...string) {
+// assertOrderedBodies receives len(want) deliveries in receipt order, settling
+// each one once ceiling are in hand, and fails unless the bodies arrive in want
+// order. A ceiling at or above len(want) holds every delivery before settling
+// any, which is what a driver declaring ScalingFree is asked for.
+func assertOrderedBodies(t *testing.T, group *groupContext, consumer driver.Consumer, ceiling int, want ...string) {
 	t.Helper()
-	messages := receiveMessages(t, group, consumer, len(want))
+	messages := receiveMessagesWithin(t, group, consumer, len(want), ceiling)
 	assertBodies(t, messages, want...)
-	for _, message := range messages {
-		settleMessage(t, group, message)
-	}
 }
 
-func assertOrderedBodiesOneAtATime(t *testing.T, group *groupContext, consumer driver.Consumer, want ...string) {
+// receiveMessagesWithin receives count deliveries in receipt order and returns
+// them in the order they were received, settling each one once ceiling are in
+// hand so that a driver admitting one delivery per partition is never asked to
+// hold more than it can.
+func receiveMessagesWithin(t *testing.T, group *groupContext, consumer driver.Consumer, count, ceiling int) []driver.InboundMessage {
 	t.Helper()
-	for _, body := range want {
+	messages := make([]driver.InboundMessage, 0, count)
+	held := make([]driver.InboundMessage, 0, ceiling)
+	for range count {
 		message := receiveMessages(t, group, consumer, 1)[0]
-		if string(message.Body) != body {
-			t.Fatalf("body=%q want=%q", message.Body, body)
+		messages = append(messages, message)
+		held = append(held, message)
+		if len(held) == ceiling {
+			settleMessages(t, group, held)
+			held = held[:0]
 		}
+	}
+	settleMessages(t, group, held)
+	return messages
+}
+
+// settleMessages acknowledges deliveries in the order given.
+func settleMessages(t *testing.T, group *groupContext, messages []driver.InboundMessage) {
+	t.Helper()
+	for _, message := range messages {
 		settleMessage(t, group, message)
 	}
 }
@@ -219,14 +269,14 @@ func settleMessage(t *testing.T, group *groupContext, message driver.InboundMess
 	}
 }
 
-func waitForSaturation(t *testing.T, group *groupContext, destination string, unsettled, ready int64) {
+func waitForSaturation(t *testing.T, group *groupContext, destination string, unsettled, ready int) {
 	t.Helper()
 	waitFor(t, group, "ordered prefetch saturation", func() (bool, string) {
 		view := inspectDestination(t, group, destination)
-		return view.Unsettled == unsettled && view.Ready == ready, fmt.Sprintf("view=%+v", view)
+		return view.Unsettled == int64(unsettled) && view.Ready == int64(ready), fmt.Sprintf("view=%+v", view)
 	})
 }
 
 func addOrderingEvent(group *groupContext, id, outcome, destination string) {
-	group.vector.Add(BehaviorEvent{ID: id, Outcome: outcome, FinalDestination: destination})
+	group.vector.add(BehaviorEvent{ID: id, Outcome: outcome, FinalDestination: destination})
 }

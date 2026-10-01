@@ -20,7 +20,6 @@ import (
 	"testing"
 	"time"
 
-	//nolint:depguard // integration test exercises the SDK through the RabbitMQ driver
 	f1 "fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk"
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/driver"
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/driver/conformance"

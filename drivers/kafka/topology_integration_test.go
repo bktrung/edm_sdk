@@ -16,6 +16,7 @@ import (
 	"github.com/twmb/franz-go/pkg/kerr"
 
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/driver"
+	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/clock"
 )
 
 func TestPartitionCountResolution(t *testing.T) {
@@ -145,21 +146,26 @@ func TestEnsureTopologyPartitionFloorAppliesToUnsetAndExistingTopics(t *testing.
 	}
 }
 
+// TestBindingsAndExchangesAreIgnored pins that the routing fields of a topology
+// spec change nothing about the plan Kafka translates it to. Kafka routes at
+// consume time, so exchanges and bindings have no plan of their own and a spec
+// that carries them translates to the plan of the same spec without them.
 func TestBindingsAndExchangesAreIgnored(t *testing.T) {
-	plan := translateTopology(driver.TopologySpec{
+	withRouting := translateTopology(driver.TopologySpec{
 		Exchanges:    []driver.ExchangeSpec{{Name: "events", Kind: "fanout", Durable: true}},
 		Destinations: []driver.DestinationSpec{{Name: "orders"}},
 		Bindings:     []driver.BindingSpec{{Source: "events", Destination: "orders"}},
 		Effective:    driver.Capabilities{Fanout: driver.FanoutAtConsume},
 	})
-	if len(plan.exchanges) != 0 {
-		t.Fatalf("translated exchanges = %v, want empty", plan.exchanges)
+	withoutRouting := translateTopology(driver.TopologySpec{
+		Destinations: []driver.DestinationSpec{{Name: "orders"}},
+		Effective:    driver.Capabilities{Fanout: driver.FanoutAtConsume},
+	})
+	if !slices.Equal(withRouting.destinations, withoutRouting.destinations) {
+		t.Fatalf("translated destinations = %#v, want the plan without routing fields %#v", withRouting.destinations, withoutRouting.destinations)
 	}
-	if len(plan.bindings) != 0 {
-		t.Fatalf("translated bindings = %v, want empty", plan.bindings)
-	}
-	if len(plan.destinations) != 1 || plan.destinations[0].name != "orders" {
-		t.Fatalf("translated destinations = %#v, want orders", plan.destinations)
+	if len(withRouting.destinations) != 1 || withRouting.destinations[0].name != "orders" {
+		t.Fatalf("translated destinations = %#v, want orders", withRouting.destinations)
 	}
 }
 
@@ -275,15 +281,13 @@ func TestTopologyVerifyRejectsUnsupportedDeliveryLimit(t *testing.T) {
 	}
 }
 
-// A deferred destination must survive TopologyVerify, and the successful call
-// must teach the connection the lane's delay. What survives Verify is the
-// produce path's read of it: the producer stamps a due time from the recorded
-// delay on a publish that carries none of its own. So this publishes without
-// DelayUntil and holds the record to the due time that stamp implies. A
-// connection that never learned the delay stamps nothing, and the consumer here
-// delivers the record at once instead of at the due time the destination
-// declares.
-func TestTopologyVerifyPopulatesDeferredDestinationDelay(t *testing.T) {
+// TestTopologyVerifyAcceptsADeferredDestination asserts that a declarative
+// verify pass accepts a destination carrying a retry delay, and that a record
+// published to it is delivered no earlier than its timestamp plus that delay.
+// The delay the consumer waits for comes from its own configuration, so the
+// spec's delay is the topology's statement about the destination rather than
+// something the driver reads back.
+func TestTopologyVerifyAcceptsADeferredDestination(t *testing.T) {
 	ctx, connection, admin := openKafkaAdminTest(t)
 	destination := kafkaTestTopic(t, "verify-deferred")
 	group := kafkaTestTopic(t, "verify-deferred-group")
@@ -315,11 +319,12 @@ func TestTopologyVerifyPopulatesDeferredDestinationDelay(t *testing.T) {
 	}
 	t.Cleanup(func() { closeKafkaConsumer(consumer) })
 
-	// The publish carries no due time, so the only due time the record can have
-	// is the one the producer stamps from the delay Verify recorded. The
-	// producer reads its clock after this snapshot, which makes the stamped due
-	// time at or after the one asserted below.
-	publishedAt := kafkaNow()
+	// The record's due time is its timestamp, which the producer stamps with
+	// its own clock inside the publish below, plus the destination's delay. The
+	// publish happens after this snapshot, so the due time the driver waited for
+	// is at or after the one this test derives, and the assertion is the
+	// never-early half of the deferral contract.
+	publishedAt := clock.NewReal().Now()
 	if err := producer.Publish(ctx, driver.OutboundMessage{
 		Destination: destination, Body: []byte("deferred"),
 	}); err != nil {

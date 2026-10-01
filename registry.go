@@ -3,7 +3,6 @@ package f1
 import (
 	"context"
 
-	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/driver"
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/dispatch"
 )
 
@@ -18,9 +17,9 @@ func newInflightRegistry() *inflightRegistry {
 	return &inflightRegistry{registry: dispatch.NewRegistry()}
 }
 
-// Add registers a delivery. The message is accepted for compatibility, but
-// the registry only needs the identity key and does not retain the message.
-func (r *inflightRegistry) Add(_ driver.InboundMessage) uint64 {
+// Add registers a delivery and returns its identity. The registry tracks the
+// identity alone; the message belongs to the settlement path.
+func (r *inflightRegistry) Add() uint64 {
 	if r == nil {
 		return 0
 	}

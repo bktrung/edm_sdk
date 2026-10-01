@@ -63,7 +63,7 @@ func TestRetrySuccessorIgnoresCodecBodyLimit(t *testing.T) {
 		Body:        body,
 		Settle:      settler,
 	}
-	if !retryAndSettle(runner, context.Background(), message, envelope, errors.New("temporary")) {
+	if !retryAndSettle(runner, context.Background(), message, envelope, errors.New("temporary"), &deliveryState{}) {
 		t.Fatal("retry successor with an oversized body was not published and settled")
 	}
 	if len(producer.messages) != 1 {

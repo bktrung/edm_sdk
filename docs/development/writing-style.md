@@ -8,20 +8,30 @@ rewriting a page under `docs/`.
 
 | Section | Directories | Voice |
 | --- | --- | --- |
-| Guide | `learn/`, `user-guide/` | Second person, task first: "Create a subscription, then call `Run`." |
-| Concepts | `basics/`, `advanced-topics/` | Neutral explanation of what F1 does and why an application cares. |
-| Internals | `development/`, `runtime-overview.md`, `drivers-and-capabilities.md` | Neutral and exact. Reference for maintainers and driver authors. |
-| Deep dives | `deep-dives/` | First person singular. How a part works inside, the reasons behind it, and what broke on the way. |
+| Learn | `learn/` | Second person, task first: "Create a subscription, then call `Run`." |
+| Basics | `basics/` | Neutral explanation of what F1 does and why an application cares. |
+| Advanced | `advanced-topics/` | The same neutral voice, for decisions that need a capacity or failure plan. |
+| Drivers | `drivers/`, `drivers-and-capabilities.md` | Neutral and exact. Configuration and provider-specific behavior. |
+| Development | `development/` | Neutral and exact. Reference for maintainers and driver authors. |
+| Deep dives | `deep-dives/` | Explain the mechanism and its reasons in present tense. Use first person for an author's decisions or observations. |
 
-Keep the voice of the section a page lives in. A Guide page that drifts into
-design history belongs in a deep dive; a deep dive that turns into option
-tables belongs in Internals.
+Keep the voice of the section a page lives in. A Learn page that drifts into
+mechanism and the reasoning behind it belongs in a deep dive; a deep dive that
+turns into option tables belongs in Development.
 
 ## Rules for every page
 
+### Per concept
+
+Define each concept in one plain sentence. Follow it with a picture or a
+concrete example, then at most three short paragraphs. Aim for about 60 words
+per paragraph; none may exceed 100 words. Add an admonition only for a real
+gotcha.
+
+
 ### ASCII only
 
-The rule in `CLAUDE.md` covers docs too. No em or en dash: use
+The rule in `AGENTS.md` covers docs too. No em or en dash: use
 a comma, a colon, parentheses, or a new sentence. Straight quotes only. Write
 an arrow as `->`.
 
@@ -40,6 +50,40 @@ unless they carry a technical meaning in the sentence: `canonical`, `ensure`,
 `robust`, `seamless`, `leverage`, `crucial`, `key` as an adjective, `delve`.
 A technical use stays: "the canonical topic" names a real derived value.
 
+### Plain words first, link the term
+
+Outside `development/`, write the plain phrase a Go developer already knows and
+link it to the glossary the first time it appears on a page: "F1
+[finishes the message](/learn/glossary#settlement) only after the retry copy is
+confirmed", not "F1 settles the original after the successor handoff". The
+project's own words stay in the glossary, in code, and in config keys, so a
+reader can still match a log line or a field name to the page.
+
+| Term | Write instead |
+| --- | --- |
+| settle, settlement, settled, unsettled | finish the message (ack or nack), finished, not yet finished or not yet acked |
+| successor, successor publish | retry copy or dead-letter copy, publishing the retry copy |
+| epoch | connection number |
+| generation | the runner's current consumer |
+| admission, admit | allowed to start, let in |
+| backstop | the broker's own dead-letter queue |
+| handoff | handing the copy to the broker |
+| deadline promotion, promotion | jumping the queue when overdue |
+| lane budget | wait limit |
+| retry tier, retry ladder | retry step, the list of retry delays |
+| cursor (Kafka) | committed offset |
+| native, emulated | done by the broker, done by F1 |
+| partition-bound, free scaling | limited by partition count, not limited by partitions |
+| capability report | the list of features the connected broker supports |
+| abandon (a delivery) | give up on |
+| physical destination, logical topic | broker queue or topic name, topic name in your code |
+
+Common messaging words stay as they are: ack, nack, requeue, redelivery,
+prefetch, partition, consumer group, dead letter, idempotency, envelope, codec,
+confirm, quorum queue, poison message, in-flight, drain, rebalance, revoke, and
+parking queue. Avoid one-off formal words such as quiescence, incarnation,
+interleaving, or invariant; say what happens instead.
+
 ### Keep sentences uneven
 
 Real prose alternates short and long sentences.
@@ -55,27 +99,80 @@ the page title.
 Bold a term the reader must not miss. Do not give every
 bullet a bold label.
 
-### Link claims to code
+### Teach the model, not the code
 
-Point at the file or test that shows the behaviour,
-using the full repository URL form the other pages use:
-`https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/<path>`.
+Pages outside `development/` explain how F1 behaves and why, in words a reader
+keeps after the code changes. Internal names change on every refactor; the
+mental model does not.
+
+- Do not name tests, test files, unexported functions, internal types, or
+  internal constants. Say what the code does: "F1 registers the delivery before
+  it queues it", not "`enqueueDelivery` calls `registry.Add`".
+- Name only the public API a user types: `f1.Subscribe`, `f1.Terminal`,
+  `Subscription.Prefetch`, config keys, and CLI or `make` targets.
+- Do not quote internal numbers that are not configuration. "F1 retries the
+  publish a few times over a fraction of a second" survives a tuning change;
+  "3 attempts, 100 ms apart" does not. Defaults a user can set are fine.
+- Code blocks show how to use F1, never how F1 is implemented.
+- Source links are rare: at most a few per page, to a file or package, never a
+  line number or a `#L` range. Use the full repository URL form with no line
+  anchor:
+  `https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/<path>`.
+
+`development/` pages are the exception: their job is to map the code, so they
+name functions, tests and files. They still never cite a line number.
 
 ### No unresolvable citations
 
 `make verify-self-contained` rejects decision
 and task identifiers a reader cannot follow. State the rule instead.
 
-### Diagrams earn their place
+### No plan or phase identifiers
 
-Use Mermaid when the reader needs to see an
-order of events or a structure that prose makes hard to hold. Keep labels
-short; one diagram per idea.
+Do not write "Phase 4", a plan id, an audit label or a finding code in a page,
+a code comment, or a generated artifact. State the behaviour.
+
+### Diagrams and tables
+
+Use one diagram per core idea that is an order of events, a state machine or a
+structure. Use tables for comparisons and worked traces.
+
+### Mermaid vocabulary
+
+The broker is a cylinder `B[(broker)]`; the application handler is a stadium
+`H([handler])`; an F1 step is a plain rectangle; a decision is a diamond; a
+dashed edge means the message goes back to the broker. Node labels at most three
+words. No `classDef` colors and no `style` lines: the site theme handles light
+and dark mode.
 
 ### Code examples compile
 
 Every example builds against the current API. When the API changes, the
 example changes in the same commit.
+
+### Algorithms
+
+Algorithms use a static worked trace, table or timeline, checked against the
+code. An interactive figure is allowed only when stepping adds understanding,
+and only over a trace taken from the Go code, never a second implementation in
+the docs.
+
+### Configuration examples
+
+Use VitePress `code-group` tabs for equivalent configuration across brokers.
+
+### Page endings
+
+Authored guides end with a short "Go further" list when related reading helps.
+Generated references keep their generator's format; do not hand-edit them.
+
+### Signs of AI writing
+
+Cut staged openers and summary sentences that repeat the paragraph. State the
+subject directly. Keep a contrast when it distinguishes real alternatives or
+corrects a likely misunderstanding; remove comparisons between unrelated concepts.
+Lists need distinct items, not a fixed count. Preserve technical caveats and
+concrete examples rather than simplifying away the contract.
 
 ## Deep dives
 
@@ -87,31 +184,33 @@ Internals for what the feature does, and spends its length on how and why.
 
 ### Voice
 
-- Write as "we", the team voice. The author is still named at the top of the
-  page, in the header `*By <author>, <Month YYYY>.*`.
-- Opinions are welcome when they read as opinions: "We think this is the
+- Use neutral prose for mechanisms. First person is useful for an author's
+  decision, measurement, or opinion; attributed essays name the author in
+  the header `*By <author>.*`.
+- Opinions are welcome when they read as opinions: "I think this is the
   weakest part of the design."
-- State uncertainty plainly: "We have not measured this under load."
-- Prefer the concrete case: real numbers, a real sequence of events, a real
-  commit. A race is explained by its interleaving, which goroutine is where
-  and what the other one does in between, as `CLAUDE.md` asks of code
-  comments.
-- History appears only when it is real. A design that broke is part of the
-  story only when a commit or a red test shows it; cite that commit or test.
-  There is no fixed history section and no retrospective of alternatives.
+- State uncertainty plainly: "I have not measured this under load."
+- Prefer the concrete case: real numbers, a real sequence of events. A race is
+  explained by its interleaving, which goroutine is where and what the other one
+  does in between, as `AGENTS.md` asks of code comments.
+- Pages explain the mechanism and the reasoning as it stands today, in present
+  tense. Do not write a design-history narrative or an account of what an
+  earlier version did.
 
 ### Accuracy
 
-- Every behavioural claim links to the source or test that shows it.
+- Every behavioural claim is checked against the source or a test before it
+  is written. Link the few that a reader will want to open, not every one: a
+  page reads as prose and examples, not as a list of source links.
 - Broker behaviour is measured against the local fixture, not taken from
   broker or client documentation. Say when a claim was measured.
-- Pages are dated and frozen. They describe the code as it was when written
-  and carry no commit sha. A later change adds an `Update (<YYYY-MM-DD>):`
-  note, or becomes a new post.
-- Numbers follow the benchmark rule: cite an existing test, benchmark, or
-  `make bench`, and give the reproduce command, the machine (CPU model,
-  cores, Go version), and the date beside each number. A number that would
-  need a new harness is a finding, not an edit.
+- Pages are living and in present tense. They describe the code as it is now,
+  carry no date and no commit sha, and are edited in place when the code
+  changes.
+- Measured numbers live on [Benchmarks](/development/benchmarks) with the
+  reproduce command and the machine. A deep dive states the finding in words
+  and links there. A number that would need a new harness is a finding, not an
+  edit.
 
 ### Page template
 
@@ -121,7 +220,7 @@ different order.
 ```md
 # <A claim or a problem, not a component name>
 
-*By <author>, <Month YYYY>.*
+*By <author>.*
 
 <Lede: one concrete scenario that goes wrong without this mechanism.>
 
@@ -133,27 +232,25 @@ different order.
 
 <One worked example end to end, one diagram.>
 
-## Measured
-
-<Numbers, how to reproduce, machine, date.>
-
 ## Limits and trade-offs
 
-## Read the code
+## Go further
 
-- [`path/to/file.go`](<repository URL>) - what to look for there
-- [`path/to/file_test.go`](<repository URL>) - the test that pins the behaviour
+- [<Development page>](/development/<page>) - where the code map for this path lives
 ```
 
-Add the page to the "Deep dives" sidebar group in
-`docs/.vitepress/config.mts`.
+A deep dive follows "Teach the model, not the code": no test names, no internal
+function names, no internal constants. The reader leaves with the mechanism and
+the reasons; the Development pages hold the code map.
 
 ### Before merging a deep dive
 
-1. Read the draft against Wikipedia's
-   [Signs of AI writing](https://en.wikipedia.org/wiki/Wikipedia:Signs_of_AI_writing)
-   list and rewrite what matches. The history exception above still applies.
-2. Ask someone who did not write the page to read it cold and mark where they
+1. Ask someone who did not write the page to read it cold and mark where they
    got lost.
-3. Follow every source link and check it still shows what the page says.
-4. Run `npm run docs:build` and `make verify-self-contained`.
+2. Check every claim against the current code, and follow every link.
+3. Run `npm run docs:build` and `make verify-self-contained`.
+
+## Go further
+
+- [Source-reading guide](/development/source-reading-guide) - choose evidence before editing.
+- [Documentation home](/) - follow the reader paths through the site.

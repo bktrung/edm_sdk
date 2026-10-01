@@ -18,7 +18,9 @@ const (
 	ReasonDecode DeathReason = "decode"
 	// ReasonExpired means the event expired before handling.
 	ReasonExpired DeathReason = "expired"
-	// ReasonPoison means the message repeatedly crashed its worker process.
+	// ReasonPoison means the envelope attempt counter exceeded the delivery's
+	// effective maxAttempts by more than 10, so the worker dead-letters the delivery as a
+	// retry-counter runaway.
 	ReasonPoison DeathReason = "poison"
 	// ReasonUnmatched means no handler matched the event type.
 	ReasonUnmatched DeathReason = "unmatched"
@@ -26,14 +28,3 @@ const (
 
 // String returns the wire value of r.
 func (r DeathReason) String() string { return string(r) }
-
-// Valid reports whether r is a known dead-letter reason.
-func (r DeathReason) Valid() bool {
-	switch r {
-	case ReasonMaxAttempts, ReasonTerminal, ReasonPanic, ReasonDecode,
-		ReasonExpired, ReasonPoison, ReasonUnmatched:
-		return true
-	default:
-		return false
-	}
-}

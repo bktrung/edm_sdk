@@ -59,6 +59,65 @@ func survivorRunOutput(t *testing.T) []byte {
 	return output
 }
 
+// TestRunReportsFailedDestinationRead is the acceptance for a reclaim
+// verification read that fails for a reason other than a missing destination.
+func TestRunReportsFailedDestinationRead(t *testing.T) {
+	output := failedDestinationReadRunOutput(t)
+	text := string(output)
+	for _, profile := range []string{"full", "strict"} {
+		verification := "conformance " + profile + " profile reclaim verification"
+		if !strings.Contains(text, verification) {
+			t.Fatalf("Run output omitted failed verification for %s profile:\n%s", profile, output)
+		}
+		leftBehind := "conformance " + profile + " profile left destinations behind"
+		if strings.Contains(text, leftBehind) {
+			t.Fatalf("Run counted an unreadable destination as left behind for %s profile:\n%s", profile, output)
+		}
+	}
+	if !strings.Contains(text, "deliberate describe failure") {
+		t.Fatalf("Run output omitted the DescribeTopology failure:\n%s", output)
+	}
+}
+
+const failedDestinationReadRunMode = "CONFORMANCE_FAILED_DESTINATION_READ_MODE"
+
+// failedDestinationReadRunOutput runs the suite in a child process, because a
+// failed reclaim verification is reported through the testing package.
+func failedDestinationReadRunOutput(t *testing.T) []byte {
+	t.Helper()
+	cmd := exec.Command(os.Args[0], "-test.run=TestFailedDestinationReadRunHelper", "-test.v") //nolint:gosec // the harness re-executes its own test binary.
+	cmd.Env = append(os.Environ(), failedDestinationReadRunMode+"=1")
+	output, err := cmd.CombinedOutput()
+	if err == nil {
+		t.Fatalf("Run passed after a failed destination read:\n%s", output)
+	}
+	return output
+}
+
+// TestFailedDestinationReadRunHelper is the child process failedDestinationReadRunOutput drives.
+func TestFailedDestinationReadRunHelper(t *testing.T) {
+	if os.Getenv(failedDestinationReadRunMode) == "" {
+		return
+	}
+	useOnlyGroups(t, []manifestEntry{{name: "reclaim", declared: 1}}, reclaimGroupRunners("reclaim.read-failure"))
+	conn := &recordingAdminConn{
+		probeTestConn:   newProbeTestConn(),
+		describeErrName: "read-failure",
+		describeErr:     errors.New("deliberate describe failure"),
+	}
+	Run(t, Suite{
+		Driver: fixedConnDriver{conn: conn},
+		NewInspector: func(raw driver.Conn) (Inspect, error) {
+			wrapped, ok := raw.(*recordingAdminConn)
+			if !ok {
+				return nil, errors.New("unexpected recording test connection")
+			}
+			return probeTestInspect(wrapped.probeTestConn), nil
+		},
+	})
+	t.Fatal("Run returned after an expected verification failure")
+}
+
 // TestSurvivorRunHelper is the child process survivorRunOutput drives.
 func TestSurvivorRunHelper(t *testing.T) {
 	if os.Getenv(survivorRunMode) == "" {
@@ -217,21 +276,33 @@ func (a keepingAdmin) Prune(ctx context.Context, names []string) ([]driver.Prune
 // of a destination.
 type recordingAdminConn struct {
 	*probeTestConn
-	events []string
+	events          []string
+	describeErrName string
+	describeErr     error
 }
 
 func (c *recordingAdminConn) Admin() driver.Admin {
-	return recordingAdmin{probeTestAdmin: c.probeTestConn.Admin().(probeTestAdmin), events: &c.events}
+	return recordingAdmin{
+		probeTestAdmin:  c.probeTestConn.Admin().(probeTestAdmin),
+		events:          &c.events,
+		describeErrName: c.describeErrName,
+		describeErr:     c.describeErr,
+	}
 }
 
 type recordingAdmin struct {
 	probeTestAdmin
-	events *[]string
+	events          *[]string
+	describeErrName string
+	describeErr     error
 }
 
 func (a recordingAdmin) DescribeTopology(ctx context.Context, names []string) (driver.TopologyState, error) {
 	for _, name := range names {
 		*a.events = append(*a.events, "describe:"+name)
+		if a.describeErr != nil && strings.Contains(name, a.describeErrName) {
+			return driver.TopologyState{}, a.describeErr
+		}
 	}
 	return a.probeTestAdmin.DescribeTopology(ctx, names)
 }

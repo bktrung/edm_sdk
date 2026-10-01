@@ -1,29 +1,22 @@
 # Failure handling
 
-Failure is part of normal message delivery. A handler tells F1 what should
-happen by returning an error; F1 classifies that result, publishes any retry
-or dead-letter successor, and settles the original delivery. The handler does
-not acknowledge, reject, or requeue a driver message directly.
+F1 turns a handler result into a delivery outcome: it decides what the result means, publishes any [retry or dead-letter copy](/learn/glossary#successor-publish), and then [finishes the original](/learn/glossary#settlement) with an ack or a nack.
 
-F1 provides at-least-once delivery. A successful handler run and its business
-side effects can still be followed by a process or connection failure before
-the original delivery is settled, so handlers that change external state
-should use a stable idempotency key. See [Message](/basics/message) and
-[Publisher and subscriber](/basics/pubsub) for the delivery model.
+A handler does not acknowledge, reject, or requeue a driver message directly. F1 provides [at-least-once delivery](/learn/glossary#at-least-once-delivery), so a process or connection failure can repeat a business effect after the handler has returned. Use `Event.IdempotencyKey()` when an effect must be safe to apply twice. See [Message](/basics/message) and [Publisher and subscriber](/basics/pubsub).
 
 ## Choose the outcome
 
-Return the outcome that matches the business meaning of the failure:
+Return the result that matches the business meaning of the failure.
 
-| Handler result | F1 outcome |
+| Outcome | Trigger and delivery result |
 | --- | --- |
-| `nil` | Acknowledge the delivery as handled. |
-| An ordinary error | Retry according to the subscription ladder, then dead-letter when the effective attempt limit is reached. |
-| `f1.RetryAfter(err, delay)` | Retry at the ladder tier nearest the requested delay, still subject to the attempt limit. |
-| `f1.Terminal(err)` | Stop retrying and publish the message to the dead-letter destination. |
-| `f1.Drop(err)` | Acknowledge the delivery without applying its effect or retaining a dead-letter copy. |
+| Retryable | An ordinary error publishes a retry copy, then acks the original, until the attempt limit is reached. |
+| Terminal | `f1.Terminal` or the last allowed attempt publishes a dead-letter copy, then acks the original. |
+| Dropped | `f1.Drop` acknowledges without applying the effect or retaining a dead-letter copy. |
+| Unmatched | No handler matches; `f1.Ignore` acknowledges it, while `f1.DeadLetter` publishes a dead-letter copy. |
+| Unpublishable | A copy that can never be encoded or accepted: a retry copy is dead-lettered instead; when no dead-letter copy can be made, F1 drops the message and reports it as an observer event and through `WithErrorHandler`, or an error log when no handler is set. |
 
-For example, a temporary downstream outage should remain retryable:
+A temporary dependency outage should remain retryable. A payload that cannot be decoded cannot become valid on a later attempt, so return `f1.Terminal` for that case.
 
 ```go
 func handleOrder(ctx context.Context, event *f1.Event) error {
@@ -31,25 +24,18 @@ func handleOrder(ctx context.Context, event *f1.Event) error {
 	if err := event.Decode(&order); err != nil {
 		return f1.Terminal(fmt.Errorf("decode order: %w", err))
 	}
-
 	if err := reserveInventory(ctx, order); err != nil {
-		return f1.RetryAfter(err, 30*time.Second)
+		return fmt.Errorf("reserve inventory: %w", err)
 	}
 	return nil
 }
 ```
 
-`reserveInventory` is application code. The important distinction is that a
-temporary dependency failure asks F1 to try again, while a payload that cannot
-be decoded cannot become valid on a later attempt and should be terminal.
+Returning `nil` after logging a failure acknowledges the delivery. Return the error instead.
 
-Return the error instead of logging and returning `nil`. Returning `nil`
-changes the delivery outcome to success.
+## Keep classification through context
 
-### Preserve classification while adding context
-
-Classification helpers work through wrapped errors. Add context with `%w` so
-F1 can still find `Terminal`, `Drop`, or `RetryAfter` in the error chain:
+Classification helpers work through wrapped errors. Add context with `%w` so F1 can still find `Terminal` or `Drop` in the error chain.
 
 ```go
 if err := validateOrder(order); err != nil {
@@ -60,16 +46,11 @@ if err := validateOrder(order); err != nil {
 }
 ```
 
-`f1.WithDetails` adds diagnostic values to a terminal or max-attempts
-dead-letter copy. Details do not affect routing, retries, settlement, or
-ordering. Keys must be lowercase alphanumeric; F1 accepts at most 16 keys and
-1 KiB of encoded detail data. Invalid or excess details are discarded and
-reported when the message is dead-lettered. See [`WithDetails`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/errors.go)
-for the exact contract.
+`f1.WithDetails` adds diagnostics to a terminal or max-attempts dead-letter copy. Details do not affect routing, retries, acks, or ordering. Keys are lowercase alphanumeric; F1 accepts at most 16 keys and 1 KiB of encoded detail data. Invalid or excess details are discarded and reported when the message is dead-lettered. See [`WithDetails`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/errors.go).
 
-## Retry policy
+## Configure the retry delays
 
-The subscription's [`RetryConfig`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/config.go) defines the retry ladder:
+`RetryConfig` defines [the list of retry delays](/learn/glossary#retry-ladder): when an ordinary error gets another attempt, and how long it waits first.
 
 ```go
 runner, err := client.Subscribe(ctx, f1.Subscription{
@@ -87,206 +68,62 @@ runner, err := client.Subscribe(ctx, f1.Subscription{
 })
 ```
 
-The effective attempt limit is the smaller of the event's
-[`WithMaxAttempts`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/publisher.go) value and the subscription policy.
-An event can lower the policy ceiling, but cannot raise it. `MaxAttempts` is
-the total delivery-attempt cap, including the first delivery; the event's
-`Attempt()` value is one-based. Once the current attempt reaches that cap, an
-ordinary or `RetryAfter` error becomes `ReasonMaxAttempts` and follows the
-dead-letter path.
+The effective attempt limit is the smaller of the event's `WithMaxAttempts` value and the subscription policy. `MaxAttempts` includes the first delivery, and `Event.Attempt()` is one-based. Once the current attempt reaches that cap, an ordinary error follows the dead-letter path with `ReasonMaxAttempts`.
 
-When no explicit retry tiers are configured, F1 derives them from
-`InitialInterval`, `Multiplier`, and `MaxInterval`. Explicit `Tiers` can define
-the delays directly. `RetryAfter` replaces the current retry's delay with the
-nominal delay of the tier nearest the requested value, so it rounds a handler's
-request onto the configured ladder instead of parking the event for an
-arbitrary interval, and it does not bypass the configured attempt cap. The
-validation and delay calculation live in [`config.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/config.go); keep service
-policy in configuration rather than implementing a second retry loop in a
-handler or middleware.
+When `Tiers` is not set, F1 works out the [retry steps](/learn/glossary#retry-tier) from `InitialInterval`, `Multiplier`, and `MaxInterval`. A handler cannot choose its own delay: every retry waits the delay of the step for its attempt. No retry step may be longer than 2,147,483,647 ms (about 24.8 days), the longest delay a RabbitMQ message can carry; a longer step is rejected at startup rather than released early.
 
-## Dead-letter handling
+## Follow a failed delivery
 
-F1 publishes a dead-letter successor when a message cannot or should not be
-retried. The dead-letter copy carries the original body and envelope metadata,
-plus a death reason and the last error. Current automatic reasons include:
+A retry or dead-letter copy is published before F1 acks the original delivery. This order means a message is never lost between the two: until the broker confirms the copy, the original is still there.
 
-- `terminal` - the handler returned `f1.Terminal`;
-- `max_attempts` - the retry ladder was exhausted;
-- `panic` - the handler or middleware panicked;
-- `decode` - the envelope, codec, or body could not be decoded;
-- `expired` - the event expired before handling;
-- `unmatched` - no handler matched and the subscription selected
-  `f1.DeadLetter`; and
-- `poison` - the retry metadata exceeded the runtime's sanity limit.
-
-The reason is available in the dead-letter envelope and in the
-[`DeadLettered`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/subscription.go) callback payload:
-
-```go
-subscription := f1.Subscription{
-	Name:            "orders-worker",
-	Topics:          []string{"orders.created"},
-	UnmatchedPolicy: f1.DeadLetter,
-	OnDeadLetter: func(ctx context.Context, dead f1.DeadLettered) {
-		log.ErrorContext(ctx, "event dead-lettered",
-			"id", dead.Envelope.ID,
-			"reason", dead.Reason,
-			"attempt", dead.Attempt,
-			"destination", dead.Destination,
-			"error", dead.LastErr,
-		)
-	},
-}
+```mermaid
+flowchart TB
+    B[(broker)] --> H([handler])
+    H --> R[handler result]
+    R --> C{classify}
+    C -->|retryable| RP[retry publish]
+    C -->|terminal| DP[dead-letter publish]
+    C -->|drop| A[ack original]
+    RP -.-> B
+    DP -.-> B
+    RP --> S[ack original]
+    DP --> S
+    S -->|ack| B
+    A -->|ack| B
 ```
 
-`OnDeadLetter` is a notification surface. Its `Body` and `Envelope` are
-independent copies, but the callback must not be the only place where a
-correctness-critical action happens. F1 invokes the callback asynchronously
-with a bounded notification context; a slow or panicking callback must not
-stall delivery or shutdown.
+F1 waits for the broker to confirm the copy before acking the original. If a retry or dead-letter copy cannot be published within the time allowed for handing it to the broker, F1 stops the subscription, reports the runtime error through `WithErrorHandler`, releases the consumer without acknowledging the original, and records the failure for `Health`.
 
-The dead-letter publication is confirmed before F1 acknowledges the original
-delivery. If the successor cannot be published within the bounded successor
-handoff budget, F1 stops the subscription: it reports the runtime error through
-`WithErrorHandler`, releases the consumer without acknowledging the original
-delivery, and records the failure so `Health` reports it against that
-subscription. `Release` leaves the delivery unsettled, so the broker still owns
-it, but nothing redelivers it until the runner is started again. This
-settle-last ordering prevents a failed dead-letter handoff from becoming silent
-loss. The full settlement sequence is described in
-[Lifecycle and shutdown](/advanced-topics/lifecycle-and-shutdown).
+A copy that can never be published is different. If the broker refuses the copy because it is too large, or its headers cannot be encoded, every redelivery would fail the same way. F1 acknowledges the original and reports the deliberate drop through `WithErrorHandler`. A retry copy that is too large is first sent through the dead-letter path; if that copy is also unpublishable, the same drop applies.
 
-A successor that can never be published is the one exception. When the broker
-refuses a dead-letter copy as too large, or the copy's headers cannot be
-encoded, every redelivery would fail the same way and so would every restart.
-F1 acknowledges the original and reports the drop through `WithErrorHandler`
-instead of stopping the subscription. The report names the event, the
-destination, the death reason, and the cause. A retry copy the broker refuses
-as too large is dead-lettered first, and if that dead-letter copy is then
-unpublishable too, the same drop applies. Dropping is deliberate here: apart
-from a dead-letter route that does not exist, this is the only case where F1
-discards a delivery on its own initiative, without the application selecting
-`f1.Drop` or an unmatched-event policy. A failure that can heal never drops, so
-transient, permission, and fatal successor failures still stop the
-subscription.
+## Dead letters and discarded events
 
-## Drop and unmatched events
+A dead-letter copy keeps the original body and envelope metadata, then adds a death reason and the last error. Automatic reasons include `terminal`, `max_attempts`, `panic`, `decode`, `expired`, `unmatched`, and `poison`.
 
-Use `f1.Drop` only when the event is intentionally handled without applying an
-effect and should not be retained for later inspection. F1 acknowledges it and
-notifies `Subscription.OnDiscarded` with `DiscardDropped`:
+`Subscription.OnDeadLetter` receives a confirmed dead-letter outcome. `Subscription.OnDiscarded` receives an unmatched or explicitly dropped event. These callbacks are for logs, metrics, and alerts, not correctness-critical workflow steps. They run asynchronously with bounded notification contexts, so a slow or panicking callback must not stall delivery or shutdown.
 
-```go
-if alreadyCancelled(order) {
-	return f1.Drop(errors.New("order was cancelled before processing"))
-}
-```
+Use `f1.Drop` only when the event is intentionally handled without applying an effect and should not be retained. The default `UnmatchedPolicy` is `f1.Ignore`, which acknowledges an event without a matching handler and reports `DiscardUnmatched`. Use `f1.DeadLetter` when unmatched events must be retained.
 
-An event with no matching handler is a separate case. The default
-`UnmatchedPolicy` is `f1.Ignore`: F1 acknowledges the event and reports
-`DiscardUnmatched` through `OnDiscarded`. Set `UnmatchedPolicy: f1.DeadLetter`
-when an unmatched event must be retained instead of silently discarded.
+## Make effects idempotent
 
-Do not use `Drop` for a transient dependency failure. It removes the event
-from the delivery path just as surely as a successful acknowledgement.
+F1 publishes a copy before acking the current delivery, but a process can still stop after a handler's side effect and before the copy or the ack completes. The original or its copy may therefore be seen more than once.
 
-## Idempotency and duplicate delivery
+Use [`Event.IdempotencyKey()`](/basics/message#delivery-identity-and-redelivery) as the input to application-owned deduplication. A producer can set the key with `WithIdempotencyKey`; otherwise F1 falls back to the event ID. `Event.Attempt()` is useful for diagnostics and policy decisions, but it is not an identity.
 
-Retry and dead-letter handoff are successor operations. F1 publishes the
-successor first and acknowledges the current delivery second, but a process can
-still stop after the handler's side effect and before either settlement step
-completes. The original or successor may therefore be observed more than once.
+## Read runtime failures
 
-Use [`Event.IdempotencyKey()`](/basics/message#delivery-identity-and-redelivery)
-as the input to application-owned deduplication when an effect must be safe to
-repeat. A producer can set the key with
-[`WithIdempotencyKey`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/publisher.go); otherwise F1 falls back to the
-event ID. The key is an input to the application's idempotency store, not a
-deduplication database managed by F1.
-
-`Event.Attempt()` is useful for diagnostics and policy decisions, but it is
-not an identity. Never use the attempt number as a deduplication key.
-
-## Runtime error visibility
-
-There are two different kinds of failure notification:
+The notification surfaces have different meanings.
 
 | Surface | Receives | Does not receive |
 | --- | --- | --- |
-| `Subscription.OnDeadLetter` | A confirmed dead-letter outcome and its reason | A failed successor handoff that was not confirmed |
+| `Subscription.OnDeadLetter` | A confirmed dead-letter outcome and its reason | A dead-letter copy the broker has not confirmed |
 | `Subscription.OnDiscarded` | An unmatched or explicitly dropped event | Retried or dead-lettered handler errors |
-| `f1.WithErrorHandler` | Driver-level asynchronous errors, retry/dead-letter successor-publish failures, and a delivery dropped because its successor can never be published | Ordinary errors returned by a handler |
+| `f1.WithErrorHandler` | Driver errors, failures to publish a retry or dead-letter copy, and a dropped copy that can never be published | Ordinary handler errors already covered by retry or dead-letter policy |
 
-Configure [`WithErrorHandler`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/options.go) for runtime failures that the
-handler result cannot represent. The event argument identifies the affected
-delivery when there is one; it is `nil` for a connection-level error. The
-callback runs asynchronously with a bounded context and must remain safe to
-drop or repeat. Ordinary handler errors are already represented by the retry
-or dead-letter policy and are not sent to this callback a second time.
+The event passed to `WithErrorHandler` identifies the affected delivery when there is one. It is `nil` for a connection-level error. The callback runs asynchronously with a bounded context and must remain safe to drop or repeat.
 
-## Test the policy, not a driver
+## Go further
 
-Failure behavior is easiest to verify with [`f1test`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/f1test/f1test.go),
-which uses the in-memory driver and a manually advanced clock:
-
-```go
-func TestOrderFailurePolicy(t *testing.T) {
-	client := f1test.NewClient(t)
-	client.Deliver(t, "orders.created.v1", Order{ID: "order-123"})
-
-	// Let the handler run, then move fake time across the configured retry tier.
-	client.Advance(time.Minute)
-
-	deadLetters := client.DLQ()
-	if len(deadLetters) != 1 {
-		t.Fatalf("dead letters = %d, want 1", len(deadLetters))
-	}
-}
-```
-
-The example shows the test surface; a real test should register a subscription
-whose handler deliberately returns the failure being exercised and then assert
-the complete policy: attempt count, delay, dead-letter reason, body, and
-whether `OnDiscarded` or `OnDeadLetter` ran. Use `Advance` instead of sleeping.
-Cover at least:
-
-1. an ordinary error that retries and then reaches `ReasonMaxAttempts`;
-2. `RetryAfter` choosing an explicit delay;
-3. `Terminal` bypassing the retry ladder;
-4. `Drop` acknowledging without a dead-letter copy;
-5. malformed or expired input becoming a dead letter; and
-6. duplicate-safe business effects using the idempotency key.
-
-The in-memory driver and test helper are useful for policy tests, but driver
-compatibility still belongs to the driver's conformance suite. See
-[`f1test`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/f1test/f1test.go) and the [driver conformance package](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/tree/main/driver/conformance)
-for the two boundaries.
-
-## Common mistakes
-
-- Returning `nil` after logging a failure, which acknowledges the event.
-- Retrying a deterministic decode or validation failure instead of returning
-  `f1.Terminal`.
-- Returning a wrapped classification without `%w`, which hides the original
-  error from F1.
-- Assuming `WithDetails` changes retry routing; it only adds terminal or
-  max-attempts dead-letter diagnostics.
-- Using `Attempt()` as a business identity.
-- Performing manual driver acknowledgement or retry logic from a handler,
-  middleware, or notification callback.
-- Treating `OnDeadLetter`, `OnDiscarded`, or `WithErrorHandler` as a durable
-  workflow step instead of an observation surface.
-
-## Continue from here
-
-- [Message](/basics/message) - envelope metadata, identity, and
-  at-least-once handler design;
-- [Publisher and subscriber](/basics/pubsub) - the publish/consume
-  boundary and handler lifecycle;
-- [Middleware](/basics/middleware) - where cross-cutting handler logic
-  runs and where classification remains outside the chain;
-- [Lifecycle and shutdown](/advanced-topics/lifecycle-and-shutdown) - successor
-  handoff, acknowledgement, release, and drain behavior; and
-- [`errors.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/errors.go), [`worker.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/worker.go), and
-  [`subscription.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/subscription.go) - executable failure contracts.
+- [Ordering and scheduling](/advanced-topics/ordering-and-scheduling) - retry lanes, fairness, and per-key order;
+- [Lifecycle and shutdown](/advanced-topics/lifecycle-and-shutdown) - drain and the ack-last close order; and
+- [Message](/basics/message) - envelope identity and idempotent effects.

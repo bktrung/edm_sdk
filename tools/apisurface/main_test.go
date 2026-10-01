@@ -70,6 +70,7 @@ func TestLoadFixtureReadsDocumentedNotBuilt(t *testing.T) {
 		t.Fatalf("fixture = %q, %v, %v; want sample, [Present], [Translator]", packageName, symbols, gaps)
 	}
 }
+
 func TestSurfaceDifferencesReportFixtureOnlySymbols(t *testing.T) {
 	missing, stale, closed := surfaceDifferences(
 		[]string{"Present", "New"},
@@ -86,6 +87,7 @@ func TestSurfaceDifferencesReportFixtureOnlySymbols(t *testing.T) {
 		t.Fatalf("closed = %v, want []", closed)
 	}
 }
+
 func TestSurfaceDifferencesAllowDocumentedNotBuiltSymbols(t *testing.T) {
 	missing, stale, closed := surfaceDifferences(
 		[]string{"Present"},

@@ -14,32 +14,6 @@ func TestResolveTierHoldsAtLastTier(t *testing.T) {
 	}
 }
 
-func TestResolveRetryAfterRoutesToNearestTierNominalDelay(t *testing.T) {
-	cfg := Config{Tiers: []time.Duration{time.Second, 2 * time.Second}}
-	tier, delay := ResolveRetryAfter(cfg, 5*time.Minute)
-	if tier != 2 || delay != 2*time.Second {
-		t.Fatalf("far ResolveRetryAfter() = tier %d delay %s", tier, delay)
-	}
-	tier, delay = ResolveRetryAfter(cfg, 1900*time.Millisecond)
-	if tier != 2 || delay != 2*time.Second {
-		t.Fatalf("near-top ResolveRetryAfter() = tier %d delay %s", tier, delay)
-	}
-	tier, delay = ResolveRetryAfter(cfg, 1200*time.Millisecond)
-	if tier != 1 || delay != time.Second {
-		t.Fatalf("near-bottom ResolveRetryAfter() = tier %d delay %s", tier, delay)
-	}
-}
-
-func TestResolveRetryAfterHandlesEmptyAndSingleTier(t *testing.T) {
-	if tier, delay := ResolveRetryAfter(Config{}, time.Second); tier != 0 || delay != 0 {
-		t.Fatalf("empty ladder = %d, %s", tier, delay)
-	}
-	cfg := Config{Tiers: []time.Duration{2 * time.Second}}
-	if tier, delay := ResolveRetryAfter(cfg, 5*time.Second); tier != 1 || delay != 2*time.Second {
-		t.Fatalf("single ladder = %d, %s", tier, delay)
-	}
-}
-
 func TestDelayForUsesExponentialDefaultsAndMaximum(t *testing.T) {
 	if got := (Config{}).DelayFor(0); got != time.Second {
 		t.Fatalf("zero config first delay = %s, want 1s", got)
@@ -139,12 +113,6 @@ func TestDelayForDefensiveDefaults(t *testing.T) {
 				t.Fatalf("DelayFor(%d) with %+v = %s, want %s", test.attempt, test.cfg, got, test.want)
 			}
 		})
-	}
-}
-
-func TestResolveRetryAfterClampsNegativeRequest(t *testing.T) {
-	if tier, delay := ResolveRetryAfter(Config{Tiers: []time.Duration{time.Second}}, -time.Second); tier != 1 || delay != time.Second {
-		t.Fatalf("negative request = %d, %s", tier, delay)
 	}
 }
 

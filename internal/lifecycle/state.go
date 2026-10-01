@@ -91,6 +91,14 @@ func allowed(from, to State) bool {
 	if to == Aborted && from != Closed && from != Aborted {
 		return true
 	}
+	// Aborted means a shutdown that failed part way and may be retried, so a
+	// retried drain is a legal move: the state it leaves is the same Draining
+	// the first attempt ran in, and the resources it did not release are still
+	// there for the second attempt to release. Closed is the one state that
+	// does not move again.
+	if from == Aborted && to == Draining {
+		return true
+	}
 	switch from {
 	case Starting:
 		return to == Ready

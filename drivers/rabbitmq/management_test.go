@@ -1,8 +1,10 @@
 package rabbitmq
 
 import (
+	"encoding/json"
 	"errors"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
@@ -11,6 +13,72 @@ import (
 
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/driver"
 )
+
+func TestManagementClientListsAndDeletesExchanges(t *testing.T) {
+	const username = "management-user"
+	const password = "management-password"
+	const exchange = "orders/fanout"
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if usernameFromRequest, requestPassword, ok := r.BasicAuth(); !ok || usernameFromRequest != username || requestPassword != password {
+			t.Errorf("BasicAuth() = %q, %q, %t; want %q, %q, true", usernameFromRequest, requestPassword, ok, username, password)
+		}
+		switch {
+		case r.Method == http.MethodGet && r.URL.EscapedPath() == "/api/exchanges/%2F":
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode([]managementExchange{{Name: exchange}})
+		case r.Method == http.MethodDelete && r.URL.EscapedPath() == "/api/exchanges/%2F/orders%2Ffanout":
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	client := &managementClient{
+		baseURL:  server.URL,
+		username: username,
+		password: password,
+		vhost:    "/",
+		client:   *server.Client(),
+	}
+	exchanges, err := client.listExchanges(t.Context())
+	if err != nil {
+		t.Fatalf("listExchanges: %v", err)
+	}
+	if len(exchanges) != 1 || exchanges[0].Name != exchange {
+		t.Fatalf("listExchanges() = %+v, want one exchange named %q", exchanges, exchange)
+	}
+	deleted, err := client.deleteExchange(t.Context(), exchange)
+	if err != nil {
+		t.Fatalf("deleteExchange: %v", err)
+	}
+	if !deleted {
+		t.Fatal("deleteExchange() = false, want true")
+	}
+}
+
+func TestManagementClientDeleteExchangeTreatsNotFoundAsAbsent(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodDelete {
+			t.Errorf("request method = %s, want DELETE", r.Method)
+		}
+		http.NotFound(w, r)
+	}))
+	defer server.Close()
+	client := &managementClient{
+		baseURL: server.URL,
+		vhost:   "/",
+		client:  *server.Client(),
+	}
+
+	deleted, err := client.deleteExchange(t.Context(), "missing")
+	if err != nil {
+		t.Fatalf("deleteExchange: %v", err)
+	}
+	if deleted {
+		t.Fatal("deleteExchange() = true, want false for 404")
+	}
+}
 
 func TestManagementClientHasExplicitTimeout(t *testing.T) {
 	cfg := driver.Config{ConnectTimeout: 7 * time.Second}
@@ -23,23 +91,45 @@ func TestManagementClientHasExplicitTimeout(t *testing.T) {
 	}
 }
 
-func TestManagementClientDerivesStandardPort(t *testing.T) {
-	client, err := newManagementClient("amqp://localhost:5672/", driver.Config{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if client.baseURL != "http://localhost:15672" {
-		t.Fatalf("management base URL = %q, want standard management endpoint", client.baseURL)
-	}
-}
-
-func TestManagementClientDerivesAlternatePort(t *testing.T) {
-	client, err := newManagementClient("amqp://localhost:25672/", driver.Config{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if client.baseURL != "http://localhost:35672" {
-		t.Fatalf("management base URL = %q, want alternate management endpoint", client.baseURL)
+// TestManagementClientPort pins where the management API is addressed: the
+// AMQP port plus 10000 when nothing is configured, the configured port when one
+// is, the scheme following the AMQP transport, and a refusal for a port outside
+// the valid range whichever way it was reached.
+func TestManagementClientPort(t *testing.T) {
+	for _, test := range []struct {
+		name     string
+		endpoint string
+		port     string
+		want     string
+	}{
+		{name: "derived from the standard port", endpoint: "amqp://localhost:5672/", want: "http://localhost:15672"},
+		{name: "derived from an alternate port", endpoint: "amqp://localhost:25672/", want: "http://localhost:35672"},
+		{name: "derived port out of range", endpoint: "amqp://localhost:55536/"},
+		{name: "configured", endpoint: "amqp://localhost:5673/", port: "18080", want: "http://localhost:18080"},
+		{name: "configured over amqps", endpoint: "amqps://broker.example:5671/", port: "18080", want: "https://broker.example:18080"},
+		{name: "configured not a port", endpoint: "amqp://localhost:5672/", port: "not-a-port"},
+		{name: "configured zero", endpoint: "amqp://localhost:5672/", port: "0"},
+		{name: "configured out of range", endpoint: "amqp://localhost:5672/", port: "65536"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			cfg := driver.Config{}
+			if test.port != "" {
+				cfg.DriverOptions = map[string]string{managementPortOption: test.port}
+			}
+			client, err := newManagementClient(test.endpoint, cfg)
+			if test.want == "" {
+				if err == nil || client != nil {
+					t.Fatalf("newManagementClient(%q) = client %v, error %v; want an invalid port error", test.endpoint, client, err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if client.baseURL != test.want {
+				t.Fatalf("management base URL = %q, want %q", client.baseURL, test.want)
+			}
+		})
 	}
 }
 
@@ -58,10 +148,8 @@ type managementVhostCase struct {
 // reading fails here and names the spelling that moved.
 //
 // An endpoint with no authority is the one spelling whose vhost the management
-// client never derives: the AMQP library reads "orders" from amqp://///orders
-// through its triple-slash branch and would connect to the default host, but
-// the constructor refuses any endpoint without a host long before that, so the
-// row pins the refusal instead.
+// client refuses before derivation: the driver does not support endpoints
+// without an explicit host, so the row pins that refusal instead.
 func managementVhostCases() []managementVhostCase {
 	return []managementVhostCase{
 		{
@@ -97,8 +185,8 @@ func managementVhostCases() []managementVhostCase {
 		},
 		{
 			name:     "authority-less endpoint is refused before any derivation",
-			endpoint: "amqp://///orders",
-			wantErr:  "missing host",
+			endpoint: "amqp:///orders",
+			wantErr:  "without a host is unsupported",
 		},
 	}
 }
@@ -177,10 +265,35 @@ func TestManagementClientRejectsEndpointTheAMQPParserRefuses(t *testing.T) {
 	}
 }
 
-func TestManagementClientRejectsInvalidDerivedPort(t *testing.T) {
-	client, err := newManagementClient("amqp://localhost:55536/", driver.Config{})
-	if err == nil || client != nil {
-		t.Fatalf("newManagementClient() = client %v, error %v; want invalid derived port error", client, err)
+// TestManagementClientEndpointValidityDoesNotDependOnConfiguredVhost keeps the
+// AMQP parser as the authority for endpoint validity regardless of whether the
+// management vhost comes from the endpoint or a driver option.
+func TestManagementClientEndpointValidityDoesNotDependOnConfiguredVhost(t *testing.T) {
+	tests := []struct {
+		name     string
+		endpoint string
+		accepted bool
+	}{
+		{name: "valid endpoint with host", endpoint: "amqp://localhost:5672/orders", accepted: true},
+		{name: "AMQP-invalid whitespace", endpoint: "amqp://localhost:5672/order s"},
+		{name: "host-less endpoint", endpoint: "amqp:///orders"},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			for _, configured := range []bool{false, true} {
+				t.Run(map[bool]string{false: "vhost from endpoint", true: "configured vhost"}[configured], func(t *testing.T) {
+					options := map[string]string{}
+					if configured {
+						options["rabbitmq.vhost"] = "configured-vhost"
+					}
+					client, err := newManagementClient(test.endpoint, driver.Config{DriverOptions: options})
+					if (err == nil) != test.accepted {
+						t.Fatalf("newManagementClient(%q) with configured=%t = client %v, error %v; accepted=%t", test.endpoint, configured, client, err, test.accepted)
+					}
+				})
+			}
+		})
 	}
 }
 
@@ -333,37 +446,20 @@ func TestManagementClientUsesResolvedVhostCredentialsAndTLS(t *testing.T) {
 	}
 }
 
-func TestManagementClientUsesConfiguredPort(t *testing.T) {
-	cfg := driver.Config{DriverOptions: map[string]string{managementPortOption: "18080"}}
-	client, err := newManagementClient("amqp://localhost:5673/", cfg)
-	if err != nil {
-		t.Fatal(err)
+func TestManagementClientUsesConfiguredTLSServerName(t *testing.T) {
+	cfg := driver.Config{
+		TLS: &driver.TLSConfig{Enabled: true, InsecureSkipVerify: true, ServerName: "broker.alias.example"},
 	}
-	if client.baseURL != "http://localhost:18080" {
-		t.Fatalf("management base URL = %q, want configured port", client.baseURL)
-	}
-}
-
-func TestManagementClientUsesConfiguredPortForAMQPSTransport(t *testing.T) {
-	cfg := driver.Config{DriverOptions: map[string]string{managementPortOption: "18080"}}
 	client, err := newManagementClient("amqps://broker.example:5671/", cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if client.baseURL != "https://broker.example:18080" {
-		t.Fatalf("management base URL = %q, want configured HTTPS port", client.baseURL)
+	transport, ok := client.client.Transport.(*http.Transport)
+	if !ok || transport.TLSClientConfig == nil {
+		t.Fatalf("management TLS transport = %#v, want configured TLS client", client.client.Transport)
 	}
-}
-
-func TestManagementClientRejectsInvalidConfiguredPort(t *testing.T) {
-	for _, configured := range []string{"not-a-port", "0", "65536"} {
-		t.Run(configured, func(t *testing.T) {
-			cfg := driver.Config{DriverOptions: map[string]string{managementPortOption: configured}}
-			client, err := newManagementClient(defaultEndpoint, cfg)
-			if err == nil || client != nil {
-				t.Fatalf("newManagementClient() = client %v, error %v; want invalid port error", client, err)
-			}
-		})
+	if transport.TLSClientConfig.ServerName != "broker.alias.example" {
+		t.Fatalf("management tls.Config.ServerName = %q, want %q", transport.TLSClientConfig.ServerName, "broker.alias.example")
 	}
 }
 

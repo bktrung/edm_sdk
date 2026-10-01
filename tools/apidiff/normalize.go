@@ -1,3 +1,5 @@
+// Command apidiff-normalize normalizes Go API export data for stable
+// compatibility comparisons.
 package main
 
 import (

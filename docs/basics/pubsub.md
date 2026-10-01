@@ -14,11 +14,11 @@ surface is split into a client, a publisher, a subscription, and a runner:
 
 | Responsibility | F1 entry point | What it owns |
 | --- | --- | --- |
-| Connect to the selected transport | [`f1.New`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/client.go) with [`f1.WithDriver`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/options.go) | Driver connection and client resources |
-| Publish events | [`Client.Publisher`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/client.go) | Encoding, envelope construction, and durable publish acknowledgement |
+| Connect to the selected transport | [`f1.New`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/client.go) with `f1.WithDriver` | Driver connection and client resources |
+| Publish events | `Client.Publisher` | Encoding, envelope construction, and durable publish acknowledgement |
 | Declare consumption | [`Client.Subscribe`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/subscription.go) | Subscription validation, topics, handlers, and delivery policy |
-| Run consumption | [`Runner.Run`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/worker.go) | Fetching, dispatch, retries, settlement, and reconnect behavior |
-| Stop consumption | [`Runner.Drain`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/worker.go) or [`Client.Close`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/client.go) | Stop fetching, settle in-flight work, and release resources |
+| Run consumption | [`Runner.Run`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/worker.go) | Fetching, dispatch, retries, [the final ack or nack](/learn/glossary#settlement), and reconnect behavior |
+| Stop consumption | [`Runner.Drain`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/worker.go) or [`Client.Close`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/client.go) | Stop fetching, finish in-flight work, and release resources |
 
 The application-facing code stays on the F1 side of this boundary. A concrete
 driver is selected in composition code and passed through `WithDriver`; handler
@@ -47,12 +47,12 @@ selected driver, and waits for durable acknowledgement before returning. Its
 context controls the publish operation; use a context with an appropriate
 deadline rather than an unbounded background operation.
 
-The event type is the handler lookup key. F1 derives the logical topic by
+The event type is the handler lookup key. F1 derives the [topic](/learn/glossary#logical-topic) by
 removing a trailing version segment such as `.v1`; use `WithTopic` only when an
 explicit topic is part of the application contract. Routing and workflow
 metadata are added with `PublishOption` constructors such as `WithKey`,
 `WithSubject`, `WithIdempotencyKey`, and `WithCorrelationID`. The complete
-option contract lives in [`publisher.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/publisher.go).
+option contract lives in `publisher.go`.
 
 ### Batch publishing
 
@@ -76,11 +76,18 @@ result, err := client.Publisher().PublishBatch(ctx, []f1.Message{
 if err != nil {
 	return fmt.Errorf("publish batch: %w", err)
 }
+for i, item := range result.Results {
+	if item.Err != nil {
+		return fmt.Errorf("publish batch item %d: %w", i, item.Err)
+	}
+}
 ```
 
-Batch publishing preserves input order in `BatchResult.Results` and makes no
-atomicity claim. Inspect each `MessageResult`; a transport-wide error is the
-method error, while an individual item failure is attached to that item. See
+Batch publishing preserves input order in `BatchResult.Results`, and it is not
+atomic. A nil error from `PublishBatch` says the call itself went through, not
+that every message was published: a failure that affected the whole call is
+returned as the method error, while a message the broker rejected on its own
+appears as that item's `MessageResult.Err`, which the loop above checks. See
 the [publish flow](/development/publish-flow) for topology timing, partial failure,
 and close interaction.
 
@@ -91,10 +98,15 @@ not start fetching messages. The runner starts only when `Run` is called:
 
 ```go
 runner, err := client.Subscribe(ctx, f1.Subscription{
-	Name:   "order-projector",
-	Topics: []string{"orders.placed"},
+	Name:           "order-projector",
+	Topics:         []string{"orders.placed"},
+	Concurrency:    4,
+	Prefetch:       16,
+	Retry:          f1.RetryConfig{MaxAttempts: 3},
+	HandlerTimeout: 10 * time.Second,
 	Handlers: map[string]f1.Handler{
-		"orders.placed.v1": f1.HandlerFunc(handleOrderPlaced),
+		"orders.placed.v1":  f1.HandlerFunc(handleOrderPlaced),
+		"orders.shipped.v1": f1.Typed(handleOrderShipped),
 	},
 })
 if err != nil {
@@ -107,38 +119,62 @@ if runErr != nil && !errors.Is(runErr, context.Canceled) {
 }
 ```
 
-The subscription name identifies the consumer group or equivalent driver
-ownership scope. Topics select the logical destinations to consume. The
-handler map selects a handler by the exact event type emitted by the publisher.
+The subscription name identifies the [consumer group](/learn/glossary#consumer-group) or equivalent driver ownership
+scope. A new subscription with the same name joins that scope; a different name creates an independent
+scope. The name becomes one segment of the destination names, so it may use only letters, digits, `-`, and `_`. Topics select the destinations to consume, and each topic may appear once: `orders` and `orders.v2` name the same topic. The handler map first checks for an exact
+event-type key. When no exact key exists, a key ending in `*` matches by prefix, and the longest matching
+prefix wins. If no key matches, `UnmatchedPolicy` decides whether F1 ignores or dead-letters the event.
+
+| Handler keys | Event type | Handler |
+| --- | --- | --- |
+| `orders.placed.v1`, `orders.*` | `orders.placed.v1` | `orders.placed.v1` (exact) |
+| `orders.*`, `orders.placed.*` | `orders.placed.v2` | `orders.placed.*` (longest prefix) |
+| `orders.*` | `payments.refunded.v1` | None (`UnmatchedPolicy`) |
+
 Retry, concurrency, prefetch, ordering, and unmatched-event behavior are
-subscription policy; their owning fields are documented in
-[`Subscription`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/subscription.go).
+subscription policy; their owning fields are documented in `Subscription`,
+and [Ordering and scheduling](/advanced-topics/ordering-and-scheduling) explains how the
+concurrency, prefetch, and fairness fields interact.
 
-The handler receives an [`f1.Event`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/event.go), not a driver message. It
-can decode the payload and inspect F1 metadata while remaining independent of
-transport-specific delivery references.
+The handler receives an `*f1.Event`, not a driver message. Decode the payload into a service-owned
+type and return an error when the effect was not completed:
 
-## Handler results settle deliveries
+```go
+func handleOrderCreated(ctx context.Context, event *f1.Event) error {
+	var payload OrderCreated
+	if err := event.Decode(&payload); err != nil {
+		return f1.Terminal(fmt.Errorf("decode order event: %w", err))
+	}
+	if err := processOrder(ctx, payload); err != nil {
+		return err
+	}
+	return nil
+}
+```
+
+For a known payload type, `f1.Typed` performs the decode and makes a decode failure terminal on the
+first attempt:
+
+```go
+func handleOrderShipped(ctx context.Context, event *f1.Event, payload OrderShipped) error {
+	return processOrder(ctx, payload)
+}
+```
+
+A handler can read the event ID, type, subject, attempt number, priority, headers, correlation and
+causation identifiers, the raw payload, and the stable idempotency key. Use the idempotency key when
+applying an effect that must be safe across redelivery.
+
+## Handler results decide the ack
 
 F1 does not require application handlers to call `Ack` or `Nack`. The returned
-error classifies the outcome, and the runtime performs the corresponding
-settlement:
-
-| Handler result | Delivery behavior |
-| --- | --- |
-| `nil` | Acknowledge the event as handled. |
-| Ordinary error | Apply the subscription retry policy. |
-| `f1.RetryAfter(err, delay)` | Retry at the ladder tier nearest the requested delay. |
-| `f1.Terminal(err)` | Stop retrying and dead-letter the event. |
-| `f1.Drop(err)` | Acknowledge the event without applying its effect or retaining a copy. |
+error decides the outcome, and F1 performs the matching ack or nack. The full
+table of results is in [Message](/basics/message#the-handler-result-decides-the-ack).
 
 Decode failures and permanent validation failures should normally be terminal.
 Transient downstream failures should return their ordinary error so the retry
 policy can decide when to try again. Return `nil` only after the application
 effect has completed.
-
-The classification helpers are defined in [`errors.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/errors.go), and
-the dispatch path that applies them is owned by [`worker.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/worker.go).
 
 ## At-least-once delivery
 
@@ -161,7 +197,7 @@ The service that owns the side effect owns its idempotency decision. The
 
 Use `Runner.Drain` when stopping one subscription while the client remains in
 use. Drain stops fetching new messages and waits for in-flight deliveries to
-settle.
+be acked.
 
 Use `Client.Close` at the process boundary. It drains registered runners, waits
 for accepted publishes, and closes the driver's producer and connection
@@ -177,13 +213,11 @@ if err := client.Close(shutdownCtx); err != nil {
 ```
 
 For a complete signal-driven shutdown sequence, see [Getting started](/learn/getting-started)
-and the [graceful shutdown guide](/user-guide/graceful-shutdown). The
-client lifecycle contract is implemented in [`client.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/client.go) and
-the runner drain contract in [`worker.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/worker.go).
+and [Lifecycle and shutdown](/advanced-topics/lifecycle-and-shutdown).
 
 ## Driver portability
 
-The [`driver.Driver`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/driver/driver.go) interface is the transport
+The `driver.Driver` interface is the transport
 boundary. F1 opens the selected driver, creates producer and consumer resources,
 and keeps envelope, routing, retry, and handler semantics in the core.
 
@@ -194,13 +228,13 @@ capabilities, not assumptions. The [driver and capabilities guide](/drivers-and-
 explains that boundary and its portability rules.
 
 When implementing a new driver, use the public driver interfaces and the
-[conformance package](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/tree/main/driver/conformance) as the executable contract.
+conformance package as the executable contract.
 Do not make application handlers depend on driver transport types merely to
 access broker-specific behavior.
 
 ## Testing the pub/sub boundary
 
-Use [`f1test`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/f1test/f1test.go) for deterministic handler tests. It
+Use `f1test` for deterministic handler tests. It
 provides the normal client and runner APIs backed by an in-memory driver, plus
 helpers for delivering events, observing accepted messages, advancing deferred
 delivery time, and inspecting dead-letter output.
@@ -209,15 +243,13 @@ Use driver conformance tests when validating a driver implementation. Keep
 application behavior tests focused on event contracts, handler outcomes,
 idempotency, and shutdown rather than on broker-specific delivery references.
 
-## Continue from here
+## Go further
 
-- [Message](/basics/message) - event payloads, envelopes, headers, metadata, and
-  delivery identity;
-- [Publishing events](/user-guide/publishing-events) - publish options,
-  routing metadata, and batches;
-- [Consuming events](/user-guide/consuming-events) - handler registration,
-  event decoding, ordering, and capabilities;
+- [Message](/basics/message) - publish options, routing metadata, and batches;
+- [Failure handling](/advanced-topics/failure-handling) - retry, terminal, drop, and dead-letter;
+- [Ordering and scheduling](/advanced-topics/ordering-and-scheduling) - ordered mode and the
+  concurrency and prefetch knobs;
 - [Publish flow](/development/publish-flow) - publisher internals and acknowledgement
   timing; and
-- [Consume flow](/development/consume-flow) - runner startup, dispatch, settlement,
+- [Consume flow](/development/consume-flow) - runner startup, dispatch, acks,
   and reconnect behavior.

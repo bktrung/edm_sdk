@@ -142,49 +142,93 @@ func TestErrorHandlerReceivesDriverError(t *testing.T) {
 	}
 }
 
+// failingPublishProducer fails every publish with the cause it was given, so a
+// test can drive the successor hand-off path with a chosen cause.
+type failingPublishProducer struct{ err error }
+
+func (p *failingPublishProducer) Publish(context.Context, ...driver.OutboundMessage) error {
+	return p.err
+}
+
+func (p *failingPublishProducer) Close(context.Context) error { return nil }
+
 // TestErrorHandlerReceivesSuccessorHandoffFailure proves a terminal retry or
 // dead-letter hand-off failure reaches WithErrorHandler with a non-nil
-// Event identifying the delivery whose successor could not be published.
+// Event identifying the delivery whose successor could not be published. It
+// also proves the reported error is the core's own hand-off failure: it keeps
+// the cause reachable, and it reports the classification the cause carries
+// rather than claiming a classified driver failure for an unclassified cause.
 func TestErrorHandlerReceivesSuccessorHandoffFailure(t *testing.T) {
 	t.Parallel()
-	recorder := newErrorHandlerRecorder()
-	consumer := newDispatchConsumer()
-	client, runner := newErrorHandlerRunner(t, nil, consumer, recorder.handle)
-	defer func() { _ = client.Close(context.Background()) }()
-	client.producerHandle = &retryBridgeFailingProducer{}
+	cases := []struct {
+		name           string
+		cause          error
+		wantKind       driver.Kind
+		wantClassified bool
+	}{
+		{
+			name:  "unclassified cause stays unclassified",
+			cause: errors.New("successor publish failed"),
+		},
+		{
+			name:           "classified cause keeps its kind",
+			cause:          &driver.Error{Driver: "test", Op: "publish", K: driver.KindNotFound, Err: errors.New("no route")},
+			wantKind:       driver.KindNotFound,
+			wantClassified: true,
+		},
+	}
+	for _, test := range cases {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			recorder := newErrorHandlerRecorder()
+			consumer := newDispatchConsumer()
+			client, runner := newErrorHandlerRunner(t, nil, consumer, recorder.handle)
+			defer func() { _ = client.Close(context.Background()) }()
+			client.producerHandle = &failingPublishProducer{err: test.cause}
 
-	settler := &retryBridgeSettler{}
-	envelope := Envelope{
-		SpecVersion:     "1.0",
-		ID:              "handoff-failure",
-		Source:          "/test/orders",
-		Type:            "orders.created.v1",
-		DataContentType: "application/protobuf",
-		Priority:        PriorityHigh,
-		Attempt:         1,
-	}
-	message := retryBridgeMessage(t, envelope, settler)
-	if retryAndSettle(runner, context.Background(), message, envelope, errors.New("temporary")) {
-		t.Fatal("retry successor hand-off was reported as successful")
-	}
-	recorder.waitForCall(t, time.Second)
-	if got := recorder.count(); got != 1 {
-		t.Fatalf("error handler calls = %d, want 1", got)
-	}
-	recorder.mu.Lock()
-	call := recorder.calls[0]
-	recorder.mu.Unlock()
-	if call.event == nil {
-		t.Fatal("event = nil, want the failed delivery's Event")
-	}
-	if got := call.event.ID(); got != envelope.ID {
-		t.Fatalf("event ID = %q, want %q", got, envelope.ID)
-	}
-	if err := call.event.Decode(&map[string]any{}); err == nil || err.Error() != "f1: event codec is unavailable" {
-		t.Fatalf("event.Decode() error = %v, want unavailable-codec error", err)
-	}
-	if _, ok := errors.AsType[*driver.Error](call.err); !ok {
-		t.Fatalf("error = %v, want a classified *driver.Error", call.err)
+			settler := &retryBridgeSettler{}
+			envelope := Envelope{
+				SpecVersion:     "1.0",
+				ID:              "handoff-failure",
+				Source:          "/test/orders",
+				Type:            "orders.created.v1",
+				DataContentType: "application/protobuf",
+				Priority:        PriorityHigh,
+				Attempt:         1,
+			}
+			message := retryBridgeMessage(t, envelope, settler)
+			if retryAndSettle(runner, context.Background(), message, envelope, errors.New("temporary"), &deliveryState{}) {
+				t.Fatal("retry successor hand-off was reported as successful")
+			}
+			recorder.waitForCall(t, time.Second)
+			if got := recorder.count(); got != 1 {
+				t.Fatalf("error handler calls = %d, want 1", got)
+			}
+			recorder.mu.Lock()
+			call := recorder.calls[0]
+			recorder.mu.Unlock()
+			if call.event == nil {
+				t.Fatal("event = nil, want the failed delivery's Event")
+			}
+			if got := call.event.ID(); got != envelope.ID {
+				t.Fatalf("event ID = %q, want %q", got, envelope.ID)
+			}
+			if err := call.event.Decode(&map[string]any{}); err == nil || err.Error() != "f1: event codec is unavailable" {
+				t.Fatalf("event.Decode() error = %v, want unavailable-codec error", err)
+			}
+			if !errors.Is(call.err, test.cause) {
+				t.Fatalf("error = %v, want the hand-off failure to carry the cause", call.err)
+			}
+			// The reported error is the core's own failure. Reporting a driver
+			// error here would claim an operation no driver performed, and the
+			// cause is what carries the hand-off's classification.
+			if _, ok := errors.AsType[*successorHandoffError](call.err); !ok {
+				t.Fatalf("error = %v, want the core's own hand-off failure", call.err)
+			}
+			if kind, classified := driver.Classify(call.err); classified != test.wantClassified || kind != test.wantKind {
+				t.Fatalf("driver.Classify(error) = %v, %v; want %v, %v", kind, classified, test.wantKind, test.wantClassified)
+			}
+		})
 	}
 }
 
@@ -216,7 +260,7 @@ func TestErrorHandlerNotInvokedForHandlerError(t *testing.T) {
 		Attempt:     1,
 	}
 	message := retryBridgeMessage(t, envelope, settler)
-	if !dispatchMessage(runner, context.Background(), message, &Envelope{}, new(bool)) {
+	if !dispatchMessage(runner, context.Background(), message, &Envelope{}, new(bool), &deliveryState{}) {
 		t.Fatal("delivery with a failing handler was not settled via the retry ladder")
 	}
 	if len(producer.messages) != 1 {
@@ -329,5 +373,44 @@ func TestErrorHandlerNotificationsAreBoundedAndDroppable(t *testing.T) {
 			t.Fatal("error handler did not finish after release")
 		}
 		timer.Stop()
+	}
+}
+
+// TestFailedReleaseAfterAHandoffFailureEndsTheGeneration pins what happens when
+// a successor publish exhausts its budget and the consumer then refuses to be
+// released. A released consumer would close its stream and end the generation;
+// this one stays open holding the delivery, so the generation is ended instead
+// of fetching on, and the client keeps the consumer to release again.
+func TestFailedReleaseAfterAHandoffFailureEndsTheGeneration(t *testing.T) {
+	t.Parallel()
+	client, runner := newErrorHandlerRunner(t, nil, newDispatchConsumer(), func(context.Context, *Event, error) {})
+	defer func() { _ = client.Close(context.Background()) }()
+	client.producerHandle = &failingPublishProducer{err: errors.New("successor publish failed")}
+	consumer := newAbortTeardownConsumer(nil, errors.New("consumer release failed"))
+	runner.consumer = consumer
+	generation, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	runner.cancel = cancel
+
+	envelope := Envelope{
+		SpecVersion: "1.0",
+		ID:          "handoff-release-failure",
+		Source:      "/test/orders",
+		Type:        "orders.created.v1",
+		Priority:    PriorityHigh,
+		Attempt:     1,
+	}
+	message := retryBridgeMessage(t, envelope, &retryBridgeSettler{})
+	if retryAndSettle(runner, context.Background(), message, envelope, errors.New("temporary"), &deliveryState{}) {
+		t.Fatal("retry successor hand-off was reported as successful")
+	}
+	if generation.Err() == nil {
+		t.Fatal("the generation kept running on a consumer that refused to be released")
+	}
+	client.mu.Lock()
+	kept := len(client.unreleasedConsumers)
+	client.mu.Unlock()
+	if kept != 1 {
+		t.Fatalf("kept consumers = %d, want the one that refused to be released", kept)
 	}
 }

@@ -1,11 +1,12 @@
 package rabbitmq
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net"
-	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -20,8 +21,8 @@ func TestDriverCapabilities(t *testing.T) {
 	if !caps.PerMessageAck || caps.NativeDelay || !caps.NativeDLQ {
 		t.Fatalf("capabilities = %#v, want per-message ack, no native delay, and native DLQ", caps)
 	}
-	if caps.NativePriority != driver.PriorityStrict || caps.NativePriorityLevels != 32 {
-		t.Fatalf("priority capabilities = %#v, want strict 32 levels", caps)
+	if caps.NativePriority != driver.PriorityNone || caps.NativePriorityLevels != 0 {
+		t.Fatalf("priority capabilities = %#v, want none: the driver applies no AMQP priority", caps)
 	}
 	if caps.Fanout != driver.FanoutAtPublish || !caps.OrderedByKey {
 		t.Fatalf("routing capabilities = %#v, want publish fanout and ordered keys", caps)
@@ -90,9 +91,30 @@ func TestQueueKindCapabilities(t *testing.T) {
 	}
 }
 
-func TestExpirationMillisClampsLargeDelay(t *testing.T) {
-	if got := expirationMillis(100 * 365 * 24 * time.Hour); got != "2147483647" {
-		t.Fatalf("expirationMillis(100 years) = %q, want 2147483647", got)
+// TestQuorumQueueKindReportsDurabilityUpgrade proves the upgrade a quorum
+// queue kind forces on a non-durable destination is visible. Quorum queues are
+// durable by definition, so the declare cannot honor a non-durable request, and
+// the connection reports the difference instead of leaving the caller to
+// discover it from the broker: once per destination, naming it.
+func TestQuorumQueueKindReportsDurabilityUpgrade(t *testing.T) {
+	if declared, _, _ := queueFlags(false, queueKindQuorum); !declared {
+		t.Fatal("queueFlags(non-durable, quorum) is not durable, want the kind to force durability")
+	}
+
+	var logged bytes.Buffer
+	c := &conn{queueKind: queueKindQuorum, logger: slog.New(slog.NewTextHandler(&logged, nil))}
+	c.reportDurabilityUpgrade("orders")
+	c.reportDurabilityUpgrade("orders")
+	c.reportDurabilityUpgrade("payments")
+
+	lines := strings.Split(strings.TrimSpace(logged.String()), "\n")
+	if len(lines) != 2 {
+		t.Fatalf("durability upgrade reported %d times, want one per destination: %q", len(lines), logged.String())
+	}
+	for index, destination := range []string{"orders", "payments"} {
+		if !strings.Contains(lines[index], destination) {
+			t.Fatalf("durability upgrade for %q = %q, want the destination named", destination, lines[index])
+		}
 	}
 }
 
@@ -120,6 +142,19 @@ func TestOpenRejectsEmptyEndpoints(t *testing.T) {
 	}
 	if kind, ok := driver.Classify(err); !ok || kind != driver.KindFatal {
 		t.Fatalf("Classify(Open error) = %v, %t, want fatal, true", kind, ok)
+	}
+}
+
+func TestValidateEndpointRejectsHostlessEndpoint(t *testing.T) {
+	err := validateEndpoint("amqp:///orders")
+	if err == nil {
+		t.Fatal("validateEndpoint() error = nil, want unsupported host-less endpoint error")
+	}
+	if !strings.Contains(err.Error(), "without a host is unsupported") {
+		t.Fatalf("validateEndpoint() error = %v, want unsupported-spelling detail", err)
+	}
+	if !strings.Contains(err.Error(), "amqp://localhost/orders") {
+		t.Fatalf("validateEndpoint() error = %v, want explicit-host example", err)
 	}
 }
 
@@ -152,13 +187,24 @@ func TestOpenAllowsAmqpsEndpoint(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			listener, accepted := listenerForOpenAttempt(t)
 			endpoint := fmt.Sprintf("amqps://0.0.0.0:%d/", listener.Addr().(*net.TCPAddr).Port)
-			ctx, cancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
+			opened := make(chan struct{})
+			go func() {
+				defer close(opened)
+				_, _ = (Driver{}).Open(ctx, driver.Config{Endpoints: []string{endpoint}, TLS: test.tls})
+			}()
 
-			_, _ = (Driver{}).Open(ctx, driver.Config{Endpoints: []string{endpoint}, TLS: test.tls})
-			if !receivedOpenAttempt(accepted) {
-				t.Fatal("Open() refused the amqps endpoint before dialing")
+			// The dial is the proof; stop the handshake retries once it lands.
+			select {
+			case <-accepted:
+			case <-opened:
+				if !receivedOpenAttempt(accepted) {
+					t.Fatal("Open() refused the amqps endpoint before dialing")
+				}
 			}
+			cancel()
+			<-opened
 		})
 	}
 }
@@ -390,63 +436,93 @@ func TestSizeRefusalLimit(t *testing.T) {
 	}
 }
 
-// TestSizeRefusalKinds covers the decision a window makes once the broker has
-// closed its channel for the size of one of its messages, with no broker and no
-// channel in the test. The rows are the shapes that race produces: the message
-// in front of the refused one is the one a quorum queue can leave unconfirmed,
-// a window can hold more than one message over the limit, and a message exactly
-// at the limit is publishable.
-func TestSizeRefusalKinds(t *testing.T) {
+// TestCloseBlame covers which messages a channel's close is the broker
+// refusing, with no broker and no channel in the test. The size rows are the
+// shapes the refusal race produces: the message in front of the refused one is
+// the one a quorum queue can leave unconfirmed, a segment can hold more than one
+// message over the limit, and a message exactly at the limit is publishable.
+// The missing-exchange rows use the reason the broker was measured to send,
+// including a name that carries quotes of its own, and prove a message routed
+// through the default exchange by queue name is never blamed.
+func TestCloseBlame(t *testing.T) {
 	const limit = 1 << 10
-	small := limit / 2
-	over := limit + 1
+	sizeClose := classifyPublishClose(&amqp.Error{
+		Code:   406,
+		Server: true,
+		Reason: fmt.Sprintf("PRECONDITION_FAILED - message size %d is larger than configured max size %d", limit+1, limit),
+	})
+	missingClose := func(exchange string) error {
+		return classifyPublishClose(&amqp.Error{Code: 404, Server: true, Reason: "NOT_FOUND - no exchange '" + exchange + "' in vhost '/'"})
+	}
+	body := func(length int) outboundMessage {
+		return outboundMessage{routingKey: "queue", publishing: amqp.Publishing{Body: make([]byte, length)}}
+	}
+	to := func(exchange string) outboundMessage { return outboundMessage{exchange: exchange} }
 	for _, test := range []struct {
-		name    string
-		lengths []int
-		decided int
-		want    []driver.Kind
+		name     string
+		close    error
+		messages []outboundMessage
+		want     []bool
+		named    bool
 	}{
 		{
-			name:    "the message in front of the refusal is unconfirmed",
-			lengths: []int{small, over},
-			decided: 0,
-			want:    []driver.Kind{driver.KindTransient, driver.KindTooLarge},
+			name:     "size: the message in front of the refusal is unconfirmed",
+			close:    sizeClose,
+			messages: []outboundMessage{body(limit / 2), body(limit + 1)},
+			want:     []bool{false, true},
+			named:    true,
 		},
 		{
-			name:    "two oversized messages in one window",
-			lengths: []int{over, small, over},
-			decided: 0,
-			want:    []driver.Kind{driver.KindTooLarge, driver.KindTransient, driver.KindTooLarge},
+			name:     "size: two oversized messages",
+			close:    sizeClose,
+			messages: []outboundMessage{body(limit + 1), body(limit / 2), body(limit + 1)},
+			want:     []bool{true, false, true},
+			named:    true,
 		},
 		{
-			name:    "only the last message is oversized",
-			lengths: []int{small, small, over},
-			decided: 0,
-			want:    []driver.Kind{driver.KindTransient, driver.KindTransient, driver.KindTooLarge},
+			name:     "size: a body exactly at the limit",
+			close:    sizeClose,
+			messages: []outboundMessage{body(limit)},
+			want:     []bool{false},
+			named:    true,
 		},
 		{
-			name:    "a body exactly at the limit",
-			lengths: []int{limit},
-			decided: 0,
-			want:    []driver.Kind{driver.KindTransient},
+			name:     "missing exchange: only messages to it",
+			close:    missingClose("orders"),
+			messages: []outboundMessage{to("orders"), to("orders.v2"), to("order"), to("")},
+			want:     []bool{true, false, false, false},
+			named:    true,
 		},
 		{
-			name:    "the messages the window already decided",
-			lengths: []int{small, over, over},
-			decided: 1,
-			want:    []driver.Kind{driver.KindTooLarge, driver.KindTooLarge},
+			name:     "missing exchange: a name with quotes",
+			close:    missingClose("it's 'quoted'"),
+			messages: []outboundMessage{to("it's 'quoted'"), to("it")},
+			want:     []bool{true, false},
+			named:    true,
 		},
 		{
-			name:    "every message of the window decided",
-			lengths: []int{small, over},
-			decided: 2,
-			want:    []driver.Kind{},
+			name:     "a close that names no message",
+			close:    classifyPublishClose(&amqp.Error{Code: 320, Server: true, Reason: "CONNECTION_FORCED - broker forced connection closure"}),
+			messages: []outboundMessage{to("orders")},
+		},
+		{
+			name:     "a close without a reason",
+			close:    classify("publish", driver.KindTransient, amqp.ErrClosed),
+			messages: []outboundMessage{body(limit + 1)},
 		},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			got := sizeRefusalKinds(test.lengths, test.decided, limit)
-			if !slices.Equal(got, test.want) {
-				t.Fatalf("sizeRefusalKinds(%v, %d, %d) = %v, want %v", test.lengths, test.decided, limit, got, test.want)
+			blamed, named := closeBlame(test.close)
+			if named != test.named {
+				t.Fatalf("closeBlame(%v) named = %t, want %t", test.close, named, test.named)
+			}
+			if !named {
+				return
+			}
+			for index, message := range test.messages {
+				if got := blamed(message); got != test.want[index] {
+					t.Fatalf("message %d (exchange %q, %d bytes) blamed = %t, want %t", index, message.exchange, len(message.publishing.Body), got, test.want[index])
+				}
 			}
 		})
 	}
@@ -519,104 +595,6 @@ func TestClassifyPublishClose(t *testing.T) {
 			}
 			if test.wantReason != "" && !strings.Contains(err.Error(), test.wantReason) {
 				t.Fatalf("error = %v, want the broker's reason %q to survive", err, test.wantReason)
-			}
-		})
-	}
-}
-
-// TestConfirmOrCloseServesAQueuedConfirmation pins the interleaving a refused
-// publish leaves behind: the client closes the return stream before the confirm
-// stream, so a confirmation it had already delivered can be sitting behind the
-// close. That confirmation is the broker saying it published the message the
-// window is waiting for, and reporting the close instead would report a message
-// the broker published as one the close covers.
-//
-// The second half is the same channel once those confirmations are gone: no
-// confirmation is left for the message being waited for, so the close is what
-// the window reads. The close is classified too large here, which is what the
-// limit it carries makes it; which message of the window that covers is decided
-// by the window, not by this path.
-func TestConfirmOrCloseServesAQueuedConfirmation(t *testing.T) {
-	closedReturns := make(chan amqp.Return)
-	close(closedReturns)
-	channel := &publishChannel{
-		confirms: make(chan amqp.Confirmation, 1),
-		returns:  closedReturns,
-		closes:   make(chan *amqp.Error, 1),
-	}
-	channel.closes <- &amqp.Error{
-		Code:   406,
-		Server: true,
-		Reason: "PRECONDITION_FAILED - message size 16777217 is larger than configured max size 16777216",
-	}
-	channel.confirms <- amqp.Confirmation{DeliveryTag: 1, Ack: true}
-
-	confirmation, err := channel.confirmOrClose(nil)
-	if err != nil {
-		t.Fatalf("confirmOrClose() error = %v, want the confirmation that was already delivered", err)
-	}
-	if !confirmation.Ack || confirmation.DeliveryTag != 1 {
-		t.Fatalf("confirmOrClose() = %+v, want the confirmation that was already delivered", confirmation)
-	}
-
-	_, err = channel.confirmOrClose(nil)
-	kind, classified := driver.Classify(err)
-	if err == nil || !classified || kind != driver.KindTooLarge {
-		t.Fatalf("confirmOrClose() error = %v, kind = %v, %t, want the close of a refused message", err, kind, classified)
-	}
-}
-
-// TestPublishChannelCloseError covers what a channel's close is reported as
-// once nothing is left of it but the client's notification: the reason the
-// broker gave when there is one, and the closed publish channel this driver has
-// always reported when there is not. Both shapes of "no reason" are pinned,
-// because only one of them is the state a reader expects the notification to be
-// in: the client closes the notification stream whether or not it had something
-// to send on it.
-func TestPublishChannelCloseError(t *testing.T) {
-	for _, test := range []struct {
-		name         string
-		notification *amqp.Error
-		closeStream  bool
-		want         driver.Kind
-		wantSentinel error
-	}{
-		{
-			name: "the broker refused the message for its size",
-			notification: &amqp.Error{
-				Code:   406,
-				Server: true,
-				Reason: "PRECONDITION_FAILED - message size 16777217 is larger than configured max size 16777216",
-			},
-			closeStream: true,
-			want:        driver.KindTooLarge,
-		},
-		{
-			name:         "the client closed the notification without sending one",
-			closeStream:  true,
-			want:         driver.KindTransient,
-			wantSentinel: amqp.ErrClosed,
-		},
-		{
-			name:         "no notification has arrived yet",
-			want:         driver.KindTransient,
-			wantSentinel: amqp.ErrClosed,
-		},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			closes := make(chan *amqp.Error, 1)
-			if test.notification != nil {
-				closes <- test.notification
-			}
-			if test.closeStream {
-				close(closes)
-			}
-			err := (&publishChannel{closes: closes}).closeError()
-			if kind, ok := driver.Classify(err); !ok || kind != test.want {
-				t.Fatalf("Classify(closeError()) = %v, %t, want %v, true", kind, ok, test.want)
-			}
-			if test.wantSentinel != nil && !errors.Is(err, test.wantSentinel) {
-				t.Fatalf("closeError() = %v, want %v", err, test.wantSentinel)
 			}
 		})
 	}

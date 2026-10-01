@@ -7,7 +7,19 @@
     "Client.DLQ",
     "Client.Deliver",
     "Client.Published",
-    "NewClient"
+    "NewClient",
+    "NewRecorder",
+    "ObserverCall",
+    "ObserverOp",
+    "ObserverOpFinish",
+    "ObserverOpRecord",
+    "ObserverOpStart",
+    "Recorder",
+    "Recorder.Calls",
+    "Recorder.Finish",
+    "Recorder.Record",
+    "Recorder.Start",
+    "Recorder.Wait"
   ],
   "documented-not-built": []
 }

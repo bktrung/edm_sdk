@@ -41,11 +41,11 @@ func runCapability(group *groupContext) {
 
 	group.Check("per-message settlement leaves sibling deliveries unsettled", func(t *testing.T) {
 		name := "capability.ack.independent"
-		producer := newProducer(t, group, profileDestination(group, name), driver.ProducerConfig{Effective: group.effective})
+		producer := newPlacedProducer(t, group, name, driver.ProducerConfig{Effective: group.effective})
 		consumer := newConsumer(t, group, profileDestination(group, name), 2)
 		if err := producer.Publish(group.ctx,
-			driver.OutboundMessage{Destination: name, Body: []byte("one")},
-			driver.OutboundMessage{Destination: name, Body: []byte("two")},
+			driver.OutboundMessage{Destination: name, Key: []byte(placementKey(0)), Body: []byte("one")},
+			driver.OutboundMessage{Destination: name, Key: []byte(placementKey(1)), Body: []byte("two")},
 		); err != nil {
 			t.Fatal(err)
 		}
@@ -119,17 +119,17 @@ func runCapability(group *groupContext) {
 		producer := newDeferredProducer(t, group, profileDestination(group, name), deferredDelay)
 		consumer := deferredConsumer(t, group, []string{name}, map[string]time.Duration{name: deferredDelay}, 1)
 		due := deferredNow(group).Add(deferredDelay)
-		if err := producer.Publish(group.ctx, driver.OutboundMessage{Destination: name, Body: []byte("delayed"), DelayUntil: due}); err != nil {
+		if err := producer.Publish(group.ctx, driver.OutboundMessage{Destination: name, Body: []byte("delayed")}); err != nil {
 			t.Fatal(err)
 		}
-		assertNoDelivery(t, group, consumer, "delayed capability message before due time")
+		assertNoDeliveryBefore(t, group, consumer, due, "delayed capability message before due time")
 		advanceDeferredTo(group, due)
 		message := receiveBefore(t, group, consumer, due.Add(deferredLateBound), "delayed capability message")
-		if string(message.Body) != "delayed" {
-			t.Fatalf("body=%q, want delayed", message.Body)
+		if string(message.Body) != "delayed" || message.ReceivedAt.Before(due) {
+			t.Fatalf("delivery body=%q at %s, want delayed at or after %s", message.Body, message.ReceivedAt, due)
 		}
 		ackMessage(t, group, message)
-		group.capability("NativeDelay/delivery", strconv.FormatBool(group.effective.NativeDelay), capabilityBoolStatus(group.effective.NativeDelay), "DelayUntil was honored with the declared native or portable path")
+		group.capability("NativeDelay/delivery", strconv.FormatBool(group.effective.NativeDelay), capabilityBoolStatus(group.effective.NativeDelay), "the destination delay was honored with the declared native or portable path")
 	})
 
 	group.Check("delivery count reports first delivery and redelivery distinctly", func(t *testing.T) {
@@ -423,7 +423,7 @@ func checkFanoutDeclaration(group *groupContext) {
 			t.Fatalf("EnsureTopology fanout probe: %v", err)
 		}
 		producer, err := group.conn.Producer(group.ctx, driver.ProducerConfig{
-			RequireDurableAck: true, Effective: group.effective,
+			Effective: group.effective,
 		})
 		if err != nil {
 			t.Fatalf("Producer fanout probe: %v", err)

@@ -7,7 +7,7 @@ import (
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/clock"
 )
 
-func TestDWRRShareMatchesWeights(t *testing.T) {
+func TestSchedulerShareMatchesWeights(t *testing.T) {
 	scheduler, err := New([]LaneSpec{{ID: "high", Weight: 8, Capacity: 10001}, {ID: "medium", Weight: 4, Capacity: 10001}, {ID: "low", Weight: 1, Capacity: 10001}}, clock.NewFake(time.Unix(0, 0)), false)
 	if err != nil {
 		t.Fatal(err)
@@ -21,7 +21,7 @@ func TestDWRRShareMatchesWeights(t *testing.T) {
 	}
 	counts := map[string]int{}
 	for range 130 {
-		item, ok := scheduler.Next()
+		item, _, ok := scheduler.Next()
 		if !ok {
 			t.Fatal("scheduler unexpectedly empty")
 		}
@@ -32,7 +32,7 @@ func TestDWRRShareMatchesWeights(t *testing.T) {
 	}
 }
 
-func TestDWRRNoStarvationUnderSaturation(t *testing.T) {
+func TestSchedulerNoStarvationUnderSaturation(t *testing.T) {
 	scheduler, err := New([]LaneSpec{{ID: "high", Weight: 8, Capacity: 1000}, {ID: "low", Weight: 1, Capacity: 1000}}, clock.NewFake(time.Unix(0, 0)), false)
 	if err != nil {
 		t.Fatal(err)
@@ -43,7 +43,7 @@ func TestDWRRNoStarvationUnderSaturation(t *testing.T) {
 	}
 	seenLow := 0
 	for {
-		item, ok := scheduler.Next()
+		item, _, ok := scheduler.Next()
 		if !ok {
 			break
 		}
@@ -56,7 +56,7 @@ func TestDWRRNoStarvationUnderSaturation(t *testing.T) {
 	}
 }
 
-func TestDWRRDeficitResetOnEmpty(t *testing.T) {
+func TestSchedulerDeficitResetOnEmpty(t *testing.T) {
 	scheduler, err := New([]LaneSpec{{ID: "high", Weight: 8, Capacity: 100}, {ID: "low", Weight: 1, Capacity: 100}}, clock.NewFake(time.Unix(0, 0)), false)
 	if err != nil {
 		t.Fatal(err)
@@ -65,20 +65,20 @@ func TestDWRRDeficitResetOnEmpty(t *testing.T) {
 		if err := scheduler.Enqueue("high", Item{Value: "high"}); err != nil {
 			t.Fatal(err)
 		}
-		if _, ok := scheduler.Next(); !ok {
+		if _, _, ok := scheduler.Next(); !ok {
 			t.Fatal("high item not dispatched")
 		}
 	}
 	if err := scheduler.Enqueue("low", Item{Value: "low"}); err != nil {
 		t.Fatal(err)
 	}
-	item, ok := scheduler.Next()
+	item, _, ok := scheduler.Next()
 	if !ok || item.Value != "low" {
 		t.Fatalf("first returning lane item = %#v, %v", item.Value, ok)
 	}
 }
 
-func TestAgingOverrunOrdering(t *testing.T) {
+func TestDeadlinePromotionOverrunOrdering(t *testing.T) {
 	start := time.Unix(0, 0)
 	fake := clock.NewFake(start)
 	scheduler, err := New([]LaneSpec{{ID: "first", Weight: 8, Budget: time.Second, Capacity: 10}, {ID: "second", Weight: 1, Budget: time.Second, Capacity: 10}}, fake, true)
@@ -92,13 +92,13 @@ func TestAgingOverrunOrdering(t *testing.T) {
 	if err := scheduler.Enqueue("second", Item{Value: "second", EnqueuedAt: start.Add(time.Second)}); err != nil {
 		t.Fatal(err)
 	}
-	item, ok := scheduler.Next()
+	item, _, ok := scheduler.Next()
 	if !ok || item.Value != "first" {
 		t.Fatalf("promoted item = %#v, %v", item.Value, ok)
 	}
 }
 
-func TestAgingTieUsesConfiguredSlotOrder(t *testing.T) {
+func TestDeadlinePromotionTieUsesConfiguredSlotOrder(t *testing.T) {
 	start := time.Unix(0, 0)
 	fake := clock.NewFake(start)
 	scheduler, err := New([]LaneSpec{
@@ -114,13 +114,13 @@ func TestAgingTieUsesConfiguredSlotOrder(t *testing.T) {
 		}
 	}
 	fake.Advance(2 * time.Second)
-	item, ok := scheduler.Next()
+	item, _, ok := scheduler.Next()
 	if !ok || item.Value != "first" {
 		t.Fatalf("equal slot overrun selected %#v, %v; want first", item.Value, ok)
 	}
 }
 
-func TestAgingTieUsesConfiguredLaneOrder(t *testing.T) {
+func TestDeadlinePromotionTieUsesConfiguredLaneOrder(t *testing.T) {
 	start := time.Unix(0, 0)
 	fake := clock.NewFake(start)
 	scheduler, err := New([]LaneSpec{
@@ -136,13 +136,13 @@ func TestAgingTieUsesConfiguredLaneOrder(t *testing.T) {
 		}
 	}
 	fake.Advance(2 * time.Second)
-	item, ok := scheduler.Next()
+	item, _, ok := scheduler.Next()
 	if !ok || item.Value != "first" {
 		t.Fatalf("equal lane overrun selected %#v, %v; want first", item.Value, ok)
 	}
 }
 
-func TestAgingFallsBackToWeightedSelectionWhenNothingIsOverdue(t *testing.T) {
+func TestDeadlinePromotionFallsBackToWeightedSelectionWhenNothingIsOverdue(t *testing.T) {
 	start := time.Unix(0, 0)
 	fake := clock.NewFake(start)
 	scheduler, err := New([]LaneSpec{
@@ -160,15 +160,16 @@ func TestAgingFallsBackToWeightedSelectionWhenNothingIsOverdue(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	for i, want := range []string{"high", "high", "low"} {
-		item, ok := scheduler.Next()
+	// Smooth weighted round robin interleaves 2:1 as high, low, high; pick four distinguishes it from 1:1.
+	for i, want := range []string{"high", "low", "high", "high"} {
+		item, _, ok := scheduler.Next()
 		if !ok || item.Value != want {
 			t.Fatalf("fallback item %d = %#v, %v; want %s", i, item.Value, ok, want)
 		}
 	}
 }
 
-func TestAgingUsesLaneBudgetAndEnqueueTime(t *testing.T) {
+func TestDeadlinePromotionUsesLaneBudgetAndEnqueueTime(t *testing.T) {
 	start := time.Unix(0, 0)
 	fake := clock.NewFake(start)
 	scheduler, err := New([]LaneSpec{
@@ -189,7 +190,7 @@ func TestAgingUsesLaneBudgetAndEnqueueTime(t *testing.T) {
 		t.Fatal(err)
 	}
 	fake.Advance(4 * time.Second)
-	item, ok := scheduler.Next()
+	item, _, ok := scheduler.Next()
 	if !ok || item.Value != "old" {
 		t.Fatalf("most overdue item = %#v, %v; want old", item.Value, ok)
 	}
@@ -228,7 +229,7 @@ func TestSchedulerValidationDepthPendingAndCapacity(t *testing.T) {
 	if err := scheduler.Enqueue("x", Item{}); err == nil {
 		t.Fatal("full lane must fail")
 	}
-	if _, ok := scheduler.Next(); !ok || scheduler.Pending() != 0 {
+	if _, _, ok := scheduler.Next(); !ok || scheduler.Pending() != 0 {
 		t.Fatal("queued item was not drained")
 	}
 }
@@ -238,7 +239,7 @@ func TestSchedulerRequiresClockAndHandlesEmptyNext(t *testing.T) {
 		t.Fatal("nil clock must fail")
 	}
 	var scheduler Scheduler
-	if _, ok := scheduler.Next(); ok || scheduler.Pending() != 0 {
+	if _, _, ok := scheduler.Next(); ok || scheduler.Pending() != 0 {
 		t.Fatal("zero scheduler must be empty")
 	}
 }
@@ -261,7 +262,7 @@ func TestGroupedLanesShareOneWeightedSlot(t *testing.T) {
 		}
 	}
 	for i, want := range []string{"one", "two", "one", "two"} {
-		item, ok := scheduler.Next()
+		item, _, ok := scheduler.Next()
 		if !ok || item.Value != want {
 			t.Fatalf("grouped item %d = %#v, %v; want %s", i, item.Value, ok, want)
 		}
@@ -276,7 +277,7 @@ func TestGroupedLanesRequireMatchingWeights(t *testing.T) {
 
 func TestSlotHelpersHandleEmptyAndSparseGroups(t *testing.T) {
 	var empty slot
-	if !empty.empty() || empty.head().Value != nil || empty.pop().Value != nil {
+	if !empty.empty() || empty.pop().Value != nil {
 		t.Fatal("empty slot helpers returned work")
 	}
 	first, err := newLane(LaneSpec{ID: "first", Weight: 1, Capacity: 1})
@@ -291,7 +292,7 @@ func TestSlotHelpersHandleEmptyAndSparseGroups(t *testing.T) {
 		t.Fatal(err)
 	}
 	group := slot{lanes: []*lane{first, second}}
-	if group.empty() || group.head().Value != "second" || group.pop().Value != "second" {
+	if group.empty() || group.pop().Value != "second" {
 		t.Fatal("sparse slot helpers selected the wrong item")
 	}
 	var scheduler *Scheduler
@@ -300,7 +301,7 @@ func TestSlotHelpersHandleEmptyAndSparseGroups(t *testing.T) {
 	}
 }
 
-func TestAgingKeepsLowPriorityMovingUnderSustainedHighLoad(t *testing.T) {
+func TestDeadlinePromotionKeepsLowPriorityMovingUnderSustainedHighLoad(t *testing.T) {
 	start := time.Unix(0, 0)
 	fake := clock.NewFake(start)
 	scheduler, err := New([]LaneSpec{
@@ -320,8 +321,91 @@ func TestAgingKeepsLowPriorityMovingUnderSustainedHighLoad(t *testing.T) {
 	}
 	fake.Advance(10 * time.Millisecond)
 
-	item, ok := scheduler.Next()
+	item, _, ok := scheduler.Next()
 	if !ok || item.Value != "low" {
-		t.Fatalf("aged low-priority item = %#v, %v; want low", item.Value, ok)
+		t.Fatalf("deadline-promoted low-priority item = %#v, %v; want low", item.Value, ok)
+	}
+}
+
+func TestNextReportsPromotionLaneAndPrePopDepth(t *testing.T) {
+	start := time.Unix(0, 0)
+	fake := clock.NewFake(start)
+	scheduler, err := New([]LaneSpec{
+		{ID: "overdue", Weight: 1, Budget: time.Second, Capacity: 10},
+		{ID: "fresh", Weight: 1, Budget: time.Hour, Capacity: 10},
+	}, fake, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := scheduler.Enqueue("overdue", Item{Value: "first", EnqueuedAt: start}); err != nil {
+		t.Fatal(err)
+	}
+	if err := scheduler.Enqueue("overdue", Item{Value: "second", EnqueuedAt: start}); err != nil {
+		t.Fatal(err)
+	}
+	if err := scheduler.Enqueue("fresh", Item{Value: "fresh", EnqueuedAt: start}); err != nil {
+		t.Fatal(err)
+	}
+	fake.Advance(2 * time.Second)
+	item, prom, ok := scheduler.Next()
+	if !ok || item.Value != "first" {
+		t.Fatalf("promoted item = %#v, %v; want first", item.Value, ok)
+	}
+	if prom.LaneID != "overdue" {
+		t.Fatalf("promotion lane = %q, want overdue", prom.LaneID)
+	}
+	if prom.Depth != 2 {
+		t.Fatalf("promotion depth = %d, want 2", prom.Depth)
+	}
+}
+
+func TestNextReturnsZeroPromotionForRoundRobinPick(t *testing.T) {
+	start := time.Unix(0, 0)
+	fake := clock.NewFake(start)
+	scheduler, err := New([]LaneSpec{
+		{ID: "high", Weight: 2, Budget: time.Hour, Capacity: 3},
+		{ID: "low", Weight: 1, Budget: time.Hour, Capacity: 3},
+	}, fake, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := scheduler.Enqueue("high", Item{Value: "high", EnqueuedAt: start}); err != nil {
+		t.Fatal(err)
+	}
+	if err := scheduler.Enqueue("low", Item{Value: "low", EnqueuedAt: start}); err != nil {
+		t.Fatal(err)
+	}
+	_, prom, ok := scheduler.Next()
+	if !ok {
+		t.Fatal("scheduler unexpectedly empty")
+	}
+	if prom != (Promotion{}) {
+		t.Fatalf("round-robin promotion = %+v, want zero", prom)
+	}
+}
+
+func TestNextReturnsZeroPromotionWhenDisabled(t *testing.T) {
+	start := time.Unix(0, 0)
+	fake := clock.NewFake(start)
+	scheduler, err := New([]LaneSpec{
+		{ID: "first", Weight: 1, Budget: time.Second, Capacity: 2},
+		{ID: "second", Weight: 1, Budget: time.Second, Capacity: 2},
+	}, fake, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := scheduler.Enqueue("first", Item{Value: "first", EnqueuedAt: start}); err != nil {
+		t.Fatal(err)
+	}
+	if err := scheduler.Enqueue("second", Item{Value: "second", EnqueuedAt: start}); err != nil {
+		t.Fatal(err)
+	}
+	fake.Advance(2 * time.Second)
+	_, prom, ok := scheduler.Next()
+	if !ok {
+		t.Fatal("scheduler unexpectedly empty")
+	}
+	if prom != (Promotion{}) {
+		t.Fatalf("disabled promotion = %+v, want zero", prom)
 	}
 }

@@ -1,6 +1,7 @@
 # Architecture
 
-This is the canonical maintainer map of the F1 repository. It explains where
+F1 keeps its delivery rules in the root package and gives every broker operation
+to the driver port and its adapters. This maintainer map explains where
 responsibilities live and which boundaries are deliberate. The source and tests
 remain authoritative for current behavior; use the links below to inspect the
 implementation when a detail matters.
@@ -11,21 +12,26 @@ or decide whether a behavior belongs in the core SDK or in a driver.
 ## System shape
 
 ```mermaid
+%%{init: {"flowchart": {"nodeSpacing": 24, "rankSpacing": 40}}}%%
 flowchart TB
     APP[Application]
-    CORE[Root package f1<br/>public API and orchestration]
-    CODEC[codec/<br/>payload codecs]
-    INTERNAL[internal/*<br/>portable runtime primitives]
-    PORT[driver/<br/>broker-independent port]
-    INMEM[drivers/inmem/<br/>reference driver]
-    RABBIT[drivers/rabbitmq/<br/>RabbitMQ adapter]
-    KAFKA[drivers/kafka/<br/>Kafka adapter]
+    CORE[f1]
+    CODEC[codec/]
+    INTERNAL[internal/]
+    PORT[driver/]
+    OBS[f1.Observer]
+    OTEL[f1otel/]
+    INMEM[inmem]
+    RABBIT[rabbitmq]
+    KAFKA[kafka]
     BROKER[(External broker)]
 
     APP --> CORE
     CORE --> CODEC
     CORE --> INTERNAL
     CORE --> PORT
+    CORE --> OBS
+    OBS --> OTEL
     PORT --> INMEM
     PORT --> RABBIT
     PORT --> KAFKA
@@ -33,10 +39,87 @@ flowchart TB
     KAFKA --> BROKER
 ```
 
+| Package | Role |
+| --- | --- |
+| `f1` (root) | Public API and orchestration |
+| `codec/` | Payload codecs |
+| `internal/` | Portable runtime primitives |
+| `driver/` | Broker-independent port |
+| `f1.Observer` | Observer port; `f1otel/` is its OpenTelemetry adapter |
+| `drivers/inmem/` (inmem) | Reference driver |
+| `drivers/rabbitmq/`, `drivers/kafka/` | Broker adapters |
+
+## Runtime paths at a glance
+
+The public path is the same regardless of the connected driver: the root
+package builds the message or handler-facing event, and the driver translates
+the port operation into broker work.
+
+### Publish path
+
+```mermaid
+%%{init: {"sequence": {"actorMargin": 24, "width": 100}}}%%
+sequenceDiagram
+    participant App
+    participant P as Publisher
+    participant C as Codec
+    participant E as Envelope
+    participant D as Producer
+    participant B as Broker
+
+    App->>P: Publish(type, payload)
+    P->>C: Encode(payload)
+    P->>E: build envelope
+    E-->>P: headers
+    P->>D: Publish(OutboundMessage)
+    D->>B: Write, await confirm
+    B-->>D: Confirm or failure
+    D-->>P: Result
+    P-->>App: Event ID or error
+```
+
+See [Publish flow](/development/publish-flow) for the complete path,
+including topology, producer admission, and close interaction.
+
+### Consume path
+
+```mermaid
+%%{init: {"sequence": {"actorMargin": 24, "width": 100}}}%%
+sequenceDiagram
+    participant B as Broker
+    participant D as Consumer
+    participant R as Runner
+    participant S as Scheduler
+    participant W as Pool
+    participant H as Handler
+    participant P as Producer
+
+    B->>D: Delivery
+    D->>R: message + settler
+    R->>S: enqueue in lane
+    S->>W: next delivery
+    W->>H: Decode and invoke
+    alt success or Drop
+        W->>D: Ack original
+    else retryable failure
+        W->>P: Publish retry copy
+        W->>D: Ack original
+    else dead-letter outcome
+        W->>P: Publish DLQ copy
+        W->>D: Ack original
+    end
+```
+
+A dead-letter outcome is a terminal failure, a panic, a decode failure, an expiry, or an unmatched event under the dead-letter policy. Both successor copies are published with a durable confirmation before the original is acked.
+
+See [Consume flow](/development/consume-flow) and
+[Lifecycle and shutdown](/advanced-topics/lifecycle-and-shutdown) for
+dispatch, settlement, reconnect, and drain behavior.
+
 The verification packages sit beside the runtime and point at what they exercise:
 
 ```mermaid
-flowchart LR
+flowchart TB
     CONFORMANCE[driver/conformance/<br/>port contract suite]
     F1TEST[f1test/<br/>deterministic test client]
     TOOLS[tools/<br/>API and compatibility checks]
@@ -60,6 +143,13 @@ The in-memory driver is both a deterministic reference implementation and the
 foundation of `f1test`. RabbitMQ and Kafka provide connected broker adapters;
 their broker clients stay inside their respective packages.
 
+Observability follows the same boundary. The core emits lifecycle events through
+`f1.Observer` and the optional `TraceInjector`, but never imports OpenTelemetry.
+`f1otel` is the built-in adapter in its own package, outside the core. See the
+[Observer guide](/basics/observer) for the adapter contract and the
+[Observer event reference](/development/observer-events) for the generated event
+vocabulary.
+
 ## Package ownership
 
 The following map records the real responsibility boundaries. It is intentionally
@@ -68,15 +158,18 @@ own the details.
 
 | Package | Responsibility | Start here |
 | --- | --- | --- |
-| `.` (`package f1`) | Public API, configuration, client lifecycle, publishing, subscriptions, runners, event/envelope types, routing, errors, and capability limits | [`client.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/client.go), [`publisher.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/publisher.go), [`subscription.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/subscription.go), [`worker.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/worker.go) |
+| `.` (`package f1`) | Public API, configuration, client lifecycle, publishing, subscriptions, runners, event/envelope types, observer events, trace injection, routing, errors, and capability limits | [`client.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/client.go), [`publisher.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/publisher.go), [`observer.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/observer.go), [`subscription.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/subscription.go), [`worker.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/worker.go) |
 | `codec/` | Broker-independent payload codec interface and JSON implementation | [`codec/codec.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/codec/codec.go) |
-| `driver/` | Broker port: connection, producer, consumer, settlement, administration, topology, capabilities, messages, and driver errors | [`driver/driver.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/driver/driver.go), [`driver/capability.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/driver/capability.go), [`driver/topology.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/driver/topology.go) |
+| `driver/` | Broker port: connection, producer, consumer, settlement, administration, topology, capabilities, enqueue time, backlog, messages, and driver errors | [`driver/driver.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/driver/driver.go), [`driver/enqueue.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/driver/enqueue.go), [`driver/capability.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/driver/capability.go), [`driver/topology.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/driver/topology.go) |
 | `driver/conformance/` | Broker-independent contract suite that exercises a candidate driver through the port | [`driver/conformance/run.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/driver/conformance/run.go), [`driver/conformance/manifest.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/driver/conformance/manifest.go) |
 | `internal/clock/` | Real and manually advanced clocks used to keep timing behavior testable | [`internal/clock/clock.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/internal/clock/clock.go) |
 | `internal/retry/` | Backoff tiers, delay resolution, and retry sanity checks | [`internal/retry/ladder.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/internal/retry/ladder.go) |
-| `internal/sched/` | Bounded weighted lanes, aging, and scheduling fairness | [`internal/sched/scheduler.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/internal/sched/scheduler.go) |
+| `internal/sched/` | Bounded weighted lanes, deadline promotion, and scheduling fairness | [`internal/sched/scheduler.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/internal/sched/scheduler.go) |
 | `internal/dispatch/` | Worker pool, ordered-key routing, and in-flight delivery accounting | [`internal/dispatch/pool.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/internal/dispatch/pool.go), [`internal/dispatch/registry.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/internal/dispatch/registry.go) |
 | `internal/lifecycle/` | Runner lifecycle state machine and transition validation | [`internal/lifecycle/state.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/internal/lifecycle/state.go) |
+| `internal/kafka/` | Standard-library-only Kafka timeout rules shared by core configuration validation and Kafka consumer admission | [`internal/kafka/drain.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/internal/kafka/drain.go) |
+| `internal/wire/` | Wire header names shared by the envelope codec and the RabbitMQ property mapping | [`internal/wire/headers.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/internal/wire/headers.go) |
+| `f1otel/` | Application-owned OpenTelemetry metrics, spans, and trace propagation adapter for `f1.Observer` | [`f1otel/doc.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/f1otel/doc.go), [`f1otel/observer.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/f1otel/observer.go) |
 | `drivers/inmem/` | Deterministic in-memory broker, including topology, delivery, settlement, and fault behavior for tests | [`drivers/inmem/inmem.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/drivers/inmem/inmem.go) |
 | `drivers/rabbitmq/` | RabbitMQ transport, topology, management, settlement, reconnect, and broker-specific tests | [`drivers/rabbitmq/rabbitmq.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/drivers/rabbitmq/rabbitmq.go) |
 | `drivers/kafka/` | Kafka transport, classic consumer groups, topology, offsets, rebalancing, and broker-specific tests | [`drivers/kafka/kafka.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/drivers/kafka/kafka.go) |
@@ -84,6 +177,19 @@ own the details.
 | `tools/` | API-surface and API-diff checks for public packages | [`tools/apisurface/main.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/tools/apisurface/main.go), [`tools/apidiff/normalize.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/tools/apidiff/normalize.go) |
 
 ## Ownership of the runtime
+
+The runtime objects have distinct owners:
+
+| Object | Owns |
+| --- | --- |
+| `Client` | one live connection, shared producer, runners, lifecycle admission |
+| `Publisher` | application publish calls; delegates state to `Client` |
+| `Subscription` | handler-facing policy and callbacks |
+| `Runner` | one subscription's consumer, fetcher, scheduler, workers, and drain |
+| `driver.Conn` | live broker resources |
+| `driver.Producer` | durable publish acknowledgement |
+| `driver.Consumer` | broker delivery and transport lifecycle |
+| `driver.Settler` | broker-specific ack/nack operation for one delivery |
 
 The public root package coordinates the runtime, but each concern has one
 primary owner:
@@ -115,11 +221,15 @@ primary owner:
   lanes, and subscription destinations into `driver.TopologySpec`. The driver
   translates that specification into broker objects through `driver.Admin`.
   See [Topology and capabilities](/advanced-topics/topology-and-capabilities).
+- **Observability:** `observer.go` defines the public observer port; the core
+  emits lifecycle events from publish, consume, settlement, drain, reconnect,
+  backlog, and scheduling paths. `f1otel` implements that port for application-owned
+  OpenTelemetry providers. See [Observer](/basics/observer) and
+  [Observability](/advanced-topics/observability).
 
-The canonical implementation walkthroughs are [publish flow](/development/publish-flow)
-and [consume flow](/development/consume-flow). The [runtime overview](/runtime-overview)
-and provider guide remain useful companion pages: the runtime overview explains
-the system at a glance, while the provider guide retains adapter-specific notes.
+The implementation walkthroughs are [Publish flow](/development/publish-flow)
+and [Consume flow](/development/consume-flow). The provider guide remains a
+useful companion page for adapter-specific notes and broker operations.
 
 ## Dependency and import boundaries
 
@@ -128,7 +238,10 @@ These boundaries keep the SDK broker-agnostic and are enforced by the
 [`make verify-agnostic`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/Makefile):
 
 - The root package and `internal/**` may depend on the port and portable
-  standard-library code, but must not import `drivers/**` or a broker client.
+  standard-library code, plus narrow standard-library-only rule helpers shared
+  with a driver. For example, `internal/kafka` owns the scalar timeout rule
+  shared by core validation and Kafka consumer admission. Neither the root nor
+  `internal/**` may import `drivers/**` or a broker client.
 - `driver/**` outside `driver/conformance/**` is a standard-library-only port.
 - A concrete driver may import the standard library, the shared `driver` port,
   and its own broker client. It must not import another concrete driver.
@@ -154,6 +267,10 @@ types. Broker syntax, client objects, acknowledgements, offsets, and management
 APIs remain inside `drivers/*`. This keeps the application-facing API generic
 and lets the same runtime use in-memory, RabbitMQ, or Kafka transports.
 
+Core configuration may validate relationships between driver options, and may
+share a standard-library-only scalar rule with the matching adapter. It must
+not use broker client types or broker APIs to perform that validation.
+
 The import boundary is checked by `make verify-agnostic`; the port itself is
 defined in [`driver/driver.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/driver/driver.go).
 
@@ -172,26 +289,22 @@ bridge tests in [`worker_retry_bridge_test.go`](https://fgit.zapps.vn/zatf2026-b
 
 ### Delivery is at least once
 
-A message may be delivered again after a connection failure, an uncertain
-settlement, a release, or a process restart. F1 preserves message identity and
-does not deduplicate application effects. Handlers must make externally visible
-effects idempotent, normally using the event idempotency key exposed by the
-public event model.
+F1 provides at-least-once delivery: connection failures, uncertain settlements,
+releases, and process restarts may redeliver a message with its stable identity.
+F1 does not deduplicate application effects.
 
-The user-facing trade-off is documented in
-[Failure handling](/advanced-topics/failure-handling); the settlement
-state and redelivery behavior are covered by the root settlement and driver
-tests.
+See [Failure handling](/advanced-topics/failure-handling) and
+[Consume flow](/development/consume-flow#settle-last-ordering) for the
+settlement boundaries and failure cases.
 
 ### Handlers must be idempotent
 
-The SDK can provide stable identity and safe retry routing, but it does not own
-the application's effect store or deduplication policy. A handler that charges a
-card, updates a database, or emits an external side effect must tolerate the
-same event being observed more than once.
+Handlers must tolerate the same event more than once because F1 does not own the
+application's effect store or deduplication policy.
 
-This is the application boundary of at-least-once delivery, not an optional
-optimization.
+See [Failure handling](/advanced-topics/failure-handling) and
+[Ordering and scheduling](/advanced-topics/ordering-and-scheduling#hash-collisions-and-abandoned-handlers)
+for equal-key execution limits.
 
 ### Capabilities may be reduced at runtime
 
@@ -227,7 +340,7 @@ behavioral tests before modifying a boundary.
 
 The maintainer route is:
 
-1. [Runtime overview](/runtime-overview) for object ownership and flow.
+1. [Architecture](/development/architecture) for object ownership and flow.
 2. [Publish flow](/development/publish-flow) or [Consume flow](/development/consume-flow)
    for the message path.
 3. [Driver contract](/development/driver-contract) for port behavior and extension rules.
@@ -237,5 +350,11 @@ The maintainer route is:
    differences and the current adapter notes.
 6. [Source-reading guide](/development/source-reading-guide) for a staged source and test tour.
 
-The development documentation is the canonical maintainer route. The root
+The development pages are the maintainer route. The root
 `ARCHITECTURE.md` remains a stable entrypoint that points here.
+
+## Go further
+
+- [Publish flow](/development/publish-flow) - the outbound message path;
+- [Consume flow](/development/consume-flow) - delivery, settlement, drain, and reconnect;
+- [Driver contract](/development/driver-contract) - the broker-independent port.

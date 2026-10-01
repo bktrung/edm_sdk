@@ -119,9 +119,11 @@ func TestRunUsesOneConnectionAndInspector(t *testing.T) {
 
 func TestTrackedAdminRecordsMaintenanceDestinations(t *testing.T) {
 	raw := &runTestConn{
-		queues:    make(map[string][]driver.OutboundMessage),
+		queues:    make(map[string][]runTestMessage),
 		unsettled: make(map[string]int),
 	}
+	raw.queues["tracked.prune.a"] = nil
+	raw.queues["tracked.prune.b"] = nil
 	tracked := newTrackedConn(raw)
 	admin, ok := tracked.Admin().(driver.Maintenance)
 	if !ok {
@@ -130,8 +132,14 @@ func TestTrackedAdminRecordsMaintenanceDestinations(t *testing.T) {
 	if _, err := admin.Purge(context.Background(), "tracked.purge"); err != nil {
 		t.Fatalf("Purge: %v", err)
 	}
-	if _, err := admin.Prune(context.Background(), []string{"tracked.prune.a", "tracked.prune.b"}); err != nil {
+	results, err := admin.Prune(context.Background(), []string{"tracked.prune.a", "tracked.prune.b"})
+	if err != nil {
 		t.Fatalf("Prune: %v", err)
+	}
+	for _, result := range results {
+		if !result.Deleted {
+			t.Fatalf("Prune(%q) = %+v, want deleted", result.Name, result)
+		}
 	}
 	tracked.mu.Lock()
 	defer tracked.mu.Unlock()
@@ -353,7 +361,7 @@ func TestRunFailureHelper(t *testing.T) {
 		groupRunners = map[string]groupRunner{}
 		registerGroup("publish", func(group *groupContext) {
 			group.Check("profile behavior differs", func(*testing.T) {
-				group.vector.Add(BehaviorEvent{ID: "profile", Outcome: group.profile.String()})
+				group.vector.add(BehaviorEvent{ID: "profile", Outcome: group.profile.String()})
 			})
 		})
 		factory = runTestInspector
@@ -385,7 +393,7 @@ func (d runTestDriver) Open(context.Context, driver.Config) (driver.Conn, error)
 	return &runTestConn{
 		caps:                 driver.Capabilities{},
 		failFullProfileSetup: d.failFullProfileSetup,
-		queues:               make(map[string][]driver.OutboundMessage),
+		queues:               make(map[string][]runTestMessage),
 		unsettled:            make(map[string]int),
 		specs:                make(map[string]driver.DestinationSpec),
 	}, nil
@@ -418,9 +426,17 @@ type maintenanceLessAdmin struct {
 type runTestConn struct {
 	caps                 driver.Capabilities
 	failFullProfileSetup bool
-	queues               map[string][]driver.OutboundMessage
+	queues               map[string][]runTestMessage
 	unsettled            map[string]int
 	specs                map[string]driver.DestinationSpec
+}
+
+// runTestMessage is one queued message and whether it was published while its
+// destination declared a delay, which is what the inspector counts as
+// Auxiliary. It is fixed at publish, as a broker parks a message at publish.
+type runTestMessage struct {
+	message  driver.OutboundMessage
+	deferred bool
 }
 
 func (c *runTestConn) Capabilities() driver.Capabilities { return c.caps }
@@ -443,7 +459,7 @@ func (c *runTestConn) Consumer(_ context.Context, cfg driver.ConsumerConfig) (dr
 	for _, destination := range cfg.Destinations {
 		queued := c.queues[destination]
 		for len(queued) > 0 && consumer.outstanding < capacity {
-			message := queued[0]
+			message := queued[0].message
 			queued = queued[1:]
 			settler := &runTestSettler{conn: c, consumer: consumer, destination: destination, message: message}
 			consumer.settlers[settler] = struct{}{}
@@ -472,7 +488,7 @@ func runTestInspector(raw driver.Conn) (Inspect, error) {
 		}
 		var ready, auxiliary int64
 		for _, message := range messages {
-			if !message.DelayUntil.IsZero() {
+			if message.deferred {
 				auxiliary++
 				continue
 			}
@@ -491,7 +507,8 @@ func (p *runTestProducer) Publish(_ context.Context, messages ...driver.Outbound
 		}
 	}
 	for _, message := range messages {
-		p.conn.queues[message.Destination] = append(p.conn.queues[message.Destination], message)
+		deferred := p.conn.specs[message.Destination].Delay > 0
+		p.conn.queues[message.Destination] = append(p.conn.queues[message.Destination], runTestMessage{message: message, deferred: deferred})
 	}
 	return nil
 }
@@ -535,7 +552,7 @@ func (c *runTestConsumer) Release(context.Context) error {
 		delete(c.settlers, settler)
 		c.outstanding--
 		c.conn.unsettled[settler.destination]--
-		c.conn.queues[settler.destination] = append([]driver.OutboundMessage{settler.message}, c.conn.queues[settler.destination]...)
+		c.conn.queues[settler.destination] = append([]runTestMessage{{message: settler.message}}, c.conn.queues[settler.destination]...)
 	}
 	c.stopped = true
 	close(c.messages)
@@ -594,6 +611,10 @@ func (a runTestAdmin) EnsureTopology(_ context.Context, spec driver.TopologySpec
 	}
 	for _, destination := range spec.Destinations {
 		if _, exists := a.conn.queues[destination.Name]; exists {
+			// A redeclare can add a delay, as a check that seeds a ready message and
+			// then a deferred one on the same destination does, so the spec follows
+			// the latest declaration while the queued messages keep their own state.
+			a.conn.specs[destination.Name] = destination
 			diff.ExistingDestinations = append(diff.ExistingDestinations, destination.Name)
 			continue
 		}
@@ -607,7 +628,16 @@ func (a runTestAdmin) EnsureTopology(_ context.Context, spec driver.TopologySpec
 func (a runTestAdmin) DescribeTopology(_ context.Context, names []string) (driver.TopologyState, error) {
 	depth := make(map[string]int64, len(names))
 	for _, name := range names {
-		depth[name] = int64(len(a.conn.queues[name]))
+		queue, exists := a.conn.queues[name]
+		if !exists {
+			return driver.TopologyState{}, &driver.Error{
+				Driver: "run-test",
+				Op:     "describe",
+				K:      driver.KindNotFound,
+				Err:    driver.ErrDestinationMissing,
+			}
+		}
+		depth[name] = int64(len(queue))
 	}
 	return driver.TopologyState{Depth: depth}, nil
 }
@@ -759,7 +789,7 @@ func (c *consumerConfigRecordingConn) recordedConfigs() []driver.ConsumerConfig 
 func TestRunScopedPersistentGroups(t *testing.T) {
 	runCheckCalls := func(t *testing.T, profile Profile, runID string) []driver.ConsumerConfig {
 		raw := &runTestConn{
-			queues:    make(map[string][]driver.OutboundMessage),
+			queues:    make(map[string][]runTestMessage),
 			unsettled: make(map[string]int),
 			specs:     make(map[string]driver.DestinationSpec),
 		}

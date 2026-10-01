@@ -1,0 +1,17 @@
+{
+  "package": "f1otel",
+  "symbols": [
+    "New",
+    "Observer",
+    "Observer.Finish",
+    "Observer.InjectTrace",
+    "Observer.Record",
+    "Observer.Start",
+    "Option",
+    "WithCreateSpans",
+    "WithMeterProvider",
+    "WithPropagator",
+    "WithTracerProvider"
+  ],
+  "documented-not-built": []
+}
