@@ -17,7 +17,7 @@
     "Conn",
     "Consumer",
     "ConsumerConfig",
-    "DelayAccuracy",
+    "ConsumerConfig.DestinationPrefetch",
     "DestBackstopDLQ",
     "DestDLQ",
     "DestKind",

@@ -5,6 +5,72 @@ F1's notable changes are recorded here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project uses
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Changed
+
+- Documentation qualifies shutdown, scheduling, ordering, and retry timing guarantees,
+  reconciles RabbitMQ publishing with shared confirm channels, and removes duplicate
+  analysis and standalone JavaScript simulators.
+- The RabbitMQ driver publishes on 16 shared confirm channels and waits for each message's own
+  confirmation, instead of holding one of 16 channels for a whole `Publish` call. Publish
+  throughput now follows the offered rate until the broker or its disk is the limit: 10,000
+  msgs/s at a 5.4 ms median latency where the previous producer reached about 2,500. A cancelled
+  publish no longer closes its channel.
+- A RabbitMQ destination with a delay has one parking queue, `<destination>.park`, instead of a
+  ladder of eight rung queues (`<destination>.park.500ms` to `<destination>.park.64s`) or a
+  `<destination>.park.fixed-<N>ms` queue. Every message waits the destination's own delay.
+  `EnsureTopology` refuses a delay longer than 2,147,483,647 ms.
+- Zero or omitted `broker.defaultPrefetch` selects automatic sizing from the resolved lane
+  capacities instead of a fixed 64. A zero or omitted subscription prefetch uses a positive
+  `broker.defaultPrefetch` when one is set, and automatic sizing otherwise. A positive
+  subscription prefetch overrides it, and an environment zero clears a lower-priority
+  subscription value before that fallback. A total above the lane-capacity sum is capped without
+  shrinking any destination's window.
+- A positive subscription prefetch from 1 to 65535 is valid even below the lane count: the total
+  cap limits admission without reducing destination windows.
+- Consumers enforce both the subscription's total prefetch and each destination's window over
+  the deliveries the SDK has admitted and not yet settled. RabbitMQ broker credit and Kafka fetch
+  buffering stay separate from that admission, and RabbitMQ's `brokerPrefetch` cannot bypass
+  either ceiling.
+- A subscription's `fairness.weights` must be at most 65535 per priority; a larger weight fails
+  validation. Weights are ratios, and the bound lets automatic prefetch size every lane exactly:
+  large weights used to shrink it, for example to 128 where 512 was right.
+- The Kafka driver batches offset commits: the commits that arrive while one request is in
+  flight go out together in the next. A settlement still returns only after the request carrying
+  its offset finished.
+- Deferred conformance measures release lateness from a bracket around publication, excluding
+  time spent publishing while retaining the never-early and late-delivery checks.
+
+### Removed
+
+- `f1.RetryAfter` and `f1.RetryDelay`. A delayed retry always waits its retry step's delay; a
+  handler cannot choose its own.
+- `driver.DelayAccuracy` and `driver.Capabilities.DelayAccuracy`. The `native_delay` entry of
+  `Client.Limits` now says where a delayed message waits instead of rendering a lateness bound.
+- `driver.OutboundMessage.DelayUntil` and `driver.DestinationSpec.FixedDelay`. A destination's
+  `Delay` applies to every message published to it.
+- `conformance.DeferralModel` and `conformance.Suite.DeferralModel`.
+- The driver-flip acceptance's redundant same-checkout source-tree comparison and
+  business-tree manifest artifacts. Both broker runs still use the same binaries built once.
+
+### Fixed
+
+- Kafka drain and release fence settlement-side handoffs as well as polling, so an in-flight
+  handoff cannot send after drain returns.
+- The RabbitMQ consumer's `Stop` and `Release` wait for their goroutines only as long as the
+  caller's context allows. A `Release` that ends on its context leaves the consumer registered,
+  and the next `Release` finishes the teardown instead of the first being reported as done.
+
+### Upgrade notes
+
+- RabbitMQ: the parking queues 0.1.0 declared, `<destination>.park.<rung>` and
+  `<destination>.park.fixed-<N>ms`, are no longer used. Messages already in them still return to
+  their destination when their delay ends. `EnsureTopology` reports those queues as orphaned,
+  with their message counts. `Prune` refuses such a queue while it holds messages, but a
+  destination's own prune checks only `<destination>.park`, not the old queues. Prune the old
+  queues once they are empty, and only then the destination their messages return to.
+
 ## [0.1.0] - 2026-09-23
 
 ### Added

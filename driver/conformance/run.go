@@ -140,7 +140,7 @@ func Run(t *testing.T, suite Suite) Report {
 		profileCompleted := false
 		t.Run(profile.String(), func(profileTest *testing.T) {
 			profileStarted = true
-			result = runProfile(profileTest, ctx, conn, inspect, runID, profile, factoryCapabilities, inject, deadline, &report, suite.Driver, suite.Config, suite.NewFaultInjector, suite.DeferralModel)
+			result = runProfile(profileTest, ctx, conn, inspect, runID, profile, factoryCapabilities, inject, deadline, &report, suite.Driver, suite.Config, suite.NewFaultInjector)
 			profileCompleted = true
 		})
 		if profileCompleted {
@@ -185,7 +185,6 @@ func runProfile(
 	drv driver.Driver,
 	cfg driver.Config,
 	injectFactory func(driver.Conn) (FaultInjector, error),
-	deferralModel DeferralModel,
 ) ProfileReport {
 	effective := effectiveCapabilities(conn.Capabilities(), profile)
 	inspectScope := "conformance.inspect." + runID + "." + profile.String() + "."
@@ -322,7 +321,7 @@ func runProfile(
 			groupResult = &groupContext{
 				t: groupTest, ctx: ctx, conn: tracked, inspect: inspect,
 				profile: profile, effective: effective, factoryCapabilities: factoryCapabilities, inject: inject, report: report,
-				drv: drv, cfg: cfg, injectFactory: injectFactory, deferralModel: deferralModel,
+				drv: drv, cfg: cfg, injectFactory: injectFactory,
 				checkNames: make(map[string]struct{}),
 				skips:      make(map[string]string), deadline: deadline,
 				runID: runID,

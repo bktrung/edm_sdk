@@ -140,7 +140,7 @@ func TestConsumerDefersFutureRecordWithPositiveControl(t *testing.T) {
 	}
 	due := clock.NewReal().Now().Add(delay)
 	if err := producer.Publish(ctx, driver.OutboundMessage{
-		Destination: deferred, Body: []byte("deferred"), DelayUntil: due,
+		Destination: deferred, Body: []byte("deferred"),
 	}); err != nil {
 		t.Fatalf("Publish(deferred): %v", err)
 	}
@@ -191,7 +191,7 @@ func TestConsumerLoneDeferredRecordArrivesAtDueTime(t *testing.T) {
 
 	due := clock.NewReal().Now().Add(delay)
 	if err := producer.Publish(ctx, driver.OutboundMessage{
-		Destination: topic, Body: []byte("lone"), DelayUntil: due,
+		Destination: topic, Body: []byte("lone"),
 	}); err != nil {
 		t.Fatalf("Publish: %v", err)
 	}
@@ -267,13 +267,13 @@ func TestConsumerRequeueIsDeliveredAheadOfTheQueuedRecords(t *testing.T) {
 	// is the first one and its hold applies to the whole partition.
 	firstDue := clock.NewReal().Now().Add(delay)
 	if err := producer.Publish(ctx, driver.OutboundMessage{
-		Destination: topic, Body: []byte("first"), DelayUntil: firstDue,
+		Destination: topic, Body: []byte("first"),
 	}); err != nil {
 		t.Fatalf("Publish(first): %v", err)
 	}
 	secondDue := clock.NewReal().Now().Add(delay)
 	if err := producer.Publish(ctx, driver.OutboundMessage{
-		Destination: topic, Body: []byte("second"), DelayUntil: secondDue,
+		Destination: topic, Body: []byte("second"),
 	}); err != nil {
 		t.Fatalf("Publish(second): %v", err)
 	}
@@ -1515,6 +1515,7 @@ func newRevokeTestConsumer(t *testing.T, errorCapacity int, drainTimeout time.Du
 		settlers:              make(map[*settler]struct{}),
 		settlerCh:             make(chan struct{}, 1),
 		unsettled:             map[string]int{"topic": 1},
+		admitted:              1,
 		budgets:               map[string]int{"topic": 1},
 		pauseReasons:          make(map[string]pauseReasonSet),
 	}
@@ -1878,6 +1879,7 @@ func TestConsumerOnePartitionChangeDoesNotResetDestinationAccounting(t *testing.
 		owned:        map[partitionKey]bool{key0: true, key1: true},
 		settlers:     make(map[*settler]struct{}),
 		unsettled:    map[string]int{"topic": 7},
+		admitted:     7,
 		budgets:      map[string]int{"topic": 10},
 		pauseReasons: make(map[string]pauseReasonSet),
 		clock:        clock.NewReal(),

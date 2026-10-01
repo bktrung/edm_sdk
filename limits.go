@@ -1,10 +1,6 @@
 package f1
 
 import (
-	"fmt"
-	"math"
-	"time"
-
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/driver"
 )
 
@@ -92,46 +88,6 @@ func featureModeString(mode FeatureMode) string {
 	}
 }
 
-// maxDelayDuration is the largest delay the port can carry, and the MaxDelay a
-// driver declares when no delay a caller can request is above its bound.
-const maxDelayDuration = time.Duration(math.MaxInt64)
-
-// undeclaredDelayAccuracy is reported for native_delay when the connected
-// driver declares no delay accuracy. It names the gap rather than rendering a
-// duration, because a zero bound reads as a promise to deliver at the due time
-// exactly, which is the strongest claim the shape can make.
-const undeclaredDelayAccuracy = "delay accuracy not declared by this driver"
-
-// delayAccuracyDetail renders a declared delay accuracy as one sentence an
-// operator reads without knowing how the driver implements the delay.
-func delayAccuracyDetail(accuracy driver.DelayAccuracy) string {
-	if accuracy == (driver.DelayAccuracy{}) {
-		return undeclaredDelayAccuracy
-	}
-	bound := "delivered at its due time"
-	switch {
-	case accuracy.Floor > 0 && accuracy.Relative > 0:
-		bound = fmt.Sprintf("late by at most %s, or %s, whichever is larger", relativeDelay(accuracy.Relative), accuracy.Floor)
-	case accuracy.Relative > 0:
-		bound = "late by at most " + relativeDelay(accuracy.Relative)
-	case accuracy.Floor > 0:
-		bound = "late by at most " + accuracy.Floor.String()
-	}
-	if accuracy.MaxDelay >= maxDelayDuration {
-		return bound + ", at any requested delay"
-	}
-	return fmt.Sprintf("%s, for a delay of at most %s; no bound above that", bound, accuracy.MaxDelay)
-}
-
-// relativeDelay names a relative lateness bound the way a caller reads it,
-// rather than as a fraction of the delay it deferred.
-func relativeDelay(relative float64) string {
-	if relative == 1 {
-		return "the requested delay"
-	}
-	return fmt.Sprintf("%g times the requested delay", relative)
-}
-
 // Limits returns the connected broker's stable capability report.
 func (c *Client) Limits() Limits {
 	if c == nil {
@@ -151,11 +107,12 @@ func limitsFor(driverName string, info driver.BrokerInfo, caps driver.Capabiliti
 		}
 		return FeatureStatus{Feature: string(name), Mode: missing}
 	}
-	// native_delay carries the accuracy the connected driver's deferral path
-	// delivers, so an application plans against a stated bound rather than
-	// against the folklore that a delay is roughly honoured.
 	nativeDelay := feature(capabilityNativeDelay, caps.NativeDelay, FeatureEmulated)
-	nativeDelay.Detail = delayAccuracyDetail(caps.DelayAccuracy)
+	if caps.NativeDelay {
+		nativeDelay.Detail = "the broker holds each message on a delayed destination for that destination's delay"
+	} else {
+		nativeDelay.Detail = "the driver holds each message on a delayed destination for that destination's delay, in a parking queue or on the consumer"
+	}
 	perMessageAck := feature(capabilityPerMessageAck, caps.PerMessageAck, FeatureEmulated)
 	if caps.PerMessageAck {
 		perMessageAck.Detail = "the broker settles each message independently, so a slow message does not hold its lane's in-flight budget"

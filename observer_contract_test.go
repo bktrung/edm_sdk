@@ -19,6 +19,9 @@ type observerScenario struct {
 	order [][]string
 }
 
+// TestObserverContract drives each scenario through the inmem public API. Decode
+// failure, poison without a route, reconnect and a partial batch failure cannot
+// be produced from there, so the package-internal observer tests own them.
 func TestObserverContract(t *testing.T) {
 	factory := inmemObserverFactory
 	for _, scenario := range []observerScenario{
@@ -48,18 +51,6 @@ func TestObserverContract(t *testing.T) {
 				{"finish process", "record dead_letter_decided", "start publish", "finish publish", "record dead_letter_published", "start settle", "finish settle"},
 			},
 			run: runMaxAttempts,
-		},
-		{
-			name: "decode failure unavailable through inmem public API",
-			run: func(t *testing.T, _ *f1test.Client, _ *f1test.Recorder) {
-				t.Skip("inmem public API cannot inject malformed inbound headers or body bytes")
-			},
-		},
-		{
-			name: "poison unavailable through inmem public API",
-			run: func(t *testing.T, _ *f1test.Client, _ *f1test.Recorder) {
-				t.Skip("inmem public API cannot inject a runaway retry counter or a missing poison route")
-			},
 		},
 		{
 			name:  "handler panic",
@@ -93,28 +84,14 @@ func TestObserverContract(t *testing.T) {
 			},
 			run: runDrain,
 		},
-		{
-			name: "reconnect unavailable through inmem public API",
-			run: func(t *testing.T, _ *f1test.Client, _ *f1test.Recorder) {
-				t.Skip("f1test exposes no public operation that fails the inmem connection and requests reconnect")
-			},
-		},
-		{
-			name: "batch publish partial failure unavailable through inmem public API",
-			run: func(t *testing.T, _ *f1test.Client, _ *f1test.Recorder) {
-				t.Skip("inmem accepts the whole public PublishBatch call and exposes no per-index publish failure")
-			},
-		},
 	} {
 		t.Run(scenario.name, func(t *testing.T) {
 			recorder := f1test.NewRecorder()
 			client := factory(t, recorder)
 			scenario.run(t, client, recorder)
-			if scenario.count != nil {
-				calls := waitForCounts(t, recorder, scenario.count)
-				assertObserverContract(t, calls, scenario.count)
-				assertObserverOrder(t, calls, scenario.order)
-			}
+			calls := waitForCounts(t, recorder, scenario.count)
+			assertObserverContract(t, calls, scenario.count)
+			assertObserverOrder(t, calls, scenario.order)
 		})
 	}
 }

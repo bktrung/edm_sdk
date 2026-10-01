@@ -154,7 +154,7 @@ func benchmarkDispatchDueBacklog(b *testing.B, resetCursor bool) {
 	}
 	impl := opened.(*conn)
 	_, err = opened.Admin().EnsureTopology(ctx, driver.TopologySpec{
-		Destinations: []driver.DestinationSpec{{Name: "orders"}},
+		Destinations: []driver.DestinationSpec{{Name: "orders", Delay: time.Hour}},
 	})
 	if err != nil {
 		b.Fatal(err)
@@ -172,11 +172,7 @@ func benchmarkDispatchDueBacklog(b *testing.B, resetCursor bool) {
 	}
 	backlog := make([]driver.OutboundMessage, 4096)
 	for i := range backlog {
-		backlog[i] = driver.OutboundMessage{
-			Destination: "orders",
-			DelayUntil:  start.Add(time.Hour),
-			Body:        []byte("body"),
-		}
+		backlog[i] = driver.OutboundMessage{Destination: "orders", Body: []byte("body")}
 	}
 	if err := producer.Publish(ctx, backlog...); err != nil {
 		b.Fatal(err)
@@ -207,7 +203,7 @@ func benchmarkDispatchDueBacklog(b *testing.B, resetCursor bool) {
 func TestDispatchCursorSkipsDueBacklog(t *testing.T) {
 	start := time.Unix(0, 0)
 	fake := clock.NewFake(start)
-	ctx, opened, producer := openTest(t, fake, driver.DestinationSpec{Name: "orders"})
+	ctx, opened, producer := openTest(t, fake, driver.DestinationSpec{Name: "orders", Delay: time.Hour})
 	impl := opened.(*conn)
 	consumer, err := impl.Consumer(ctx, driver.ConsumerConfig{
 		Destinations: []string{"orders"},
@@ -222,11 +218,7 @@ func TestDispatchCursorSkipsDueBacklog(t *testing.T) {
 
 	backlog := make([]driver.OutboundMessage, 256)
 	for i := range backlog {
-		backlog[i] = driver.OutboundMessage{
-			Destination: "orders",
-			DelayUntil:  start.Add(time.Hour),
-			Body:        []byte("body"),
-		}
+		backlog[i] = driver.OutboundMessage{Destination: "orders", Body: []byte("body")}
 	}
 	require.NoError(t, producer.Publish(ctx, backlog...))
 

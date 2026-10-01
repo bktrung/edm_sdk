@@ -4,7 +4,6 @@ import (
 	"context"
 	"strings"
 	"testing"
-	"time"
 
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/driver"
 )
@@ -26,100 +25,6 @@ func reportedLimits(t *testing.T, caps driver.Capabilities, options ...Option) L
 	return client.Limits()
 }
 
-func TestDelayAccuracyDetail(t *testing.T) {
-	t.Parallel()
-
-	tests := []struct {
-		name     string
-		accuracy driver.DelayAccuracy
-		want     []string
-		deny     []string
-	}{
-		{
-			name:     "undeclared",
-			accuracy: driver.DelayAccuracy{},
-			want:     []string{"not declared"},
-			deny:     []string{"0s"},
-		},
-		{
-			name:     "floor and relative bound",
-			accuracy: driver.DelayAccuracy{Floor: 500 * time.Millisecond, Relative: 1, MaxDelay: 64 * time.Second},
-			want:     []string{"500ms", "the requested delay", "1m4s"},
-		},
-		{
-			name:     "floor alone",
-			accuracy: driver.DelayAccuracy{Floor: 2 * time.Second, MaxDelay: time.Minute},
-			want:     []string{"2s", "1m"},
-			deny:     []string{"requested delay"},
-		},
-		{
-			name:     "relative alone",
-			accuracy: driver.DelayAccuracy{Relative: 0.5, MaxDelay: 64 * time.Second},
-			want:     []string{"0.5 times the requested delay", "1m4s"},
-		},
-		{
-			name:     "at the due time for every delay",
-			accuracy: driver.DelayAccuracy{MaxDelay: maxDelayDuration},
-			want:     []string{"delivered at its due time", "any requested delay"},
-			deny:     []string{"late by"},
-		},
-	}
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			t.Parallel()
-			got := delayAccuracyDetail(test.accuracy)
-			for _, want := range test.want {
-				if !strings.Contains(got, want) {
-					t.Errorf("detail %q does not mention %q", got, want)
-				}
-			}
-			for _, deny := range test.deny {
-				if strings.Contains(got, deny) {
-					t.Errorf("detail %q says %q", got, deny)
-				}
-			}
-		})
-	}
-}
-
-func TestLimitsReportsDriverDelayAccuracy(t *testing.T) {
-	t.Parallel()
-
-	caps := driver.Capabilities{
-		DelayAccuracy: driver.DelayAccuracy{Floor: 500 * time.Millisecond, Relative: 1, MaxDelay: 64 * time.Second},
-	}
-	got := featureStatus(reportedLimits(t, caps), "native_delay")
-	if got.Mode != FeatureEmulated {
-		t.Errorf("native_delay mode = %v, want emulated", got.Mode)
-	}
-	// The report has to carry the relative term and the ceiling, not one worst
-	// case: a caller deferring 700ms and a caller deferring a minute read
-	// different bounds out of the same declaration.
-	for _, want := range []string{"500ms", "the requested delay", "1m4s"} {
-		if !strings.Contains(got.Detail, want) {
-			t.Errorf("native_delay detail %q does not mention %q", got.Detail, want)
-		}
-	}
-}
-
-func TestLimitsRendersUndeclaredDelayAccuracy(t *testing.T) {
-	t.Parallel()
-
-	// A driver that never sets the field declares nothing. Rendering the zero
-	// value as a duration would read as a promise to deliver at the due time
-	// exactly, which is the strongest claim the shape can make.
-	got := featureStatus(reportedLimits(t, driver.Capabilities{}), "native_delay")
-	if got.Detail == "" {
-		t.Fatal("native_delay reported no detail for an undeclared accuracy")
-	}
-	if strings.Contains(got.Detail, "0s") {
-		t.Fatalf("native_delay detail = %q, want an undeclared accuracy rather than a duration", got.Detail)
-	}
-	if !strings.Contains(got.Detail, "not declared") {
-		t.Fatalf("native_delay detail = %q, want it to say the accuracy is undeclared", got.Detail)
-	}
-}
-
 func TestLimitsReportsCoreFeatureDetails(t *testing.T) {
 	t.Parallel()
 
@@ -131,6 +36,8 @@ func TestLimitsReportsCoreFeatureDetails(t *testing.T) {
 		emulatedDLQBackstop    = "the core's dead-letter path publishes a successor and settles the source after publication; this feature reports only broker-native dead-letter routing"
 		nativeDLQBackstop      = "the broker routes an exhausted message to its dead-letter destination; the core also has a successor publish path, but this feature reports only broker-native dead-letter routing"
 		priorityFairnessDetail = "the core's scheduler substitutes weighted lanes, so fairness is per lane and not per broker"
+		emulatedNativeDelay    = "the driver holds each message on a delayed destination for that destination's delay, in a parking queue or on the consumer"
+		nativeNativeDelay      = "the broker holds each message on a delayed destination for that destination's delay"
 	)
 	tests := []struct {
 		name       string
@@ -179,6 +86,19 @@ func TestLimitsReportsCoreFeatureDetails(t *testing.T) {
 			wantDetail: nativeDLQBackstop,
 		},
 		{
+			name:       "native delay emulated",
+			feature:    "native_delay",
+			wantMode:   FeatureEmulated,
+			wantDetail: emulatedNativeDelay,
+		},
+		{
+			name:       "native delay native",
+			feature:    "native_delay",
+			caps:       driver.Capabilities{NativeDelay: true},
+			wantMode:   FeatureNative,
+			wantDetail: nativeNativeDelay,
+		},
+		{
 			name:       "priority fairness always emulated",
 			feature:    "priority_fairness",
 			caps:       driver.Capabilities{PerMessageAck: true, NativeDeliveryCount: true, NativeDLQ: true},
@@ -200,33 +120,17 @@ func TestLimitsReportsCoreFeatureDetails(t *testing.T) {
 	}
 }
 
-func TestStrictPortabilityWithdrawsDelayAccuracy(t *testing.T) {
+func TestStrictPortabilityReportsEmulatedDelay(t *testing.T) {
 	t.Parallel()
 
-	// Under strict the core emulates the delay, so the driver's bound is not
-	// the one in force and reporting it would have an application plan against
-	// a number the core is not delivering.
-	caps := driver.Capabilities{
-		NativeDelay:     true,
-		ConsumerScaling: driver.ScalingFree,
-		DelayAccuracy:   driver.DelayAccuracy{Floor: 500 * time.Millisecond, Relative: 1, MaxDelay: 64 * time.Second},
-	}
+	// Under strict the core does not use the driver's native delay, so the
+	// report names the emulated path even when the driver declares one.
+	caps := driver.Capabilities{NativeDelay: true, ConsumerScaling: driver.ScalingFree}
 	got := featureStatus(reportedLimits(t, caps, WithStrictPortability()), "native_delay")
-	if !strings.Contains(got.Detail, "not declared") {
-		t.Fatalf("strict native_delay detail = %q, want the driver accuracy withdrawn", got.Detail)
+	if got.Mode != FeatureEmulated {
+		t.Fatalf("strict native_delay mode = %v, want emulated", got.Mode)
 	}
-}
-
-func TestCapabilitiesEqualityCountsDelayAccuracy(t *testing.T) {
-	t.Parallel()
-
-	// The driver consumers read Effective == Capabilities{} as "the caller
-	// supplied no profile". A declared accuracy is part of a profile, so it
-	// takes part in that comparison instead of being invisible to it.
-	declared := driver.Capabilities{
-		DelayAccuracy: driver.DelayAccuracy{Floor: 500 * time.Millisecond, Relative: 1, MaxDelay: 64 * time.Second},
-	}
-	if declared == (driver.Capabilities{}) {
-		t.Fatal("a capabilities value carrying a declared delay accuracy compares equal to the zero value")
+	if !strings.Contains(got.Detail, "the driver holds each message") {
+		t.Fatalf("strict native_delay detail = %q, want the emulated detail", got.Detail)
 	}
 }

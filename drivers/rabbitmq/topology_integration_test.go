@@ -244,23 +244,19 @@ func TestVerifyTopologyReportsArgumentDrift(t *testing.T) {
 }
 
 // TestEnsureTopologyParkQueueArgumentsReachBroker proves the at-least-once
-// dead-letter arguments reach the broker rather than only a Go map, on a rung
-// queue and on the queue above the ladder: it reads both back through the
-// management API, which is the only channel that reports a queue's real
-// arguments (AMQP passive declare checks the name only). The rung also carries
-// the queue-level TTL that makes expiry order FIFO order. The queue above the
-// ladder must not carry that TTL: it keeps the per-message expiration a due
-// time beyond the ladder needs, and a TTL there would release such a message
-// early.
+// dead-letter arguments reach the broker rather than only a Go map, and that
+// the parking queue carries no TTL of its own: it reads the queue back through
+// the management API, which is the only channel that reports a queue's real
+// arguments (AMQP passive declare checks the name only). A queue TTL would cap
+// every message's wait and could not follow a changed delay.
 func TestEnsureTopologyParkQueueArgumentsReachBroker(t *testing.T) {
 	requireBroker(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 
-	const destination = "rabbitmq-driver-park-rung-args-queue"
-	const rung = 2 * time.Second
-	rungQueue := parkQueueName(destination, rung)
-	const aboveLadder = destination + ".park"
+	const destination = "rabbitmq-driver-park-args-queue"
+	const delay = 2 * time.Second
+	parkQueue := parkQueueName(destination)
 	raw, err := amqp.Dial(defaultEndpoint)
 	if err != nil {
 		t.Fatalf("Dial: %v", err)
@@ -281,7 +277,7 @@ func TestEnsureTopologyParkQueueArgumentsReachBroker(t *testing.T) {
 	t.Cleanup(func() { _ = conn.Close(ctx) })
 
 	if _, err := conn.Admin().EnsureTopology(ctx, driver.TopologySpec{
-		Destinations: []driver.DestinationSpec{{Name: destination, Durable: true, Delay: rung}},
+		Destinations: []driver.DestinationSpec{{Name: destination, Durable: true, Delay: delay}},
 	}); err != nil {
 		t.Fatalf("EnsureTopology: %v", err)
 	}
@@ -290,9 +286,9 @@ func TestEnsureTopologyParkQueueArgumentsReachBroker(t *testing.T) {
 	if err != nil {
 		t.Fatalf("newManagementClient: %v", err)
 	}
-	queue, err := mgmt.getQueue(ctx, rungQueue)
+	queue, err := mgmt.getQueue(ctx, parkQueue)
 	if err != nil {
-		t.Fatalf("getQueue(%q): %v", rungQueue, err)
+		t.Fatalf("getQueue(%q): %v", parkQueue, err)
 	}
 	parkArguments := map[string]string{
 		"x-queue-type":              "quorum",
@@ -301,14 +297,9 @@ func TestEnsureTopologyParkQueueArgumentsReachBroker(t *testing.T) {
 		"x-dead-letter-strategy":    "at-least-once",
 		"x-overflow":                "reject-publish",
 	}
-	assertQueueArguments(t, "rung", queue.Arguments, parkArguments, map[string]string{"x-message-ttl": "2000"})
-	above, err := mgmt.getQueue(ctx, aboveLadder)
-	if err != nil {
-		t.Fatalf("getQueue(%q): %v", aboveLadder, err)
-	}
-	assertQueueArguments(t, "above-ladder", above.Arguments, parkArguments, nil)
-	if value, present := above.Arguments["x-message-ttl"]; present {
-		t.Fatalf("the queue above the ladder carries x-message-ttl=%v, which would release a beyond-the-ladder due time early", value)
+	assertQueueArguments(t, "park", queue.Arguments, parkArguments, nil)
+	if value, present := queue.Arguments["x-message-ttl"]; present {
+		t.Fatalf("parking queue carries x-message-ttl=%v, want the wait on each message instead", value)
 	}
 }
 
@@ -324,7 +315,8 @@ func TestVerifyTopologyReportsDriftOnStaleParkQueue(t *testing.T) {
 	defer cancel()
 
 	const destination = "rabbitmq-driver-stale-park-queue"
-	const park = destination + ".park"
+	const delay = time.Second
+	park := parkQueueName(destination)
 	raw, err := amqp.Dial(defaultEndpoint)
 	if err != nil {
 		t.Fatalf("Dial: %v", err)
@@ -362,16 +354,6 @@ func TestVerifyTopologyReportsDriftOnStaleParkQueue(t *testing.T) {
 		t.Fatalf("out-of-band QueueDeclare(%q): %v", park, err)
 	}
 
-	// Declare the rung queues through the driver. The declare path checks a
-	// parking queue by name and never rewrites its arguments, so the hand-made
-	// queue above the ladder is left exactly as it is, while the ladder the
-	// verify pass below requires now exists.
-	if _, err := conn.Admin().EnsureTopology(ctx, driver.TopologySpec{
-		Destinations: []driver.DestinationSpec{{Name: destination, Durable: true, Delay: time.Second}},
-	}); err != nil {
-		t.Fatalf("EnsureTopology(declare ladder): %v", err)
-	}
-
 	// Confirm through the management API that the hand-declared queue really
 	// lacks x-dead-letter-strategy before verifying. A typo here that
 	// accidentally included the key would turn the assertion below green for
@@ -390,7 +372,7 @@ func TestVerifyTopologyReportsDriftOnStaleParkQueue(t *testing.T) {
 
 	spec := driver.TopologySpec{
 		Policy:       driver.TopologyVerify,
-		Destinations: []driver.DestinationSpec{{Name: destination, Durable: true, Delay: time.Second}},
+		Destinations: []driver.DestinationSpec{{Name: destination, Durable: true, Delay: delay}},
 	}
 	diff, err := conn.Admin().EnsureTopology(ctx, spec)
 	if err != nil {
@@ -410,7 +392,7 @@ func TestVerifyTopologyReportsDriftOnStaleParkQueue(t *testing.T) {
 	}
 }
 
-// TestEnsureTopologyParkQueueArgumentsClassicKind proves parkingArguments
+// TestEnsureTopologyParkQueueArgumentsClassicKind proves parkArguments
 // honours a classic-configured connection: the park queue's x-queue-type
 // must be classic, and neither at-least-once argument may appear, since
 // RabbitMQ's at-least-once dead-letter strategy applies to quorum queues
@@ -421,7 +403,8 @@ func TestEnsureTopologyParkQueueArgumentsClassicKind(t *testing.T) {
 	defer cancel()
 
 	const destination = "rabbitmq-driver-park-args-classic-queue"
-	const park = destination + ".park"
+	const delay = time.Second
+	park := parkQueueName(destination)
 	raw, err := amqp.Dial(defaultEndpoint)
 	if err != nil {
 		t.Fatalf("Dial: %v", err)
@@ -445,7 +428,7 @@ func TestEnsureTopologyParkQueueArgumentsClassicKind(t *testing.T) {
 	t.Cleanup(func() { _ = conn.Close(ctx) })
 
 	spec := driver.TopologySpec{
-		Destinations: []driver.DestinationSpec{{Name: destination, Durable: true, Delay: time.Second}},
+		Destinations: []driver.DestinationSpec{{Name: destination, Durable: true, Delay: delay}},
 	}
 	if _, err := conn.Admin().EnsureTopology(ctx, spec); err != nil {
 		t.Fatalf("EnsureTopology: %v", err)
@@ -602,15 +585,19 @@ func containsBinding(values []driver.BindingSpec, want driver.BindingSpec) bool 
 	return slices.Contains(values, want)
 }
 
-func TestEnsureTopologyFixedDelayDeclaresOneQueue(t *testing.T) {
+// TestEnsureTopologyDelayChangeReusesTheParkingQueue proves a retry tier
+// whose delay changes keeps its one parking queue: the redeclare reports the
+// queue as existing, creates nothing, orphans nothing, and a message published
+// afterwards waits the new delay. A delay carried as a queue argument would
+// instead need a second queue, because RabbitMQ refuses to redeclare a queue
+// with different arguments.
+func TestEnsureTopologyDelayChangeReusesTheParkingQueue(t *testing.T) {
 	requireBroker(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 
-	const destination = "rabbitmq-driver-fixed-park-queue"
-	fixedQueue := destination + ".park.fixed-5000ms"
-	aboveLadder := destination + ".park"
-	rungQueue := destination + ".park.8s"
+	const destination = "rabbitmq-driver-park-delay-change"
+	parkQueue := parkQueueName(destination)
 	raw, err := amqp.Dial(defaultEndpoint)
 	if err != nil {
 		t.Fatalf("Dial: %v", err)
@@ -622,11 +609,7 @@ func TestEnsureTopologyFixedDelayDeclaresOneQueue(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = rawChannel.Close() })
 	deleteParkQueues(rawChannel, destination)
-	_, _ = rawChannel.QueueDelete(fixedQueue, false, false, false)
-	t.Cleanup(func() {
-		deleteParkQueues(rawChannel, destination)
-		_, _ = rawChannel.QueueDelete(fixedQueue, false, false, false)
-	})
+	t.Cleanup(func() { deleteParkQueues(rawChannel, destination) })
 
 	conn, err := (Driver{}).Open(ctx, driver.Config{Endpoints: []string{defaultEndpoint}})
 	if err != nil {
@@ -635,87 +618,110 @@ func TestEnsureTopologyFixedDelayDeclaresOneQueue(t *testing.T) {
 	t.Cleanup(func() { _ = conn.Close(ctx) })
 
 	if _, err := conn.Admin().EnsureTopology(ctx, driver.TopologySpec{
-		Destinations: []driver.DestinationSpec{{Name: destination, Durable: true, Delay: 5 * time.Second, FixedDelay: true}},
+		Destinations: []driver.DestinationSpec{{Name: destination, Durable: true, Delay: 25 * time.Second}},
 	}); err != nil {
+		t.Fatalf("EnsureTopology(25s): %v", err)
+	}
+	diff, err := conn.Admin().EnsureTopology(ctx, driver.TopologySpec{
+		Destinations: []driver.DestinationSpec{{Name: destination, Durable: true, Delay: time.Second}},
+		Scope:        []string{destination},
+	})
+	if err != nil {
+		t.Fatalf("EnsureTopology(1s): %v", err)
+	}
+	if len(diff.CreatedDestinations) != 0 {
+		t.Fatalf("CreatedDestinations = %v, want none after a delay change", diff.CreatedDestinations)
+	}
+	if !slices.Contains(diff.ExistingDestinations, parkQueue) {
+		t.Fatalf("ExistingDestinations = %v, want the parking queue %q", diff.ExistingDestinations, parkQueue)
+	}
+	if len(diff.Orphaned) != 0 {
+		t.Fatalf("Orphaned = %v, want none after a delay change", diff.Orphaned)
+	}
+
+	deliveries, err := rawChannel.Consume(destination, "park-delay-change", false, false, false, false, nil)
+	if err != nil {
+		t.Fatalf("Consume: %v", err)
+	}
+	producer, err := conn.Producer(ctx, driver.ProducerConfig{})
+	if err != nil {
+		t.Fatalf("Producer: %v", err)
+	}
+	t.Cleanup(func() { _ = producer.Close(ctx) })
+	publishedAt := time.Now() //nolint:forbidigo // the timing assertion uses the real broker clock
+	if err := producer.Publish(ctx, driver.OutboundMessage{Destination: destination, Body: []byte("new-delay")}); err != nil {
+		t.Fatalf("Publish: %v", err)
+	}
+	deadlineCtx, deadlineCancel := context.WithDeadline(ctx, publishedAt.Add(5*time.Second))
+	defer deadlineCancel()
+	select {
+	case delivery := <-deliveries:
+		if elapsed := time.Since(publishedAt); elapsed < time.Second { //nolint:forbidigo // the timing assertion uses the real broker clock
+			t.Fatalf("delivery after %s, want at least the new 1s delay", elapsed)
+		}
+		if err := delivery.Ack(false); err != nil {
+			t.Fatalf("Ack: %v", err)
+		}
+	case <-deadlineCtx.Done():
+		t.Fatalf("delivery did not arrive within 5s under the new 1s delay: %v", deadlineCtx.Err())
+	}
+}
+
+// TestEnsureTopologyDelayDeclaresOneParkingQueue proves a delayed destination
+// gets exactly one parking queue, named for the destination alone, and no
+// delay-tagged queue beside it.
+func TestEnsureTopologyDelayDeclaresOneParkingQueue(t *testing.T) {
+	requireBroker(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	const destination = "rabbitmq-driver-fixed-park-queue"
+	const delay = 5 * time.Second
+	parkQueue := parkQueueName(destination)
+	raw, err := amqp.Dial(defaultEndpoint)
+	if err != nil {
+		t.Fatalf("Dial: %v", err)
+	}
+	t.Cleanup(func() { _ = raw.Close() })
+	rawChannel, err := raw.Channel()
+	if err != nil {
+		t.Fatalf("Channel: %v", err)
+	}
+	t.Cleanup(func() { _ = rawChannel.Close() })
+	deleteParkQueues(rawChannel, destination)
+	t.Cleanup(func() { deleteParkQueues(rawChannel, destination) })
+
+	conn, err := (Driver{}).Open(ctx, driver.Config{Endpoints: []string{defaultEndpoint}})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	t.Cleanup(func() { _ = conn.Close(ctx) })
+
+	diff, err := conn.Admin().EnsureTopology(ctx, driver.TopologySpec{
+		Destinations: []driver.DestinationSpec{{Name: destination, Durable: true, Delay: delay}},
+	})
+	if err != nil {
 		t.Fatalf("EnsureTopology: %v", err)
+	}
+	if want := []string{destination, parkQueue}; !slices.Equal(diff.CreatedDestinations, want) {
+		t.Fatalf("CreatedDestinations = %v, want %v", diff.CreatedDestinations, want)
 	}
 
 	mgmt, err := newManagementClient(defaultEndpoint, driver.Config{})
 	if err != nil {
 		t.Fatalf("newManagementClient: %v", err)
 	}
-	fixed, err := mgmt.getQueue(ctx, fixedQueue)
+	park, err := mgmt.getQueue(ctx, parkQueue)
 	if err != nil {
-		t.Fatalf("getQueue(%q): %v", fixedQueue, err)
+		t.Fatalf("getQueue(%q): %v", parkQueue, err)
 	}
-	if got := fmt.Sprint(fixed.Arguments["x-message-ttl"]); got != "5000" {
-		t.Fatalf("fixed queue x-message-ttl = %v, want 5000", got)
+	if value, present := park.Arguments["x-message-ttl"]; present {
+		t.Fatalf("parking queue x-message-ttl = %v, want none", value)
 	}
-	if _, err := mgmt.getQueue(ctx, aboveLadder); err != nil {
-		t.Fatalf("getQueue(%q): %v", aboveLadder, err)
-	}
-	if _, err := mgmt.getQueue(ctx, rungQueue); err == nil {
-		t.Fatalf("getQueue(%q) succeeded, want no such queue", rungQueue)
-	}
-}
-
-func TestEnsureTopologyFixedDelayReportsOldRungsAsOrphans(t *testing.T) {
-	requireBroker(t)
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-
-	const destination = "rabbitmq-driver-fixed-park-orphan"
-	fixedQueue := destination + ".park.fixed-5000ms"
-	raw, err := amqp.Dial(defaultEndpoint)
-	if err != nil {
-		t.Fatalf("Dial: %v", err)
-	}
-	t.Cleanup(func() { _ = raw.Close() })
-	rawChannel, err := raw.Channel()
-	if err != nil {
-		t.Fatalf("Channel: %v", err)
-	}
-	t.Cleanup(func() { _ = rawChannel.Close() })
-	deleteParkQueues(rawChannel, destination)
-	_, _ = rawChannel.QueueDelete(fixedQueue, false, false, false)
-	t.Cleanup(func() {
-		deleteParkQueues(rawChannel, destination)
-		_, _ = rawChannel.QueueDelete(fixedQueue, false, false, false)
-	})
-
-	conn, err := (Driver{}).Open(ctx, driver.Config{Endpoints: []string{defaultEndpoint}})
-	if err != nil {
-		t.Fatalf("Open: %v", err)
-	}
-	t.Cleanup(func() { _ = conn.Close(ctx) })
-
-	if _, err := conn.Admin().EnsureTopology(ctx, driver.TopologySpec{
-		Destinations: []driver.DestinationSpec{{Name: destination, Durable: true, Delay: 5 * time.Second}},
-	}); err != nil {
-		t.Fatalf("EnsureTopology(ladder): %v", err)
-	}
-	diff, err := conn.Admin().EnsureTopology(ctx, driver.TopologySpec{
-		Destinations: []driver.DestinationSpec{{Name: destination, Durable: true, Delay: 5 * time.Second, FixedDelay: true}},
-		Scope:        []string{destination},
-	})
-	if err != nil {
-		t.Fatalf("EnsureTopology(fixed): %v", err)
-	}
-	want := make(map[string]struct{}, len(parkRungs))
-	for _, rung := range parkRungs {
-		want[parkQueueName(destination, rung)] = struct{}{}
-	}
-	got := make(map[string]struct{}, len(diff.Orphaned))
-	for _, orphan := range diff.Orphaned {
-		got[orphan.Name] = struct{}{}
-	}
-	for name := range want {
-		if _, found := got[name]; !found {
-			t.Fatalf("Orphaned = %v, want old rung queue %q", diff.Orphaned, name)
+	for _, absent := range []string{destination + ".park.fixed-5000ms", destination + ".park.8s"} {
+		if _, err := mgmt.getQueue(ctx, absent); err == nil {
+			t.Fatalf("getQueue(%q) succeeded, want no such queue", absent)
 		}
-	}
-	if len(diff.Orphaned) != len(want) {
-		t.Fatalf("Orphaned = %v, want exactly the 8 old rung queues", diff.Orphaned)
 	}
 }
 

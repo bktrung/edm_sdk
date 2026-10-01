@@ -29,8 +29,7 @@ type DestinationSpec struct {
 	Kind          DestKind      // Kind identifies the destination's role.
 	Durable       bool          // Durable reports whether the destination survives a broker restart.
 	Partitions    int           // Partitions sets the partition count on brokers that support partitions; other drivers ignore it.
-	Delay         time.Duration // Delay is the destination's declared delivery delay; zero means no destination delay.
-	FixedDelay    bool          // FixedDelay means each message is due exactly Delay after publish.
+	Delay         time.Duration // Delay is how long after publish every message on the destination becomes due; zero means no delay.
 	DeadLetter    *Route        // DeadLetter is the explicit broker-side backstop route, if any.
 	DeliveryLimit int           // DeliveryLimit is the broker backstop count; values at or below zero mean no limit.
 }

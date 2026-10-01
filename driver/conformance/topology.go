@@ -334,8 +334,7 @@ func runTopology(group *groupContext) {
 			t.Fatalf("Publish(%q): %v", dropped, err)
 		}
 		deferredProducer := newDeferredProducer(t, group, profileDestination(group, dropped), topologyParkDelay)
-		due := deferredNow(group).Add(topologyParkDelay)
-		if err := deferredProducer.Publish(group.ctx, driver.OutboundMessage{Destination: dropped, DelayUntil: due}); err != nil {
+		if err := deferredProducer.Publish(group.ctx, driver.OutboundMessage{Destination: dropped}); err != nil {
 			t.Fatalf("Publish(%q): %v", dropped, err)
 		}
 		waitFor(t, group, "seeded messages to land on the dropped destination", func() (bool, string) {
@@ -371,10 +370,9 @@ func runTopology(group *groupContext) {
 			t.Fatalf("Publish(%q): %v", name, err)
 		}
 		deferredProducer := newDeferredProducer(t, group, profileDestination(group, name), topologyParkDelay)
-		due := deferredNow(group).Add(topologyParkDelay)
 		if err := deferredProducer.Publish(group.ctx,
-			driver.OutboundMessage{Destination: name, DelayUntil: due},
-			driver.OutboundMessage{Destination: name, DelayUntil: due},
+			driver.OutboundMessage{Destination: name},
+			driver.OutboundMessage{Destination: name},
 		); err != nil {
 			t.Fatalf("Publish(%q): %v", name, err)
 		}
@@ -452,8 +450,7 @@ func runTopology(group *groupContext) {
 			t.Fatalf("EnsureTopology(eligible): %v", err)
 		}
 		producer := newDeferredProducer(t, group, profileDestination(group, parked), topologyParkDelay)
-		due := deferredNow(group).Add(topologyParkDelay)
-		if err := producer.Publish(group.ctx, driver.OutboundMessage{Destination: parked, DelayUntil: due}); err != nil {
+		if err := producer.Publish(group.ctx, driver.OutboundMessage{Destination: parked}); err != nil {
 			t.Fatalf("Publish(%q): %v", parked, err)
 		}
 		// The sharpest case: the ready queue is empty while the park is not, so

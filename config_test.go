@@ -11,7 +11,6 @@ import (
 	"time"
 
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/dispatch"
-	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/retry"
 )
 
 func TestLoadConfigUnknownKeyIsStartupError(t *testing.T) {
@@ -261,16 +260,6 @@ func TestLoadConfigSubscriptionUsesBrokerPrefetchFallback(t *testing.T) {
 	}
 	if got, want := cfg.Subscriptions["orders"].Prefetch, 128; got != want {
 		t.Fatalf("Prefetch = %d, want %d", got, want)
-	}
-}
-
-func TestLoadConfigRejectsExplicitZeroPrefetch(t *testing.T) {
-	t.Parallel()
-	path := writeConfig(t, "f1:\n  env: test\n  service: orders\n  broker:\n    driver: inmem\n  subscriptions:\n    orders:\n      topics: [orders]\n      prefetch: 0\n")
-	_, err := LoadConfig(path)
-	want := "f1: subscriptions.orders.prefetch 0 must be at least lane count 12 (topics x priorities x (1 + retryTiers))"
-	if err == nil || err.Error() != want {
-		t.Fatalf("LoadConfig() error = %v, want %q", err, want)
 	}
 }
 
@@ -696,6 +685,10 @@ func TestConfigAndSubscribeRejectTheSameSubscriptions(t *testing.T) {
 		}},
 		{"negative retry weight divisor", "retryWeightDivisor", func(sub *SubscriptionConfig) { sub.Fairness.RetryWeightDivisor = -1 }},
 		{"negative prefetch factor", "prefetchFactor", func(sub *SubscriptionConfig) { sub.Fairness.PrefetchFactor = -1 }},
+		{"overflowing automatic prefetch factor", "prefetch 65536", func(sub *SubscriptionConfig) {
+			sub.Prefetch = 0
+			sub.Fairness.PrefetchFactor = int(^uint(0) >> 1)
+		}},
 		{"ordered buffer too large", "ordered mode", func(sub *SubscriptionConfig) {
 			sub.Mode = OrderedByKey
 			sub.Concurrency = 1024
@@ -754,31 +747,27 @@ func TestValidateConfigRejectsNegativeLifecycleDurations(t *testing.T) {
 	}
 }
 
-func TestRetryConfigDelayForAgreesWithInternalRetryLadder(t *testing.T) {
+// TestRetryConfigDelayForAppliesDocumentedDefaults pins the public DelayFor
+// contract with literal delays: a non-positive InitialInterval becomes one
+// second, a zero Multiplier becomes five, and Tiers select by attempt and hold
+// at the last entry.
+func TestRetryConfigDelayForAppliesDocumentedDefaults(t *testing.T) {
 	cases := []struct {
 		name    string
 		cfg     RetryConfig
 		attempt int
+		want    time.Duration
 	}{
-		{name: "negative initial interval", cfg: RetryConfig{InitialInterval: -time.Second, Multiplier: 2}, attempt: 3},
-		{name: "zero initial interval", cfg: RetryConfig{Multiplier: 2}, attempt: 2},
-		{name: "zero multiplier", cfg: RetryConfig{InitialInterval: time.Second}, attempt: 3},
-		{name: "explicit tiers", cfg: RetryConfig{Tiers: []time.Duration{time.Second, 3 * time.Second, 9 * time.Second}}, attempt: 2},
-		{name: "attempt beyond tier count", cfg: RetryConfig{Tiers: []time.Duration{time.Second, 3 * time.Second}}, attempt: 5},
+		{name: "negative initial interval", cfg: RetryConfig{InitialInterval: -time.Second, Multiplier: 2}, attempt: 3, want: 4 * time.Second},
+		{name: "zero initial interval", cfg: RetryConfig{Multiplier: 2}, attempt: 2, want: 2 * time.Second},
+		{name: "zero multiplier", cfg: RetryConfig{InitialInterval: time.Second}, attempt: 3, want: 25 * time.Second},
+		{name: "explicit tiers", cfg: RetryConfig{Tiers: []time.Duration{time.Second, 3 * time.Second, 9 * time.Second}}, attempt: 2, want: 3 * time.Second},
+		{name: "attempt beyond tier count", cfg: RetryConfig{Tiers: []time.Duration{time.Second, 3 * time.Second}}, attempt: 5, want: 3 * time.Second},
 	}
 	for _, test := range cases {
 		t.Run(test.name, func(t *testing.T) {
-			got := test.cfg.DelayFor(test.attempt)
-			internalCfg := retry.Config{
-				MaxAttempts:     test.cfg.MaxAttempts,
-				InitialInterval: test.cfg.InitialInterval,
-				Multiplier:      test.cfg.Multiplier,
-				MaxInterval:     test.cfg.MaxInterval,
-				Tiers:           test.cfg.Tiers,
-			}
-			want := internalCfg.DelayFor(test.attempt)
-			if got != want {
-				t.Fatalf("RetryConfig.DelayFor(%d) = %v, internal/retry.Config.DelayFor(%d) = %v; want agreement", test.attempt, got, test.attempt, want)
+			if got := test.cfg.DelayFor(test.attempt); got != test.want {
+				t.Fatalf("RetryConfig.DelayFor(%d) = %v, want %v", test.attempt, got, test.want)
 			}
 		})
 	}
@@ -930,6 +919,93 @@ func validValidationConfig() Config {
 		},
 	}
 	return cfg
+}
+
+func TestAutomaticSubscriptionPrefetchUsesResolvedLaneCapacitySum(t *testing.T) {
+	sub := validValidationConfig().Subscriptions["orders"]
+	sub.Prefetch = 0
+	if got, want := automaticSubscriptionPrefetch(sub), 12; got != want {
+		t.Fatalf("automaticSubscriptionPrefetch() = %d, want %d", got, want)
+	}
+}
+
+// TestAutomaticSubscriptionPrefetchKeepsWeightedSharesExact pins the lane
+// share computed before any clipping. Each row's product of concurrency and
+// weight, or its total weight, passes the prefetch bound, which is where
+// clipping the intermediate values changed a valid answer: the share was
+// computed from the clipped product or divided by the clipped total.
+func TestAutomaticSubscriptionPrefetchKeepsWeightedSharesExact(t *testing.T) {
+	for _, test := range []struct {
+		name        string
+		concurrency int
+		weights     map[Priority]int
+		priorities  []Priority
+		want        int
+	}{
+		{
+			// ceil(256 x 1024 / 1024) x 2; clipped first it was 64 x 2.
+			name:        "product of concurrency and weight past the bound",
+			concurrency: 256,
+			weights:     map[Priority]int{PriorityMedium: 1024},
+			priorities:  []Priority{PriorityMedium},
+			want:        512,
+		},
+		{
+			// Two lanes of ceil(1024 x 40000 / 80000) x 2; a total clipped to
+			// the bound made each share the minimum.
+			name:        "total weight past the bound",
+			concurrency: 1024,
+			weights:     map[Priority]int{PriorityHigh: 40000, PriorityLow: 40000},
+			priorities:  []Priority{PriorityHigh, PriorityLow},
+			want:        2048,
+		},
+		{
+			// ceil(80/13) + ceil(40/13) + max(ceil(10/13), 3), times 2.
+			name:        "uneven weights round each share up",
+			concurrency: 10,
+			weights:     map[Priority]int{PriorityHigh: 8, PriorityMedium: 4, PriorityLow: 1},
+			priorities:  []Priority{PriorityHigh, PriorityMedium, PriorityLow},
+			want:        28,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			sub := validValidationConfig().Subscriptions["orders"]
+			sub.Prefetch = 0
+			sub.Retry = RetryConfig{MaxAttempts: 1}
+			sub.Concurrency = test.concurrency
+			sub.Priorities = test.priorities
+			sub.Fairness.Weights = test.weights
+			sub.Fairness.PrefetchFactor = 2
+			if got := automaticSubscriptionPrefetch(sub); got != test.want {
+				t.Fatalf("automaticSubscriptionPrefetch() = %d, want %d", got, test.want)
+			}
+		})
+	}
+}
+
+// TestFairnessWeightIsBounded pins the bound that keeps the weighted share
+// exact: the largest weight is accepted, and one past it is refused with the
+// range in the message.
+func TestFairnessWeightIsBounded(t *testing.T) {
+	for _, test := range []struct {
+		weight  int
+		wantErr bool
+	}{
+		{weight: maxFairnessWeight},
+		{weight: maxFairnessWeight + 1, wantErr: true},
+	} {
+		cfg := validValidationConfig()
+		sub := cfg.Subscriptions["orders"]
+		sub.Fairness.Weights = map[Priority]int{PriorityMedium: test.weight}
+		cfg.Subscriptions["orders"] = sub
+		err := validateConfiguredConfig(cfg)
+		if test.wantErr != (err != nil) {
+			t.Fatalf("weight %d: validate = %v, want error %t", test.weight, err, test.wantErr)
+		}
+		if test.wantErr && !strings.Contains(err.Error(), "fairness.weights.medium must be between 1 and 65535") {
+			t.Fatalf("weight %d: error = %v, want the allowed range named", test.weight, err)
+		}
+	}
 }
 
 func withRetry(sub SubscriptionConfig, retry RetryConfig) SubscriptionConfig {

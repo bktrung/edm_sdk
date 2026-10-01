@@ -119,19 +119,15 @@ as provided and must not parse it, rebuild F1 names, or infer whether it is a
 publish entry point from the name. The `EntryPoint` flag is also core-owned and
 must be honored as supplied.
 
-Drivers transport the body, headers, key, optional priority hint, and optional
-`DelayUntil`. A broker that cannot implement a native hint must rely on the
-effective capability profile and the portable path selected by the core; it
-must not change the observable F1 result silently.
+Drivers transport the body, headers, key, and optional priority hint. A broker
+that cannot implement a native hint must rely on the effective capability
+profile and the portable path selected by the core; it must not change the
+observable F1 result silently.
 
-A driver may defer on its own terms rather than honour `DelayUntil`. A message
-sent to a destination that declares a delay may be delivered at that message's
-publish instant plus the declared delay, whatever due time the message carries,
-and never earlier; within one partition of a destination, the messages it
-deferred are then delivered in the order they were published. That is a property
-of the driver rather than a capability, because it describes the semantics the
-driver owes instead of an optimisation it performs, so it is declared to the
-conformance suite rather than reported by `Capabilities`.
+A message carries no due time of its own. A message sent to a destination that
+declares a `Delay` is owed delivery at its publish instant plus that delay, and
+never earlier; within one partition of a destination, delayed messages are
+delivered in the order they were published.
 
 ### `InboundMessage`
 
@@ -233,9 +229,9 @@ chance to observe the error and release or drain outstanding deliveries.
 delivery. An empty destination list applies the operation to all destinations
 owned by the consumer.
 
-Pause must respect the per-destination prefetch budget passed in
-`ConsumerConfig` as a ceiling it may not exceed; it must not allow an outage or
-paused lane to accumulate an unbounded local buffer.
+Pause must preserve both SDK admission ceilings in `ConsumerConfig`. Transport
+buffering is separate and must remain bounded during an outage or paused lane;
+see the [prefetch contract](/advanced-topics/configuration#prefetch-resolution).
 
 ### Drain
 
@@ -243,6 +239,12 @@ paused lane to accumulate an unbounded local buffer.
 settleable. When `Drain` returns, `Messages` must yield no new deliveries, but
 the driver must continue to accept settlement calls for deliveries already
 handed to the core.
+
+This boundary covers every delivery sender, including a settlement call that
+hands the next queued record to `Messages`. Stopping the fetch loop alone is
+not sufficient when settlement can deliver independently.
+The fence stops new sends; it does not discard deliveries already buffered on
+`Messages`, which remain settleable.
 
 Drain is not Stop and is not Release. It is the first phase of an orderly
 handoff: stop intake, preserve ownership of accepted work, and let the core
@@ -271,7 +273,12 @@ explicit handoff operation for connection loss, reconnect, and shutdown paths
 where the core cannot prove settlement. It must be idempotent and safe after a
 previous release or stop. The core calls `Release` after any `Stop` error, and a
 driver whose `Stop` did not return within the phase budget may still receive it,
-so the two calls can overlap. A `Stop` after `Release` returns nil. A broker
+so the two calls can overlap. A `Stop` after `Release` returns nil.
+
+A `Release` that returned an error has not released. The core keeps that
+consumer and calls `Release` again before it closes the connection, so the next
+call must finish the teardown rather than return nil for a release that never
+happened. Concurrent calls must not tear the consumer down twice. A broker
 that cannot return unsettled work must return [`ErrUnsupported`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/driver/errors.go).
 
 ### Lag
@@ -350,17 +357,18 @@ core.
   that defers on the consumer side. The core fills it from the same topology it
   passes to `EnsureTopology`, and a destination absent from the map has no
   delay, which is how a driver is told a destination defers nothing;
-- total prefetch and the core-calculated `PerDestination` allocation, which
-  bound the deliveries the consumer may hold unsettled in total and per
-  destination;
+- the positive resolved total prefetch and full `PerDestination` lane windows.
+  Neither ceiling may be exceeded by SDK-admitted unsettled deliveries; these
+  windows are not static shares of the total. Use
+  `ConsumerConfig.DestinationPrefetch` for each destination's window;
 - exclusive mode;
 - start position for a new group only; and
 - the same effective capability profile.
 
 Drivers must honor the effective configuration they receive as a ceiling they
 may not exceed. They may retain internal connection facts, but must not replace
-core-selected behavior with a different capability view, and must not hold more
-unsettled work than the prefetch budget allows.
+core-selected behavior with a different capability view. Broker credit, poll
+results, and client buffers do not enlarge SDK admission.
 
 A ceiling is not a floor. A driver may hold fewer deliveries than the
 configuration allows when its own transport bounds it lower. The Kafka driver

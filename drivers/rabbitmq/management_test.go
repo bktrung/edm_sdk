@@ -91,23 +91,45 @@ func TestManagementClientHasExplicitTimeout(t *testing.T) {
 	}
 }
 
-func TestManagementClientDerivesStandardPort(t *testing.T) {
-	client, err := newManagementClient("amqp://localhost:5672/", driver.Config{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if client.baseURL != "http://localhost:15672" {
-		t.Fatalf("management base URL = %q, want standard management endpoint", client.baseURL)
-	}
-}
-
-func TestManagementClientDerivesAlternatePort(t *testing.T) {
-	client, err := newManagementClient("amqp://localhost:25672/", driver.Config{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if client.baseURL != "http://localhost:35672" {
-		t.Fatalf("management base URL = %q, want alternate management endpoint", client.baseURL)
+// TestManagementClientPort pins where the management API is addressed: the
+// AMQP port plus 10000 when nothing is configured, the configured port when one
+// is, the scheme following the AMQP transport, and a refusal for a port outside
+// the valid range whichever way it was reached.
+func TestManagementClientPort(t *testing.T) {
+	for _, test := range []struct {
+		name     string
+		endpoint string
+		port     string
+		want     string
+	}{
+		{name: "derived from the standard port", endpoint: "amqp://localhost:5672/", want: "http://localhost:15672"},
+		{name: "derived from an alternate port", endpoint: "amqp://localhost:25672/", want: "http://localhost:35672"},
+		{name: "derived port out of range", endpoint: "amqp://localhost:55536/"},
+		{name: "configured", endpoint: "amqp://localhost:5673/", port: "18080", want: "http://localhost:18080"},
+		{name: "configured over amqps", endpoint: "amqps://broker.example:5671/", port: "18080", want: "https://broker.example:18080"},
+		{name: "configured not a port", endpoint: "amqp://localhost:5672/", port: "not-a-port"},
+		{name: "configured zero", endpoint: "amqp://localhost:5672/", port: "0"},
+		{name: "configured out of range", endpoint: "amqp://localhost:5672/", port: "65536"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			cfg := driver.Config{}
+			if test.port != "" {
+				cfg.DriverOptions = map[string]string{managementPortOption: test.port}
+			}
+			client, err := newManagementClient(test.endpoint, cfg)
+			if test.want == "" {
+				if err == nil || client != nil {
+					t.Fatalf("newManagementClient(%q) = client %v, error %v; want an invalid port error", test.endpoint, client, err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if client.baseURL != test.want {
+				t.Fatalf("management base URL = %q, want %q", client.baseURL, test.want)
+			}
+		})
 	}
 }
 
@@ -275,13 +297,6 @@ func TestManagementClientEndpointValidityDoesNotDependOnConfiguredVhost(t *testi
 	}
 }
 
-func TestManagementClientRejectsInvalidDerivedPort(t *testing.T) {
-	client, err := newManagementClient("amqp://localhost:55536/", driver.Config{})
-	if err == nil || client != nil {
-		t.Fatalf("newManagementClient() = client %v, error %v; want invalid derived port error", client, err)
-	}
-}
-
 func TestManagementClientRejectsInvalidEndpoint(t *testing.T) {
 	client, err := newManagementClient("://invalid", driver.Config{})
 	if err == nil || client != nil {
@@ -445,40 +460,6 @@ func TestManagementClientUsesConfiguredTLSServerName(t *testing.T) {
 	}
 	if transport.TLSClientConfig.ServerName != "broker.alias.example" {
 		t.Fatalf("management tls.Config.ServerName = %q, want %q", transport.TLSClientConfig.ServerName, "broker.alias.example")
-	}
-}
-
-func TestManagementClientUsesConfiguredPort(t *testing.T) {
-	cfg := driver.Config{DriverOptions: map[string]string{managementPortOption: "18080"}}
-	client, err := newManagementClient("amqp://localhost:5673/", cfg)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if client.baseURL != "http://localhost:18080" {
-		t.Fatalf("management base URL = %q, want configured port", client.baseURL)
-	}
-}
-
-func TestManagementClientUsesConfiguredPortForAMQPSTransport(t *testing.T) {
-	cfg := driver.Config{DriverOptions: map[string]string{managementPortOption: "18080"}}
-	client, err := newManagementClient("amqps://broker.example:5671/", cfg)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if client.baseURL != "https://broker.example:18080" {
-		t.Fatalf("management base URL = %q, want configured HTTPS port", client.baseURL)
-	}
-}
-
-func TestManagementClientRejectsInvalidConfiguredPort(t *testing.T) {
-	for _, configured := range []string{"not-a-port", "0", "65536"} {
-		t.Run(configured, func(t *testing.T) {
-			cfg := driver.Config{DriverOptions: map[string]string{managementPortOption: configured}}
-			client, err := newManagementClient(defaultEndpoint, cfg)
-			if err == nil || client != nil {
-				t.Fatalf("newManagementClient() = client %v, error %v; want invalid port error", client, err)
-			}
-		})
 	}
 }
 

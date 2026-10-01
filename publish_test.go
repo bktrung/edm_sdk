@@ -505,9 +505,22 @@ func TestNewLogsNonNativeCapabilities(t *testing.T) {
 	}
 }
 
-func TestWarnUnclassifiedWithContextAcceptsNilLogger(t *testing.T) {
+// TestPublishWithoutLoggerReportsAnUnclassifiedProducerFailure pins the
+// no-logger path: a client built without WithLogger has no logger to warn an
+// unclassified producer build failure through, so Publish must return the
+// failure rather than panic on the warning.
+func TestPublishWithoutLoggerReportsAnUnclassifiedProducerFailure(t *testing.T) {
 	t.Parallel()
-	warnUnclassifiedWithContext(nil, context.Background(), errors.New("unclassified"))
+	cause := errors.New("unclassified producer failure")
+	conn := &publishConn{
+		producer:    &recordingProducer{},
+		producerErr: cause,
+		info:        driver.BrokerInfo{Kind: "test", Version: "1"},
+	}
+	client := newPublishClientWithConn(t, conn)
+	if _, err := client.Publisher().Publish(context.Background(), "orders.created", "payload"); !errors.Is(err, cause) {
+		t.Fatalf("Publish() error = %v, want it to wrap %v", err, cause)
+	}
 }
 
 func TestInvokeHandlerMessageSkipsTopicLookupForPlainDelivery(t *testing.T) {

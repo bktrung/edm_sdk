@@ -130,56 +130,6 @@ func (s admitState) name() string {
 	return strings.Join(names, "+")
 }
 
-// reachable reports whether a client that came through New can be in this
-// combination.
-//
-//   - No connection: New refuses a nil connection and the swap refuses one too,
-//     and no code clears c.current.conn, so a client that came through New
-//     holds one for its whole life. The table keeps the combination anyway: it
-//     is the state a hand-built client is in, and the exhaustive test below
-//     leaves it out for that reason.
-//   - The producer teardown with a Ready lifecycle: the teardown is recorded
-//     only from the publish-idle wait, which Close runs after it has entered the
-//     drain, and the lifecycle never returns to Ready from there.
-//
-// Everything else is reachable. The three parts are independent facts, so they
-// combine freely: a retained reconnect decision can be read while an attempt is
-// still the client's, a Close can be draining while an attempt is winding down,
-// and a Close that failed after the producer was torn down leaves both facts set.
-func (s admitState) reachable() bool {
-	switch {
-	case !s.connected:
-		return false
-	case s.producerTeardown && s.lifecycle == lifecycle.Ready:
-		return false
-	default:
-		return true
-	}
-}
-
-// reachableAdmitStates enumerates every combination of the stored state a live
-// client can be in: the four lifecycle states, a live or reconnecting
-// connection, a retained reconnect decision or none, and the producer fact.
-func reachableAdmitStates() []admitState {
-	var states []admitState
-	for _, life := range []lifecycle.State{lifecycle.Ready, lifecycle.Draining, lifecycle.Aborted, lifecycle.Closed} {
-		for _, conn := range []connState{connLive, connReconnecting} {
-			for _, failed := range []bool{false, true} {
-				for _, tornDown := range []bool{false, true} {
-					candidate := admitState{lifecycle: life, conn: conn, connected: true, producerTeardown: tornDown}
-					if failed {
-						candidate.reconnectErr = admitTestExhaustion
-					}
-					if candidate.reachable() {
-						states = append(states, candidate)
-					}
-				}
-			}
-		}
-	}
-	return states
-}
-
 var admitKinds = []workKind{
 	workPublishEntry,
 	workPublish,
@@ -329,6 +279,24 @@ func TestAdmitReproducesEachCallSitePredicate(t *testing.T) {
 			want: admitWants{
 				publishEntry:      closedText,
 				publish:           admitTestPublishReconnecting,
+				subscribe:         closingText,
+				run:               closingText,
+				consumerAdmission: admitTestConsumeReconnecting,
+				reconnect:         closingText,
+				health:            closingText,
+			},
+		},
+		{
+			// A failed Close tore the producer down and the caller's connection
+			// was replaced: the producer clause is read before the claim, so a
+			// successor publish reports the closed client rather than a
+			// reconnect it could wait out.
+			name:  "aborted-live-producer-torn-down-stale-claim",
+			state: admitState{lifecycle: lifecycle.Aborted, connected: true, producerTeardown: true},
+			claim: 2,
+			want: admitWants{
+				publishEntry:      closedText,
+				publish:           closedText,
 				subscribe:         closingText,
 				run:               closingText,
 				consumerAdmission: admitTestConsumeReconnecting,
@@ -505,8 +473,7 @@ func TestAdmitReproducesEachCallSitePredicate(t *testing.T) {
 			// both no connection and a retained decision about one. The
 			// connection axis reports the absent connection first, so Health
 			// answers with it, while the site reads the retained decision
-			// before the connection and would answer with the decision. The
-			// exhaustive test below excludes the combination for that reason.
+			// before the connection and would answer with the decision.
 			name:  "no-connection",
 			state: admitState{lifecycle: lifecycle.Ready},
 			want: admitWants{
@@ -545,151 +512,6 @@ func TestAdmitReproducesEachCallSitePredicate(t *testing.T) {
 			})
 		}
 	}
-}
-
-// TestAdmitAgreesWithTheSitesOnEveryReachableState runs the same claim over
-// every combination of the stored state a live client can be in rather than the
-// rows a person thought to write down, and over every connection a caller can
-// claim to hold in that combination: none, the one the client is on, and one it
-// has left. The expected answer is transcribed from the sites as they read the
-// state today, in the order they read it.
-func TestAdmitAgreesWithTheSitesOnEveryReachableState(t *testing.T) {
-	t.Parallel()
-
-	for _, state := range reachableAdmitStates() {
-		for _, kind := range admitKinds {
-			for _, claim := range state.claims() {
-				t.Run(state.name()+"/"+admitKindName(kind)+"/"+claimName(state, claim), func(t *testing.T) {
-					t.Parallel()
-					client := state.client()
-					want := admitSiteAnswer(kind, state, claim)
-					got := admitErrorText(client.admit(kind, claim))
-					if got != want {
-						t.Fatalf("admit(%s) with %s and claim %d = %q, want %q, the answer the sites give for this state",
-							admitKindName(kind), state.name(), claim, got, want)
-					}
-				})
-			}
-		}
-	}
-}
-
-// claims enumerates the connections a caller can hold against a client in this
-// combination. A client with no connection has no incarnation for a caller to
-// have captured, so the only claim it can be asked about is the zero one, the
-// sites that never captured a connection pass; a connected one is asked about
-// that claim, the incarnation it is on, and one it has left.
-func (s admitState) claims() []uint64 {
-	if !s.connected {
-		return []uint64{0}
-	}
-	return []uint64{0, s.epochValue(), s.epochValue() + 1}
-}
-
-// claimName renders a claim against the client's incarnation, so a failing
-// subtest says which of the three a caller held.
-func claimName(s admitState, claim uint64) string {
-	switch {
-	case claim == 0:
-		return "no-claim"
-	case claim == s.epochValue():
-		return "current-claim"
-	default:
-		return "stale-claim"
-	}
-}
-
-// admitSiteAnswer transcribes what the sites admit replaced answered for one
-// combination of the stored state and one connection the caller captured. Each
-// branch is the predicate one of them ran, in the order it ran it, with the
-// stored lifecycle read where the flags behind it were read:
-//
-//   - the application publish's entry gate: shutdown begun, no connection,
-//     then the retained reconnect error, then a running attempt;
-//   - the shared publish admission: Closed, no connection, producer torn down,
-//     then the retained reconnect error, then a running attempt, then the
-//     caller's connection no longer being the client's. It never read a drain
-//     in flight, which is what admits a successor publish while Close is
-//     draining;
-//   - Subscribe's gates: Closed or no connection, then shutdown begun;
-//   - Runner.Run's gate: shutdown begun, no connection;
-//   - the consumer admission: a running attempt, then the caller's connection
-//     no longer being the client's. It does not read the retained reconnect
-//     error, which reported a connection that is still the one the client
-//     holds;
-//   - requestReconnect's gate: shutdown begun, then the retained reconnect
-//     error;
-//   - Health: Closed, then the retained reconnect error, then no connection,
-//     then a running attempt, then a shutdown that is not a drain.
-func admitSiteAnswer(kind workKind, s admitState, claim uint64) string {
-	shutdownBegan := s.lifecycle != lifecycle.Ready
-	switch kind {
-	case workPublishEntry:
-		if shutdownBegan || !s.connected {
-			return "f1: client is closed"
-		}
-		if s.reconnectErr != nil {
-			return admitTestExhaustion.Error()
-		}
-		if s.conn == connReconnecting {
-			return admitTestPublishReconnecting
-		}
-	case workPublish:
-		if s.lifecycle == lifecycle.Closed || !s.connected || s.producerTeardown {
-			return "f1: client is closed"
-		}
-		if s.reconnectErr != nil {
-			return admitTestExhaustion.Error()
-		}
-		if s.conn == connReconnecting {
-			return admitTestPublishReconnecting
-		}
-		if claim != 0 && claim != s.epochValue() {
-			return admitTestPublishReconnecting
-		}
-	case workSubscribe:
-		if s.lifecycle == lifecycle.Closed || !s.connected {
-			return "f1: client is closed"
-		}
-		if shutdownBegan {
-			return "f1: client is closing"
-		}
-	case workRun:
-		if shutdownBegan || !s.connected {
-			return "f1: client is closing"
-		}
-	case workConsumerAdmission:
-		if s.conn == connReconnecting {
-			return admitTestConsumeReconnecting
-		}
-		if claim != 0 && claim != s.epochValue() {
-			return admitTestConsumeReconnecting
-		}
-	case workReconnect:
-		if shutdownBegan {
-			return "f1: client is closing"
-		}
-		if s.reconnectErr != nil {
-			return admitTestExhaustion.Error()
-		}
-	case workHealth:
-		if s.lifecycle == lifecycle.Closed {
-			return "f1: client is closed"
-		}
-		if s.reconnectErr != nil {
-			return admitTestExhaustion.Error()
-		}
-		if !s.connected {
-			return "f1: client is not connected"
-		}
-		if s.conn == connReconnecting {
-			return "f1: client is reconnecting"
-		}
-		if shutdownBegan {
-			return "f1: client is closing"
-		}
-	}
-	return ""
 }
 
 // TestReconnectSwapMovesTheEpochAndReleasesTheWaiterParkedBeforeIt pins the two

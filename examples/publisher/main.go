@@ -30,7 +30,7 @@ func main() {
 	}
 }
 
-func run() error {
+func run() (runErr error) {
 	configPath := flag.String("config", "examples/config.yaml", "path to the F1 YAML configuration")
 	waitForConsumer := flag.Bool("wait", false, "wait for Enter before publishing")
 	flag.Parse()
@@ -52,7 +52,7 @@ func run() error {
 	defer func() {
 		closeCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
-		_ = client.Close(closeCtx)
+		runErr = errors.Join(runErr, client.Close(closeCtx))
 	}()
 
 	if *waitForConsumer {

@@ -96,6 +96,9 @@ func (c *consumer) admissionLocked(record *kgo.Record) bool {
 		c.setPauseReasonLocked(record.Topic, pauseReasonPrefetch, true)
 		return false
 	}
+	if !requeued && c.cfg.Prefetch > 0 && c.admitted >= c.cfg.Prefetch {
+		return false
+	}
 	if c.outstanding[key] > 0 && !requeued {
 		// The hold rule: this partition already has a delivery outstanding, and
 		// the next one waits for it to settle. A requeue is the exception,
@@ -147,7 +150,7 @@ func (c *consumer) setPartitionPauseReasonLocked(key partitionKey, reason partit
 	if reasons.empty() {
 		delete(c.partitionPauses, key)
 		c.resumePartitionIfFreeLocked(key)
-		c.wakePollLocked()
+		c.wakePartitionLocked(key)
 	}
 }
 
@@ -168,24 +171,43 @@ func (c *consumer) resumePartitionIfFreeLocked(key partitionKey) {
 func (c *consumer) syncReadAheadPauses() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	counts := c.readAheadCounts
-	if counts == nil {
-		counts = make(map[partitionKey]int, len(c.pending))
-		c.readAheadCounts = counts
+	// A held partition may have no queue left, and a queued one may hold no
+	// reason yet, so both sets are walked; reconciling a partition twice
+	// changes nothing the second time.
+	for key := range c.partitionPauses {
+		c.syncReadAheadPauseLocked(key)
 	}
-	clear(counts)
-	for key, records := range c.pending {
-		counts[key] = len(records)
+	for key := range c.pending {
+		c.syncReadAheadPauseLocked(key)
 	}
-	for key, reasons := range c.partitionPauses {
-		if _, held := reasons[partitionPauseReadAhead]; held && (counts[key] < c.readAheadLimit(key.destination) || c.requeued[key] > 0) {
-			c.setPartitionPauseReasonLocked(key, partitionPauseReadAhead, false)
-		}
+}
+
+// syncReadAheadAfterFlush reconciles the read-ahead reasons after the poll
+// loop's flushPending: over every partition when a pass of the flush was full,
+// and otherwise over the partitions the flush visited, the only ones whose
+// queue or requeue count it can have changed. A partition an event changed
+// while the flush ran is marked for the next pass, which reconciles it.
+func (c *consumer) syncReadAheadAfterFlush() {
+	if c.visitedAll {
+		c.syncReadAheadPauses()
+		return
 	}
-	for key, count := range counts {
-		if count >= c.readAheadLimit(key.destination) && c.requeued[key] == 0 {
-			c.setPartitionPauseReasonLocked(key, partitionPauseReadAhead, true)
-		}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for _, key := range c.visitedKeys {
+		c.syncReadAheadPauseLocked(key)
+	}
+}
+
+// syncReadAheadPauseLocked is syncReadAheadPauses for one partition. The caller
+// must hold c.mu.
+func (c *consumer) syncReadAheadPauseLocked(key partitionKey) {
+	count, limit, requeued := len(c.pending[key]), c.readAheadLimit(key.destination), c.requeued[key] > 0
+	if _, held := c.partitionPauses[key][partitionPauseReadAhead]; held && (count < limit || requeued) {
+		c.setPartitionPauseReasonLocked(key, partitionPauseReadAhead, false)
+	}
+	if count >= limit && !requeued {
+		c.setPartitionPauseReasonLocked(key, partitionPauseReadAhead, true)
 	}
 }
 

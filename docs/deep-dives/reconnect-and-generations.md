@@ -6,9 +6,16 @@ An F1 client keeps one connection to the broker, and every publish and every sub
 
 ## Background
 
-F1 stores the live connection together with a [connection number](/learn/glossary#connection-epoch), a counter that only goes up, once per replacement, so work can tell whether the connection it started on is still the current one. The first connection is number 1. A replacement is installed with the next number, in the same locked step as its features and limits (what the new broker supports, such as message size), and the old producer is dropped; the next publish builds a new one. The connection and its number always change together: nobody can see a new connection with an old number.
+F1 stores the live connection together with a
+[connection number](/learn/glossary#connection-epoch) that changes on replacement.
+Installing the connection and its number in one locked step prevents work from
+seeing a new connection with an old number. The same swap updates the broker's
+features and limits and retires the old shared producer.
 
-Every driver error carries a kind: transient (worth trying again, such as a dropped connection), fatal (will not get better), or no kind at all. A reconnect request comes from a publish or a consumer that hit a transient error, or a consumer error with no kind. A consumer error marked fatal stops that runner instead of asking for a new connection.
+A transient consumer error can request repair of that consumer; an
+unclassified error requests connection replacement. A fatal consumer error
+ends the runner. Other classified errors can be reported without recovery:
+not every error says the transport is broken.
 
 A publish is stricter: only a transient error counts as evidence of a bad connection, because one bad message should not tear down the connection for everyone. In a batch where some messages failed, at least one failed message must itself be transient; a transient label on the batch as a whole is only a hint to the caller that trying the batch again may work.
 
@@ -18,10 +25,8 @@ I think of reconnect as a gate around two kinds of work: publishes already runni
 
 ```mermaid
 flowchart TB
-    B[(broker)] --> E[detect loss]
-    E --> D{transient?}
-    D -->|no| F[stop runner]
-    D -->|yes| R[mark reconnecting]
+    B[(broker)] --> E[rebuild requested]
+    E --> R[mark reconnecting]
     R --> A[release runners]
     A -.-> B
     A --> Q[wait publishes]
@@ -37,9 +42,12 @@ flowchart TB
 
 The first request marks the client as reconnecting before it reaches the reconnect supervisor, the one goroutine that replaces connections. While that mark is set, new publishes and new consumers are refused before they start. A second request about the same connection does not start a second attempt. If the connection was already replaced while a request waited, the supervisor drops the request, because the change it asked for has already happened.
 
-The supervisor first releases every runner's current consumer. A runner is the loop that runs one subscription. Each running runner switches to reconnecting, stops its fetch and dispatch goroutines, and releases its consumer. Releasing closes the consumer, and the broker takes back every message it had not seen acked, including one whose handler or ack is still running, so that message can be delivered again.
+The supervisor first releases every runner's current consumer. Each running runner switches to reconnecting, stops its fetch and dispatch goroutines, and releases its consumer. Releasing closes the consumer, and the broker takes back every message it had not seen acked, including one whose handler or ack is still running, so that message can be delivered again.
 
-A release that fails is logged and does not stop the other runners from being released; that consumer goes away when the old connection is closed, which returns its messages the same way. This is recovering the connection, not retrying a handler or dead-lettering a message.
+A failed release must not strand the other runners halfway through recovery.
+F1 logs it and keeps that consumer for another release attempt when retiring
+the old connection. The old connection is then closed. This is recovering the
+transport, not retrying a handler or dead-lettering a message.
 
 After releasing the runners, F1 waits until no publish is running. It does not cancel a publish that already started. That order lets a running publish return its own result before the old producer is closed, and it keeps anyone from building a new producer on a connection that is about to be replaced.
 
@@ -61,59 +69,112 @@ This table shows one possible order of events. The publish error, the consumer e
 | 2 | The producer call is still running when the connection drops. | The consumer's error stream reports a transient loss. | Connection 1, live |
 | 3 | The producer returns an error and asks to reconnect connection 1. | The supervisor marks the runner reconnecting, stops it, and releases its consumer. | Connection 1, reconnecting |
 | 4 | The publish returns its own error; F1 does not resend it. | The released message can be delivered again by the broker; the runner waits for the new connection. | Connection 1, attempt running |
-| 5 | Reconnect waits until no publish is running. | A runner that started opening a consumer before step 1 can get it back now, on connection 1; the number check in the previous section refuses it. | Connection 1, attempt running |
+| 5 | Reconnect waits until no publish is running. | A consumer open begun earlier can return on connection 1 now; the reconnect gate refuses it. If it returns after the swap, the connection-number check rejects it as stale. | Connection 1, attempt running |
 | 6 | The replacement opens and its queues and topics are declared. | Waiters stay on the old wake-up channel until the swap. | Connection 1, attempt running |
-| 7 | New publishes record number 2 and build a new shared producer. | The waiter sees the new number and reopens its consumer on connection 2. | Connection 2 |
+| 7 | After retirement finishes, new publishes record number 2 and build a new shared producer. | The waiter sees the new number and reopens when the client is live. | Connection 2 |
 | 8 | The caller decides whether the failed publish should be sent again. | The broker may deliver the released message to the new consumer. | Connection 2, live |
 
-The old producer is closed after the swap, then the old connection. Close errors are logged and do not undo the replacement. The cleanup runs on a detached context, so canceling the reconnect does not stop it. Each close is bounded by `Lifecycle.CloseTimeout`, because the client reads as reconnecting until the cleanup returns. A close that times out is logged, and the reconnect finishes without waiting for it.
+Retiring the replaced connection uses a context detached from reconnect
+cancellation. With a positive `Lifecycle.CloseTimeout`, each retired producer
+close, retained-consumer release, and retired connection close has a bounded
+wait. Zero leaves that wait unbounded. A timeout is logged and lets recovery
+continue; it does not prove that a driver call ignoring cancellation has ended.
 
-If `Close` starts while a reconnect is running, it cancels the reconnect and then waits up to `Lifecycle.CloseTimeout` for it to stop before it closes the current connection. The old connection's cleanup therefore finishes before `Close` returns, unless that wait times out.
+If `Close` starts during reconnect, it cancels the supervisor and waits for it
+before closing the current connection, subject to the caller context and
+`Lifecycle.CloseTimeout`. Completing that wait means the retirement path has
+returned, not necessarily that every timed-out driver call has finished. The
+cleanup and replacement decisions are in
+[`reconnect.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/reconnect.go);
+[`client.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/client.go)
+owns the shutdown wait.
 
 ## Who owns what
 
-Publishers, runners, the supervisor, and `Close` all run on their own goroutines and all touch the client's state. One mutex guards the client's state, and nothing reads it without the lock. The lock alone does not make reconnect correct.
+Publishers, runners, the supervisor, and `Close` all touch client state from
+different goroutines. A mutex protects their shared view, but a lock alone does
+not make reconnect correct when broker work runs outside it.
 
 A runner reads connection 1 under the lock, releases it, and starts opening a consumer on the broker. While that open is in flight, the supervisor installs connection 2. When the open returns, the runner checks the number again under the lock, sees it is stale, and releases the new consumer instead of using it. What keeps the state consistent is deciding who may change each part, and checking the number whenever work comes back from the broker.
 
-| State | Changed by | How a stale read is caught |
-| --- | --- | --- |
-| The current connection and its number, the broker's features and limits | Only the supervisor, in the swap. Creating the client sets the first connection. | The number changes in the same locked step, so work that recorded the old number is refused. |
-| The stored reconnect failure | Only the supervisor: set when attempts run out, cleared by a swap. | Every new piece of work sees it and is refused. |
-| The reconnecting mark | The first caller that asks for a reconnect sets it. The end of the attempt clears it. | A second request while it is set is dropped, so one loss starts one attempt. |
-| The wake-up channel and the attempt's result | Whoever ends an attempt or makes a swap: it closes the channel and installs a new one in the same locked step. | A waiter records the channel together with the connection number and compares numbers after waking. |
-| The shared producer | Any publisher builds one outside the lock; the first to install it under the lock wins. The swap and `Close` clear it. | The builder checks its recorded number again after building, and a losing or stale producer is closed, not used. |
-| The count of running publishes | Each publish on start and finish. The last one to finish closes a "no publishes" channel. | The supervisor and `Close` wait on that channel instead of polling the count. |
-| The "producer is closing" mark | `Close`, in the same locked step that sees zero publishes. | A retry or dead-letter copy that arrives later is refused. |
-| Open or closing | Only `Close`. | Every new piece of work checks it. |
-| The list of runners | `Subscribe` adds a runner. | The supervisor and `Close` copy the list under the lock, then work on the copy without it. |
+Only the supervisor replaces the connection. A publisher or runner requests
+recovery with the connection number it observed rather than opening a
+replacement itself. This makes simultaneous failure reports converge on one
+attempt and lets requests for an already replaced connection be discarded.
 
-Five rules follow from the table:
+Broker calls run outside the lock. Otherwise a stalled open or close would
+prevent even checking whether new work is allowed. The cost is a second check
+after the call: a producer or consumer built on a stale connection must be
+discarded, not installed. Catching stale results is simpler than preventing
+every possible overlap with the swap.
 
-- **One goroutine replaces the connection.** A caller that sees a transient failure does not repair the connection. It sends a request with its connection number on a channel, and the supervisor is the only code that opens, swaps, and closes connections.
-- **No broker calls under the lock.** Opening a connection, building a producer, and closing either one happen with the lock released, so a slow broker never blocks new work from being checked.
-- **Check again after the call.** Because the lock was released, the state may have moved. The caller takes the lock again and compares the connection number it recorded before the call. If the number moved, the result is thrown away.
-- **Catch stale work instead of preventing it.** The number does not stop old work from running. It makes old work fail its next check, which is simpler than proving that no order of events can reach the old connection.
-- **Wake by closing a channel.** A closed channel wakes every waiter at once and cannot lose a wake-up. It is replaced in the same locked step, so a waiter that arrives later waits on the next one.
+Waiters capture their connection number and wake-up channel under the same
+lock. Closing that channel wakes all waiters; reading state again tells them
+whether to reopen, fail, or stop. A wake-up is not itself permission to use the
+connection. [Publish flow](/development/publish-flow) and
+[Consume flow](/development/consume-flow) map the executable gates.
 
-In Go terms, the bug is a check-then-act race: a decision made under the lock and acted on after it is released. The supervisor is the single-owner pattern, from the proverb "don't communicate by sharing memory; share memory by communicating". The connection number is a generation counter, called a fencing token in distributed systems.
+The runner takes another route to the same goal: one goroutine serializes its
+lifecycle decisions and the rest report events
+([one owner per runner](/deep-dives/runner-owner-loop)).
 
-When you add state to the client, place it in this table first: name who changes it, and if a caller reads it, releases the lock, and then acts, give that caller a connection number to check. The runner takes the other route to the same goal: one goroutine owns all of its state, and the rest send it events ([one owner per runner](/deep-dives/runner-owner-loop)).
+## Repair the consumer before the connection
+
+Not every consumer error means the connection is bad. RabbitMQ can close the channel under one consumer while the connection and every other channel keep working. Replacing the whole connection for that would release every subscription's consumer and hold up every publish. So a runner first tries the smaller fix: it releases only its own consumer and opens a new one on the same connection. The connection number does not change, and no other runner notices.
+
+```mermaid
+flowchart TB
+    E[consumer error] --> K{kind?}
+    K -->|fatal| F[stop runner]
+    K -->|no kind| R[new connection]
+    K -->|other| G[report, keep running]
+    K -->|transient| C{client reconnecting?}
+    C -->|yes, join it| R
+    C -->|no| L{repair exhausted?}
+    L -->|yes| R
+    L -->|no| O[release consumer]
+    O -.-> B[(broker)]
+    O --> N[open new consumer]
+```
+
+Only an error the driver marks transient is repaired this way. An error with no kind goes straight to a connection replacement, because nothing says the connection is fine. If the client is already reconnecting, the runner waits for that instead of repairing on a connection about to go away. Errors such as a missing queue or a refused permission are reported and the consumer keeps running.
+
+A consumer that keeps failing before finishing a message gives little evidence
+that the smaller repair works. Repeated failed replacements therefore escalate
+to a connection rebuild. Finishing a message without a retry or dead-letter
+copy resets that repair streak; publishing a copy alone does not establish that
+the consumer can finish ordinary work.
+
+If releasing the old consumer fails, the runner also escalates rather than
+opening more consumers on a suspect connection. These transport repairs are
+separate from the attempt limit for handler failures.
 
 ## Limits and trade-offs
 
-A positive `broker.maxReconnectAttempts` limits how many times F1 tries to open a connection, counting the first try. When the attempts run out, F1 stores a fatal reconnect error and the client has no connection. Zero means no limit on attempts, although context cancellation and shutdown still end the loop. Before each attempt F1 waits a random time between zero and a ceiling that starts at 500 milliseconds, doubles each attempt, and stops growing at 30 seconds. These values are about repairing the connection, not about handler retries.
+`broker.maxReconnectAttempts` bounds connection-open attempts when positive;
+zero allows recovery to keep trying until cancellation or shutdown. Jittered
+backoff avoids synchronized reconnects across clients. The retry schedule and
+classification of open or topology failures belong to the
+[reconnect source](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/reconnect.go),
+not the handler retry policy.
 
 F1 does not resend an application publish after a connection error. The broker may have accepted the message before the error showed up, so a resend could duplicate it. The caller decides whether to send again and should set an [idempotency key](/learn/glossary#idempotency-key) with `WithIdempotencyKey` and check it in the handler, or use another way to make a duplicate harmless.
 
-Replacing a consumer has its own limit: if two replacement consumers in a row fail before handling a single message, F1 stops replacing consumers and asks for a whole new connection. It is separate from `RetryConfig.MaxAttempts`, which limits handler retries. A message handled successfully resets that limit. Reconnect repairs the connection; the normal retry path repairs a handler failure.
+A consumer that fails intermittently but finishes messages between failures
+can keep using local repair instead of disrupting every subscription. That
+trade-off relies on visible repair failures, not a claim that the transport
+is permanently healthy.
 
-A connection loss can deliver a message again and can leave a failed publish uncertain. At any moment a message is either held by F1 for handling or back with the broker, never both on purpose, but that is not exactly-once: the broker can take a message back while its handler is still running, and deliver it again. The application still has to handle duplicates and decide whether an uncertain publish is safe to repeat.
+A connection loss can return a message to the broker while its handler is
+still running. The broker may deliver it again before the first effect ends.
+It can also leave a failed publish uncertain. Applications still need
+idempotent effects and a decision about whether an uncertain publish is safe
+to repeat.
 
 ## Go further
 
 - [Publish flow](/development/publish-flow) - how a publish is let in, waited for, and reported when uncertain.
 - [Consume flow](/development/consume-flow) - a runner's consumers, message ownership, and repair.
-- [Life of a delivery](/deep-dives/life-of-a-delivery) - what redelivery means for a handler.
+- [Message](/basics/message#delivery-identity-and-redelivery) - what redelivery means for handler effects.
 - [Lifecycle and shutdown](/advanced-topics/lifecycle-and-shutdown) - close and drain limits.
 - [Source-reading guide](/development/source-reading-guide#code-behind-the-deep-dives) - where this lives in the code.

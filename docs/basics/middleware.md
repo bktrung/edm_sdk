@@ -56,7 +56,7 @@ func withLogging(next f1.Handler) f1.Handler {
 
 The middleware should normally return the downstream error unchanged. If it
 adds context, wrap the error with `%w` so F1 can still recognize classified
-errors such as `f1.Terminal`, `f1.Drop`, and `f1.RetryAfter`.
+errors such as `f1.Terminal` and `f1.Drop`.
 
 ## Register middleware
 
@@ -168,7 +168,7 @@ return fmt.Errorf("record handler metrics: %w", err)
 
 Do not implement a second retry or dead-letter loop by calling the handler
 again from middleware. Configure retry on the `Subscription`
-and return `f1.Terminal`, `f1.Drop`, or `f1.RetryAfter` as described in
+and return `f1.Terminal` or `f1.Drop` as described in
 [Failure handling](/advanced-topics/failure-handling).
 
 ## Middleware is not an error callback
@@ -218,7 +218,7 @@ implementation.
 - [Message](/basics/message) - event data, metadata, context, and identity;
 - [Publisher and subscriber](/basics/pubsub) - publish, subscribe, runner, and
   lifecycle boundaries;
-- [Failure handling](/advanced-topics/failure-handling) - `Terminal`, `Drop`, and `RetryAfter` failure
+- [Failure handling](/advanced-topics/failure-handling) - `Terminal` and `Drop` failure
   classification helpers;
 - [Consume flow](/development/consume-flow) - dispatch, classification, and
   ack internals; and

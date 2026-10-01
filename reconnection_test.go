@@ -14,7 +14,6 @@ import (
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/driver"
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/clock"
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/lifecycle"
-	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/retry"
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/sched"
 )
 
@@ -2196,24 +2195,13 @@ func TestHealthReportsReconnectingWhileAnAttemptRebuildsTheConnection(t *testing
 	}
 }
 
-func TestReconnectPolicyUsesFullJitter(t *testing.T) {
-	for attempt, want := range map[int]time.Duration{1: 500 * time.Millisecond, 2: time.Second, 3: 2 * time.Second, 100: 30 * time.Second} {
-		if got := reconnectPolicy.DelayFor(attempt); got != want {
-			t.Fatalf("reconnect delay %d = %s, want %s", attempt, got, want)
-		}
-	}
-	for _, test := range []struct {
-		sample  float64
-		nominal time.Duration
-		want    time.Duration
-	}{
-		{sample: 0, nominal: 500 * time.Millisecond, want: 0},
-		{sample: 0.5, nominal: time.Second, want: 500 * time.Millisecond},
-		{sample: 1, nominal: 30 * time.Second, want: 30 * time.Second},
-	} {
-		if got := retry.FullJitter(test.nominal, test.sample); got != test.want {
-			t.Fatalf("FullJitter(%s,%v) = %s, want %s", test.nominal, test.sample, got, test.want)
-		}
+// TestReconnectPolicyCapsTheNominalDelay pins the ceiling of the reconnect
+// backoff: however many attempts have failed, the nominal delay a jittered
+// sleep is drawn from stays at 30 seconds. The early rungs are pinned through
+// the client by TestReconnectBackoffBudgetAndJitter.
+func TestReconnectPolicyCapsTheNominalDelay(t *testing.T) {
+	if got := reconnectPolicy.DelayFor(100); got != 30*time.Second {
+		t.Fatalf("reconnect delay at attempt 100 = %s, want 30s", got)
 	}
 }
 

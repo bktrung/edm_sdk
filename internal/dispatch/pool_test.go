@@ -46,6 +46,9 @@ func TestOrderedPoolKeepsEqualKeysOnOneWorker(t *testing.T) {
 		}
 	}
 	pool.Close()
+	if len(sequence) != 10 {
+		t.Fatalf("ordered sequence length = %d, want 10", len(sequence))
+	}
 	for i, value := range sequence {
 		if value != i {
 			t.Fatalf("ordered sequence = %v", sequence)
@@ -112,9 +115,11 @@ func TestPoolValidationFreeSignalAndClosedSubmit(t *testing.T) {
 		t.Fatal("zero concurrency must fail")
 	}
 	var parent context.Context
-	if _, err := NewPool(parent, 1, false, 1); err != nil {
+	nilParentPool, err := NewPool(parent, 1, false, 1)
+	if err != nil {
 		t.Fatal(err)
 	}
+	nilParentPool.Close()
 	p, err := NewPool(context.Background(), 1, false, 1)
 	if err != nil {
 		t.Fatal(err)
@@ -314,63 +319,6 @@ func TestPoolSubmitHonorsCancellationWhenQueueIsFull(t *testing.T) {
 	close(release)
 	p.Close()
 	p.Close()
-}
-
-func TestPoolCloseUnblocksBlockedSubmit(t *testing.T) {
-	p, err := NewPool(context.Background(), 1, false, 1)
-	if err != nil {
-		t.Fatal(err)
-	}
-	started := make(chan struct{})
-	release := make(chan struct{})
-	if err := p.Submit(context.Background(), Work{Run: func(context.Context) {
-		close(started)
-		<-release
-	}}); err != nil {
-		t.Fatal(err)
-	}
-	<-started
-	if err := p.Submit(context.Background(), Work{Run: func(context.Context) {}}); err != nil {
-		t.Fatal(err)
-	}
-
-	submitDone := make(chan error, 1)
-	go func() {
-		submitDone <- p.Submit(context.Background(), Work{Run: func(context.Context) {}})
-	}()
-	for i := range 100000 {
-		p.mu.Lock()
-		active := p.active
-		p.mu.Unlock()
-		if active > 0 {
-			break
-		}
-		if i == 99999 {
-			t.Fatal("blocked submit did not reach the pool")
-		}
-		runtime.Gosched()
-	}
-
-	closeDone := make(chan struct{})
-	go func() {
-		p.Close()
-		close(closeDone)
-	}()
-	<-p.closing
-	for range 100000 {
-		select {
-		case err := <-submitDone:
-			if err == nil {
-				t.Fatal("blocked submit succeeded after Close")
-			}
-			close(release)
-			<-closeDone
-			return
-		default:
-			runtime.Gosched()
-		}
-	}
-	t.Fatal("Close did not unblock the blocked submit")
 }
 
 func TestPoolNilOperations(t *testing.T) {

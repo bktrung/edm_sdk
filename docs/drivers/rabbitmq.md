@@ -27,52 +27,25 @@ Use the RabbitMQ suite for queue, exchange, management, confirmation,
 reconnect, TLS, and broker-specific flow control. Use conformance when
 the behavior is part of the shared port.
 
-### Publishing runs on a pool of confirm channels
+### Publishing shares a few confirm channels
 
-A client has one producer, and every publish goes through it: application
-publishes, retry copies, and dead-letter copies. The producer holds up to 16
-AMQP channels in confirm mode, so up to 16 publishes can wait for broker
-confirmations at the same time. A 17th publish waits for a free channel, or
-until its context ends.
+Application publishes, retry copies, and dead-letter copies share the producer's
+confirm-mode channels. A call waits for its own per-message confirmations
+without exclusively holding a channel through that wait.
 
-```mermaid
-flowchart LR
-    A[application publish] --> S{free channel?}
-    R[retry copy] --> S
-    D[dead-letter copy] --> S
-    S -- yes --> P[(pool: up to 16<br/>confirm channels)]
-    S -- no --> W[wait for a channel<br/>or the context]
-    W --> S
-    P --> B[RabbitMQ broker]
-```
+[`producer.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/drivers/rabbitmq/producer.go)
+owns the channel count, bounded batch segments, ID reservations, cancellation,
+and channel-failure recovery. Order is preserved within each call; later
+segments can use other channels after the earlier segment's outcomes are
+decided. Concurrent calls have no relative ordering guarantee.
 
-With a single channel, each publish waited for the confirmations of the one
-before it, and throughput stayed near 300 messages per second no matter how
-many publishers ran. The pool lets those publishes overlap.
-
-What to expect from the pool:
-
-- **One channel per call.** A `Publish` keeps its channel until the call
-  returns, because RabbitMQ only promises message order within one channel.
-  A batch keeps its order.
-- **Windows of 64.** Inside a call, the producer sends up to 64 messages before
-  it reads their confirmations, so a large batch costs about one confirm round
-  trip per 64 messages instead of one per message.
-- **Channels open when needed.** The first channel opens with the producer, so a
-  connection that cannot give a confirm channel fails at startup. The others
-  open as concurrent publishes need them.
-- **A broken channel is replaced.** When a channel fails in the middle of a
-  publish, the producer closes it and never reuses it, so its late confirmations
-  cannot be read against another publish. The next publish opens a fresh one.
-- **Close waits for publishes.** `Close` stops new publishes, waits for the
-  ones in flight to hand their channels back (bounded by its context), then
-  closes every channel.
-
-The size is a constant in
-[`producer.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/drivers/rabbitmq/producer.go),
-not a configuration key. It matches a default subscription's handler
-concurrency, which bounds how many retry and dead-letter copies one subscription
-publishes at once.
+Shared channels avoid a fixed ceiling on concurrent calls, but do not promise
+a particular throughput. Use [Benchmarks](/development/benchmarks) for
+measurement context and measure your own workload.
+The [publish-channel rationale](/deep-dives/rabbitmq-publish-pool) explains why
+returns need message IDs, why cancellation leaves a shared channel usable,
+and why recovery after a channel failure must account for ordering and
+duplicates.
 
 ### The management HTTP API is a deployment requirement
 
@@ -108,59 +81,46 @@ which credentials, so check it before deploying.
 
 ### Delayed and retried messages need per-destination [parking queues](/learn/glossary#parking-queue)
 
-RabbitMQ has no built-in delayed delivery, so the adapter builds it from
-queue-level TTLs and a dead-letter route back to the destination.
+RabbitMQ has no built-in delayed delivery, so the adapter builds it from a
+message expiration and a dead-letter route back to the destination.
 
-A delay of at most 64s on the generic path is parked in the smallest fixed
-delay that is at least the delay. Fixed-delay destinations are the exception:
-each [retry step](/learn/glossary#retry-tier) uses one queue whose TTL is that step's delay. See [Parking retries on RabbitMQ](/deep-dives/rabbitmq-delay-ladder) for the queue sequence.
+Each delayed destination, which in F1 means each [retry step](/learn/glossary#retry-tier),
+has exactly one parking queue, named `<destination>.park`, for example
+`orders.retry.2.park`. Every message published to the destination is routed to
+that queue and carries the destination's delay, rounded up to whole
+milliseconds, as its expiration. When it expires, RabbitMQ dead-letters it
+through the default exchange into the destination, where the consumer reads it.
 
-| Fixed delay | 500ms | 1s | 2s | 4s | 8s | 16s | 32s | 64s |
-| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+The queue carries no TTL of its own, and its name carries no delay, so changing
+a step's delay needs no change to the queue: the next copy simply carries the new
+delay. Under the head-of-queue expiration model, equal-delay copies avoid
+holding a shorter delay behind a longer one. After a delay decrease, or while
+a rolling deployment publishes both delays, that head-of-line blocking can
+return within the step.
 
-That queue is named `<destination>.park.<delay>`, for example `orders.park.2s`,
-and it is declared with `x-message-ttl` set to its delay. The message carries no
-expiration of its own: RabbitMQ expires a per-message TTL only when the message
-reaches the head of its queue, so a message parked behind a later one waits for
-it and the delay can overrun by the distance between the two due times. The
-queue TTL makes every message expire in FIFO order, so a fixed-delay queue cannot
-create that case at all.
+Expiration makes a copy eligible for dead-letter routing once it reaches the
+queue head; it does not bound when the transfer completes, when a consumer
+picks it up, or when a handler finishes. See
+[Parking retries on RabbitMQ](/deep-dives/rabbitmq-delay-ladder) for the
+illustrative queue sequence and failure trade-offs.
 
-Rounding the delay up keeps a message from being released before its due time.
-The cost is lateness below one step, so a 5s delay is released at about 8s. A
-fixed-delay retry step is late only by the time its publish took.
+The longest delay a message expiration holds is 2,147,483,647 ms, about 24.8
+days; the adapter refuses a longer one at topology time under every policy.
 
-For the queue sequence and its trade-offs, see [Parking retries on RabbitMQ](/deep-dives/rabbitmq-delay-ladder).
+The name shape is reserved: a destination may not end in `.park`, because that
+shape belongs to parking queues.
 
-That cost is reported rather than left to folklore. `Client.Limits()`
-renders the delay feature for this driver as `late by at most the requested delay, or
-500ms, whichever is larger, for a delay of at most 1m4s; no bound above that`.
-The report derives the floor and ceiling from the fixed-delay table. Changing a fixed delay therefore changes the
-reported limit too.
+The parking queue is declared for every destination with a delay, and which
+policy makes it exist is the same split as any other destination:
 
-A delay above 64s parks in `<destination>.park`, the queue that carries a
-per-message expiration. The longest delay it accepts is about 24.8 days. Because
-RabbitMQ expires only the message at the head of a queue, a due time beyond the
-largest fixed delay can be released late by a message parked ahead of it. F1's
-retry path never reaches this queue, because each retry step has its own fixed
-queue; only code that calls the driver directly with a delay does.
-
-The names are reserved: a destination may not end in `.park`, `.park.` plus a
-fixed-delay tag, or `.park.fixed-<ms>ms`. All three shapes belong to parking queues,
-so application destinations must avoid them.
-
-The fixed-delay queues and the queue for longer delays are declared from the
-destination's delay, and which policy makes them exist is the same split as any
-other destination:
-
-| Topology policy | Parking queues |
+| Topology policy | Parking queue |
 | --- | --- |
 | `TopologyDeclare` | Declared by the adapter at subscription start. |
-| `TopologyVerify` | Must exist and match their declared arguments, checked at subscription start. |
+| `TopologyVerify` | Must exist and match its declared arguments, checked at subscription start. |
 | `TopologyNone` | Provisioned by the operator. The adapter declares and checks nothing. |
 
-The queues are durable, and their declare arguments follow the deployment's
-queue type (`broker.rabbitmq.queueType`, `quorum` by default):
+The queue is durable, and its declare arguments follow the deployment's queue
+type (`broker.rabbitmq.queueType`, `quorum` by default):
 
 | Argument | Value |
 | --- | --- |
@@ -169,22 +129,16 @@ queue type (`broker.rabbitmq.queueType`, `quorum` by default):
 | `x-dead-letter-routing-key` | the destination name |
 | `x-dead-letter-strategy` | `at-least-once`, on quorum only |
 | `x-overflow` | `reject-publish`, on quorum only |
-| `x-message-ttl` | the fixed delay, in milliseconds, on the fixed-delay queues only |
 
 On quorum the two strategy arguments are added because all three dead-letter
 arguments are required together for RabbitMQ's at-least-once dead-letter
-guarantee; the parking queues are the delay mechanism itself, not a failure
+guarantee; the parking queue is the delay mechanism itself, not a failure
 path, so a message lost there is a dropped retry with no error. A classic
 deployment omits them, and its delay path is at-most-once.
 
-Upgrading from a release without the fixed delays needs no drain. The existing
-`<destination>.park` queue keeps dead-lettering to its destination and the
-messages parked in it leave on their own schedule, and the fixed-delay queues are
-declared by the topology pass. A fixed-delay destination declares its fixed
-queue plus `<destination>.park`; fixed-delay queues left by an earlier version report
-as orphans and drain on their own TTLs. An application that empties a destination
-(`Purge`) empties every parking queue of it, and one that deletes a destination
-(`Prune`) is refused while any of them still holds a message.
+An application that empties a destination (`Purge`) empties its parking queue
+too, and one that deletes a destination (`Prune`) is refused while any parking
+queue of it still holds a message.
 
 Under `TopologyNone` a missing parking queue is discovered by the publish that
 needed it. The broker returns the message (`312 NO_ROUTE`) rather than closing
@@ -226,7 +180,7 @@ setting; the drift warning is the signal to do so.
 | `broker.rabbitmq.vhost` | Vhost the management API inspects when it reads queue arguments and bindings. It does not change the AMQP connection: the endpoint URI still selects the vhost that messages are published to. | Any string, used as the vhost name. Empty falls back to the endpoint URI. | The endpoint URI's vhost as the AMQP client parses it: `/` when the URI has no path, and `orders` for `amqp://host/orders`. | Open |
 | `broker.rabbitmq.queueType` | Queue type every destination and its parking queue is declared with. `classic` also clears the delivery-count and dead-letter capabilities, both of which are quorum arguments. Quorum queues are always durable, so a destination declared non-durable is declared durable and the driver logs one warning for it. | `quorum` or `classic`, case-insensitive, with surrounding whitespace ignored. Any other value fails `Open`, and `env: prod` requires the exact string `quorum`. | `quorum` | Open |
 | `broker.rabbitmq.consumerTimeout` | `x-consumer-timeout` declared on quorum destination queues. The broker cancels a consumer that has held one delivery this long. | Go duration of at least `1ms`, and at least three times every subscription's `handlerTimeout`. Shorter, zero, negative, or unparsable fails `Open`. | None: nothing is declared and the broker's own default stays in force. | Open |
-| `broker.rabbitmq.brokerPrefetch` | Broker credit per destination. It raises how many deliveries RabbitMQ can hold ahead of the core without changing the core's in-flight limit. Extra deliveries wait in the driver's messages channel, and a delivery that meets its full lane stops intake for every lane of the subscription until that lane has room ([why](/deep-dives/scheduler#why-lane-capacity-stays-small)). | Integer from 1 to 65535, at least every destination's core window. A non-integer, zero, negative value, or smaller value fails `Open` or consumer creation. | Unset: each destination uses its core window. | Open |
+| `broker.rabbitmq.brokerPrefetch` | Broker transport credit per destination, separate from the [SDK admission total and destination windows](/advanced-topics/configuration#prefetch-resolution). Extra broker deliveries wait in bounded driver pending buffers; this option never bypasses either SDK ceiling. | Integer from 1 to 65535, at least every destination's core window. A non-integer, zero, negative value, or smaller value fails `Open` or consumer creation. | Unset: each destination uses its core window. | Open |
 | `broker.rabbitmq.managementPort` | Port the RabbitMQ management HTTP API listens on. | Integer from 1 to 65535. Any other value fails `Open`. | The AMQP port plus 10000, so 15672 for the usual 5672. | Open |
 | `broker.rabbitmq.trustBrokerTimestamp` | Trusts RabbitMQ's `timestamp_in_ms` header as the broker enqueue time. Enable this only when `message_interceptors.incoming.set_header_timestamp.overwrite = true`; without that setting the header is publisher-controlled. | Boolean, using Go's accepted boolean spellings after surrounding whitespace is trimmed. Any other value fails `Open`. | `false` | Open |
 
@@ -246,6 +200,22 @@ the option value per destination, so a subscription with several destinations
 can hold that value times the destination count. The other costs of the option
 are in [Ordering and
 scheduling](/advanced-topics/ordering-and-scheduling#configure-execution-capacity).
+
+### Delivery counts
+
+RabbitMQ `DeliveryCount` describes broker delivery/acquisition history. It
+must be interpreted separately from the F1 retry attempt, the number of
+handler invocations, and the number of business side effects. A delivery held
+by broker prefetch can contribute to that history when the consumer is
+released even if no handler ran.
+
+[`consumer.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/drivers/rabbitmq/consumer.go),
+at `deliveryCount`, owns the mapping from broker metadata, including the
+priority of `x-acquired-count` over `x-delivery-count` and the unavailable-count
+sentinel. The
+[broker-prefetch integration scenario](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/drivers/rabbitmq/broker_prefetch_integration_test.go)
+is the evidence owner for held-delivery redelivery.
+
 
 ## RabbitMQ TLS
 

@@ -3,7 +3,6 @@ package inmem
 import (
 	"context"
 	"errors"
-	"math"
 	"slices"
 	"sort"
 	"sync"
@@ -66,13 +65,12 @@ func (Driver) Name() string { return "inmem" }
 
 // Capabilities reports the features provided by the in-memory driver. It supports per-message acknowledgements, key ordering, native delays, delivery counts, unrestricted consumer scaling, and lag queries.
 //
-// The reported delay accuracy has no lateness for delays up to MaxDelay. The driver also reports a 1 MiB message-body limit and a 64 KiB header limit.
+// The driver also reports a 1 MiB message-body limit and a 64 KiB header limit.
 func (d Driver) Capabilities() driver.Capabilities {
 	caps := driver.Capabilities{
 		PerMessageAck:       true,
 		OrderedByKey:        true,
 		NativeDelay:         true,
-		DelayAccuracy:       driver.DelayAccuracy{MaxDelay: time.Duration(math.MaxInt64)},
 		NativeDeliveryCount: true,
 		ConsumerScaling:     driver.ScalingFree,
 		LagQueryable:        true,

@@ -49,12 +49,6 @@ func (o *recordingObserver) Record(event PointEvent) {
 	o.lastPoint = event
 }
 
-func (o *recordingObserver) counts() (uint64, uint64, uint64) {
-	o.mu.Lock()
-	defer o.mu.Unlock()
-	return o.starts, o.finishes, o.records
-}
-
 type panickingObserver struct{}
 
 func (panickingObserver) Start(context.Context, StartEvent) (context.Context, Token) {
@@ -81,46 +75,6 @@ func (o *nilContextObserver) Start(_ context.Context, event StartEvent) (context
 func (*nilContextObserver) Finish(Token, FinishEvent) {}
 
 func (*nilContextObserver) Record(PointEvent) {}
-
-func TestObserverRecordingCountsCalls(t *testing.T) {
-	t.Parallel()
-	rec := &recordingObserver{}
-	client := newPublishClient(t, &recordingProducer{}, WithObserver(rec))
-	baseStarts, baseFinishes, baseRecords := rec.counts()
-	ctx := context.Background()
-	start := StartEvent{Kind: ObserverProcess, At: client.options.clock.Now(), Topic: "orders.created"}
-	if client.observer == nil {
-		t.Fatal("client observer is nil")
-	}
-	_, token := client.observeStart(ctx, start)
-	finish := FinishEvent{Kind: ObserverProcess, At: client.options.clock.Now(), Outcome: ObserverOutcomeOK}
-	client.observeFinish(token, finish)
-	point := PointEvent{Kind: ObserverDeliveryReceived, At: client.options.clock.Now(), Topic: "orders.created"}
-	client.observeRecord(point)
-	starts, finishes, records := rec.counts()
-	if starts-baseStarts != 1 || finishes-baseFinishes != 1 || records-baseRecords != 1 {
-		t.Fatalf("counts = %d/%d/%d, want 1/1/1", starts-baseStarts, finishes-baseFinishes, records-baseRecords)
-	}
-}
-
-func TestObserverPanickingMethodsPanic(t *testing.T) {
-	t.Parallel()
-	var panicker panickingObserver
-	for _, call := range []func(){
-		func() { _, _ = panicker.Start(context.Background(), StartEvent{}) },
-		func() { panicker.Finish(Token{}, FinishEvent{}) },
-		func() { panicker.Record(PointEvent{}) },
-	} {
-		func() {
-			defer func() {
-				if recover() == nil {
-					t.Fatal("observer method did not panic")
-				}
-			}()
-			call()
-		}()
-	}
-}
 
 func TestObserverRecoverKeepsGoingAndLogsOncePerKind(t *testing.T) {
 	t.Parallel()

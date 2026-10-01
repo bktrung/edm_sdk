@@ -75,37 +75,6 @@ func TestSubscribeAcceptsOrderedByKeyWhenNative(t *testing.T) {
 	}
 }
 
-func TestSubscribeRejectsNamedPrefetchBelowLaneCount(t *testing.T) {
-	t.Parallel()
-	for _, test := range []struct {
-		name     string
-		topics   []string
-		prefetch int
-		want     []string
-	}{
-		{name: "one topic", topics: []string{"orders.created"}, prefetch: 11, want: []string{"prefetch 11", "lane count 12", "topics x priorities x (1 + retryTiers)"}},
-		{name: "six topics", topics: prefetchDefaultSixTopics, prefetch: 64, want: []string{"prefetch 64", "lane count 72"}},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			t.Parallel()
-			client := newPublishClient(t, &recordingProducer{})
-			_, err := client.Subscribe(context.Background(), Subscription{
-				Name:     "orders",
-				Topics:   test.topics,
-				Prefetch: test.prefetch,
-			})
-			if err == nil {
-				t.Fatal("Subscribe() error = nil, want lane-floor validation")
-			}
-			for _, fragment := range test.want {
-				if !strings.Contains(err.Error(), fragment) {
-					t.Fatalf("Subscribe() error = %v, want it to contain %q", err, fragment)
-				}
-			}
-		})
-	}
-}
-
 func TestSubscribeRejectsPrefetchAboveCeiling(t *testing.T) {
 	for _, test := range []struct {
 		name     string

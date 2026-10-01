@@ -318,7 +318,7 @@ $(APIDIFF): tools/apidiff/go.mod tools/apidiff/go.sum
 $(APIDIFF_NORMALIZE): tools/apidiff/normalize.go tools/apidiff/go.mod tools/apidiff/go.sum
 	cd tools/apidiff && go build -o ../../.tools/bin/apidiff-normalize .
 
-.PHONY: broker-up broker-down broker-reset broker-smoke test-rabbitmq test-rabbitmq-driver test-rabbitmq-conformance test-kafka test-infra test-driver-flip test-kafka-conformance kafka-up kafka-down bench
+.PHONY: broker-up broker-down broker-reset broker-smoke test-rabbitmq test-rabbitmq-driver test-rabbitmq-conformance test-kafka test-infra test-driver-flip test-kafka-conformance measure-kafka-move kafka-up kafka-down bench
 
 ## test-rabbitmq: run the RabbitMQ driver suite and its conformance suite
 ## against the selected fixture, starting it first. The integration tag selects
@@ -372,6 +372,14 @@ test-driver-flip: kafka-up broker-up broker-smoke
 	F1_KAFKA_ENDPOINT=$${F1_KAFKA_ENDPOINT:-localhost:$(KAFKA_PORT)} \
 	F1_RABBITMQ_ENDPOINT=$${F1_RABBITMQ_ENDPOINT:-amqp://guest:guest@localhost:$(RABBITMQ_PORT)/} \
 	go test -v -count=1 -tags integration -run TestDriverFlipAcceptance -timeout 45m ./examples/acceptance/
+
+## measure-kafka-move: measure what a member joining costs a Kafka group, the
+## first-delivery delay and the records delivered twice, three runs against the
+## fixture. It prints readings and asserts no bound, so it is not a gate.
+measure-kafka-move: kafka-up
+	F1_KAFKA_MEASURE_MOVE=1 \
+	F1_KAFKA_ENDPOINT=$${F1_KAFKA_ENDPOINT:-localhost:$(KAFKA_PORT)} \
+	go test -v -count=1 -tags integration -run '^TestBalancerMoveCost$$' -timeout 20m ./drivers/kafka/
 
 ## test-kafka-conformance: run both Kafka conformance profiles against the fixture.
 ## This takes about 7 minutes and requires a live Kafka broker; the integration tag

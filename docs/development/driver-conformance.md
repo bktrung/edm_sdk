@@ -193,7 +193,7 @@ the useful reading guide, not a second test manifest:
 | Settlement | Ack, requeue and discard nack, no double settlement, out-of-order accounting, concurrent settlement, and cancellation | [`settle.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/driver/conformance/settle.go) |
 | Retry and redelivery | Transient recovery, delivery faults, redelivery count, stale settlement, and classified fatal errors at the driver boundary | [`failure.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/driver/conformance/failure.go) |
 | Ordering | Equal-key receipt order, independent-key progress, requeued-key precedence, nil keys, and usable exclusive ordering | [`ordering.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/driver/conformance/ordering.go) |
-| Deferred delivery | Due-time behavior, destination delay and the publish order that model owes, auxiliary depth, and delivery-deadline interaction | [`deferred.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/driver/conformance/deferred.go) |
+| Deferred delivery | Destination delay, bounded lateness, publish order within a delayed destination, auxiliary depth, and delivery-deadline interaction | [`deferred.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/driver/conformance/deferred.go) |
 | Enqueue | Enqueue timestamps, backlog samples, head ordering, and empty head | [`enqueue.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/driver/conformance/enqueue.go) |
 | Draining | Stop-fetch semantics, settleability after drain, open channels, refusal and timeout, idempotence, stop closure, and release redelivery | [`drain.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/driver/conformance/drain.go) |
 | Rebalance | Work redistribution, per-consumer budgets, in-flight transfer, key ordering across ownership changes, and stable repeated departure | [`rebalance.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/driver/conformance/rebalance.go) |
@@ -250,23 +250,16 @@ driver must return the port's expected classified unsupported result or the
 core must use the portable path. It must not skip a check merely because the
 driver does not implement an optional optimization.
 
-A driver whose deferral semantics differ from exact due times declares which
-model it implements through [`Suite.DeferralModel`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/driver/conformance/types.go).
-`DeferralExact` delivers each deferred message at the due time the message
-carries, and it is the zero value, so a harness that declares nothing keeps
-exact deferral and needs no edit.
+The deferred group holds every driver to one model: a message on a delayed
+destination is delivered at its publish instant plus the destination's declared
+delay, never earlier, and in publish order within one partition of the
+destination.
 
-`DeferralDestinationDelay` delivers a deferred message at its publish instant
-plus its destination's declared delay, whatever due time the message carries.
-Its deliveries are never earlier than that instant, and the messages it deferred
-within one partition of a destination are delivered in the order they were
-published.
-
-The field is a harness declaration rather than a capability: it states the
-semantics the driver implements, where a capability states an optimization the
-core can do without, and the deferred group records a skip for each of its
-checks the declared model does not owe instead of holding a driver to a due time
-its model never promised.
+The bounded-lateness check samples the clock before and after publication.
+The pre-publication sample plus the destination delay is the conservative
+never-early bound; the post-publication sample plus that delay and the lateness
+allowance is the upper bound. Fixture clocks advance from the latter sample,
+so time spent publishing is not mistaken for late release.
 
 The authoritative pending list and group counts are in
 [`manifest.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/driver/conformance/manifest.go). Do not copy the list or

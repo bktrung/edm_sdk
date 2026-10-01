@@ -13,6 +13,8 @@ import (
 	"time"
 
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/driver"
+
+	amqp "github.com/rabbitmq/amqp091-go"
 )
 
 type consumerResult struct {
@@ -53,42 +55,54 @@ func openConsumerAdmissionConn(t *testing.T, queue string) *conn {
 }
 
 func cleanupConsumerAdmissionConn(t *testing.T, connection *conn, queue string) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
 	connection.mu.RLock()
-	closed := connection.closed
+	active := make([]*consumer, 0, len(connection.active))
+	for candidate := range connection.active {
+		active = append(active, candidate)
+	}
 	connection.mu.RUnlock()
-	if closed {
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		public, err := (Driver{}).Open(ctx, driver.Config{Endpoints: []string{defaultEndpoint}})
-		if err == nil {
-			fresh := public.(*conn)
-			freshAdmin, ok := fresh.Admin().(driver.Maintenance)
-			if ok {
-				results, err := freshAdmin.Prune(ctx, []string{queue})
-				if err != nil {
-					t.Logf("cleanup %q: prune: %v", queue, err)
-				}
-				for _, result := range results {
-					if !result.Deleted {
-						t.Logf("cleanup %q: prune kept %q: %s", queue, result.Name, result.Reason)
-					}
-				}
-			}
-			_ = fresh.Close(context.Background())
-		}
-		cancel()
-	}
-	if maintenance, ok := connection.Admin().(driver.Maintenance); ok {
-		results, err := maintenance.Prune(context.Background(), []string{queue})
-		if err != nil {
-			t.Logf("cleanup %q: prune: %v", queue, err)
-		}
-		for _, result := range results {
-			if !result.Deleted {
-				t.Logf("cleanup %q: prune kept %q: %s", queue, result.Name, result.Reason)
-			}
+	for _, candidate := range active {
+		if err := candidate.Release(ctx); err != nil && !errors.Is(err, amqp.ErrClosed) {
+			t.Errorf("cleanup %q: release consumer: %v", queue, err)
 		}
 	}
-	_ = connection.Close(context.Background())
+	if err := connection.Close(ctx); err != nil {
+		t.Errorf("cleanup %q: close connection: %v", queue, err)
+	}
+
+	public, err := (Driver{}).Open(ctx, driver.Config{Endpoints: []string{defaultEndpoint}})
+	if err != nil {
+		t.Errorf("cleanup %q: reopen connection: %v", queue, err)
+		return
+	}
+	fresh := public.(*conn)
+	defer func() {
+		if err := fresh.Close(context.Background()); err != nil {
+			t.Errorf("cleanup %q: close cleanup connection: %v", queue, err)
+		}
+	}()
+	maintenance, ok := fresh.Admin().(driver.Maintenance)
+	if !ok {
+		t.Errorf("cleanup %q: Admin does not implement driver.Maintenance", queue)
+		return
+	}
+	if _, err := maintenance.Purge(ctx, queue); err != nil && !errors.Is(err, driver.ErrDestinationMissing) {
+		t.Errorf("cleanup %q: purge: %v", queue, err)
+	}
+	results, err := maintenance.Prune(ctx, []string{queue})
+	if err != nil {
+		t.Errorf("cleanup %q: prune: %v", queue, err)
+		return
+	}
+	for _, result := range results {
+		if !result.Deleted {
+			t.Errorf("cleanup %q: prune kept %q: %s", queue, result.Name, result.Reason)
+		}
+	}
 }
 
 func waitConsumerResult(t *testing.T, done <-chan consumerResult, what string) consumerResult {
@@ -154,7 +168,6 @@ func TestConsumerConstructionDoesNotHoldConnectionLock(t *testing.T) {
 		releaseFirst()
 		stopIfPresent(firstDone)
 		stopIfPresent(secondDone)
-		cleanupConsumerAdmissionConn(t, connection, queue)
 	})
 
 	go func() {
@@ -244,7 +257,6 @@ func runConsumerConflictTest(t *testing.T, firstExclusive, secondExclusive bool,
 		releaseFirst()
 		stopIfPresent(firstDone)
 		stopIfPresent(secondDone)
-		cleanupConsumerAdmissionConn(t, connection, queue)
 	})
 
 	go func() {
@@ -326,7 +338,6 @@ func TestConsumerCloseWinsBeforeInstallAndCleansBuiltLanes(t *testing.T) {
 	t.Cleanup(func() {
 		releaseInstall()
 		stopIfPresent(consumerDone)
-		cleanupConsumerAdmissionConn(t, connection, queue)
 	})
 
 	go func() {

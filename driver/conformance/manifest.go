@@ -15,10 +15,10 @@ type manifestEntry struct {
 
 var groupManifest = []manifestEntry{
 	{name: "publish", declared: 15},
-	{name: "consume", declared: 21},
+	{name: "consume", declared: 22},
 	{name: "settle", declared: 16},
 	{name: "ordering", declared: 8},
-	{name: "deferred", declared: 11},
+	{name: "deferred", declared: 8},
 	{name: "drain", declared: 16},
 	{name: "rebalance", declared: 11},
 	{name: "failure", declared: 23},
@@ -39,7 +39,6 @@ type groupContext struct {
 	profile             Profile
 	effective           driver.Capabilities
 	factoryCapabilities driver.Capabilities
-	deferralModel       DeferralModel
 	vector              BehaviorVector
 	checks              int
 	checkNames          map[string]struct{}

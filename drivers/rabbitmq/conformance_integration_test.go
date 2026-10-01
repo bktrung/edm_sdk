@@ -42,15 +42,12 @@ func rabbitInspector(raw driver.Conn) (conformance.Inspect, error) {
 			active = append(active, item)
 		}
 		conn.mu.RUnlock()
-		for _, parkName := range conn.parkingOf(destination) {
+		if parkName, isDeferred := conn.parkingOf(destination); isDeferred {
 			park, parkErr := admin.inspectQueue(ctx, parkName)
-			if parkErr == nil {
-				parked += int(park)
-				continue
-			}
-			if !isNotFound(parkErr) {
+			if parkErr != nil && !isNotFound(parkErr) {
 				return conformance.BrokerView{}, parkErr
 			}
+			parked += int(park)
 		}
 		var unsettled int64
 		for _, item := range active {

@@ -2,19 +2,17 @@
 
 *By trungbk.*
 
-Suppose records 10, 11, and 12 of one partition were handled at the same time, and the handler for 12 finished first. If I committed 13 for it, a crash right then would make the next owner start at 13, and records 10 and 11 would never be handled. Kafka commits one offset per partition, not one ack per record, so a commit says "everything below this is done". I only commit past a record once every record before it that Kafka delivered is done, and I refuse to commit for a partition after Kafka has taken it away from this consumer.
-
-I treat the committed offset as the partition's promise: every offset below it is done, and the committed offset itself is the next one a new owner must read.
+Suppose records 10, 11, and 12 of one partition were handled at the same time, and the handler for 12 finished first. Committing 13 for it would let a restart skip records 10 and 11. Kafka stores a group position per partition, not an ack per record. F1's safety rule is therefore about records it delivered: a commit must not pass an earlier delivery that is still unfinished.
 
 ## Background
 
 A Kafka topic is split into append-only partitions. A consumer group stores one committed position per partition. That position means "the next offset to read", so a restart or rebalance resumes there.
 
-Kafka itself would accept a commit of 15 while 14 is unfinished; the gap is F1's to prevent. F1 therefore lets in one delivery per partition at a time, so a commit never skips a record that is still being handled. When Kafka never delivered some offsets, for example after compaction, the delivery after them commits past them. An ack and a discard move the committed offset forward; a requeue leaves it where it is so the record can be delivered again.
+One delivery at a time per partition makes that rule simple, at the cost of letting a slow record hold up its partition. Offsets Kafka never delivered are different from unfinished deliveries: a gap after compaction does not imply that F1 owes a handler for the missing record.
 
 ## The committed offset
 
-For each partition it owns, F1 keeps the next uncommitted offset and whether that ownership has ended ([how assignments change](/deep-dives/kafka-lane-balancer)). The commit request itself carries Kafka's group generation, Kafka's number for the current assignment, so Kafka refuses a commit from a member whose assignment has changed. An ack from the delivery that the current ownership let in commits the offset after it, even when Kafka skipped offsets before it. An ack from an earlier ownership, after the partition was lost and regained, must name the current offset; any other offset, later or older, is refused rather than allowed to skip a record.
+Ownership matters as much as offset order. A delivery from the current assignment can commit past offsets Kafka skipped. An old delivery cannot use that permission after the partition is lost and regained: it must match the offset the current ownership owes. Otherwise a late ack could pass a different record that the new assignment has not finished. The [offset tracker](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/drivers/kafka/acktracker.go) and the [consumer's ownership boundary](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/drivers/kafka/consumer.go) are the executable owners.
 
 The figure traces why a stale ack for any offset other than the current one is refused. The refused acks in it come from a delivery whose ownership has ended; a delivery of the current ownership never sends them.
 
@@ -37,7 +35,7 @@ The figure traces why a stale ack for any offset other than the current one is r
 
 </details>
 
-The committed position is always the next offset Kafka should deliver. A crash before a successful commit can deliver the current record again, which is the [at-least-once](/learn/glossary#at-least-once-delivery) guarantee and why handler effects must be idempotent.
+A crash before a successful commit can deliver the current record again. This is the [at-least-once](/learn/glossary#at-least-once-delivery) boundary, not proof that a handler effect failed. Handler effects must be idempotent.
 
 ## Why commits stay ordered
 
@@ -60,21 +58,21 @@ sequenceDiagram
     K-->>B: committed
 ```
 
-The driver releases its ordinary lock before waiting on the broker, but a second lock, held for the whole move-and-commit, makes the next one wait until the first returns. Other code can still read the state while the commit is running, and it sees the offset already moved forward.
+Serialization must cover the whole move-and-commit, not just the local offset update. Releasing it before the broker call finishes would admit the out-of-order sequence above. Batching points from different partitions does not remove this requirement; the [commit batching owner](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/drivers/kafka/committer.go) preserves the confirmation boundary.
 
-A failed commit moves the in-memory offset back when the partition is still owned. F1 treats a commit error as not committed; if Kafka did store it, the cost is only that the same offset is committed again later. If Kafka takes the partition away while the commit call is running, the old offset is not restored for the lost partition. A successful commit stays successful even if the partition is taken away right after.
+A failed commit restores the local offset while the partition is still owned. An ambiguous error does not prove whether Kafka stored the request: later commits or a restart can produce duplicate work, and the outcome is not limited to repeating the same offset. Rollback favors replay over skipping work.
 
-## Requeue is a local redelivery
+If ownership ends while the commit is running, rollback must not revive the old assignment. A successful commit remains successful if ownership ends just after it; an old tracker stays ended even when a fresh assignment is created.
 
-A handler error normally creates a retry copy and acks the original. Requeue is for work the driver gives back without creating a copy. It leaves the committed position unchanged and puts the record ahead of later records for that partition on the current consumer.
+## Requeue keeps the original record
 
-If the partition moves before the requeued record is acked, the next member starts from Kafka's unchanged committed position and can deliver it again. An offset below the committed offset is already done and is skipped; an offset not seen before is let in as the next current record.
+A retry creates another record; a requeue keeps the original offset unfinished. Confusing the two would advance the group position before the original was done. If ownership moves first, Kafka's stored position, rather than the old consumer's local queue, determines redelivery.
 
-A discard moves the committed offset forward like an ack. Kafka's consumer groups do not expose a per-message delivery count, so an F1 failure count cannot become a counter inside Kafka.
+See [Consume flow](/development/consume-flow) for the distinction between retry publication and finishing the original.
 
 ## When the partition moves
 
-A rebalance changes the member that owns a partition. F1 waits up to `lifecycle.rebalanceDrainTimeout` for the in-flight delivery, then marks the old ownership as revoked and detaches it.
+A rebalance can leave a handler running after its partition changes ownership. Waiting indefinitely would prevent the group from making progress; accepting every late ack would let the old assignment change the new one's position. The bounded revoke wait trades possible duplicate work for a finite ownership transfer.
 
 ```mermaid
 sequenceDiagram
@@ -95,15 +93,11 @@ A late requeue does not commit and cannot be finished through the new member. If
 
 The old tracker stays marked as ended, so an ack sent through it is refused.
 
-The new owner starts at Kafka's committed position. If the old owner did not commit before losing the partition, a redelivery is expected. If it committed, the new owner starts after that offset. Cooperative rebalancing moves fewer partitions, but it does not promise that no message is delivered twice.
+The new owner resumes from Kafka's stored position, which can differ from the old owner's local state after an uncertain commit. Cooperative rebalancing reduces how much ownership changes; it does not remove the duplicate window.
 
 ## Limits and trade-offs
 
-- One slow record pauses its partition, because the next record cannot pass the current offset.
-- A crash or a lost partition before a successful commit can deliver the current record again.
-- A requeue keeps the committed offset where it is and gives the current consumer the record again first.
-- A partition that moved to another member rejects late acks instead of committing through the old assignment.
-- Partition count is how you get more parallelism on Kafka; F1 never lets a later ack pass an unfinished offset. Adding partitions moves some keys to other partitions, and Kafka cannot lower a topic's partition count afterwards.
+One slow record holds its partition. More handler workers cannot bypass that safety boundary; [partition capacity](/drivers/kafka#kafka-parallelism-and-partitions) is a separate deployment decision. Lost ownership or an uncertain commit requires idempotent effects, even when a handler completed successfully.
 
 ## Go further
 

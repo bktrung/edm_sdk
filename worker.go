@@ -1027,26 +1027,20 @@ func runnerLanePlan(r *Runner) []runnerLane {
 // read, so a consumer open sizes its caps from the same read that named its
 // destinations.
 func runnerLanePlanFor(r *Runner, effective driver.Capabilities, source string) []runnerLane {
-	weights := r.subscription.Fairness.Weights
 	budgets := r.subscription.Fairness.Budgets
-	divisor := r.subscription.Fairness.RetryWeightDivisor
-	if divisor < 1 {
-		divisor = defaultRetryWeightDivisor
-	}
-	factor := r.subscription.Fairness.PrefetchFactor
-	if factor < 1 {
-		factor = defaultPrefetchFactor
-	}
+	sizing := subscriptionLaneSizing(SubscriptionConfig{
+		Topics: r.subscription.Topics, Priorities: r.subscription.Priorities,
+		Concurrency: r.subscription.Concurrency, Fairness: r.subscription.Fairness,
+		Retry: r.subscription.Retry,
+	})
 	meta := make(map[string]runnerLane, len(r.subscription.Topics)*len(r.subscription.Priorities)*(1+r.subscription.Retry.tierCount()))
-	groups := make(map[string]struct{})
-	totalWeight := 0
 	forEachDestination(effective, source, r.subscription, func(logical string, priority Priority, tier int, destination string) {
 		laneID := schedulerLaneID(logical, priority, tier)
 		group := laneID
-		laneWeight, laneBudget := max(weights[priority], 1), budgets[priority]
+		laneWeight, laneBudget := sizing.mainWeight(priority), budgets[priority]
 		if tier > 0 {
 			group = schedulerRetryGroupID(logical, priority)
-			laneWeight = max(laneWeight/divisor, 1)
+			laneWeight = sizing.retryWeight(priority)
 			laneBudget *= retryBudgetMultiplier
 		}
 		meta[laneID] = runnerLane{
@@ -1054,14 +1048,7 @@ func runnerLanePlanFor(r *Runner, effective driver.Capabilities, source string) 
 			weight: laneWeight, budget: laneBudget,
 			topic: logical, priority: priority,
 		}
-		if _, exists := groups[group]; !exists {
-			groups[group] = struct{}{}
-			totalWeight += laneWeight
-		}
 	})
-	if totalWeight < 1 {
-		totalWeight = 1
-	}
 	ids := make([]string, 0, len(meta))
 	for id := range meta {
 		ids = append(ids, id)
@@ -1070,25 +1057,15 @@ func runnerLanePlanFor(r *Runner, effective driver.Capabilities, source string) 
 	plan := make([]runnerLane, 0, len(ids))
 	for _, id := range ids {
 		lane := meta[id]
-		lane.capacity = max((r.subscription.Concurrency*lane.weight+totalWeight-1)/totalWeight, minimumLaneCapacity) * factor
+		lane.capacity = sizing.capacity(lane.weight)
 		plan = append(plan, lane)
 	}
 	return plan
 }
 
-// runnerConsumerPrefetch returns the consumer's total in-flight budget: the
-// configured prefetch, capped by the sum of the lane capacities. A larger
-// total would let the driver fetch work ahead of the lanes that can hold it,
-// which is the buffering the lane bound exists to keep out: fetch must pause
-// on a full destination rather than queue behind it.
-//
-// A cap on a prefetch the caller named is reported, because that is a budget
-// the caller set and the destinations carry less. A prefetch nobody named is
-// not: the broker default is not the caller's decision, and a line that fires
-// on every subscription is unread when a caller's own budget is capped. The
-// report runs on every call rather than holding state to report once, so the
-// line repeats at the rate the caller's own reconnect loop repeats, which is
-// the rate the condition is re-decided.
+// runnerConsumerPrefetch resolves automatic sizing to the lane-capacity sum.
+// A positive configured budget is an admission ceiling; the lane windows may
+// impose a smaller effective ceiling, which is reported rather than hidden.
 func runnerConsumerPrefetch(r *Runner, configured int, lanes []runnerLane) int {
 	total := 0
 	for _, lane := range lanes {
@@ -1097,7 +1074,10 @@ func runnerConsumerPrefetch(r *Runner, configured int, lanes []runnerLane) int {
 	if total < 1 {
 		return configured
 	}
-	if configured > total && r.prefetchConfigured {
+	if configured == 0 {
+		return total
+	}
+	if configured > total {
 		lastResortRunnerLogger(r).Warn("f1 configured prefetch exceeds the destination windows",
 			"subscription", r.subscription.Name,
 			"configured", configured,
@@ -3028,10 +3008,6 @@ func retryAndSettle(r *Runner, ctx context.Context, message driver.InboundMessag
 	}
 	tier := retry.ResolveTier(retryConfig, envelope.Attempt)
 	delay := retryConfig.DelayFor(tier)
-	if requested, ok := RetryDelay(lastErr); ok {
-		resolvedTier, resolvedDelay := retry.ResolveRetryAfter(retryConfig, requested)
-		tier, delay = resolvedTier, resolvedDelay
-	}
 	now := r.client.options.clock.Now().UTC()
 	due := now.Add(delay)
 	copyEnvelope.DueTime = &due
@@ -3062,7 +3038,7 @@ func retryAndSettle(r *Runner, ctx context.Context, message driver.InboundMessag
 		return deadLetterAndSettle(r, ctx, message, envelope, ReasonTerminal,
 			errors.Join(lastErr, fmt.Errorf("f1: retry copy cannot be encoded: %w", err)), state)
 	}
-	out := driver.OutboundMessage{Destination: destination, Key: append([]byte(nil), message.Key...), Body: append([]byte(nil), message.Body...), DelayUntil: due}
+	out := driver.OutboundMessage{Destination: destination, Key: append([]byte(nil), message.Key...), Body: append([]byte(nil), message.Body...)}
 	for key, value := range encoded {
 		out.Headers = append(out.Headers, driver.Header{Key: key, Value: []byte(value)})
 	}
@@ -3363,7 +3339,7 @@ func subscriptionTopologySpecs(effective driver.Capabilities, source string, sub
 				result.Bindings = append(result.Bindings, driver.BindingSpec{Source: entryPoint, Destination: main})
 			}
 			for tier := 1; tier <= sub.Retry.tierCount(); tier++ {
-				add(driver.DestinationSpec{Name: retryDestinationFor(source, logical, priority, tier, sub.Name), Kind: driver.DestRetry, Durable: true, Delay: sub.Retry.DelayFor(tier), FixedDelay: true, DeadLetter: route, DeliveryLimit: limit})
+				add(driver.DestinationSpec{Name: retryDestinationFor(source, logical, priority, tier, sub.Name), Kind: driver.DestRetry, Durable: true, Delay: sub.Retry.DelayFor(tier), DeadLetter: route, DeliveryLimit: limit})
 			}
 		}
 		add(driver.DestinationSpec{Name: deadLetterDestinationFor(source, logical, sub.Name), Kind: driver.DestDLQ, Durable: true})

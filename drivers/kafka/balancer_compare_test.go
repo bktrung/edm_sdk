@@ -362,51 +362,6 @@ func TestDefaultBalancerLaneCoverage(t *testing.T) {
 	compareCell(t, balancer, compareLiveLanes(2), 3, 2)
 }
 
-// TestWholeLaneOwnershipObservation measures the state StickyBalancer's own doc
-// comment starts from: two members that each hold a whole topic, a third topic
-// free, and a third member gone, which is also the state a generation skews into
-// when its members arrived one at a time against a live backlog.
-//
-// It is an observation only, printed rather than asserted beyond exactly-once:
-// the comment's answer leaves one member with none of the other's topic, and
-// whether the settled plan here does the same is the thing this cell records,
-// not a rule the balancer is held to. The three lanes all have three partitions,
-// which is more than the two members, so the coverage rule the other test pins
-// does not reach this cell: what it measures is whether a balancer that balances
-// totals keeps a member's whole topic together when nothing asks it to move.
-func TestWholeLaneOwnershipObservation(t *testing.T) {
-	balancer := compareDefaultBalancer(t)
-	lanes := map[string]int32{"t0": 3, "t1": 3, "t2": 3}
-	ids := []string{"member-0", "member-1"}
-	prior := map[string]map[string][]int32{
-		"member-0": {"t0": {0, 1, 2}},
-		"member-1": {"t1": {0, 1, 2}},
-	}
-
-	plan, rounds, pending := compareRebalance(t, balancer, lanes, prior, "", ids)
-	compareExactlyOnce(t, "whole lanes", lanes, plan, ids)
-	zeroPairs, maxSpread, spreadLane := compareCoverage(lanes, plan, ids)
-	least, most := compareTotals(lanes, plan, ids)
-	t.Logf("plan balancer=default protocol=%s lanes=%d partitions=3 members=%d zeroPairs=%d maxSpread=%d spreadLane=%s totals=%d:%d rounds=%d pending=%d assignment=%s",
-		balancer.ProtocolName(), len(lanes), len(ids), zeroPairs, maxSpread, spreadLane, least, most, rounds, pending, comparePlanLine(lanes, plan, ids))
-}
-
-// comparePlanLine renders an assignment as member, lane and partitions, so a
-// cell whose lanes are few enough to read can print what it assigned.
-func comparePlanLine(lanes map[string]int32, assignment map[string]map[string][]int32, ids []string) string {
-	line := ""
-	for _, id := range ids {
-		line += id + "{"
-		for _, lane := range slices.Sorted(maps.Keys(lanes)) {
-			if partitions := assignment[id][lane]; len(partitions) > 0 {
-				line += fmt.Sprintf("%s%v", compareShortName(lane), partitions)
-			}
-		}
-		line += "} "
-	}
-	return line
-}
-
 // compareLiveLanes is the lane set the live priority comparison declares: the
 // high and low lanes of one topic, and nothing else.
 func compareLiveLanes(partitions int32) map[string]int32 {

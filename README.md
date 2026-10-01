@@ -41,8 +41,9 @@ for each guarantee. Broker-backed jobs remain opt-in behind `RUN_BROKER_TESTS=1`
   promise a maximum wait.
 - **Poison-message safety.** A message that cannot be decoded, or a handler that panics, is
   quarantined rather than retried forever or taken down with the process.
-- **Ordering, where declared.** Per-key ordering is available and preserved end to end when a
-  subscription asks for it. F1 does not offer or imply global ordering across partitions or queues.
+- **Ordered execution, where declared.** A subscription requesting per-key ordering serializes
+  equal-key handlers in scheduler dispatch order. Later messages can run before a delayed retry;
+  F1 does not promise arrival order across priority lanes or global ordering across partitions or queues.
 - **Non-leaking abstraction.** No broker-specific concept is visible in the handler-facing API.
   Broker differences may appear in configuration; they never appear in business code.
 - **Capability declaration, no silent degradation.** F1 declares its limits under the connected

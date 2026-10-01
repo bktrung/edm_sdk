@@ -44,9 +44,6 @@ func TestBrokerPrefetchHeldQuorumDeliveries(t *testing.T) {
 		t.Fatalf("Consumer: %v", err)
 	}
 	rabbitConsumer := sdkConsumer.(*consumer)
-	if got := cap(rabbitConsumer.messages); got != brokerPrefetchSafetyValue {
-		t.Fatalf("messages channel capacity = %d, want %d", got, brokerPrefetchSafetyValue)
-	}
 	if len(rabbitConsumer.lanes) != 1 || rabbitConsumer.lanes[0].prefetch != brokerPrefetchSafetyValue {
 		t.Fatalf("lane prefetch = %#v, want %d", rabbitConsumer.lanes, brokerPrefetchSafetyValue)
 	}
@@ -75,16 +72,27 @@ func TestBrokerPrefetchHeldQuorumDeliveries(t *testing.T) {
 	if first.DeliveryCount < 0 {
 		t.Fatalf("held delivery has no native delivery count")
 	}
-	held := make([]driver.InboundMessage, 0, brokerPrefetchSafetyValue)
-	for range brokerPrefetchSafetyValue - 1 {
-		select {
-		case message := <-sdkConsumer.Messages():
-			held = append(held, message)
-		case <-ctx.Done():
-			t.Fatalf("waiting for all held deliveries: got %d of %d: %v", len(held)+1, brokerPrefetchSafetyValue, ctx.Err())
-		}
+	// One delivery is SDK-admitted. The next waits at admission while the
+	// remaining transport credit fills pending, without registering settlers.
+	waitForwarderState(t, "all broker-prefetched deliveries", func() bool {
+		lane := rabbitConsumer.lanes[0]
+		lane.mu.Lock()
+		emitting := lane.emitting
+		lane.mu.Unlock()
+		return len(lane.pending)+emitting == brokerPrefetchSafetyValue-1
+	})
+	select {
+	case message := <-sdkConsumer.Messages():
+		t.Fatalf("broker prefetch bypassed SDK cap: %q", message.Body)
+	default:
 	}
-	t.Logf("held deliveries before close: %d", len(held)+1)
+	rabbitConsumer.mu.Lock()
+	outstanding := rabbitConsumer.outstanding
+	rabbitConsumer.mu.Unlock()
+	if outstanding != 1 {
+		t.Fatalf("SDK-admitted unsettled deliveries = %d, want 1", outstanding)
+	}
+	t.Logf("broker-held deliveries: %d; SDK-admitted deliveries: %d", brokerPrefetchSafetyValue, outstanding)
 	if err := sdkConsumer.Release(ctx); err != nil {
 		t.Fatalf("Release: %v", err)
 	}
@@ -214,5 +222,81 @@ func publishBrokerPrefetchMessages(t *testing.T, ctx context.Context, channel *a
 		}); err != nil {
 			t.Fatalf("Publish %d: %v", i, err)
 		}
+	}
+}
+
+func TestConsumerAggregateAdmissionAcrossDestinations(t *testing.T) {
+	for _, brokerPrefetch := range []string{"", "8"} {
+		t.Run("broker-prefetch-"+brokerPrefetch, func(t *testing.T) {
+			requireBroker(t)
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			options := map[string]string{}
+			if brokerPrefetch != "" {
+				options[brokerPrefetchOption] = brokerPrefetch
+			}
+			public, err := (Driver{}).Open(ctx, driver.Config{
+				Endpoints: []string{defaultEndpoint}, DriverOptions: options,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = public.Close(context.Background()) })
+			firstQueue := "rabbitmq-aggregate-admission-first-" + brokerPrefetch
+			secondQueue := "rabbitmq-aggregate-admission-second-" + brokerPrefetch
+			firstChannel := declareBrokerPrefetchQueue(t, firstQueue)
+			secondChannel := declareBrokerPrefetchQueue(t, secondQueue)
+			publishBrokerPrefetchMessages(t, ctx, firstChannel, firstQueue, 4)
+			publishBrokerPrefetchMessages(t, ctx, secondChannel, secondQueue, 4)
+			sdk, err := public.Consumer(ctx, driver.ConsumerConfig{
+				Destinations:   []string{firstQueue, secondQueue},
+				Prefetch:       2,
+				PerDestination: map[string]int{firstQueue: 2, secondQueue: 2},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = sdk.Release(context.Background()) })
+			read := func() driver.InboundMessage {
+				select {
+				case message := <-sdk.Messages():
+					return message
+				case <-ctx.Done():
+					t.Fatalf("waiting for admitted delivery: %v", ctx.Err())
+					return driver.InboundMessage{}
+				}
+			}
+			assertSaturated := func() {
+				t.Helper()
+				select {
+				case message := <-sdk.Messages():
+					t.Fatalf("aggregate cap exceeded by delivery from %q", message.Destination)
+				case <-time.After(30 * time.Millisecond): //nolint:forbidigo // observe the absence of broker-backed admission
+				}
+			}
+			first, second := read(), read()
+			assertSaturated()
+			if err := first.Settle.Ack(ctx); err != nil {
+				t.Fatalf("Ack: %v", err)
+			}
+			refill := read()
+			assertSaturated()
+			if err := sdk.Drain(ctx); err != nil {
+				t.Fatalf("Drain at saturated admission: %v", err)
+			}
+			for _, message := range []driver.InboundMessage{second, refill} {
+				if err := message.Settle.Ack(ctx); err != nil {
+					t.Fatalf("Ack after Drain: %v", err)
+				}
+			}
+			select {
+			case message := <-sdk.Messages():
+				t.Fatalf("delivery admitted after Drain: %q", message.Body)
+			default:
+			}
+			if err := sdk.Stop(ctx); err != nil {
+				t.Fatalf("Stop after saturated Drain: %v", err)
+			}
+		})
 	}
 }

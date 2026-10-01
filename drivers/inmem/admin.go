@@ -74,7 +74,12 @@ func (a *adminOperations) EnsureTopology(ctx context.Context, spec driver.Topolo
 		return diff, nil
 	}
 	for _, item := range spec.Destinations {
-		if _, ok := a.conn.destinations[item.Name]; ok {
+		if stored, ok := a.conn.destinations[item.Name]; ok {
+			// A redeclared delay applies to the next publish, as it does on the
+			// brokers: a retry tier whose delay changed between deploys keeps its
+			// destination name, and its copies are owed the new delay. Messages
+			// already queued keep the due time they were published with.
+			stored.spec.Delay = item.Delay
 			diff.ExistingDestinations = append(diff.ExistingDestinations, item.Name)
 			continue
 		}

@@ -19,6 +19,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"slices"
 	"strings"
 	"sync"
@@ -901,10 +902,19 @@ func measureCleanup(t *testing.T, admin *kadm.Client, group, topic string, shape
 	}
 }
 
+// measureMoveGateEnv opts in to TestBalancerMoveCost. The test only prints its
+// readings and asserts no bound on them, so it is a measurement rather than a
+// gate: without the variable it skips, and make test-infra does not pay three
+// runs on the shared fixture for numbers nothing checks.
+const measureMoveGateEnv = "F1_KAFKA_MEASURE_MOVE"
+
 // TestBalancerMoveCost measures what a join costs the group: how long after the
 // joining member's assignment its first delivery arrives, and how many records
 // the group delivered twice while the membership changed.
 func TestBalancerMoveCost(t *testing.T) {
+	if os.Getenv(measureMoveGateEnv) != "1" {
+		t.Skipf("balancer move cost: set %s=1, or run make measure-kafka-move, to perform the measurement", measureMoveGateEnv)
+	}
 	requirePortBroker(t)
 	for run := 1; run <= measureRuns; run++ {
 		measureMoveRun(t, run)

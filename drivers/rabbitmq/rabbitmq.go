@@ -95,41 +95,20 @@ func capabilitiesForQueueKind(kind queueKind) driver.Capabilities {
 	return caps
 }
 
-// delayAccuracyForLadder derives the delay accuracy the parking ladder
-// delivers, from the ladder itself rather than from a restatement of it: an
-// edited rung, or a ladder that stops doubling, then changes the reported
-// number instead of leaving a stale literal behind.
-//
-// A delay at or below the first rung parks in that rung, so its lateness is at
-// most the rung. A delay in (previous, rung] parks in rung, so its lateness is
-// at most rung - previous, and the relative bound is the largest such gap as a
-// fraction of the rung below it. The top rung is the last delay with a
-// declared bound: above it a message takes the per-message expiration path,
-// where one parked ahead of it holds it back for as long as that one's due
-// time is later, so no bound is declared there.
-func delayAccuracyForLadder(rungs []time.Duration) driver.DelayAccuracy {
-	accuracy := driver.DelayAccuracy{Floor: rungs[0], MaxDelay: rungs[len(rungs)-1]}
-	for i := 1; i < len(rungs); i++ {
-		previous := rungs[i-1]
-		accuracy.Relative = max(accuracy.Relative, float64(rungs[i]-previous)/float64(previous))
-	}
-	return accuracy
-}
-
 // Capabilities reports the default RabbitMQ capabilities: per-message
 // acknowledgements, key ordering, fanout at publish time, unrestricted
 // consumer scaling, and lag queries. It reports no native priority: the
 // driver declares no x-max-priority queue and sets no AMQP message priority,
-// because the core carries priority in its own per-priority destinations. It also
-// reports bounded delay accuracy for parking queues, but does not advertise
-// native delay support. A connection using classic queues does not report
-// native delivery counts or native dead-letter queues.
+// because the core carries priority in its own per-priority destinations. It
+// does not advertise native delay support: a message on a delayed destination
+// waits in a parking queue until its expiration passes. A connection using
+// classic queues does not report native delivery counts or native dead-letter
+// queues.
 func (Driver) Capabilities() driver.Capabilities {
 	return driver.Capabilities{
 		PerMessageAck:       true,
 		OrderedByKey:        true,
 		NativeDelay:         false,
-		DelayAccuracy:       delayAccuracyForLadder(parkRungs[:]),
 		NativeDeliveryCount: true,
 		NativeDLQ:           true,
 		ConsumerScaling:     driver.ScalingFree,
@@ -237,7 +216,6 @@ type conn struct {
 	publishFault    atomic.Int32 // 0 = unset; otherwise driver.Kind + 1
 	closeFault      atomic.Bool
 	deferred        map[string]time.Duration
-	fixed           map[string]time.Duration
 	// durabilityUpgrades holds the destinations whose non-durable declaration
 	// this connection has already reported as upgraded to durable, so the
 	// report is one per destination rather than one per ensure topology pass.
@@ -253,12 +231,19 @@ type conn struct {
 	// closes.
 	blockMu    sync.Mutex
 	blockWatch sync.WaitGroup
-	// detachWatch tracks the channel closes that outlive the caller that began
-	// them. amqp091's Channel.Close waits for close-ok, which a connection the
-	// broker has stopped reading never sends, so a close that a caller cannot
-	// wait for runs on a goroutine of its own; Close waits on that set once the
-	// connection is actually closed, for the same reason it waits on
-	// blockWatch.
+	// detachWatch tracks the goroutines that outlive the caller that began
+	// them: channel closes, publish channel watchers, and the releases a
+	// cancelled publish leaves for its channel's watcher. amqp091's
+	// Channel.Close waits for close-ok, which a connection the broker has
+	// stopped reading never sends, so a close that a caller cannot wait for
+	// runs on a goroutine of its own; a watcher lives as long as its channel,
+	// and a release until the confirmations it waits for resolve, which a
+	// closed channel guarantees. Close waits on that set once the connection
+	// is actually closed, for the same reason it waits on blockWatch. The Add
+	// for a watcher or a release can race that Wait only from a publish still
+	// running when the connection closed, the same window a channel close
+	// has, and it is benign for the same reason: the goroutine ends as soon as
+	// the connection's shutdown reaches its channel.
 	detachWatch sync.WaitGroup
 }
 
@@ -444,7 +429,6 @@ func newConn(amqpConn *amqp.Connection, caps driver.Capabilities, endpoint strin
 		active:               make(map[*consumer]struct{}),
 		producers:            make(map[*producer]struct{}),
 		deferred:             make(map[string]time.Duration),
-		fixed:                make(map[string]time.Duration),
 	}
 	// One subscription per connection is the whole of the block handling:
 	// c.amqp is set here and never replaced, so this connection's notifications
@@ -957,9 +941,9 @@ func classifyAMQP(op string, fallback driver.Kind, err error) error {
 //
 // Only the size refusal is classified here rather than by classifyAMQP. It is
 // the one close that names the limit the broker applies, so it is the one kind
-// a message's own body can answer for: the window that read this close reports
-// every message over that limit as too large, whether or not it is the message
-// the broker refused.
+// a message's own body can answer for: a publish that read this close reports
+// every undecided message over that limit as too large, whether or not it is
+// the message the broker refused.
 //
 // Every other close keeps the transient kind a closed publish channel has
 // always had, whatever code it carried. That includes a server-sent 501-504,

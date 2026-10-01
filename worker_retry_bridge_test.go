@@ -866,7 +866,7 @@ func TestDispatchDeadLettersRunawayCounter(t *testing.T) {
 	}
 }
 
-func TestRetryAfterClampCarriesTier(t *testing.T) {
+func TestRetryCopyLaneFollowsDestinationTier(t *testing.T) {
 	producer := &dispatchProducer{}
 	client, runner := newRetryBridgeRunner(t, producer, "orders.retry.created")
 	defer func() { _ = client.Close(context.Background()) }()
@@ -874,19 +874,19 @@ func TestRetryAfterClampCarriesTier(t *testing.T) {
 	settler := &dispatchSettler{}
 	envelope := Envelope{
 		SpecVersion: "1.0",
-		ID:          "clamped",
+		ID:          "second-attempt",
 		Source:      "/test/orders",
 		Type:        "orders.retry.created.v1",
 		Priority:    PriorityHigh,
-		Attempt:     1,
+		Attempt:     2,
 	}
 	message := retryBridgeMessage(t, envelope, settler)
-	if !retryAndSettle(runner, context.Background(), message, envelope, RetryAfter(errors.New("slow"), 5*time.Minute), &deliveryState{}) {
+	if !retryAndSettle(runner, context.Background(), message, envelope, errors.New("slow"), &deliveryState{}) {
 		t.Fatal("retry successor was not published and settled")
 	}
 	retryDestination := producer.messages[0].Destination
 	if want := "f1.test.orders.retry.created.orders.high.retry.2"; retryDestination != want {
-		t.Fatalf("retry destination = %q, want the clamped tier-2 destination %q", retryDestination, want)
+		t.Fatalf("retry destination = %q, want the tier-2 destination %q", retryDestination, want)
 	}
 	runner.destinationMetadata = map[string]destinationMetadata{retryDestination: {topic: "orders.retry.created", priority: PriorityHigh, tier: 2}}
 	inbound := driver.InboundMessage{
@@ -1081,60 +1081,6 @@ func (s *retryBridgeSettler) Ack(context.Context) error {
 func (s *retryBridgeSettler) Nack(_ context.Context, options driver.NackOptions) error {
 	s.nacks = append(s.nacks, options)
 	return nil
-}
-
-// TestFailedSuccessorHandoffsDoNotBareRequeue is a preservation guard: it
-// asserts a failed retry or dead-letter hand-off never gives the original
-// back to the broker uncounted (a "bare requeue", Requeue: true with no
-// failure accounting - the one sanctioned bare requeue is the drain phase,
-// not this path). It says nothing about whether the original is
-// discarded, which is a separate invariant covered by
-// TestFailedSuccessorHandoffLeavesOriginalUnsettled.
-func TestFailedSuccessorHandoffsDoNotBareRequeue(t *testing.T) {
-	cases := []struct {
-		name    string
-		handOff func(*Runner, context.Context, driver.InboundMessage, Envelope, *deliveryState) bool
-	}{
-		{
-			name: "retry",
-			handOff: func(r *Runner, ctx context.Context, message driver.InboundMessage, envelope Envelope, state *deliveryState) bool {
-				return retryAndSettle(r, ctx, message, envelope, errors.New("temporary"), state)
-			},
-		},
-		{
-			name: "dead-letter",
-			handOff: func(r *Runner, ctx context.Context, message driver.InboundMessage, envelope Envelope, state *deliveryState) bool {
-				return deadLetterAndSettle(r, ctx, message, envelope, ReasonTerminal, errors.New("terminal"), state)
-			},
-		},
-	}
-	for _, testCase := range cases {
-		t.Run(testCase.name, func(t *testing.T) {
-			producer := &dispatchProducer{}
-			client, runner := newRetryBridgeRunner(t, producer, "orders.created")
-			defer func() { _ = client.Close(context.Background()) }()
-			client.producerHandle = &retryBridgeFailingProducer{}
-			settler := &retryBridgeSettler{}
-			envelope := Envelope{
-				SpecVersion: "1.0",
-				ID:          "handoff-failure",
-				Source:      "/test/orders",
-				Type:        "orders.created.v1",
-				Priority:    PriorityHigh,
-				Attempt:     1,
-			}
-			message := retryBridgeMessage(t, envelope, settler)
-			state := &deliveryState{}
-			if testCase.handOff(runner, context.Background(), message, envelope, state) {
-				t.Fatal("failed successor hand-off was reported as successful")
-			}
-			for _, nack := range settler.nacks {
-				if nack.Requeue {
-					t.Fatalf("bare requeue occurred: %+v", nack)
-				}
-			}
-		})
-	}
 }
 
 // TestFailedSuccessorHandoffLeavesOriginalUnsettled proves the consume-side

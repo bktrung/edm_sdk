@@ -21,10 +21,14 @@ import (
 // handlers, and lifecycle callbacks. Client.Subscribe validates it and returns
 // a Runner that has not started consuming.
 type Subscription struct {
-	Name            string
-	Topics          []string
-	Mode            Mode
-	Concurrency     int
+	Name        string
+	Topics      []string
+	Mode        Mode
+	Concurrency int
+	// Prefetch caps total SDK-admitted unsettled deliveries. Zero leaves
+	// configuration overrides in effect, then uses a positive broker fallback
+	// or automatic sizing from the resolved lane capacities.
+	// Broker/client transport buffering is separate from this admission cap.
 	Prefetch        int
 	Priorities      []Priority
 	Fairness        FairnessConfig
@@ -131,13 +135,6 @@ type Runner struct {
 	// client's live capabilities instead.
 	lanePlan  []runnerLane
 	lifecycle *lifecycle.Machine
-
-	// prefetchConfigured records whether the caller named an in-flight budget
-	// on this subscription, as opposed to taking the broker default. A cap on
-	// a budget nobody named is not reported: the default is not the caller's
-	// decision, and the line would fire on nearly every subscription, which is
-	// what leaves it unread when a caller's own budget is capped.
-	prefetchConfigured bool
 }
 
 const terminalNotificationTimeout = time.Second
@@ -272,7 +269,7 @@ func (c *Client) Subscribe(ctx context.Context, sub Subscription) (*Runner, erro
 	}
 	c.mu.Unlock()
 
-	resolved, prefetchConfigured, err := resolveSubscription(c, sub)
+	resolved, err := resolveSubscription(c, sub)
 	if err != nil {
 		return nil, err
 	}
@@ -296,7 +293,7 @@ func (c *Client) Subscribe(ctx context.Context, sub Subscription) (*Runner, erro
 	effective.HandlerTimeout = resolved.HandlerTimeout
 	effective.UnmatchedPolicy = resolved.UnmatchedPolicy
 	effective.Handlers = wrapHandlers(c.options.middleware, sub.Handlers)
-	runner := &Runner{client: c, subscription: effective, config: resolved, prefetchConfigured: prefetchConfigured}
+	runner := &Runner{client: c, subscription: effective, config: resolved}
 	c.mu.Lock()
 	if err := c.admit(workSubscribe, 0); err != nil {
 		c.mu.Unlock()
@@ -318,37 +315,17 @@ func wrapHandlers(middleware []Middleware, handlers map[string]Handler) map[stri
 	return wrapped
 }
 
-func resolveSubscription(c *Client, sub Subscription) (resolved SubscriptionConfig, prefetchConfigured bool, err error) {
-	resolved = defaultSubscription()
-	// Whether the caller named an in-flight budget, as opposed to taking the
-	// broker default. Three things name one: the Subscription, the loaded
-	// configuration block, and the environment overlay. The block is read
-	// through its presence flag rather than its value, because a block that
-	// named no prefetch has already been filled with the broker default by
-	// config normalization, so its value cannot tell the two apart. The
-	// environment overlay writes the value directly, so its key is read beside
-	// it. A budget nobody named is not reported when the lane windows cap it:
-	// that line would fire for every subscription on the shipped defaults.
-	prefetchConfigured = sub.Prefetch != 0
+func resolveSubscription(c *Client, sub Subscription) (SubscriptionConfig, error) {
+	resolved := defaultSubscription()
 	if loaded, ok := c.config.Subscriptions[sub.Name]; ok {
-		prefetchConfigured = prefetchConfigured || loaded.presence.Prefetch
 		overlayLoadedSubscription(&resolved, loaded)
 	}
-	if err = applySubscriptionEnvironment(sub.Name, &resolved); err != nil {
-		return SubscriptionConfig{}, false, err
+	if err := applySubscriptionEnvironment(sub.Name, &resolved); err != nil {
+		return SubscriptionConfig{}, err
 	}
 	overlayExplicitSubscription(&resolved, sub)
-	if _, ok := lookupSubscriptionEnv(subscriptionEnvPrefix(sub.Name), "prefetch"); ok {
-		prefetchConfigured = prefetchConfigured || resolved.Prefetch != 0
-	}
-	if resolved.Prefetch == 0 {
-		resolved.Prefetch = resolvePrefetch(resolved.Prefetch, c.config.Broker.DefaultPrefetch)
-	}
-	if !prefetchConfigured {
-		lanes := subscriptionLaneCount(len(resolved.Topics), len(resolved.Priorities), resolved.Retry)
-		resolved.Prefetch = max(resolved.Prefetch, lanes)
-	}
-	return resolved, prefetchConfigured, nil
+	resolved.Prefetch = resolvePrefetch(resolved.Prefetch, c.config.Broker.DefaultPrefetch)
+	return resolved, nil
 }
 
 func overlayLoadedSubscription(dst *SubscriptionConfig, src SubscriptionConfig) {
@@ -461,12 +438,8 @@ func validateSubscription(cfg Config, driverName, name string, sub SubscriptionC
 	if err := validateRetryConfig("subscriptions."+name+".retry", sub.Retry); err != nil {
 		return err
 	}
-	lanes := subscriptionLaneCount(len(sub.Topics), len(sub.Priorities), sub.Retry)
-	if err := validatePrefetch(name, sub.Prefetch, lanes); err != nil {
+	if err := validatePrefetch(name, sub.Prefetch); err != nil {
 		return err
-	}
-	if sub.Mode == OrderedByKey && sub.Concurrency > dispatch.MaxOrderedBufferEntries/sub.Prefetch {
-		return fmt.Errorf("f1: subscriptions.%s: ordered mode needs concurrency x prefetch at most %d, got %d x %d", name, dispatch.MaxOrderedBufferEntries, sub.Concurrency, sub.Prefetch)
 	}
 	if sub.HandlerTimeout <= 0 {
 		return fmt.Errorf("f1: subscriptions.%s.handlerTimeout must be positive", name)
@@ -475,8 +448,8 @@ func validateSubscription(cfg Config, driverName, name string, sub SubscriptionC
 		return fmt.Errorf("f1: lifecycle.drainTimeout must exceed subscriptions.%s.handlerTimeout", name)
 	}
 	for priority, weight := range sub.Fairness.Weights {
-		if !priority.Valid() || weight < 1 {
-			return fmt.Errorf("f1: subscriptions.%s.fairness.weights.%s must be at least 1", name, priority)
+		if !priority.Valid() || weight < 1 || weight > maxFairnessWeight {
+			return fmt.Errorf("f1: subscriptions.%s.fairness.weights.%s must be between 1 and %d", name, priority, maxFairnessWeight)
 		}
 	}
 	for priority, budget := range sub.Fairness.Budgets {
@@ -491,6 +464,16 @@ func validateSubscription(cfg Config, driverName, name string, sub SubscriptionC
 	}
 	if sub.Fairness.PrefetchFactor < 0 {
 		return fmt.Errorf("f1: subscriptions.%s.fairness.prefetchFactor must not be negative", name)
+	}
+	prefetch := sub.Prefetch
+	if prefetch == 0 {
+		prefetch = automaticSubscriptionPrefetch(sub)
+		if err := validatePrefetch(name, prefetch); err != nil {
+			return err
+		}
+	}
+	if sub.Mode == OrderedByKey && sub.Concurrency > dispatch.MaxOrderedBufferEntries/prefetch {
+		return fmt.Errorf("f1: subscriptions.%s: ordered mode needs concurrency x prefetch at most %d, got %d x %d", name, dispatch.MaxOrderedBufferEntries, sub.Concurrency, prefetch)
 	}
 	if driverName == "rabbitmq" {
 		consumerTimeout, err := durationOption(cfg.Broker.DriverOptions, "rabbitmq.consumerTimeout", 90*time.Second)
