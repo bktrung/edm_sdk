@@ -56,6 +56,9 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ### Fixed
 
+- A runner drained while waiting for a connection rebuild completes its terminal
+  consumer teardown before `Run` returns, including when reconnect has already
+  released the consumer.
 - RabbitMQ management 401/403 responses are classified as permission errors and no longer retried.
 - Reconnect retains retired resources after close errors or timeouts, preserving
   producer/consumer-before-connection order. `Client.Close` returns an error until every
