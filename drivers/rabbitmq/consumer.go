@@ -596,6 +596,10 @@ func (c *consumer) readDeliveries(lane *lane) {
 	}
 }
 
+// emitMessages is the lane's only forwarder. emitting counts the delivery it
+// holds before admission; stale-generation deliveries need no window place.
+// An admitted message abandoned at teardown is released locally with c.release;
+// its delivery returns to the queue when the channel closes.
 func (c *consumer) emitMessages(lane *lane) {
 	defer func() {
 		if c.forwarderExitHook != nil {
@@ -616,102 +620,14 @@ func (c *consumer) emitMessages(lane *lane) {
 		case <-c.forwarderStopC:
 			return
 		}
-		lane.mu.Lock()
-		lane.emitting++
-		lane.mu.Unlock()
-		c.mu.Lock()
-		if c.draining || c.stopped {
-			c.mu.Unlock()
-			lane.mu.Lock()
-			lane.emitting--
-			lane.mu.Unlock()
+		admitted := c.admitMessage(lane, item)
+		if admitted == nil {
 			return
 		}
-		c.mu.Unlock()
-		for {
-			c.mu.Lock()
-			if c.draining || c.stopped {
-				c.mu.Unlock()
-				lane.mu.Lock()
-				lane.emitting--
-				lane.mu.Unlock()
-				return
-			}
-			c.mu.Unlock()
-			lane.mu.Lock()
-			paused, resume := lane.paused, lane.resume
-			lane.mu.Unlock()
-			if !paused {
-				break
-			}
-			select {
-			case <-resume:
-			case <-c.forwarderStopC:
-				lane.mu.Lock()
-				lane.emitting--
-				lane.mu.Unlock()
-				return
-			case <-c.stoppedC:
-				lane.mu.Lock()
-				lane.emitting--
-				lane.mu.Unlock()
-				return
-			}
-		}
-		var admitted *settler
-		for admitted == nil {
-			c.mu.Lock()
-			if c.draining || c.stopped {
-				c.mu.Unlock()
-				lane.mu.Lock()
-				lane.emitting--
-				lane.mu.Unlock()
-				return
-			}
-			lane.mu.Lock()
-			paused := lane.paused
-			var resume <-chan struct{}
-			if paused {
-				resume = lane.resume
-			}
-			lane.mu.Unlock()
-			// A delivery from a consumer the broker has since cancelled was
-			// taken back with that consumer, so it holds no place in any
-			// window and is admitted without one. lane.generation is read
-			// under c.mu, which attachReplacement also holds to move it.
-			stale := item.generation < lane.generation
-			if !paused && (stale || ((c.cfg.Prefetch <= 0 || c.admitted < c.cfg.Prefetch) &&
-				(lane.admissionLimit <= 0 || lane.admitted < lane.admissionLimit))) {
-				admitted = &settler{owner: c, destination: lane.destination, delivery: item.Delivery, generation: item.generation, counted: !stale}
-				c.settlers[admitted] = struct{}{}
-				c.outstanding++
-				if !stale {
-					c.admitted++
-					lane.admitted++
-				}
-			}
-			c.mu.Unlock()
-			if admitted == nil {
-				select {
-				case <-lane.admissionWake:
-				case <-resume:
-				case <-c.forwarderStopC:
-					lane.mu.Lock()
-					lane.emitting--
-					lane.mu.Unlock()
-					return
-				case <-c.stoppedC:
-					lane.mu.Lock()
-					lane.emitting--
-					lane.mu.Unlock()
-					return
-				}
-			}
-		}
-		lane.mu.Lock()
-		lane.emitting--
-		lane.mu.Unlock()
 		message := c.inboundMessage(lane.destination, item.Delivery, admitted, c.nativeDeliveryCount(), c.trustBrokerTimestamp)
+		// Admission precedes Drain setting draining under c.mu and closing
+		// forwarderStopC. If send and stop are both ready afterward, Go may
+		// choose the send; delivering that already-admitted message is correct.
 		select {
 		case c.messages <- message:
 		case <-c.forwarderStopC:
@@ -722,6 +638,62 @@ func (c *consumer) emitMessages(lane *lane) {
 			return
 		}
 	}
+}
+
+// admitMessage keeps the held delivery counted across every admission wait,
+// without leaving emission accounting behind on a teardown exit.
+func (c *consumer) admitMessage(lane *lane, item laneDelivery) *settler {
+	lane.mu.Lock()
+	lane.emitting++
+	lane.mu.Unlock()
+	defer func() {
+		lane.mu.Lock()
+		lane.emitting--
+		lane.mu.Unlock()
+	}()
+
+	var admitted *settler
+	for admitted == nil {
+		c.mu.Lock()
+		if c.draining || c.stopped {
+			c.mu.Unlock()
+			return nil
+		}
+		lane.mu.Lock()
+		paused := lane.paused
+		var resume <-chan struct{}
+		if paused {
+			resume = lane.resume
+		}
+		lane.mu.Unlock()
+		// A delivery from a consumer the broker has since cancelled was
+		// taken back with that consumer, so it holds no place in any
+		// window and is admitted without one. lane.generation is read
+		// under c.mu, which attachReplacement also holds to move it.
+		stale := item.generation < lane.generation
+		if !paused && (stale || ((c.cfg.Prefetch <= 0 || c.admitted < c.cfg.Prefetch) &&
+			(lane.admissionLimit <= 0 || lane.admitted < lane.admissionLimit))) {
+			admitted = &settler{owner: c, destination: lane.destination, delivery: item.Delivery, generation: item.generation, counted: !stale}
+			c.settlers[admitted] = struct{}{}
+			c.outstanding++
+			if !stale {
+				c.admitted++
+				lane.admitted++
+			}
+		}
+		c.mu.Unlock()
+		if admitted == nil {
+			select {
+			case <-lane.admissionWake:
+			case <-resume:
+			case <-c.forwarderStopC:
+				return nil
+			case <-c.stoppedC:
+				return nil
+			}
+		}
+	}
+	return admitted
 }
 
 func (c *consumer) hasDestination(destination string) bool {
