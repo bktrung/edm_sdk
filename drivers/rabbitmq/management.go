@@ -210,38 +210,63 @@ func (m *managementClient) do(ctx context.Context, method, path string) (*http.R
 	return m.client.Do(request)
 }
 
-func (m *managementClient) listQueues(ctx context.Context) ([]managementQueue, error) {
-	response, err := m.do(ctx, http.MethodGet, m.queuesPath())
+type managementHTTPError struct {
+	statusCode int
+	method     string
+	resource   string
+	status     string
+	body       string
+}
+
+// Error preserves the management response's diagnostic text.
+func (e *managementHTTPError) Error() string {
+	return fmt.Sprintf("management API %s %s: %s: %s", e.method, e.resource, e.status, e.body)
+}
+
+func newManagementHTTPError(response *http.Response, method, resource string) error {
+	body, _ := io.ReadAll(io.LimitReader(response.Body, 4096))
+	return &managementHTTPError{
+		statusCode: response.StatusCode,
+		method:     method,
+		resource:   resource,
+		status:     response.Status,
+		body:       strings.TrimSpace(string(body)),
+	}
+}
+
+func classifyManagement(op string, err error) error {
+	kind := driver.KindTransient
+	if httpErr, ok := errors.AsType[*managementHTTPError](err); ok {
+		if httpErr.statusCode == http.StatusUnauthorized || httpErr.statusCode == http.StatusForbidden {
+			kind = driver.KindPermission
+		}
+	}
+	return classify(op, kind, err)
+}
+
+func managementGet[T any](ctx context.Context, m *managementClient, path, resource string) (T, error) {
+	var value T
+	response, err := m.do(ctx, http.MethodGet, path)
 	if err != nil {
-		return nil, err
+		return value, err
 	}
 	defer response.Body.Close()
 	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
-		body, _ := io.ReadAll(io.LimitReader(response.Body, 4096))
-		return nil, fmt.Errorf("management API GET queues: %s: %s", response.Status, strings.TrimSpace(string(body)))
+		return value, newManagementHTTPError(response, http.MethodGet, resource)
 	}
-	var queues []managementQueue
-	if err := json.NewDecoder(response.Body).Decode(&queues); err != nil {
-		return nil, fmt.Errorf("management API decode queues: %w", err)
+	if err := json.NewDecoder(response.Body).Decode(&value); err != nil {
+		var zero T
+		return zero, fmt.Errorf("management API decode %s: %w", resource, err)
 	}
-	return queues, nil
+	return value, nil
+}
+
+func (m *managementClient) listQueues(ctx context.Context) ([]managementQueue, error) {
+	return managementGet[[]managementQueue](ctx, m, m.queuesPath(), "queues")
 }
 
 func (m *managementClient) listExchanges(ctx context.Context) ([]managementExchange, error) {
-	response, err := m.do(ctx, http.MethodGet, m.exchangesPath())
-	if err != nil {
-		return nil, err
-	}
-	defer response.Body.Close()
-	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
-		body, _ := io.ReadAll(io.LimitReader(response.Body, 4096))
-		return nil, fmt.Errorf("management API GET exchanges: %s: %s", response.Status, strings.TrimSpace(string(body)))
-	}
-	var exchanges []managementExchange
-	if err := json.NewDecoder(response.Body).Decode(&exchanges); err != nil {
-		return nil, fmt.Errorf("management API decode exchanges: %w", err)
-	}
-	return exchanges, nil
+	return managementGet[[]managementExchange](ctx, m, m.exchangesPath(), "exchanges")
 }
 
 // getQueue fetches one queue's current state, including its broker-recorded
@@ -257,8 +282,7 @@ func (m *managementClient) getQueue(ctx context.Context, name string) (managemen
 		return managementQueue{}, fmt.Errorf("management API GET queue %q: %w", name, errQueueNotFound)
 	}
 	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
-		body, _ := io.ReadAll(io.LimitReader(response.Body, 4096))
-		return managementQueue{}, fmt.Errorf("management API GET queue %q: %s: %s", name, response.Status, strings.TrimSpace(string(body)))
+		return managementQueue{}, newManagementHTTPError(response, http.MethodGet, fmt.Sprintf("queue %q", name))
 	}
 	var queue managementQueue
 	if err := json.NewDecoder(response.Body).Decode(&queue); err != nil {
@@ -268,20 +292,7 @@ func (m *managementClient) getQueue(ctx context.Context, name string) (managemen
 }
 
 func (m *managementClient) listBindings(ctx context.Context) ([]managementBinding, error) {
-	response, err := m.do(ctx, http.MethodGet, m.bindingsPath())
-	if err != nil {
-		return nil, err
-	}
-	defer response.Body.Close()
-	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
-		body, _ := io.ReadAll(io.LimitReader(response.Body, 4096))
-		return nil, fmt.Errorf("management API GET bindings: %s: %s", response.Status, strings.TrimSpace(string(body)))
-	}
-	var bindings []managementBinding
-	if err := json.NewDecoder(response.Body).Decode(&bindings); err != nil {
-		return nil, fmt.Errorf("management API decode bindings: %w", err)
-	}
-	return bindings, nil
+	return managementGet[[]managementBinding](ctx, m, m.bindingsPath(), "bindings")
 }
 
 func (m *managementClient) deleteExchange(ctx context.Context, name string) (bool, error) {
@@ -294,8 +305,7 @@ func (m *managementClient) deleteExchange(ctx context.Context, name string) (boo
 		return false, nil
 	}
 	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
-		body, _ := io.ReadAll(io.LimitReader(response.Body, 4096))
-		return false, fmt.Errorf("management API DELETE exchange %q: %s: %s", name, response.Status, strings.TrimSpace(string(body)))
+		return false, newManagementHTTPError(response, http.MethodDelete, fmt.Sprintf("exchange %q", name))
 	}
 	return true, nil
 }
