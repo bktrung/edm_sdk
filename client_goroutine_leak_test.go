@@ -5,7 +5,6 @@ import (
 	"io"
 	"log/slog"
 	"runtime"
-	"strings"
 	"testing"
 	"time"
 
@@ -21,8 +20,6 @@ import (
 	//nolint:depguard // provider construction is part of the f1otel lifecycle check.
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 )
-
-const goroutineLeakModulePath = "fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk"
 
 func TestClientGoroutineLeak(t *testing.T) {
 	t.Run("publish-only client", func(t *testing.T) {
@@ -125,33 +122,10 @@ func assertNoClientGoroutineLeak(t *testing.T, run func(*testing.T)) {
 		}
 		select {
 		case <-deadline.C:
-			t.Fatalf("goroutines after close = %d, baseline = %d\nmodule-owned goroutine stacks:\n%s", current, baseline, moduleGoroutineStacks())
+			t.Fatalf("goroutines after close = %d, baseline = %d\nmodule-owned goroutine stacks:\n%s", current, baseline, f1.ModuleGoroutineStacks())
 		case <-poll.C:
 		}
 	}
-}
-
-func moduleGoroutineStacks() string {
-	buf := make([]byte, 1<<20)
-	n := runtime.Stack(buf, true)
-	var stacks []string
-	for stack := range strings.SplitSeq(string(buf[:n]), "\n\n") {
-		lines := strings.Split(stack, "\n")
-		for i := 1; i+1 < len(lines); i++ {
-			if strings.HasPrefix(lines[i], "created by ") {
-				break
-			}
-			source := strings.TrimSpace(lines[i+1])
-			if strings.Contains(lines[i], goroutineLeakModulePath) && strings.Contains(source, ".go:") && !strings.Contains(source, "_test.go:") {
-				stacks = append(stacks, stack)
-				break
-			}
-		}
-	}
-	if len(stacks) == 0 {
-		return "<none>"
-	}
-	return strings.Join(stacks, "\n\n")
 }
 
 func newGoroutineLeakClient(t *testing.T, opts ...f1.Option) *f1.Client {

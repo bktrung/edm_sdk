@@ -8,7 +8,6 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
-	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -17,6 +16,16 @@ import (
 
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/driver"
 )
+
+// newManagementClient builds the management client a connection to endpoint
+// would use, so a test can drive or inspect the management API directly.
+func newManagementClient(endpoint string, cfg driver.Config) (*managementClient, error) {
+	resolved, err := resolveEndpoint(endpoint, cfg)
+	if err != nil {
+		return nil, err
+	}
+	return managementClientForEndpoint(resolved, cfg)
+}
 
 func TestManagementClientListsAndDeletesExchanges(t *testing.T) {
 	const username = "management-user"
@@ -561,31 +570,15 @@ func (b *managementResponseBody) Close() error {
 	return nil
 }
 
-// requireManagementStatus uses reflection so the regression compiles before
-// the private HTTP error exists, and fails on lost status rather than a missing type.
 func requireManagementStatus(t *testing.T, err error, status int, method, resource string) {
 	t.Helper()
-	for cause := err; cause != nil; cause = errors.Unwrap(cause) {
-		value := reflect.ValueOf(cause)
-		if value.Kind() != reflect.Pointer || value.Elem().Kind() != reflect.Struct {
-			continue
-		}
-		value = value.Elem()
-		if value.Type().Name() != "managementHTTPError" {
-			continue
-		}
-		target := reflect.New(reflect.TypeOf(cause))
-		if !errors.As(err, target.Interface()) {
-			t.Fatalf("errors.As(%v) did not reach the HTTP error", err)
-		}
-		if value.FieldByName("statusCode").Int() != int64(status) ||
-			value.FieldByName("method").String() != method ||
-			value.FieldByName("resource").String() != resource {
-			t.Fatalf("HTTP error = %v, want status %d, method %s, resource %s", cause, status, method, resource)
-		}
-		return
+	var httpErr *managementHTTPError
+	if !errors.As(err, &httpErr) {
+		t.Fatalf("error %v lost HTTP status %d", err, status)
 	}
-	t.Fatalf("error %v lost HTTP status %d", err, status)
+	if httpErr.statusCode != status || httpErr.method != method || httpErr.resource != resource {
+		t.Fatalf("HTTP error = %v, want status %d, method %s, resource %s", httpErr, status, method, resource)
+	}
 }
 
 func TestManagementHTTPErrorPreservesStatus(t *testing.T) {
@@ -646,7 +639,7 @@ func TestPruneManagementAuthorizationErrors(t *testing.T) {
 						return
 					}
 					if resource == "exchanges" {
-						_, _ = io.WriteString(w, `[{"name":"t047-exchange"}]`)
+						_, _ = io.WriteString(w, `[{"name":"orders-exchange"}]`)
 					} else {
 						_, _ = io.WriteString(w, `[]`)
 					}
@@ -656,7 +649,7 @@ func TestPruneManagementAuthorizationErrors(t *testing.T) {
 				// These branches stop before channel admission; IsClosed on the
 				// zero connection reads its open-state flag without doing I/O.
 				admin := &adminOperations{conn: &conn{amqp: &amqp.Connection{}, management: m}}
-				_, err := admin.Prune(t.Context(), []string{"t047-exchange"})
+				_, err := admin.Prune(t.Context(), []string{"orders-exchange"})
 				want := driver.KindPermission
 				if status == 503 {
 					want = driver.KindTransient
@@ -670,7 +663,7 @@ func TestPruneManagementAuthorizationErrors(t *testing.T) {
 				}
 				resource, method := stage, http.MethodGet
 				if stage == "delete" {
-					resource, method = `exchange "t047-exchange"`, http.MethodDelete
+					resource, method = `exchange "orders-exchange"`, http.MethodDelete
 				}
 				requireManagementStatus(t, err, status, method, resource)
 			})

@@ -2,10 +2,7 @@ package rabbitmq
 
 import (
 	"context"
-	"encoding/binary"
 	"errors"
-	"io"
-	"net"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -355,108 +352,6 @@ func TestConsumerReattachReleasesCancelledAdmission(t *testing.T) {
 	}
 }
 
-// closedTeardownChannel uses only public AMQP APIs and an in-memory peer. A
-// zero Channel panics on the old Stop's direct Close; this real, already-closed
-// channel makes both old and new teardown paths safe to unwind without a broker.
-func closedTeardownChannel(t *testing.T) *amqp.Channel {
-	t.Helper()
-	client, peer := net.Pipe()
-	serverDone := make(chan struct{})
-	endPeer := make(chan struct{})
-	var endOnce sync.Once
-	closePeer := func() { endOnce.Do(func() { close(endPeer) }) }
-	t.Cleanup(func() {
-		closePeer()
-		_ = client.Close()
-		_ = peer.Close()
-		select {
-		case <-serverDone:
-		case <-time.After(time.Second): //nolint:forbidigo // join the in-memory protocol fixture on every exit
-			t.Error("in-memory AMQP peer did not exit")
-		}
-	})
-	if err := peer.SetDeadline(clock.NewReal().Now().Add(time.Second)); err != nil {
-		t.Fatal(err)
-	}
-	server := make(chan error, 1)
-	go func() {
-		defer close(serverDone)
-		defer peer.Close()
-		readMethod := func(class, method uint16) error {
-			var header [7]byte
-			if _, err := io.ReadFull(peer, header[:]); err != nil {
-				return err
-			}
-			payload := make([]byte, int(binary.BigEndian.Uint32(header[3:]))+1)
-			if _, err := io.ReadFull(peer, payload); err != nil {
-				return err
-			}
-			if header[0] != 1 || len(payload) < 5 || binary.BigEndian.Uint16(payload) != class ||
-				binary.BigEndian.Uint16(payload[2:]) != method || payload[len(payload)-1] != 0xce {
-				return errors.New("unexpected in-memory AMQP method")
-			}
-			return nil
-		}
-		writeMethod := func(channel, class, method uint16, args []byte) error {
-			frame := []byte{1}
-			frame = binary.BigEndian.AppendUint16(frame, channel)
-			frame = binary.BigEndian.AppendUint32(frame, uint32(4+len(args))) //nolint:gosec // fixed internal handshake arguments, never external input
-			frame = binary.BigEndian.AppendUint16(frame, class)
-			frame = binary.BigEndian.AppendUint16(frame, method)
-			frame = append(frame, args...)
-			frame = append(frame, 0xce)
-			_, err := peer.Write(frame)
-			return err
-		}
-		var protocol [8]byte
-		_, err := io.ReadFull(peer, protocol[:])
-		if err == nil {
-			err = writeMethod(0, 10, 10, []byte{0, 9, 0, 0, 0, 0, 0, 0, 0, 5, 'P', 'L', 'A', 'I', 'N', 0, 0, 0, 5, 'e', 'n', '_', 'U', 'S'})
-		}
-		if err == nil {
-			err = readMethod(10, 11)
-		}
-		if err == nil {
-			err = writeMethod(0, 10, 30, []byte{0, 0, 0, 2, 0, 0, 0, 0})
-		}
-		if err == nil {
-			err = readMethod(10, 31)
-		}
-		if err == nil {
-			err = readMethod(10, 40)
-		}
-		if err == nil {
-			err = writeMethod(0, 10, 41, []byte{0})
-		}
-		if err == nil {
-			err = readMethod(20, 10)
-		}
-		if err == nil {
-			err = writeMethod(1, 20, 11, []byte{0, 0, 0, 0})
-		}
-		server <- err
-		if err == nil {
-			<-endPeer
-		}
-	}()
-	connection, err := amqp.Open(client, amqp.Config{
-		SASL: []amqp.Authentication{&amqp.PlainAuth{Username: "guest", Password: "guest"}},
-	})
-	if err != nil {
-		t.Fatalf("open in-memory AMQP connection: %v", err)
-	}
-	channel, err := connection.Channel()
-	if err != nil {
-		t.Fatalf("open in-memory AMQP channel: %v", err)
-	}
-	if err := <-server; err != nil {
-		t.Fatalf("in-memory AMQP peer: %v", err)
-	}
-	closePeer()
-	waitForwarderState(t, "in-memory AMQP channel shutdown", channel.IsClosed)
-	return channel
-}
-
 func assertTeardownState(t *testing.T, c *consumer, complete bool) {
 	t.Helper()
 	c.conn.mu.RLock()
@@ -514,15 +409,15 @@ func joinTeardownFixture(t *testing.T, c *consumer, calls *sync.WaitGroup) {
 	_ = teardownResult(t, done)
 }
 
-// teardownWaitContext signals arrival at a context-aware wait without depending
-// on renamed private lifecycle fields. With the fixture owner blocked, the new
-// implementation reaches Done in its shared-attempt select. The old Stop may
-// reach Done in a local join instead, but must then fail on its premature nil.
+// teardownWaitContext closes arrived the first time a teardown call asks for
+// Done, which is where it starts waiting on the context. It expires only when
+// the test calls expire, so the test decides whether that wait ends early.
 type teardownWaitContext struct {
 	context.Context
-	arrived chan struct{}
-	once    sync.Once
-	expired chan struct{}
+	arrived    chan struct{}
+	once       sync.Once
+	expired    chan struct{}
+	expireOnce sync.Once
 }
 
 func newTeardownWaitContext() *teardownWaitContext {
@@ -531,6 +426,10 @@ func newTeardownWaitContext() *teardownWaitContext {
 		arrived: make(chan struct{}),
 		expired: make(chan struct{}),
 	}
+}
+
+func (ctx *teardownWaitContext) expire() {
+	ctx.expireOnce.Do(func() { close(ctx.expired) })
 }
 
 func (ctx *teardownWaitContext) Done() <-chan struct{} {
@@ -547,17 +446,23 @@ func (ctx *teardownWaitContext) Err() error {
 	}
 }
 
-// postDrainDeadlineContext expires at the check after Stop's drain and joins;
-// the earlier checks at teardown entry and Drain still see a live context.
+// postDrainDeadlineContext expires at the first check after Stop's drain has
+// closed stoppedC. The checks at teardown entry and in Drain run before that and
+// see a live context; the joins after stoppedC wait on Done, not Err.
 type postDrainDeadlineContext struct {
 	*teardownWaitContext
-	checks int
+	consumer *consumer
+}
+
+func newPostDrainDeadlineContext(c *consumer) *postDrainDeadlineContext {
+	return &postDrainDeadlineContext{teardownWaitContext: newTeardownWaitContext(), consumer: c}
 }
 
 func (ctx *postDrainDeadlineContext) Err() error {
-	ctx.checks++
-	if ctx.checks == 3 {
-		close(ctx.expired)
+	select {
+	case <-ctx.consumer.stoppedC:
+		ctx.expire()
+	default:
 	}
 	return ctx.teardownWaitContext.Err()
 }
@@ -565,7 +470,7 @@ func (ctx *postDrainDeadlineContext) Err() error {
 func TestConsumerStopFinishesAfterSuccessfulDrainDeadline(t *testing.T) {
 	c := newForwarderTestConsumer()
 	c.conn.active = map[*consumer]struct{}{c: {}}
-	ctx := &postDrainDeadlineContext{teardownWaitContext: newTeardownWaitContext()}
+	ctx := newPostDrainDeadlineContext(c)
 
 	if err := c.Stop(ctx); err != nil {
 		t.Errorf("Stop() = %v, want nil after successful drain", err)
@@ -578,30 +483,34 @@ func TestConsumerStopFinishesAfterSuccessfulDrainDeadline(t *testing.T) {
 	assertTeardownState(t, c, true)
 }
 
-func awaitTeardownWait(t *testing.T, ctx *teardownWaitContext, result <-chan error) bool {
+func awaitTeardownWait(t *testing.T, ctx *teardownWaitContext, result <-chan error) {
+	t.Helper()
+	awaitTeardownSignal(t, ctx.arrived, result, "competitor's context-aware wait")
+}
+
+// requireTeardownPending fails if a call waiting on an incomplete teardown has
+// already returned. Its caller has seen the call reach that wait, so nothing
+// but the end of the teardown attempt can wake it.
+func requireTeardownPending(t *testing.T, name string, result <-chan error) {
 	t.Helper()
 	select {
-	case <-ctx.arrived:
-		return true
 	case err := <-result:
-		t.Errorf("competitor returned %v while teardown incomplete before entering its wait", err)
-		return false
-	case <-time.After(time.Second): //nolint:forbidigo // bound scheduling of the context-aware wait
-		t.Fatal("competitor did not reach its context-aware wait")
-		return false
+		t.Fatalf("%s returned %v while teardown incomplete", name, err)
+	default:
 	}
 }
 
-// blockedStopFixture installs the synthetic lane only after Drain snapshots the
-// empty lanes. Holding channelMu and freezing the clock wedges both the old
-// lockBefore and the shared closeLanesWithContext, not merely the new close hook.
+// blockedStopFixture leaves a Stop holding the teardown claim inside
+// closeLanesWithContext. It installs a lane after Drain has snapshotted the empty
+// lanes, so Drain sends no Cancel, then holds that lane's channelMu with the
+// clock frozen, so the lock wait never reaches its forced-close deadline.
 func blockedStopFixture(t *testing.T) (*consumer, <-chan error, *sync.WaitGroup, func(), *atomic.Int32) {
 	t.Helper()
 	c := newForwarderTestConsumer()
 	c.conn.active = map[*consumer]struct{}{c: {}}
 	fake := clock.NewFake(time.Unix(0, 0))
 	c.clock = fake
-	l := &lane{owner: c, channel: closedTeardownChannel(t), destination: "shared-stop"}
+	l := &lane{owner: c, destination: "shared-stop"}
 	l.channelMu.Lock()
 	var unlockOnce, forwardOnce sync.Once
 	var starts atomic.Int32
@@ -642,14 +551,8 @@ func TestConsumerStopWaitsForSharedTeardown(t *testing.T) {
 	secondCtx, releaseCtx := newTeardownWaitContext(), newTeardownWaitContext()
 	second := startTeardownCall(t, c, calls, func() error { return c.Stop(secondCtx) })
 	release := startTeardownCall(t, c, calls, func() error { return c.Release(releaseCtx) })
-	secondWaiting := awaitTeardownWait(t, secondCtx, second)
-	releaseWaiting := awaitTeardownWait(t, releaseCtx, release)
-	if !secondWaiting {
-		second = nil
-	}
-	if !releaseWaiting {
-		release = nil
-	}
+	awaitTeardownWait(t, secondCtx, second)
+	awaitTeardownWait(t, releaseCtx, release)
 	pending := []struct {
 		name   string
 		result <-chan error
@@ -658,27 +561,12 @@ func TestConsumerStopWaitsForSharedTeardown(t *testing.T) {
 		{name: "second Stop", result: second},
 		{name: "Release", result: release},
 	}
-	for index := range pending {
-		if pending[index].result == nil {
-			continue
-		}
-		select {
-		case err := <-pending[index].result:
-			if err == nil {
-				t.Errorf("%s returned nil while teardown incomplete", pending[index].name)
-			} else {
-				t.Errorf("%s returned %v while teardown incomplete, want no return", pending[index].name, err)
-			}
-			pending[index].result = nil
-		case <-time.After(20 * time.Millisecond): //nolint:forbidigo // bound the early-success observation while the fake clock stays frozen
-		}
-		assertTeardownState(t, c, false)
+	for _, call := range pending {
+		requireTeardownPending(t, call.name, call.result)
 	}
+	assertTeardownState(t, c, false)
 	unblock()
 	for _, call := range pending {
-		if call.result == nil {
-			continue
-		}
 		if err := teardownResult(t, call.result); err != nil {
 			t.Errorf("%s = %v, want nil", call.name, err)
 		}
@@ -702,31 +590,18 @@ func TestSecondStopBoundsItsWaitForTeardown(t *testing.T) {
 	c, first, calls, unblock, starts := blockedStopFixture(t)
 	ctx := newTeardownWaitContext()
 	second := startTeardownCall(t, c, calls, func() error { return c.Stop(ctx) })
-	var err error
-	if awaitTeardownWait(t, ctx, second) {
-		select {
-		case err = <-second:
-		case <-time.After(20 * time.Millisecond): //nolint:forbidigo // keep the context live while the baseline's already-finished joins return
-			close(ctx.expired)
-			err = teardownResult(t, second)
-		}
+	awaitTeardownWait(t, ctx, second)
+	requireTeardownPending(t, "second Stop", second)
+	ctx.expire()
+	err := teardownResult(t, second)
+	if !errors.Is(err, driver.ErrDrainTimeout) || !errors.Is(err, context.DeadlineExceeded) {
+		t.Errorf("second Stop = %v, want ErrDrainTimeout and context.DeadlineExceeded", err)
 	}
-	if err == nil {
-		t.Error("second Stop returned nil while teardown incomplete")
-	} else {
-		if !errors.Is(err, driver.ErrDrainTimeout) || !errors.Is(err, context.DeadlineExceeded) {
-			t.Errorf("second Stop = %v, want ErrDrainTimeout and context.DeadlineExceeded", err)
-		}
-		if kind, ok := driver.Classify(err); !ok || kind != driver.KindTransient {
-			t.Errorf("second Stop = %v, want transient classification", err)
-		}
+	if kind, ok := driver.Classify(err); !ok || kind != driver.KindTransient {
+		t.Errorf("second Stop = %v, want transient classification", err)
 	}
 	assertTeardownState(t, c, false)
-	select {
-	case err := <-first:
-		t.Fatalf("first Stop returned %v while teardown incomplete", err)
-	default:
-	}
+	requireTeardownPending(t, "first Stop", first)
 	unblock()
 	if err := teardownResult(t, first); err != nil {
 		t.Errorf("first Stop = %v, want nil", err)
@@ -748,7 +623,7 @@ func blockedReleaseFixture(t *testing.T) (*consumer, <-chan error, *sync.WaitGro
 	c.conn.active = map[*consumer]struct{}{c: {}}
 	c.settlers[&settler{owner: c}] = struct{}{}
 	c.outstanding = 1
-	c.lanes = []*lane{{owner: c, channel: closedTeardownChannel(t), destination: "release-first"}}
+	c.lanes = []*lane{{owner: c, destination: "release-first"}}
 	started := make(chan struct{})
 	resume := make(chan struct{})
 	var once sync.Once
@@ -785,27 +660,18 @@ func TestStopWaitsForReleaseTeardown(t *testing.T) {
 	c, release, calls, _, unblock, starts := blockedReleaseFixture(t)
 	ctx := newTeardownWaitContext()
 	stop := startTeardownCall(t, c, calls, func() error { return c.Stop(ctx) })
-	returned := !awaitTeardownWait(t, ctx, stop)
-	if !returned {
-		select {
-		case err := <-stop:
-			t.Errorf("Stop returned %v while Release teardown incomplete", err)
-			returned = true
-		case <-time.After(20 * time.Millisecond): //nolint:forbidigo // bound the early-success observation after confirmed arrival
-		}
-	}
+	awaitTeardownWait(t, ctx, stop)
+	requireTeardownPending(t, "Stop", stop)
 	assertTeardownState(t, c, false)
 	unblock()
 	if err := teardownResult(t, release); err != nil {
 		t.Errorf("Release = %v, want nil", err)
 	}
 	assertTeardownState(t, c, true)
-	if !returned {
-		if err := teardownResult(t, stop); err != nil {
-			t.Errorf("Stop after Release = %v, want nil despite abandoned settlers", err)
-		}
-		assertTeardownState(t, c, true)
+	if err := teardownResult(t, stop); err != nil {
+		t.Errorf("Stop after Release = %v, want nil despite abandoned settlers", err)
 	}
+	assertTeardownState(t, c, true)
 	if got := starts.Load(); got != 1 {
 		t.Errorf("lane close starts = %d, want 1", got)
 	}
@@ -828,7 +694,7 @@ func TestConsumerStopBoundsFailedReleaseTakeover(t *testing.T) {
 			c := newForwarderTestConsumer()
 			c.clock = clock.NewFake(time.Unix(0, 0))
 			c.conn.active = map[*consumer]struct{}{c: {}}
-			l := &lane{owner: c, channel: closedTeardownChannel(t), destination: "retained-close"}
+			l := &lane{owner: c, destination: "retained-close"}
 			c.lanes = []*lane{l}
 			closeStarted, allowClose := make(chan struct{}), make(chan struct{})
 			var starts atomic.Int32
@@ -864,7 +730,7 @@ func TestConsumerStopBoundsFailedReleaseTakeover(t *testing.T) {
 			ctx := newTeardownWaitContext()
 			stop := startTeardownCall(t, c, &calls, func() error { return c.Stop(ctx) })
 			awaitTeardownSignal(t, ctx.arrived, stop, "Stop's retained close wait")
-			close(ctx.expired)
+			ctx.expire()
 			err := teardownResult(t, stop)
 			if !errors.Is(err, driver.ErrDrainTimeout) || !errors.Is(err, context.DeadlineExceeded) {
 				t.Fatalf("Stop = %v, want ErrDrainTimeout and context.DeadlineExceeded", err)
@@ -934,9 +800,9 @@ func TestConsumerStopResumesAfterReleaseClaimsBeforeDrain(t *testing.T) {
 	c.clock = clock.NewFake(time.Unix(0, 0))
 	c.conn.active = map[*consumer]struct{}{c: {}}
 	deliveries := make(chan amqp.Delivery)
-	first := &lane{owner: c, channel: closedTeardownChannel(t), destination: "first-close"}
+	first := &lane{owner: c, destination: "first-close"}
 	second := &lane{
-		owner: c, channel: closedTeardownChannel(t), destination: "reader-left-open",
+		owner: c, destination: "reader-left-open",
 		deliveries: deliveries, generation: 1, pending: make(chan laneDelivery),
 	}
 	c.lanes = []*lane{first, second}
@@ -1027,7 +893,7 @@ func TestConsumerStopKeepsSuccessfulDrainCloseUnbounded(t *testing.T) {
 		<-allowClose
 		return nil
 	}
-	ctx := &postDrainDeadlineContext{teardownWaitContext: newTeardownWaitContext()}
+	ctx := newPostDrainDeadlineContext(c)
 	var calls sync.WaitGroup
 	t.Cleanup(func() {
 		unblockExit()
@@ -1043,7 +909,7 @@ func TestConsumerStopKeepsSuccessfulDrainCloseUnbounded(t *testing.T) {
 	// reaches its exit hook before Done; taking mu here waits out that snapshot.
 	// Installing the lane now bypasses Cancel and isolates the final Close RPC.
 	c.mu.Lock()
-	c.lanes = []*lane{{owner: c, channel: closedTeardownChannel(t), destination: "post-drain-close"}}
+	c.lanes = []*lane{{owner: c, destination: "post-drain-close"}}
 	c.mu.Unlock()
 	unblockExit()
 	awaitTeardownSignal(t, closeStarted, stop, "successful-drain final close")

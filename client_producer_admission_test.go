@@ -69,9 +69,11 @@ func (p *admissionProducer) counts() (publish, close int) {
 
 func waitForSignal(t *testing.T, signal <-chan struct{}, what string) {
 	t.Helper()
+	timer := clock.NewReal().Timer(2 * time.Second)
+	defer timer.Stop()
 	select {
 	case <-signal:
-	case <-clock.NewReal().Timer(time.Second).C:
+	case <-timer.C:
 		t.Fatalf("timed out waiting for %s", what)
 	}
 }

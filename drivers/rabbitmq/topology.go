@@ -297,8 +297,8 @@ func (a *adminOperations) managementUnavailable(purpose string, err error) error
 // than folded into an empty result: TopologyVerify must be able to say "this
 // was not checked" instead of silently reporting a clean diff. The client
 // itself is never absent, because newConn is the only construction of a conn
-// the port hands out, it fails Open when newManagementClient cannot build
-// one, and nothing reassigns the field, so the only failure to report here is
+// the port hands out, it fails Open when managementClientForEndpoint cannot
+// build one, and nothing reassigns the field, so the only failure to report here is
 // reaching the broker rather than a missing client.
 func (a *adminOperations) argumentDrift(ctx context.Context, name string, want amqp.Table) ([]driver.ArgumentDrift, error) {
 	if len(want) == 0 {
