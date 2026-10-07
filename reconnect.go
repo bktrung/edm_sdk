@@ -263,6 +263,12 @@ func (c *Client) reconnectOnce(ctx context.Context, cause error) error {
 		}
 		kind, classified := driver.Classify(err)
 		if classified && kind != driver.KindTransient {
+			c.mu.Lock()
+			c.reconnectErr = err
+			c.mu.Unlock()
+			if logger := configuredClientLogger(c); logger != nil {
+				logger.Error("f1 fatal reconnect failure", "error", err)
+			}
 			return err
 		}
 		if c.config.Broker.MaxReconnectAttempts > 0 && attempt >= c.config.Broker.MaxReconnectAttempts {

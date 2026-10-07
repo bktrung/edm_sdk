@@ -2686,6 +2686,12 @@ func deadLetter(r *Runner, ctx context.Context, message driver.InboundMessage, e
 			defer publishGuard.abandon()
 		}
 		setDeathHeaders(headers, reason, lastErr, r.client.options.clock.Now().UTC(), message.Destination)
+		if err := capMalformedDeathHeaders(headers, headerMaxBytes); err != nil {
+			if observed {
+				finishSuccessorPublish(&publishGuard, publishBase, err)
+			}
+			return fmt.Errorf("%w: %w", errSuccessorCopyUnencodable, err)
+		}
 		if err := publishSuccessor(r, runnerSettlementContext(r, ctx), driver.OutboundMessage{Destination: destination, Key: append([]byte(nil), message.Key...), Headers: headerSlice(headers), Body: append([]byte(nil), message.Body...)}); err != nil {
 			if observed {
 				finishSuccessorPublish(&publishGuard, publishBase, err)
@@ -2769,6 +2775,30 @@ func deadLetter(r *Runner, ctx context.Context, message driver.InboundMessage, e
 		observeDeadLetterPublished(r, message, envelope, reason, destination, topic)
 	}
 	runnerNotifyDeadLetter(r, runnerSettlementContext(r, ctx), DeadLettered{Envelope: death, Body: append([]byte(nil), message.Body...), Reason: reason, Attempt: death.Attempt, LastErr: lastErr, Destination: destination})
+	return nil
+}
+
+func capMalformedDeathHeaders(headers map[string]string, maxHeaderBytes int) error {
+	limit := CoreMaxHeaderBytes
+	if maxHeaderBytes > 0 && maxHeaderBytes < limit {
+		limit = maxHeaderBytes
+	}
+	if headerBytes(headers) <= limit {
+		return nil
+	}
+	shrinkDeathErrorTo(headers, limit, deathErrorFloor)
+	if headerBytes(headers) <= limit {
+		return nil
+	}
+	for key := range headers {
+		if !knownHeaders[key] {
+			delete(headers, key)
+		}
+	}
+	shrinkDeathError(headers, limit)
+	if headerBytes(headers) > limit {
+		return fmt.Errorf("f1: malformed envelope dead-letter headers exceed cap: %w", ErrEnvelopeTooLarge)
+	}
 	return nil
 }
 

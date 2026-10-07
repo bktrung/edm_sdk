@@ -936,8 +936,9 @@ func TestRunReturnsFailedPreRunReconnectOwner(t *testing.T) {
 	case <-clock.NewReal().Timer(2 * time.Second).C:
 		t.Fatal("Run did not return the failed pre-run reconnect")
 	}
-	if healthErr := client.Health(context.Background()); healthErr != wantErr { //nolint:errorlint // exact attempt error identity is the health contract
-		t.Fatalf("Health() = %v, want exact reconnect error %v", healthErr, wantErr)
+	// Health preserves the reconnect cause through errors.Is alongside subscription diagnostics.
+	if healthErr := client.Health(context.Background()); !errors.Is(healthErr, wantErr) {
+		t.Fatalf("Health() = %v, want reconnect cause %v", healthErr, wantErr)
 	}
 }
 

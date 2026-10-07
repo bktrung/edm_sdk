@@ -58,6 +58,17 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ### Fixed
 
+- A reconnect failure classified by the driver as non-transient is terminal, just like
+  exhausted attempts. Publishes, `Client.Health`, and further reconnect requests return
+  that error. After any terminal reconnect failure, `Client.Health` joins the reconnect
+  error with stopped-subscription errors; match it with `errors.Is`, not `==`.
+- Closing a spare producer created by concurrent first publishes is bounded by
+  `Lifecycle.CloseTimeout`, so a stuck broker no longer hangs the publish.
+- Dead letters for messages whose envelope cannot be decoded respect the header size
+  limit. A message whose dead-letter headers can never fit is dropped and reported,
+  and consumption continues.
+- `Envelope.EncodeHeaders` no longer sheds `datacontenttype` to fit the header size
+  limit. Headers that cannot fit with it return `ErrEnvelopeTooLarge`.
 - RabbitMQ management uses the AMQP-parsed URI login, including defaults, or the selected
   PLAIN/AMQPLAIN SASL identity. EXTERNAL retains the URI login for management.
 - RabbitMQ `Open` bounds TCP connect, TLS and AMQP handshakes by the connect timeout, so a peer
