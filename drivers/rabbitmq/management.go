@@ -142,14 +142,6 @@ func resolveEndpoint(endpoint string, cfg driver.Config) (resolvedEndpoint, erro
 	return resolved, nil
 }
 
-func newManagementClient(endpoint string, cfg driver.Config) (*managementClient, error) {
-	resolved, err := resolveEndpoint(endpoint, cfg)
-	if err != nil {
-		return nil, err
-	}
-	return managementClientForEndpoint(resolved, cfg)
-}
-
 func managementClientForEndpoint(endpoint resolvedEndpoint, cfg driver.Config) (*managementClient, error) {
 	parsed := endpoint.parsed
 	scheme := "http"

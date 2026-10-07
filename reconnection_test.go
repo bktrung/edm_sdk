@@ -1227,18 +1227,6 @@ func holdRetirementProducer(t *testing.T, conn *reconnectTestConn) (<-chan struc
 	return entered, release
 }
 
-func awaitRetirementSignal(t *testing.T, signal <-chan struct{}) {
-	t.Helper()
-	waitReconnectCondition(t, func() bool {
-		select {
-		case <-signal:
-			return true
-		default:
-			return false
-		}
-	})
-}
-
 func nextRetirementTimer(t *testing.T, recorded *recordingClock) time.Duration {
 	t.Helper()
 	waitReconnectCondition(t, func() bool { return len(recorded.timerStarted) > 0 })
@@ -1254,7 +1242,7 @@ func beginRetirementReconnect(t *testing.T, client *Client, recorded *recordingC
 		t.Fatal(err)
 	}
 	waitReconnectCondition(t, func() bool { return len(recorded.sleepStarted) > 0 })
-	awaitRetirementSignal(t, <-recorded.sleepStarted)
+	waitForSignal(t, <-recorded.sleepStarted, "recorded.sleepStarted")
 	// Publish quiescence has finished before the backoff registers. Discard
 	// its stopped timer so the next signal identifies this retirement's wait.
 	for len(recorded.timerStarted) > 0 {
@@ -1268,9 +1256,8 @@ func expireRetirementWait(t *testing.T, client *Client, recorded *recordingClock
 	if duration := nextRetirementTimer(t, recorded); duration != 100*time.Millisecond {
 		t.Fatalf("retirement timer = %v, want close bound", duration)
 	}
-	// The held driver entry identifies the unfinished stage. A baseline
-	// retirement can have left a stopped producer timer in the event queue
-	// before registering its held connection timer.
+	// Advance expires only registered timers, so wait until the held stage's
+	// close bound is the one waiter before expiring it.
 	waitReconnectCondition(t, func() bool { return recorded.NumWaiters() == 1 })
 	recorded.Advance(100 * time.Millisecond)
 	waitReconnectCondition(t, func() bool { return !client.isReconnecting() })
@@ -1322,7 +1309,7 @@ func TestRetiredProducerTimeoutKeepsConnectionCloseOrdered(t *testing.T) {
 	consumer := keptRetirementConsumer(t, client, old, 1)
 	entered, release := holdRetirementProducer(t, old)
 	beginRetirementReconnect(t, client, recorded)
-	awaitRetirementSignal(t, entered)
+	waitForSignal(t, entered, "entered")
 	expireRetirementWait(t, client, recorded)
 	if d.OpenCount() != 2 || old.producerCloseCalls.Load() != 1 {
 		t.Fatal("reconnect did not install one replacement with one pending producer close")
@@ -1345,7 +1332,7 @@ func TestClientCloseRejoinsPendingRetirement(t *testing.T) {
 	old := retirementConnection(d, 0)
 	entered, release := holdRetirementProducer(t, old)
 	beginRetirementReconnect(t, client, recorded)
-	awaitRetirementSignal(t, entered)
+	waitForSignal(t, entered, "entered")
 	expireRetirementWait(t, client, recorded)
 	publishRetirementMessage(t, client)
 	current := retirementConnection(d, 1)
@@ -1381,23 +1368,7 @@ func assertRetirementGoroutinesReturned(t *testing.T, baseline int) {
 		}
 		select {
 		case <-deadline.C:
-			buf := make([]byte, 1<<20)
-			n := runtime.Stack(buf, true)
-			var stacks []string
-			for stack := range strings.SplitSeq(string(buf[:n]), "\n\n") {
-				lines := strings.Split(stack, "\n")
-				for i := 1; i+1 < len(lines); i++ {
-					if strings.HasPrefix(lines[i], "created by ") {
-						break
-					}
-					source := strings.TrimSpace(lines[i+1])
-					if strings.Contains(lines[i], "fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk") && strings.Contains(source, ".go:") && !strings.Contains(source, "_test.go:") {
-						stacks = append(stacks, stack)
-						break
-					}
-				}
-			}
-			t.Fatalf("goroutines after Close = %d, baseline = %d\nmodule-owned goroutine stacks:\n%s", current, baseline, strings.Join(stacks, "\n\n"))
+			t.Fatalf("goroutines after Close = %d, baseline = %d\nmodule-owned goroutine stacks:\n%s", current, baseline, ModuleGoroutineStacks())
 		case <-poll.C:
 		}
 	}
@@ -1484,13 +1455,13 @@ func TestRetirementsKeepEveryEpochOwned(t *testing.T) {
 	first := retirementConnection(d, 0)
 	firstEntered, releaseFirst := holdRetirementProducer(t, first)
 	beginRetirementReconnect(t, client, recorded)
-	awaitRetirementSignal(t, firstEntered)
+	waitForSignal(t, firstEntered, "firstEntered")
 	expireRetirementWait(t, client, recorded)
 	publishRetirementMessage(t, client)
 	second := retirementConnection(d, 1)
 	secondEntered, releaseSecond := holdRetirementProducer(t, second)
 	beginRetirementReconnect(t, client, recorded)
-	awaitRetirementSignal(t, secondEntered)
+	waitForSignal(t, secondEntered, "secondEntered")
 	expireRetirementWait(t, client, recorded)
 	if first.closeCalls.Load() != 0 || second.closeCalls.Load() != 0 {
 		t.Fatal("an old connection closed before its producer")

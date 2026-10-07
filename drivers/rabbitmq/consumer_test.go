@@ -252,7 +252,7 @@ func TestReleaseBoundsLaneCloseAndRetriesIt(t *testing.T) {
 		if !classified || kind != driver.KindTransient {
 			t.Fatalf("Release() error = %v, want a transient classification", err)
 		}
-	case <-time.After(2 * time.Second): //nolint:forbidigo // bound the context regression
+	case <-time.After(2 * time.Second): //nolint:forbidigo // bound a Release that ignores its cancelled context
 		t.Fatal("Release did not return after its context was cancelled")
 	}
 	if len(c.conn.active) != 1 {
@@ -331,23 +331,18 @@ func TestStopTakesOverFailedReleaseTeardown(t *testing.T) {
 			return false
 		}
 	})
-	returned := !awaitTeardownWait(t, ctx, stop)
+	awaitTeardownWait(t, ctx, stop)
 	// Closing the retained broker outcome is insufficient: the Stop owner must
 	// also join the watcher left behind by the failed Release before finalizing.
 	assertTeardownState(t, c, false)
-	if !returned {
-		select {
-		case err := <-stop:
-			t.Errorf("Stop returned %v before joining the remaining watcher", err)
-			returned = true
-		case <-time.After(20 * time.Millisecond): //nolint:forbidigo // observe the local join after broker close completion
-		}
+	select {
+	case err := <-stop:
+		t.Fatalf("Stop returned %v before joining the remaining watcher", err)
+	case <-time.After(20 * time.Millisecond): //nolint:forbidigo // nothing marks Stop parked on the watcher join, so give an early return time to show
 	}
 	releaseJoin()
-	if !returned {
-		if err := teardownResult(t, stop); err != nil {
-			t.Errorf("Stop takeover = %v, want nil despite abandoned settlers", err)
-		}
+	if err := teardownResult(t, stop); err != nil {
+		t.Errorf("Stop takeover = %v, want nil despite abandoned settlers", err)
 	}
 	assertTeardownState(t, c, true)
 	for _, call := range []func() error{

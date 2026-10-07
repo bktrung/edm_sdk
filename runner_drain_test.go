@@ -533,17 +533,6 @@ func drainTestGate(t *testing.T) (chan struct{}, func()) {
 	return gate, release
 }
 
-func waitDrainTestSignal(t *testing.T, signal <-chan struct{}) {
-	t.Helper()
-	timer := clock.NewReal().Timer(2 * time.Second)
-	defer timer.Stop()
-	select {
-	case <-signal:
-	case <-timer.C:
-		t.Fatal("timed out waiting for drain test barrier")
-	}
-}
-
 // startRebuildDrainRunner uses real Run/Drain ownership with a manually pending
 // reconnect. No supervisor runs this synthetic attempt: otherwise its abandon
 // could release the consumer before the test reaches the held-consumer exit.
@@ -593,7 +582,7 @@ func startRebuildDrainRunner(t *testing.T, probe *drainProbeConsumer, observer O
 	t.Cleanup(func() {
 		release()
 		cancel()
-		waitDrainTestSignal(t, finished)
+		waitForSignal(t, finished, "finished")
 	})
 	return runner, client, ctx, result, finished
 }
@@ -618,10 +607,10 @@ func TestRunnerDrainDuringHeldConsumerRebuildWaitJoinsTerminalDrain(t *testing.T
 			client.conn = connReconnecting
 			client.mu.Unlock()
 			probe.errs <- &driver.Error{Driver: "inmem", Op: "consumer", K: driver.KindTransient, Err: errors.New("generation failed")}
-			waitDrainTestSignal(t, ctx.entered)
+			waitForSignal(t, ctx.entered, "ctx.entered")
 			drained := make(chan error, 1)
 			go func() { drained <- runner.Drain(context.Background()) }()
-			waitDrainTestSignal(t, observer.entered)
+			waitForSignal(t, observer.entered, "observer.entered")
 			if order == "drain-first" {
 				releaseObserver()
 				// The owner installs the window while handling Drain, before
@@ -644,7 +633,7 @@ func TestRunnerDrainDuringHeldConsumerRebuildWaitJoinsTerminalDrain(t *testing.T
 				t.Fatal("terminal Stop did not start")
 			}
 			releaseStop()
-			waitDrainTestSignal(t, finished)
+			waitForSignal(t, finished, "finished")
 			if err := <-result; err != nil {
 				t.Fatalf("Run() = %v, want nil after completed Stop", err)
 			}
@@ -673,7 +662,7 @@ func TestRunnerDrainDuringRebuildAndAbandonSharesConsumerTeardown(t *testing.T) 
 	client.conn = connReconnecting
 	client.mu.Unlock()
 	probe.errs <- &driver.Error{Driver: "inmem", Op: "consumer", K: driver.KindTransient, Err: errors.New("generation failed")}
-	waitDrainTestSignal(t, ctx.entered)
+	waitForSignal(t, ctx.entered, "ctx.entered")
 	// The owner can receive abandon while its rebuild waiter is gated. Wait
 	// for abandon's Release to finish before allowing terminal Stop to start.
 	if err := runner.abandonForReconnect(context.Background()); err != nil {
@@ -684,9 +673,9 @@ func TestRunnerDrainDuringRebuildAndAbandonSharesConsumerTeardown(t *testing.T) 
 	}
 	drained := make(chan error, 1)
 	go func() { drained <- runner.Drain(context.Background()) }()
-	waitDrainTestSignal(t, observer.entered)
+	waitForSignal(t, observer.entered, "observer.entered")
 	ctx.unblock()
-	waitDrainTestSignal(t, finished)
+	waitForSignal(t, finished, "finished")
 	if err := <-result; err != nil {
 		t.Fatalf("Run() = %v, want nil after abandon and terminal Stop", err)
 	}
@@ -731,7 +720,7 @@ func TestRunnerDrainDuringFailedOpenRebuildWaitDoesNotRelease(t *testing.T) {
 			})
 			waitReconnectCondition(t, func() bool { return runnerState(runner) == lifecycle.Ready })
 			probe.errs <- &driver.Error{Driver: "inmem", Op: "consumer", K: driver.KindTransient, Err: errors.New("generation failed")}
-			waitDrainTestSignal(t, opened)
+			waitForSignal(t, opened, "opened")
 			client.mu.Lock()
 			client.conn = connReconnecting
 			client.mu.Unlock()
@@ -741,15 +730,15 @@ func TestRunnerDrainDuringFailedOpenRebuildWaitDoesNotRelease(t *testing.T) {
 				}
 			}
 			releaseOpen()
-			waitDrainTestSignal(t, ctx.entered)
+			waitForSignal(t, ctx.entered, "ctx.entered")
 			stopsBefore, releasesBefore, _ := probe.probes()
 			drained := make(chan error, 1)
 			go func() { drained <- runner.Drain(context.Background()) }()
 			// Gate rebuilt-first explicitly: drain-first can start terminal
 			// drain on the old pointer retained after the earlier repair Release.
-			waitDrainTestSignal(t, observer.entered)
+			waitForSignal(t, observer.entered, "observer.entered")
 			ctx.unblock()
-			waitDrainTestSignal(t, finished)
+			waitForSignal(t, finished, "finished")
 			if err := <-result; err != nil {
 				t.Fatalf("Run() = %v, want nil after failed open", err)
 			}

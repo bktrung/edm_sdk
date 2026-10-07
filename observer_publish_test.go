@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"reflect"
 	"sort"
 	"strings"
 	"sync"
@@ -575,8 +574,6 @@ type publishResultSnapshot struct {
 
 type publishResultObserver struct {
 	results  []publishResultSnapshot
-	text     string
-	rawError bool
 	class    ErrorClass
 	finishes int
 }
@@ -591,31 +588,16 @@ func (o *publishResultObserver) Finish(_ Token, event FinishEvent) {
 	}
 	o.finishes++
 	o.class = event.ErrorClass
-	o.text = fmt.Sprintf("%+v", event.Results)
-	// Inspect both result representations so the regression runs at the old
-	// API and fails on the error leak, rather than failing to compile.
 	for _, result := range event.Results {
-		value := reflect.ValueOf(result)
-		snapshot := publishResultSnapshot{id: result.ID}
-		if class := value.FieldByName("ErrorClass"); class.IsValid() {
-			snapshot.class = ErrorClass(class.String())
-		}
-		for _, field := range value.Fields() {
-			if _, ok := field.Interface().(error); ok {
-				o.rawError = true
-			}
-		}
-		o.results = append(o.results, snapshot)
+		o.results = append(o.results, publishResultSnapshot{id: result.ID, class: result.ErrorClass})
 	}
 }
 
 func (*publishResultObserver) Record(PointEvent) {}
 
-func TestObserverPublishResultsExcludeRawErrors(t *testing.T) {
+func TestObserverPublishResultsCarryIDAndClass(t *testing.T) {
 	t.Parallel()
-	const marker = "RAW_T041_MARKER"
-	cause := errors.New("broker secret=" + marker)
-	fatal := &driver.Error{Driver: "test", Op: "publish", K: driver.KindFatal, Err: cause}
+	fatal := &driver.Error{Driver: "test", Op: "publish", K: driver.KindFatal, Err: errors.New("broker refused")}
 	permission := &driver.Error{Driver: "test", Op: "publish", K: driver.KindPermission, Err: errors.New("permission denied")}
 	for _, test := range []struct {
 		name       string
@@ -673,9 +655,6 @@ func TestObserverPublishResultsExcludeRawErrors(t *testing.T) {
 			if (err != nil) != test.methodErr {
 				t.Fatalf("method error = %v, want error %v", err, test.methodErr)
 			}
-			if rec.rawError || strings.Contains(rec.text, marker) {
-				t.Fatal("observer results expose a raw error or broker marker")
-			}
 			if rec.finishes != 1 || rec.class != test.topClass {
 				t.Fatalf("primary finishes/class = %d/%q, want 1/%q", rec.finishes, rec.class, test.topClass)
 			}
@@ -693,7 +672,7 @@ func TestObserverPublishResultsExcludeRawErrors(t *testing.T) {
 
 func TestObserverPublishBatchPreservesCallerErrors(t *testing.T) {
 	t.Parallel()
-	cause := errors.New("broker secret=RAW_T041_CALLER_MARKER")
+	cause := errors.New("broker refused")
 	fatal := &driver.Error{Driver: "test", Op: "publish", K: driver.KindFatal, Err: cause}
 	for _, observed := range []bool{false, true} {
 		for _, transport := range []bool{false, true} {

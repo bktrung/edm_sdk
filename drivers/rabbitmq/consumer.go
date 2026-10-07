@@ -133,9 +133,9 @@ type laneDelivery struct {
 }
 
 type laneCloseOutcome struct {
-	// done closes after Channel.Close returns. amqp091's Channel.Close defers
-	// connection.closeChannel(ch), so its return leaves the channel locally
-	// closed and a second Close returns nil (channel.go:689-702).
+	// done closes after Channel.Close returns. amqp091's Channel.Close removes
+	// the channel from its connection before returning, so its return leaves the
+	// channel locally closed and a second Close returns nil.
 	// closeLanesWithContext discards that error too, so a completed outcome is
 	// successful for Release finalization.
 	done chan struct{}

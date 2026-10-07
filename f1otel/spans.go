@@ -126,7 +126,7 @@ func (o *Observer) spanAttributes(event f1.StartEvent) []attribute.KeyValue {
 	if operation := spanOperation(event); operation != "" {
 		attrs = append(attrs, attribute.String("messaging.operation.type", operation))
 	}
-	if event.Priority.Valid() && (event.Kind != f1.ObserverPublish || event.Route != f1.PublishRoutePrimary && event.Route != "") {
+	if event.Priority.Valid() && (event.Kind != f1.ObserverPublish || (event.Route != f1.PublishRoutePrimary && event.Route != "")) {
 		attrs = append(attrs, attribute.String("f1.priority", event.Priority.String()))
 	}
 	if event.Attempt > 0 {
