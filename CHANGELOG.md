@@ -91,6 +91,13 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 - The RabbitMQ consumer's `Stop` and `Release` wait for their goroutines only as long as the
   caller's context allows. A `Release` that ends on its context leaves the consumer registered,
   and the next `Release` finishes the teardown instead of the first being reported as done.
+- A RabbitMQ consumer `Stop` whose drain succeeded no longer returns `ErrDrainTimeout` when its
+  deadline passes just after the drain. It finishes the shutdown and closes the consumer's lanes.
+- A RabbitMQ consumer `Stop` that takes over the shutdown of a failed `Release` is bounded by its
+  own context, and returns a retryable `ErrDrainTimeout` if that context ends. A `Stop` racing a
+  `Release` no longer waits on reader goroutines that only the `Release` could end.
+- The Kafka consumer clears a delivered record's slot in its pending queue, so the delivered
+  record and its fetch data can be freed sooner.
 
 ### Upgrade notes
 
