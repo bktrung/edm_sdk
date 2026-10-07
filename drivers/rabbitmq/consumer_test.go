@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -227,5 +228,86 @@ func messagesClosed(c *consumer) bool {
 		return !ok
 	default:
 		return false
+	}
+}
+
+// TestReleaseBoundsLaneCloseAndRetriesIt verifies that a pending lane close is
+// bounded by Release's context and that a retry joins the original close.
+func TestReleaseBoundsLaneCloseAndRetriesIt(t *testing.T) {
+	c := newForwarderTestConsumer()
+	c.conn.active = map[*consumer]struct{}{c: {}}
+	testLane := &lane{owner: c, destination: "pending-close"}
+	c.lanes = []*lane{testLane}
+
+	started := make(chan struct{})
+	releaseClose := make(chan struct{})
+	var releaseCloseOnce sync.Once
+	releaseCloseFn := func() { releaseCloseOnce.Do(func() { close(releaseClose) }) }
+	t.Cleanup(releaseCloseFn)
+	var startOnce sync.Once
+	var starts atomic.Int32
+	c.channelCloseHook = func(got *lane) error {
+		if got != testLane {
+			t.Errorf("close hook lane = %p, want %p", got, testLane)
+		}
+		starts.Add(1)
+		startOnce.Do(func() { close(started) })
+		<-releaseClose
+		return nil
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	result := make(chan error, 1)
+	go func() { result <- c.Release(ctx) }()
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second): //nolint:forbidigo // bound a direct close seam
+		t.Fatal("Release did not start the lane close")
+	}
+	cancel()
+
+	select {
+	case err := <-result:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("Release() error = %v, want context.Canceled", err)
+		}
+		kind, classified := driver.Classify(err)
+		if !classified || kind != driver.KindTransient {
+			t.Fatalf("Release() error = %v, want a transient classification", err)
+		}
+	case <-time.After(2 * time.Second): //nolint:forbidigo // bound the context regression
+		t.Fatal("Release did not return after its context was cancelled")
+	}
+	if len(c.conn.active) != 1 {
+		t.Fatalf("consumers registered after failed Release = %d, want 1", len(c.conn.active))
+	}
+	if messagesClosed(c) {
+		t.Fatal("Messages closed by a failed Release")
+	}
+
+	releaseCloseFn()
+	detached := make(chan struct{})
+	go func() {
+		c.conn.detachWatch.Wait()
+		close(detached)
+	}()
+	select {
+	case <-detached:
+	case <-time.After(2 * time.Second): //nolint:forbidigo // bound a detached close leak
+		t.Fatal("lane close did not leave detachWatch")
+	}
+
+	if err := c.Release(context.Background()); err != nil {
+		t.Fatalf("retried Release() = %v, want nil", err)
+	}
+	if got := starts.Load(); got != 1 {
+		t.Fatalf("lane close starts = %d, want 1", got)
+	}
+	if len(c.conn.active) != 0 {
+		t.Fatalf("consumers registered after retried Release = %d, want 0", len(c.conn.active))
+	}
+	if !messagesClosed(c) {
+		t.Fatal("Messages still open after retried Release")
 	}
 }

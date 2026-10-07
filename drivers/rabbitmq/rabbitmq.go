@@ -231,6 +231,12 @@ type conn struct {
 	// closes.
 	blockMu    sync.Mutex
 	blockWatch sync.WaitGroup
+	// detachMu serializes channel-close registration with the wait in
+	// Conn.Close. detaching becomes true before that wait, so no channel close
+	// can Add to a zero-counter WaitGroup. None of the goroutines detachWatch
+	// tracks takes detachMu, so waitDetached can hold it across the Wait.
+	detachMu  sync.Mutex
+	detaching bool
 	// detachWatch tracks the goroutines that outlive the caller that began
 	// them: channel closes, publish channel watchers, and the releases a
 	// cancelled publish leaves for its channel's watcher. amqp091's
@@ -241,9 +247,8 @@ type conn struct {
 	// closed channel guarantees. Close waits on that set once the connection
 	// is actually closed, for the same reason it waits on blockWatch. The Add
 	// for a watcher or a release can race that Wait only from a publish still
-	// running when the connection closed, the same window a channel close
-	// has, and it is benign for the same reason: the goroutine ends as soon as
-	// the connection's shutdown reaches its channel.
+	// running when the connection closed, and it is benign: the goroutine ends
+	// as soon as the connection's shutdown reaches its channel.
 	detachWatch sync.WaitGroup
 }
 
@@ -290,26 +295,51 @@ const blockedEventBuffer = 4
 // connection the broker has stopped reading never answers, and a caller whose
 // context has run out must not be held by it.
 //
-// The close is tracked so that conn.Close can wait for it: nothing of ours may
-// still be running once the connection is closed. Closing the connection is
-// also what ends one of these, since Channel.Close returns as soon as its
-// connection is gone.
-//
-// Registration is ordered before the connection is asked to drop a producer, so
-// the wait covers every close of a producer that Wait can see; the one window
-// left is the confirm round trip failing on a producer admission then refuses,
-// which is a race with the connection closing rather than with a registered
-// producer. That window is benign for the reason above: the close cannot
-// outlive the connection, which answers it as soon as the shutdown reaches the
-// channel and releases one already inside a kernel write when the socket goes.
+// Producer callers receive the same buffered outcome and no finish callback,
+// so their close behavior is unchanged.
 func (c *conn) startChannelClose(channel *amqp.Channel) <-chan error {
-	c.detachWatch.Add(1)
+	return c.startChannelCloseWithFinish(channel.Close, nil)
+}
+
+// startChannelCloseWithFinish runs closeFn and finish in the one goroutine
+// tracked by detachWatch. finish runs before Done, so a lane close cannot
+// release channelMu or publish its completion after Conn.Close has finished
+// waiting for the detached work.
+func (c *conn) startChannelCloseWithFinish(closeFn func() error, finish func(error)) <-chan error {
 	done := make(chan error, 1)
+	c.detachMu.Lock()
+	if c.detaching {
+		c.detachMu.Unlock()
+		err := closeFn()
+		if finish != nil {
+			finish(err)
+		}
+		done <- err
+		return done
+	}
+	c.detachWatch.Add(1)
+	c.detachMu.Unlock()
 	go func() {
 		defer c.detachWatch.Done()
-		done <- channel.Close()
+		err := closeFn()
+		if finish != nil {
+			finish(err)
+		}
+		done <- err
 	}()
 	return done
+}
+
+// waitDetached closes the registration window before waiting for detached
+// channel work. If registration wins detachMu, Add makes the count non-zero
+// before this Wait. If the wait wins, detaching makes a later close run
+// synchronously against the already-closed AMQP connection, so it cannot add
+// work after Wait returns.
+func (c *conn) waitDetached() {
+	c.detachMu.Lock()
+	c.detaching = true
+	c.detachWatch.Wait()
+	c.detachMu.Unlock()
 }
 
 // awaitChannelClose waits for a close startChannelClose began, for as long as
@@ -629,7 +659,7 @@ func (c *conn) Close(ctx context.Context) error {
 	defer func() {
 		if amqpConn.IsClosed() {
 			c.blockWatch.Wait()
-			c.detachWatch.Wait()
+			c.waitDetached()
 		}
 	}()
 	c.mu.Lock()

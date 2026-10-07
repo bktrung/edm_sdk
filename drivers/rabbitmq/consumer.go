@@ -50,6 +50,9 @@ type consumer struct {
 	// cancelHook is a test-only synchronization seam. It remains nil in
 	// production and does not change the driver behavior.
 	cancelHook func()
+	// channelCloseHook replaces a lane's Channel.Close call in tests. It
+	// remains nil in production and does not change the driver behavior.
+	channelCloseHook func(*lane) error
 
 	mu       sync.Mutex
 	draining bool
@@ -95,9 +98,11 @@ type lane struct {
 	// closeLockWait, so a stuck RPC cannot hold Channel.Close back for long.
 	// It also guards tag, which changes each time a server-initiated cancel is
 	// re-established.
-	channelMu sync.Mutex
-	tag       string
-	prefetch  int
+	channelMu    sync.Mutex
+	closeMu      sync.Mutex
+	closeOutcome *laneCloseOutcome
+	tag          string
+	prefetch     int
 	// deliveriesMu guards deliveries and generation. The broker can cancel this
 	// lane's consumer at any time, which closes the deliveries channel the
 	// library handed out; watchCancel attaches a replacement and bumps the
@@ -131,6 +136,15 @@ type lane struct {
 type laneDelivery struct {
 	amqp.Delivery
 	generation uint64
+}
+
+type laneCloseOutcome struct {
+	// done closes after Channel.Close returns. amqp091's Channel.Close defers
+	// connection.closeChannel(ch), so its return leaves the channel locally
+	// closed and a second Close returns nil (channel.go:689-702). closeLanes
+	// discards that error too, so a completed outcome is successful for Release
+	// finalization.
+	done chan struct{}
 }
 
 var _ driver.Consumer = (*consumer)(nil)
@@ -300,6 +314,96 @@ func (c *consumer) closeLanes() {
 		_ = lane.channel.Close()
 		if locked {
 			lane.channelMu.Unlock()
+		}
+	}
+}
+
+// closeLanesWithContext starts each lane close once and waits for every close
+// under ctx. A close outcome remains set so a later Release joins the same
+// broker close rather than issuing another AMQP close request.
+func (c *consumer) closeLanesWithContext(ctx context.Context, op string) error {
+	deadline := c.clock.Now().Add(closeLockWait)
+	for _, lane := range c.lanes {
+		lane.closeMu.Lock()
+		outcome := lane.closeOutcome
+		if outcome != nil {
+			lane.closeMu.Unlock()
+			if err := waitLaneClose(ctx, outcome); err != nil {
+				return classify(op, driver.KindTransient, err)
+			}
+			continue
+		}
+		if err := ctx.Err(); err != nil {
+			lane.closeMu.Unlock()
+			return classify(op, driver.KindTransient, err)
+		}
+		locked, forced := lockBeforeContext(ctx, c.clock, &lane.channelMu, deadline)
+		if !locked && !forced {
+			err := ctx.Err()
+			lane.closeMu.Unlock()
+			if err == nil {
+				err = context.DeadlineExceeded
+			}
+			return classify(op, driver.KindTransient, err)
+		}
+		outcome = &laneCloseOutcome{done: make(chan struct{})}
+		lane.closeOutcome = outcome
+		lane.closeMu.Unlock()
+
+		closeFn := lane.channel.Close
+		if hook := c.channelCloseHook; hook != nil {
+			closeFn = func() error { return hook(lane) }
+		}
+		finish := func(_ error) {
+			lane.closeMu.Lock()
+			if locked {
+				lane.channelMu.Unlock()
+			}
+			close(outcome.done)
+			lane.closeMu.Unlock()
+		}
+		c.conn.startChannelCloseWithFinish(closeFn, finish)
+		if err := waitLaneClose(ctx, outcome); err != nil {
+			return classify(op, driver.KindTransient, err)
+		}
+	}
+	return nil
+}
+
+func waitLaneClose(ctx context.Context, outcome *laneCloseOutcome) error {
+	select {
+	case <-outcome.done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// lockBeforeContext takes mu before deadline unless ctx ends first. The
+// deadlineReached result is the only path allowed to start a forced close.
+func lockBeforeContext(ctx context.Context, clk clock.Clock, mu *sync.Mutex, deadline time.Time) (locked, deadlineReached bool) {
+	for wait := time.Millisecond; ; wait = min(2*wait, 20*time.Millisecond) {
+		if err := ctx.Err(); err != nil {
+			return false, false
+		}
+		if mu.TryLock() {
+			return true, false
+		}
+		if !clk.Now().Before(deadline) {
+			return false, true
+		}
+		timer := clk.Timer(wait)
+		select {
+		case <-timer.C:
+			if err := ctx.Err(); err != nil {
+				return false, false
+			}
+			if !clk.Now().Before(deadline) {
+				return false, true
+			}
+		case <-ctx.Done():
+			timer.Stop()
+			return false, false
 		}
 	}
 }
@@ -1087,7 +1191,9 @@ func (c *consumer) stopSignals() {
 func (c *consumer) stopAndWait(ctx context.Context, op string, closeLanes bool) error {
 	c.stopSignals()
 	if closeLanes {
-		c.closeLanes()
+		if err := c.closeLanesWithContext(ctx, op); err != nil {
+			return err
+		}
 	}
 	if err := c.waitReaders(ctx, op); err != nil {
 		return err
