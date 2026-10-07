@@ -154,11 +154,22 @@ type Client struct {
 	// Close attempt. A retried Close rejoins this same call instead of starting
 	// a second one against the same connection.
 	connCloseWait <-chan error
+
+	// observerUnbind releases the observer's ObserverBinder attachment. It is
+	// guarded by mu, set by New, and taken exactly once by the Close attempt
+	// that completes terminal shutdown.
+	observerUnbind func()
 }
 
 // New applies opts, normalizes and validates cfg, and opens the supplied driver
 // before returning. Startup errors are returned before any publish or subscribe
 // call. Env and Service remain required for hand-built configurations.
+//
+// If the configured observer implements [ObserverBinder], New binds it after
+// validation and before opening the driver. A refused binding fails New with
+// the observer's error wrapped and nothing opened; a binding New acquired is
+// released again if New fails later, and otherwise belongs to the Client until
+// Close completes.
 func New(ctx context.Context, cfg Config, opts ...Option) (*Client, error) {
 	jsonCodec := codec.JSON{}
 	options := clientOptions{
@@ -198,6 +209,26 @@ func New(ctx context.Context, cfg Config, opts ...Option) (*Client, error) {
 	if _, ok := options.codecsByName[cfg.Codec.Default]; !ok {
 		return nil, fmt.Errorf("f1: codec.default %q is not registered", cfg.Codec.Default)
 	}
+	// Binding comes before Open so that a refused observer leaves nothing to
+	// undo: no connection, and no driver_selected event that would overwrite
+	// the endpoint the observer's current Client reports under.
+	var observerUnbind func()
+	if binder, ok := options.observer.(ObserverBinder); ok {
+		unbind, err := binder.BindClient()
+		if err != nil {
+			return nil, fmt.Errorf("f1: bind observer: %w", err)
+		}
+		observerUnbind = unbind
+	}
+	// One deferred rollback covers every later return, so a failed New never
+	// keeps the observer from a Client built after it. Ownership passes to the
+	// Client only on the successful return.
+	constructed := false
+	defer func() {
+		if !constructed && observerUnbind != nil {
+			observerUnbind()
+		}
+	}()
 	connection, err := options.driver.Open(ctx, driverConfig(cfg, options.logger))
 	if err != nil {
 		return nil, fmt.Errorf("f1: open %s driver: %w", driverName, err)
@@ -229,6 +260,7 @@ func New(ctx context.Context, cfg Config, opts ...Option) (*Client, error) {
 		supervisorDone:      make(chan struct{}),
 		attemptEnded:        make(chan struct{}),
 		runners:             make(map[*Runner]struct{}),
+		observerUnbind:      observerUnbind,
 	}
 	if client.observer != nil {
 		client.observerPanics = make(map[ObserverKind]struct{})
@@ -265,6 +297,7 @@ func New(ctx context.Context, cfg Config, opts ...Option) (*Client, error) {
 		})
 	}
 	go client.reconnectSupervisor()
+	constructed = true
 	return client, nil
 }
 
@@ -513,7 +546,10 @@ func (c *Client) clearFailedSubscription(name string) {
 // A current producer-close error is returned but does not prevent current
 // connection shutdown. A current connection-close error leaves the Client
 // retryable. A concurrent call returns an error while shutdown is in progress.
-// A nil or fully closed Client returns nil.
+// A nil or fully closed Client returns nil. Terminal shutdown, including one
+// that returns a producer-close error, releases an [ObserverBinder] binding so
+// the observer can be bound to a new Client; a Close that leaves the Client
+// retryable keeps it.
 func (c *Client) Close(ctx context.Context) error {
 	if c == nil {
 		return nil
@@ -824,6 +860,30 @@ func (c *Client) closeConnection(ctx context.Context, conn driver.Conn, producer
 }
 
 func (c *Client) finishClose(producerCloseErr error) error {
+	// The binding is released only here, on terminal shutdown: a Close that
+	// failed part way still owns resources and may be retried, so its observer
+	// is not yet free for another Client. The callback is user code and runs
+	// outside mu.
+	//
+	// The lifecycle stays Draining until unbind returns. Moving to Closed
+	// first opens this interleaving: the admitted Close goroutine G1 sets
+	// Closed and releases mu, but has not yet called unbind. A second Close
+	// on goroutine G2 now finds Closed and returns nil, and G2's caller builds
+	// a replacement Client with the same observer. That New calls BindClient
+	// while G1 still holds the binding, and is refused even though Close has
+	// already reported success. Kept in Draining, G2's Close is refused as
+	// in progress instead, and no Close returns nil before the release.
+	//
+	// The release does not wait for observer calls in flight: a publish
+	// finishing on another goroutine may still deliver its paired Finish
+	// after this, and dropping it would break the Start and Finish pairing.
+	c.mu.Lock()
+	unbind := c.observerUnbind
+	c.observerUnbind = nil
+	c.mu.Unlock()
+	if unbind != nil {
+		unbind()
+	}
 	c.mu.Lock()
 	_ = c.lifecycle.Transition(lifecycle.Closed)
 	c.mu.Unlock()

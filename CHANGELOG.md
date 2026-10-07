@@ -43,6 +43,15 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
   its offset finished.
 - Deferred conformance measures release lateness from a bracket around publication, excluding
   time spent publishing while retaining the never-early and late-delivery checks.
+- Breaking, draft observer API: `FinishEvent.Results` is now `[]ObserverMessageResult`
+  (`ID`, `ErrorClass`) instead of `[]MessageResult`, so observers no longer receive raw
+  per-message errors. An observer that checked `Err == nil` checks `ErrorClass == ""` and
+  `ID != ""` instead. `PublishBatch` results and `MessageResult.Err` returned to the application
+  are unchanged.
+- `f1.New` refuses an f1otel observer that is already attached to another live Client. Create
+  one `f1otel.New` per Client and share the OpenTelemetry providers between them. An observer
+  opts in through the new optional `f1.ObserverBinder` interface; the binding is released when
+  `Close` completes terminal shutdown or when `New` fails.
 
 ### Removed
 
@@ -98,6 +107,11 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
   `Release` no longer waits on reader goroutines that only the `Release` could end.
 - The Kafka consumer clears a delivered record's slot in its pending queue, so the delivered
   record and its fetch data can be freed sooner.
+- f1otel metrics no longer carry `f1.priority=medium` when the priority is unknown: a
+  `PublishBatch` of mixed priorities, or an abandoned stage. The new `FinishEvent.PriorityKnown`
+  field reports whether `Priority` carries the stage's delivery lane; F1 sets it on every Finish
+  that has one. A batch's topic and priority are resolved independently. Metrics and spans name
+  the consumer group by the same rule: `ConsumerGroup`, else `Subscription`.
 
 ### Upgrade notes
 

@@ -2,6 +2,7 @@ package f1otel
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"sync/atomic"
 
@@ -16,9 +17,15 @@ import (
 )
 
 var (
-	_              f1.Observer = (*Observer)(nil)
+	_              f1.Observer       = (*Observer)(nil)
+	_              f1.ObserverBinder = (*Observer)(nil)
 	observerHandle atomic.Uint64
 )
+
+// errObserverBound is the refusal a second live Client receives. It names the
+// supported shape because the endpoint an Observer reports is one value: two
+// Clients sharing it would relabel each other's telemetry.
+var errObserverBound = errors.New("f1otel: observer is already attached to a Client; create one f1otel.New per Client and share the OpenTelemetry providers")
 
 type endpointInfo struct {
 	system     string
@@ -27,8 +34,13 @@ type endpointInfo struct {
 }
 
 // Observer implements f1.Observer with OpenTelemetry metrics and spans. Observer
-// methods are safe for concurrent calls. The zero value and a nil *Observer are
-// no-ops.
+// methods are safe for concurrent calls. The zero value and a nil *Observer
+// record no telemetry.
+//
+// A non-nil Observer, including the zero value, attaches to one live Client at
+// a time through [Observer.BindClient]: create one Observer per Client and share
+// the OpenTelemetry providers between them. Concurrent safety is not sharing
+// safety; an Observer reports the endpoint of the Client it is attached to.
 type Observer struct {
 	metrics *metrics
 
@@ -36,8 +48,11 @@ type Observer struct {
 	propagator  propagation.TextMapPropagator
 	createSpans bool
 
-	mu       sync.Mutex
-	starts   map[uint64]startState
+	mu     sync.Mutex
+	starts map[uint64]startState
+	// bound is guarded by mu and is true while a Client holds this Observer's
+	// attachment. It is checked only at bind and release, never per event.
+	bound    bool
 	endpoint atomic.Pointer[endpointInfo]
 }
 
@@ -75,6 +90,38 @@ func New(opts ...Option) (*Observer, error) {
 		observer.starts = make(map[uint64]startState)
 	}
 	return observer, nil
+}
+
+// BindClient attaches Observer to one live F1 Client; f1.New calls it. A second
+// attachment fails, with an error naming the fix, until the returned unbind is
+// called. Concurrent calls are safe and at most one succeeds while the Observer
+// is free. Unbind is safe for concurrent and repeated calls and releases only
+// the attachment it was returned with, never a later one. The zero Observer
+// follows the same rule; a nil receiver returns nil, nil. Unbind does not wait
+// for observer calls in flight and does not reset recorded state.
+func (o *Observer) BindClient() (func(), error) {
+	if o == nil {
+		return nil, nil
+	}
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if o.bound {
+		return nil, errObserverBound
+	}
+	o.bound = true
+	// The once is per attachment, not per Observer. Without it a stale release
+	// clears a newer binding: Client A closes and its unbind runs, Client B
+	// binds, and then A's unbind is called a second time, setting bound false
+	// while B is still attached, so a third Client binds alongside B and
+	// relabels B's telemetry.
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			o.mu.Lock()
+			o.bound = false
+			o.mu.Unlock()
+		})
+	}, nil
 }
 
 // Start returns a token when the event starts a metric-bearing or span-bearing
@@ -152,7 +199,7 @@ func (o *Observer) Finish(token f1.Token, event f1.FinishEvent) {
 
 	if o.metrics != nil {
 		endpoint := o.endpoint.Load()
-		attrs := o.attrs(event.Kind, event.Topic, event.Subscription, event.Priority, event.ErrorClass, "", endpoint)
+		attrs := o.attrs(event.Kind, event.Topic, resolvedConsumerGroup(event.ConsumerGroup, event.Subscription), event.Priority, event.PriorityKnown, event.ErrorClass, "", endpoint)
 		system := messagingconv.SystemAttr(o.systemAttr(endpoint))
 		seconds := event.At.Sub(token.Start).Seconds()
 		recordingCtx := context.Background()
@@ -164,7 +211,7 @@ func (o *Observer) Finish(token f1.Token, event f1.FinishEvent) {
 			if o.metrics.sent != nil {
 				var successful int64
 				for _, result := range event.Results {
-					if result.Err == nil && result.ID != "" {
+					if result.ErrorClass == "" && result.ID != "" {
 						successful++
 					}
 				}
@@ -212,7 +259,7 @@ func (o *Observer) Record(event f1.PointEvent) {
 	}
 
 	endpoint := o.endpoint.Load()
-	attrs := o.attrs(event.Kind, event.Topic, event.Subscription, event.Priority, event.ErrorClass, event.Reason, endpoint)
+	attrs := o.attrs(event.Kind, event.Topic, resolvedConsumerGroup(event.ConsumerGroup, event.Subscription), event.Priority, true, event.ErrorClass, event.Reason, endpoint)
 	system := messagingconv.SystemAttr(o.systemAttr(endpoint))
 	customAttrs := customMetricAttributes(attrs, system)
 	ctx := context.Background()
@@ -268,15 +315,22 @@ func (o *Observer) systemAttr(endpoint *endpointInfo) string {
 	return endpoint.system
 }
 
-func (o *Observer) attrs(kind f1.ObserverKind, topic, subscription string, priority f1.Priority, class f1.ErrorClass, reason f1.DeathReason, endpoint *endpointInfo) []attribute.KeyValue {
+func resolvedConsumerGroup(consumerGroup, subscription string) string {
+	if consumerGroup != "" {
+		return consumerGroup
+	}
+	return subscription
+}
+
+func (o *Observer) attrs(kind f1.ObserverKind, topic, consumerGroup string, priority f1.Priority, priorityKnown bool, class f1.ErrorClass, reason f1.DeathReason, endpoint *endpointInfo) []attribute.KeyValue {
 	attrs := make([]attribute.KeyValue, 0, 6)
 	if topic != "" {
 		attrs = append(attrs, attribute.String("messaging.destination.name", topic))
 	}
-	if subscription != "" {
-		attrs = append(attrs, attribute.String("messaging.consumer.group.name", subscription))
+	if consumerGroup != "" {
+		attrs = append(attrs, attribute.String("messaging.consumer.group.name", consumerGroup))
 	}
-	if metricCarriesPriority(kind) {
+	if priorityKnown && metricCarriesPriority(kind) {
 		attrs = append(attrs, attribute.String("f1.priority", priority.String()))
 	}
 	if class == "" && reason != "" {

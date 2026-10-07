@@ -3,6 +3,7 @@ package f1
 import (
 	"context"
 	"errors"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -471,5 +472,232 @@ func waitLifecycleCondition(t *testing.T, msg string, cond func() bool) {
 			t.Fatal(msg)
 		case <-ticker.C:
 		}
+	}
+}
+
+// bindingObserver is a lifecycleObserver that also implements ObserverBinder
+// with one exclusive attachment, the shape an adapter with per-Client state
+// needs. Its unbind is deliberately not idempotent, so a double release shows
+// up in unbinds instead of being absorbed.
+type bindingObserver struct {
+	lifecycleObserver
+	bindErr error
+	// unbindStarted and unbindRelease, when set, hold unbind open so a test
+	// can act while the release is in progress.
+	unbindStarted chan struct{}
+	unbindRelease chan struct{}
+
+	bindMu                sync.Mutex
+	bound                 bool
+	binds                 int
+	unbinds               int
+	boundAtDriverSelected []bool
+}
+
+func (o *bindingObserver) BindClient() (func(), error) {
+	o.bindMu.Lock()
+	defer o.bindMu.Unlock()
+	if o.bindErr != nil {
+		return nil, o.bindErr
+	}
+	if o.bound {
+		return nil, errBindingObserverBound
+	}
+	o.bound = true
+	o.binds++
+	return func() {
+		if o.unbindStarted != nil {
+			close(o.unbindStarted)
+			<-o.unbindRelease
+		}
+		o.bindMu.Lock()
+		defer o.bindMu.Unlock()
+		o.bound = false
+		o.unbinds++
+	}, nil
+}
+
+func (o *bindingObserver) Record(event PointEvent) {
+	if event.Kind == ObserverDriverSelected {
+		o.bindMu.Lock()
+		o.boundAtDriverSelected = append(o.boundAtDriverSelected, o.bound)
+		o.bindMu.Unlock()
+	}
+	o.lifecycleObserver.Record(event)
+}
+
+func (o *bindingObserver) state() (bound bool, binds, unbinds int) {
+	o.bindMu.Lock()
+	defer o.bindMu.Unlock()
+	return o.bound, o.binds, o.unbinds
+}
+
+func (o *bindingObserver) requireState(t *testing.T, wantBound bool, wantBinds, wantUnbinds int) {
+	t.Helper()
+	bound, binds, unbinds := o.state()
+	if bound != wantBound || binds != wantBinds || unbinds != wantUnbinds {
+		t.Fatalf("binding = bound %v, binds %d, unbinds %d; want bound %v, binds %d, unbinds %d",
+			bound, binds, unbinds, wantBound, wantBinds, wantUnbinds)
+	}
+}
+
+var errBindingObserverBound = errors.New("observer already bound")
+
+type openErrDriver struct {
+	err error
+}
+
+func (openErrDriver) Name() string                      { return "test" }
+func (openErrDriver) Capabilities() driver.Capabilities { return driver.Capabilities{} }
+func (d openErrDriver) Open(context.Context, driver.Config) (driver.Conn, error) {
+	return nil, d.err
+}
+
+func TestObserverBinderRefusalOpensNothing(t *testing.T) {
+	t.Parallel()
+	errRefused := errors.New("observer refused")
+	rec := &bindingObserver{bindErr: errRefused}
+	fakeDriver := &testDriver{conn: &testConn{}}
+	client, err := New(context.Background(), testClientConfig(t), WithDriver(fakeDriver), WithObserver(rec))
+	if client != nil {
+		t.Cleanup(func() { _ = client.Close(context.Background()) })
+		t.Fatal("New() returned a Client for a refused observer binding")
+	}
+	if !errors.Is(err, errRefused) || !strings.Contains(err.Error(), "f1: bind observer: ") {
+		t.Fatalf("New() error = %v, want the wrapped refusal", err)
+	}
+	if fakeDriver.opened {
+		t.Fatal("New() opened the driver after the observer refused its binding")
+	}
+	starts, finishes, points := rec.snapshot()
+	if len(starts)+len(finishes)+len(points) != 0 {
+		t.Fatalf("observer events after refused binding = %d starts, %d finishes, %d points; want none", len(starts), len(finishes), len(points))
+	}
+}
+
+func TestObserverBinderBoundBeforeDriverSelected(t *testing.T) {
+	t.Parallel()
+	rec := &bindingObserver{}
+	client, err := New(context.Background(), testClientConfig(t), WithDriver(&testDriver{conn: &testConn{}}), WithObserver(rec))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = client.Close(context.Background()) })
+	rec.requireState(t, true, 1, 0)
+	rec.bindMu.Lock()
+	seen := append([]bool(nil), rec.boundAtDriverSelected...)
+	rec.bindMu.Unlock()
+	if len(seen) != 1 || !seen[0] {
+		t.Fatalf("bound at driver_selected = %v, want [true]", seen)
+	}
+}
+
+func TestObserverBinderNotCalledWhenValidationFails(t *testing.T) {
+	t.Parallel()
+	missingCodec := testClientConfig(t)
+	missingCodec.Codec.Default = "missing"
+	missingEnv := testClientConfig(t)
+	missingEnv.Env = ""
+	tests := []struct {
+		name string
+		cfg  Config
+		opts []Option
+	}{
+		{name: "option error", cfg: testClientConfig(t), opts: []Option{WithLogger(nil)}},
+		{name: "invalid config", cfg: missingEnv},
+		{name: "unregistered codec", cfg: missingCodec},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			rec := &bindingObserver{}
+			opts := append([]Option{WithDriver(&testDriver{conn: &testConn{}}), WithObserver(rec)}, test.opts...)
+			if _, err := New(context.Background(), test.cfg, opts...); err == nil {
+				t.Fatal("New() = nil, want a validation error")
+			}
+			rec.requireState(t, false, 0, 0)
+		})
+	}
+}
+
+func TestObserverBinderRollsBackFailedNew(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name   string
+		driver driver.Driver
+	}{
+		{name: "driver open error", driver: openErrDriver{err: errors.New("open boom")}},
+		{name: "nil connection", driver: nilConnectionDriver{}},
+		{name: "topology without admin", driver: &testDriver{conn: &testConn{}}},
+		{name: "topology error", driver: &lifecycleFailDriver{conn: &lifecycleFailConn{testConn: &testConn{}, admin: lifecycleFailAdmin{}}}},
+		{name: "topology error and close error", driver: &lifecycleFailDriver{conn: &lifecycleFailConn{testConn: &testConn{closeErr: errors.New("close boom")}, admin: lifecycleFailAdmin{}}}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			rec := &bindingObserver{}
+			client, err := New(context.Background(), testClientConfig(t),
+				WithDriver(test.driver), WithObserver(rec), WithPublishTopics("orders.created"))
+			if err == nil {
+				_ = client.Close(context.Background())
+				t.Fatal("New() = nil, want a startup error")
+			}
+			rec.requireState(t, false, 1, 1)
+			if _, _, points := rec.snapshot(); len(lifecyclePointsByKind(points, ObserverDriverSelected)) != 0 {
+				t.Fatalf("driver_selected recorded by a failed New: %v", points)
+			}
+
+			// The rollback must leave the observer attachable, not only count
+			// a callback.
+			next, err := New(context.Background(), testClientConfig(t), WithDriver(&testDriver{conn: &testConn{}}), WithObserver(rec))
+			if err != nil {
+				t.Fatalf("New() after a failed New error = %v, want the observer released", err)
+			}
+			rec.requireState(t, true, 2, 1)
+			if err := next.Close(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			rec.requireState(t, false, 2, 2)
+		})
+	}
+}
+
+func TestObserverBinderReleasedOnTerminalClose(t *testing.T) {
+	t.Parallel()
+	rec := &bindingObserver{}
+	client, err := New(context.Background(), testClientConfig(t), WithDriver(&testDriver{conn: &testConn{}}), WithObserver(rec))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := New(context.Background(), testClientConfig(t), WithDriver(&testDriver{conn: &testConn{}}), WithObserver(rec)); !errors.Is(err, errBindingObserverBound) {
+		t.Fatalf("second New() error = %v, want the observer's refusal", err)
+	}
+	if err := client.Close(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	rec.requireState(t, false, 1, 1)
+	if err := client.Close(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	rec.requireState(t, false, 1, 1)
+
+	next, err := New(context.Background(), testClientConfig(t), WithDriver(&testDriver{conn: &testConn{}}), WithObserver(rec))
+	if err != nil {
+		t.Fatalf("New() after Close error = %v, want the observer released", err)
+	}
+	t.Cleanup(func() { _ = next.Close(context.Background()) })
+	rec.requireState(t, true, 2, 1)
+}
+
+func TestObserverWithoutBinderIsShareable(t *testing.T) {
+	t.Parallel()
+	rec := &lifecycleObserver{}
+	for range 2 {
+		client, err := New(context.Background(), testClientConfig(t), WithDriver(&testDriver{conn: &testConn{}}), WithObserver(rec))
+		if err != nil {
+			t.Fatalf("New() error = %v, want an observer without ObserverBinder to be shareable", err)
+		}
+		t.Cleanup(func() { _ = client.Close(context.Background()) })
+	}
+	if _, _, points := rec.snapshot(); len(lifecyclePointsByKind(points, ObserverDriverSelected)) != 2 {
+		t.Fatalf("driver_selected points = %v, want one per Client", points)
 	}
 }

@@ -2265,6 +2265,7 @@ func invokeHandlerMessage(r *Runner, parent context.Context, handler Handler, ev
 			ConsumerGroup: r.subscription.Name,
 			EventType:     eventType,
 			Priority:      priority,
+			PriorityKnown: true,
 			Attempt:       attempt,
 			Destination:   message.Destination,
 
@@ -2429,6 +2430,7 @@ func startSettleObservation(r *Runner, ctx context.Context, message driver.Inbou
 		Subscription:  r.subscription.Name,
 		ConsumerGroup: r.subscription.Name,
 		Priority:      priority,
+		PriorityKnown: true,
 		Destination:   message.Destination,
 	}
 	return guard, base, true
@@ -3000,6 +3002,7 @@ func startSuccessorPublish(r *Runner, ctx context.Context, route PublishRoute, t
 		Topic:         topic,
 		EventType:     eventType,
 		Priority:      priority,
+		PriorityKnown: true,
 		Attempt:       attempt,
 		Destination:   destination,
 		MessageID:     messageID,

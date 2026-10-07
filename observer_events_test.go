@@ -82,8 +82,8 @@ func TestObserverPrimaryPublishFinishCarriesTopicAndPriority(t *testing.T) {
 			if finish.Kind != ObserverPublish {
 				continue
 			}
-			if finish.Topic != "" || finish.Priority != 0 {
-				t.Fatalf("mixed publish finish = topic %q priority %v, want zero fields", finish.Topic, finish.Priority)
+			if finish.Topic != "" || finish.Priority != PriorityHigh {
+				t.Fatalf("mixed publish finish = topic %q priority %v, want empty topic and high priority", finish.Topic, finish.Priority)
 			}
 			return
 		}
@@ -136,5 +136,45 @@ func TestObserverDeliveryReceivedCarriesLogicalTopicAndPriority(t *testing.T) {
 		if delivery.Priority != PriorityHigh {
 			t.Fatalf("delivery %d priority = %v, want high", i, delivery.Priority)
 		}
+	}
+}
+
+// TestObserverFinishesReportKnownPriority covers every Finish kind that carries
+// a delivery lane: the published message, its primary and retry publishes, and
+// both processing attempts with their settles.
+func TestObserverFinishesReportKnownPriority(t *testing.T) {
+	rec := &consumeRecordingObserver{}
+	client := newConsumeObserverClient(t, rec)
+	var attempts atomic.Int32
+	sub := consumeTestSubscription("orders", func(context.Context, *Event) error {
+		if attempts.Add(1) == 1 {
+			return errors.New("retry once")
+		}
+		return nil
+	})
+	sub.Priorities = []Priority{PriorityHigh}
+	sub.Retry = RetryConfig{MaxAttempts: 2, Tiers: []time.Duration{time.Millisecond}}
+	ctx, _, _, _ := startConsumeRunner(t, client, sub)
+	publishConsumeOne(t, client, ctx, "payload", WithPriority(PriorityHigh))
+	waitConsumeCondition(t, "both settle finishes did not arrive", func() bool {
+		_, finishes := rec.settlePairs()
+		return len(finishes) == 2
+	})
+
+	_, _, finishes, _ := rec.snapshot()
+	seen := map[ObserverKind]int{}
+	for _, finish := range finishes {
+		switch finish.Kind {
+		case ObserverMessageBuilt, ObserverPublish, ObserverProcess, ObserverSettle:
+		default:
+			continue
+		}
+		seen[finish.Kind]++
+		if !finish.PriorityKnown || finish.Priority != PriorityHigh {
+			t.Errorf("%s finish = priority %v known %v, want high and known", finish.Kind, finish.Priority, finish.PriorityKnown)
+		}
+	}
+	if seen[ObserverMessageBuilt] == 0 || seen[ObserverPublish] < 2 || seen[ObserverProcess] < 2 || seen[ObserverSettle] < 2 {
+		t.Fatalf("finish kinds = %v, want message-built, primary and retry publishes, and two processes and settles", seen)
 	}
 }
