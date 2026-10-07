@@ -331,11 +331,10 @@ func (o *runnerOwner) startOpen(waitCtx context.Context, prefetch int) {
 	})
 }
 
-// startRebuild waits for the connection rebuild a generation needs on its own
-// goroutine, for the same reason the open runs on one. cause is the failure
-// the runner asks a rebuild for, and nil for a runner that only has a change
-// to wait for.
-func (o *runnerOwner) startRebuild(ctx context.Context, cause error, epoch uint64) {
+// startRebuild waits for the connection rebuild while pumping the owner's events.
+// cause is the failure the runner asks a rebuild for, or nil when it only waits
+// for a change. draining distinguishes shutdown from a rebuild failure.
+func (o *runnerOwner) startRebuild(ctx context.Context, cause error, epoch uint64) (draining bool, err error) {
 	o.rebuilt = false
 	o.rebuiltErr = nil
 	o.runner.asyncGroup.Go(func() error {
@@ -343,6 +342,8 @@ func (o *runnerOwner) startRebuild(ctx context.Context, cause error, epoch uint6
 		o.events <- runnerEvent{kind: runnerEventRebuilt, err: err}
 		return nil
 	})
+	o.pumpUntil(func() bool { return o.rebuilt })
+	return errors.Is(o.rebuiltErr, errRunnerDraining), o.rebuiltErr
 }
 
 // releaseConsumer releases the generation's consumer on its own goroutine. The
@@ -526,18 +527,19 @@ func (r *Runner) Run(ctx context.Context) (runErr error) {
 		if err != nil {
 			repairCause = nil
 			if errors.Is(err, errRunnerDraining) {
+				// The failed open admitted no consumer or deliveries, so there is nothing to drain.
 				return nil
 			}
 			if owner.abandoned {
 				// An attempt in flight released this consumer, and the open it
 				// cancelled is not a failure of the runner's: it waits for the
 				// attempt and opens again on what it leaves behind.
-				owner.startRebuild(ctx, nil, 0)
-				owner.pumpUntil(func() bool { return owner.rebuilt })
-				if reconnectErr := owner.rebuiltErr; reconnectErr != nil {
-					if errors.Is(reconnectErr, errRunnerDraining) {
-						return nil
-					}
+				draining, reconnectErr := owner.startRebuild(ctx, nil, 0)
+				if draining {
+					// The cancelled open admitted no consumer or deliveries, so there is nothing to drain.
+					return nil
+				}
+				if reconnectErr != nil {
 					runErr = reconnectErr
 					break
 				}
@@ -555,12 +557,12 @@ func (r *Runner) Run(ctx context.Context) (runErr error) {
 			// rebuild is asked for, and it is what this runner reports if the
 			// rebuild hands one back.
 			r.transitionToReconnecting()
-			owner.startRebuild(ctx, err, 0)
-			owner.pumpUntil(func() bool { return owner.rebuilt })
-			if reconnectErr := owner.rebuiltErr; reconnectErr != nil {
-				if errors.Is(reconnectErr, errRunnerDraining) {
-					return nil
-				}
+			draining, reconnectErr := owner.startRebuild(ctx, err, 0)
+			if draining {
+				// The failed open admitted no consumer or deliveries, so there is nothing to drain.
+				return nil
+			}
+			if reconnectErr != nil {
 				runErr = reconnectErr
 				break
 			}
@@ -740,12 +742,11 @@ func (r *Runner) Run(ctx context.Context) (runErr error) {
 			}
 		}
 		r.transitionToReconnecting()
-		owner.startRebuild(ctx, cause, openedEpoch)
-		owner.pumpUntil(func() bool { return owner.rebuilt })
-		if reconnectErr := owner.rebuiltErr; reconnectErr != nil {
-			if errors.Is(reconnectErr, errRunnerDraining) {
-				return nil
-			}
+		draining, reconnectErr := owner.startRebuild(ctx, cause, openedEpoch)
+		if draining {
+			return nil
+		}
+		if reconnectErr != nil {
 			runErr = reconnectErr
 			break
 		}
@@ -1205,12 +1206,7 @@ func (r *Runner) Drain(ctx context.Context) error {
 	cancel := r.cancel
 	if r.lifecycle != nil {
 		switch r.lifecycle.State() {
-		case lifecycle.Ready:
-			if err := r.lifecycle.Transition(lifecycle.Draining); err != nil {
-				r.mu.Unlock()
-				return err
-			}
-		case lifecycle.Reconnecting:
+		case lifecycle.Ready, lifecycle.Reconnecting:
 			if err := r.lifecycle.Transition(lifecycle.Draining); err != nil {
 				r.mu.Unlock()
 				return err
@@ -1284,9 +1280,6 @@ func (r *Runner) Drain(ctx context.Context) error {
 	}
 	if handlerCancel != nil {
 		drainTimeout := r.client.config.Lifecycle.DrainTimeout
-		if drainTimeout < 0 {
-			return fmt.Errorf("f1: lifecycle.drainTimeout must not be negative")
-		}
 		if drainTimeout > 0 {
 			grace := r.client.config.Lifecycle.HandlerGrace
 			if grace < 0 || grace >= drainTimeout {
