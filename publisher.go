@@ -200,6 +200,7 @@ func (p *Publisher) PublishBatch(ctx context.Context, messages []Message) (Batch
 	// recordObserverPanic takes c.mu, so the publish start must come after
 	// the Unlock above. Values only; nothing escapes on the nil path.
 	observer := p.client.observer
+	observeCtx := ctx
 	var publishGuard observerFinishGuard
 	observed := false
 	if observer != nil {
@@ -210,7 +211,7 @@ func (p *Publisher) PublishBatch(ctx context.Context, messages []Message) (Batch
 			BatchSize: len(messages),
 		}
 		nextCtx, token := p.client.observeStart(ctx, start)
-		ctx = nextCtx
+		observeCtx = nextCtx
 		publishGuard = p.client.newObserverGuard(ObserverPublish, token)
 		observed = true
 		defer publishGuard.abandon()
@@ -220,7 +221,7 @@ func (p *Publisher) PublishBatch(ctx context.Context, messages []Message) (Batch
 	ids := make([]string, len(messages))
 	var publishFields primaryPublishFields
 	for i, message := range messages {
-		outboundMessage, id, err := buildOutbound(ctx, p.client, options, effective, headerMaxBytes, source, producerIdentity, message, &publishFields)
+		outboundMessage, id, err := buildOutbound(ctx, observeCtx, p.client, options, effective, headerMaxBytes, source, producerIdentity, message, &publishFields)
 		if err != nil {
 			methodErr := fmt.Errorf("f1: message %d: %w", i, err)
 			if observed {
@@ -272,7 +273,7 @@ func (p *Publisher) PublishBatch(ctx context.Context, messages []Message) (Batch
 		return result, built.refused
 	}
 	if built.buildErr != nil {
-		warnUnclassifiedWithContext(p.client.options.logger, ctx, built.buildErr)
+		warnUnclassifiedWithContext(p.client.options.logger, observeCtx, built.buildErr)
 		requestReconnectOnTransient(ctx, p.client, built.buildErr, epoch)
 		methodErr := fmt.Errorf("f1: create publisher: %w", built.buildErr)
 		if observed {
@@ -291,7 +292,7 @@ func (p *Publisher) PublishBatch(ctx context.Context, messages []Message) (Batch
 		return result, nil
 	}
 
-	warnPublishError(p.client.options.logger, ctx, publishErr)
+	warnPublishError(p.client.options.logger, observeCtx, publishErr)
 	requestReconnectOnTransient(ctx, p.client, publishErr, epoch)
 	var partial *driver.PublishError
 	if errors.As(publishErr, &partial) && len(partial.Failed) > 0 && !failedIndexesInRange(partial.Failed, len(ids)) {
@@ -402,7 +403,7 @@ func (f *primaryPublishFields) record(topic string, priority Priority) {
 	}
 }
 
-func buildOutbound(ctx context.Context, c *Client, options clientOptions, effective driver.Capabilities, headerMaxBytes int, source, producerIdentity string, message Message, fields *primaryPublishFields) (driver.OutboundMessage, string, error) {
+func buildOutbound(ctx, observeCtx context.Context, c *Client, options clientOptions, effective driver.Capabilities, headerMaxBytes int, source, producerIdentity string, message Message, fields *primaryPublishFields) (driver.OutboundMessage, string, error) {
 	if err := ctx.Err(); err != nil {
 		return driver.OutboundMessage{}, "", err
 	}
@@ -508,8 +509,8 @@ func buildOutbound(ctx context.Context, c *Client, options clientOptions, effect
 			Attempt:       1,
 			CorrelationID: correlationID,
 		}
-		nextCtx, token := c.observeStart(ctx, start)
-		ctx = nextCtx
+		nextCtx, token := c.observeStart(observeCtx, start)
+		observeCtx = nextCtx
 		base = FinishEvent{
 			Topic:         topic,
 			Destination:   destination,
@@ -524,7 +525,7 @@ func buildOutbound(ctx context.Context, c *Client, options clientOptions, effect
 		defer guard.abandon()
 	}
 	if injector != nil {
-		traceParent, traceState := c.injectTrace(ctx)
+		traceParent, traceState := c.injectTrace(observeCtx)
 		if traceParent != "" {
 			envelope.TraceParent = traceParent
 			envelope.TraceState = traceState

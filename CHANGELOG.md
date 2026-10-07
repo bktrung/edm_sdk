@@ -56,6 +56,11 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ### Fixed
 
+- Reconnect retains retired resources after close errors or timeouts, preserving
+  producer/consumer-before-connection order. `Client.Close` returns an error until every
+  retired teardown succeeds, rejoining running attempts or retrying failed retirements
+  once per caller-issued close without background retries. Each retirement wait has its
+  own `Lifecycle.CloseTimeout` bound.
 - Kafka drain and release fence settlement-side handoffs as well as polling, so an in-flight
   handoff cannot send after drain returns.
 - The RabbitMQ consumer's `Stop` and `Release` wait for their goroutines only as long as the

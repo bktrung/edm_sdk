@@ -123,7 +123,8 @@ type Client struct {
 	// current is the connection the client is on and the number that names it.
 	// Its epoch is 1 for the connection New opened, and a nil conn means the
 	// client holds none.
-	current currentConnection
+	current     currentConnection
+	retirements []*retiredConnection
 	// reconnectErr records a terminal reconnect decision for the current client
 	// state. It is guarded by mu and is the value the failed connection axis
 	// carries: reconnect exhaustion does not mean Close has been entered, and a
@@ -495,15 +496,18 @@ func (c *Client) clearFailedSubscription(name string) {
 	})
 }
 
-// Close drains active work and releases the driver resources. It refuses new
-// work after shutdown begins, and waits up to Lifecycle.CloseTimeout for a
-// reconnect in progress to stop before it closes the connection. A timed-out phase continues in the background,
-// and a retry rejoins that phase instead of starting a duplicate driver call.
-// A producer-close error is returned but does not prevent connection shutdown.
-// A connection-close error leaves the Client retryable; once all phases finish,
-// the Client is closed even if a phase returned an error. A concurrent call
-// returns an error while shutdown is in progress. A nil or fully closed Client
-// returns nil.
+// Close drains active work and refuses new work after shutdown begins. It waits
+// for the reconnect supervisor and finishes retired teardowns before current
+// resources; nil requires every retired teardown to have succeeded. Running
+// teardowns are rejoined, not duplicated; each failed retirement gets one new
+// attempt per call, skipping successful stages, with no background retry.
+// Each wait is bounded by Lifecycle.CloseTimeout and ctx; multiple retirements
+// can make total shutdown exceed one CloseTimeout. A retirement error or timeout
+// leaves unfinished resources owned and stops shutdown before current teardown.
+// A current producer-close error is returned but does not prevent current
+// connection shutdown. A current connection-close error leaves the Client
+// retryable. A concurrent call returns an error while shutdown is in progress.
+// A nil or fully closed Client returns nil.
 func (c *Client) Close(ctx context.Context) error {
 	if c == nil {
 		return nil
@@ -524,13 +528,15 @@ func (c *Client) Close(ctx context.Context) error {
 	if err := c.waitForSupervisor(ctx); err != nil {
 		return c.failClose(err)
 	}
+	if err := c.closeRetirements(ctx); err != nil {
+		return c.failClose(err)
+	}
 	return c.closeResources(ctx)
 }
 
-// waitForSupervisor waits, bounded by Lifecycle.CloseTimeout, for the
-// reconnect supervisor that beginClose cancelled to return, so a reconnect
-// still retiring its old connection finishes before Close closes the current
-// one and returns. A retried Close waits again.
+// waitForSupervisor transfers retirement ownership to Close. If the supervisor
+// timed out joining an old teardown, it may still be running, but after this
+// barrier no reconnect waiter can consume its result or register another one.
 func (c *Client) waitForSupervisor(ctx context.Context) error {
 	if c.supervisorDone == nil {
 		return nil
@@ -704,13 +710,10 @@ func (c *Client) releaseKeptConsumers(ctx context.Context) error {
 	return errors.Join(errs...)
 }
 
-// retireKeptConsumers releases the consumers kept for the connection epoch
-// being retired, bounded by Lifecycle.CloseTimeout, and forgets them whatever
-// the outcome. The connection they were opened on is being closed, so no later
-// path has it to release them through, and a failure is logged like every
-// other teardown step of that connection rather than kept for an attempt with
-// nothing left to release it against.
-func (c *Client) retireKeptConsumers(ctx context.Context, epoch uint64) {
+// retireKeptConsumers leaves failed releases owned by their retired epoch.
+// The enclosing retirement attempt bounds waiting, not individual driver calls,
+// so a hung Release cannot be overtaken by the connection close.
+func (c *Client) retireKeptConsumers(ctx context.Context, epoch uint64) error {
 	c.mu.Lock()
 	kept := make([]unreleasedConsumer, 0, len(c.unreleasedConsumers))
 	for _, entry := range c.unreleasedConsumers {
@@ -720,12 +723,12 @@ func (c *Client) retireKeptConsumers(ctx context.Context, epoch uint64) {
 	}
 	c.mu.Unlock()
 	for _, entry := range kept {
-		if err := runWithClockTimeout(ctx, c.options.clock, c.config.Lifecycle.CloseTimeout, "close", entry.consumer.Release); err != nil {
-			lastResortClientLogger(c).Warn("f1 kept consumer release failed while retiring the connection",
-				"epoch", entry.epoch, "error", err)
+		if err := entry.consumer.Release(ctx); err != nil {
+			return fmt.Errorf("f1: release consumer on connection epoch %d: %w", entry.epoch, err)
 		}
 		c.forgetUnreleasedConsumer(entry)
 	}
+	return nil
 }
 
 func (c *Client) closeResources(ctx context.Context) error {

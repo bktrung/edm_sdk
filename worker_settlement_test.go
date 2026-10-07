@@ -6,6 +6,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/driver"
@@ -79,6 +80,118 @@ func newSettlementOrderingRunner(t *testing.T) (*Client, *Runner, *dispatchConsu
 	}
 	runner.consumer = consumer
 	return client, runner, consumer
+}
+
+type settleCallerKey struct{}
+
+type settlementContextObserver struct {
+	consumeRecordingObserver
+	next context.Context
+}
+
+func (o *settlementContextObserver) Start(ctx context.Context, event StartEvent) (context.Context, Token) {
+	_, token := o.consumeRecordingObserver.Start(ctx, event)
+	return o.next, token
+}
+
+type contextCheckingSettler struct {
+	scriptedNackSettler
+	ctx     context.Context
+	options driver.NackOptions
+}
+
+func (s *contextCheckingSettler) Ack(ctx context.Context) error {
+	s.ctx = ctx
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return s.scriptedNackSettler.Ack(ctx)
+}
+
+func (s *contextCheckingSettler) Nack(ctx context.Context, options driver.NackOptions) error {
+	s.ctx = ctx
+	s.options = options
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return s.scriptedNackSettler.Nack(ctx, options)
+}
+
+func TestObserverSettleCanceledContextDoesNotControlBrokerCalls(t *testing.T) {
+	for _, operation := range []SettleOperation{SettleAck, SettleNack} {
+		t.Run(string(operation), func(t *testing.T) {
+			client, runner, _ := newSettlementOrderingRunner(t)
+			canceled, cancel := context.WithCancel(context.Background())
+			cancel()
+			observer := &settlementContextObserver{next: canceled}
+			client.observer = observer
+			ctx, cancelCaller := context.WithTimeout(context.WithValue(t.Context(), settleCallerKey{}, "caller"), time.Minute)
+			defer cancelCaller()
+			settler := &contextCheckingSettler{}
+			message := driver.InboundMessage{Destination: "orders.in", Settle: settler}
+			state := &deliveryState{}
+			options := driver.NackOptions{Requeue: true}
+			if operation == SettleAck {
+				if !ackDeliveryAs(runner, ctx, message, false, state) {
+					t.Fatal("Ack did not settle with live caller context")
+				}
+			} else if err := nackDelivery(runner, ctx, message, options, state); err != nil {
+				t.Fatalf("Nack did not settle with live caller context: %v", err)
+			}
+			if !state.attempted || !state.settled {
+				t.Fatalf("settlement state = %#v, want attempted and settled", state)
+			}
+			nacks, acks, _ := settler.state()
+			if (operation == SettleAck && (acks != 1 || nacks != 0)) ||
+				(operation == SettleNack && (nacks != 1 || acks != 0 || settler.options != options)) {
+				t.Fatalf("accepted calls = Ack %d Nack %d options %#v", acks, nacks, settler.options)
+			}
+			deadline, _ := ctx.Deadline()
+			gotDeadline, ok := settler.ctx.Deadline()
+			if settler.ctx.Err() != nil || settler.ctx.Value(settleCallerKey{}) != "caller" || !ok || gotDeadline != deadline {
+				t.Fatal("settler lost the live caller's cancellation, values, or deadline")
+			}
+			starts, finishes := observer.settlePairs()
+			if len(starts) != 1 || len(finishes) != 1 || finishes[0].Outcome != ObserverOutcomeOK {
+				t.Fatalf("settle pairs = %#v / %#v, want one successful pair", starts, finishes)
+			}
+		})
+	}
+}
+
+func TestObserverLiveContextDoesNotOverrideCallerCancellation(t *testing.T) {
+	t.Run("publish", func(t *testing.T) {
+		observer := &settlementContextObserver{next: context.Background()}
+		producer := &recordingProducer{}
+		client := newPublishClient(t, producer, WithObserver(observer))
+		ctx, cancel := context.WithCancel(t.Context())
+		cancel()
+		_, err := client.Publisher().Publish(ctx, "orders.created.v1", "payload")
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("Publish error = %v, want caller cancellation", err)
+		}
+		if len(producer.messages) != 0 {
+			t.Fatal("canceled caller published a message")
+		}
+	})
+	t.Run("ack", func(t *testing.T) {
+		client, runner, _ := newSettlementOrderingRunner(t)
+		client.observer = &settlementContextObserver{next: context.Background()}
+		ctx, cancel := context.WithCancel(t.Context())
+		cancel()
+		settler := &contextCheckingSettler{}
+		state := &deliveryState{}
+		if ackDeliveryAs(runner, ctx, driver.InboundMessage{Settle: settler}, false, state) {
+			t.Fatal("Ack settled despite caller cancellation")
+		}
+		if !state.attempted || state.settled || !errors.Is(settler.ctx.Err(), context.Canceled) {
+			t.Fatalf("Ack state = %#v, context error = %v, want unsettled caller cancellation", state, settler.ctx.Err())
+		}
+		_, acks, _ := settler.state()
+		if acks != 0 {
+			t.Fatal("canceled caller acknowledged a message")
+		}
+	})
 }
 
 // TestRetriedDeliveryDoesNotCountAsHandled pins the report the reconnect
@@ -581,4 +694,127 @@ func TestCleanupRetriesAFailedAckInKindAfterTheRequeueFallback(t *testing.T) {
 	if !settler.acked || !state.settled {
 		t.Fatalf("acked = %v, settled = %v after Ack calls = %d and Nack calls = %d, want the ack retried in kind", settler.acked, state.settled, settler.ackCalls, settler.nackCalls)
 	}
+}
+
+// discardAckSettler adds transient Ack failures to the existing Nack script.
+// Hooks run without the mutex so a held Ack can be inspected by its test.
+type discardAckSettler struct {
+	scriptedNackSettler
+	failAcks int
+	options  driver.NackOptions
+}
+
+func (s *discardAckSettler) Ack(context.Context) error {
+	s.mu.Lock()
+	s.ackCalls++
+	call := s.ackCalls
+	hook := s.onAck
+	s.mu.Unlock()
+	if hook != nil {
+		hook()
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if call <= s.failAcks {
+		s.outstanding = true
+		return &driver.Error{Driver: "test", Op: "ack", K: driver.KindTransient, Err: errors.New("injected transient ack failure")}
+	}
+	s.outstanding = false
+	return nil
+}
+
+func (s *discardAckSettler) Nack(ctx context.Context, options driver.NackOptions) error {
+	s.mu.Lock()
+	s.options = options
+	s.mu.Unlock()
+	return s.scriptedNackSettler.Nack(ctx, options)
+}
+
+func TestDiscardCallbackIsSuppressedAfterRequeueFallback(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		failNacks int
+		wantAcks  int
+		wantNacks int
+	}{
+		{name: "requeue succeeds", wantAcks: 2, wantNacks: 1},
+		{name: "settlement budget exhausted", failNacks: settlementRetryAttempts, wantAcks: 1 + settlementRetryAttempts, wantNacks: settlementRetryAttempts},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				_, runner, _ := newSettlementOrderingRunner(t)
+				cause := errors.New("discard this event")
+				runner.subscription.Handlers = map[string]Handler{
+					"orders.created.v1": HandlerFunc(func(context.Context, *Event) error { return Drop(cause) }),
+				}
+				callbacks := 0
+				runner.subscription.OnDiscarded = func(context.Context, Discarded) { callbacks++ }
+				settler := &discardAckSettler{
+					scriptedNackSettler: scriptedNackSettler{failFirst: test.failNacks, outstanding: true},
+					failAcks:            1 + settlementRetryAttempts,
+				}
+				envelope := Envelope{SpecVersion: "1.0", ID: "discard-requeue", Source: "/test/orders", Type: "orders.created.v1", Priority: PriorityHigh, Attempt: 1}
+				message := retryBridgeMessage(t, envelope, settler)
+				processDelivery(runner, t.Context(), delivery{id: runner.inflight.Add(), message: message})
+				synctest.Wait()
+				nacks, acks, outstanding := settler.state()
+				if acks != test.wantAcks || nacks != test.wantNacks || !settler.options.Requeue {
+					t.Fatalf("settlement calls: acks=%d nacks=%d options=%+v, want acks=%d nacks=%d requeue", acks, nacks, settler.options, test.wantAcks, test.wantNacks)
+				}
+				if outstanding != (test.failNacks > 0) || runner.inflight.Len() != 0 {
+					t.Fatalf("outstanding=%t inflight=%d, want outstanding=%t inflight=0", outstanding, runner.inflight.Len(), test.failNacks > 0)
+				}
+				if callbacks != 0 {
+					t.Fatalf("OnDiscarded calls = %d, want 0 without a successful Ack", callbacks)
+				}
+			})
+		})
+	}
+}
+
+func TestDiscardCallbackFollowsDeferredAckSuccessOnce(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		_, runner, _ := newSettlementOrderingRunner(t)
+		cause := errors.New("discard this event")
+		runner.subscription.Handlers = map[string]Handler{
+			"orders.created.v1": HandlerFunc(func(context.Context, *Event) error { return Drop(cause) }),
+		}
+		var reports []Discarded
+		runner.subscription.OnDiscarded = func(_ context.Context, payload Discarded) { reports = append(reports, payload) }
+		started, release, done := make(chan struct{}), make(chan struct{}), make(chan struct{})
+		settler := &discardAckSettler{failAcks: 1}
+		settler.onAck = func() {
+			_, acks, _ := settler.state()
+			if acks == 2 {
+				close(started)
+				<-release
+			}
+		}
+		envelope := Envelope{SpecVersion: "1.0", ID: "discard-deferred", Source: "/test/orders", Type: "orders.created.v1", Priority: PriorityHigh, Attempt: 1}
+		message := retryBridgeMessage(t, envelope, settler)
+		go func() {
+			defer close(done)
+			processDelivery(runner, t.Context(), delivery{id: runner.inflight.Add(), message: message})
+		}()
+		<-started
+		synctest.Wait()
+		beforeSuccess := len(reports)
+		close(release)
+		<-done
+		synctest.Wait()
+		if beforeSuccess != 0 {
+			t.Errorf("OnDiscarded calls before deferred Ack success = %d, want 0", beforeSuccess)
+		}
+		if len(reports) != 1 {
+			t.Fatalf("OnDiscarded calls after deferred Ack success = %d, want 1", len(reports))
+		}
+		got := reports[0]
+		if got.Envelope.ID != envelope.ID || string(got.Body) != string(message.Body) || got.Reason != DiscardDropped || !errors.Is(got.Err, cause) {
+			t.Fatalf("discard payload = %+v, want original envelope/body/drop cause", got)
+		}
+		nacks, acks, outstanding := settler.state()
+		if acks != 2 || nacks != 0 || outstanding || runner.inflight.Len() != 0 {
+			t.Fatalf("settlement: acks=%d nacks=%d outstanding=%t inflight=%d, want 2, 0, false, 0", acks, nacks, outstanding, runner.inflight.Len())
+		}
+	})
 }

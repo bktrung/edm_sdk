@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -132,6 +133,17 @@ type reconnectTestConn struct {
 	// the rest of this file is about what the core does with the count, not
 	// about what the driver refuses.
 	refuseCloseWithConsumers atomic.Bool
+	producerCloseCalls       atomic.Int32
+	closeCalls               atomic.Int32
+	producersAtClose         atomic.Int32
+	previousOpenAtClose      atomic.Int32
+	closeMu                  sync.Mutex
+	producerGate             <-chan struct{}
+	producerEntered          chan struct{}
+	producerFailures         int
+	producerErr              error
+	closeFailures            int
+	closeErr                 error
 }
 
 func (c *reconnectTestConn) Capabilities() driver.Capabilities { return c.driver.Capabilities() }
@@ -188,14 +200,32 @@ func (c *reconnectTestConn) Consumer(ctx context.Context, cfg driver.ConsumerCon
 func (c *reconnectTestConn) Admin() driver.Admin      { return c.admin }
 func (*reconnectTestConn) Ping(context.Context) error { return nil }
 func (c *reconnectTestConn) Close(context.Context) error {
+	c.closeCalls.Add(1)
 	c.driver.mu.Lock()
 	gate := c.driver.firstCloseGate
 	first := len(c.driver.connections) > 0 && c.driver.connections[0] == c
+	for _, previous := range c.driver.connections {
+		if previous == c {
+			break
+		}
+		if !previous.closed.Load() {
+			c.previousOpenAtClose.Add(1)
+		}
+	}
 	c.driver.mu.Unlock()
 	if gate != nil && first {
 		c.driver.firstCloseEntered.Store(true)
 		<-gate
 	}
+	c.producersAtClose.Store(c.producer.Load())
+	c.closeMu.Lock()
+	if c.closeFailures > 0 {
+		c.closeFailures--
+		err := c.closeErr
+		c.closeMu.Unlock()
+		return err
+	}
+	c.closeMu.Unlock()
 	c.openAtClose.Store(c.openConsumers.Load())
 	if c.refuseCloseWithConsumers.Load() && c.openConsumers.Load() > 0 {
 		return &driver.Error{
@@ -257,6 +287,7 @@ func (*reconnectTestAdmin) Prune(context.Context, []string) ([]driver.PruneResul
 
 type reconnectTestProducer struct {
 	conn *reconnectTestConn
+	once sync.Once
 }
 
 func (p *reconnectTestProducer) Publish(context.Context, ...driver.OutboundMessage) error {
@@ -264,7 +295,27 @@ func (p *reconnectTestProducer) Publish(context.Context, ...driver.OutboundMessa
 }
 
 func (p *reconnectTestProducer) Close(context.Context) error {
-	p.conn.producer.Add(-1)
+	c := p.conn
+	c.producerCloseCalls.Add(1)
+	c.closeMu.Lock()
+	gate, entered := c.producerGate, c.producerEntered
+	c.producerEntered = nil
+	failing := c.producerFailures > 0
+	if failing {
+		c.producerFailures--
+	}
+	err := c.producerErr
+	c.closeMu.Unlock()
+	if entered != nil {
+		close(entered)
+	}
+	if gate != nil {
+		<-gate
+	}
+	if failing {
+		return err
+	}
+	p.once.Do(func() { c.producer.Add(-1) })
 	return nil
 }
 
@@ -298,6 +349,7 @@ type reconnectTestConsumer struct {
 	// connection the consumer is still registered on.
 	releaseHold    chan struct{}
 	releaseEntered chan struct{}
+	releaseCalls   atomic.Int32
 }
 
 func (c *reconnectTestConsumer) Messages() <-chan driver.InboundMessage { return c.messages }
@@ -363,6 +415,7 @@ func (c *reconnectTestConsumer) Stop(context.Context) error {
 }
 
 func (c *reconnectTestConsumer) Release(context.Context) error {
+	c.releaseCalls.Add(1)
 	if c.drainRelease != nil {
 		return nil
 	}
@@ -445,6 +498,15 @@ type recordingClock struct {
 	mu           sync.Mutex
 	sleeps       []time.Duration
 	sleepStarted chan chan struct{}
+	timerStarted chan time.Duration
+}
+
+func (c *recordingClock) Timer(duration time.Duration) clock.Timer {
+	timer := c.Fake.Timer(duration)
+	if c.timerStarted != nil {
+		c.timerStarted <- duration
+	}
+	return timer
 }
 
 func (c *recordingClock) Sleep(ctx context.Context, duration time.Duration) error {
@@ -1098,24 +1160,405 @@ func TestFatalConsumerErrorStopsOnlyItsRunner(t *testing.T) {
 }
 
 func TestAHungRetiredConnectionCloseEndsTheReconnectAndCloseWaitsForIt(t *testing.T) {
-	d := &reconnectTestDriver{created: make(chan *reconnectTestConsumer, 1), firstCloseGate: make(chan struct{})}
-	client := newReconnectTestClient(t, d, nil, 0)
-	t.Cleanup(func() { close(d.firstCloseGate) })
-	cause := &driver.Error{Driver: d.Name(), Op: "publish", K: driver.KindTransient, Err: errors.New("connection reset")}
-	if err := client.requestReconnect(cause, 1); err != nil {
+	client, d, recorded := newRetirementTestClient(t)
+	d.firstCloseGate = make(chan struct{})
+	var once sync.Once
+	release := func() { once.Do(func() { close(d.firstCloseGate) }) }
+	t.Cleanup(release)
+	old := retirementConnection(d, 0)
+	beginRetirementReconnect(t, client, recorded)
+	waitReconnectCondition(t, d.firstCloseEntered.Load)
+	expireRetirementWait(t, client, recorded)
+	if err := timedRetirementClose(t, client, recorded); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Close while old connection hangs = %v, want deadline", err)
+	}
+	if retirementConnection(d, 1).closeCalls.Load() != 0 {
+		t.Fatal("current connection closed while retired connection hangs")
+	}
+	release()
+	if err := client.Close(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	waitReconnectCondition(t, d.firstCloseEntered.Load)
-	// The new connection is installed; a retired connection whose Close hangs
-	// must not keep the client reconnecting past the close bound.
-	waitReconnectCondition(t, func() bool { return !client.isReconnecting() })
-	if err := client.Close(context.Background()); err != nil {
-		t.Fatalf("Close() error = %v", err)
+	if old.closeCalls.Load() != 1 || !old.closed.Load() {
+		t.Fatalf("old connection calls = %d, closed = %v", old.closeCalls.Load(), old.closed.Load())
 	}
-	select {
-	case <-client.supervisorDone:
-	default:
-		t.Fatal("Close() returned while the reconnect supervisor was still running")
+	if retirementConnection(d, 1).previousOpenAtClose.Load() != 0 {
+		t.Fatal("current connection close entered before retirement completed")
+	}
+}
+
+func newRetirementTestClient(t *testing.T) (*Client, *reconnectTestDriver, *recordingClock) {
+	t.Helper()
+	recorded := &recordingClock{
+		Fake:         clock.NewFake(time.Unix(940, 0)),
+		sleepStarted: make(chan chan struct{}, 8),
+		timerStarted: make(chan time.Duration, 64),
+	}
+	d := &reconnectTestDriver{created: make(chan *reconnectTestConsumer, 8)}
+	client := newReconnectTestClient(t, d, recorded, 0)
+	client.reconnectRandom = func() float64 { return 0 }
+	publishRetirementMessage(t, client)
+	return client, d, recorded
+}
+
+func publishRetirementMessage(t *testing.T, client *Client) {
+	t.Helper()
+	if _, err := client.Publisher().Publish(context.Background(), "orders.created", map[string]string{"value": "retirement"}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func retirementConnection(d *reconnectTestDriver, index int) *reconnectTestConn {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.connections[index]
+}
+
+func holdRetirementProducer(t *testing.T, conn *reconnectTestConn) (<-chan struct{}, func()) {
+	t.Helper()
+	gate, entered := make(chan struct{}), make(chan struct{})
+	conn.closeMu.Lock()
+	conn.producerGate, conn.producerEntered = gate, entered
+	conn.closeMu.Unlock()
+	var once sync.Once
+	release := func() { once.Do(func() { close(gate) }) }
+	t.Cleanup(release)
+	return entered, release
+}
+
+func awaitRetirementSignal(t *testing.T, signal <-chan struct{}) {
+	t.Helper()
+	waitReconnectCondition(t, func() bool {
+		select {
+		case <-signal:
+			return true
+		default:
+			return false
+		}
+	})
+}
+
+func nextRetirementTimer(t *testing.T, recorded *recordingClock) time.Duration {
+	t.Helper()
+	waitReconnectCondition(t, func() bool { return len(recorded.timerStarted) > 0 })
+	return <-recorded.timerStarted
+}
+
+func beginRetirementReconnect(t *testing.T, client *Client, recorded *recordingClock) {
+	t.Helper()
+	client.mu.Lock()
+	epoch := client.current.epoch
+	client.mu.Unlock()
+	if err := client.requestReconnect(errors.New("retirement transport failure"), epoch); err != nil {
+		t.Fatal(err)
+	}
+	waitReconnectCondition(t, func() bool { return len(recorded.sleepStarted) > 0 })
+	awaitRetirementSignal(t, <-recorded.sleepStarted)
+	// Publish quiescence has finished before the backoff registers. Discard
+	// its stopped timer so the next signal identifies this retirement's wait.
+	for len(recorded.timerStarted) > 0 {
+		<-recorded.timerStarted
+	}
+	recorded.Advance(0)
+}
+
+func expireRetirementWait(t *testing.T, client *Client, recorded *recordingClock) {
+	t.Helper()
+	if duration := nextRetirementTimer(t, recorded); duration != 100*time.Millisecond {
+		t.Fatalf("retirement timer = %v, want close bound", duration)
+	}
+	// The held driver entry identifies the unfinished stage. A baseline
+	// retirement can have left a stopped producer timer in the event queue
+	// before registering its held connection timer.
+	waitReconnectCondition(t, func() bool { return recorded.NumWaiters() == 1 })
+	recorded.Advance(100 * time.Millisecond)
+	waitReconnectCondition(t, func() bool { return !client.isReconnecting() })
+}
+
+func timedRetirementClose(t *testing.T, client *Client, recorded *recordingClock) error {
+	t.Helper()
+	for len(recorded.timerStarted) > 0 {
+		<-recorded.timerStarted
+	}
+	closed := make(chan error, 1)
+	go func() { closed <- client.Close(context.Background()) }()
+	// The first timer belongs to the supervisor barrier. Its completion
+	// precedes the second registration, the pending retirement join.
+	_ = nextRetirementTimer(t, recorded)
+	waitReconnectCondition(t, func() bool {
+		select {
+		case <-client.supervisorDone:
+			return true
+		default:
+			return false
+		}
+	})
+	waitReconnectCondition(t, func() bool { return len(recorded.timerStarted) > 0 || len(closed) > 0 })
+	if len(closed) == 0 {
+		if duration := nextRetirementTimer(t, recorded); duration != 100*time.Millisecond {
+			t.Fatalf("Close timer = %v, want close bound", duration)
+		}
+		recorded.Advance(100 * time.Millisecond)
+	}
+	waitReconnectCondition(t, func() bool { return len(closed) > 0 })
+	return <-closed
+}
+
+func keptRetirementConsumer(t *testing.T, client *Client, conn *reconnectTestConn, epoch uint64) *reconnectTestConsumer {
+	t.Helper()
+	consumer, err := conn.Consumer(context.Background(), driver.ConsumerConfig{Group: "kept"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	client.keepUnreleasedConsumer(consumer, epoch)
+	t.Cleanup(func() { _ = consumer.Release(context.Background()) })
+	return consumer.(*reconnectTestConsumer)
+}
+
+func TestRetiredProducerTimeoutKeepsConnectionCloseOrdered(t *testing.T) {
+	client, d, recorded := newRetirementTestClient(t)
+	old := retirementConnection(d, 0)
+	consumer := keptRetirementConsumer(t, client, old, 1)
+	entered, release := holdRetirementProducer(t, old)
+	beginRetirementReconnect(t, client, recorded)
+	awaitRetirementSignal(t, entered)
+	expireRetirementWait(t, client, recorded)
+	if d.OpenCount() != 2 || old.producerCloseCalls.Load() != 1 {
+		t.Fatal("reconnect did not install one replacement with one pending producer close")
+	}
+	if consumer.releaseCalls.Load() != 0 || old.closeCalls.Load() != 0 {
+		t.Fatalf("teardown overtook producer: releases = %d, connection closes = %d", consumer.releaseCalls.Load(), old.closeCalls.Load())
+	}
+	release()
+	if err := client.Close(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if consumer.releaseCalls.Load() != 1 || old.closeCalls.Load() != 1 || old.producersAtClose.Load() != 0 || old.openAtClose.Load() != 0 {
+		t.Fatal("retirement did not release consumer and close connection once after producer success")
+	}
+}
+
+func TestClientCloseRejoinsPendingRetirement(t *testing.T) {
+	baseline := runtime.NumGoroutine()
+	client, d, recorded := newRetirementTestClient(t)
+	old := retirementConnection(d, 0)
+	entered, release := holdRetirementProducer(t, old)
+	beginRetirementReconnect(t, client, recorded)
+	awaitRetirementSignal(t, entered)
+	expireRetirementWait(t, client, recorded)
+	publishRetirementMessage(t, client)
+	current := retirementConnection(d, 1)
+	if err := timedRetirementClose(t, client, recorded); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Close while producer hangs = %v, want deadline", err)
+	}
+	if old.producerCloseCalls.Load() != 1 || old.closeCalls.Load() != 0 || current.producerCloseCalls.Load() != 0 || current.closeCalls.Load() != 0 {
+		t.Fatal("Close duplicated pending work or tore down current resources")
+	}
+	release()
+	if err := client.Close(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if old.producerCloseCalls.Load() != 1 || old.closeCalls.Load() != 1 || current.closeCalls.Load() != 1 {
+		t.Fatal("retry did not rejoin the single retirement attempt and close both epochs")
+	}
+	if current.previousOpenAtClose.Load() != 0 {
+		t.Fatal("current connection close entered before retirement completed")
+	}
+	assertRetirementGoroutinesReturned(t, baseline)
+}
+
+func assertRetirementGoroutinesReturned(t *testing.T, baseline int) {
+	t.Helper()
+	deadline := clock.NewReal().Timer(2 * time.Second)
+	defer deadline.Stop()
+	poll := clock.NewReal().Ticker(5 * time.Millisecond)
+	defer poll.Stop()
+	for {
+		current := runtime.NumGoroutine()
+		if current <= baseline {
+			return
+		}
+		select {
+		case <-deadline.C:
+			buf := make([]byte, 1<<20)
+			n := runtime.Stack(buf, true)
+			var stacks []string
+			for _, stack := range strings.Split(string(buf[:n]), "\n\n") {
+				lines := strings.Split(stack, "\n")
+				for i := 1; i+1 < len(lines); i++ {
+					if strings.HasPrefix(lines[i], "created by ") {
+						break
+					}
+					source := strings.TrimSpace(lines[i+1])
+					if strings.Contains(lines[i], "fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk") && strings.Contains(source, ".go:") && !strings.Contains(source, "_test.go:") {
+						stacks = append(stacks, stack)
+						break
+					}
+				}
+			}
+			t.Fatalf("goroutines after Close = %d, baseline = %d\nmodule-owned goroutine stacks:\n%s", current, baseline, strings.Join(stacks, "\n\n"))
+		case <-poll.C:
+		}
+	}
+}
+
+func TestClientCloseRetriesFailedRetirement(t *testing.T) {
+	for _, stage := range []string{"producer", "consumer release", "connection"} {
+		t.Run(stage, func(t *testing.T) {
+			client, d, recorded := newRetirementTestClient(t)
+			old := retirementConnection(d, 0)
+			consumer := keptRetirementConsumer(t, client, old, 1)
+			failure := errors.New(stage + " retirement failed")
+			switch stage {
+			case "producer":
+				old.producerFailures, old.producerErr = 3, failure
+			case "consumer release":
+				consumer.setFailRelease(3, failure)
+			case "connection":
+				old.closeFailures, old.closeErr = 3, failure
+			}
+			t.Cleanup(func() {
+				old.closeMu.Lock()
+				old.producerFailures, old.closeFailures = 0, 0
+				old.closeMu.Unlock()
+				consumer.setFailRelease(0, nil)
+			})
+			beginRetirementReconnect(t, client, recorded)
+			waitReconnectCondition(t, func() bool { return !client.isReconnecting() })
+			publishRetirementMessage(t, client)
+			current := retirementConnection(d, 1)
+			assertCalls := func(attempt int32) {
+				t.Helper()
+				producer, releases, connection := int32(1), int32(1), int32(0)
+				switch stage {
+				case "producer":
+					producer, releases = attempt, 0
+				case "consumer release":
+					releases = attempt
+				case "connection":
+					connection = attempt
+				}
+				if old.producerCloseCalls.Load() != producer || consumer.releaseCalls.Load() != releases || old.closeCalls.Load() != connection {
+					t.Fatalf("attempt %d: producer/release/connection = %d/%d/%d, want %d/%d/%d", attempt, old.producerCloseCalls.Load(), consumer.releaseCalls.Load(), old.closeCalls.Load(), producer, releases, connection)
+				}
+				if current.producerCloseCalls.Load() != 0 || current.closeCalls.Load() != 0 {
+					t.Fatal("failed retirement closed current resources")
+				}
+			}
+			assertCalls(1)
+			recorded.Advance(time.Hour)
+			assertCalls(1)
+			for attempt := int32(2); attempt <= 3; attempt++ {
+				if err := client.Close(context.Background()); !errors.Is(err, failure) {
+					t.Fatalf("Close attempt %d = %v, want retirement failure", attempt, err)
+				}
+				assertCalls(attempt)
+				recorded.Advance(time.Hour)
+				assertCalls(attempt)
+			}
+			if err := client.Close(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			wantProducer, wantRelease, wantConnection := int32(1), int32(1), int32(1)
+			switch stage {
+			case "producer":
+				wantProducer = 4
+			case "consumer release":
+				wantRelease = 4
+			case "connection":
+				wantConnection = 4
+			}
+			if old.producerCloseCalls.Load() != wantProducer || consumer.releaseCalls.Load() != wantRelease || old.closeCalls.Load() != wantConnection || !old.closed.Load() || current.closeCalls.Load() != 1 {
+				t.Fatal("successful retry did not skip completed stages and finish both epochs")
+			}
+			if old.producersAtClose.Load() != 0 || old.openAtClose.Load() != 0 || d.OpenCount() != 2 {
+				t.Fatal("retirement violated dependency order or retried reconnect")
+			}
+		})
+	}
+}
+
+func TestRetirementsKeepEveryEpochOwned(t *testing.T) {
+	client, d, recorded := newRetirementTestClient(t)
+	first := retirementConnection(d, 0)
+	firstEntered, releaseFirst := holdRetirementProducer(t, first)
+	beginRetirementReconnect(t, client, recorded)
+	awaitRetirementSignal(t, firstEntered)
+	expireRetirementWait(t, client, recorded)
+	publishRetirementMessage(t, client)
+	second := retirementConnection(d, 1)
+	secondEntered, releaseSecond := holdRetirementProducer(t, second)
+	beginRetirementReconnect(t, client, recorded)
+	awaitRetirementSignal(t, secondEntered)
+	expireRetirementWait(t, client, recorded)
+	if first.closeCalls.Load() != 0 || second.closeCalls.Load() != 0 {
+		t.Fatal("an old connection closed before its producer")
+	}
+	releaseSecond()
+	waitReconnectCondition(t, second.closed.Load)
+	current := retirementConnection(d, 2)
+	if err := timedRetirementClose(t, client, recorded); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Close with epoch 1 pending = %v, want deadline", err)
+	}
+	if first.closeCalls.Load() != 0 || current.closeCalls.Load() != 0 || second.closeCalls.Load() != 1 {
+		t.Fatal("out-of-order completion lost or duplicated a retirement")
+	}
+	releaseFirst()
+	if err := client.Close(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	for _, conn := range []*reconnectTestConn{first, second} {
+		if conn.producerCloseCalls.Load() != 1 || conn.closeCalls.Load() != 1 || conn.producersAtClose.Load() != 0 || !conn.closed.Load() {
+			t.Fatal("stacked retirement was not closed once after its producer")
+		}
+	}
+	if current.closeCalls.Load() != 1 || current.previousOpenAtClose.Load() != 0 {
+		t.Fatal("current epoch was not closed after both retirements")
+	}
+}
+
+func TestCloseJoinsRetirementBetweenProducerAndConnection(t *testing.T) {
+	client, d, recorded := newRetirementTestClient(t)
+	d.firstCloseGate = make(chan struct{})
+	var once sync.Once
+	release := func() { once.Do(func() { close(d.firstCloseGate) }) }
+	t.Cleanup(release)
+	old := retirementConnection(d, 0)
+	beginRetirementReconnect(t, client, recorded)
+	waitReconnectCondition(t, d.firstCloseEntered.Load)
+	if old.producerCloseCalls.Load() != 1 || old.producer.Load() != 0 {
+		t.Fatal("connection close entered before producer completed")
+	}
+	expireRetirementWait(t, client, recorded)
+	closed := make(chan error, 1)
+	go func() { closed <- client.Close(context.Background()) }()
+	_ = nextRetirementTimer(t, recorded)
+	waitReconnectCondition(t, func() bool {
+		select {
+		case <-client.supervisorDone:
+			return true
+		default:
+			return false
+		}
+	})
+	waitReconnectCondition(t, func() bool { return len(recorded.timerStarted) > 0 || len(closed) > 0 })
+	if len(closed) > 0 {
+		t.Fatalf("Close returned before retired connection completed: %v", <-closed)
+	}
+	_ = nextRetirementTimer(t, recorded)
+	if old.closeCalls.Load() != 1 || retirementConnection(d, 1).closeCalls.Load() != 0 {
+		t.Fatal("Close duplicated old connection close or closed current connection early")
+	}
+	release()
+	waitReconnectCondition(t, func() bool { return len(closed) > 0 })
+	if err := <-closed; err != nil {
+		t.Fatal(err)
+	}
+	if old.producerCloseCalls.Load() != 1 || old.closeCalls.Load() != 1 || !old.closed.Load() {
+		t.Fatal("Close did not join the single sequential retirement")
+	}
+	if retirementConnection(d, 1).previousOpenAtClose.Load() != 0 {
+		t.Fatal("current connection close entered before retirement completed")
 	}
 }
 

@@ -69,9 +69,11 @@ type deliveryState struct {
 	settled   bool
 	// operation records which settlement call was last made, so that a failed
 	// one can be retried in kind rather than guessed at.
-	operation   settlementOperation
-	nackOptions driver.NackOptions
-	poisonDrop  *poisonDropReport
+	operation      settlementOperation
+	nackOptions    driver.NackOptions
+	poisonDrop     *poisonDropReport
+	discard        Discarded
+	discardPending bool
 	// processCtx carries the context Start of ObserverProcess returned, stored
 	// only when an observer is set. The successor publish start uses it as its
 	// context when set and the context at hand otherwise.
@@ -1990,18 +1992,11 @@ func retryDeliverySettlement(r *Runner, ctx context.Context, message driver.Inbo
 		case settlementOperationAck:
 			ackDelivery(r, sctx, message, state)
 			if state.settled {
-				reportPendingPoisonDrop(r, sctx, message, state)
 				return
 			}
 			_ = nackDelivery(r, sctx, message, driver.NackOptions{Requeue: true}, state)
-			if state.settled {
-				state.poisonDrop = nil
-			}
 		case settlementOperationNack:
 			_ = nackDelivery(r, sctx, message, state.nackOptions, state)
-			if state.settled {
-				state.poisonDrop = nil
-			}
 		default:
 			return
 		}
@@ -2062,8 +2057,7 @@ func dispatchMessage(r *Runner, ctx context.Context, message driver.InboundMessa
 		if r.subscription.UnmatchedPolicy == DeadLetter {
 			return deadLetterAndSettle(r, ctx, message, envelope, ReasonUnmatched, errors.New("no handler matched event type"), state)
 		}
-		runnerNotifyDiscarded(r, runnerSettlementContext(r, ctx), discardUnmatched(envelope, append([]byte(nil), message.Body...)))
-		return ackDelivery(r, runnerSettlementContext(r, ctx), message, state)
+		return discardAndSettle(r, runnerSettlementContext(r, ctx), message, discardUnmatched(envelope, nil), state)
 	}
 	eventEnvelope := envelope
 	eventEnvelope.MaxAttempts = maxAttempts
@@ -2086,8 +2080,7 @@ func dispatchMessage(r *Runner, ctx context.Context, message driver.InboundMessa
 	outcome := classifyRetryError(result.err)
 	switch outcome {
 	case retryOutcomeDrop:
-		runnerNotifyDiscarded(r, runnerSettlementContext(r, ctx), Discarded{Envelope: envelope, Body: append([]byte(nil), message.Body...), Reason: DiscardDropped, Err: result.err})
-		return ackDelivery(r, runnerSettlementContext(r, ctx), message, state)
+		return discardAndSettle(r, runnerSettlementContext(r, ctx), message, Discarded{Envelope: envelope, Reason: DiscardDropped, Err: result.err}, state)
 	case retryOutcomeTerminal:
 		return deadLetterAndSettle(r, ctx, message, envelope, ReasonTerminal, result.err, state)
 	}
@@ -2402,6 +2395,15 @@ func runnerIsDraining(r *Runner) bool {
 
 // --- Settlement primitives ---
 
+func discardAndSettle(r *Runner, ctx context.Context, message driver.InboundMessage, payload Discarded, state *deliveryState) bool {
+	if r.subscription.OnDiscarded != nil {
+		payload.Body = append([]byte(nil), message.Body...)
+		state.discard = payload
+		state.discardPending = true
+	}
+	return ackDelivery(r, ctx, message, state)
+}
+
 // ackDelivery acknowledges the delivery, recording the outcome on state. state
 // is required: it is the delivery's own settlement bookkeeping, and the
 // deferred cleanup reads the operation it records here.
@@ -2410,12 +2412,11 @@ func ackDelivery(r *Runner, ctx context.Context, message driver.InboundMessage, 
 }
 
 // startSettleObservation starts one settle pair for a single broker settle
-// call. It returns the context to settle on, the guard for its finish, the
-// finish identity, and whether observation is on. A nil runner or a nil
-// observer settles on the caller context with no observation.
-func startSettleObservation(r *Runner, ctx context.Context, message driver.InboundMessage, op SettleOperation, state *deliveryState) (context.Context, observerFinishGuard, FinishEvent, bool) {
+// call. It returns the guard for its finish, the finish identity, and whether
+// observation is on. A nil runner or a nil observer starts nothing.
+func startSettleObservation(r *Runner, ctx context.Context, message driver.InboundMessage, op SettleOperation, state *deliveryState) (observerFinishGuard, FinishEvent, bool) {
 	if r == nil || r.client == nil || r.client.observer == nil {
-		return ctx, observerFinishGuard{}, FinishEvent{}, false
+		return observerFinishGuard{}, FinishEvent{}, false
 	}
 	topic, priority := runnerDestinationObservation(r, message.Destination)
 	start := StartEvent{
@@ -2428,7 +2429,7 @@ func startSettleObservation(r *Runner, ctx context.Context, message driver.Inbou
 		Destination:   message.Destination,
 		Operation:     op,
 	}
-	nextCtx, token := r.client.observeStart(ctx, start)
+	_, token := r.client.observeStart(ctx, start)
 	guard := r.client.newObserverGuard(ObserverSettle, token)
 	base := FinishEvent{
 		Topic:         topic,
@@ -2437,7 +2438,7 @@ func startSettleObservation(r *Runner, ctx context.Context, message driver.Inbou
 		Priority:      priority,
 		Destination:   message.Destination,
 	}
-	return nextCtx, guard, base, true
+	return guard, base, true
 }
 
 // finishSettleObservation emits the settle finish for one broker settle call.
@@ -2462,11 +2463,11 @@ func ackDeliveryAs(r *Runner, ctx context.Context, message driver.InboundMessage
 		return false
 	}
 	state.operation = settlementOperationAck
-	settleCtx, settleGuard, settleBase, observed := startSettleObservation(r, ctx, message, SettleAck, state)
+	settleGuard, settleBase, observed := startSettleObservation(r, ctx, message, SettleAck, state)
 	if observed {
 		defer settleGuard.abandon()
 	}
-	err := message.Settle.Ack(settleCtx)
+	err := message.Settle.Ack(ctx)
 	state.attempted = true
 	state.settled = err == nil
 	if observed {
@@ -2474,6 +2475,9 @@ func ackDeliveryAs(r *Runner, ctx context.Context, message driver.InboundMessage
 	}
 	if r != nil && state.settled && handled {
 		r.report(runnerEvent{kind: runnerEventHandledDelivery})
+	}
+	if state.settled {
+		reportPendingAfterAck(r, ctx, message, state)
 	}
 	return state.settled
 }
@@ -2487,15 +2491,20 @@ func nackDelivery(r *Runner, ctx context.Context, message driver.InboundMessage,
 	}
 	state.operation = settlementOperationNack
 	state.nackOptions = options
-	settleCtx, settleGuard, settleBase, observed := startSettleObservation(r, ctx, message, SettleNack, state)
+	settleGuard, settleBase, observed := startSettleObservation(r, ctx, message, SettleNack, state)
 	if observed {
 		defer settleGuard.abandon()
 	}
-	err := message.Settle.Nack(settleCtx, options)
+	err := message.Settle.Nack(ctx, options)
 	state.attempted = true
 	state.settled = err == nil
 	if observed {
 		finishSettleObservation(&settleGuard, settleBase, err)
+	}
+	if state.settled {
+		state.poisonDrop = nil
+		state.discard = Discarded{}
+		state.discardPending = false
 	}
 	return err
 }
@@ -2571,12 +2580,7 @@ func deadLetterAndSettle(r *Runner, ctx context.Context, message driver.InboundM
 			failSuccessorHandoff(r, runnerSettlementContext(r, ctx), "dead_letter", eventFromDelivery(r, message, envelope), err)
 			return false
 		}
-		sctx := runnerSettlementContext(r, ctx)
-		settled := ackDeliveryAs(r, sctx, message, true, state)
-		if settled {
-			reportPendingPoisonDrop(r, sctx, message, state)
-		}
-		return settled
+		return ackDeliveryAs(r, runnerSettlementContext(r, ctx), message, true, state)
 	}
 	return ackDeliveryAs(r, runnerSettlementContext(r, ctx), message, false, state)
 }
@@ -2639,13 +2643,23 @@ func reportPoisonDrop(r *Runner, ctx context.Context, message driver.InboundMess
 	runnerNotifyError(r, ctx, eventFromDelivery(r, message, report.envelope), dropErr)
 }
 
-func reportPendingPoisonDrop(r *Runner, ctx context.Context, message driver.InboundMessage, state *deliveryState) {
-	if state == nil || state.poisonDrop == nil {
+func reportPendingAfterAck(r *Runner, ctx context.Context, message driver.InboundMessage, state *deliveryState) {
+	if state == nil {
 		return
 	}
-	report := *state.poisonDrop
+	poison := state.poisonDrop
+	discard, discardPending := state.discard, state.discardPending
+	// Consume intent before scheduling callbacks; subsequent settlement cleanup
+	// must not report the same delivery a second time.
 	state.poisonDrop = nil
-	reportPoisonDrop(r, ctx, message, report)
+	state.discard = Discarded{}
+	state.discardPending = false
+	if poison != nil {
+		reportPoisonDrop(r, ctx, message, *poison)
+	}
+	if discardPending {
+		runnerNotifyDiscarded(r, ctx, discard)
+	}
 }
 
 // deadLetter republishes message to its dead-letter destination, carrying
