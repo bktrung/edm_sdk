@@ -330,7 +330,8 @@ one lives in the code.
   (`target`) translates a delayed destination into parking publication.
 - **Kafka retry delays**: `drivers/kafka/deferral.go` (`dueTime`,
   `admissionLocked`, `setHeadHoldLocked`, `syncHeadTimerLocked`,
-  `headHoldLoop`); `drivers/kafka/consumer.go` (the poll loop's head admission,
+  `armHeadTimerLocked`, `rearmHeadTimerLocked`, `headHoldLoop`);
+  `drivers/kafka/consumer.go` (the poll loop's head admission,
   `completeSettlement`); `driver/driver.go` (`ConsumerConfig.Delays`).
 - **RabbitMQ publish channels**: `drivers/rabbitmq/producer.go`
   (`publishChannelCount`, `publishSegment`, `reserve`, `channelIn`, `write`,
