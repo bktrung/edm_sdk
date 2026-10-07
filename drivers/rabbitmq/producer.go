@@ -273,7 +273,10 @@ func (p *producer) publishSegment(ctx context.Context, msgs []driver.OutboundMes
 	for offset, message := range msgs[base:] {
 		publishing, err := amqpPublishing(message)
 		if err != nil {
-			failed[base+offset] = classify("publish", driver.KindFatal, err)
+			// amqpPublishing classifies the refusal, so a message over the
+			// short-string limit fails alone as too large while the messages
+			// around it still publish.
+			failed[base+offset] = err
 			consumed = offset + 1
 			continue
 		}
@@ -791,6 +794,14 @@ func declareArgumentsText(args amqp.Table) string {
 	return strings.Join(parts, ", ")
 }
 
+// maxShortStringBytes is the longest value an AMQP short string carries: the
+// length prefix of its wire form is one byte.
+const maxShortStringBytes = 255
+
+// amqpPublishing encodes one outbound message as an AMQP publishing, or returns
+// a classified error for a message AMQP cannot encode. The error is classified
+// here rather than at the call site because it decides the caller-visible kind:
+// a message over the short-string limit is one the broker can never accept.
 func amqpPublishing(message driver.OutboundMessage) (amqp.Publishing, error) {
 	headers := make(amqp.Table, len(message.Headers)+1)
 	publishing := amqp.Publishing{
@@ -814,7 +825,8 @@ func amqpPublishing(message driver.OutboundMessage) (amqp.Publishing, error) {
 		case wire.Time:
 			parsed, err := time.Parse(time.RFC3339Nano, value)
 			if err != nil {
-				return amqp.Publishing{}, fmt.Errorf("invalid time header: %w", err)
+				return amqp.Publishing{}, classify("publish", driver.KindFatal,
+					fmt.Errorf("invalid time header: %w", err))
 			}
 			publishing.Timestamp = parsed
 			headers["cloudEvents:time"] = value
@@ -826,7 +838,38 @@ func amqpPublishing(message driver.OutboundMessage) (amqp.Publishing, error) {
 		case wire.CorrelationID:
 			publishing.CorrelationId = value
 		default:
-			headers["cloudEvents:"+header.Key] = value
+			key := "cloudEvents:" + header.Key
+			if len(key) > maxShortStringBytes {
+				return amqp.Publishing{}, classify("publish", driver.KindTooLarge,
+					fmt.Errorf("header key is %d bytes, over the AMQP short-string limit of %d",
+						len(key), maxShortStringBytes))
+			}
+			headers[key] = value
+		}
+	}
+	// These four are the AMQP short-string properties this encoder fills. The
+	// client refuses a value over 255 bytes while serializing the header,
+	// after the publish method frame is already on the wire, and shuts the
+	// whole connection down for that write error (amqp091-go writeShortstr and
+	// sendUnflushed): one oversized property would take every call sharing the
+	// connection with it, and the plain error reads transient, so a retrying
+	// caller would loop. Refusing the message here, before any channel is
+	// touched, keeps the failure on the message that caused it. KindTooLarge
+	// says the message can never be accepted, which is what lets the core drop
+	// an unpublishable successor copy once instead of stopping the
+	// subscription. The error names the property and its length and never
+	// quotes the value, so a credential or payload in a property cannot reach a
+	// log or an error report through it.
+	for _, property := range [...]struct{ name, value string }{
+		{"CorrelationId", publishing.CorrelationId},
+		{"MessageId", publishing.MessageId},
+		{"Type", publishing.Type},
+		{"ContentType", publishing.ContentType},
+	} {
+		if len(property.value) > maxShortStringBytes {
+			return amqp.Publishing{}, classify("publish", driver.KindTooLarge,
+				fmt.Errorf("property %s is %d bytes, over the AMQP short-string limit of %d",
+					property.name, len(property.value), maxShortStringBytes))
 		}
 	}
 	return publishing, nil
