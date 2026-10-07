@@ -2,7 +2,12 @@ package rabbitmq
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
+	"io"
+	"net"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -347,5 +352,430 @@ func TestConsumerReattachReleasesCancelledAdmission(t *testing.T) {
 	}
 	if total, lane := counts(); total != 0 || lane != 0 {
 		t.Fatalf("admitted after every settlement = %d total, %d lane, want 0, 0", total, lane)
+	}
+}
+
+// closedTeardownChannel uses only public AMQP APIs and an in-memory peer. A
+// zero Channel panics on the old Stop's direct Close; this real, already-closed
+// channel makes both old and new teardown paths safe to unwind without a broker.
+func closedTeardownChannel(t *testing.T) *amqp.Channel {
+	t.Helper()
+	client, peer := net.Pipe()
+	serverDone := make(chan struct{})
+	endPeer := make(chan struct{})
+	var endOnce sync.Once
+	closePeer := func() { endOnce.Do(func() { close(endPeer) }) }
+	t.Cleanup(func() {
+		closePeer()
+		_ = client.Close()
+		_ = peer.Close()
+		select {
+		case <-serverDone:
+		case <-time.After(time.Second): //nolint:forbidigo // join the in-memory protocol fixture on every exit
+			t.Error("in-memory AMQP peer did not exit")
+		}
+	})
+	if err := peer.SetDeadline(clock.NewReal().Now().Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	server := make(chan error, 1)
+	go func() {
+		defer close(serverDone)
+		defer peer.Close()
+		readMethod := func(class, method uint16) error {
+			var header [7]byte
+			if _, err := io.ReadFull(peer, header[:]); err != nil {
+				return err
+			}
+			payload := make([]byte, int(binary.BigEndian.Uint32(header[3:]))+1)
+			if _, err := io.ReadFull(peer, payload); err != nil {
+				return err
+			}
+			if header[0] != 1 || len(payload) < 5 || binary.BigEndian.Uint16(payload) != class ||
+				binary.BigEndian.Uint16(payload[2:]) != method || payload[len(payload)-1] != 0xce {
+				return errors.New("unexpected in-memory AMQP method")
+			}
+			return nil
+		}
+		writeMethod := func(channel, class, method uint16, args []byte) error {
+			frame := []byte{1}
+			frame = binary.BigEndian.AppendUint16(frame, channel)
+			frame = binary.BigEndian.AppendUint32(frame, uint32(4+len(args))) //nolint:gosec // fixed internal handshake arguments, never external input
+			frame = binary.BigEndian.AppendUint16(frame, class)
+			frame = binary.BigEndian.AppendUint16(frame, method)
+			frame = append(frame, args...)
+			frame = append(frame, 0xce)
+			_, err := peer.Write(frame)
+			return err
+		}
+		var protocol [8]byte
+		_, err := io.ReadFull(peer, protocol[:])
+		if err == nil {
+			err = writeMethod(0, 10, 10, []byte{0, 9, 0, 0, 0, 0, 0, 0, 0, 5, 'P', 'L', 'A', 'I', 'N', 0, 0, 0, 5, 'e', 'n', '_', 'U', 'S'})
+		}
+		if err == nil {
+			err = readMethod(10, 11)
+		}
+		if err == nil {
+			err = writeMethod(0, 10, 30, []byte{0, 0, 0, 2, 0, 0, 0, 0})
+		}
+		if err == nil {
+			err = readMethod(10, 31)
+		}
+		if err == nil {
+			err = readMethod(10, 40)
+		}
+		if err == nil {
+			err = writeMethod(0, 10, 41, []byte{0})
+		}
+		if err == nil {
+			err = readMethod(20, 10)
+		}
+		if err == nil {
+			err = writeMethod(1, 20, 11, []byte{0, 0, 0, 0})
+		}
+		server <- err
+		if err == nil {
+			<-endPeer
+		}
+	}()
+	connection, err := amqp.Open(client, amqp.Config{
+		SASL: []amqp.Authentication{&amqp.PlainAuth{Username: "guest", Password: "guest"}},
+	})
+	if err != nil {
+		t.Fatalf("open in-memory AMQP connection: %v", err)
+	}
+	channel, err := connection.Channel()
+	if err != nil {
+		t.Fatalf("open in-memory AMQP channel: %v", err)
+	}
+	if err := <-server; err != nil {
+		t.Fatalf("in-memory AMQP peer: %v", err)
+	}
+	closePeer()
+	waitForwarderState(t, "in-memory AMQP channel shutdown", channel.IsClosed)
+	return channel
+}
+
+func assertTeardownState(t *testing.T, c *consumer, complete bool) {
+	t.Helper()
+	c.conn.mu.RLock()
+	_, registered := c.conn.active[c]
+	c.conn.mu.RUnlock()
+	if registered == complete {
+		t.Errorf("consumer registered = %v, want %v", registered, !complete)
+	}
+	if closed := messagesClosed(c); closed != complete {
+		t.Errorf("Messages closed = %v, want %v", closed, complete)
+	}
+	select {
+	case _, ok := <-c.Errors():
+		if ok || !complete {
+			t.Errorf("Errors ready with open = %v, want closed = %v", ok, complete)
+		}
+	default:
+		if complete {
+			t.Error("Errors still open after successful teardown")
+		}
+	}
+}
+
+func teardownResult(t *testing.T, result <-chan error) error {
+	t.Helper()
+	select {
+	case err := <-result:
+		return err
+	case <-time.After(time.Second): //nolint:forbidigo // bound a direct teardown fixture
+		t.Fatal("teardown call did not return")
+		return nil
+	}
+}
+
+func startTeardownCall(t *testing.T, c *consumer, calls *sync.WaitGroup, call func() error) <-chan error {
+	result := make(chan error, 1)
+	calls.Go(func() {
+		err := call()
+		if err == nil {
+			assertTeardownState(t, c, true)
+		}
+		result <- err
+	})
+	return result
+}
+
+func joinTeardownFixture(t *testing.T, c *consumer, calls *sync.WaitGroup) {
+	t.Helper()
+	done := make(chan error, 1)
+	go func() {
+		calls.Wait()
+		c.conn.detachWatch.Wait()
+		done <- nil
+	}()
+	_ = teardownResult(t, done)
+}
+
+// teardownWaitContext signals arrival at a context-aware wait without depending
+// on renamed private lifecycle fields. With the fixture owner blocked, the new
+// implementation reaches Done in its shared-attempt select. The old Stop may
+// reach Done in a local join instead, but must then fail on its premature nil.
+type teardownWaitContext struct {
+	context.Context
+	arrived chan struct{}
+	once    sync.Once
+	expired chan struct{}
+}
+
+func newTeardownWaitContext() *teardownWaitContext {
+	return &teardownWaitContext{
+		Context: context.Background(),
+		arrived: make(chan struct{}),
+		expired: make(chan struct{}),
+	}
+}
+
+func (ctx *teardownWaitContext) Done() <-chan struct{} {
+	ctx.once.Do(func() { close(ctx.arrived) })
+	return ctx.expired
+}
+
+func (ctx *teardownWaitContext) Err() error {
+	select {
+	case <-ctx.expired:
+		return context.DeadlineExceeded
+	default:
+		return nil
+	}
+}
+
+func awaitTeardownWait(t *testing.T, ctx *teardownWaitContext, result <-chan error) bool {
+	t.Helper()
+	select {
+	case <-ctx.arrived:
+		return true
+	case err := <-result:
+		t.Errorf("competitor returned %v while teardown incomplete before entering its wait", err)
+		return false
+	case <-time.After(time.Second): //nolint:forbidigo // bound scheduling of the context-aware wait
+		t.Fatal("competitor did not reach its context-aware wait")
+		return false
+	}
+}
+
+// blockedStopFixture installs the synthetic lane only after Drain snapshots the
+// empty lanes. Holding channelMu and freezing the clock wedges both the old
+// lockBefore and the shared closeLanesWithContext, not merely the new close hook.
+func blockedStopFixture(t *testing.T) (*consumer, <-chan error, *sync.WaitGroup, func(), *atomic.Int32) {
+	t.Helper()
+	c := newForwarderTestConsumer()
+	c.conn.active = map[*consumer]struct{}{c: {}}
+	fake := clock.NewFake(time.Unix(0, 0))
+	c.clock = fake
+	l := &lane{owner: c, channel: closedTeardownChannel(t), destination: "shared-stop"}
+	l.channelMu.Lock()
+	var unlockOnce, forwardOnce sync.Once
+	var starts atomic.Int32
+	c.channelCloseHook = func(*lane) error {
+		starts.Add(1)
+		return nil
+	}
+	var calls sync.WaitGroup
+	c.forward.Add(1)
+	unblock := func() {
+		forwardOnce.Do(c.forward.Done)
+		unlockOnce.Do(func() {
+			l.channelMu.Unlock()
+			fake.Advance(closeLockWait)
+		})
+	}
+	t.Cleanup(func() {
+		unblock()
+		joinTeardownFixture(t, c, &calls)
+	})
+	first := startTeardownCall(t, c, &calls, func() error { return c.Stop(context.Background()) })
+	waitForwarderState(t, "Stop's empty Drain snapshot", func() bool {
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		return c.draining
+	})
+	c.mu.Lock()
+	c.lanes = []*lane{l}
+	c.mu.Unlock()
+	forwardOnce.Do(c.forward.Done)
+	waitForwarderState(t, "Stop waiting on the lane RPC lock", func() bool { return fake.NumWaiters() > 0 })
+	assertTeardownState(t, c, false)
+	return c, first, &calls, unblock, &starts
+}
+
+func TestConsumerStopWaitsForSharedTeardown(t *testing.T) {
+	c, first, calls, unblock, starts := blockedStopFixture(t)
+	secondCtx, releaseCtx := newTeardownWaitContext(), newTeardownWaitContext()
+	second := startTeardownCall(t, c, calls, func() error { return c.Stop(secondCtx) })
+	release := startTeardownCall(t, c, calls, func() error { return c.Release(releaseCtx) })
+	secondWaiting := awaitTeardownWait(t, secondCtx, second)
+	releaseWaiting := awaitTeardownWait(t, releaseCtx, release)
+	if !secondWaiting {
+		second = nil
+	}
+	if !releaseWaiting {
+		release = nil
+	}
+	pending := []struct {
+		name   string
+		result <-chan error
+	}{
+		{name: "first Stop", result: first},
+		{name: "second Stop", result: second},
+		{name: "Release", result: release},
+	}
+	for index := range pending {
+		if pending[index].result == nil {
+			continue
+		}
+		select {
+		case err := <-pending[index].result:
+			if err == nil {
+				t.Errorf("%s returned nil while teardown incomplete", pending[index].name)
+			} else {
+				t.Errorf("%s returned %v while teardown incomplete, want no return", pending[index].name, err)
+			}
+			pending[index].result = nil
+		case <-time.After(20 * time.Millisecond): //nolint:forbidigo // bound the early-success observation while the fake clock stays frozen
+		}
+		assertTeardownState(t, c, false)
+	}
+	unblock()
+	for _, call := range pending {
+		if call.result == nil {
+			continue
+		}
+		if err := teardownResult(t, call.result); err != nil {
+			t.Errorf("%s = %v, want nil", call.name, err)
+		}
+		assertTeardownState(t, c, true)
+	}
+	if got := starts.Load(); got != 1 {
+		t.Errorf("lane close starts = %d, want 1", got)
+	}
+	for _, call := range []func() error{
+		func() error { return c.Stop(context.Background()) },
+		func() error { return c.Release(context.Background()) },
+	} {
+		if err := teardownResult(t, startTeardownCall(t, c, calls, call)); err != nil {
+			t.Errorf("repeated teardown = %v, want nil", err)
+		}
+		assertTeardownState(t, c, true)
+	}
+}
+
+func TestSecondStopBoundsItsWaitForTeardown(t *testing.T) {
+	c, first, calls, unblock, starts := blockedStopFixture(t)
+	ctx := newTeardownWaitContext()
+	second := startTeardownCall(t, c, calls, func() error { return c.Stop(ctx) })
+	var err error
+	if awaitTeardownWait(t, ctx, second) {
+		select {
+		case err = <-second:
+		case <-time.After(20 * time.Millisecond): //nolint:forbidigo // keep the context live while the baseline's already-finished joins return
+			close(ctx.expired)
+			err = teardownResult(t, second)
+		}
+	}
+	if err == nil {
+		t.Error("second Stop returned nil while teardown incomplete")
+	} else {
+		if !errors.Is(err, driver.ErrDrainTimeout) || !errors.Is(err, context.DeadlineExceeded) {
+			t.Errorf("second Stop = %v, want ErrDrainTimeout and context.DeadlineExceeded", err)
+		}
+		if kind, ok := driver.Classify(err); !ok || kind != driver.KindTransient {
+			t.Errorf("second Stop = %v, want transient classification", err)
+		}
+	}
+	assertTeardownState(t, c, false)
+	select {
+	case err := <-first:
+		t.Fatalf("first Stop returned %v while teardown incomplete", err)
+	default:
+	}
+	unblock()
+	if err := teardownResult(t, first); err != nil {
+		t.Errorf("first Stop = %v, want nil", err)
+	}
+	assertTeardownState(t, c, true)
+	if err := teardownResult(t, startTeardownCall(t, c, calls, func() error { return c.Stop(context.Background()) })); err != nil {
+		t.Errorf("Stop after completion = %v, want nil", err)
+	}
+	assertTeardownState(t, c, true)
+	if got := starts.Load(); got != 1 {
+		t.Errorf("lane close starts = %d, want 1", got)
+	}
+}
+
+func blockedReleaseFixture(t *testing.T) (*consumer, <-chan error, *sync.WaitGroup, context.CancelFunc, func(), *atomic.Int32) {
+	t.Helper()
+	c := newForwarderTestConsumer()
+	c.clock = clock.NewFake(time.Unix(0, 0))
+	c.conn.active = map[*consumer]struct{}{c: {}}
+	c.settlers[&settler{owner: c}] = struct{}{}
+	c.outstanding = 1
+	c.lanes = []*lane{{owner: c, channel: closedTeardownChannel(t), destination: "release-first"}}
+	started := make(chan struct{})
+	resume := make(chan struct{})
+	var once sync.Once
+	var starts atomic.Int32
+	c.channelCloseHook = func(*lane) error {
+		if starts.Add(1) == 1 {
+			close(started)
+		}
+		<-resume
+		return nil
+	}
+	unblock := func() { once.Do(func() { close(resume) }) }
+	ctx, cancel := context.WithCancel(context.Background())
+	var calls sync.WaitGroup
+	t.Cleanup(func() {
+		cancel()
+		unblock()
+		joinTeardownFixture(t, c, &calls)
+	})
+	first := startTeardownCall(t, c, &calls, func() error { return c.Release(ctx) })
+	waitForwarderState(t, "Release's broker close", func() bool {
+		select {
+		case <-started:
+			return true
+		default:
+			return false
+		}
+	})
+	assertTeardownState(t, c, false)
+	return c, first, &calls, cancel, unblock, &starts
+}
+
+func TestStopWaitsForReleaseTeardown(t *testing.T) {
+	c, release, calls, _, unblock, starts := blockedReleaseFixture(t)
+	ctx := newTeardownWaitContext()
+	stop := startTeardownCall(t, c, calls, func() error { return c.Stop(ctx) })
+	returned := !awaitTeardownWait(t, ctx, stop)
+	if !returned {
+		select {
+		case err := <-stop:
+			t.Errorf("Stop returned %v while Release teardown incomplete", err)
+			returned = true
+		case <-time.After(20 * time.Millisecond): //nolint:forbidigo // bound the early-success observation after confirmed arrival
+		}
+	}
+	assertTeardownState(t, c, false)
+	unblock()
+	if err := teardownResult(t, release); err != nil {
+		t.Errorf("Release = %v, want nil", err)
+	}
+	assertTeardownState(t, c, true)
+	if !returned {
+		if err := teardownResult(t, stop); err != nil {
+			t.Errorf("Stop after Release = %v, want nil despite abandoned settlers", err)
+		}
+		assertTeardownState(t, c, true)
+	}
+	if got := starts.Load(); got != 1 {
+		t.Errorf("lane close starts = %d, want 1", got)
 	}
 }

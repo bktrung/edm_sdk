@@ -118,7 +118,9 @@ func (Driver) Capabilities() driver.Capabilities {
 }
 
 // Open establishes a RabbitMQ connection and retries failed endpoint dials
-// until the caller's context or ConnectTimeout expires.
+// until the caller's context or ConnectTimeout expires. It refuses a configured
+// vhost that differs from any endpoint, or SASL credentials without a mechanism,
+// with a fatal configuration error before dialing.
 func (Driver) Open(ctx context.Context, cfg driver.Config) (driver.Conn, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, classify("open", driver.KindTransient, err)
@@ -139,9 +141,8 @@ func (Driver) Open(ctx context.Context, cfg driver.Config) (driver.Conn, error) 
 	if err != nil {
 		return nil, classify("open", driver.KindFatal, err)
 	}
-	// The AMQP settings, TLS material included, are the same for every
-	// endpoint and every attempt, so a file that fails to load is a
-	// configuration error: retrying the dial cannot fix it.
+	// TLS material and connection properties are shared across attempts;
+	// retrying cannot repair a file that fails to load.
 	if len(cfg.Endpoints) == 0 {
 		return nil, classify("open", driver.KindFatal, errMissingEndpoints)
 	}
@@ -156,17 +157,26 @@ func (Driver) Open(ctx context.Context, cfg driver.Config) (driver.Conn, error) 
 		defer cancel()
 	}
 
-	endpoints := cfg.Endpoints
+	endpoints := make([]resolvedEndpoint, len(cfg.Endpoints))
+	for index, endpoint := range cfg.Endpoints {
+		if err := openCtx.Err(); err != nil {
+			return nil, classify("open", driver.KindTransient, err)
+		}
+		resolved, err := resolveEndpoint(endpoint, cfg)
+		if err != nil {
+			return nil, classify("open", driver.KindFatal, err)
+		}
+		endpoints[index] = resolved
+	}
 	var lastErr error
 	for {
 		for _, endpoint := range endpoints {
 			if err := openCtx.Err(); err != nil {
 				return nil, classify("open", driver.KindTransient, err)
 			}
-			if err := validateEndpoint(endpoint); err != nil {
-				return nil, classify("open", driver.KindFatal, err)
-			}
-			conn, err := dial(openCtx, endpoint, amqpConfig, cfg.ConnectTimeout)
+			attemptConfig := amqpConfig
+			attemptConfig.SASL = endpoint.sasl
+			conn, err := dial(openCtx, endpoint.endpoint, attemptConfig, cfg.ConnectTimeout)
 			if err == nil {
 				managedConn, connErr := newConn(conn, capabilitiesForQueueKind(queueKind), endpoint, cfg, queueKind, trustBrokerTimestamp, brokerPrefetch)
 				if connErr != nil {
@@ -433,8 +443,8 @@ func (c *conn) awaitUnblocked(ctx context.Context) error {
 
 var _ driver.Conn = (*conn)(nil)
 
-func newConn(amqpConn *amqp.Connection, caps driver.Capabilities, endpoint string, cfg driver.Config, kind queueKind, trustBrokerTimestamp bool, brokerPrefetch int) (*conn, error) {
-	management, err := newManagementClient(endpoint, cfg)
+func newConn(amqpConn *amqp.Connection, caps driver.Capabilities, endpoint resolvedEndpoint, cfg driver.Config, kind queueKind, trustBrokerTimestamp bool, brokerPrefetch int) (*conn, error) {
+	management, err := managementClientForEndpoint(endpoint, cfg)
 	if err != nil {
 		return nil, err
 	}
@@ -738,8 +748,34 @@ func dial(ctx context.Context, endpoint string, amqpConfig amqp.Config, connectT
 	if timeout <= 0 || timeout > 30*time.Second {
 		timeout = 30 * time.Second
 	}
+	handshakeCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	deadline, _ := handshakeCtx.Deadline()
+	var mu sync.Mutex
+	var raw net.Conn
+	var abandoned bool
 	dialer := &net.Dialer{Timeout: timeout}
-	amqpConfig.Dial = dialer.Dial
+	amqpConfig.Dial = func(network, addr string) (net.Conn, error) {
+		socket, err := dialer.DialContext(handshakeCtx, network, addr)
+		if err != nil {
+			return nil, err
+		}
+		// This also bounds TLS and AMQP; amqp091 clears the deadline in
+		// openComplete before a successful connection leaves DialConfig.
+		if err := socket.SetDeadline(deadline); err != nil {
+			_ = socket.Close()
+			return nil, err
+		}
+		mu.Lock()
+		if abandoned {
+			mu.Unlock()
+			_ = socket.Close()
+			return nil, handshakeCtx.Err()
+		}
+		raw = socket
+		mu.Unlock()
+		return socket, nil
+	}
 	if amqpConfig.TLSClientConfig != nil {
 		// amqp091 writes the dialed host into an empty ServerName. Open shares
 		// one config across its endpoints, so each dial gets its own copy.
@@ -755,14 +791,38 @@ func dial(ctx context.Context, endpoint string, amqpConfig amqp.Config, connectT
 		}
 		result <- connection
 	}()
+	// If success is queued and selected, the caller detaches the socket before
+	// returning; a later cancel has no watcher that can close the live connection.
+	// If cancel is selected while success is queued, it closes the transport and
+	// the single cleanup goroutine consumes the unreturned AMQP connection.
+	// If TCP connects while cancel selects before socket publication, cancel
+	// marks abandonment under mu; publication then closes instead of handing
+	// that socket to the handshake. A queued result alone never transfers ownership.
 	select {
 	case connection := <-result:
+		mu.Lock()
+		raw = nil
+		mu.Unlock()
 		return connection, nil
 	case err := <-errResult:
+		mu.Lock()
+		socket := raw
+		raw = nil
+		mu.Unlock()
+		if socket != nil {
+			_ = socket.Close()
+		}
 		return nil, err
-	case <-ctx.Done():
-		// The dial still ends one way or the other; wait for either outcome so
-		// a dial that fails after the cancel does not strand this goroutine.
+	case <-handshakeCtx.Done():
+		mu.Lock()
+		abandoned = true
+		socket := raw
+		raw = nil
+		mu.Unlock()
+		if socket != nil {
+			_ = socket.Close()
+		}
+		// Interrupt the transport before waiting for either late result.
 		go func() {
 			select {
 			case connection := <-result:
@@ -770,7 +830,7 @@ func dial(ctx context.Context, endpoint string, amqpConfig amqp.Config, connectT
 			case <-errResult:
 			}
 		}()
-		return nil, ctx.Err()
+		return nil, handshakeCtx.Err()
 	}
 }
 
@@ -793,23 +853,6 @@ func makeAMQPConfig(cfg driver.Config) (amqp.Config, error) {
 	if cfg.ClientID != "" {
 		config.Properties.SetClientConnectionName(cfg.ClientID)
 	}
-	if cfg.SASL != nil {
-		switch strings.ToLower(cfg.SASL.Mechanism) {
-		case "":
-		case "plain":
-			config.SASL = []amqp.Authentication{&amqp.PlainAuth{
-				Username: cfg.SASL.Username,
-				Password: cfg.SASL.Password,
-			}}
-		case "amqplain":
-			config.SASL = []amqp.Authentication{&amqp.AMQPlainAuth{
-				Username: cfg.SASL.Username,
-				Password: cfg.SASL.Password,
-			}}
-		case "external":
-			config.SASL = []amqp.Authentication{&amqp.ExternalAuth{}}
-		}
-	}
 	if cfg.TLS == nil || !cfg.TLS.Enabled {
 		return config, nil
 	}
@@ -829,7 +872,12 @@ func validateSASL(settings *driver.SASLConfig) error {
 		return nil
 	}
 	switch strings.ToLower(settings.Mechanism) {
-	case "", "plain", "amqplain", "external":
+	case "":
+		if settings.Username != "" || settings.Password != "" {
+			return errors.New("rabbitmq: SASL credentials require a mechanism; set PLAIN, AMQPLAIN, or EXTERNAL")
+		}
+		return nil
+	case "plain", "amqplain", "external":
 		return nil
 	default:
 		return fmt.Errorf("rabbitmq: unsupported SASL mechanism %q; supported mechanisms: PLAIN, AMQPLAIN, EXTERNAL, or empty", settings.Mechanism)

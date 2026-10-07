@@ -182,10 +182,16 @@ func managementVhostCases() []managementVhostCase {
 			want:     "orders/sub",
 		},
 		{
-			name:     "configured option wins over the endpoint",
+			name:     "configured mismatch is refused",
 			endpoint: "amqp://localhost:5672/orders",
 			options:  map[string]string{"rabbitmq.vhost": "configured-vhost"},
-			want:     "configured-vhost",
+			wantErr:  `"configured-vhost" does not match endpoint vhost "orders"`,
+		},
+		{
+			name:     "configured matching vhost",
+			endpoint: "amqp://localhost:5672/orders",
+			options:  map[string]string{"rabbitmq.vhost": "orders"},
+			want:     "orders",
 		},
 		{
 			name:     "authority-less endpoint is refused before any derivation",
@@ -223,16 +229,15 @@ func TestManagementClientDerivesVhostFromEndpoint(t *testing.T) {
 }
 
 // TestManagementClientVhostMatchesAMQPParse is the property the row exists for:
-// with no configured vhost, the management client addresses the vhost the AMQP
-// connection's own parse reads from the same endpoint. It is what makes a
-// hand-written reimplementation of that parse impossible to land quietly.
+// every accepted configuration addresses the vhost the AMQP connection's own
+// parse reads from the same endpoint, including a matching configured option.
 func TestManagementClientVhostMatchesAMQPParse(t *testing.T) {
 	for _, test := range managementVhostCases() {
-		if test.wantErr != "" || test.options["rabbitmq.vhost"] != "" {
-			continue // the property holds only where the endpoint decides the vhost
+		if test.wantErr != "" {
+			continue
 		}
 		t.Run(test.name, func(t *testing.T) {
-			client, err := newManagementClient(test.endpoint, driver.Config{})
+			client, err := newManagementClient(test.endpoint, driver.Config{DriverOptions: test.options})
 			if err != nil {
 				t.Fatalf("newManagementClient(%q): %v", test.endpoint, err)
 			}
@@ -270,8 +275,8 @@ func TestManagementClientRejectsEndpointTheAMQPParserRefuses(t *testing.T) {
 }
 
 // TestManagementClientEndpointValidityDoesNotDependOnConfiguredVhost keeps the
-// AMQP parser as the authority for endpoint validity regardless of whether the
-// management vhost comes from the endpoint or a driver option.
+// AMQP parser as the authority for endpoint validity with an absent or matching
+// configured vhost.
 func TestManagementClientEndpointValidityDoesNotDependOnConfiguredVhost(t *testing.T) {
 	tests := []struct {
 		name     string
@@ -289,7 +294,7 @@ func TestManagementClientEndpointValidityDoesNotDependOnConfiguredVhost(t *testi
 				t.Run(map[bool]string{false: "vhost from endpoint", true: "configured vhost"}[configured], func(t *testing.T) {
 					options := map[string]string{}
 					if configured {
-						options["rabbitmq.vhost"] = "configured-vhost"
+						options["rabbitmq.vhost"] = "orders"
 					}
 					client, err := newManagementClient(test.endpoint, driver.Config{DriverOptions: options})
 					if (err == nil) != test.accepted {
@@ -427,7 +432,7 @@ func TestManagementClientUsesHTTPSWhenTLSEnabled(t *testing.T) {
 func TestManagementClientUsesResolvedVhostCredentialsAndTLS(t *testing.T) {
 	cfg := driver.Config{
 		ConnectTimeout: 7 * time.Second,
-		DriverOptions:  map[string]string{"rabbitmq.vhost": "configured-vhost"},
+		DriverOptions:  map[string]string{"rabbitmq.vhost": "from-url"},
 		TLS:            &driver.TLSConfig{Enabled: true, InsecureSkipVerify: true},
 		SASL:           &driver.SASLConfig{Mechanism: "plain", Username: "configured-user", Password: "configured-pass"},
 	}
@@ -438,11 +443,11 @@ func TestManagementClientUsesResolvedVhostCredentialsAndTLS(t *testing.T) {
 	if client.baseURL != "https://broker.example:15671" {
 		t.Fatalf("management base URL = %q, want configured TLS management endpoint", client.baseURL)
 	}
-	if client.vhost != "configured-vhost" {
-		t.Fatalf("management vhost = %q, want configured-vhost", client.vhost)
+	if client.vhost != "from-url" {
+		t.Fatalf("management vhost = %q, want from-url", client.vhost)
 	}
 	if client.username != "configured-user" || client.password != "configured-pass" {
-		t.Fatalf("management credentials = %q/%q, want configured credentials", client.username, client.password)
+		t.Fatal("management credentials do not match configured PLAIN identity")
 	}
 	transport, ok := client.client.Transport.(*http.Transport)
 	if !ok || transport.TLSClientConfig == nil || !transport.TLSClientConfig.InsecureSkipVerify {
@@ -696,5 +701,57 @@ func TestTopologyManagementAuthorizationErrors(t *testing.T) {
 				requireManagementStatus(t, err, status, http.MethodGet, "bindings")
 			})
 		}
+	}
+}
+
+func TestManagementClientUsesDefaultURIIdentity(t *testing.T) {
+	for _, settings := range []*driver.SASLConfig{nil, {}} {
+		assertManagementLogin(t, "amqp://localhost:5672/", settings, "guest", "guest")
+	}
+}
+
+func TestManagementClientUsesURIIdentityWithoutPassword(t *testing.T) {
+	assertManagementLogin(t, "amqp://orders-user@localhost:5672/", nil, "orders-user", "guest")
+}
+
+func TestManagementClientUsesSelectedSASLIdentity(t *testing.T) {
+	for _, test := range []struct {
+		name     string
+		settings driver.SASLConfig
+		username string
+		password string
+	}{
+		{name: "PLAIN", settings: driver.SASLConfig{Mechanism: "PLAIN", Username: "sasl-user", Password: "sasl-secret"}, username: "sasl-user", password: "sasl-secret"},
+		{name: "AMQPLAIN", settings: driver.SASLConfig{Mechanism: "AMQPLAIN", Username: "sasl-user", Password: "sasl-secret"}, username: "sasl-user", password: "sasl-secret"},
+		{name: "EXTERNAL", settings: driver.SASLConfig{Mechanism: "EXTERNAL", Username: "ignored-user", Password: "ignored-secret"}, username: "uri-user", password: "uri-secret"},
+		{name: "empty PLAIN identity", settings: driver.SASLConfig{Mechanism: "plain"}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			assertManagementLogin(t, "amqp://uri-user:uri-secret@localhost:5672/", &test.settings, test.username, test.password)
+			assertOpenSASL(t, &test.settings)
+		})
+	}
+}
+
+func assertManagementLogin(t *testing.T, endpoint string, settings *driver.SASLConfig, username, password string) {
+	t.Helper()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotUser, gotPassword, ok := r.BasicAuth()
+		if !ok || gotUser != username || gotPassword != password {
+			t.Error("management HTTP Basic Auth does not match the AMQP login")
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, "[]")
+	}))
+	defer server.Close()
+	port := server.URL[strings.LastIndex(server.URL, ":")+1:]
+	client, err := newManagementClient(endpoint, driver.Config{
+		SASL: settings, DriverOptions: map[string]string{managementPortOption: port},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.listQueues(t.Context()); err != nil {
+		t.Fatal(err)
 	}
 }

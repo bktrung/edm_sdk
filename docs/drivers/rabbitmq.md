@@ -177,19 +177,19 @@ setting; the drift warning is the signal to do so.
 
 | Key | What it does | Accepted values | Default | Read at |
 | --- | --- | --- | --- | --- |
-| `broker.rabbitmq.vhost` | Vhost the management API inspects when it reads queue arguments and bindings. It does not change the AMQP connection: the endpoint URI still selects the vhost that messages are published to. | Any string, used as the vhost name. Empty falls back to the endpoint URI. | The endpoint URI's vhost as the AMQP client parses it: `/` when the URI has no path, and `orders` for `amqp://host/orders`. | Open |
+| `broker.rabbitmq.vhost` | Checks that management and AMQP use the same endpoint-selected vhost; never changes AMQP routing. | Empty, or an exact match for every endpoint's parsed vhost. A mismatch fails `Open` fatal before any dial. | The endpoint URI's vhost as the AMQP client parses it: `/` when the URI has no path, and `orders` for `amqp://host/orders`. | Open |
 | `broker.rabbitmq.queueType` | Queue type every destination and its parking queue is declared with. `classic` also clears the delivery-count and dead-letter capabilities, both of which are quorum arguments. Quorum queues are always durable, so a destination declared non-durable is declared durable and the driver logs one warning for it. | `quorum` or `classic`, case-insensitive, with surrounding whitespace ignored. Any other value fails `Open`, and `env: prod` requires the exact string `quorum`. | `quorum` | Open |
 | `broker.rabbitmq.consumerTimeout` | `x-consumer-timeout` declared on quorum destination queues. The broker cancels a consumer that has held one delivery this long. | Go duration of at least `1ms`, and at least three times every subscription's `handlerTimeout`. Shorter, zero, negative, or unparsable fails `Open`. | None: nothing is declared and the broker's own default stays in force. | Open |
 | `broker.rabbitmq.brokerPrefetch` | Broker transport credit per destination, separate from the [SDK admission total and destination windows](/advanced-topics/configuration#prefetch-resolution). Extra broker deliveries wait in bounded driver pending buffers; this option never bypasses either SDK ceiling. | Integer from 1 to 65535, at least every destination's core window. A non-integer, zero, negative value, or smaller value fails `Open` or consumer creation. | Unset: each destination uses its core window. | Open |
 | `broker.rabbitmq.managementPort` | Port the RabbitMQ management HTTP API listens on. | Integer from 1 to 65535. Any other value fails `Open`. | The AMQP port plus 10000, so 15672 for the usual 5672. | Open |
 | `broker.rabbitmq.trustBrokerTimestamp` | Trusts RabbitMQ's `timestamp_in_ms` header as the broker enqueue time. Enable this only when `message_interceptors.incoming.set_header_timestamp.overwrite = true`; without that setting the header is publisher-controlled. | Boolean, using Go's accepted boolean spellings after surrounding whitespace is trimmed. Any other value fails `Open`. | `false` | Open |
 
-`broker.rabbitmq.vhost` deserves extra care because the management client and
-the AMQP connection must read the same vhost from the endpoint. Both parse it
-once through the AMQP client: `amqp://host/orders` is the vhost `orders`, and a
-URI with no path is the default vhost `/`. The readings agree for the
-percent-encoded `amqp://host/%2Forders` vhost `/orders`. Set this key only when
-the management API must inspect a vhost other than the one the endpoint names.
+Management inspection drives topology and prune decisions, so
+`broker.rabbitmq.vhost` must match the endpoint-selected vhost. A nonempty key
+that differs from any configured endpoint fails `Open` before dialing, naming
+both vhosts. Leave it empty to use each endpoint's own vhost; AMQP routing never
+changes. The AMQP parser reads `amqp://host/orders` as `orders`, no path as `/`,
+and `amqp://host/%2Forders` as `/orders`; compare the decoded vhost name.
 
 Extra broker credit carries a RabbitMQ-specific risk. On a quorum queue, closing
 a consumer that holds deliveries increments the broker delivery count for each
@@ -232,7 +232,7 @@ is the evidence owner for held-delivery redelivery.
 
 | YAML key | What it does |
 | --- | --- |
-| `broker.sasl.mechanism` | Selects `plain`, `amqplain`, or `external`, case-insensitively. Leave it empty to use no explicit SASL mechanism. |
+| `broker.sasl.mechanism` | Selects `plain`, `amqplain`, or `external`, case-insensitively. Empty uses URI authentication; setting a username or password with an empty mechanism fails `Open` fatal before dialing. |
 | `broker.sasl.username` | Username passed to the `plain` or `amqplain` mechanism. Credentials are never logged. |
 | `broker.sasl.password` | Password passed to the `plain` or `amqplain` mechanism. Credentials are never logged. |
 
@@ -240,6 +240,12 @@ An unsupported RabbitMQ mechanism makes `Open` return
 `rabbitmq: unsupported SASL mechanism %q; supported mechanisms: PLAIN, AMQPLAIN, EXTERNAL, or empty`,
 with the unsupported value substituted for `%q`. In `prod`, selecting SASL
 also requires `broker.tls.enabled: true`.
+
+With no explicit SASL mechanism, management uses the AMQP parser's URI login,
+including its defaults for omitted fields. PLAIN and AMQPLAIN use the configured
+SASL pair for both connections. EXTERNAL authenticates AMQP by certificate;
+management still uses the URI credentials for HTTP Basic Auth, not the SASL
+username or password.
 
 ## Go further
 

@@ -54,7 +54,7 @@ f1:
       password: ""
     rabbitmq:                   # only for driver: rabbitmq; values are strings
       queueType: quorum
-      # vhost: orders           # management API vhost; defaults to the endpoint's vhost
+      # vhost: "/"              # if set, must match every endpoint's parsed vhost
     # kafka:                    # only for driver: kafka
     #   balancer: cooperative-sticky
 

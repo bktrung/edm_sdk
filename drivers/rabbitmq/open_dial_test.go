@@ -3,6 +3,8 @@ package rabbitmq
 import (
 	"context"
 	"crypto/tls"
+	"errors"
+	"io"
 	"net"
 	"runtime"
 	"strings"
@@ -107,5 +109,132 @@ func TestDialLeavesTheSharedTLSConfigUntouched(t *testing.T) {
 	}
 	if shared.ServerName != "" {
 		t.Fatalf("shared TLS config ServerName = %q after one dial, want it left empty", shared.ServerName)
+	}
+}
+
+func TestCanceledSilentDialClosesSocketAndLeavesNoGoroutine(t *testing.T) {
+	for _, scheme := range []string{"amqp", "amqps"} {
+		t.Run(scheme, func(t *testing.T) {
+			server, cancel, dialed := startSilentDial(t, scheme, 5*time.Second)
+			cancel()
+			wait := clock.NewReal().Timer(time.Second)
+			defer wait.Stop()
+			select {
+			case err := <-dialed:
+				if !errors.Is(err, context.Canceled) {
+					t.Fatalf("dial() error = %v, want context.Canceled", err)
+				}
+			case <-wait.C:
+				t.Fatal("dial did not return after cancellation")
+			}
+			assertSilentDialClosed(t, server)
+		})
+	}
+}
+
+func TestSilentDialHonorsConnectTimeout(t *testing.T) {
+	for _, scheme := range []string{"amqp", "amqps"} {
+		t.Run(scheme, func(t *testing.T) {
+			server, _, dialed := startSilentDial(t, scheme, 200*time.Millisecond)
+			wait := clock.NewReal().Timer(time.Second)
+			defer wait.Stop()
+			select {
+			case err := <-dialed:
+				if err == nil {
+					t.Fatal("dial() error = nil, want a handshake timeout")
+				}
+			case <-wait.C:
+				t.Fatal("dial did not return within 1s for a 200ms connect timeout")
+			}
+			assertSilentDialClosed(t, server)
+		})
+	}
+}
+
+func startSilentDial(t *testing.T, scheme string, timeout time.Duration) (net.Conn, context.CancelFunc, <-chan error) {
+	t.Helper()
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	accepted := make(chan net.Conn, 1)
+	go func() {
+		conn, acceptErr := listener.Accept()
+		if acceptErr == nil {
+			accepted <- conn
+		}
+		close(accepted)
+	}()
+	ctx, cancel := context.WithCancel(context.Background())
+	dialed := make(chan error, 1)
+	go func() {
+		defer close(dialed)
+		conn, dialErr := dial(ctx, scheme+"://guest:guest@"+listener.Addr().String()+"/",
+			amqp.Config{TLSClientConfig: &tls.Config{MinVersion: tls.VersionTLS12}}, timeout)
+		if conn != nil {
+			_ = conn.CloseDeadline(clock.NewReal().Now().Add(time.Second))
+		}
+		dialed <- dialErr
+	}()
+	var server net.Conn
+	t.Cleanup(func() {
+		_ = listener.Close()
+		cancel()
+		if server != nil {
+			_ = server.Close()
+		}
+		// A failing-before run must release the stalled handshake too.
+		for conn := range accepted {
+			_ = conn.Close()
+		}
+		wait := clock.NewReal().Timer(2 * time.Second)
+		defer wait.Stop()
+		select {
+		case <-dialed:
+		case <-wait.C:
+			t.Error("dial did not exit during test cleanup")
+		}
+		waitForDialGoroutines(t)
+	})
+	wait := clock.NewReal().Timer(2 * time.Second)
+	defer wait.Stop()
+	select {
+	case server = <-accepted:
+		if server == nil {
+			t.Fatal("listener closed before accepting the dial")
+		}
+	case <-wait.C:
+		t.Fatal("the dial never reached the silent listener")
+	}
+	return server, cancel, dialed
+}
+
+func assertSilentDialClosed(t *testing.T, server net.Conn) {
+	t.Helper()
+	if err := server.SetReadDeadline(clock.NewReal().Now().Add(500 * time.Millisecond)); err != nil {
+		t.Fatal(err)
+	}
+	// Drain the AMQP header or TLS ClientHello before looking for peer closure.
+	_, err := io.Copy(io.Discard, server)
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		t.Fatal("silent peer socket remained open after dial returned")
+	}
+	waitForDialGoroutines(t)
+}
+
+func waitForDialGoroutines(t *testing.T) {
+	t.Helper()
+	wait := clock.NewReal().Timer(time.Second)
+	defer wait.Stop()
+	poll := clock.NewReal().Ticker(5 * time.Millisecond)
+	defer poll.Stop()
+	for dialGoroutines() > 0 {
+		select {
+		case <-wait.C:
+			t.Errorf("%d dial goroutine(s) still running", dialGoroutines())
+			return
+		case <-poll.C:
+		}
 	}
 }

@@ -39,7 +39,7 @@ type consumer struct {
 	// send are one step that another sender cannot interleave with.
 	errorsMu sync.Mutex
 	stoppedC chan struct{}
-	// Drain releases local forwarders; stoppedC remains the completed-teardown signal.
+	// Drain stops forwarders; stoppedC stops all local goroutines before teardown completes.
 	forwarderStopC chan struct{}
 	// forwarderExitHook is a test-only synchronization seam. It remains nil in
 	// production and does not change the driver behavior.
@@ -57,21 +57,15 @@ type consumer struct {
 	mu       sync.Mutex
 	draining bool
 	stopped  bool
-	// released is the completion channel of the Release attempt that is running,
-	// or of the last attempt that failed. It is made fresh for every attempt and
-	// closed when that attempt returns, so a concurrent Release waits on the
-	// attempt that is actually running rather than on one that already failed. It
-	// is nil until the first Release starts.
-	released chan struct{}
-	// releasing is true while a Release attempt is running, which is what tells a
-	// concurrent Release to wait on released instead of starting a second teardown
-	// over the same lanes.
-	releasing bool
-	// releaseFinished is true once the attempt that removed the consumer from its
-	// connection and closed Messages and Errors has returned. A failed attempt
-	// leaves it false, so the next Release retries the teardown instead of
-	// reporting a release that never happened.
-	releaseFinished bool
+	// teardownDone is fresh for each Stop or Release teardown attempt. Closing
+	// it wakes waiters to re-inspect the result, not to assume success.
+	teardownDone chan struct{}
+	// tearingDown keeps one owner through lane closure, joins, unregistration,
+	// and output closure. stopped only prevents new admission.
+	tearingDown bool
+	// teardownFinished becomes true only after unregistration and both output
+	// closes. A failed attempt leaves the consumer stopped but retryable.
+	teardownFinished bool
 
 	outstanding int
 	settlers    map[*settler]struct{}
@@ -319,7 +313,7 @@ func (c *consumer) closeLanes() {
 }
 
 // closeLanesWithContext starts each lane close once and waits for every close
-// under ctx. A close outcome remains set so a later Release joins the same
+// under ctx. A close outcome remains set so a later teardown joins the same
 // broker close rather than issuing another AMQP close request.
 func (c *consumer) closeLanesWithContext(ctx context.Context, op string) error {
 	deadline := c.clock.Now().Add(closeLockWait)
@@ -1218,10 +1212,7 @@ func waitFor(ctx context.Context, op string, wg *sync.WaitGroup) error {
 	case <-done:
 		return nil
 	case <-ctx.Done():
-		if op == "stop" && errors.Is(ctx.Err(), context.DeadlineExceeded) {
-			return classify("stop", driver.KindTransient, fmt.Errorf("%w: %w", driver.ErrDrainTimeout, ctx.Err()))
-		}
-		return classify(op, driver.KindTransient, ctx.Err())
+		return teardownContextError(op, ctx.Err())
 	}
 }
 
@@ -1256,104 +1247,118 @@ func cancelConsumer(ctx context.Context, lane *lane) error {
 }
 
 // Stop drains the consumer and closes its channels after every delivered message has been settled.
-// It returns an error while messages remain unsettled.
+// It returns an error while messages remain unsettled. Concurrent Stop and Release
+// calls wait for the same teardown under their own contexts. The owning Stop's
+// final lane close is unbounded, as it is after a successful drain.
 func (c *consumer) Stop(ctx context.Context) error {
-	if err := ctx.Err(); err != nil {
-		if errors.Is(err, context.DeadlineExceeded) {
-			return classify("stop", driver.KindTransient, fmt.Errorf("%w: %w", driver.ErrDrainTimeout, err))
-		}
-		return classify("stop", driver.KindTransient, err)
-	}
-	drainErr := c.Drain(ctx)
-	if drainErr != nil {
-		if errors.Is(drainErr, context.DeadlineExceeded) && !errors.Is(drainErr, driver.ErrDrainTimeout) {
-			return classify("stop", driver.KindTransient, fmt.Errorf("%w: %w", driver.ErrDrainTimeout, drainErr))
-		}
-		return drainErr
-	}
-	if err := c.stopAndWait(ctx, "stop", false); err != nil {
-		return err
-	}
-	c.mu.Lock()
-	if c.stopped {
-		c.mu.Unlock()
-		return nil
-	}
-	if c.outstanding != 0 {
-		count := c.outstanding
-		c.mu.Unlock()
-		return classify("stop", driver.KindFatal, fmt.Errorf("%w: %d outstanding messages", driver.ErrResourcesOutstanding, count))
-	}
-	c.stopped = true
-	c.mu.Unlock()
-	c.closeLanes()
-	c.conn.removeConsumer(c)
-	close(c.messages)
-	close(c.errors)
-	return nil
+	return c.teardown(ctx, "stop")
 }
 
 // Release abandons unsettled deliveries, closes the consumer, and lets RabbitMQ redeliver them.
+// Concurrent Stop and Release calls share teardown; a failed attempt is retryable.
 func (c *consumer) Release(ctx context.Context) error {
+	return c.teardown(ctx, "release")
+}
+
+// teardown coordinates final closure without merging Stop's settlement refusal
+// with Release's abandonment. op also preserves their context-error contracts.
+func (c *consumer) teardown(ctx context.Context, op string) error {
+	var prepared bool
+	var prepareErr error
 	for {
 		c.mu.Lock()
-		// Stop closes the consumer without a Release, and a finished Release has
-		// already done so. Either way there is nothing left to abandon.
-		if c.releaseFinished || (c.stopped && c.released == nil) {
+		if c.teardownFinished {
 			c.mu.Unlock()
 			return nil
 		}
-		if c.releasing {
-			attempt := c.released
+		if c.tearingDown {
+			attempt := c.teardownDone
 			c.mu.Unlock()
+			// A has stopped admission and is blocked closing a lane. B must
+			// wait here, not mistake stopped for completed unregistration.
+			// A may fail on its context, so B re-inspects after waking.
 			select {
 			case <-attempt:
-				// Re-inspect rather than assume success: the attempt may have
-				// failed on its context, and then this caller drives the teardown
-				// the consumer is still waiting for.
 				continue
 			case <-ctx.Done():
-				return classify("release", driver.KindTransient, ctx.Err())
+				return teardownContextError(op, ctx.Err())
 			}
+		}
+		if op == "stop" && !c.stopped && prepared && prepareErr != nil {
+			c.mu.Unlock()
+			return prepareErr
 		}
 		if err := ctx.Err(); err != nil {
 			c.mu.Unlock()
-			return classify("release", driver.KindTransient, err)
+			return teardownContextError(op, err)
 		}
+		if op == "stop" && !c.stopped {
+			if !prepared {
+				c.mu.Unlock()
+				prepareErr = c.prepareStop(ctx)
+				prepared = true
+				// A drains outside mu while B claims Release and stops
+				// admission. A must re-check B's attempt before returning
+				// its drain result or refusing B's abandoned settlements.
+				continue
+			}
+			if c.outstanding != 0 {
+				count := c.outstanding
+				c.mu.Unlock()
+				return classify("stop", driver.KindFatal, fmt.Errorf("%w: %d outstanding messages", driver.ErrResourcesOutstanding, count))
+			}
+		}
+		// The outstanding check and claim share mu. If Release already
+		// admitted teardown but failed, stopped skips a new drain obligation:
+		// closing its lanes has already selected broker redelivery.
 		c.stopped = true
-		c.releasing = true
-		attempt := make(chan struct{})
-		c.released = attempt
+		c.tearingDown = true
+		c.teardownDone = make(chan struct{})
 		c.mu.Unlock()
 
-		// Closing the AMQP channels requeues their unacked deliveries. Do this
-		// before waiting for local goroutines so a blocked forwarder can observe
-		// forwarderStopC and stoppedC rather than waiting for the application to
-		// consume an abandoned message.
-		err := c.stopAndWait(ctx, "release", true)
-		if err != nil {
-			// The teardown did not finish. The consumer stays stopped but
-			// registered on its connection with Messages and Errors open, so this
-			// Release reports the failure and the next one - the client retries a
-			// Release it was told failed - finishes the work. Only an attempt that
-			// got all the way here closes those channels, so two Releases cannot
-			// close them twice.
-			c.mu.Lock()
-			c.releasing = false
-			c.mu.Unlock()
-			close(attempt)
-			return err
+		var err error
+		if op == "stop" {
+			err = c.closeLanesWithContext(context.Background(), "stop") //nolint:contextcheck // preserve Stop's unbounded final lane close after drain
+			if err == nil && (!prepared || prepareErr != nil) {
+				// A Release may have failed before its local joins. A Stop
+				// taking over closes lanes first, then joins those goroutines
+				// rather than relying on its skipped drain preparation.
+				err = c.stopAndWait(ctx, "stop", false)
+			}
+		} else {
+			// Requeue before joins so an abandoned forwarder can escape
+			// without the application receiving its pending delivery.
+			err = c.stopAndWait(ctx, "release", true)
 		}
-		c.conn.removeConsumer(c)
-		close(c.messages)
-		close(c.errors)
+		if err == nil {
+			c.conn.removeConsumer(c)
+			close(c.messages)
+			close(c.errors)
+		}
 		c.mu.Lock()
-		c.releaseFinished = true
-		c.releasing = false
+		c.teardownFinished = err == nil
+		c.tearingDown = false
+		close(c.teardownDone)
 		c.mu.Unlock()
-		close(attempt)
-		return nil
+		return err
 	}
+}
+
+func (c *consumer) prepareStop(ctx context.Context) error {
+	if err := c.Drain(ctx); err != nil {
+		if errors.Is(err, context.DeadlineExceeded) && !errors.Is(err, driver.ErrDrainTimeout) {
+			return teardownContextError("stop", err)
+		}
+		return err
+	}
+	return c.stopAndWait(ctx, "stop", false)
+}
+
+func teardownContextError(op string, err error) error {
+	if op == "stop" && errors.Is(err, context.DeadlineExceeded) {
+		err = fmt.Errorf("%w: %w", driver.ErrDrainTimeout, err)
+	}
+	return classify(op, driver.KindTransient, err)
 }
 
 func (c *consumer) release(settler *settler) {
