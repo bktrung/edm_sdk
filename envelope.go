@@ -75,8 +75,9 @@ const CoreMaxHeaderBytes = 8 * 1024
 //
 // When headers exceed the cap, EncodeHeaders drops Extensions, shrinks
 // DeathError to a 512-byte floor, drops DeathDetails, drops unknown Forwarded
-// fields, then removes tracestate, dataschema, datacontenttype, subject, and
-// traceparent in that order. It then truncates DeathError without a floor.
+// fields, then removes tracestate, dataschema, subject, and traceparent in that
+// order. It then truncates DeathError without a floor. datacontenttype is never
+// removed because the consumer selects its decoder from it.
 // Required CloudEvents and F1 protocol headers are never removed. If the
 // remaining headers still exceed the cap, EncodeHeaders returns
 // ErrEnvelopeTooLarge. Invalid priorities and reserved extension keys return
@@ -169,7 +170,7 @@ func (e Envelope) EncodeHeaders(maxHeaderBytes int) (map[string]string, error) {
 	if headerBytes(h) <= limit {
 		return h, nil
 	}
-	for _, k := range []string{wire.TraceState, wire.DataSchema, wire.DataContentType, wire.Subject, wire.TraceParent} {
+	for _, k := range []string{wire.TraceState, wire.DataSchema, wire.Subject, wire.TraceParent} {
 		delete(h, k)
 		if headerBytes(h) <= limit {
 			return h, nil

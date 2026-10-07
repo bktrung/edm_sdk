@@ -392,14 +392,20 @@ func logCapabilities(c *Client) {
 }
 
 // Health checks the broker connection and reports stopped subscription runners.
-// It returns a ping error, an admission error, or an error for unhealthy
-// subscriptions. A nil Client returns an error.
+// It returns a ping error, an admission error joined with stopped-subscription
+// errors when the connection failed, or unhealthy-subscription errors.
+// A nil Client returns an error.
 func (c *Client) Health(ctx context.Context) error {
 	if c == nil {
 		return fmt.Errorf("f1: client is not connected")
 	}
 	c.mu.Lock()
 	if err := c.admit(workHealth, 0); err != nil {
+		if c.connStateLocked() == connFailed && c.lifecycleLocked() != lifecycle.Closed {
+			if failed := failedRunnerHealthLocked(c); failed != nil {
+				err = errors.Join(err, failed)
+			}
+		}
 		c.mu.Unlock()
 		return err
 	}
@@ -952,7 +958,7 @@ func closeDiscardedProducer(c *Client, producer driver.Producer, ctx context.Con
 	if producer == nil {
 		return
 	}
-	if err := producer.Close(context.WithoutCancel(ctx)); err != nil {
+	if err := runWithClockTimeout(context.WithoutCancel(ctx), c.options.clock, c.config.Lifecycle.CloseTimeout, "close", producer.Close); err != nil {
 		lastResortClientLogger(c).Warn("f1 discarded producer close failed", "error", err)
 	}
 }

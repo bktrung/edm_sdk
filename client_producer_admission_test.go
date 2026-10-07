@@ -606,3 +606,70 @@ func TestPublishBatchPreservesClosedAndReconnectErrors(t *testing.T) {
 		t.Fatalf("reconnect-error result = %#v, want empty result entry", result.Results)
 	}
 }
+
+type blockingDiscardProducer struct {
+	admissionProducer
+	started chan struct{}
+	release chan struct{}
+}
+
+func (p *blockingDiscardProducer) Close(ctx context.Context) error {
+	_ = p.admissionProducer.Close(ctx)
+	close(p.started)
+	<-p.release
+	return nil
+}
+
+func TestPublishReturnsAfterDiscardedProducerCloseTimeout(t *testing.T) {
+	fake := clock.NewFake(time.Unix(0, 0))
+	built := &blockingDiscardProducer{started: make(chan struct{}), release: make(chan struct{})}
+	var client *Client
+	conn := &producerAdmissionConn{
+		publishConn: &publishConn{info: driver.BrokerInfo{Kind: "test", Version: "1"}},
+		build: func() (driver.Producer, error) {
+			setClientLifecycle(client, lifecycle.Closed)
+			return built, nil
+		},
+	}
+	cfg := testClientConfig(t)
+	cfg.Lifecycle.CloseTimeout = time.Second
+	var err error
+	client, err = New(context.Background(), cfg, WithDriver(&producerAdmissionDriver{conn: conn}), withClock(fake))
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	finished := make(chan struct{})
+	t.Cleanup(func() {
+		close(built.release)
+		waitForSignal(t, finished, "publishing caller cleanup")
+		_ = client.Close(context.Background())
+	})
+	go func() {
+		defer close(finished)
+		done <- publishMessages(client, context.Background(), driver.OutboundMessage{Destination: "orders.created"})
+	}()
+	waitForSignal(t, built.started, "discarded producer close")
+	guard := clock.NewReal().Timer(time.Second)
+	defer guard.Stop()
+	tick := clock.NewReal().Ticker(time.Millisecond)
+	defer tick.Stop()
+	for {
+		if fake.NumWaiters() > 0 {
+			fake.Advance(cfg.Lifecycle.CloseTimeout + time.Nanosecond)
+		}
+		select {
+		case err := <-done:
+			if err == nil || err.Error() != "f1: client is closed" {
+				t.Fatalf("publish after discarded close timeout = %v, want client is closed", err)
+			}
+			if publishCalls, closeCalls := built.counts(); publishCalls != 0 || closeCalls != 1 {
+				t.Fatalf("discarded producer counts = publish %d, close %d, want 0, 1", publishCalls, closeCalls)
+			}
+			return
+		case <-tick.C:
+		case <-guard.C:
+			t.Fatal("publishing call did not return while discarded producer Close was blocked")
+		}
+	}
+}
