@@ -17,12 +17,14 @@ import (
 // message outcome. F1 calls no observer method while holding Client or Runner
 // locks, so implementations may call back into the Client.
 //
-// Start's returned context reaches the handler only for ObserverProcess; other
-// returned contexts do not control settlement or successor publication. Event
-// values are passed by value. Do not retain or mutate FinishEvent.Results after
-// Finish returns. Timestamps use the Client clock; derive durations from event
-// timestamps. Errors are represented by bounded ErrorClass values, not raw
-// error strings or Go type names.
+// Start's returned context reaches the handler only for ObserverProcess. Other
+// returned contexts may supply values for trace injection and context-aware
+// logging, but do not control broker operations, including primary publication,
+// successor publication, and settlement. Event values are passed by value.
+// Do not retain or mutate FinishEvent.Results after Finish returns. Timestamps
+// use the Client clock; derive durations from event timestamps. Errors are
+// represented by bounded ErrorClass values, not raw error strings or Go type
+// names.
 //
 // For metric dimensions, use logical topics, subscriptions, and consumer groups;
 // avoid physical destinations and message identities.

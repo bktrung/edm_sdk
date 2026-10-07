@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"math/rand/v2"
+	"slices"
 	"sync"
 	"time"
 
@@ -493,39 +494,138 @@ func (c *Client) ensureSubscriptionTopologiesOn(ctx context.Context, conn driver
 	return failed
 }
 
-// retireConnection closes what the swap replaced: the producer that was built
-// on the old connection, and the old connection itself when it belongs to an
-// incarnation the client has left. The swap installs the replacement under the
-// next epoch, so an old epoch that is no longer the client's is a connection
-// nothing will use again, and its consumers have already been released.
+// retiredConnection stays owned until its sequential teardown succeeds. mu
+// guards progress and wait; only the running attempt advances the handles.
+type retiredConnection struct {
+	epoch    uint64
+	producer driver.Producer
+	conn     driver.Conn
+	wait     <-chan error
+}
+
 func (c *Client) retireConnection(ctx context.Context, producer driver.Producer, oldConn driver.Conn, oldEpoch uint64) {
-	closeCtx := context.WithoutCancel(ctx)
-	// The replacement is already installed, but the client reads as
-	// reconnecting until this returns, so each close is bounded by
-	// Lifecycle.CloseTimeout: a retired connection whose teardown hangs on a
-	// dead broker must not keep publishes refused on a healthy one.
-	closeTimeout := c.config.Lifecycle.CloseTimeout
-	if producer != nil {
-		if err := runWithClockTimeout(closeCtx, c.options.clock, closeTimeout, "retired producer close", producer.Close); err != nil {
-			lastResortClientLogger(c).Warn("f1 retired producer close failed", "error", err)
+	c.reapRetirements()
+	c.mu.Lock()
+	if !c.staleClaimLocked(oldEpoch) {
+		c.mu.Unlock()
+		return
+	}
+	retired := &retiredConnection{epoch: oldEpoch, producer: producer, conn: oldConn}
+	c.retirements = append(c.retirements, retired)
+	c.mu.Unlock()
+	c.startRetirement(context.WithoutCancel(ctx), retired)
+	// The replacement is installed but publishes stay refused until reconnect
+	// returns. Bound the whole attempt so a dead old broker cannot keep the
+	// healthy replacement unavailable; its unfinished teardown remains owned.
+	err, _ := c.joinRetirement(context.WithoutCancel(ctx), retired)
+	if err != nil {
+		lastResortClientLogger(c).Warn("f1 retired teardown failed", "epoch", oldEpoch, "error", err)
+	}
+}
+
+func (c *Client) startRetirement(ctx context.Context, retired *retiredConnection) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	retired.wait = startPhase(ctx, func(closeCtx context.Context) error {
+		c.mu.Lock()
+		producer, conn := retired.producer, retired.conn
+		c.mu.Unlock()
+		if producer != nil {
+			if err := producer.Close(closeCtx); err != nil {
+				return err
+			}
+			c.mu.Lock()
+			retired.producer = nil
+			c.mu.Unlock()
+		}
+		if err := c.retireKeptConsumers(closeCtx, retired.epoch); err != nil {
+			return err
+		}
+		if conn != nil {
+			if err := conn.Close(closeCtx); err != nil {
+				return err
+			}
+			c.mu.Lock()
+			retired.conn = nil
+			c.mu.Unlock()
+		}
+		return nil
+	})
+}
+
+func (c *Client) completeRetirement(retired *retiredConnection, err error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	retired.wait = nil
+	if err == nil {
+		c.retirements = slices.DeleteFunc(c.retirements, func(entry *retiredConnection) bool {
+			return entry == retired
+		})
+	}
+}
+
+func (c *Client) joinRetirement(ctx context.Context, retired *retiredConnection) (error, bool) {
+	c.mu.Lock()
+	wait := retired.wait
+	c.mu.Unlock()
+	err, resolved := c.joinShutdownPhase(ctx, c.config.Lifecycle.CloseTimeout, "retired teardown", wait)
+	if resolved {
+		c.completeRetirement(retired, err)
+	}
+	return err, resolved
+}
+
+// reapRetirements runs only on the supervisor before registering another epoch.
+// When reconnect's join times out, the attempt may finish before a later swap.
+// Close is still waiting for supervisorDone, so only this reader can consume the
+// buffered result here; a pending result stays untouched for a later join.
+func (c *Client) reapRetirements() {
+	c.mu.Lock()
+	count := len(c.retirements)
+	c.mu.Unlock()
+	for index := count - 1; index >= 0; index-- {
+		c.mu.Lock()
+		retired := c.retirements[index]
+		wait := retired.wait
+		c.mu.Unlock()
+		select {
+		case err := <-wait:
+			c.completeRetirement(retired, err)
+			if err != nil {
+				lastResortClientLogger(c).Warn("f1 retired teardown failed", "epoch", retired.epoch, "error", err)
+			}
+		default:
 		}
 	}
-	if oldConn == nil {
-		return
-	}
-	c.mu.Lock()
-	retired := c.staleClaimLocked(oldEpoch)
-	c.mu.Unlock()
-	if !retired {
-		return
-	}
-	// A consumer kept for this connection is still registered on it, and the
-	// driver refuses to close a connection that carries one. Release it before
-	// the close, on the same detached context and with the same bound the
-	// swap's own teardown uses.
-	c.retireKeptConsumers(closeCtx, oldEpoch)
-	if err := runWithClockTimeout(closeCtx, c.options.clock, closeTimeout, "retired connection close", oldConn.Close); err != nil {
-		lastResortClientLogger(c).Warn("f1 retired connection close failed", "error", err)
+}
+
+func (c *Client) closeRetirements(ctx context.Context) error {
+	for {
+		c.mu.Lock()
+		if len(c.retirements) == 0 {
+			c.mu.Unlock()
+			return nil
+		}
+		retired := c.retirements[0]
+		pending := retired.wait != nil
+		c.mu.Unlock()
+		// The supervisor has exited, so it can no longer read this attempt's
+		// result. A timeout leaves the same attempt for the next Close; a
+		// returned error permits one new attempt, never an unbounded loop.
+		if pending {
+			err, resolved := c.joinRetirement(ctx, retired)
+			if !resolved {
+				return err
+			}
+			if err == nil {
+				continue
+			}
+		}
+		c.startRetirement(context.WithoutCancel(ctx), retired)
+		err, _ := c.joinRetirement(ctx, retired)
+		if err != nil {
+			return err
+		}
 	}
 }
 

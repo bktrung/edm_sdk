@@ -82,7 +82,7 @@ A timeout can leave one fact changed while another phase continues. For example,
 
 ## Close in ack-last order
 
-`Client.Close` stops new work, drains registered runners, waits for in-flight publishing, closes the shared producer, and finally closes the driver connection.
+`Client.Close` stops new work, drains registered runners, waits for in-flight publishing and the reconnect supervisor, finishes retired teardowns, closes the current shared producer, and finally closes the current driver connection.
 
 ```mermaid
 flowchart TB
@@ -90,8 +90,9 @@ flowchart TB
     R --> D[runner drain]
     D --> Q[wait for publishes]
     Q --> W[wait for reconnect to stop]
-    W --> P[producer close]
-    P --> C[connection close]
+    W --> T[finish retired teardowns]
+    T --> P[current producer close]
+    P --> C[current connection close]
 ```
 
 The phases are:
@@ -100,24 +101,33 @@ The phases are:
 2. stop the reconnect supervisor;
 3. drain registered runners concurrently within `Lifecycle.ConsumerDrainTimeout`;
 4. wait for application publishes started before close, and for retry and dead-letter copies still being handed to the broker, up to `Lifecycle.DrainTimeout`;
-5. wait up to `Lifecycle.CloseTimeout` for a reconnect in progress to stop, so
-   it does not close an old connection after `Close` returns;
-6. close the producer, after releasing any consumer a failed `Release` left
-   registered; and
-7. close the driver connection.
+5. wait up to `Lifecycle.CloseTimeout` for a reconnect in progress to stop, then
+   finish retired teardowns before closing current resources, with a separate
+   `Lifecycle.CloseTimeout` bound for each retirement wait;
+6. close the current producer, after releasing any consumer a failed `Release`
+   left registered; and
+7. close the current driver connection.
 
-`Lifecycle.CloseTimeout` bounds every consumer `Stop` and `Release`, the wait
-for a reconnect to stop, the producer close, and the connection close, including
-the releases and closes the reconnect and lane-repair paths make. A consumer whose `Release` failed is still
-registered on the driver, and a driver refuses to close a connection that still
-carries one: the client keeps such a consumer, and releases it again on a later
-`Client.Close` and before the reconnect path closes the connection it belongs
-to. A retried `Client.Close` rejoins a producer or connection close phase that
-is still running instead of starting a second driver call. A concurrent close is
-rejected. A later call is safe after shutdown completes, and a producer-close
-error does not prevent connection shutdown.
+`Lifecycle.CloseTimeout` bounds consumer `Stop` and `Release` waits outside
+retirement attempts, the wait for the reconnect supervisor, each retired teardown
+wait, and current producer and connection close waits. A retired teardown calls
+its producer close, retained-consumer releases, and connection close sequentially;
+it stops at the first error and retains unfinished resources. `Client.Close`
+returns nil only after all retired teardowns finish successfully. A running
+attempt is rejoined, never duplicated; a failed retirement gets at most one new
+attempt per caller-issued `Close`, skipping successful stages. An error or timeout
+stops shutdown before current resource teardown. There is no background retry,
+timer, or backoff; the caller chooses when to retry. Several retired connections
+can make total shutdown exceed one `CloseTimeout`, while the caller context bounds
+the invocation.
 
-A timeout bounds the caller's wait, not necessarily the underlying driver call. A retryable close phase can continue in the background and is rejoined by a later `Close`.
+A consumer whose `Release` failed remains owned until release succeeds. A retried
+`Client.Close` rejoins running current producer or connection close phases as well.
+A concurrent close is rejected, and a fully closed client returns nil. For the
+current producer only, a returned close error does not prevent current connection
+shutdown; this policy does not apply to retired resources. A timeout bounds the
+caller's wait, not necessarily the driver call, which can continue and be rejoined
+later.
 
 ## Configure shutdown time limits
 
@@ -129,7 +139,7 @@ Lifecycle time limits live in `LifecycleConfig`. Choose them from handler and de
 | `HandlerGrace` | Final cancellation grace for handlers | Must not be negative. A value at or above `DrainTimeout` is treated as `0`, so handlers get no grace. |
 | `RebalanceDrainTimeout` | Kafka only: the wait for an in-flight delivery on each revoked partition during a rebalance | Must not exceed 0.6 times the smaller of `broker.kafka.sessionTimeout` and `broker.kafka.rebalanceTimeout`. Zero selects the package default. |
 | `ConsumerDrainTimeout` | `Client.Close` waiting for runner drains | Zero leaves the caller's context as the only bound. |
-| `CloseTimeout` | Every consumer `Stop` and `Release`, including the reconnect and lane-repair paths, the wait for a reconnect to stop, plus producer close and connection close | Zero selects the package default. |
+| `CloseTimeout` | Consumer Stop and Release waits outside retirement attempts, the supervisor wait, each retired teardown wait, and current producer and connection close waits | Zero selects the package default. |
 
 `DrainTimeout` applies separately to the runner drain and to the wait for acks. `ConsumerDrainTimeout` is a separate client-level limit around all runner drains together. The caller's `Close` context can end the current wait earlier.
 
