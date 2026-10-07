@@ -217,6 +217,10 @@ func (c *consumer) readAheadLimit(destination string) int {
 	return max(c.budgets[destination], readAheadLimitNoHold)
 }
 
+// syncHeadTimerLocked points the timer at the earliest held head, expired
+// entries included: it runs on a hold change, where the expired entry a fire
+// left behind is not the hold being armed for, and the fire's own re-arm
+// (rearmHeadTimerLocked) is what skips past it. The caller must hold c.mu.
 func (c *consumer) syncHeadTimerLocked() {
 	var earliest time.Time
 	for _, due := range c.heldUntil {
@@ -224,6 +228,35 @@ func (c *consumer) syncHeadTimerLocked() {
 			earliest = due
 		}
 	}
+	c.armHeadTimerLocked(earliest)
+}
+
+// rearmHeadTimerLocked points the timer at the earliest held head that is still
+// in the future, which is the wake a fire owes the holds it did not clear. The
+// head that armed the timer can stay held after its due: the caller paused its
+// destination, so the expired entry waits for the resume that delivers it.
+// Choosing that entry as the next due would arm a zero-duration timer, and
+// choosing it on every re-arm would spin the loop, so expired entries are
+// skipped here and the next wake is the next held head that can fire. The
+// caller must hold c.mu.
+func (c *consumer) rearmHeadTimerLocked() {
+	now := c.currentTime()
+	var earliest time.Time
+	for _, due := range c.heldUntil {
+		if !due.After(now) {
+			continue
+		}
+		if earliest.IsZero() || due.Before(earliest) {
+			earliest = due
+		}
+	}
+	c.armHeadTimerLocked(earliest)
+}
+
+// armHeadTimerLocked points the one head timer at earliest, with the zero time
+// meaning no held head is waiting and the timer left unarmed. The caller must
+// hold c.mu.
+func (c *consumer) armHeadTimerLocked(earliest time.Time) {
 	if earliest.Equal(c.headTimerDue) {
 		return
 	}
@@ -284,6 +317,11 @@ func (c *consumer) headHoldLoop() {
 				c.headTimer.Stop()
 				c.headTimerSet = false
 				c.headTimerDue = time.Time{}
+				// The fire woke polling for the head that armed the timer, but
+				// that head can still be held past its due, so the loop owes the
+				// holds it left behind the next held head's wake before it waits
+				// again.
+				c.rearmHeadTimerLocked()
 				c.wakePollLocked()
 			}
 			c.mu.Unlock()

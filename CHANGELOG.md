@@ -112,6 +112,9 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
   field reports whether `Priority` carries the stage's delivery lane; F1 sets it on every Finish
   that has one. A batch's topic and priority are resolved independently. Metrics and spans name
   the consumer group by the same rule: `ConsumerGroup`, else `Subscription`.
+- The Kafka consumer re-arms its head-hold timer after it fires for a held retry whose destination
+  is paused, so the next held retry is delivered when its own delay elapses instead of waiting for
+  unrelated traffic.
 - The RabbitMQ driver refuses a message whose correlation ID, message ID, type or content type is
   longer than 255 bytes as too large, before anything is written, instead of letting the AMQP client
   close the whole shared connection.
