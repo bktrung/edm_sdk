@@ -87,7 +87,7 @@ func TestReleaseBoundsEachTeardownJoinWithItsContext(t *testing.T) {
 			waitForwarderState(t, "Release to begin its teardown", func() bool {
 				c.mu.Lock()
 				defer c.mu.Unlock()
-				return c.releasing
+				return c.stopped
 			})
 			cancel()
 
@@ -126,35 +126,13 @@ func TestReleaseRetriesTheTeardownAfterAFailedAttempt(t *testing.T) {
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("Release() error = %v, want context.DeadlineExceeded", err)
 	}
-	c.mu.Lock()
-	finished := c.releaseFinished
-	c.mu.Unlock()
-	if finished {
-		t.Fatal("a failed Release marked the consumer released")
-	}
-	if len(c.conn.active) != 1 {
-		t.Fatalf("consumers registered after a failed Release = %d, want 1", len(c.conn.active))
-	}
-	if messagesClosed(c) {
-		t.Fatal("Messages closed by a failed Release")
-	}
+	assertTeardownState(t, c, false)
 
 	c.forward.Done()
 	if err := c.Release(context.Background()); err != nil {
 		t.Fatalf("retried Release() = %v, want nil", err)
 	}
-	c.mu.Lock()
-	finished = c.releaseFinished
-	c.mu.Unlock()
-	if !finished {
-		t.Fatal("the retried Release did not mark the consumer released")
-	}
-	if len(c.conn.active) != 0 {
-		t.Fatalf("consumers registered after the retried Release = %d, want 0", len(c.conn.active))
-	}
-	if !messagesClosed(c) {
-		t.Fatal("Messages still open after the retried Release")
-	}
+	assertTeardownState(t, c, true)
 }
 
 // TestReleaseEarlyReturnLeavesNoWedgedJoin pins that a Release that returns on
@@ -183,7 +161,7 @@ func TestReleaseEarlyReturnLeavesNoWedgedJoin(t *testing.T) {
 			waitForwarderState(t, "Release to begin its teardown", func() bool {
 				c.mu.Lock()
 				defer c.mu.Unlock()
-				return c.releasing
+				return c.stopped
 			})
 			cancel()
 
@@ -307,5 +285,81 @@ func TestReleaseBoundsLaneCloseAndRetriesIt(t *testing.T) {
 	}
 	if !messagesClosed(c) {
 		t.Fatal("Messages still open after retried Release")
+	}
+}
+
+func TestStopTakesOverFailedReleaseTeardown(t *testing.T) {
+	c, release, calls, cancel, unblock, starts := blockedReleaseFixture(t)
+	c.events.Add(1)
+	var joinOnce sync.Once
+	releaseJoin := func() { joinOnce.Do(c.events.Done) }
+	t.Cleanup(releaseJoin)
+	cancel()
+	err := teardownResult(t, release)
+	if !errors.Is(err, context.Canceled) {
+		t.Errorf("failed Release = %v, want context.Canceled", err)
+	}
+	if kind, ok := driver.Classify(err); !ok || kind != driver.KindTransient {
+		t.Errorf("failed Release = %v, want transient classification", err)
+	}
+	assertTeardownState(t, c, false)
+	c.mu.Lock()
+	outstanding, settlers := c.outstanding, len(c.settlers)
+	c.mu.Unlock()
+	if outstanding != 1 || settlers != 1 {
+		t.Fatalf("failed Release accounting = outstanding %d, settlers %d, want 1, 1", outstanding, settlers)
+	}
+
+	ctx := newTeardownWaitContext()
+	stop := startTeardownCall(t, c, calls, func() error { return c.Stop(ctx) })
+	assertTeardownState(t, c, false)
+	if got := starts.Load(); got != 1 {
+		t.Errorf("lane close starts during takeover = %d, want 1", got)
+	}
+	unblock()
+	waitForwarderState(t, "retained broker close completion", func() bool {
+		l := c.lanes[0]
+		l.closeMu.Lock()
+		defer l.closeMu.Unlock()
+		if l.closeOutcome == nil {
+			return false
+		}
+		select {
+		case <-l.closeOutcome.done:
+			return true
+		default:
+			return false
+		}
+	})
+	returned := !awaitTeardownWait(t, ctx, stop)
+	// Closing the retained broker outcome is insufficient: the Stop owner must
+	// also join the watcher left behind by the failed Release before finalizing.
+	assertTeardownState(t, c, false)
+	if !returned {
+		select {
+		case err := <-stop:
+			t.Errorf("Stop returned %v before joining the remaining watcher", err)
+			returned = true
+		case <-time.After(20 * time.Millisecond): //nolint:forbidigo // observe the local join after broker close completion
+		}
+	}
+	releaseJoin()
+	if !returned {
+		if err := teardownResult(t, stop); err != nil {
+			t.Errorf("Stop takeover = %v, want nil despite abandoned settlers", err)
+		}
+	}
+	assertTeardownState(t, c, true)
+	for _, call := range []func() error{
+		func() error { return c.Stop(context.Background()) },
+		func() error { return c.Release(context.Background()) },
+	} {
+		if err := teardownResult(t, startTeardownCall(t, c, calls, call)); err != nil {
+			t.Errorf("repeated teardown after takeover = %v, want nil", err)
+		}
+		assertTeardownState(t, c, true)
+	}
+	if got := starts.Load(); got != 1 {
+		t.Errorf("lane close starts after takeover = %d, want 1", got)
 	}
 }

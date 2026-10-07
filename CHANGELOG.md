@@ -9,6 +9,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ### Changed
 
+- RabbitMQ `Open` refuses a `broker.rabbitmq.vhost` that differs from any endpoint's
+  parsed vhost, and SASL credentials set without a mechanism, with a fatal error before dialing.
 - Documentation qualifies shutdown, scheduling, ordering, and retry timing guarantees,
   reconciles RabbitMQ publishing with shared confirm channels, and removes duplicate
   analysis and standalone JavaScript simulators.
@@ -56,6 +58,14 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ### Fixed
 
+- RabbitMQ management uses the AMQP-parsed URI login, including defaults, or the selected
+  PLAIN/AMQPLAIN SASL identity. EXTERNAL retains the URI login for management.
+- RabbitMQ `Open` bounds TCP connect, TLS and AMQP handshakes by the connect timeout, so a peer
+  that accepts TCP but never answers no longer hangs connection setup. A cancelled connect
+  closes its socket at once instead of leaking it.
+- RabbitMQ consumer `Stop` and `Release` share one teardown. A concurrent or repeated call
+  returns success only after the consumer is unregistered from its connection and `Messages`
+  and `Errors` are closed, so closing the connection afterwards no longer fails.
 - A runner drained while waiting for a connection rebuild completes its terminal
   consumer teardown before `Run` returns, including when reconnect has already
   released the consumer.

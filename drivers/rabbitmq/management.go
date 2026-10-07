@@ -88,16 +88,70 @@ func managementTransport(tlsClientConfig *tls.Config) *http.Transport {
 	return transport
 }
 
-func newManagementClient(endpoint string, cfg driver.Config) (*managementClient, error) {
+type resolvedEndpoint struct {
+	endpoint string
+	parsed   *url.URL
+	vhost    string
+	username string
+	password string
+	sasl     []amqp.Authentication
+}
+
+func resolveEndpoint(endpoint string, cfg driver.Config) (resolvedEndpoint, error) {
+	resolved := resolvedEndpoint{endpoint: endpoint}
 	parsed, err := url.Parse(endpoint)
 	if err != nil {
-		return nil, invalidEndpointError(err)
+		return resolved, invalidEndpointError(err)
 	}
 	if parsed.Hostname() == "" {
-		// Opaque and path fields can retain raw credential-looking input; keep only the scheme.
 		redacted := url.URL{Scheme: parsed.Scheme}
-		return nil, fmt.Errorf("rabbitmq: invalid management endpoint %q: %w", redacted.String(), errUnsupportedHostlessEndpoint)
+		return resolved, fmt.Errorf("rabbitmq: invalid management endpoint %q: %w", redacted.String(), errUnsupportedHostlessEndpoint)
 	}
+	if err := validateEndpoint(endpoint); err != nil {
+		return resolved, err
+	}
+	uri, err := amqp.ParseURI(endpoint)
+	if err != nil {
+		return resolved, invalidEndpointError(err)
+	}
+	if configured := cfg.DriverOptions["rabbitmq.vhost"]; configured != "" && configured != uri.Vhost {
+		return resolved, fmt.Errorf("rabbitmq: rabbitmq.vhost %q does not match endpoint vhost %q", configured, uri.Vhost)
+	}
+	if err := validateSASL(cfg.SASL); err != nil {
+		return resolved, err
+	}
+	resolved.parsed = parsed
+	resolved.vhost = uri.Vhost
+	resolved.username, resolved.password = uri.Username, uri.Password
+	if cfg.SASL != nil {
+		switch strings.ToLower(cfg.SASL.Mechanism) {
+		case "plain", "amqplain":
+			resolved.username, resolved.password = cfg.SASL.Username, cfg.SASL.Password
+			var auth amqp.Authentication
+			if strings.EqualFold(cfg.SASL.Mechanism, "plain") {
+				auth = &amqp.PlainAuth{Username: resolved.username, Password: resolved.password}
+			} else {
+				auth = &amqp.AMQPlainAuth{Username: resolved.username, Password: resolved.password}
+			}
+			resolved.sasl = []amqp.Authentication{auth}
+		case "external":
+			// EXTERNAL authenticates AMQP by certificate, not HTTP Basic Auth.
+			resolved.sasl = []amqp.Authentication{&amqp.ExternalAuth{}}
+		}
+	}
+	return resolved, nil
+}
+
+func newManagementClient(endpoint string, cfg driver.Config) (*managementClient, error) {
+	resolved, err := resolveEndpoint(endpoint, cfg)
+	if err != nil {
+		return nil, err
+	}
+	return managementClientForEndpoint(resolved, cfg)
+}
+
+func managementClientForEndpoint(endpoint resolvedEndpoint, cfg driver.Config) (*managementClient, error) {
+	parsed := endpoint.parsed
 	scheme := "http"
 	if parsed.Scheme == "amqps" || (cfg.TLS != nil && cfg.TLS.Enabled) {
 		scheme = "https"
@@ -106,30 +160,7 @@ func newManagementClient(endpoint string, cfg driver.Config) (*managementClient,
 	if portErr != nil {
 		return nil, portErr
 	}
-	if parsed.Scheme != "amqps" && !isLoopbackEndpoint(endpoint) {
-		return nil, errors.New("rabbitmq: plaintext connection to non-loopback host requires an amqps:// endpoint")
-	}
 	host := net.JoinHostPort(parsed.Hostname(), strconv.Itoa(managementPort))
-	username, password := "", ""
-	if parsed.User != nil {
-		username = parsed.User.Username()
-		password, _ = parsed.User.Password()
-	}
-	if cfg.SASL != nil && (cfg.SASL.Username != "" || cfg.SASL.Password != "") {
-		username = cfg.SASL.Username
-		password = cfg.SASL.Password
-	}
-	amqpURI, uriErr := amqp.ParseURI(endpoint)
-	if uriErr != nil {
-		return nil, invalidEndpointError(uriErr)
-	}
-	vhost := cfg.DriverOptions["rabbitmq.vhost"]
-	if vhost == "" {
-		// The AMQP connection reads its vhost from this same endpoint through
-		// this parse, so re-deriving it here is how the two readers drifted
-		// apart. One parse, one answer.
-		vhost = amqpURI.Vhost
-	}
 	timeout := cfg.ConnectTimeout
 	if timeout <= 0 {
 		timeout = defaultManagementTimeout
@@ -146,9 +177,9 @@ func newManagementClient(endpoint string, cfg driver.Config) (*managementClient,
 	}
 	return &managementClient{
 		baseURL:  scheme + "://" + host,
-		username: username,
-		password: password,
-		vhost:    vhost,
+		username: endpoint.username,
+		password: endpoint.password,
+		vhost:    endpoint.vhost,
 		client:   client,
 	}, nil
 }
