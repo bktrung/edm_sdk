@@ -346,10 +346,7 @@ func newLeaveTestConsumer(t *testing.T, connection *conn, destination string, bu
 	t.Cleanup(client.Close)
 	pollDone := make(chan struct{})
 	close(pollDone)
-	messagesCapacity := budget
-	if messagesCapacity < 1 {
-		messagesCapacity = 1
-	}
+	messagesCapacity := max(budget, 1)
 	c := &consumer{
 		conn:            connection,
 		client:          client,

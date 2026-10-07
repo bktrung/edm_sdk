@@ -225,7 +225,9 @@ func WithTopology(p TopologyPolicy) Option {
 }
 
 // WithObserver installs the observer that receives this Client's lifecycle and
-// point events. A nil observer disables these callbacks.
+// point events. A nil observer disables these callbacks. An observer that
+// implements [ObserverBinder] is bound to the Client by New and released when
+// the Client closes; New fails if the observer refuses the binding.
 func WithObserver(observer Observer) Option {
 	return func(options *clientOptions) error {
 		options.observer = observer

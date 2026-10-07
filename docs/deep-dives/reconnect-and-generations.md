@@ -35,7 +35,7 @@ flowchart TB
     C -->|no, attempts left| O
     C -->|no, limit reached| X[store fatal error]
     C -->|yes| S[swap connection]
-    S --> T[close old]
+    S --> T[bounded wait for retired teardown]
     T --> N[reopen consumers]
     N --> H([handler])
 ```
@@ -46,8 +46,9 @@ The supervisor first releases every runner's current consumer. Each running runn
 
 A failed release must not strand the other runners halfway through recovery.
 F1 logs it and keeps that consumer for another release attempt when retiring
-the old connection. The old connection is then closed. This is recovering the
-transport, not retrying a handler or dead-lettering a message.
+the old connection. That connection closes only after its producer and retained
+consumers finish successfully. This is recovering the transport, not retrying a
+handler or dead-lettering a message.
 
 After releasing the runners, F1 waits until no publish is running. It does not cancel a publish that already started. That order lets a running publish return its own result before the old producer is closed, and it keeps anyone from building a new producer on a connection that is about to be replaced.
 
@@ -71,20 +72,24 @@ This table shows one possible order of events. The publish error, the consumer e
 | 4 | The publish returns its own error; F1 does not resend it. | The released message can be delivered again by the broker; the runner waits for the new connection. | Connection 1, attempt running |
 | 5 | Reconnect waits until no publish is running. | A consumer open begun earlier can return on connection 1 now; the reconnect gate refuses it. If it returns after the swap, the connection-number check rejects it as stale. | Connection 1, attempt running |
 | 6 | The replacement opens and its queues and topics are declared. | Waiters stay on the old wake-up channel until the swap. | Connection 1, attempt running |
-| 7 | After retirement finishes, new publishes record number 2 and build a new shared producer. | The waiter sees the new number and reopens when the client is live. | Connection 2 |
+| 7 | After the bounded retirement wait ends, new publishes record number 2 and build a new shared producer. | The waiter sees the new number and reopens when the client is live. | Connection 2 |
 | 8 | The caller decides whether the failed publish should be sent again. | The broker may deliver the released message to the new consumer. | Connection 2, live |
 
-Retiring the replaced connection uses a context detached from reconnect
-cancellation. With a positive `Lifecycle.CloseTimeout`, each retired producer
-close, retained-consumer release, and retired connection close has a bounded
-wait. Zero leaves that wait unbounded. A timeout is logged and lets recovery
-continue; it does not prove that a driver call ignoring cancellation has ended.
+Retirement uses a detached context and one sequential producer-close,
+retained-consumer-release, connection-close attempt, stopping at the first error.
+Reconnect bounds its wait for the whole attempt by `Lifecycle.CloseTimeout`; a
+timeout lets recovery continue without abandoning ownership.
 
-If `Close` starts during reconnect, it cancels the supervisor and waits for it
-before closing the current connection, subject to the caller context and
-`Lifecycle.CloseTimeout`. Completing that wait means the retirement path has
-returned, not necessarily that every timed-out driver call has finished. The
-cleanup and replacement decisions are in
+If `Close` starts during reconnect, it cancels and waits for the supervisor, then
+finishes every retired teardown before current resources. Nil requires every
+retired teardown to have succeeded. Running attempts are rejoined; failed
+retirements get one new attempt per caller-issued `Close`, skipping successful
+stages. Errors and timeouts retain unfinished ownership. There is no background
+retry, timer, or backoff. Each retirement wait has its own
+`Lifecycle.CloseTimeout` bound, subject to the caller context; total shutdown can
+exceed one such bound.
+
+The cleanup and replacement decisions are in
 [`reconnect.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/reconnect.go);
 [`client.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/client.go)
 owns the shutdown wait.

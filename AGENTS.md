@@ -156,9 +156,16 @@ records live elsewhere. State the rule the citation stands for instead of the re
 
 ## Commit style
 
-One logical change per commit. Subject is `<scope>: <what changed>`, lowercase, no trailing
-period, present tense. Scope is the package or driver: `kafka:`, `worker:`, `docs:`. One or
-two lines total. Add a body only when the reason is not obvious, and keep it short.
+One logical change per commit. The subject follows Conventional Commits:
+`<type>(<scope>): <what changed>`, lowercase, no trailing period, imperative present tense.
+
+- Type is one of `feat`, `fix`, `perf`, `refactor`, `test`, `docs`, `build`, `chore`.
+- Scope is the package or driver: `fix(rabbitmq):`, `refactor(worker):`, `test(kafka):`.
+  `docs:` may omit the scope.
+- A breaking API change adds `!` after the scope: `refactor(api)!:`.
+- A bare `<scope>: ...` subject, such as `rabbitmq: ...`, is wrong.
+
+Keep it to one or two lines. Add a body only when the reason is not obvious, and keep it short.
 
 No AI attribution, no co-author trailers, no plan or ticket identifiers.
 

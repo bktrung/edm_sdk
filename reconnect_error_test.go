@@ -15,6 +15,44 @@ import (
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/lifecycle"
 )
 
+func TestFatalReconnectFailureRefusesPublish(t *testing.T) {
+	fake := clock.NewFake(time.Unix(940, 0))
+	recorded := &recordingClock{Fake: fake}
+	d := &attemptDriver{reconnectTestDriver: &reconnectTestDriver{created: make(chan *reconnectTestConsumer, 1)}}
+	client := newAttemptTestClient(t, d, recorded, WithPublishTopics("orders.created"))
+	client.reconnectRandom = func() float64 { return 1 }
+	cause := errors.New("credentials rejected")
+	fatal := &driver.Error{Driver: d.Name(), Op: "open", K: driver.KindFatal, Err: cause}
+	d.setFailOpensWithError(1, fatal)
+
+	if err := client.requestReconnect(errors.New("connection lost"), 0); err != nil {
+		t.Fatal(err)
+	}
+	advanceReconnect(t, recorded, 500*time.Millisecond, 1)
+	if err := client.awaitRebuild(context.Background(), nil, 0, nil); !errors.Is(err, fatal) {
+		t.Fatalf("awaitRebuild() = %v, want original fatal error %v", err, fatal)
+	}
+	waitReconnectCondition(t, func() bool { return !client.isReconnecting() })
+
+	_, err := client.Publisher().Publish(context.Background(), "orders.created", map[string]string{"value": "after-fatal"})
+	if !errors.Is(err, fatal) {
+		t.Fatalf("Publish() = %v, want original fatal error %v", err, fatal)
+	}
+	var classified *driver.Error
+	if !errors.As(err, &classified) || classified != fatal || !errors.Is(err, cause) {
+		t.Fatalf("Publish() = %v, want original driver classification and broker cause", err)
+	}
+	if got := d.opened()[0].raw.producer.Load(); got != 0 {
+		t.Fatalf("producer opens = %d, want no producer receiving the refused publish", got)
+	}
+	if err := client.Health(context.Background()); !errors.Is(err, fatal) {
+		t.Fatalf("Health() = %v, want original fatal error %v", err, fatal)
+	}
+	if err := client.requestReconnect(errors.New("retry"), 0); !errors.Is(err, fatal) {
+		t.Fatalf("requestReconnect() = %v, want original fatal error %v", err, fatal)
+	}
+}
+
 // TestUnservedRequestReleasesTheWaitersWithItsOwnError pins what a caller
 // waiting on a rebuild no supervisor will serve receives. The request is
 // recorded and then released because the supervisor is already leaving, and the

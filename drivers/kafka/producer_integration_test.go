@@ -326,7 +326,7 @@ func TestPublishOversizeRejected(t *testing.T) {
 	cleanupKafkaTopics(t, admin, topic)
 
 	responses, err := admin.CreateTopics(ctx, 1, -1, map[string]*string{
-		"max.message.bytes": kadm.StringPtr("65536"),
+		"max.message.bytes": new("65536"),
 	}, topic)
 	if err != nil {
 		t.Fatalf("CreateTopic(%q): %v", topic, err)

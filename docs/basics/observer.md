@@ -181,6 +181,31 @@ These strings are a public contract and appear as metric labels in the
 OpenTelemetry adapter. The [observer events reference](/development/observer-events)
 lists all values and their meanings.
 
+Primary-publish `FinishEvent.Results` contains `[]ObserverMessageResult` in
+input order. Each result exposes only `ID` and a bounded `ErrorClass`, never
+the raw publish error or its wrapped cause:
+
+| ID | ErrorClass | Meaning |
+| --- | --- | --- |
+| Non-empty | Empty | Successfully published |
+| Empty | Non-empty | Failed at this index |
+| Empty | Empty | No published result and no per-index error |
+
+The last state occurs when the batch fails before publication, for example
+during encoding. The method error and top-level Finish `ErrorClass` describe
+that failure; do not count an empty-class result as sent unless its ID is also
+non-empty. A driver-reported partial failure without a cause gets `_OTHER`,
+not an empty class.
+
+This draft observer API replaces per-result `Err` with `ErrorClass`. Custom
+observers should use the class and ID to inspect outcomes and copy any needed
+values during Finish; they must not retain or mutate the Results slice.
+The SDK converts into separate observer storage only when observation is
+enabled. Application callers still receive `BatchResult.Results` containing
+the original `MessageResult.Err`, including wrapped causes reachable through
+`errors.Is` and `errors.As`; Publisher and Observer method signatures do not
+change.
+
 ## Rules an observer must follow
 
 **Be safe for concurrent use.** F1 calls every method concurrently for different
@@ -244,6 +269,45 @@ One boundary worth knowing: the context from `Start` for `ObserverProcess` is th
 context the handler receives, but the ack and the retry publish can run on a
 different drain-time context. Trace context crossing a retry or dead-letter hop
 travels on the message, not on a context.
+
+## Bind an observer to one client
+
+Most observers can be shared by any number of clients. One that keeps
+per-client state, such as the broker endpoint it labels telemetry with, cannot,
+and it says so by also implementing
+[`ObserverBinder`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/observer.go):
+
+```go
+type ObserverBinder interface {
+	BindClient() (unbind func(), err error)
+}
+```
+
+`f1.New` calls `BindClient` once, after it validates the configuration and
+before it opens the driver or emits any event. An error fails `New` with that
+error wrapped, and nothing is opened. After a successful bind, F1 calls a
+non-nil `unbind` exactly once: when `New` fails later, or when `Close` completes
+shutdown. A `Close` that fails and leaves the client retryable keeps the
+binding. `unbind` runs outside client locks and does not wait for observer calls
+already in flight.
+
+The [OpenTelemetry adapter](/advanced-topics/observability#one-observer-per-client)
+implements it, which is why each client needs its own `f1otel` observer.
+
+A wrapper must forward the call to keep the wrapped observer's binding
+enforced:
+
+```go
+func (w *loggingObserver) BindClient() (func(), error) {
+	if binder, ok := w.inner.(f1.ObserverBinder); ok {
+		return binder.BindClient()
+	}
+	return nil, nil
+}
+```
+
+F1 cannot see through a wrapper that does not forward it, so such a wrapper is
+not checked.
 
 ## Test against a recorder
 

@@ -53,8 +53,10 @@ type DeadLettered struct {
 	Destination string
 }
 
-// Discarded carries the message data passed to OnDiscarded after the message
-// is acknowledged without applying its effect or retaining a copy.
+// Discarded carries the message data passed to OnDiscarded when a message is
+// acknowledged without applying its effect or retaining a copy. The callback
+// is scheduled at most once per delivery, only after an inline or deferred Ack
+// returns success. A requeue fallback or unsettled delivery never schedules it.
 type Discarded struct {
 	Envelope Envelope
 	// Body is an independent copy of the message payload, safe to read after

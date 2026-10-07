@@ -72,8 +72,8 @@ func unprofileDestination(group *groupContext, destination string) string {
 }
 
 func profileScope(group *groupContext, scope string) string {
-	if strings.HasSuffix(scope, ".") {
-		base := strings.TrimSuffix(scope, ".")
+	if before, ok := strings.CutSuffix(scope, "."); ok {
+		base := before
 		return profileDestination(group, base) + "."
 	}
 	return profileDestination(group, scope)

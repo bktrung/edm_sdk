@@ -137,7 +137,7 @@ func encodeFuzzHeaders(headers map[string]string) string {
 
 func decodeFuzzHeaders(encoded string) map[string]string {
 	headers := make(map[string]string)
-	for _, line := range strings.Split(encoded, "\n") {
+	for line := range strings.SplitSeq(encoded, "\n") {
 		key, value, ok := strings.Cut(line, "=")
 		if ok {
 			headers[key] = value

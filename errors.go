@@ -2,6 +2,7 @@ package f1
 
 import (
 	"errors"
+	"maps"
 	"slices"
 
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/wire"
@@ -106,9 +107,7 @@ func collectDeathDetails(err error) (map[string]string, []string) {
 				if details == nil {
 					details = make(map[string]string)
 				}
-				for key, value := range carrier.DeathDetails() {
-					details[key] = value
-				}
+				maps.Copy(details, carrier.DeathDetails())
 			}
 			discarded = append(discarded, carrier.discardedDetails()...)
 			return

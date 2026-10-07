@@ -147,7 +147,7 @@ func (a *adminOperations) Prune(ctx context.Context, names []string) ([]driver.P
 	}
 	queues, err := a.conn.management.listQueues(ctx)
 	if err != nil {
-		return nil, classify("prune", driver.KindTransient, err)
+		return nil, classifyManagement("prune", err)
 	}
 	results := make([]driver.PruneResult, 0, len(names))
 	exchangeListLoaded := false
@@ -162,7 +162,7 @@ func (a *adminOperations) Prune(ctx context.Context, names []string) ([]driver.P
 			if !exchangeListLoaded {
 				exchanges, err = a.conn.management.listExchanges(ctx)
 				if err != nil {
-					return nil, classify("prune", driver.KindTransient, err)
+					return nil, classifyManagement("prune", err)
 				}
 				exchangeListLoaded = true
 			}
@@ -180,7 +180,7 @@ func (a *adminOperations) Prune(ctx context.Context, names []string) ([]driver.P
 			if !bindingsLoaded {
 				bindings, err = a.conn.management.listBindings(ctx)
 				if err != nil {
-					return nil, classify("prune", driver.KindTransient, err)
+					return nil, classifyManagement("prune", err)
 				}
 				bindingsLoaded = true
 			}
@@ -198,7 +198,7 @@ func (a *adminOperations) Prune(ctx context.Context, names []string) ([]driver.P
 			}
 			deleted, deleteErr := a.conn.management.deleteExchange(ctx, name)
 			if deleteErr != nil {
-				return nil, classify("prune", driver.KindTransient, deleteErr)
+				return nil, classifyManagement("prune", deleteErr)
 			}
 			if !deleted {
 				result.Reason = "exchange disappeared before deletion"
@@ -219,7 +219,7 @@ func (a *adminOperations) Prune(ctx context.Context, names []string) ([]driver.P
 		if len(parking) > 0 {
 			queues, err = a.conn.management.listQueues(ctx)
 			if err != nil {
-				return nil, classify("prune", driver.KindTransient, err)
+				return nil, classifyManagement("prune", err)
 			}
 			if _, exists = findQueue(queues, name); !exists {
 				result.Reason = "destination disappeared before deletion"
@@ -258,7 +258,7 @@ func (a *adminOperations) Prune(ctx context.Context, names []string) ([]driver.P
 		}
 		queues, err = a.conn.management.listQueues(ctx)
 		if err != nil {
-			return nil, classify("prune", driver.KindTransient, err)
+			return nil, classifyManagement("prune", err)
 		}
 		_, exists = findQueue(queues, name)
 		if !exists {

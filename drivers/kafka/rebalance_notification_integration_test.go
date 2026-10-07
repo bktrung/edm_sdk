@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -103,9 +104,7 @@ func TestPublicRunnerConsumesKafkaMessagesAfterAssignmentNotification(t *testing
 
 	receivedMu.Lock()
 	got := make(map[string]int, len(received))
-	for id, count := range received {
-		got[id] = count
-	}
+	maps.Copy(got, received)
 	receivedMu.Unlock()
 	if gotCount := arrivals.Load(); gotCount != published {
 		t.Fatalf("handler arrivals = %d, want %d", gotCount, published)

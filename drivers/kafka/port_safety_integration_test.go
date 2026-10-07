@@ -12,7 +12,7 @@ package kafka_test
 
 import (
 	"fmt"
-	"sort"
+	"slices"
 	"sync"
 	"testing"
 	"time"
@@ -836,7 +836,7 @@ func TestPortTurnaroundAfterSettle(t *testing.T) {
 		settled = clk.Now()
 	}
 
-	sort.Slice(samples, func(i, j int) bool { return samples[i] < samples[j] })
+	slices.Sort(samples)
 	p50 := portTurnaroundPercentile(samples, 50)
 	p99 := portTurnaroundPercentile(samples, 99)
 	t.Logf("port-metrics test=turnaround p50-ms=%.3f p99-ms=%.3f",
@@ -901,14 +901,12 @@ func TestPortCooperativeKeepsRetainedPartitionsDelivering(t *testing.T) {
 	settler := holder.pump(func(message driver.InboundMessage) {
 		ledger.received(portSequenceOf(message))
 		trace.record(message.Ref.Partition, clk.Now())
-		handlers.Add(1)
-		go func() {
-			defer handlers.Done()
+		handlers.Go(func() {
 			if err := pace.wait(ctx, clk); err != nil {
 				return
 			}
 			ledger.acknowledge(ctx, message)
-		}()
+		})
 	})
 	defer settler.stop()
 

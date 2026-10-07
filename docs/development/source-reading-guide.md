@@ -307,7 +307,7 @@ one lives in the code.
   `publisher.go` (`Publisher.PublishBatch` and its captured epoch); `worker.go`
   (generation opening, consumer admission, repair after a connection error).
 - **One owner per runner**: `worker.go` (`runnerEvent` and its kinds,
-  `runnerOwner`, `pumpUntil`, `handle`, `startOpen`, `startRebuild`,
+  `runnerOwner`, `pumpUntil`, `handle`, `startOpen`, `awaitRebuild`,
   `releaseConsumer`, `requestDrain`, `startDrain`, `Runner.Run`, `Runner.Drain`,
   the source goroutines' deferred reports); `reconnect.go` (the supervisor's
   abandon); `runner_owner_test.go`.
@@ -330,7 +330,8 @@ one lives in the code.
   (`target`) translates a delayed destination into parking publication.
 - **Kafka retry delays**: `drivers/kafka/deferral.go` (`dueTime`,
   `admissionLocked`, `setHeadHoldLocked`, `syncHeadTimerLocked`,
-  `headHoldLoop`); `drivers/kafka/consumer.go` (the poll loop's head admission,
+  `armHeadTimerLocked`, `rearmHeadTimerLocked`, `headHoldLoop`);
+  `drivers/kafka/consumer.go` (the poll loop's head admission,
   `completeSettlement`); `driver/driver.go` (`ConsumerConfig.Delays`).
 - **RabbitMQ publish channels**: `drivers/rabbitmq/producer.go`
   (`publishChannelCount`, `publishSegment`, `reserve`, `channelIn`, `write`,

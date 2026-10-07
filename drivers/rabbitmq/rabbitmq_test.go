@@ -3,8 +3,10 @@ package rabbitmq
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"strings"
@@ -597,5 +599,174 @@ func TestClassifyPublishClose(t *testing.T) {
 				t.Fatalf("error = %v, want the broker's reason %q to survive", err, test.wantReason)
 			}
 		})
+	}
+}
+
+func TestOpenRejectsMismatchedVhostBeforeDialing(t *testing.T) {
+	for _, later := range []bool{false, true} {
+		t.Run(fmt.Sprintf("later endpoint=%t", later), func(t *testing.T) {
+			listener, accepted := listenerForOpenAttempt(t)
+			address := listener.Addr().String()
+			endpoints := []string{"amqp://redaction-user:redaction-secret@" + address + "/billing"}
+			if later {
+				endpoints = append([]string{"amqp://" + address + "/orders"}, endpoints...)
+			}
+			ctx, cancel := context.WithTimeout(t.Context(), 200*time.Millisecond)
+			defer cancel()
+			connection, err := (Driver{}).Open(ctx, driver.Config{
+				Endpoints: endpoints, ConnectTimeout: 200 * time.Millisecond,
+				DriverOptions: map[string]string{"rabbitmq.vhost": "orders"},
+			})
+			assertFatalOpenRefusal(t, connection, err, accepted)
+			for _, detail := range []string{"orders", "billing"} {
+				if !strings.Contains(err.Error(), detail) {
+					t.Errorf("vhost refusal does not name %s", detail)
+				}
+			}
+		})
+	}
+}
+
+func TestOpenRejectsSASLCredentialsWithoutMechanism(t *testing.T) {
+	for _, settings := range []driver.SASLConfig{
+		{Username: "redaction-user"},
+		{Password: "redaction-secret"},
+		{Username: "redaction-user", Password: "redaction-secret"},
+	} {
+		listener, accepted := listenerForOpenAttempt(t)
+		ctx, cancel := context.WithTimeout(t.Context(), 200*time.Millisecond)
+		connection, err := (Driver{}).Open(ctx, driver.Config{
+			Endpoints: []string{"amqp://" + listener.Addr().String() + "/"},
+			SASL:      &settings, ConnectTimeout: 200 * time.Millisecond,
+		})
+		cancel()
+		assertFatalOpenRefusal(t, connection, err, accepted)
+		if !strings.Contains(err.Error(), "mechanism") {
+			t.Error("credential refusal does not ask for a mechanism")
+		}
+	}
+}
+
+func assertFatalOpenRefusal(t *testing.T, connection driver.Conn, err error, accepted <-chan struct{}) {
+	t.Helper()
+	var classified *driver.Error
+	if connection != nil || !errors.As(err, &classified) || classified.Driver != "rabbitmq" || classified.Op != "open" || classified.K != driver.KindFatal {
+		t.Fatalf("Open did not return a fatal rabbitmq/open configuration refusal: %v", err)
+	}
+	if receivedOpenAttempt(accepted) {
+		t.Error("Open dialed before refusing the configuration")
+	}
+	for _, secret := range []string{"redaction-user", "redaction-secret", "amqp://"} {
+		if strings.Contains(err.Error(), secret) {
+			t.Error("Open refusal disclosed endpoint credentials")
+		}
+	}
+}
+
+// assertOpenSASL observes connection.start-ok on the socket Open actually dials.
+// Stopping after authentication avoids inventing a broker's topology behavior.
+func assertOpenSASL(t *testing.T, settings *driver.SASLConfig) {
+	t.Helper()
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+	defer cancel()
+	deadline, _ := ctx.Deadline()
+	if err := listener.(*net.TCPListener).SetDeadline(deadline); err != nil {
+		t.Fatal(err)
+	}
+	result := make(chan error, 1)
+	go func() {
+		_, openErr := (Driver{}).Open(ctx, driver.Config{
+			Endpoints: []string{"amqp://uri-user:uri-secret@" + listener.Addr().String() + "/"},
+			SASL:      settings, ConnectTimeout: time.Second,
+		})
+		result <- openErr
+	}()
+	socket, err := listener.Accept()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer socket.Close()
+	if err := socket.SetDeadline(deadline); err != nil {
+		t.Fatal(err)
+	}
+	header := make([]byte, 8)
+	if _, err := io.ReadFull(socket, header); err != nil {
+		t.Fatal(err)
+	}
+	start := []byte{0, 10, 0, 10, 0, 9, 0, 0, 0, 0}
+	const mechanisms = "PLAIN AMQPLAIN EXTERNAL"
+	const startLength = uint32(10 + 4 + len(mechanisms) + 4 + len("en_US"))
+	start = binary.BigEndian.AppendUint32(start, uint32(len(mechanisms)))
+	start = append(start, mechanisms...)
+	start = binary.BigEndian.AppendUint32(start, 5)
+	start = append(start, "en_US"...)
+	frame := binary.BigEndian.AppendUint32([]byte{1, 0, 0}, startLength)
+	frame = append(frame, start...)
+	frame = append(frame, 0xce)
+	if _, err := socket.Write(frame); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := io.ReadFull(socket, header[:7]); err != nil {
+		t.Fatal(err)
+	}
+	payload := make([]byte, int(binary.BigEndian.Uint32(header[3:7]))+1)
+	if _, err := io.ReadFull(socket, payload); err != nil {
+		t.Fatal(err)
+	}
+	cancel()
+	<-result
+	// start-ok is class/method, client-properties table, mechanism shortstr,
+	// response longstr, then locale shortstr.
+	offset := 8 + int(binary.BigEndian.Uint32(payload[4:8]))
+	mechanismLength := int(payload[offset])
+	mechanism := string(payload[offset+1 : offset+1+mechanismLength])
+	offset += 1 + mechanismLength
+	responseLength := int(binary.BigEndian.Uint32(payload[offset : offset+4]))
+	response := string(payload[offset+4 : offset+4+responseLength])
+	var expected amqp.Authentication
+	switch strings.ToLower(settings.Mechanism) {
+	case "plain":
+		expected = &amqp.PlainAuth{Username: settings.Username, Password: settings.Password}
+	case "amqplain":
+		// AMQPLAIN is a field table; map iteration makes its byte order vary.
+		fields := bytes.NewReader([]byte(response))
+		identity := make(map[string]string, 2)
+		for fields.Len() > 0 {
+			keyLength, err := fields.ReadByte()
+			if err != nil {
+				t.Fatal("invalid AMQPLAIN field name")
+			}
+			key := make([]byte, keyLength)
+			if _, err := io.ReadFull(fields, key); err != nil {
+				t.Fatal("invalid AMQPLAIN field name")
+			}
+			fieldType, err := fields.ReadByte()
+			if err != nil || fieldType != 'S' {
+				t.Fatal("AMQPLAIN credential is not a long string")
+			}
+			var valueLength uint32
+			if err := binary.Read(fields, binary.BigEndian, &valueLength); err != nil || int64(valueLength) > int64(fields.Len()) {
+				t.Fatal("invalid AMQPLAIN field length")
+			}
+			value := make([]byte, valueLength)
+			if _, err := io.ReadFull(fields, value); err != nil {
+				t.Fatal("invalid AMQPLAIN field value")
+			}
+			identity[string(key)] = string(value)
+		}
+		if mechanism != "AMQPLAIN" || len(identity) != 2 || identity["LOGIN"] != settings.Username || identity["PASSWORD"] != settings.Password {
+			t.Error("Open AMQPLAIN authentication does not use the configured identity")
+		}
+		return
+	case "external":
+		expected = &amqp.ExternalAuth{}
+	}
+	if mechanism != expected.Mechanism() || response != expected.Response() {
+		t.Error("Open AMQP authentication does not use the configured SASL mechanism and identity")
 	}
 }
