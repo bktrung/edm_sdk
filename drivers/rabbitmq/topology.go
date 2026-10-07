@@ -139,7 +139,7 @@ func (a *adminOperations) ensureTopology(ctx context.Context, spec driver.Topolo
 		var err error
 		actualBindings, err = a.currentBindings(ctx)
 		if err != nil {
-			return driver.TopologyDiff{}, classify("ensure_topology", driver.KindTransient, err)
+			return driver.TopologyDiff{}, classifyManagement("ensure_topology", err)
 		}
 	}
 	for _, binding := range spec.Bindings {
@@ -204,7 +204,7 @@ func (a *adminOperations) verifyTopology(ctx context.Context, spec driver.Topolo
 		drifted, err := a.argumentDrift(ctx, destination.Name, mainArgs)
 		if err != nil {
 			purpose := fmt.Sprintf("argument drift verification for destination %q", destination.Name)
-			return driver.TopologyDiff{}, classify("ensure_topology", driver.KindTransient, a.managementUnavailable(purpose, err))
+			return driver.TopologyDiff{}, classifyManagement("ensure_topology", a.managementUnavailable(purpose, err))
 		}
 		diff.Drifted = append(diff.Drifted, drifted...)
 		if destination.Delay > 0 {
@@ -221,7 +221,7 @@ func (a *adminOperations) verifyTopology(ctx context.Context, spec driver.Topolo
 			parkDrifted, err := a.argumentDrift(ctx, parkName, parkArgs)
 			if err != nil {
 				purpose := fmt.Sprintf("argument drift verification for parking destination %q", parkName)
-				return driver.TopologyDiff{}, classify("ensure_topology", driver.KindTransient, a.managementUnavailable(purpose, err))
+				return driver.TopologyDiff{}, classifyManagement("ensure_topology", a.managementUnavailable(purpose, err))
 			}
 			diff.Drifted = append(diff.Drifted, parkDrifted...)
 		}
@@ -231,7 +231,7 @@ func (a *adminOperations) verifyTopology(ctx context.Context, spec driver.Topolo
 		var err error
 		actualBindings, err = a.currentBindings(ctx)
 		if err != nil {
-			return driver.TopologyDiff{}, classify("ensure_topology", driver.KindTransient, err)
+			return driver.TopologyDiff{}, classifyManagement("ensure_topology", err)
 		}
 	}
 	seenBindings := make(map[bindingKey]struct{}, len(spec.Bindings))
