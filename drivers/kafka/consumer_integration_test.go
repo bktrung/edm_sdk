@@ -952,7 +952,7 @@ func TestConsumerPerDestinationShareRefillsOnSettlement(t *testing.T) {
 				record := &kgo.Record{
 					Topic:     destination,
 					Partition: partition,
-					Value:     []byte(fmt.Sprintf("%s-%d-%d", destination, partition, index)),
+					Value:     fmt.Appendf(nil, "%s-%d-%d", destination, partition, index),
 				}
 				if err := publisher.ProduceSync(ctx, record).FirstErr(); err != nil {
 					t.Fatalf("ProduceSync %s partition %d record %d: %v", destination, partition, index, err)

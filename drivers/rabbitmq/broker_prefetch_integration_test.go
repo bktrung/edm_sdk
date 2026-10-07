@@ -218,7 +218,7 @@ func publishBrokerPrefetchMessages(t *testing.T, ctx context.Context, channel *a
 	for i := range count {
 		if err := channel.PublishWithContext(ctx, "", queue, false, false, amqp.Publishing{
 			DeliveryMode: amqp.Persistent,
-			Body:         []byte(fmt.Sprintf("held-%d", i)),
+			Body:         fmt.Appendf(nil, "held-%d", i),
 		}); err != nil {
 			t.Fatalf("Publish %d: %v", i, err)
 		}

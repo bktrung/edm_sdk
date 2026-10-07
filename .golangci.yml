@@ -35,6 +35,8 @@ linters:
     - usestdlibvars
     - intrange
     - copyloopvar
+    # Modern Go idioms with behavior-preserving rewrites.
+    - modernize
 
   settings:
     revive:

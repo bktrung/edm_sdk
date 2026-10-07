@@ -775,18 +775,18 @@ func parseRevokedPartitions(text string) map[int32]bool {
 			break
 		}
 		rest := text[start+2:]
-		end := strings.Index(rest, "]")
-		if end < 0 {
+		before, after, ok := strings.Cut(rest, "]")
+		if !ok {
 			break
 		}
-		for _, field := range strings.Fields(rest[:end]) {
+		for field := range strings.FieldsSeq(before) {
 			partition, convErr := strconv.ParseInt(field, 10, 32)
 			if convErr != nil {
 				continue
 			}
 			given[int32(partition)] = true
 		}
-		text = rest[end+1:]
+		text = after
 	}
 	return given
 }
@@ -1374,10 +1374,7 @@ func portTurnaroundPercentile(sorted []time.Duration, percent int) time.Duration
 	if len(sorted) == 0 {
 		return 0
 	}
-	index := (len(sorted)*percent+99)/100 - 1
-	if index < 0 {
-		index = 0
-	}
+	index := max((len(sorted)*percent+99)/100-1, 0)
 	if index >= len(sorted) {
 		index = len(sorted) - 1
 	}

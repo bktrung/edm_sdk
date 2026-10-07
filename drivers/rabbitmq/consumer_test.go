@@ -172,12 +172,10 @@ func TestReleaseEarlyReturnLeavesNoWedgedJoin(t *testing.T) {
 			var releaseOnce sync.Once
 			releaseWedge := func() { releaseOnce.Do(func() { close(release) }) }
 			t.Cleanup(releaseWedge)
-			group.Add(1)
-			go func() {
-				defer group.Done()
+			group.Go(func() {
 				<-release
 				close(exited)
-			}()
+			})
 
 			ctx, cancel := context.WithCancel(context.Background())
 			result := make(chan error, 1)

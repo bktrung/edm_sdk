@@ -468,9 +468,7 @@ func (c *Client) ensureSubscriptionTopologiesOn(ctx context.Context, conn driver
 			<-slots
 			break
 		}
-		running.Add(1)
-		go func() {
-			defer running.Done()
+		running.Go(func() {
 			defer func() { <-slots }()
 			spec := subscriptionTopologySpecs(effective, source, runner.subscription)
 			spec.Policy = policy
@@ -486,7 +484,7 @@ func (c *Client) ensureSubscriptionTopologiesOn(ctx context.Context, conn driver
 				mu.Unlock()
 				cancel()
 			}
-		}()
+		})
 	}
 	running.Wait()
 	mu.Lock()

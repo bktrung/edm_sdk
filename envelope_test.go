@@ -343,7 +343,7 @@ func TestEnvelope_HeaderRoundTripIsLossless(t *testing.T) {
 	e.DataContentType = "application/json"
 	e.Subject = "ORD-88213"
 	e.DataSchema = "https://schemas.example/order.v1.json"
-	e.Expiry = timePtr(time.Date(2026, 8, 6, 0, 0, 0, 0, time.UTC))
+	e.Expiry = new(time.Date(2026, 8, 6, 0, 0, 0, 0, time.UTC))
 	e.Extensions = map[string]string{"x-custom-ext": "value"}
 
 	headers, err := e.EncodeHeaders(0)
@@ -400,8 +400,6 @@ func TestEnvelope_InvalidDeathDetailKeyIsSilent(t *testing.T) {
 	require.NotContains(t, headers, "f1detailBAD_KEY")
 	require.Empty(t, logs.String())
 }
-
-func timePtr(t time.Time) *time.Time { return &t }
 
 func TestEnvelope_TracedMessageSurvivesDecodeEncodeRoundTrip(t *testing.T) {
 	t.Parallel()

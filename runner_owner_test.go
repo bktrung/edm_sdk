@@ -202,15 +202,13 @@ func startOwnerRunner(t *testing.T, consumer driver.Consumer) *ownerRunner {
 	ctx, cancel := context.WithCancel(context.Background())
 	runDone := make(chan error, 1)
 	var stopped sync.WaitGroup
-	stopped.Add(1)
-	go func() {
-		defer stopped.Done()
+	stopped.Go(func() {
 		result := runner.Run(ctx)
 		select {
 		case runDone <- result:
 		default:
 		}
-	}()
+	})
 	t.Cleanup(func() {
 		cancel()
 		finished := make(chan struct{})

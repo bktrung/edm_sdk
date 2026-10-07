@@ -152,12 +152,10 @@ func TestConcurrentPurgeCountsRecordsOnce(t *testing.T) {
 	results := make(chan purgeResult, 2)
 	var group sync.WaitGroup
 	for range 2 {
-		group.Add(1)
-		go func() {
-			defer group.Done()
+		group.Go(func() {
 			removed, err := connection.Admin().(driver.Maintenance).Purge(ctx, topic)
 			results <- purgeResult{removed: removed, err: err}
-		}()
+		})
 	}
 	group.Wait()
 	close(results)

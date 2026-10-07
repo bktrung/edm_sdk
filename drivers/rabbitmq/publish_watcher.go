@@ -99,11 +99,9 @@ func startPublishWatcher(c *conn, returns <-chan amqp.Return, closes <-chan *amq
 		done:     make(chan struct{}),
 		shut:     make(chan struct{}),
 	}
-	c.detachWatch.Add(1)
-	go func() {
-		defer c.detachWatch.Done()
+	c.detachWatch.Go(func() {
 		w.run(returns, closes)
-	}()
+	})
 	return w
 }
 

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"maps"
 	"runtime"
 	"strings"
 	"sync"
@@ -107,9 +108,7 @@ func (c *backlogLagConsumer) Lag(context.Context) (map[string]int64, error) {
 		return nil, c.lagErr
 	}
 	out := make(map[string]int64, len(c.lagMap))
-	for k, v := range c.lagMap {
-		out[k] = v
-	}
+	maps.Copy(out, c.lagMap)
 	return out, nil
 }
 
@@ -149,9 +148,7 @@ func (c *backlogReaderConsumer) Backlog(context.Context) (map[string]driver.Back
 	defer c.mu.Unlock()
 	c.backlogCalls++
 	out := make(map[string]driver.BacklogSample, len(c.backlogMap))
-	for k, v := range c.backlogMap {
-		out[k] = v
-	}
+	maps.Copy(out, c.backlogMap)
 	return out, nil
 }
 
@@ -734,9 +731,7 @@ func (c *joinGateConsumer) Lag(ctx context.Context) (map[string]int64, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	out := make(map[string]int64, len(c.lagMap))
-	for k, v := range c.lagMap {
-		out[k] = v
-	}
+	maps.Copy(out, c.lagMap)
 	return out, nil
 }
 

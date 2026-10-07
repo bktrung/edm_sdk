@@ -3,6 +3,7 @@ package f1otel
 import (
 	"context"
 	"errors"
+	"maps"
 	"sync"
 	"testing"
 	"time"
@@ -312,9 +313,7 @@ func TestMetricsUseEventTimesAndBoundedAttributes(t *testing.T) {
 	retries := asSum[int64](t, seen["f1.messaging.retries"])
 	require.Equal(t, int64(1), retries.DataPoints[0].Value)
 	retryAttrs := make(map[string]string, len(commonPointAttrs)+1)
-	for key, value := range commonPointAttrs {
-		retryAttrs[key] = value
-	}
+	maps.Copy(retryAttrs, commonPointAttrs)
 	retryAttrs["error.type"] = "f1_retryable"
 	require.Equal(t, retryAttrs, stringAttributes(retries.DataPoints[0].Attributes))
 	deadLetters := asSum[int64](t, seen["f1.messaging.dead_letters"])

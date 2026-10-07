@@ -97,7 +97,7 @@ func TestKafkaInboundCreateTimeReportsProducerSource(t *testing.T) {
 
 func createKafkaTopicWithTimestampType(t *testing.T, admin *kadm.Client, ctx context.Context, name, timestampType string) {
 	t.Helper()
-	value := kadm.StringPtr(timestampType)
+	value := new(timestampType)
 	response, err := admin.CreateTopic(ctx, 1, -1, map[string]*string{"message.timestamp.type": value}, name)
 	if err != nil {
 		t.Fatalf("CreateTopic(%q): %v", name, err)

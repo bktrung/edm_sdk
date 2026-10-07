@@ -135,7 +135,7 @@ func moduleGoroutineStacks() string {
 	buf := make([]byte, 1<<20)
 	n := runtime.Stack(buf, true)
 	var stacks []string
-	for _, stack := range strings.Split(string(buf[:n]), "\n\n") {
+	for stack := range strings.SplitSeq(string(buf[:n]), "\n\n") {
 		lines := strings.Split(stack, "\n")
 		for i := 1; i+1 < len(lines); i++ {
 			if strings.HasPrefix(lines[i], "created by ") {
