@@ -424,7 +424,14 @@ func (a *adminOperations) scanOrphans(ctx context.Context, spec driver.TopologyS
 			}
 			if _, parentExists := byName[parent]; parentExists {
 				if _, parentKnown := known[parent]; !parentKnown {
-					add(parent, queue.totalMessages())
+					if matchesScope(parent, spec.Scope) {
+						add(parent, queue.totalMessages())
+					} else {
+						// Folding the parent in would report a name the caller
+						// excluded from the scan, so the parking queue keeps its
+						// own name and count instead.
+						add(queue.Name, queue.totalMessages())
+					}
 				}
 				continue
 			}
