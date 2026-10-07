@@ -1394,6 +1394,8 @@ func (c *consumer) deliverHead(key partitionKey) headOutcome {
 	if len(records) == 1 {
 		delete(c.pending, key)
 	} else {
+		// Keep the backing array from retaining the delivered record and its fetch data.
+		records[0] = nil
 		c.pending[key] = records[1:]
 	}
 	budget := c.budgets[record.Topic]
