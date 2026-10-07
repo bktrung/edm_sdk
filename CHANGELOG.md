@@ -115,6 +115,9 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 - The Kafka consumer re-arms its head-hold timer after it fires for a held retry whose destination
   is paused, so the next held retry is delivered when its own delay elapses instead of waiting for
   unrelated traffic.
+- The RabbitMQ orphan scan folds a parking queue into its parent only when the parent is itself in
+  the caller's scope. An out-of-scope parent is no longer reported, and the parking queue is
+  reported under its own name with its own count.
 - The RabbitMQ driver refuses a message whose correlation ID, message ID, type or content type is
   longer than 255 bytes as too large, before anything is written, instead of letting the AMQP client
   close the whole shared connection.
