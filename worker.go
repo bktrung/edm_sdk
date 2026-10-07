@@ -331,10 +331,10 @@ func (o *runnerOwner) startOpen(waitCtx context.Context, prefetch int) {
 	})
 }
 
-// startRebuild waits for the connection rebuild while pumping the owner's events.
+// awaitRebuild waits for the connection rebuild while pumping the owner's events.
 // cause is the failure the runner asks a rebuild for, or nil when it only waits
 // for a change. draining distinguishes shutdown from a rebuild failure.
-func (o *runnerOwner) startRebuild(ctx context.Context, cause error, epoch uint64) (draining bool, err error) {
+func (o *runnerOwner) awaitRebuild(ctx context.Context, cause error, epoch uint64) (draining bool, err error) {
 	o.rebuilt = false
 	o.rebuiltErr = nil
 	o.runner.asyncGroup.Go(func() error {
@@ -380,7 +380,7 @@ func (o *runnerOwner) requestDrain() {
 		}
 	}
 	if o.generationEnded() {
-		o.startDrain()
+		o.startDrain(o.base)
 	}
 }
 
@@ -398,13 +398,16 @@ func (o *runnerOwner) generationEnded() bool {
 // the consumer back to the connection it is leaving before the runner reopens
 // on the replacement: ending the runner and handing a consumer back are not
 // the same operation, and the drain is only the first of them.
-func (o *runnerOwner) startDrain() {
+func (o *runnerOwner) startDrain(base context.Context) {
 	if o.drained {
 		return
 	}
 	o.drained = true
+	// A drain event can start teardown while the owner still awaits a rebuild.
+	// If the rebuild reports before this goroutine runs, drain rewrites o.base
+	// while joining teardown. The argument captures it before that interleaving.
 	o.runner.asyncGroup.Go(func() error {
-		o.events <- runnerEvent{kind: runnerEventDrainDone, err: o.runner.drainAfterRun(o.base)}
+		o.events <- runnerEvent{kind: runnerEventDrainDone, err: o.runner.drainAfterRun(base)}
 		return nil
 	})
 }
@@ -416,7 +419,7 @@ func (o *runnerOwner) startDrain() {
 func (o *runnerOwner) drain(base context.Context) error {
 	o.base = base
 	o.requestDrain()
-	o.startDrain()
+	o.startDrain(base)
 	o.pumpUntil(func() bool { return o.drainDone })
 	return o.drainErr
 }
@@ -534,7 +537,7 @@ func (r *Runner) Run(ctx context.Context) (runErr error) {
 				// An attempt in flight released this consumer, and the open it
 				// cancelled is not a failure of the runner's: it waits for the
 				// attempt and opens again on what it leaves behind.
-				draining, reconnectErr := owner.startRebuild(ctx, nil, 0)
+				draining, reconnectErr := owner.awaitRebuild(ctx, nil, 0)
 				if draining {
 					// The cancelled open admitted no consumer or deliveries, so there is nothing to drain.
 					return nil
@@ -557,7 +560,7 @@ func (r *Runner) Run(ctx context.Context) (runErr error) {
 			// rebuild is asked for, and it is what this runner reports if the
 			// rebuild hands one back.
 			r.transitionToReconnecting()
-			draining, reconnectErr := owner.startRebuild(ctx, err, 0)
+			draining, reconnectErr := owner.awaitRebuild(ctx, err, 0)
 			if draining {
 				// The failed open admitted no consumer or deliveries, so there is nothing to drain.
 				return nil
@@ -742,9 +745,9 @@ func (r *Runner) Run(ctx context.Context) (runErr error) {
 			}
 		}
 		r.transitionToReconnecting()
-		draining, reconnectErr := owner.startRebuild(ctx, cause, openedEpoch)
+		draining, reconnectErr := owner.awaitRebuild(ctx, cause, openedEpoch)
 		if draining {
-			return nil
+			break
 		}
 		if reconnectErr != nil {
 			runErr = reconnectErr
