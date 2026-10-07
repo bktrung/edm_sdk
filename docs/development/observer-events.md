@@ -111,7 +111,8 @@ This page is generated from F1's observer event vocabulary in [`observer.go`](ht
 | `Subscription` | `string` | Subscription names the subscription. F1 sets it for process and settle Finishes; it is zero otherwise. |
 | `ConsumerGroup` | `string` | ConsumerGroup names the consumer group. F1 sets it for process and settle Finishes; it is zero otherwise. |
 | `EventType` | `string` | EventType is the event type. F1 sets it for message-built, process and successor-publish Finishes; it is zero for primary-publish, settle and drain. |
-| `Priority` | `Priority` | Priority is the delivery lane. F1 sets it for message-built, process, settle and successor-publish Finishes. A primary-publish Finish gets it only when every message resolves to one priority; mixed and drain Finishes use the zero value, PriorityMedium. |
+| `Priority` | `Priority` | Priority is the delivery lane. It is meaningful only when PriorityKnown is true; otherwise it holds the zero value, PriorityMedium. |
+| `PriorityKnown` | `bool` | PriorityKnown reports whether Priority carries the stage's delivery lane. F1 sets it for message-built, process, settle and successor-publish Finishes, and for a primary-publish Finish whose messages all resolve to one priority. It is false for a mixed or unresolved primary publish, a drain Finish, and an abandoned Finish. |
 | `Attempt` | `int` | Attempt is the one-based attempt. F1 sets it for message-built, process and successor-publish Finishes; it is zero otherwise. |
 | `Destination` | `string` | Destination is the physical destination. F1 sets it for message-built, process, settle and successor-publish Finishes; it is zero otherwise. |
 | `MessageID` | `string` | MessageID is the envelope ID. F1 sets it for message-built, process and successor-publish Finishes; it is zero for primary-publish, settle and drain. |
@@ -119,7 +120,7 @@ This page is generated from F1's observer event vocabulary in [`observer.go`](ht
 | `Outcome` | `ObserverOutcome` | Outcome identifies how the stage ended. F1 sets it for every Finish kind. |
 | `ErrorClass` | `ErrorClass` | ErrorClass classifies the failure. F1 sets it when Outcome is error; it is empty otherwise. |
 | `Terminal` | `bool` | Terminal reports whether processing ended the delivery. F1 sets it for process Finishes; it is false otherwise. |
-| `Results` | `[]MessageResult` | Results carries per-index primary-publish outcomes. F1 sets it for primary publish Finishes; it is nil for successor-publish and other Finishes. The implementation must not retain or mutate it. |
+| `Results` | `[]ObserverMessageResult` | Results carries bounded per-index primary-publish outcomes in input order. F1 sets it for primary-publish Finishes; it is nil for successor-publish and other Finishes. Observers must not retain or mutate it. An empty ID and empty ErrorClass means no published result and no per-index error. |
 | `Drain` | `DrainCounts` | Drain carries drain progress. F1 sets it for drain Finishes; it is zero otherwise. |
 
 ## PointEvent fields

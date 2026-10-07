@@ -49,6 +49,9 @@ func (o *Observer) finishSpan(token f1.Token, event f1.FinishEvent, start startS
 	if event.Kind == f1.ObserverPublish && event.Topic != "" {
 		start.span.SetName("send " + event.Topic)
 	}
+	if event.Kind == f1.ObserverPublish && event.PriorityKnown {
+		start.span.SetAttributes(attribute.String("f1.priority", event.Priority.String()))
+	}
 
 	if event.Kind == f1.ObserverMessageBuilt && start.parentSpan != nil && start.span.SpanContext().IsValid() {
 		start.parentSpan.AddLink(trace.Link{SpanContext: start.span.SpanContext()})
@@ -116,17 +119,14 @@ func (o *Observer) spanAttributes(event f1.StartEvent) []attribute.KeyValue {
 	if event.MessageID != "" {
 		attrs = append(attrs, attribute.String("messaging.message.id", event.MessageID))
 	}
-	consumerGroup := event.ConsumerGroup
-	if consumerGroup == "" {
-		consumerGroup = event.Subscription
-	}
+	consumerGroup := resolvedConsumerGroup(event.ConsumerGroup, event.Subscription)
 	if consumerGroup != "" {
 		attrs = append(attrs, attribute.String("messaging.consumer.group.name", consumerGroup))
 	}
 	if operation := spanOperation(event); operation != "" {
 		attrs = append(attrs, attribute.String("messaging.operation.type", operation))
 	}
-	if event.Priority.Valid() {
+	if event.Priority.Valid() && (event.Kind != f1.ObserverPublish || event.Route != f1.PublishRoutePrimary && event.Route != "") {
 		attrs = append(attrs, attribute.String("f1.priority", event.Priority.String()))
 	}
 	if event.Attempt > 0 {

@@ -52,25 +52,29 @@ func TestSpansUseEventTimesLinksAttributesAndStatus(t *testing.T) {
 		Destination: "f1.test.orders.created.high",
 	})
 	observer.Finish(firstCreateToken, f1.FinishEvent{
-		Kind:        f1.ObserverMessageBuilt,
-		At:          base.Add(1500 * time.Millisecond),
-		Topic:       "orders.created",
-		Priority:    f1.PriorityHigh,
-		Destination: "f1.test.orders.created.high",
-		Outcome:     f1.ObserverOutcomeOK,
+		Kind:          f1.ObserverMessageBuilt,
+		At:            base.Add(1500 * time.Millisecond),
+		Topic:         "orders.created",
+		Priority:      f1.PriorityHigh,
+		PriorityKnown: true,
+		Destination:   "f1.test.orders.created.high",
+		Outcome:       f1.ObserverOutcomeOK,
 	})
 	observer.Finish(secondCreateToken, f1.FinishEvent{
-		Kind:        f1.ObserverMessageBuilt,
-		At:          base.Add(2500 * time.Millisecond),
-		Topic:       "orders.created",
-		Priority:    f1.PriorityHigh,
-		Destination: "f1.test.orders.created.high",
-		Outcome:     f1.ObserverOutcomeOK,
+		Kind:          f1.ObserverMessageBuilt,
+		At:            base.Add(2500 * time.Millisecond),
+		Topic:         "orders.created",
+		Priority:      f1.PriorityHigh,
+		PriorityKnown: true,
+		Destination:   "f1.test.orders.created.high",
+		Outcome:       f1.ObserverOutcomeOK,
 	})
 	observer.Finish(publishToken, f1.FinishEvent{
-		Kind:    f1.ObserverPublish,
-		At:      base.Add(3 * time.Second),
-		Outcome: f1.ObserverOutcomeOK,
+		Kind:          f1.ObserverPublish,
+		At:            base.Add(3 * time.Second),
+		Priority:      f1.PriorityHigh,
+		PriorityKnown: true,
+		Outcome:       f1.ObserverOutcomeOK,
 	})
 
 	inboundTraceID, err := trace.TraceIDFromHex("11111111111111111111111111111111")
@@ -99,15 +103,16 @@ func TestSpansUseEventTimesLinksAttributesAndStatus(t *testing.T) {
 	_, handlerSpan := provider.Tracer("test").Start(processCtx, "handler")
 	handlerSpan.End(trace.WithTimestamp(base.Add(4500 * time.Millisecond)))
 	observer.Finish(processToken, f1.FinishEvent{
-		Kind:         f1.ObserverProcess,
-		At:           base.Add(5 * time.Second),
-		Topic:        "orders.created",
-		Subscription: "orders",
-		Priority:     f1.PriorityHigh,
-		Attempt:      2,
-		Destination:  "f1.test.orders.orders",
-		Outcome:      f1.ObserverOutcomeError,
-		ErrorClass:   f1.ErrorClassRetryable,
+		Kind:          f1.ObserverProcess,
+		At:            base.Add(5 * time.Second),
+		Topic:         "orders.created",
+		Subscription:  "orders",
+		Priority:      f1.PriorityHigh,
+		PriorityKnown: true,
+		Attempt:       2,
+		Destination:   "f1.test.orders.orders",
+		Outcome:       f1.ObserverOutcomeError,
+		ErrorClass:    f1.ErrorClassRetryable,
 	})
 
 	_, republishToken := observer.Start(processCtx, f1.StartEvent{

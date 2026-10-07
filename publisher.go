@@ -225,7 +225,7 @@ func (p *Publisher) PublishBatch(ctx context.Context, messages []Message) (Batch
 		if err != nil {
 			methodErr := fmt.Errorf("f1: message %d: %w", i, err)
 			if observed {
-				publishGuard.finishWith(FinishEvent{Outcome: ObserverOutcomeError, ErrorClass: errorClassOf(methodErr), Results: result.Results})
+				finishPrimaryPublish(&publishGuard, FinishEvent{Outcome: ObserverOutcomeError, ErrorClass: errorClassOf(methodErr)}, result.Results)
 			}
 			return result, methodErr
 		}
@@ -242,7 +242,7 @@ func (p *Publisher) PublishBatch(ctx context.Context, messages []Message) (Batch
 		if maxBodyBytes > 0 && len(outboundMessage.Body) > maxBodyBytes {
 			methodErr := fmt.Errorf("f1: message %d: body exceeds codec.maxBodyBytes (%d)", i, maxBodyBytes)
 			if observed {
-				publishGuard.finishWith(FinishEvent{Outcome: ObserverOutcomeError, ErrorClass: errorClassOf(methodErr), Results: result.Results})
+				finishPrimaryPublish(&publishGuard, FinishEvent{Outcome: ObserverOutcomeError, ErrorClass: errorClassOf(methodErr)}, result.Results)
 			}
 			return result, methodErr
 		}
@@ -251,8 +251,11 @@ func (p *Publisher) PublishBatch(ctx context.Context, messages []Message) (Batch
 	}
 	var publishTopic string
 	var publishPriority Priority
-	if publishFields.set && !publishFields.mixed {
+	if publishFields.set && !publishFields.topicMixed {
 		publishTopic = publishFields.topic
+	}
+	priorityKnown := publishFields.set && !publishFields.priorityMixed
+	if priorityKnown {
 		publishPriority = publishFields.priority
 	}
 
@@ -268,7 +271,7 @@ func (p *Publisher) PublishBatch(ctx context.Context, messages []Message) (Batch
 	built := p.client.sharedProducer(ctx, workPublish, epoch, nil)
 	if built.refused != nil {
 		if observed {
-			publishGuard.finishWith(FinishEvent{Topic: publishTopic, Priority: publishPriority, Outcome: ObserverOutcomeError, ErrorClass: errorClassOf(built.refused), Results: result.Results})
+			finishPrimaryPublish(&publishGuard, FinishEvent{Topic: publishTopic, Priority: publishPriority, PriorityKnown: priorityKnown, Outcome: ObserverOutcomeError, ErrorClass: errorClassOf(built.refused)}, result.Results)
 		}
 		return result, built.refused
 	}
@@ -277,7 +280,7 @@ func (p *Publisher) PublishBatch(ctx context.Context, messages []Message) (Batch
 		requestReconnectOnTransient(ctx, p.client, built.buildErr, epoch)
 		methodErr := fmt.Errorf("f1: create publisher: %w", built.buildErr)
 		if observed {
-			publishGuard.finishWith(FinishEvent{Topic: publishTopic, Priority: publishPriority, Outcome: ObserverOutcomeError, ErrorClass: errorClassOf(methodErr), Results: result.Results})
+			finishPrimaryPublish(&publishGuard, FinishEvent{Topic: publishTopic, Priority: publishPriority, PriorityKnown: priorityKnown, Outcome: ObserverOutcomeError, ErrorClass: errorClassOf(methodErr)}, result.Results)
 		}
 		return result, methodErr
 	}
@@ -287,7 +290,7 @@ func (p *Publisher) PublishBatch(ctx context.Context, messages []Message) (Batch
 			result.Results[i].ID = id
 		}
 		if observed {
-			publishGuard.finishWith(FinishEvent{Topic: publishTopic, Priority: publishPriority, Outcome: ObserverOutcomeOK, Results: result.Results})
+			finishPrimaryPublish(&publishGuard, FinishEvent{Topic: publishTopic, Priority: publishPriority, PriorityKnown: priorityKnown, Outcome: ObserverOutcomeOK}, result.Results)
 		}
 		return result, nil
 	}
@@ -328,7 +331,7 @@ func (p *Publisher) PublishBatch(ctx context.Context, messages []Message) (Batch
 					break
 				}
 			}
-			publishGuard.finishWith(FinishEvent{Topic: publishTopic, Priority: publishPriority, Outcome: ObserverOutcomeError, ErrorClass: errorClassOf(firstErr), Results: result.Results})
+			finishPrimaryPublish(&publishGuard, FinishEvent{Topic: publishTopic, Priority: publishPriority, PriorityKnown: priorityKnown, Outcome: ObserverOutcomeError, ErrorClass: errorClassOf(firstErr)}, result.Results)
 		}
 		return result, nil
 	}
@@ -336,9 +339,20 @@ func (p *Publisher) PublishBatch(ctx context.Context, messages []Message) (Batch
 		result.Results[i].Err = publishErr
 	}
 	if observed {
-		publishGuard.finishWith(FinishEvent{Topic: publishTopic, Priority: publishPriority, Outcome: ObserverOutcomeError, ErrorClass: errorClassOf(publishErr), Results: result.Results})
+		finishPrimaryPublish(&publishGuard, FinishEvent{Topic: publishTopic, Priority: publishPriority, PriorityKnown: priorityKnown, Outcome: ObserverOutcomeError, ErrorClass: errorClassOf(publishErr)}, result.Results)
 	}
 	return result, publishErr
+}
+
+// finishPrimaryPublish keeps raw application errors outside the observer
+// boundary. Callers gate it on observation so an unobserved publish does not
+// allocate or classify an additional result slice.
+func finishPrimaryPublish(guard *observerFinishGuard, event FinishEvent, results []MessageResult) {
+	event.Results = make([]ObserverMessageResult, len(results))
+	for i, result := range results {
+		event.Results[i] = ObserverMessageResult{ID: result.ID, ErrorClass: errorClassOf(result.Err)}
+	}
+	guard.finishWith(event)
 }
 
 func failedIndexesInRange(failed map[int]error, size int) bool {
@@ -382,10 +396,11 @@ func warnUnclassifiedWithContext(logger *slog.Logger, ctx context.Context, err e
 }
 
 type primaryPublishFields struct {
-	topic    string
-	priority Priority
-	set      bool
-	mixed    bool
+	topic         string
+	priority      Priority
+	set           bool
+	topicMixed    bool
+	priorityMixed bool
 }
 
 func (f *primaryPublishFields) record(topic string, priority Priority) {
@@ -398,9 +413,8 @@ func (f *primaryPublishFields) record(topic string, priority Priority) {
 		f.set = true
 		return
 	}
-	if f.topic != topic || f.priority != priority {
-		f.mixed = true
-	}
+	f.topicMixed = f.topicMixed || f.topic != topic
+	f.priorityMixed = f.priorityMixed || f.priority != priority
 }
 
 func buildOutbound(ctx, observeCtx context.Context, c *Client, options clientOptions, effective driver.Capabilities, headerMaxBytes int, source, producerIdentity string, message Message, fields *primaryPublishFields) (driver.OutboundMessage, string, error) {
@@ -517,6 +531,7 @@ func buildOutbound(ctx, observeCtx context.Context, c *Client, options clientOpt
 			MessageID:     id,
 			EventType:     message.EventType,
 			Priority:      publish.priority,
+			PriorityKnown: true,
 			Attempt:       1,
 			CorrelationID: correlationID,
 		}

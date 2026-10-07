@@ -3,6 +3,7 @@
   "symbols": [
     "New",
     "Observer",
+    "Observer.BindClient",
     "Observer.Finish",
     "Observer.InjectTrace",
     "Observer.Record",

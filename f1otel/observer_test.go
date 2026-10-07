@@ -2,6 +2,7 @@ package f1otel
 
 import (
 	"context"
+	"sync"
 	"testing"
 	"time"
 
@@ -168,4 +169,82 @@ func TestNewStampsTheSDKVersionOnItsInstrumentationScope(t *testing.T) {
 	require.Equal(t, instrumentationName, tracers.name)
 	require.Equal(t, version.SDK(), tracers.version)
 	require.NotEmpty(t, version.SDK())
+}
+
+func TestBindClientAdmitsOneConcurrentOwner(t *testing.T) {
+	const contenders = 16
+	for name, observer := range map[string]*Observer{
+		"zero":         {},
+		"providerless": providerlessObserver(t),
+	} {
+		t.Run(name, func(t *testing.T) {
+			start := make(chan struct{})
+			unbinds := make(chan func(), contenders)
+			errs := make(chan error, contenders)
+			var wg sync.WaitGroup
+			for range contenders {
+				wg.Go(func() {
+					<-start
+					unbind, err := observer.BindClient()
+					if err != nil {
+						errs <- err
+						return
+					}
+					unbinds <- unbind
+				})
+			}
+			close(start)
+			wg.Wait()
+			close(unbinds)
+			close(errs)
+
+			require.Len(t, unbinds, 1, "exactly one concurrent BindClient may own the observer")
+			for err := range errs {
+				require.ErrorIs(t, err, errObserverBound)
+			}
+			owner := <-unbinds
+			require.NotNil(t, owner)
+			owner()
+			again, err := observer.BindClient()
+			require.NoError(t, err, "a released observer must be bindable again")
+			again()
+		})
+	}
+}
+
+func TestStaleUnbindKeepsNewerBinding(t *testing.T) {
+	observer := providerlessObserver(t)
+	first, err := observer.BindClient()
+	require.NoError(t, err)
+	first()
+	second, err := observer.BindClient()
+	require.NoError(t, err)
+
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	for range 8 {
+		wg.Go(func() {
+			<-start
+			first()
+		})
+	}
+	close(start)
+	wg.Wait()
+	_, err = observer.BindClient()
+	require.ErrorIs(t, err, errObserverBound, "a stale unbind released a newer binding")
+
+	second()
+	second()
+	third, err := observer.BindClient()
+	require.NoError(t, err)
+	third()
+}
+
+func TestNilObserverBindClientIsNoOp(t *testing.T) {
+	var observer *Observer
+	for range 2 {
+		unbind, err := observer.BindClient()
+		require.NoError(t, err)
+		require.Nil(t, unbind)
+	}
 }

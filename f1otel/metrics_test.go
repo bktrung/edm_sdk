@@ -9,6 +9,8 @@ import (
 	"time"
 
 	f1 "fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk"
+	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/driver"
+	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/drivers/inmem"
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/f1test"
 
 	"github.com/stretchr/testify/require"
@@ -18,6 +20,154 @@ import (
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 )
+
+func TestMetricsAndSpansUseConsumerGroupPrecedence(t *testing.T) {
+	tests := []struct {
+		name  string
+		group string
+		want  string
+	}{
+		{name: "explicit group", group: "orders-workers", want: "orders-workers"},
+		{name: "subscription fallback", want: "orders"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			ctx := context.Background()
+			reader := sdkmetric.NewManualReader()
+			meterProvider := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
+			t.Cleanup(func() { require.NoError(t, meterProvider.Shutdown(ctx)) })
+			exporter := tracetest.NewInMemoryExporter()
+			tracerProvider := sdktrace.NewTracerProvider(sdktrace.WithSyncer(exporter))
+			t.Cleanup(func() { require.NoError(t, tracerProvider.Shutdown(ctx)) })
+			observer, err := New(WithMeterProvider(meterProvider), WithTracerProvider(tracerProvider))
+			require.NoError(t, err)
+			base := time.Unix(100, 0)
+			for _, kind := range []f1.ObserverKind{f1.ObserverProcess, f1.ObserverSettle} {
+				_, token := observer.Start(ctx, f1.StartEvent{
+					Kind: kind, At: base, Topic: "orders.created",
+					Subscription: "orders", ConsumerGroup: test.group,
+				})
+				observer.Finish(token, f1.FinishEvent{
+					Kind: kind, At: base.Add(time.Second), Topic: "orders.created",
+					Subscription: "orders", ConsumerGroup: test.group, Outcome: f1.ObserverOutcomeOK,
+				})
+			}
+			observer.Record(f1.PointEvent{
+				Kind: f1.ObserverDeliveryReceived, At: base, Topic: "orders.created",
+				Subscription: "orders", ConsumerGroup: test.group,
+			})
+			var collected metricdata.ResourceMetrics
+			require.NoError(t, reader.Collect(ctx, &collected))
+			seen := make(map[string]metricdata.Metrics)
+			for _, scope := range collected.ScopeMetrics {
+				for _, metric := range scope.Metrics {
+					seen[metric.Name] = metric
+				}
+			}
+			consumed := asSum[int64](t, seen["messaging.client.consumed.messages"])
+			require.Len(t, consumed.DataPoints, 1)
+			require.Equal(t, int64(1), consumed.DataPoints[0].Value)
+			require.Equal(t, test.want, stringAttributes(consumed.DataPoints[0].Attributes)["messaging.consumer.group.name"])
+			for _, name := range []string{"messaging.process.duration", "messaging.client.operation.duration"} {
+				duration := asHistogram(t, seen[name])
+				require.Len(t, duration.DataPoints, 1)
+				require.Equal(t, uint64(1), duration.DataPoints[0].Count)
+				require.Equal(t, test.want, stringAttributes(duration.DataPoints[0].Attributes)["messaging.consumer.group.name"])
+			}
+			spans := exporter.GetSpans()
+			require.Equal(t, test.want, spanAttributes(spanNamed(t, spans, "process orders.created", 0))["messaging.consumer.group.name"])
+			require.Equal(t, test.want, spanAttributes(spanNamed(t, spans, "settle", 0))["messaging.consumer.group.name"])
+		})
+	}
+}
+
+func TestPublishBatchAttributesResolveIndependently(t *testing.T) {
+	tests := []struct {
+		name     string
+		topics   [2]string
+		priority [2]f1.Priority
+		want     map[string]string
+	}{
+		{
+			name:     "same topic mixed priorities",
+			topics:   [2]string{"orders.created", "orders.created"},
+			priority: [2]f1.Priority{f1.PriorityHigh, f1.PriorityLow},
+			want:     map[string]string{"messaging.destination.name": "orders.created"},
+		},
+		{
+			name:     "same topic high priority",
+			topics:   [2]string{"orders.created", "orders.created"},
+			priority: [2]f1.Priority{f1.PriorityHigh, f1.PriorityHigh},
+			want:     map[string]string{"messaging.destination.name": "orders.created", "f1.priority": "high"},
+		},
+		{
+			name:     "mixed topics high priority",
+			topics:   [2]string{"orders.created", "orders.updated"},
+			priority: [2]f1.Priority{f1.PriorityHigh, f1.PriorityHigh},
+			want:     map[string]string{"f1.priority": "high"},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			ctx := context.Background()
+			reader := sdkmetric.NewManualReader()
+			meterProvider := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
+			t.Cleanup(func() { require.NoError(t, meterProvider.Shutdown(ctx)) })
+			exporter := tracetest.NewInMemoryExporter()
+			tracerProvider := sdktrace.NewTracerProvider(sdktrace.WithSyncer(exporter))
+			t.Cleanup(func() { require.NoError(t, tracerProvider.Shutdown(ctx)) })
+			observer, err := New(WithMeterProvider(meterProvider), WithTracerProvider(tracerProvider))
+			require.NoError(t, err)
+			client, err := f1.New(ctx, f1.Config{
+				Env: "test", Service: "attribution",
+				Broker:   f1.BrokerConfig{Driver: "inmem"},
+				Topology: f1.TopologyConfig{AutoCreate: true},
+			}, f1.WithDriver(inmem.New()), f1.WithPublishTopics("orders.created", "orders.updated"), f1.WithObserver(observer))
+			require.NoError(t, err)
+			t.Cleanup(func() { require.NoError(t, client.Close(ctx)) })
+			result, err := client.Publisher().PublishBatch(ctx, []f1.Message{
+				{EventType: "orders.created.v1", Payload: "first", Opts: []f1.PublishOption{f1.WithTopic(test.topics[0]), f1.WithPriority(test.priority[0])}},
+				{EventType: "orders.created.v1", Payload: "second", Opts: []f1.PublishOption{f1.WithTopic(test.topics[1]), f1.WithPriority(test.priority[1])}},
+			})
+			require.NoError(t, err)
+			require.Len(t, result.Results, 2)
+			for _, message := range result.Results {
+				require.NoError(t, message.Err)
+				require.NotEmpty(t, message.ID)
+			}
+			var collected metricdata.ResourceMetrics
+			require.NoError(t, reader.Collect(ctx, &collected))
+			seen := make(map[string]metricdata.Metrics)
+			for _, scope := range collected.ScopeMetrics {
+				for _, metric := range scope.Metrics {
+					seen[metric.Name] = metric
+				}
+			}
+			sent := asSum[int64](t, seen["messaging.client.sent.messages"])
+			require.Len(t, sent.DataPoints, 1)
+			require.Equal(t, int64(2), sent.DataPoints[0].Value)
+			operation := asHistogram(t, seen["messaging.client.operation.duration"])
+			require.Len(t, operation.DataPoints, 1)
+			require.Equal(t, uint64(1), operation.DataPoints[0].Count)
+			want := maps.Clone(test.want)
+			want["messaging.operation.name"] = "publish"
+			want["messaging.system"] = "f1.inmem"
+			require.Equal(t, want, stringAttributes(sent.DataPoints[0].Attributes))
+			require.Equal(t, want, stringAttributes(operation.DataPoints[0].Attributes))
+			spanName := "send"
+			if topic := test.want["messaging.destination.name"]; topic != "" {
+				spanName += " " + topic
+			}
+			send := spanNamed(t, exporter.GetSpans(), spanName, 0)
+			attrs := spanAttributes(send)
+			if priority, known := test.want["f1.priority"]; known {
+				require.Equal(t, priority, attrs["f1.priority"])
+			} else {
+				require.NotContains(t, attrs, "f1.priority")
+			}
+		})
+	}
+}
 
 func TestMetricsUseEventTimesAndBoundedAttributes(t *testing.T) {
 	reader := sdkmetric.NewManualReader()
@@ -44,15 +194,16 @@ func TestMetricsUseEventTimesAndBoundedAttributes(t *testing.T) {
 	}
 	_, publishToken := observer.Start(context.Background(), publishStart)
 	observer.Finish(publishToken, f1.FinishEvent{
-		Kind:     f1.ObserverPublish,
-		At:       base.Add(2 * time.Second),
-		Topic:    publishStart.Topic,
-		Priority: publishStart.Priority,
-		Outcome:  f1.ObserverOutcomeOK,
-		Results: []f1.MessageResult{
+		Kind:          f1.ObserverPublish,
+		At:            base.Add(2 * time.Second),
+		Topic:         publishStart.Topic,
+		Priority:      publishStart.Priority,
+		PriorityKnown: true,
+		Outcome:       f1.ObserverOutcomeOK,
+		Results: []f1.ObserverMessageResult{
 			{ID: "published-1"},
 			{ID: "published-2"},
-			{Err: errors.New("publish failed")},
+			{ErrorClass: f1.ErrorClassOther},
 		},
 	})
 
@@ -73,6 +224,7 @@ func TestMetricsUseEventTimesAndBoundedAttributes(t *testing.T) {
 		Subscription:  processStart.Subscription,
 		ConsumerGroup: processStart.ConsumerGroup,
 		Priority:      processStart.Priority,
+		PriorityKnown: true,
 		Attempt:       2,
 		Outcome:       f1.ObserverOutcomeError,
 		ErrorClass:    f1.ErrorClassRetryable,
@@ -95,6 +247,7 @@ func TestMetricsUseEventTimesAndBoundedAttributes(t *testing.T) {
 		Subscription:  settleStart.Subscription,
 		ConsumerGroup: settleStart.ConsumerGroup,
 		Priority:      settleStart.Priority,
+		PriorityKnown: true,
 		Outcome:       f1.ObserverOutcomeOK,
 	})
 
@@ -562,11 +715,13 @@ func TestInternalPublishSentMetric(t *testing.T) {
 		BatchSize: 1,
 	})
 	observer.Finish(token, f1.FinishEvent{
-		Kind:     f1.ObserverPublish,
-		At:       base.Add(time.Second),
-		Topic:    "orders.retry",
-		Priority: f1.PriorityLow,
-		Outcome:  f1.ObserverOutcomeOK,
+		Kind:          f1.ObserverPublish,
+		At:            base.Add(time.Second),
+		Topic:         "orders.retry",
+		Priority:      f1.PriorityLow,
+		PriorityKnown: true,
+		Destination:   "f1.test.orders.retry.1",
+		Outcome:       f1.ObserverOutcomeOK,
 	})
 
 	var metrics metricdata.ResourceMetrics
@@ -862,4 +1017,219 @@ func runRealDrain(t *testing.T, client *f1test.Client, recorder *f1test.Recorder
 		f1.ObserverProcess: 1,
 		f1.ObserverSettle:  1,
 	})
+}
+
+// ownershipTelemetry is one application's shared OpenTelemetry providers,
+// readable synchronously so a test can assert what each Client exported.
+type ownershipTelemetry struct {
+	reader         *sdkmetric.ManualReader
+	exporter       *tracetest.InMemoryExporter
+	meterProvider  *sdkmetric.MeterProvider
+	tracerProvider *sdktrace.TracerProvider
+}
+
+// newOwnershipTelemetry registers provider shutdown first, so the Clients a
+// test registers afterwards close before the providers they report through.
+func newOwnershipTelemetry(t *testing.T) ownershipTelemetry {
+	t.Helper()
+	ctx := context.Background()
+	reader := sdkmetric.NewManualReader()
+	meterProvider := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
+	t.Cleanup(func() { require.NoError(t, meterProvider.Shutdown(ctx)) })
+	exporter := tracetest.NewInMemoryExporter()
+	tracerProvider := sdktrace.NewTracerProvider(sdktrace.WithSyncer(exporter))
+	t.Cleanup(func() { require.NoError(t, tracerProvider.Shutdown(ctx)) })
+	return ownershipTelemetry{reader: reader, exporter: exporter, meterProvider: meterProvider, tracerProvider: tracerProvider}
+}
+
+func (o ownershipTelemetry) observer(t *testing.T) *Observer {
+	t.Helper()
+	observer, err := New(WithMeterProvider(o.meterProvider), WithTracerProvider(o.tracerProvider))
+	require.NoError(t, err)
+	return observer
+}
+
+// sentByEndpoint returns the sent-message count per server.address and
+// server.port, failing on any series that is not the inmem system.
+func (o ownershipTelemetry) sentByEndpoint(t *testing.T) map[string]int64 {
+	t.Helper()
+	var collected metricdata.ResourceMetrics
+	require.NoError(t, o.reader.Collect(context.Background(), &collected))
+	out := make(map[string]int64)
+	for _, scope := range collected.ScopeMetrics {
+		for _, metric := range scope.Metrics {
+			if metric.Name != "messaging.client.sent.messages" {
+				continue
+			}
+			for _, point := range asSum[int64](t, metric).DataPoints {
+				attrs := stringAttributes(point.Attributes)
+				require.Equal(t, "f1.inmem", attrs["messaging.system"])
+				out[attrs["server.address"]+":"+attrs["server.port"]] += point.Value
+			}
+		}
+	}
+	return out
+}
+
+// sendSpanEndpoints returns the server.address and server.port of every
+// exported primary send span, in the order the spans ended.
+func (o ownershipTelemetry) sendSpanEndpoints() []string {
+	var out []string
+	for _, span := range o.exporter.GetSpans() {
+		if span.Name != "send orders.created" {
+			continue
+		}
+		attrs := spanAttributes(span)
+		out = append(out, attrs["server.address"]+":"+attrs["server.port"])
+	}
+	return out
+}
+
+const (
+	ownershipEndpointA = "amqp://a.example:5672"
+	ownershipEndpointB = "amqp://b.example:5672"
+	ownershipLabelA    = "a.example:5672"
+	ownershipLabelB    = "b.example:5672"
+	ownershipRemedy    = "create one f1otel.New per Client and share the OpenTelemetry providers"
+)
+
+func ownershipConfig(endpoint string) f1.Config {
+	return f1.Config{
+		Env: "test", Service: "ownership",
+		Broker:   f1.BrokerConfig{Driver: "inmem", Endpoints: []string{endpoint}},
+		Topology: f1.TopologyConfig{AutoCreate: true},
+	}
+}
+
+// newOwnershipClient returns the New result unchanged so a test can assert a
+// refusal, and registers Close for any Client that New did return.
+func newOwnershipClient(t *testing.T, observer f1.Observer, endpoint string, d driver.Driver) (*f1.Client, error) {
+	t.Helper()
+	client, err := f1.New(context.Background(), ownershipConfig(endpoint),
+		f1.WithDriver(d), f1.WithObserver(observer),
+		f1.WithPublishTopics("orders.created"), f1.WithBacklogPollInterval(-1))
+	if client != nil {
+		t.Cleanup(func() { require.NoError(t, client.Close(context.Background())) })
+	}
+	return client, err
+}
+
+func publishOwnershipMessage(t *testing.T, client *f1.Client) {
+	t.Helper()
+	_, err := client.Publisher().Publish(context.Background(), "orders.created.v1", "payload", f1.WithTopic("orders.created"))
+	require.NoError(t, err)
+}
+
+func requireOwnershipRefusal(t *testing.T, client *f1.Client, err error) {
+	t.Helper()
+	require.ErrorContains(t, err, "f1otel: observer is already attached to a Client")
+	require.ErrorContains(t, err, ownershipRemedy)
+	require.Nil(t, client)
+}
+
+func TestSharedObserverRejectsSecondClientWithoutRelabeling(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		endpointB string
+	}{
+		{name: "different endpoint", endpointB: ownershipEndpointB},
+		{name: "same endpoint", endpointB: ownershipEndpointA},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			telemetry := newOwnershipTelemetry(t)
+			observer := telemetry.observer(t)
+			clientA, err := newOwnershipClient(t, observer, ownershipEndpointA, inmem.New())
+			require.NoError(t, err)
+			publishOwnershipMessage(t, clientA)
+
+			clientB, err := newOwnershipClient(t, observer, test.endpointB, inmem.New())
+			requireOwnershipRefusal(t, clientB, err)
+
+			publishOwnershipMessage(t, clientA)
+			require.Equal(t, map[string]int64{ownershipLabelA: 2}, telemetry.sentByEndpoint(t))
+			require.Equal(t, []string{ownershipLabelA, ownershipLabelA}, telemetry.sendSpanEndpoints())
+		})
+	}
+}
+
+func TestSeparateObserversKeepClientEndpointLabels(t *testing.T) {
+	telemetry := newOwnershipTelemetry(t)
+	observerA := telemetry.observer(t)
+	observerB := telemetry.observer(t)
+	clientA, err := newOwnershipClient(t, observerA, ownershipEndpointA, inmem.New())
+	require.NoError(t, err)
+	clientB, err := newOwnershipClient(t, observerB, ownershipEndpointB, inmem.New())
+	require.NoError(t, err, "a second Observer on the same providers must attach to its own Client")
+
+	publishOwnershipMessage(t, clientA)
+	publishOwnershipMessage(t, clientB)
+	publishOwnershipMessage(t, clientA)
+	require.Equal(t, map[string]int64{ownershipLabelA: 2, ownershipLabelB: 1}, telemetry.sentByEndpoint(t))
+	require.Equal(t, []string{ownershipLabelA, ownershipLabelB, ownershipLabelA}, telemetry.sendSpanEndpoints())
+
+	// Binding belongs to each Observer, not to the providers it shares: both
+	// stay owned by their own Client.
+	for _, observer := range []*Observer{observerA, observerB} {
+		clientC, err := newOwnershipClient(t, observer, ownershipEndpointB, inmem.New())
+		requireOwnershipRefusal(t, clientC, err)
+	}
+}
+
+// failOpenDriver is the inmem driver whose Open fails, so New fails after it
+// has bound the observer.
+type failOpenDriver struct {
+	inmem.Driver
+	err error
+}
+
+func (d failOpenDriver) Open(context.Context, driver.Config) (driver.Conn, error) {
+	return nil, d.err
+}
+
+func TestFailedNewReleasesObserverBinding(t *testing.T) {
+	telemetry := newOwnershipTelemetry(t)
+	observer := telemetry.observer(t)
+	errOpen := errors.New("open refused")
+	failed, err := newOwnershipClient(t, observer, ownershipEndpointA, failOpenDriver{Driver: inmem.New(), err: errOpen})
+	require.ErrorIs(t, err, errOpen)
+	require.Nil(t, failed)
+
+	client, err := newOwnershipClient(t, observer, ownershipEndpointB, inmem.New())
+	require.NoError(t, err, "a failed New must not keep the observer bound")
+	publishOwnershipMessage(t, client)
+	require.Equal(t, map[string]int64{ownershipLabelB: 1}, telemetry.sentByEndpoint(t))
+	require.Equal(t, []string{ownershipLabelB}, telemetry.sendSpanEndpoints())
+
+	// The working Client holds a real binding, so the release above was a
+	// rollback and not the absence of any binding.
+	other, err := newOwnershipClient(t, observer, ownershipEndpointA, inmem.New())
+	requireOwnershipRefusal(t, other, err)
+}
+
+func TestClosedClientObserverCanBeReused(t *testing.T) {
+	ctx := context.Background()
+	telemetry := newOwnershipTelemetry(t)
+	observer := telemetry.observer(t)
+	clientA, err := newOwnershipClient(t, observer, ownershipEndpointA, inmem.New())
+	require.NoError(t, err)
+	publishOwnershipMessage(t, clientA)
+	require.NoError(t, clientA.Close(ctx))
+
+	clientB, err := newOwnershipClient(t, observer, ownershipEndpointB, inmem.New())
+	require.NoError(t, err, "a closed Client must release its observer")
+	publishOwnershipMessage(t, clientB)
+
+	// A's repeated Close is a no-op and cannot release B's attachment.
+	require.NoError(t, clientA.Close(ctx))
+	clientC, err := newOwnershipClient(t, observer, ownershipEndpointA, inmem.New())
+	requireOwnershipRefusal(t, clientC, err)
+
+	require.Equal(t, map[string]int64{ownershipLabelA: 1, ownershipLabelB: 1}, telemetry.sentByEndpoint(t))
+	require.Equal(t, []string{ownershipLabelA, ownershipLabelB}, telemetry.sendSpanEndpoints())
+
+	require.NoError(t, clientB.Close(ctx))
+	clientD, err := newOwnershipClient(t, observer, ownershipEndpointA, inmem.New())
+	require.NoError(t, err)
+	publishOwnershipMessage(t, clientD)
+	require.Equal(t, map[string]int64{ownershipLabelA: 2, ownershipLabelB: 1}, telemetry.sentByEndpoint(t))
 }

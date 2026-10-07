@@ -4,7 +4,9 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
+	"reflect"
 	"sort"
 	"strings"
 	"sync"
@@ -13,6 +15,8 @@ import (
 
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/driver"
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/clock"
+
+	"github.com/stretchr/testify/require"
 )
 
 // publishRecordingObserver is the phase 4a recorder local to this file. The
@@ -159,8 +163,8 @@ func TestObserverPublishSingle(t *testing.T) {
 	if len(publishFinish.Results) != 1 {
 		t.Fatalf("publish results len = %d, want 1", len(publishFinish.Results))
 	}
-	if publishFinish.Results[0].ID != id || publishFinish.Results[0].Err != nil {
-		t.Fatalf("publish results[0] = %+v, want ID %q nil error", publishFinish.Results[0], id)
+	if publishFinish.Results[0].ID != id || publishFinish.Results[0].ErrorClass != "" {
+		t.Fatalf("publish results[0] = %+v, want ID %q empty error class", publishFinish.Results[0], id)
 	}
 }
 
@@ -220,8 +224,8 @@ func TestObserverPublishBatchPartialFailure(t *testing.T) {
 		if got.ID != want.ID {
 			t.Fatalf("results[%d].ID = %q, want %q", i, got.ID, want.ID)
 		}
-		if (got.Err == nil) != (want.Err == nil) {
-			t.Fatalf("results[%d].Err nil mismatch: %v vs %v", i, got.Err, want.Err)
+		if got.ErrorClass != errorClassOf(want.Err) {
+			t.Fatalf("results[%d].ErrorClass mismatch: %q vs %q", i, got.ErrorClass, errorClassOf(want.Err))
 		}
 	}
 }
@@ -470,7 +474,7 @@ func TestObserverFinishWithAbandonIsNoop(t *testing.T) {
 	start := StartEvent{Kind: ObserverPublish, At: client.options.clock.Now()}
 	_, token := client.observeStart(context.Background(), start)
 	guard := client.newObserverGuard(ObserverPublish, token)
-	guard.finishWith(FinishEvent{Outcome: ObserverOutcomeOK, Results: []MessageResult{{ID: "x"}}})
+	guard.finishWith(FinishEvent{Outcome: ObserverOutcomeOK, Results: []ObserverMessageResult{{ID: "x"}}})
 	guard.abandon()
 	rec.mu.Lock()
 	finishes := len(rec.finishes)
@@ -562,4 +566,186 @@ func TestObserverPublishPanicLoggedOncePerKind(t *testing.T) {
 			t.Fatalf("tracestate = %q, want parent copy", headers["tracestate"])
 		}
 	})
+}
+
+type publishResultSnapshot struct {
+	id    string
+	class ErrorClass
+}
+
+type publishResultObserver struct {
+	results  []publishResultSnapshot
+	text     string
+	rawError bool
+	class    ErrorClass
+	finishes int
+}
+
+func (*publishResultObserver) Start(ctx context.Context, event StartEvent) (context.Context, Token) {
+	return ctx, Token{Kind: event.Kind, Start: event.At, Handle: 1}
+}
+
+func (o *publishResultObserver) Finish(_ Token, event FinishEvent) {
+	if event.Kind != ObserverPublish {
+		return
+	}
+	o.finishes++
+	o.class = event.ErrorClass
+	o.text = fmt.Sprintf("%+v", event.Results)
+	// Inspect both result representations so the regression runs at the old
+	// API and fails on the error leak, rather than failing to compile.
+	for _, result := range event.Results {
+		value := reflect.ValueOf(result)
+		snapshot := publishResultSnapshot{id: result.ID}
+		if class := value.FieldByName("ErrorClass"); class.IsValid() {
+			snapshot.class = ErrorClass(class.String())
+		}
+		for _, field := range value.Fields() {
+			if _, ok := field.Interface().(error); ok {
+				o.rawError = true
+			}
+		}
+		o.results = append(o.results, snapshot)
+	}
+}
+
+func (*publishResultObserver) Record(PointEvent) {}
+
+func TestObserverPublishResultsExcludeRawErrors(t *testing.T) {
+	t.Parallel()
+	const marker = "RAW_T041_MARKER"
+	cause := errors.New("broker secret=" + marker)
+	fatal := &driver.Error{Driver: "test", Op: "publish", K: driver.KindFatal, Err: cause}
+	permission := &driver.Error{Driver: "test", Op: "publish", K: driver.KindPermission, Err: errors.New("permission denied")}
+	for _, test := range []struct {
+		name       string
+		publishErr error
+		codecFail  bool
+		methodErr  bool
+		classes    []ErrorClass
+		published  []bool
+		topClass   ErrorClass
+	}{
+		{
+			name:       "partial",
+			publishErr: &driver.PublishError{Failed: map[int]error{1: fatal, 2: permission}},
+			classes:    []ErrorClass{"", ErrorClassDriverFatal, ErrorClassDriverPermission},
+			published:  []bool{true, false, false},
+			topClass:   ErrorClassDriverFatal,
+		},
+		{
+			name:       "transport",
+			publishErr: fatal,
+			methodErr:  true,
+			classes:    []ErrorClass{ErrorClassDriverFatal, ErrorClassDriverFatal, ErrorClassDriverFatal},
+			published:  []bool{false, false, false},
+			topClass:   ErrorClassDriverFatal,
+		},
+		{
+			name:       "missing partial cause",
+			publishErr: &driver.PublishError{Failed: map[int]error{1: nil}},
+			classes:    []ErrorClass{"", ErrorClassOther, ""},
+			published:  []bool{true, false, true},
+			topClass:   ErrorClassOther,
+		},
+		{
+			name:      "unattempted codec failure",
+			codecFail: true,
+			methodErr: true,
+			classes:   []ErrorClass{"", "", ""},
+			published: []bool{false, false, false},
+			topClass:  ErrorClassOther,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			rec := &publishResultObserver{}
+			options := []Option{WithObserver(rec)}
+			if test.codecFail {
+				options = append(options, WithCodec(failEncodeCodec{}))
+			}
+			client := newPublishClient(t, &recordingProducer{publishErr: test.publishErr}, options...)
+			_, err := client.Publisher().PublishBatch(context.Background(), []Message{
+				{EventType: "orders.created", Payload: "one"},
+				{EventType: "orders.created", Payload: "two"},
+				{EventType: "orders.created", Payload: "three"},
+			})
+			if (err != nil) != test.methodErr {
+				t.Fatalf("method error = %v, want error %v", err, test.methodErr)
+			}
+			if rec.rawError || strings.Contains(rec.text, marker) {
+				t.Fatal("observer results expose a raw error or broker marker")
+			}
+			if rec.finishes != 1 || rec.class != test.topClass {
+				t.Fatalf("primary finishes/class = %d/%q, want 1/%q", rec.finishes, rec.class, test.topClass)
+			}
+			if len(rec.results) != len(test.classes) {
+				t.Fatalf("observer results = %d, want %d", len(rec.results), len(test.classes))
+			}
+			for i, result := range rec.results {
+				if result.class != test.classes[i] || (result.id != "") != test.published[i] {
+					t.Fatalf("observer result[%d] = %+v, want class %q published %v", i, result, test.classes[i], test.published[i])
+				}
+			}
+		})
+	}
+}
+
+func TestObserverPublishBatchPreservesCallerErrors(t *testing.T) {
+	t.Parallel()
+	cause := errors.New("broker secret=RAW_T041_CALLER_MARKER")
+	fatal := &driver.Error{Driver: "test", Op: "publish", K: driver.KindFatal, Err: cause}
+	for _, observed := range []bool{false, true} {
+		for _, transport := range []bool{false, true} {
+			t.Run(fmt.Sprintf("observed=%v/transport=%v", observed, transport), func(t *testing.T) {
+				t.Parallel()
+				var publishErr error = &driver.PublishError{Failed: map[int]error{1: fatal}}
+				if transport {
+					publishErr = fatal
+				}
+				rec := &publishResultObserver{}
+				var options []Option
+				if observed {
+					options = append(options, WithObserver(rec))
+				}
+				client := newPublishClient(t, &recordingProducer{publishErr: publishErr}, options...)
+				result, err := client.Publisher().PublishBatch(context.Background(), []Message{
+					{EventType: "orders.created", Payload: "one"},
+					{EventType: "orders.created", Payload: "two"},
+					{EventType: "orders.created", Payload: "three"},
+				})
+				if transport {
+					require.Same(t, fatal, err)
+					if !errors.Is(err, cause) {
+						t.Fatalf("transport method error lost original error/cause: %v", err)
+					}
+				} else if err != nil {
+					t.Fatalf("partial method error = %v, want nil", err)
+				}
+				if len(result.Results) != 3 {
+					t.Fatalf("caller results = %d, want 3", len(result.Results))
+				}
+				for i, message := range result.Results {
+					if transport || i == 1 {
+						require.Same(t, fatal, message.Err)
+						if message.ID != "" || !errors.Is(message.Err, cause) {
+							t.Fatalf("caller result[%d] lost original error/cause: %+v", i, message)
+						}
+					} else if message.ID == "" || message.Err != nil {
+						t.Fatalf("caller result[%d] is not a success: %+v", i, message)
+					}
+				}
+				if observed {
+					if len(rec.results) != 3 || rec.results[1].class != ErrorClassDriverFatal {
+						t.Fatalf("observer must receive a bounded class while the caller retains the error: %+v", rec.results)
+					}
+					for i, message := range result.Results {
+						if rec.results[i].id != message.ID {
+							t.Fatalf("observer/caller IDs differ at index %d", i)
+						}
+					}
+				}
+			})
+		}
+	}
 }

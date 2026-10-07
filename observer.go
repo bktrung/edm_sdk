@@ -53,6 +53,30 @@ type TraceInjector interface {
 	InjectTrace(ctx context.Context) (traceParent, traceState string)
 }
 
+// ObserverBinder optionally binds an Observer to the Client that New is
+// building. New calls BindClient once, after configuration and codec
+// validation and before it opens the driver or emits any observer event. If
+// BindClient returns an error, no binding was acquired and New returns that
+// error wrapped, without opening the driver. Implementations must be safe for
+// concurrent calls and should return promptly.
+//
+// After a successful BindClient, F1 calls a non-nil unbind exactly once: when
+// New fails later, or when Close completes terminal shutdown of the Client. A
+// Close that fails part way and leaves the Client retryable keeps the binding.
+// A nil unbind needs no cleanup. Unbind is called without holding Client
+// locks, must return promptly, and must not wait for observer calls to stop:
+// binding controls which Client is attached, not delivery of events already in
+// flight.
+//
+// A wrapper Observer must forward BindClient to keep the wrapped Observer's
+// binding enforced, returning the wrapped callback and error unchanged.
+// Observers that do not implement ObserverBinder have no binding restriction.
+type ObserverBinder interface {
+	// BindClient acquires this Observer's attachment to one Client and returns
+	// the callback that releases it, or an error without acquiring anything.
+	BindClient() (unbind func(), err error)
+}
+
 // ObserverKind identifies one lifecycle stage or point event.
 type ObserverKind string
 
@@ -293,6 +317,18 @@ type StartEvent struct {
 	Drain DrainCounts
 }
 
+// ObserverMessageResult describes one primary-publish outcome without exposing
+// its error. Results follow input order. The zero value means no published ID
+// and no per-index error, as on an unattempted publish.
+type ObserverMessageResult struct {
+	// ID is the published envelope ID. It is empty for failed or unattempted
+	// messages; a successful result has a non-empty ID and an empty ErrorClass.
+	ID string
+	// ErrorClass is the bounded classification of the per-index publish error.
+	// It is empty when that error is nil, including unattempted messages.
+	ErrorClass ErrorClass
+}
+
 // FinishEvent describes the end of an observer stage. All structs pass by
 // value with no maps and no pointers except Results. F1 sets fields according
 // to the stage; a field a kind does not set holds its zero value.
@@ -315,11 +351,15 @@ type FinishEvent struct {
 	// EventType is the event type. F1 sets it for message-built, process and
 	// successor-publish Finishes; it is zero for primary-publish, settle and drain.
 	EventType string
-	// Priority is the delivery lane. F1 sets it for message-built, process, settle
-	// and successor-publish Finishes. A primary-publish Finish gets it only when
-	// every message resolves to one priority; mixed and drain Finishes use the
-	// zero value, PriorityMedium.
+	// Priority is the delivery lane. It is meaningful only when PriorityKnown is
+	// true; otherwise it holds the zero value, PriorityMedium.
 	Priority Priority
+	// PriorityKnown reports whether Priority carries the stage's delivery lane.
+	// F1 sets it for message-built, process, settle and successor-publish
+	// Finishes, and for a primary-publish Finish whose messages all resolve to
+	// one priority. It is false for a mixed or unresolved primary publish, a
+	// drain Finish, and an abandoned Finish.
+	PriorityKnown bool
 	// Attempt is the one-based attempt. F1 sets it for message-built, process and
 	// successor-publish Finishes; it is zero otherwise.
 	Attempt int
@@ -341,10 +381,11 @@ type FinishEvent struct {
 	// Terminal reports whether processing ended the delivery. F1 sets it for
 	// process Finishes; it is false otherwise.
 	Terminal bool
-	// Results carries per-index primary-publish outcomes. F1 sets it for primary
-	// publish Finishes; it is nil for successor-publish and other Finishes. The
-	// implementation must not retain or mutate it.
-	Results []MessageResult
+	// Results carries bounded per-index primary-publish outcomes in input order.
+	// F1 sets it for primary-publish Finishes; it is nil for successor-publish
+	// and other Finishes. Observers must not retain or mutate it. An empty ID and
+	// empty ErrorClass means no published result and no per-index error.
+	Results []ObserverMessageResult
 	// Drain carries drain progress. F1 sets it for drain Finishes; it is zero
 	// otherwise.
 	Drain DrainCounts
