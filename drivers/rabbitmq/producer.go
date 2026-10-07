@@ -486,13 +486,7 @@ func (p *producer) decide(ctx context.Context, channel *publishChannel, written,
 		failAll(undecided, reply.closeErr, failed)
 		return segmentOutcome{err: reply.closeErr}
 	}
-	culprit := false
-	for _, item := range undecided {
-		if blamed(item) {
-			culprit = true
-			break
-		}
-	}
+	culprit := slices.ContainsFunc(undecided, blamed)
 	if !culprit && republishable {
 		return segmentOutcome{republish: undecided}
 	}
@@ -529,14 +523,12 @@ func (p *producer) decide(ctx context.Context, channel *publishChannel, written,
 // goroutine ends with the channel at the latest; the connection waits for it on
 // Close with the other goroutines it owns.
 func (c *publishChannel) releaseWhenResolved(conn *conn, ids []string, confirms []publishConfirmation) {
-	conn.detachWatch.Add(1)
-	go func() {
-		defer conn.detachWatch.Done()
+	conn.detachWatch.Go(func() {
 		for _, confirm := range confirms {
 			<-confirm.Done()
 		}
 		c.watcher.release(ids)
-	}()
+	})
 }
 
 // reserve picks the channel a segment runs on and registers the segment's ids

@@ -435,8 +435,7 @@ func TestDrainWindowIsComputedWhenTheDrainStarts(t *testing.T) {
 func TestGenerationStartLeavesTheDrainWindowAlone(t *testing.T) {
 	_, runner, _ := newSettlementOrderingRunner(t)
 
-	captured, cancelCaptured := context.WithCancel(context.Background())
-	defer cancelCaptured()
+	captured := t.Context()
 
 	runner.beginSettlementWindow(captured)
 	window := runnerSettlementContext(runner, captured)

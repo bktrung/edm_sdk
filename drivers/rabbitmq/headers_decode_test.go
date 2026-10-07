@@ -31,7 +31,7 @@ func TestAMQPHeadersAcceptTypedCloudEventValues(t *testing.T) {
 		{name: "bytes", value: []byte("bytes")},
 		{name: "time", value: time.Date(2026, 8, 5, 11, 0, 0, 0, time.UTC)},
 		{name: "nested table", value: amqp.Table{"nested": "value"}},
-		{name: "array", value: []interface{}{true, int32(2), "three"}},
+		{name: "array", value: []any{true, int32(2), "three"}},
 	}
 
 	for _, tt := range tests {

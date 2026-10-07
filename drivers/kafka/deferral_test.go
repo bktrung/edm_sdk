@@ -157,11 +157,9 @@ func TestHeadHoldTimerWakesThePollLoop(t *testing.T) {
 	// The loop is waited on after pollDone is closed, so the test does not leave
 	// it running; the defers run in reverse, which is what puts the close first.
 	var loop sync.WaitGroup
-	loop.Add(1)
-	go func() {
-		defer loop.Done()
+	loop.Go(func() {
 		consumer.headHoldLoop()
-	}()
+	})
 	defer loop.Wait()
 	defer close(pollDone)
 

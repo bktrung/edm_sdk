@@ -239,7 +239,7 @@ func measureBrokerAssignment(t *testing.T, ctx context.Context, admin *kadm.Clie
 	if err != nil {
 		return "unreadable: " + err.Error()
 	}
-	line := ""
+	var line strings.Builder
 	for _, member := range described[group].Members {
 		label := member.MemberID
 		if member.InstanceID != nil && *member.InstanceID != "" {
@@ -247,24 +247,24 @@ func measureBrokerAssignment(t *testing.T, ctx context.Context, admin *kadm.Clie
 		}
 		assignment, ok := member.Assigned.AsConsumer()
 		if !ok {
-			line += label + "{no-consumer-assignment}"
+			line.WriteString(label + "{no-consumer-assignment}")
 			continue
 		}
 		assigned := make(map[string][]int32, len(assignment.Topics))
 		for _, topicAssignment := range assignment.Topics {
 			assigned[topicAssignment.Topic] = topicAssignment.Partitions
 		}
-		line += label + "{"
+		line.WriteString(label + "{")
 		for _, lane := range shape.lanes {
 			partitions := assigned[measureLaneDestination(topic, lane.name)]
 			if len(partitions) == 0 {
 				continue
 			}
-			line += fmt.Sprintf("%s%v", lane.name, partitions)
+			_, _ = fmt.Fprintf(&line, "%s%v", lane.name, partitions)
 		}
-		line += "}"
+		line.WriteString("}")
 	}
-	return line
+	return line.String()
 }
 
 // voidOrNone spells an empty void reason as none, so a printed line always says
@@ -735,19 +735,19 @@ func (a *measureAssignments) lateEntries(windowStart time.Time, slack time.Durat
 func (a *measureAssignments) line(shape measureShape, windowStart time.Time) string {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	line := ""
+	var line strings.Builder
 	for _, member := range measureMemberNames(shape.members) {
-		line += member + "{"
+		line.WriteString(member + "{")
 		for _, lane := range shape.lanes {
 			partitions := a.partitionsLocked(member, lane.name, windowStart)
 			if len(partitions) == 0 {
 				continue
 			}
-			line += fmt.Sprintf("%s%v", lane.name, partitions)
+			_, _ = fmt.Fprintf(&line, "%s%v", lane.name, partitions)
 		}
-		line += "}"
+		line.WriteString("}")
 	}
-	return line
+	return line.String()
 }
 
 // uncovered lists the (member, lane) pairs a run left with no partition at all,

@@ -233,10 +233,7 @@ func (c *consumer) syncHeadTimerLocked() {
 	}
 	c.headTimerDue = earliest
 	if !earliest.IsZero() && c.clock != nil {
-		delay := earliest.Sub(c.currentTime())
-		if delay < 0 {
-			delay = 0
-		}
+		delay := max(earliest.Sub(c.currentTime()), 0)
 		c.headTimer = c.clock.Timer(delay)
 		c.headTimerSet = true
 	}

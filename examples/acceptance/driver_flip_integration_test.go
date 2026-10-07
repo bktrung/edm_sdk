@@ -581,7 +581,7 @@ func recordTerminalEvent(t *testing.T, bySequence map[int]conformance.BehaviorEv
 // the error field ends the parse, because an error value contains spaces.
 func parseFields(line string) map[string]string {
 	fields := make(map[string]string, 8)
-	for _, field := range strings.Fields(line) {
+	for field := range strings.FieldsSeq(line) {
 		key, value, ok := strings.Cut(field, "=")
 		if !ok || key == "error" {
 			break
@@ -780,7 +780,7 @@ func formatVector(vector conformance.BehaviorVector) []byte {
 func formatLimits(report *flipLimits) []byte {
 	encoded, err := json.MarshalIndent(report, "", "  ")
 	if err != nil {
-		return []byte(fmt.Sprintf("limits unencodable: %v", err))
+		return fmt.Appendf(nil, "limits unencodable: %v", err)
 	}
 	return append(encoded, '\n')
 }

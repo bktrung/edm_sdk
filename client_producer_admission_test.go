@@ -194,11 +194,9 @@ func TestConcurrentFirstPublishesInstallOneProducerAndCloseLoser(t *testing.T) {
 		_ = client.Close(context.Background())
 	})
 	for range 2 {
-		publishers.Add(1)
-		go func() {
-			defer publishers.Done()
+		publishers.Go(func() {
 			results <- publishMessages(client, context.Background(), driver.OutboundMessage{Destination: "orders.created"})
-		}()
+		})
 	}
 	waitForSignal(t, built, "first producer build")
 	waitForSignal(t, built, "second producer build")
@@ -495,9 +493,7 @@ func TestConcurrentFirstBatchPublishesInstallOneProducerAndCloseLoser(t *testing
 		_ = client.Close(context.Background())
 	})
 	for range 2 {
-		publishers.Add(1)
-		go func() {
-			defer publishers.Done()
+		publishers.Go(func() {
 			result, err := client.Publisher().PublishBatch(context.Background(), []Message{
 				{EventType: "orders.created", Payload: "concurrent"},
 			})
@@ -505,7 +501,7 @@ func TestConcurrentFirstBatchPublishesInstallOneProducerAndCloseLoser(t *testing
 				result BatchResult
 				err    error
 			}{result, err}
-		}()
+		})
 	}
 	waitForSignal(t, built, "first batch producer build")
 	waitForSignal(t, built, "second batch producer build")

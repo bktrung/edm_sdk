@@ -2187,10 +2187,8 @@ func (c *conn) reserveConsumer(csm *consumer) error {
 			continue
 		}
 		for _, destination := range csm.destinations {
-			for _, activeDestination := range active.destinations {
-				if destination == activeDestination {
-					return fmt.Errorf("%w on destination %q", errExclusiveConsumer, destination)
-				}
+			if slices.Contains(active.destinations, destination) {
+				return fmt.Errorf("%w on destination %q", errExclusiveConsumer, destination)
 			}
 		}
 	}

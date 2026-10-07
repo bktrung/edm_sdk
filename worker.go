@@ -1350,10 +1350,7 @@ func (r *Runner) Drain(ctx context.Context) error {
 // zero so a delivery accepted between the two reads cannot turn the count
 // negative. A nil error finishes ok, else error with its class.
 func finishDrainObservation(guard *observerFinishGuard, inflight int, timeout time.Duration, remaining int, err error) {
-	drained := inflight - remaining
-	if drained < 0 {
-		drained = 0
-	}
+	drained := max(inflight-remaining, 0)
 	counts := DrainCounts{InFlight: inflight, Drained: drained, Remaining: remaining, Timeout: timeout}
 	if err == nil {
 		guard.finishWith(FinishEvent{Outcome: ObserverOutcomeOK, Drain: counts})
