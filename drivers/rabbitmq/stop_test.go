@@ -547,6 +547,37 @@ func (ctx *teardownWaitContext) Err() error {
 	}
 }
 
+// postDrainDeadlineContext expires at the check after Stop's drain and joins;
+// the earlier checks at teardown entry and Drain still see a live context.
+type postDrainDeadlineContext struct {
+	*teardownWaitContext
+	checks int
+}
+
+func (ctx *postDrainDeadlineContext) Err() error {
+	ctx.checks++
+	if ctx.checks == 3 {
+		close(ctx.expired)
+	}
+	return ctx.teardownWaitContext.Err()
+}
+
+func TestConsumerStopFinishesAfterSuccessfulDrainDeadline(t *testing.T) {
+	c := newForwarderTestConsumer()
+	c.conn.active = map[*consumer]struct{}{c: {}}
+	ctx := &postDrainDeadlineContext{teardownWaitContext: newTeardownWaitContext()}
+
+	if err := c.Stop(ctx); err != nil {
+		t.Errorf("Stop() = %v, want nil after successful drain", err)
+	}
+	select {
+	case <-ctx.Done():
+	default:
+		t.Fatal("Stop context did not expire before the teardown claim")
+	}
+	assertTeardownState(t, c, true)
+}
+
 func awaitTeardownWait(t *testing.T, ctx *teardownWaitContext, result <-chan error) bool {
 	t.Helper()
 	select {
@@ -778,4 +809,252 @@ func TestStopWaitsForReleaseTeardown(t *testing.T) {
 	if got := starts.Load(); got != 1 {
 		t.Errorf("lane close starts = %d, want 1", got)
 	}
+}
+
+func awaitTeardownSignal(t *testing.T, signal <-chan struct{}, result <-chan error, what string) {
+	t.Helper()
+	select {
+	case <-signal:
+	case err := <-result:
+		t.Fatalf("%s: teardown returned %v before the signal", what, err)
+	case <-time.After(time.Second): //nolint:forbidigo // bound a wedged teardown fixture, not its interleaving
+		t.Fatalf("timed out waiting for %s", what)
+	}
+}
+
+func TestConsumerStopBoundsFailedReleaseTakeover(t *testing.T) {
+	for _, retry := range []string{"stop", "release"} {
+		t.Run(retry, func(t *testing.T) {
+			c := newForwarderTestConsumer()
+			c.clock = clock.NewFake(time.Unix(0, 0))
+			c.conn.active = map[*consumer]struct{}{c: {}}
+			l := &lane{owner: c, channel: closedTeardownChannel(t), destination: "retained-close"}
+			c.lanes = []*lane{l}
+			closeStarted, allowClose := make(chan struct{}), make(chan struct{})
+			var starts atomic.Int32
+			c.channelCloseHook = func(*lane) error {
+				starts.Add(1)
+				close(closeStarted)
+				<-allowClose
+				return nil
+			}
+			var closeOnce sync.Once
+			unblock := func() { closeOnce.Do(func() { close(allowClose) }) }
+			releaseCtx, cancel := context.WithCancel(context.Background())
+			var calls sync.WaitGroup
+			t.Cleanup(func() {
+				cancel()
+				unblock()
+				joinTeardownFixture(t, c, &calls)
+			})
+			release := startTeardownCall(t, c, &calls, func() error { return c.Release(releaseCtx) })
+			awaitTeardownSignal(t, closeStarted, release, "Release's lane close")
+			cancel()
+			if err := teardownResult(t, release); !errors.Is(err, context.Canceled) {
+				t.Fatalf("Release = %v, want context.Canceled", err)
+			}
+			assertTeardownState(t, c, false)
+			l.closeMu.Lock()
+			retained := l.closeOutcome
+			l.closeMu.Unlock()
+			if retained == nil {
+				t.Fatal("failed Release did not retain its lane close")
+			}
+
+			ctx := newTeardownWaitContext()
+			stop := startTeardownCall(t, c, &calls, func() error { return c.Stop(ctx) })
+			awaitTeardownSignal(t, ctx.arrived, stop, "Stop's retained close wait")
+			close(ctx.expired)
+			err := teardownResult(t, stop)
+			if !errors.Is(err, driver.ErrDrainTimeout) || !errors.Is(err, context.DeadlineExceeded) {
+				t.Fatalf("Stop = %v, want ErrDrainTimeout and context.DeadlineExceeded", err)
+			}
+			var classified, nested *driver.Error
+			if !errors.As(err, &classified) || classified.Op != "stop" || classified.K != driver.KindTransient {
+				t.Fatalf("Stop = %v, want stop/transient driver.Error", err)
+			}
+			if errors.As(classified.Err, &nested) {
+				t.Fatalf("Stop has nested driver.Error: %v", nested)
+			}
+			assertTeardownState(t, c, false)
+			c.mu.Lock()
+			stopped, active, finished := c.stopped, c.tearingDown, c.teardownFinished
+			c.mu.Unlock()
+			if !stopped || active || finished {
+				t.Fatalf("failed Stop state = stopped %v, active %v, finished %v", stopped, active, finished)
+			}
+			l.closeMu.Lock()
+			sameOutcome := l.closeOutcome == retained
+			l.closeMu.Unlock()
+			if !sameOutcome || starts.Load() != 1 {
+				t.Fatal("takeover replaced or restarted the retained lane close")
+			}
+
+			unblock()
+			call := func() error { return c.Stop(context.Background()) }
+			if retry == "release" {
+				call = func() error { return c.Release(context.Background()) }
+			}
+			if err := teardownResult(t, startTeardownCall(t, c, &calls, call)); err != nil {
+				t.Fatalf("retry %s = %v, want nil", retry, err)
+			}
+			assertTeardownState(t, c, true)
+			if got := starts.Load(); got != 1 {
+				t.Fatalf("lane close starts = %d, want 1", got)
+			}
+			if err := c.Stop(context.Background()); err != nil {
+				t.Fatalf("completed Stop = %v", err)
+			}
+			if err := c.Release(context.Background()); err != nil {
+				t.Fatalf("completed Release = %v", err)
+			}
+		})
+	}
+}
+
+// beforeDrainClaimContext holds Stop before Drain takes mu, so Release can claim
+// teardown after Stop's entry inspection without relying on goroutine timing.
+type beforeDrainClaimContext struct {
+	*teardownWaitContext
+	checks      atomic.Int32
+	beforeDrain chan struct{}
+	allowDrain  chan struct{}
+}
+
+func (ctx *beforeDrainClaimContext) Err() error {
+	if ctx.checks.Add(1) == 2 {
+		close(ctx.beforeDrain)
+		<-ctx.allowDrain
+	}
+	return ctx.teardownWaitContext.Err()
+}
+
+func TestConsumerStopResumesAfterReleaseClaimsBeforeDrain(t *testing.T) {
+	c := newForwarderTestConsumer()
+	c.clock = clock.NewFake(time.Unix(0, 0))
+	c.conn.active = map[*consumer]struct{}{c: {}}
+	deliveries := make(chan amqp.Delivery)
+	first := &lane{owner: c, channel: closedTeardownChannel(t), destination: "first-close"}
+	second := &lane{
+		owner: c, channel: closedTeardownChannel(t), destination: "reader-left-open",
+		deliveries: deliveries, generation: 1, pending: make(chan laneDelivery),
+	}
+	c.lanes = []*lane{first, second}
+	firstStarted, secondStarted, allowFirst := make(chan struct{}), make(chan struct{}), make(chan struct{})
+	var firstStarts, secondStarts atomic.Int32
+	var firstOnce, deliveriesOnce, drainOnce sync.Once
+	unblockFirst := func() { firstOnce.Do(func() { close(allowFirst) }) }
+	closeDeliveries := func() { deliveriesOnce.Do(func() { close(deliveries) }) }
+	c.channelCloseHook = func(l *lane) error {
+		if l == first {
+			firstStarts.Add(1)
+			close(firstStarted)
+			<-allowFirst
+		} else {
+			secondStarts.Add(1)
+			close(secondStarted)
+			closeDeliveries()
+		}
+		return nil
+	}
+	ctx := &beforeDrainClaimContext{
+		teardownWaitContext: newTeardownWaitContext(),
+		beforeDrain:         make(chan struct{}),
+		allowDrain:          make(chan struct{}),
+	}
+	allowDrain := func() { drainOnce.Do(func() { close(ctx.allowDrain) }) }
+	releaseCtx, cancel := context.WithCancel(context.Background())
+	var calls sync.WaitGroup
+	t.Cleanup(func() {
+		cancel()
+		allowDrain()
+		unblockFirst()
+		closeDeliveries()
+		joinTeardownFixture(t, c, &calls)
+		c.readers.Wait()
+	})
+	c.readers.Add(1)
+	go c.readDeliveries(second)
+	stop := startTeardownCall(t, c, &calls, func() error { return c.Stop(ctx) })
+	awaitTeardownSignal(t, ctx.beforeDrain, stop, "Stop before Drain")
+	release := startTeardownCall(t, c, &calls, func() error { return c.Release(releaseCtx) })
+	awaitTeardownSignal(t, firstStarted, release, "Release's first close")
+	allowDrain()
+	awaitTeardownSignal(t, ctx.arrived, stop, "Stop waiting for the Release claim")
+	cancel()
+	if err := teardownResult(t, release); !errors.Is(err, context.Canceled) {
+		t.Fatalf("Release = %v, want context.Canceled", err)
+	}
+	if got := secondStarts.Load(); got != 0 {
+		t.Fatalf("second lane close starts before takeover = %d, want 0", got)
+	}
+	assertTeardownState(t, c, false)
+	unblockFirst()
+	awaitTeardownSignal(t, secondStarted, stop, "Stop's remaining lane close")
+	if err := teardownResult(t, stop); err != nil {
+		t.Fatalf("Stop takeover = %v, want nil", err)
+	}
+	if err := ctx.Err(); err != nil {
+		t.Fatalf("Stop used its deadline rather than taking over: %v", err)
+	}
+	assertTeardownState(t, c, true)
+	if firstStarts.Load() != 1 || secondStarts.Load() != 1 {
+		t.Fatalf("lane close starts = %d, %d, want 1, 1", firstStarts.Load(), secondStarts.Load())
+	}
+	if err := c.Stop(context.Background()); err != nil {
+		t.Fatalf("completed Stop = %v", err)
+	}
+	if err := c.Release(context.Background()); err != nil {
+		t.Fatalf("completed Release = %v", err)
+	}
+}
+
+func TestConsumerStopKeepsSuccessfulDrainCloseUnbounded(t *testing.T) {
+	c := newForwarderTestConsumer()
+	c.clock = clock.NewFake(time.Unix(0, 0))
+	c.conn.active = map[*consumer]struct{}{c: {}}
+	forwarderExiting, allowExit := make(chan struct{}), make(chan struct{})
+	closeStarted, allowClose := make(chan struct{}), make(chan struct{})
+	var exitOnce, closeOnce sync.Once
+	unblockExit := func() { exitOnce.Do(func() { close(allowExit) }) }
+	unblockClose := func() { closeOnce.Do(func() { close(allowClose) }) }
+	c.forwarderExitHook = func() {
+		close(forwarderExiting)
+		<-allowExit
+	}
+	c.channelCloseHook = func(*lane) error {
+		close(closeStarted)
+		<-allowClose
+		return nil
+	}
+	ctx := &postDrainDeadlineContext{teardownWaitContext: newTeardownWaitContext()}
+	var calls sync.WaitGroup
+	t.Cleanup(func() {
+		unblockExit()
+		unblockClose()
+		joinTeardownFixture(t, c, &calls)
+		c.forward.Wait()
+	})
+	c.forward.Add(1)
+	go c.emitMessages(&lane{owner: c, pending: make(chan laneDelivery)})
+	stop := startTeardownCall(t, c, &calls, func() error { return c.Stop(ctx) })
+	awaitTeardownSignal(t, forwarderExiting, stop, "Drain stopping the forwarder")
+	// Drain closes forwarderStopC and snapshots lanes under mu. The forwarder
+	// reaches its exit hook before Done; taking mu here waits out that snapshot.
+	// Installing the lane now bypasses Cancel and isolates the final Close RPC.
+	c.mu.Lock()
+	c.lanes = []*lane{{owner: c, channel: closedTeardownChannel(t), destination: "post-drain-close"}}
+	c.mu.Unlock()
+	unblockExit()
+	awaitTeardownSignal(t, closeStarted, stop, "successful-drain final close")
+	select {
+	case <-ctx.expired:
+	default:
+		t.Fatal("final lane close started before the post-drain deadline")
+	}
+	unblockClose()
+	if err := teardownResult(t, stop); err != nil {
+		t.Fatalf("Stop = %v, want nil after successful drain", err)
+	}
+	assertTeardownState(t, c, true)
 }

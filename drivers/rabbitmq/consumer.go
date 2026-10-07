@@ -88,7 +88,7 @@ type lane struct {
 	destination string
 	channel     *amqp.Channel
 	// channelMu serializes channel RPCs because AMQP does not correlate
-	// requests with their replies. closeLanes waits for it only up to
+	// requests with their replies. closeLanesWithContext waits for it only up to
 	// closeLockWait, so a stuck RPC cannot hold Channel.Close back for long.
 	// It also guards tag, which changes each time a server-initiated cancel is
 	// re-established.
@@ -135,9 +135,9 @@ type laneDelivery struct {
 type laneCloseOutcome struct {
 	// done closes after Channel.Close returns. amqp091's Channel.Close defers
 	// connection.closeChannel(ch), so its return leaves the channel locally
-	// closed and a second Close returns nil (channel.go:689-702). closeLanes
-	// discards that error too, so a completed outcome is successful for Release
-	// finalization.
+	// closed and a second Close returns nil (channel.go:689-702).
+	// closeLanesWithContext discards that error too, so a completed outcome is
+	// successful for Release finalization.
 	done chan struct{}
 }
 
@@ -157,6 +157,9 @@ const (
 // nil in production and does not change the driver behavior.
 var consumerConstructionHook func(*consumer, consumerConstructionPhase)
 
+// newConsumer opens one channel per destination so each lane has independent
+// broker credit. A partial failure rolls back the opened lanes and joins their
+// goroutines rather than leaving an unreachable consumer attached to the broker.
 func newConsumer(conn *conn, cfg driver.ConsumerConfig) (*consumer, error) {
 	seen := make(map[string]struct{}, len(cfg.Destinations))
 	for _, destination := range cfg.Destinations {
@@ -169,6 +172,9 @@ func newConsumer(conn *conn, cfg driver.ConsumerConfig) (*consumer, error) {
 		return nil, classify("consumer", driver.KindFatal, err)
 	}
 
+	// The eight-slot errors buffer absorbs bursts without blocking watchers.
+	// sendError needs a buffered slot to replace an evicted error even when
+	// no caller is receiving; an unbuffered channel loses that report.
 	c := &consumer{
 		conn:                 conn,
 		cfg:                  cfg,
@@ -259,6 +265,10 @@ func totalPrefetch(cfg driver.ConsumerConfig, brokerPrefetch int) int {
 	for index, destination := range cfg.Destinations {
 		total += effectivePrefetch(cfg, destination, index, brokerPrefetch)
 	}
+	// Broker transport credit can exceed SDK admission, so reserving all of it
+	// in the shared output buffer wastes space. admitMessage caps counted
+	// deliveries at the positive aggregate budget; stale-generation deliveries
+	// bypass that accounting because the broker has already taken them back.
 	if cfg.Prefetch > 0 && cfg.Prefetch < total {
 		total = cfg.Prefetch
 	}
@@ -268,6 +278,9 @@ func totalPrefetch(cfg driver.ConsumerConfig, brokerPrefetch int) int {
 	return total
 }
 
+// validateBrokerPrefetch rejects an override below any SDK lane window, since
+// broker credit would otherwise prevent that lane from filling its window.
+// Zero leaves transport credit derived from the SDK windows.
 func validateBrokerPrefetch(cfg driver.ConsumerConfig, brokerPrefetch int) error {
 	if brokerPrefetch == 0 {
 		return nil
@@ -285,36 +298,27 @@ func validateBrokerPrefetch(cfg driver.ConsumerConfig, brokerPrefetch int) error
 }
 
 func effectivePrefetch(cfg driver.ConsumerConfig, destination string, index, brokerPrefetch int) int {
+	// The broker override is transport credit per destination, not a total to
+	// split by index. SDK admission still uses DestinationPrefetch(index), so
+	// replacing every broker window does not enlarge the SDK's lane windows.
 	if brokerPrefetch > 0 {
 		return brokerPrefetch
 	}
 	return cfg.DestinationPrefetch(index)
 }
 
-// closeLockWait bounds how long closeLanes waits, across all lanes, for an
-// in-flight channel RPC to finish before it closes the channel anyway.
+// closeLockWait bounds how long closeLanesWithContext waits, across all lanes,
+// for an in-flight channel RPC to finish before it closes the channel anyway.
 const closeLockWait = time.Second
-
-// closeLanes closes every lane's channel. Close is itself an RPC, and AMQP
-// does not correlate replies, so a Close that overlaps an in-flight Cancel can
-// have its close-ok taken by the Cancel and then wait forever. Each Close
-// therefore runs under the lane's RPC lock when the lock comes free before one
-// shared deadline. Past that deadline the in-flight RPC is treated as stuck and
-// the channel is closed without the lock, as a stuck RPC needs.
-func (c *consumer) closeLanes() {
-	deadline := c.clock.Now().Add(closeLockWait)
-	for _, lane := range c.lanes {
-		locked := lockBefore(c.clock, &lane.channelMu, deadline)
-		_ = lane.channel.Close()
-		if locked {
-			lane.channelMu.Unlock()
-		}
-	}
-}
 
 // closeLanesWithContext starts each lane close once and waits for every close
 // under ctx. A close outcome remains set so a later teardown joins the same
 // broker close rather than issuing another AMQP close request.
+// Close is itself an RPC, and AMQP does not correlate replies, so a Close that
+// overlaps an in-flight Cancel can have its close-ok taken by the Cancel and
+// then wait forever. Each Close therefore runs under the lane's RPC lock when
+// the lock is available. One shared deadline bounds waiting across all lanes;
+// after it, a still-busy RPC is treated as stuck and Close proceeds without the lock.
 func (c *consumer) closeLanesWithContext(ctx context.Context, op string) error {
 	deadline := c.clock.Now().Add(closeLockWait)
 	for _, lane := range c.lanes {
@@ -373,8 +377,8 @@ func waitLaneClose(ctx context.Context, outcome *laneCloseOutcome) error {
 	}
 }
 
-// lockBeforeContext takes mu before deadline unless ctx ends first. The
-// deadlineReached result is the only path allowed to start a forced close.
+// lockBeforeContext takes mu if available unless ctx ends first. Once deadline
+// is reached, a still-busy mu returns deadlineReached to allow a forced close.
 func lockBeforeContext(ctx context.Context, clk clock.Clock, mu *sync.Mutex, deadline time.Time) (locked, deadlineReached bool) {
 	for wait := time.Millisecond; ; wait = min(2*wait, 20*time.Millisecond) {
 		if err := ctx.Err(); err != nil {
@@ -389,30 +393,10 @@ func lockBeforeContext(ctx context.Context, clk clock.Clock, mu *sync.Mutex, dea
 		timer := clk.Timer(wait)
 		select {
 		case <-timer.C:
-			if err := ctx.Err(); err != nil {
-				return false, false
-			}
-			if !clk.Now().Before(deadline) {
-				return false, true
-			}
 		case <-ctx.Done():
 			timer.Stop()
 			return false, false
 		}
-	}
-}
-
-// lockBefore takes mu if it comes free before deadline and reports whether it
-// did. sync.Mutex has no timed lock, so it polls; it runs only on teardown.
-func lockBefore(clk clock.Clock, mu *sync.Mutex, deadline time.Time) bool {
-	for wait := time.Millisecond; ; wait = min(2*wait, 20*time.Millisecond) {
-		if mu.TryLock() {
-			return true
-		}
-		if !clk.Now().Before(deadline) {
-			return false
-		}
-		<-clk.Timer(wait).C
 	}
 }
 
@@ -425,7 +409,7 @@ func (c *consumer) rollbackConstruction() error {
 	c.stopped = true
 	c.mu.Unlock()
 	c.stopSignals()
-	c.closeLanes()
+	_ = c.closeLanesWithContext(context.Background(), "consumer_rollback")
 	c.readers.Wait()
 	c.forward.Wait()
 	c.events.Wait()
@@ -582,6 +566,9 @@ func (c *consumer) readDeliveries(lane *lane) {
 		drained = generation
 		for delivery := range deliveries {
 			if c.ending() {
+				// Consume uses manual acknowledgements. Skipping local
+				// forwarding leaves this delivery unacked; lane closure
+				// requeues it rather than losing it during teardown.
 				continue
 			}
 			if c.readerSendHook != nil {
@@ -705,6 +692,9 @@ func (c *consumer) hasDestination(destination string) bool {
 	return false
 }
 
+// nativeDeliveryCount falls back to the connection only when Effective is the
+// port's all-zero unset sentinel, so direct driver callers retain broker counts.
+// A nonzero profile's false value is intentional and must not be overridden.
 func (c *consumer) nativeDeliveryCount() bool {
 	if c.cfg.Effective == (driver.Capabilities{}) {
 		return c.conn.caps.NativeDeliveryCount
@@ -935,6 +925,9 @@ func (c *consumer) Backlog(ctx context.Context) (map[string]driver.BacklogSample
 			if err := ctx.Err(); err != nil {
 				return nil, classify("backlog", driver.KindTransient, err)
 			}
+			// The management head timestamp is optional enrichment of the
+			// AMQP lag sample. Failure leaves the head unknown rather than
+			// discarding usable lag; caller cancellation still fails below.
 			queue, err := c.conn.management.getQueue(ctx, lane.destination)
 			if err == nil {
 				sample.HeadEnqueuedAt, sample.HeadSource = queue.headEnqueuedAt()
@@ -1200,6 +1193,13 @@ func (c *consumer) waitEvents(ctx context.Context, op string) error {
 	return waitFor(ctx, op, &c.events)
 }
 
+// cancelConsumer bounds the caller's wait, not the context-free AMQP RPC.
+// Its goroutine is deliberately outside the teardown WaitGroups: Cancel can be
+// in flight holding channelMu when ctx ends and the caller returns. A later
+// closeLanesWithContext waits for that lock only up to closeLockWait, then starts
+// the lane close without it. Channel shutdown wakes the pending Cancel through
+// amqp091's Channel.call error path, letting the goroutine release channelMu;
+// joining it before closing the lane would wait on the RPC that closure unblocks.
 func cancelConsumer(ctx context.Context, lane *lane) error {
 	result := make(chan error, 1)
 	go func() {
@@ -1220,8 +1220,8 @@ func cancelConsumer(ctx context.Context, lane *lane) error {
 
 // Stop drains the consumer and closes its channels after every delivered message has been settled.
 // It returns an error while messages remain unsettled. Concurrent Stop and Release
-// calls wait for the same teardown under their own contexts. The owning Stop's
-// final lane close is unbounded, as it is after a successful drain.
+// calls wait for the same teardown under their own contexts. A Stop that completes
+// its own drain closes lanes without a bound; failed-Release takeover honors ctx.
 func (c *consumer) Stop(ctx context.Context) error {
 	return c.teardown(ctx, "stop")
 }
@@ -1260,7 +1260,9 @@ func (c *consumer) teardown(ctx context.Context, op string) error {
 			c.mu.Unlock()
 			return prepareErr
 		}
-		if err := ctx.Err(); err != nil {
+		// Stop can finish its drain and joins, then lose its deadline before
+		// this second pass. It must still claim teardown and close its channels.
+		if err := ctx.Err(); err != nil && (op != "stop" || !prepared || prepareErr != nil || c.stopped) {
 			c.mu.Unlock()
 			return teardownContextError(op, err)
 		}
@@ -1290,12 +1292,24 @@ func (c *consumer) teardown(ctx context.Context, op string) error {
 
 		var err error
 		if op == "stop" {
-			err = c.closeLanesWithContext(context.Background(), "stop") //nolint:contextcheck // preserve Stop's unbounded final lane close after drain
-			if err == nil && (!prepared || prepareErr != nil) {
-				// A Release may have failed before its local joins. A Stop
-				// taking over closes lanes first, then joins those goroutines
-				// rather than relying on its skipped drain preparation.
-				err = c.stopAndWait(ctx, "stop", false)
+			if prepared && prepareErr == nil {
+				// A finishes its drain and joins before claiming teardown, but
+				// its context may expire at the next check. A must still close
+				// its lanes without adding a post-drain timeout point.
+				err = c.closeLanesWithContext(context.Background(), "stop") //nolint:contextcheck // preserve Stop's unbounded final lane close after drain
+			} else {
+				// B's Release starts a lane close and fails on its context.
+				// A takes over without preparing; it joins B's retained close
+				// under A's context, then closes remaining lanes before joins.
+				err = c.closeLanesWithContext(ctx, "stop")
+				if errors.Is(err, context.DeadlineExceeded) {
+					// Lane-close errors are already classified; replace that
+					// layer rather than nesting a second driver.Error.
+					err = teardownContextError("stop", errors.Unwrap(err))
+				}
+				if err == nil {
+					err = c.stopAndWait(ctx, "stop", false)
+				}
 			}
 		} else {
 			// Requeue before joins so an abandoned forwarder can escape
@@ -1316,12 +1330,24 @@ func (c *consumer) teardown(ctx context.Context, op string) error {
 	}
 }
 
+var errStopPreparationClaimed = errors.New("consumer teardown claimed during stop preparation")
+
 func (c *consumer) prepareStop(ctx context.Context) error {
 	if err := c.Drain(ctx); err != nil {
 		if errors.Is(err, context.DeadlineExceeded) && !errors.Is(err, driver.ErrDrainTimeout) {
 			return teardownContextError("stop", err)
 		}
 		return err
+	}
+	c.mu.Lock()
+	claimed := c.stopped
+	c.mu.Unlock()
+	// A leaves Stop's entry lock; B claims Release before A's Drain takes mu,
+	// so Drain returns nil without cancellation. B can fail closing lane 1
+	// while lane 2's reader stays open. A must rejoin teardown coordination,
+	// not wait for that reader before it can take over and close lane 2.
+	if claimed {
+		return errStopPreparationClaimed
 	}
 	return c.stopAndWait(ctx, "stop", false)
 }
@@ -1333,6 +1359,9 @@ func teardownContextError(op string, err error) error {
 	return classify(op, driver.KindTransient, err)
 }
 
+// release removes local settlement and admission accounting, not broker state.
+// After successful settlement there is nothing left to nack; when a forwarder
+// abandons an admitted delivery, leaving it unacked lets lane closure requeue it.
 func (c *consumer) release(settler *settler) {
 	c.mu.Lock()
 	if _, exists := c.settlers[settler]; !exists {

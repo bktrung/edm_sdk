@@ -363,3 +363,42 @@ func TestStopTakesOverFailedReleaseTeardown(t *testing.T) {
 		t.Errorf("lane close starts after takeover = %d, want 1", got)
 	}
 }
+
+func TestLockBeforeContextAcquiresLockReleasedDuringFinalSleep(t *testing.T) {
+	fake := clock.NewFake(time.Time{})
+	deadline := fake.Now().Add(500 * time.Microsecond)
+	var mu sync.Mutex
+	mu.Lock()
+	var unlockOnce sync.Once
+	unlock := func() { unlockOnce.Do(mu.Unlock) }
+	t.Cleanup(unlock)
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	type lockResult struct {
+		locked          bool
+		deadlineReached bool
+	}
+	result := make(chan lockResult, 1)
+	go func() {
+		locked, reached := lockBeforeContext(ctx, fake, &mu, deadline)
+		if locked {
+			mu.Unlock()
+		}
+		result <- lockResult{locked: locked, deadlineReached: reached}
+	}()
+	waitForwarderState(t, "lane lock backoff timer", func() bool { return fake.NumWaiters() == 1 })
+	// The RPC finishes inside the 1ms sleep, whose wakeup is past the deadline.
+	fake.Advance(250 * time.Microsecond)
+	unlock()
+	fake.Advance(750 * time.Microsecond)
+	wait := clock.NewReal().Timer(time.Second)
+	defer wait.Stop()
+	select {
+	case got := <-result:
+		if !got.locked || got.deadlineReached {
+			t.Fatalf("lockBeforeContext = (locked=%v, deadlineReached=%v), want (true, false)", got.locked, got.deadlineReached)
+		}
+	case <-wait.C:
+		t.Fatal("lockBeforeContext did not return after the final sleep")
+	}
+}

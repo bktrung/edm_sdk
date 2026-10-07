@@ -566,7 +566,7 @@ func (c *conn) Consumer(ctx context.Context, cfg driver.ConsumerConfig) (driver.
 		return nil, classify("consumer", driver.KindFatal, errors.New("no destinations"))
 	}
 
-	consumer, err := newConsumer(c, cfg)
+	consumer, err := newConsumer(c, cfg) //nolint:contextcheck // construction rollback must close every opened lane even after caller cancellation.
 	if err != nil {
 		return nil, err
 	}
