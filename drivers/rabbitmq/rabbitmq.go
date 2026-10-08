@@ -117,8 +117,28 @@ func (Driver) Capabilities() driver.Capabilities {
 	}
 }
 
+// openRefusalPasses is how many consecutive passes every endpoint may refuse a
+// dial for a reason retrying cannot repair before Open returns that refusal.
+// Pinned amqp091-go answers a socket that dies during the credential or vhost
+// exchange with the same 403 it returns for a refusal it decided, so one refused
+// pass cannot be told from a dropped handshake during a broker restart, a
+// load-balancer reset, or a short authentication-backend outage. Counting passes
+// keeps the decision free of wall-clock calls and deterministic for tests; at
+// the 250ms wait between passes this is about 5s, which absorbs those events
+// while a rejection the broker keeps making still ends the connect without
+// waiting the caller's timeout out.
+const openRefusalPasses = 20
+
+// openRetryWait is a test-only wait seam. Production uses waitRetry unchanged.
+var openRetryWait = waitRetry
+
 // Open establishes a RabbitMQ connection and retries failed endpoint dials
-// until the caller's context or ConnectTimeout expires.
+// until the caller's context or ConnectTimeout expires. A reason retrying
+// cannot repair, such as rejected credentials, ends the call with that
+// classified refusal once every endpoint has refused with it on
+// openRefusalPasses consecutive passes. It refuses a configured vhost that
+// differs from any endpoint, or SASL credentials without a mechanism, with a
+// fatal configuration error before dialing.
 func (Driver) Open(ctx context.Context, cfg driver.Config) (driver.Conn, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, classify("open", driver.KindTransient, err)
@@ -139,9 +159,8 @@ func (Driver) Open(ctx context.Context, cfg driver.Config) (driver.Conn, error) 
 	if err != nil {
 		return nil, classify("open", driver.KindFatal, err)
 	}
-	// The AMQP settings, TLS material included, are the same for every
-	// endpoint and every attempt, so a file that fails to load is a
-	// configuration error: retrying the dial cannot fix it.
+	// TLS material and connection properties are shared across attempts;
+	// retrying cannot repair a file that fails to load.
 	if len(cfg.Endpoints) == 0 {
 		return nil, classify("open", driver.KindFatal, errMissingEndpoints)
 	}
@@ -156,17 +175,36 @@ func (Driver) Open(ctx context.Context, cfg driver.Config) (driver.Conn, error) 
 		defer cancel()
 	}
 
-	endpoints := cfg.Endpoints
+	endpoints := make([]resolvedEndpoint, len(cfg.Endpoints))
+	for index, endpoint := range cfg.Endpoints {
+		if err := openCtx.Err(); err != nil {
+			return nil, classify("open", driver.KindTransient, err)
+		}
+		resolved, err := resolveEndpoint(endpoint, cfg)
+		if err != nil {
+			return nil, classify("open", driver.KindFatal, err)
+		}
+		endpoints[index] = resolved
+	}
+	// lastErr is the last dial error, which a pass that may still recover
+	// reports; refusal is the last dial error retrying cannot repair. Keeping
+	// them apart lets a pass that saw both keep retrying for the endpoint that
+	// may come back, while an abandoned Open still names the refusal that will
+	// not. refusal is not reset per pass: it is a property of the endpoint's
+	// credentials rather than of one attempt, so a later pass that runs out of
+	// time before dialing that endpoint still has the cause to report.
 	var lastErr error
+	var refusal error
+	refusedPasses := 0
 	for {
+		transient := false
 		for _, endpoint := range endpoints {
 			if err := openCtx.Err(); err != nil {
-				return nil, classify("open", driver.KindTransient, err)
+				return nil, classify("open", driver.KindTransient, errors.Join(err, openCause(refusal, lastErr)))
 			}
-			if err := validateEndpoint(endpoint); err != nil {
-				return nil, classify("open", driver.KindFatal, err)
-			}
-			conn, err := dial(openCtx, endpoint, amqpConfig, cfg.ConnectTimeout)
+			attemptConfig := amqpConfig
+			attemptConfig.SASL = endpoint.sasl
+			conn, err := dial(openCtx, endpoint.endpoint, attemptConfig, cfg.ConnectTimeout)
 			if err == nil {
 				managedConn, connErr := newConn(conn, capabilitiesForQueueKind(queueKind), endpoint, cfg, queueKind, trustBrokerTimestamp, brokerPrefetch)
 				if connErr != nil {
@@ -176,18 +214,43 @@ func (Driver) Open(ctx context.Context, cfg driver.Config) (driver.Conn, error) 
 				return managedConn, nil
 			}
 			lastErr = err
+			if kind, _ := driver.Classify(classifyAMQP("open", driver.KindTransient, err)); kind == driver.KindTransient {
+				transient = true
+				continue
+			}
+			refusal = err
+		}
+		// A pass that could still recover resets the count, and a refusal only
+		// becomes the answer once every endpoint has repeated it, which
+		// openRefusalPasses explains.
+		if transient {
+			refusedPasses = 0
+		} else {
+			refusedPasses++
+			if refusedPasses >= openRefusalPasses {
+				return nil, classifyAMQP("open", driver.KindTransient, refusal)
+			}
 		}
 
 		if err := openCtx.Err(); err != nil {
-			if lastErr != nil {
-				return nil, classify("open", driver.KindTransient, errors.Join(err, lastErr))
-			}
-			return nil, classify("open", driver.KindTransient, err)
+			return nil, classify("open", driver.KindTransient, errors.Join(err, openCause(refusal, lastErr)))
 		}
-		if err := waitRetry(openCtx); err != nil {
-			return nil, classify("open", driver.KindTransient, err)
+		if err := openRetryWait(openCtx); err != nil {
+			return nil, classify("open", driver.KindTransient, errors.Join(err, openCause(refusal, lastErr)))
 		}
 	}
+}
+
+// openCause names the broker error an Open that ran out of time reports under
+// the context error that ended it. A refusal wins over the last dial error: the
+// endpoint that refused will refuse the same credentials on the next attempt,
+// so the more recent transient error of another endpoint would leave out the
+// one cause the caller can act on.
+func openCause(refusal, lastErr error) error {
+	if refusal != nil {
+		return refusal
+	}
+	return lastErr
 }
 
 type conn struct {
@@ -231,6 +294,12 @@ type conn struct {
 	// closes.
 	blockMu    sync.Mutex
 	blockWatch sync.WaitGroup
+	// detachMu serializes channel-close registration with the wait in
+	// Conn.Close. detaching becomes true before that wait, so no channel close
+	// can Add to a zero-counter WaitGroup. None of the goroutines detachWatch
+	// tracks takes detachMu, so waitDetached can hold it across the Wait.
+	detachMu  sync.Mutex
+	detaching bool
 	// detachWatch tracks the goroutines that outlive the caller that began
 	// them: channel closes, publish channel watchers, and the releases a
 	// cancelled publish leaves for its channel's watcher. amqp091's
@@ -241,9 +310,8 @@ type conn struct {
 	// closed channel guarantees. Close waits on that set once the connection
 	// is actually closed, for the same reason it waits on blockWatch. The Add
 	// for a watcher or a release can race that Wait only from a publish still
-	// running when the connection closed, the same window a channel close
-	// has, and it is benign for the same reason: the goroutine ends as soon as
-	// the connection's shutdown reaches its channel.
+	// running when the connection closed, and it is benign: the goroutine ends
+	// as soon as the connection's shutdown reaches its channel.
 	detachWatch sync.WaitGroup
 }
 
@@ -290,26 +358,51 @@ const blockedEventBuffer = 4
 // connection the broker has stopped reading never answers, and a caller whose
 // context has run out must not be held by it.
 //
-// The close is tracked so that conn.Close can wait for it: nothing of ours may
-// still be running once the connection is closed. Closing the connection is
-// also what ends one of these, since Channel.Close returns as soon as its
-// connection is gone.
-//
-// Registration is ordered before the connection is asked to drop a producer, so
-// the wait covers every close of a producer that Wait can see; the one window
-// left is the confirm round trip failing on a producer admission then refuses,
-// which is a race with the connection closing rather than with a registered
-// producer. That window is benign for the reason above: the close cannot
-// outlive the connection, which answers it as soon as the shutdown reaches the
-// channel and releases one already inside a kernel write when the socket goes.
+// Producer callers receive the same buffered outcome and no finish callback,
+// so their close behavior is unchanged.
 func (c *conn) startChannelClose(channel *amqp.Channel) <-chan error {
-	c.detachWatch.Add(1)
+	return c.startChannelCloseWithFinish(channel.Close, nil)
+}
+
+// startChannelCloseWithFinish runs closeFn and finish in the one goroutine
+// tracked by detachWatch. finish runs before Done, so a lane close cannot
+// release channelMu or publish its completion after Conn.Close has finished
+// waiting for the detached work.
+func (c *conn) startChannelCloseWithFinish(closeFn func() error, finish func(error)) <-chan error {
 	done := make(chan error, 1)
+	c.detachMu.Lock()
+	if c.detaching {
+		c.detachMu.Unlock()
+		err := closeFn()
+		if finish != nil {
+			finish(err)
+		}
+		done <- err
+		return done
+	}
+	c.detachWatch.Add(1)
+	c.detachMu.Unlock()
 	go func() {
 		defer c.detachWatch.Done()
-		done <- channel.Close()
+		err := closeFn()
+		if finish != nil {
+			finish(err)
+		}
+		done <- err
 	}()
 	return done
+}
+
+// waitDetached closes the registration window before waiting for detached
+// channel work. If registration wins detachMu, Add makes the count non-zero
+// before this Wait. If the wait wins, detaching makes a later close run
+// synchronously against the already-closed AMQP connection, so it cannot add
+// work after Wait returns.
+func (c *conn) waitDetached() {
+	c.detachMu.Lock()
+	c.detaching = true
+	c.detachWatch.Wait()
+	c.detachMu.Unlock()
 }
 
 // awaitChannelClose waits for a close startChannelClose began, for as long as
@@ -403,8 +496,8 @@ func (c *conn) awaitUnblocked(ctx context.Context) error {
 
 var _ driver.Conn = (*conn)(nil)
 
-func newConn(amqpConn *amqp.Connection, caps driver.Capabilities, endpoint string, cfg driver.Config, kind queueKind, trustBrokerTimestamp bool, brokerPrefetch int) (*conn, error) {
-	management, err := newManagementClient(endpoint, cfg)
+func newConn(amqpConn *amqp.Connection, caps driver.Capabilities, endpoint resolvedEndpoint, cfg driver.Config, kind queueKind, trustBrokerTimestamp bool, brokerPrefetch int) (*conn, error) {
+	management, err := managementClientForEndpoint(endpoint, cfg)
 	if err != nil {
 		return nil, err
 	}
@@ -526,7 +619,7 @@ func (c *conn) Consumer(ctx context.Context, cfg driver.ConsumerConfig) (driver.
 		return nil, classify("consumer", driver.KindFatal, errors.New("no destinations"))
 	}
 
-	consumer, err := newConsumer(c, cfg)
+	consumer, err := newConsumer(c, cfg) //nolint:contextcheck // construction rollback must close every opened lane even after caller cancellation.
 	if err != nil {
 		return nil, err
 	}
@@ -629,7 +722,7 @@ func (c *conn) Close(ctx context.Context) error {
 	defer func() {
 		if amqpConn.IsClosed() {
 			c.blockWatch.Wait()
-			c.detachWatch.Wait()
+			c.waitDetached()
 		}
 	}()
 	c.mu.Lock()
@@ -708,8 +801,34 @@ func dial(ctx context.Context, endpoint string, amqpConfig amqp.Config, connectT
 	if timeout <= 0 || timeout > 30*time.Second {
 		timeout = 30 * time.Second
 	}
+	handshakeCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	deadline, _ := handshakeCtx.Deadline()
+	var mu sync.Mutex
+	var raw net.Conn
+	var abandoned bool
 	dialer := &net.Dialer{Timeout: timeout}
-	amqpConfig.Dial = dialer.Dial
+	amqpConfig.Dial = func(network, addr string) (net.Conn, error) {
+		socket, err := dialer.DialContext(handshakeCtx, network, addr)
+		if err != nil {
+			return nil, err
+		}
+		// This also bounds TLS and AMQP; amqp091 clears the deadline in
+		// openComplete before a successful connection leaves DialConfig.
+		if err := socket.SetDeadline(deadline); err != nil {
+			_ = socket.Close()
+			return nil, err
+		}
+		mu.Lock()
+		if abandoned {
+			mu.Unlock()
+			_ = socket.Close()
+			return nil, handshakeCtx.Err()
+		}
+		raw = socket
+		mu.Unlock()
+		return socket, nil
+	}
 	if amqpConfig.TLSClientConfig != nil {
 		// amqp091 writes the dialed host into an empty ServerName. Open shares
 		// one config across its endpoints, so each dial gets its own copy.
@@ -725,14 +844,38 @@ func dial(ctx context.Context, endpoint string, amqpConfig amqp.Config, connectT
 		}
 		result <- connection
 	}()
+	// If success is queued and selected, the caller detaches the socket before
+	// returning; a later cancel has no watcher that can close the live connection.
+	// If cancel is selected while success is queued, it closes the transport and
+	// the single cleanup goroutine consumes the unreturned AMQP connection.
+	// If TCP connects while cancel selects before socket publication, cancel
+	// marks abandonment under mu; publication then closes instead of handing
+	// that socket to the handshake. A queued result alone never transfers ownership.
 	select {
 	case connection := <-result:
+		mu.Lock()
+		raw = nil
+		mu.Unlock()
 		return connection, nil
 	case err := <-errResult:
+		mu.Lock()
+		socket := raw
+		raw = nil
+		mu.Unlock()
+		if socket != nil {
+			_ = socket.Close()
+		}
 		return nil, err
-	case <-ctx.Done():
-		// The dial still ends one way or the other; wait for either outcome so
-		// a dial that fails after the cancel does not strand this goroutine.
+	case <-handshakeCtx.Done():
+		mu.Lock()
+		abandoned = true
+		socket := raw
+		raw = nil
+		mu.Unlock()
+		if socket != nil {
+			_ = socket.Close()
+		}
+		// Interrupt the transport before waiting for either late result.
 		go func() {
 			select {
 			case connection := <-result:
@@ -740,7 +883,7 @@ func dial(ctx context.Context, endpoint string, amqpConfig amqp.Config, connectT
 			case <-errResult:
 			}
 		}()
-		return nil, ctx.Err()
+		return nil, handshakeCtx.Err()
 	}
 }
 
@@ -763,23 +906,6 @@ func makeAMQPConfig(cfg driver.Config) (amqp.Config, error) {
 	if cfg.ClientID != "" {
 		config.Properties.SetClientConnectionName(cfg.ClientID)
 	}
-	if cfg.SASL != nil {
-		switch strings.ToLower(cfg.SASL.Mechanism) {
-		case "":
-		case "plain":
-			config.SASL = []amqp.Authentication{&amqp.PlainAuth{
-				Username: cfg.SASL.Username,
-				Password: cfg.SASL.Password,
-			}}
-		case "amqplain":
-			config.SASL = []amqp.Authentication{&amqp.AMQPlainAuth{
-				Username: cfg.SASL.Username,
-				Password: cfg.SASL.Password,
-			}}
-		case "external":
-			config.SASL = []amqp.Authentication{&amqp.ExternalAuth{}}
-		}
-	}
 	if cfg.TLS == nil || !cfg.TLS.Enabled {
 		return config, nil
 	}
@@ -799,7 +925,12 @@ func validateSASL(settings *driver.SASLConfig) error {
 		return nil
 	}
 	switch strings.ToLower(settings.Mechanism) {
-	case "", "plain", "amqplain", "external":
+	case "":
+		if settings.Username != "" || settings.Password != "" {
+			return errors.New("rabbitmq: SASL credentials require a mechanism; set PLAIN, AMQPLAIN, or EXTERNAL")
+		}
+		return nil
+	case "plain", "amqplain", "external":
 		return nil
 	default:
 		return fmt.Errorf("rabbitmq: unsupported SASL mechanism %q; supported mechanisms: PLAIN, AMQPLAIN, EXTERNAL, or empty", settings.Mechanism)

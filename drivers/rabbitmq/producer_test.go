@@ -3,12 +3,15 @@ package rabbitmq
 import (
 	"context"
 	"errors"
+	"fmt"
+	"strings"
 	"testing"
 	"time"
 
 	amqp "github.com/rabbitmq/amqp091-go"
 
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/driver"
+	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/wire"
 )
 
 // fakeConfirmation is a message's confirmation the test resolves by hand.
@@ -222,5 +225,143 @@ func TestDecideIgnoresACloseAfterEverythingWasDecided(t *testing.T) {
 	outcome := p.decide(context.Background(), channel, []outboundMessage{acked}, nil, nil, failed)
 	if outcome.err != nil || len(outcome.republish) != 0 || len(failed) != 0 {
 		t.Fatalf("decide = %+v, failed %v, want the segment published and the call going on", outcome, failed)
+	}
+}
+
+// shortStringProperty is one AMQP property whose wire form is a short string,
+// with the wire header that fills it and a reader for the value the encoder
+// carried through.
+type shortStringProperty struct {
+	name  string
+	key   string
+	value func(amqp.Publishing) string
+}
+
+func shortStringProperties() []shortStringProperty {
+	return []shortStringProperty{
+		{"CorrelationId", wire.CorrelationID, func(p amqp.Publishing) string { return p.CorrelationId }},
+		{"MessageId", wire.ID, func(p amqp.Publishing) string { return p.MessageId }},
+		{"Type", wire.Type, func(p amqp.Publishing) string { return p.Type }},
+		{"ContentType", wire.DataContentType, func(p amqp.Publishing) string { return p.ContentType }},
+	}
+}
+
+// TestAmqpPublishingRefusesOversizedShortStringProperties pins the four AMQP
+// properties the client carries as short strings. AMQP prefixes one with a
+// single length byte, so 255 bytes is publishable and 256 is not; the client
+// finds that out while serializing the header, after the publish method frame
+// is already on the wire, and shuts the whole shared connection down for the
+// write error (amqp091-go writeShortstr, sendUnflushed). The refusal must
+// therefore happen here, before anything is written, must classify the message
+// as one the broker would never accept, and must name the property and its
+// length without echoing the value.
+func TestAmqpPublishingRefusesOversizedShortStringProperties(t *testing.T) {
+	const shortStringLimit = 255
+	for _, property := range shortStringProperties() {
+		t.Run(property.name, func(t *testing.T) {
+			atLimit := strings.Repeat("x", shortStringLimit)
+			publishing, err := amqpPublishing(driver.OutboundMessage{
+				Headers: []driver.Header{{Key: property.key, Value: []byte(atLimit)}},
+			})
+			if err != nil {
+				t.Fatalf("amqpPublishing refused a %d-byte %s: %v", shortStringLimit, property.name, err)
+			}
+			if got := property.value(publishing); got != atLimit {
+				t.Fatalf("%s = %d bytes, want all %d carried through", property.name, len(got), shortStringLimit)
+			}
+
+			oversized := atLimit + "x"
+			_, err = amqpPublishing(driver.OutboundMessage{
+				Headers: []driver.Header{{Key: property.key, Value: []byte(oversized)}},
+			})
+			if err == nil {
+				t.Fatalf("amqpPublishing accepted a %d-byte %s", len(oversized), property.name)
+			}
+			if kind, classified := driver.Classify(err); !classified || kind != driver.KindTooLarge {
+				t.Fatalf("classification = (%v, %t), want (too large, true)", kind, classified)
+			}
+			if want := fmt.Sprintf("property %s is %d bytes", property.name, len(oversized)); !strings.Contains(err.Error(), want) {
+				t.Fatalf("error = %q, want it to name %q", err, want)
+			}
+			if strings.Contains(err.Error(), oversized) {
+				t.Fatalf("error = %q, must not echo the property value", err)
+			}
+		})
+	}
+}
+
+func TestAmqpPublishingRefusesOversizedHeaderKeys(t *testing.T) {
+	atLimit := strings.Repeat("x", 243)
+	oversized := atLimit + "x"
+	batch := []driver.OutboundMessage{
+		{Headers: []driver.Header{{Key: atLimit, Value: []byte("before")}}},
+		{Headers: []driver.Header{{Key: oversized, Value: []byte("refused")}}},
+		{Headers: []driver.Header{{Key: atLimit, Value: []byte("after")}}},
+	}
+	for index, message := range batch {
+		publishing, err := amqpPublishing(message)
+		if index != 1 {
+			if err != nil {
+				t.Fatalf("message %d with a 255-byte table key was refused: %v", index, err)
+			}
+			if got := publishing.Headers["cloudEvents:"+atLimit]; got != string(message.Headers[0].Value) {
+				t.Fatalf("message %d header value = %v, want %s", index, got, message.Headers[0].Value)
+			}
+			continue
+		}
+		if err == nil {
+			t.Fatal("amqpPublishing accepted a 256-byte table key")
+		}
+		if kind, classified := driver.Classify(err); !classified || kind != driver.KindTooLarge {
+			t.Fatalf("classification = (%v, %t), want (too large, true)", kind, classified)
+		}
+		if !strings.Contains(err.Error(), "header key is 256 bytes") {
+			t.Fatalf("error = %q, want the table key's byte length", err)
+		}
+		if strings.Contains(err.Error(), oversized) {
+			t.Fatalf("error = %q, must not echo the header name", err)
+		}
+	}
+	// A refused segment must not need a connection or channel.
+	p := &producer{}
+	failed := make(map[int]error)
+	consumed, err := p.publishSegment(context.Background(), batch[1:2], 0, failed)
+	if err != nil || consumed != 1 {
+		t.Fatalf("publishSegment = (%d, %v), want (1, nil)", consumed, err)
+	}
+	if kind, classified := driver.Classify(failed[0]); !classified || kind != driver.KindTooLarge {
+		t.Fatalf("segment refusal = (%v, %t), want (too large, true)", kind, classified)
+	}
+}
+
+// TestAmqpPublishingRefusesOnlyTheOversizedMessageOfABatch covers the refusal
+// being per message: an oversized property on the middle message of a batch
+// refuses that message alone and leaves the messages around it encoded. That is
+// what lets publishSegment record the refusal against the one index and publish
+// the rest of the call.
+func TestAmqpPublishingRefusesOnlyTheOversizedMessageOfABatch(t *testing.T) {
+	oversized := strings.Repeat("x", 256)
+	batch := []driver.OutboundMessage{
+		{Destination: "orders", Headers: []driver.Header{{Key: wire.ID, Value: []byte("before")}}},
+		{Destination: "orders", Headers: []driver.Header{
+			{Key: wire.ID, Value: []byte("refused")},
+			{Key: wire.CorrelationID, Value: []byte(oversized)},
+		}},
+		{Destination: "orders", Headers: []driver.Header{{Key: wire.ID, Value: []byte("after")}}},
+	}
+	for index, message := range batch {
+		_, err := amqpPublishing(message)
+		if index != 1 {
+			if err != nil {
+				t.Fatalf("message %d of the batch was refused with the oversized message's error: %v", index, err)
+			}
+			continue
+		}
+		if err == nil {
+			t.Fatal("the oversized message of the batch was encoded")
+		}
+		if kind, classified := driver.Classify(err); !classified || kind != driver.KindTooLarge {
+			t.Fatalf("the oversized message's error = %v, want classified too large", err)
+		}
 	}
 }

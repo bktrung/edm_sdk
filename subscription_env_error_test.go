@@ -18,6 +18,7 @@ func TestSubscribeRejectsMalformedEnvironmentValues(t *testing.T) {
 		value     string
 		wantCause func(error) bool
 	}{
+		{name: "mode", key: "mode", value: "bogus"},
 		{name: "concurrency", key: "concurrency", value: "not-an-int", wantCause: hasSubscriptionNumError},
 		{name: "prefetch", key: "prefetch", value: "not-an-int", wantCause: hasSubscriptionNumError},
 		{name: "priorities", key: "priorities", value: "bogus", wantCause: hasSubscriptionPriorityError},
@@ -27,7 +28,11 @@ func TestSubscribeRejectsMalformedEnvironmentValues(t *testing.T) {
 		{name: "fairness prefetch factor", key: "fairness.prefetchFactor", value: "not-an-int", wantCause: hasSubscriptionNumError},
 		{name: "fairness deadline promotion", key: "fairness.disableDeadlinePromotion", value: "not-a-bool", wantCause: hasSubscriptionNumError},
 		{name: "fairness high weight", key: "fairness.weights.high", value: "not-an-int", wantCause: hasSubscriptionNumError},
+		{name: "fairness medium weight", key: "fairness.weights.medium", value: "not-an-int", wantCause: hasSubscriptionNumError},
+		{name: "fairness low weight", key: "fairness.weights.low", value: "not-an-int", wantCause: hasSubscriptionNumError},
 		{name: "fairness high budget", key: "fairness.budgets.high", value: "not-a-duration", wantCause: hasSubscriptionDurationError},
+		{name: "fairness medium budget", key: "fairness.budgets.medium", value: "not-a-duration", wantCause: hasSubscriptionDurationError},
+		{name: "fairness low budget", key: "fairness.budgets.low", value: "not-a-duration", wantCause: hasSubscriptionDurationError},
 		{name: "retry max attempts", key: "retry.maxAttempts", value: "not-an-int", wantCause: hasSubscriptionNumError},
 		{name: "retry initial interval", key: "retry.initialInterval", value: "not-a-duration", wantCause: hasSubscriptionDurationError},
 		{name: "retry multiplier", key: "retry.multiplier", value: "not-a-float", wantCause: hasSubscriptionNumError},
@@ -53,8 +58,9 @@ func TestSubscribeRejectsMalformedEnvironmentValues(t *testing.T) {
 			if err == nil {
 				t.Fatal("Subscribe() error = nil, want environment parse error")
 			}
-			if !strings.Contains(err.Error(), fullKey) {
-				t.Fatalf("Subscribe() error = %v, want key %q", err, fullKey)
+			wantPrefix := "f1: " + fullKey + ": "
+			if !strings.HasPrefix(err.Error(), wantPrefix) {
+				t.Fatalf("Subscribe() error = %v, want prefix %q", err, wantPrefix)
 			}
 			if tc.name == "unmatched policy" && !strings.Contains(err.Error(), "unsupported unmatched policy") {
 				t.Fatalf("Subscribe() error = %v, want unsupported policy cause", err)

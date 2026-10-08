@@ -123,7 +123,8 @@ type Client struct {
 	// current is the connection the client is on and the number that names it.
 	// Its epoch is 1 for the connection New opened, and a nil conn means the
 	// client holds none.
-	current currentConnection
+	current     currentConnection
+	retirements []*retiredConnection
 	// reconnectErr records a terminal reconnect decision for the current client
 	// state. It is guarded by mu and is the value the failed connection axis
 	// carries: reconnect exhaustion does not mean Close has been entered, and a
@@ -153,11 +154,22 @@ type Client struct {
 	// Close attempt. A retried Close rejoins this same call instead of starting
 	// a second one against the same connection.
 	connCloseWait <-chan error
+
+	// observerUnbind releases the observer's ObserverBinder attachment. It is
+	// guarded by mu, set by New, and taken exactly once by the Close attempt
+	// that completes terminal shutdown.
+	observerUnbind func()
 }
 
 // New applies opts, normalizes and validates cfg, and opens the supplied driver
 // before returning. Startup errors are returned before any publish or subscribe
 // call. Env and Service remain required for hand-built configurations.
+//
+// If the configured observer implements [ObserverBinder], New binds it after
+// validation and before opening the driver. A refused binding fails New with
+// the observer's error wrapped and nothing opened; a binding New acquired is
+// released again if New fails later, and otherwise belongs to the Client until
+// Close completes.
 func New(ctx context.Context, cfg Config, opts ...Option) (*Client, error) {
 	jsonCodec := codec.JSON{}
 	options := clientOptions{
@@ -197,6 +209,26 @@ func New(ctx context.Context, cfg Config, opts ...Option) (*Client, error) {
 	if _, ok := options.codecsByName[cfg.Codec.Default]; !ok {
 		return nil, fmt.Errorf("f1: codec.default %q is not registered", cfg.Codec.Default)
 	}
+	// Binding comes before Open so that a refused observer leaves nothing to
+	// undo: no connection, and no driver_selected event that would overwrite
+	// the endpoint the observer's current Client reports under.
+	var observerUnbind func()
+	if binder, ok := options.observer.(ObserverBinder); ok {
+		unbind, err := binder.BindClient()
+		if err != nil {
+			return nil, fmt.Errorf("f1: bind observer: %w", err)
+		}
+		observerUnbind = unbind
+	}
+	// One deferred rollback covers every later return, so a failed New never
+	// keeps the observer from a Client built after it. Ownership passes to the
+	// Client only on the successful return.
+	constructed := false
+	defer func() {
+		if !constructed && observerUnbind != nil {
+			observerUnbind()
+		}
+	}()
 	connection, err := options.driver.Open(ctx, driverConfig(cfg, options.logger))
 	if err != nil {
 		return nil, fmt.Errorf("f1: open %s driver: %w", driverName, err)
@@ -228,6 +260,7 @@ func New(ctx context.Context, cfg Config, opts ...Option) (*Client, error) {
 		supervisorDone:      make(chan struct{}),
 		attemptEnded:        make(chan struct{}),
 		runners:             make(map[*Runner]struct{}),
+		observerUnbind:      observerUnbind,
 	}
 	if client.observer != nil {
 		client.observerPanics = make(map[ObserverKind]struct{})
@@ -264,6 +297,7 @@ func New(ctx context.Context, cfg Config, opts ...Option) (*Client, error) {
 		})
 	}
 	go client.reconnectSupervisor()
+	constructed = true
 	return client, nil
 }
 
@@ -391,14 +425,20 @@ func logCapabilities(c *Client) {
 }
 
 // Health checks the broker connection and reports stopped subscription runners.
-// It returns a ping error, an admission error, or an error for unhealthy
-// subscriptions. A nil Client returns an error.
+// It returns a ping error, an admission error joined with stopped-subscription
+// errors when the connection failed, or unhealthy-subscription errors.
+// A nil Client returns an error.
 func (c *Client) Health(ctx context.Context) error {
 	if c == nil {
 		return fmt.Errorf("f1: client is not connected")
 	}
 	c.mu.Lock()
 	if err := c.admit(workHealth, 0); err != nil {
+		if c.connStateLocked() == connFailed && c.lifecycleLocked() != lifecycle.Closed {
+			if failed := failedRunnerHealthLocked(c); failed != nil {
+				err = errors.Join(err, failed)
+			}
+		}
 		c.mu.Unlock()
 		return err
 	}
@@ -495,15 +535,21 @@ func (c *Client) clearFailedSubscription(name string) {
 	})
 }
 
-// Close drains active work and releases the driver resources. It refuses new
-// work after shutdown begins, and waits up to Lifecycle.CloseTimeout for a
-// reconnect in progress to stop before it closes the connection. A timed-out phase continues in the background,
-// and a retry rejoins that phase instead of starting a duplicate driver call.
-// A producer-close error is returned but does not prevent connection shutdown.
-// A connection-close error leaves the Client retryable; once all phases finish,
-// the Client is closed even if a phase returned an error. A concurrent call
-// returns an error while shutdown is in progress. A nil or fully closed Client
-// returns nil.
+// Close drains active work and refuses new work after shutdown begins. It waits
+// for the reconnect supervisor and finishes retired teardowns before current
+// resources; nil requires every retired teardown to have succeeded. Running
+// teardowns are rejoined, not duplicated; each failed retirement gets one new
+// attempt per call, skipping successful stages, with no background retry.
+// Each wait is bounded by Lifecycle.CloseTimeout and ctx; multiple retirements
+// can make total shutdown exceed one CloseTimeout. A retirement error or timeout
+// leaves unfinished resources owned and stops shutdown before current teardown.
+// A current producer-close error is returned but does not prevent current
+// connection shutdown. A current connection-close error leaves the Client
+// retryable. A concurrent call returns an error while shutdown is in progress.
+// A nil or fully closed Client returns nil. Terminal shutdown, including one
+// that returns a producer-close error, releases an [ObserverBinder] binding so
+// the observer can be bound to a new Client; a Close that leaves the Client
+// retryable keeps it.
 func (c *Client) Close(ctx context.Context) error {
 	if c == nil {
 		return nil
@@ -524,13 +570,15 @@ func (c *Client) Close(ctx context.Context) error {
 	if err := c.waitForSupervisor(ctx); err != nil {
 		return c.failClose(err)
 	}
+	if err := c.closeRetirements(ctx); err != nil {
+		return c.failClose(err)
+	}
 	return c.closeResources(ctx)
 }
 
-// waitForSupervisor waits, bounded by Lifecycle.CloseTimeout, for the
-// reconnect supervisor that beginClose cancelled to return, so a reconnect
-// still retiring its old connection finishes before Close closes the current
-// one and returns. A retried Close waits again.
+// waitForSupervisor transfers retirement ownership to Close. If the supervisor
+// timed out joining an old teardown, it may still be running, but after this
+// barrier no reconnect waiter can consume its result or register another one.
 func (c *Client) waitForSupervisor(ctx context.Context) error {
 	if c.supervisorDone == nil {
 		return nil
@@ -704,13 +752,10 @@ func (c *Client) releaseKeptConsumers(ctx context.Context) error {
 	return errors.Join(errs...)
 }
 
-// retireKeptConsumers releases the consumers kept for the connection epoch
-// being retired, bounded by Lifecycle.CloseTimeout, and forgets them whatever
-// the outcome. The connection they were opened on is being closed, so no later
-// path has it to release them through, and a failure is logged like every
-// other teardown step of that connection rather than kept for an attempt with
-// nothing left to release it against.
-func (c *Client) retireKeptConsumers(ctx context.Context, epoch uint64) {
+// retireKeptConsumers leaves failed releases owned by their retired epoch.
+// The enclosing retirement attempt bounds waiting, not individual driver calls,
+// so a hung Release cannot be overtaken by the connection close.
+func (c *Client) retireKeptConsumers(ctx context.Context, epoch uint64) error {
 	c.mu.Lock()
 	kept := make([]unreleasedConsumer, 0, len(c.unreleasedConsumers))
 	for _, entry := range c.unreleasedConsumers {
@@ -720,12 +765,12 @@ func (c *Client) retireKeptConsumers(ctx context.Context, epoch uint64) {
 	}
 	c.mu.Unlock()
 	for _, entry := range kept {
-		if err := runWithClockTimeout(ctx, c.options.clock, c.config.Lifecycle.CloseTimeout, "close", entry.consumer.Release); err != nil {
-			lastResortClientLogger(c).Warn("f1 kept consumer release failed while retiring the connection",
-				"epoch", entry.epoch, "error", err)
+		if err := entry.consumer.Release(ctx); err != nil {
+			return fmt.Errorf("f1: release consumer on connection epoch %d: %w", entry.epoch, err)
 		}
 		c.forgetUnreleasedConsumer(entry)
 	}
+	return nil
 }
 
 func (c *Client) closeResources(ctx context.Context) error {
@@ -815,6 +860,30 @@ func (c *Client) closeConnection(ctx context.Context, conn driver.Conn, producer
 }
 
 func (c *Client) finishClose(producerCloseErr error) error {
+	// The binding is released only here, on terminal shutdown: a Close that
+	// failed part way still owns resources and may be retried, so its observer
+	// is not yet free for another Client. The callback is user code and runs
+	// outside mu.
+	//
+	// The lifecycle stays Draining until unbind returns. Moving to Closed
+	// first opens this interleaving: the admitted Close goroutine G1 sets
+	// Closed and releases mu, but has not yet called unbind. A second Close
+	// on goroutine G2 now finds Closed and returns nil, and G2's caller builds
+	// a replacement Client with the same observer. That New calls BindClient
+	// while G1 still holds the binding, and is refused even though Close has
+	// already reported success. Kept in Draining, G2's Close is refused as
+	// in progress instead, and no Close returns nil before the release.
+	//
+	// The release does not wait for observer calls in flight: a publish
+	// finishing on another goroutine may still deliver its paired Finish
+	// after this, and dropping it would break the Start and Finish pairing.
+	c.mu.Lock()
+	unbind := c.observerUnbind
+	c.observerUnbind = nil
+	c.mu.Unlock()
+	if unbind != nil {
+		unbind()
+	}
 	c.mu.Lock()
 	_ = c.lifecycle.Transition(lifecycle.Closed)
 	c.mu.Unlock()
@@ -949,7 +1018,7 @@ func closeDiscardedProducer(c *Client, producer driver.Producer, ctx context.Con
 	if producer == nil {
 		return
 	}
-	if err := producer.Close(context.WithoutCancel(ctx)); err != nil {
+	if err := runWithClockTimeout(context.WithoutCancel(ctx), c.options.clock, c.config.Lifecycle.CloseTimeout, "close", producer.Close); err != nil {
 		lastResortClientLogger(c).Warn("f1 discarded producer close failed", "error", err)
 	}
 }

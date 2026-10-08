@@ -526,3 +526,104 @@ func TestDriverConfigForwardingAndFallback(t *testing.T) {
 		}
 	})
 }
+
+func TestRetryableCloseKeepsObserverBinding(t *testing.T) {
+	t.Parallel()
+	rec := &bindingObserver{}
+	fakeDriver := &testDriver{conn: &testConn{closeErr: driver.ErrResourcesOutstanding}}
+	client, err := New(context.Background(), testClientConfig(t), WithDriver(fakeDriver), WithObserver(rec))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := client.Close(context.Background()); !errors.Is(err, driver.ErrResourcesOutstanding) {
+		t.Fatalf("Close() error = %v, want the retryable connection-close error", err)
+	}
+	rec.requireState(t, true, 1, 0)
+	if _, err := New(context.Background(), testClientConfig(t), WithDriver(&testDriver{conn: &testConn{}}), WithObserver(rec)); !errors.Is(err, errBindingObserverBound) {
+		t.Fatalf("New() during a retryable Close error = %v, want the observer still bound", err)
+	}
+
+	fakeDriver.conn.closeErr = nil
+	if err := client.Close(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	rec.requireState(t, false, 1, 1)
+}
+
+func TestTerminalCloseWithProducerErrorReleasesObserver(t *testing.T) {
+	t.Parallel()
+	rec := &bindingObserver{}
+	errProducerClose := errors.New("producer close boom")
+	producer := &recordingProducer{closeErr: errProducerClose}
+	client := newPublishClient(t, producer, WithObserver(rec))
+	if _, err := client.Publisher().Publish(context.Background(), "orders.created", "payload"); err != nil {
+		t.Fatal(err)
+	}
+	if err := client.Close(context.Background()); !errors.Is(err, errProducerClose) {
+		t.Fatalf("Close() error = %v, want the producer-close error", err)
+	}
+	// A producer-close error with a closed connection is terminal, so the
+	// binding goes with it even though Close returned an error.
+	rec.requireState(t, false, 1, 1)
+	if err := client.Close(context.Background()); err != nil {
+		t.Fatalf("Close() after terminal shutdown = %v, want nil", err)
+	}
+	rec.requireState(t, false, 1, 1)
+}
+
+func TestConcurrentCloseKeepsObserverBoundUntilShutdownFinishes(t *testing.T) {
+	rec := &bindingObserver{}
+	producer := &recordingProducer{
+		closeStarted: make(chan struct{}),
+		closeRelease: make(chan struct{}),
+	}
+	client := newPublishClient(t, producer, WithObserver(rec))
+	if _, err := client.Publisher().Publish(context.Background(), "orders.created", "payload"); err != nil {
+		t.Fatal(err)
+	}
+	var release sync.Once
+	releaseProducer := func() { release.Do(func() { close(producer.closeRelease) }) }
+	t.Cleanup(releaseProducer)
+
+	firstDone := make(chan error, 1)
+	go func() { firstDone <- client.Close(context.Background()) }()
+	<-producer.closeStarted
+	if err := client.Close(context.Background()); err == nil || !strings.Contains(err.Error(), "client is closing") {
+		t.Fatalf("concurrent Close() error = %v, want in-progress refusal", err)
+	}
+	rec.requireState(t, true, 1, 0)
+
+	releaseProducer()
+	if err := <-firstDone; err != nil {
+		t.Fatalf("first Close() = %v", err)
+	}
+	rec.requireState(t, false, 1, 1)
+}
+
+func TestCloseStaysDrainingWhileObserverUnbinds(t *testing.T) {
+	rec := &bindingObserver{unbindStarted: make(chan struct{}), unbindRelease: make(chan struct{})}
+	client, err := New(context.Background(), testClientConfig(t), WithDriver(&testDriver{conn: &testConn{}}), WithObserver(rec))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var release sync.Once
+	releaseUnbind := func() { release.Do(func() { close(rec.unbindRelease) }) }
+	t.Cleanup(releaseUnbind)
+
+	firstDone := make(chan error, 1)
+	go func() { firstDone <- client.Close(context.Background()) }()
+	select {
+	case <-rec.unbindStarted:
+	case err := <-firstDone:
+		t.Fatalf("Close() = %v returned without releasing the observer binding", err)
+	}
+	// No Close may report success before the observer is free again.
+	if err := client.Close(context.Background()); err == nil || !strings.Contains(err.Error(), "client is closing") {
+		t.Fatalf("Close() while unbind runs = %v, want in-progress refusal", err)
+	}
+	releaseUnbind()
+	if err := <-firstDone; err != nil {
+		t.Fatalf("first Close() = %v", err)
+	}
+	rec.requireState(t, false, 1, 1)
+}

@@ -20,135 +20,86 @@ func applySubscriptionEnvironment(name string, cfg *SubscriptionConfig) error {
 	if value, ok := reads.get("topics"); ok {
 		cfg.Topics = splitEnvList(value)
 	}
-	if value, ok := reads.get("mode"); ok {
-		mode, err := parseMode(value)
-		if err != nil {
-			return fmt.Errorf("f1: %s mode: %w", envKey(reads.prefix, "mode"), err)
-		}
-		cfg.Mode = mode
-	}
-	if value, ok := reads.get("concurrency"); ok {
-		parsed, err := strconv.Atoi(value)
-		if err != nil {
-			return fmt.Errorf("f1: %s concurrency: %w", envKey(reads.prefix, "concurrency"), err)
-		}
-		cfg.Concurrency = parsed
-	}
-	if value, ok := reads.get("prefetch"); ok {
-		parsed, err := strconv.Atoi(value)
-		if err != nil {
-			return fmt.Errorf("f1: %s prefetch: %w", envKey(reads.prefix, "prefetch"), err)
-		}
-		cfg.Prefetch = parsed
-	}
-	if value, ok := reads.get("priorities"); ok {
-		priorities := make([]Priority, 0)
-		for _, name := range splitEnvList(value) {
-			priority, err := ParsePriority(name)
-			if err != nil {
-				return fmt.Errorf("f1: %s priorities: %w", envKey(reads.prefix, "priorities"), err)
-			}
-			priorities = append(priorities, priority)
-		}
-		cfg.Priorities = priorities
-	}
-	if value, ok := reads.get("handlerTimeout"); ok {
-		parsed, err := time.ParseDuration(value)
-		if err != nil {
-			return fmt.Errorf("f1: %s handlerTimeout: %w", envKey(reads.prefix, "handlerTimeout"), err)
-		}
-		cfg.HandlerTimeout = parsed
-	}
-	if value, ok := reads.get("unmatchedPolicy"); ok {
-		policy, err := parseUnmatchedPolicy(value)
-		if err != nil {
-			return fmt.Errorf("f1: %s unmatchedPolicy: %w", envKey(reads.prefix, "unmatchedPolicy"), err)
-		}
-		cfg.UnmatchedPolicy = policy
-	}
-	if value, ok := reads.get("fairness.retryWeightDivisor"); ok {
-		parsed, err := strconv.Atoi(value)
-		if err != nil {
-			return fmt.Errorf("f1: %s: %w", envKey(reads.prefix, "fairness.retryWeightDivisor"), err)
-		}
-		cfg.Fairness.RetryWeightDivisor = parsed
-	}
-	if value, ok := reads.get("fairness.prefetchFactor"); ok {
-		parsed, err := strconv.Atoi(value)
-		if err != nil {
-			return fmt.Errorf("f1: %s: %w", envKey(reads.prefix, "fairness.prefetchFactor"), err)
-		}
-		cfg.Fairness.PrefetchFactor = parsed
-	}
-	if value, ok := reads.get("fairness.disableDeadlinePromotion"); ok {
-		parsed, err := strconv.ParseBool(value)
-		if err != nil {
-			return fmt.Errorf("f1: %s: %w", envKey(reads.prefix, "fairness.disableDeadlinePromotion"), err)
-		}
-		cfg.Fairness.DisableDeadlinePromotion = parsed
-	}
+	readEnv(reads, "mode", parseMode, &cfg.Mode)
+	readEnv(reads, "concurrency", strconv.Atoi, &cfg.Concurrency)
+	readEnv(reads, "prefetch", strconv.Atoi, &cfg.Prefetch)
+	readEnv(reads, "priorities", parseEnvPriorities, &cfg.Priorities)
+	readEnv(reads, "handlerTimeout", time.ParseDuration, &cfg.HandlerTimeout)
+	readEnv(reads, "unmatchedPolicy", parseUnmatchedPolicy, &cfg.UnmatchedPolicy)
+	readEnv(reads, "fairness.retryWeightDivisor", strconv.Atoi, &cfg.Fairness.RetryWeightDivisor)
+	readEnv(reads, "fairness.prefetchFactor", strconv.Atoi, &cfg.Fairness.PrefetchFactor)
+	readEnv(reads, "fairness.disableDeadlinePromotion", strconv.ParseBool, &cfg.Fairness.DisableDeadlinePromotion)
 	for _, priority := range []Priority{PriorityHigh, PriorityMedium, PriorityLow} {
-		if value, ok := reads.get("fairness.weights." + priority.String()); ok {
-			parsed, err := strconv.Atoi(value)
-			if err != nil {
-				return fmt.Errorf("f1: %s: %w", envKey(reads.prefix, "fairness.weights."+priority.String()), err)
-			}
+		var weight int
+		if readEnv(reads, "fairness.weights."+priority.String(), strconv.Atoi, &weight) {
 			if cfg.Fairness.Weights == nil {
 				cfg.Fairness.Weights = make(map[Priority]int)
 			}
-			cfg.Fairness.Weights[priority] = parsed
+			cfg.Fairness.Weights[priority] = weight
 		}
-		if value, ok := reads.get("fairness.budgets." + priority.String()); ok {
-			parsed, err := time.ParseDuration(value)
-			if err != nil {
-				return fmt.Errorf("f1: %s: %w", envKey(reads.prefix, "fairness.budgets."+priority.String()), err)
-			}
+		var budget time.Duration
+		if readEnv(reads, "fairness.budgets."+priority.String(), time.ParseDuration, &budget) {
 			if cfg.Fairness.Budgets == nil {
 				cfg.Fairness.Budgets = make(map[Priority]time.Duration)
 			}
-			cfg.Fairness.Budgets[priority] = parsed
+			cfg.Fairness.Budgets[priority] = budget
 		}
 	}
-	if value, ok := reads.get("retry.maxAttempts"); ok {
-		parsed, err := strconv.Atoi(value)
-		if err != nil {
-			return fmt.Errorf("f1: %s: %w", envKey(reads.prefix, "retry.maxAttempts"), err)
-		}
-		cfg.Retry.MaxAttempts = parsed
-	}
-	if value, ok := reads.get("retry.initialInterval"); ok {
-		parsed, err := time.ParseDuration(value)
-		if err != nil {
-			return fmt.Errorf("f1: %s: %w", envKey(reads.prefix, "retry.initialInterval"), err)
-		}
-		cfg.Retry.InitialInterval = parsed
-	}
-	if value, ok := reads.get("retry.multiplier"); ok {
-		parsed, err := strconv.ParseFloat(value, 64)
-		if err != nil {
-			return fmt.Errorf("f1: %s: %w", envKey(reads.prefix, "retry.multiplier"), err)
-		}
-		cfg.Retry.Multiplier = parsed
-	}
-	if value, ok := reads.get("retry.maxInterval"); ok {
-		parsed, err := time.ParseDuration(value)
-		if err != nil {
-			return fmt.Errorf("f1: %s: %w", envKey(reads.prefix, "retry.maxInterval"), err)
-		}
-		cfg.Retry.MaxInterval = parsed
-	}
-	if value, ok := reads.get("retry.tiers"); ok {
-		tiers := make([]time.Duration, 0)
-		for _, item := range splitEnvList(value) {
-			tier, err := time.ParseDuration(item)
-			if err != nil {
-				return fmt.Errorf("f1: %s retry.tiers: %w", envKey(reads.prefix, "retry.tiers"), err)
-			}
-			tiers = append(tiers, tier)
-		}
-		cfg.Retry.Tiers = tiers
+	readEnv(reads, "retry.maxAttempts", strconv.Atoi, &cfg.Retry.MaxAttempts)
+	readEnv(reads, "retry.initialInterval", time.ParseDuration, &cfg.Retry.InitialInterval)
+	readEnv(reads, "retry.multiplier", func(value string) (float64, error) {
+		return strconv.ParseFloat(value, 64)
+	}, &cfg.Retry.Multiplier)
+	readEnv(reads, "retry.maxInterval", time.ParseDuration, &cfg.Retry.MaxInterval)
+	readEnv(reads, "retry.tiers", parseEnvRetryTiers, &cfg.Retry.Tiers)
+	if reads.err != nil {
+		return reads.err
 	}
 	return checkSubscriptionEnvNamespace(reads)
+}
+
+// readEnv assigns only present, successfully parsed values. Retaining the first
+// error prevents later lookups and mutations before the overlay returns it.
+// The result lets map entries remain absent when their variable is absent.
+func readEnv[T any](reads *subscriptionEnvReads, key string, parse func(string) (T, error), dst *T) bool {
+	if reads.err != nil {
+		return false
+	}
+	value, ok := reads.get(key)
+	if !ok {
+		return false
+	}
+	parsed, err := parse(value)
+	if err != nil {
+		reads.err = fmt.Errorf("f1: %s: %w", envKey(reads.prefix, key), err)
+		return false
+	}
+	*dst = parsed
+	return true
+}
+
+func parseEnvPriorities(value string) ([]Priority, error) {
+	priorities := make([]Priority, 0)
+	for _, name := range splitEnvList(value) {
+		priority, err := ParsePriority(name)
+		if err != nil {
+			return nil, err
+		}
+		priorities = append(priorities, priority)
+	}
+	return priorities, nil
+}
+
+func parseEnvRetryTiers(value string) ([]time.Duration, error) {
+	tiers := make([]time.Duration, 0)
+	for _, item := range splitEnvList(value) {
+		tier, err := time.ParseDuration(item)
+		if err != nil {
+			return nil, err
+		}
+		tiers = append(tiers, tier)
+	}
+	return tiers, nil
 }
 
 // subscriptionEnvBase is the namespace every per-subscription variable lives in.
@@ -236,6 +187,7 @@ func unknownSubscriptionEnvKey(name string) error {
 type subscriptionEnvReads struct {
 	prefix string
 	tokens []string
+	err    error
 }
 
 // get reads the variable for key under the subscription prefix and records the

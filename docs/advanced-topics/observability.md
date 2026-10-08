@@ -31,7 +31,47 @@ client, err := f1.New(
 )
 ```
 
-`f1otel.New` creates no exporter and never selects the global OpenTelemetry provider. A nil provider, a zero observer, and a nil observer are no-ops. The application owns exporter setup and provider shutdown. Configure views in the application when duration histograms need explicit buckets; `f1otel` installs no view.
+`f1otel.New` creates no exporter and never selects the global OpenTelemetry provider. A nil provider, a zero observer, and a nil observer record no telemetry. The application owns exporter setup and provider shutdown. Configure views in the application when duration histograms need explicit buckets; `f1otel` installs no view.
+
+## One observer per client
+
+Create one `f1otel.New` per client and share the providers. An observer reports the broker endpoint of the client it is attached to, so it belongs to one live client at a time. Being safe for concurrent calls does not make it safe to share: two clients on one observer would label each other's metrics and spans with the wrong `server.address` and `server.port`.
+
+`f1.New` enforces this. Given an observer that another live client already holds, it fails before opening the driver and returns an error naming the fix. The binding is per live client, not per observer lifetime:
+
+- a failed `f1.New` releases the observer, so it can be passed to the next attempt;
+- a `Close` that completes shutdown releases it, so a replacement client can reuse it; and
+- a `Close` that fails and leaves the client retryable keeps it until a retry completes.
+
+Two clients reporting through the same providers:
+
+```go
+observerA, err := f1otel.New(
+	f1otel.WithMeterProvider(meterProvider),
+	f1otel.WithTracerProvider(tracerProvider),
+)
+if err != nil {
+	return err
+}
+clientA, err := f1.New(ctx, cfgA, f1.WithDriver(driverA), f1.WithObserver(observerA))
+if err != nil {
+	return err
+}
+
+observerB, err := f1otel.New(
+	f1otel.WithMeterProvider(meterProvider),
+	f1otel.WithTracerProvider(tracerProvider),
+)
+if err != nil {
+	return errors.Join(err, clientA.Close(ctx))
+}
+clientB, err := f1.New(ctx, cfgB, f1.WithDriver(driverB), f1.WithObserver(observerB))
+if err != nil {
+	return errors.Join(err, clientA.Close(ctx))
+}
+```
+
+Close both clients before shutting the providers down; the providers stay application-owned. If you wrap an `f1otel` observer in your own observer, forward `BindClient` to it, as the [observer guide](/basics/observer#bind-an-observer-to-one-client) describes. A wrapper that does not forward it is not checked, and sharing one relabels telemetry silently.
 
 ## Trace publish, process, and ack
 
@@ -79,7 +119,9 @@ The process span is a new root linked to the inbound trace context, and the cont
 | `error.type` | Classified error | `messaging.process.duration` when classified, `f1.messaging.retries`, and `f1.messaging.dead_letters` |
 | `reason` | Dead-letter reason when known | `f1.messaging.dead_letters` |
 
-Attributes are omitted when empty or undefined for an event kind. The adapter does not emit a duration when its required timestamp source is unavailable. Mixed-priority publish calls report `medium`, and mixed-topic publish calls leave the topic empty.
+Attributes are omitted when empty or undefined for an event kind. The adapter does not emit a duration when its required timestamp source is unavailable. Primary publish calls omit `f1.priority` when priorities are mixed or unresolved; a uniform priority is retained even across mixed topics. Mixed-topic publish calls omit the destination name, while a uniform topic is retained even across mixed priorities. Primary send spans set a known priority at Finish, not at the unresolved Start.
+
+Metrics and spans use `ConsumerGroup` for `messaging.consumer.group.name`, falling back to `Subscription` when the group is empty.
 
 Connection changes are not metrics. The observer receives `connection_lost` and
 `connection_restored` point events from the reconnect supervisor, but `f1otel`

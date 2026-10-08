@@ -1058,9 +1058,7 @@ func (r *run) publishBulk(ctx context.Context) error {
 		failed error
 	)
 	for publisher := range r.h.cfg.Publishers {
-		wait.Add(1)
-		go func() {
-			defer wait.Done()
+		wait.Go(func() {
 			for seq := publisher; seq < r.h.cfg.Messages; seq += r.h.cfg.Publishers {
 				if err := r.publish(ctx, seq); err != nil {
 					mu.Lock()
@@ -1069,7 +1067,7 @@ func (r *run) publishBulk(ctx context.Context) error {
 					return
 				}
 			}
-		}()
+		})
 	}
 	wait.Wait()
 	return failed
@@ -1085,9 +1083,7 @@ func (r *run) publishChunked(ctx context.Context) error {
 		failed error
 	)
 	for _, span := range publishSpans(r.h.cfg.Messages, r.h.cfg.Publishers) {
-		wait.Add(1)
-		go func() {
-			defer wait.Done()
+		wait.Go(func() {
 			for start := span[0]; start < span[1]; start += r.h.cfg.PublishBatch {
 				end := min(start+r.h.cfg.PublishBatch, span[1])
 				messages := make([]f1.Message, 0, end-start)
@@ -1105,7 +1101,7 @@ func (r *run) publishChunked(ctx context.Context) error {
 					return
 				}
 			}
-		}()
+		})
 	}
 	wait.Wait()
 	return failed

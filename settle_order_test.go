@@ -5,6 +5,7 @@ import (
 	"errors"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 
 	f1 "fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk"
 )
@@ -108,4 +109,50 @@ func TestDeadLetterCopyIsConfirmedBeforeTheOriginalIsSettled(t *testing.T) {
 	requireOrdered(t, fixture.log, "the original must be acknowledged only after its dead-letter copy was confirmed",
 		rejected, deadLetterPublish, originalSettle)
 	t.Logf("event order:%s", fixture.log.describe())
+}
+
+func TestDiscardCallbackWaitsForAckReturn(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		fixture := newRecordingFixture(t)
+		hold := fixture.calls.holdNext(eventSettled)
+		t.Cleanup(hold.letGo)
+		cause := errors.New("discard this event")
+		subscription := recordingSubscription(f1.RetryConfig{MaxAttempts: 1},
+			f1.HandlerFunc(func(context.Context, *f1.Event) error { return f1.Drop(cause) }))
+		var reports []f1.Discarded
+		const notified recordingEventKind = "discard callback"
+		subscription.OnDiscarded = func(_ context.Context, payload f1.Discarded) {
+			reports = append(reports, payload)
+			fixture.log.record(notified, payload.Envelope.ID)
+		}
+		startRecordingRunner(t, fixture, subscription)
+		body := []byte(`{"id":"discard-held"}`)
+		id, err := fixture.client.Publisher().Publish(t.Context(), "orders.created.v1",
+			map[string]string{"id": "discard-held"}, f1.WithKey(settleOrderMessageKey))
+		if err != nil {
+			t.Fatal(err)
+		}
+		waitForChannel(t, fixture.log, hold.started, "Ack never reached the hold")
+		synctest.Wait()
+		beforeReturn := len(reports)
+		hold.letGo()
+		synctest.Wait()
+		if err := fixture.client.Close(t.Context()); err != nil {
+			t.Fatal(err)
+		}
+		synctest.Wait()
+		if beforeReturn != 0 {
+			t.Errorf("OnDiscarded calls while Ack is held = %d, want 0", beforeReturn)
+		}
+		if len(reports) != 1 {
+			t.Fatalf("OnDiscarded calls after Ack returns = %d, want 1", len(reports))
+		}
+		got := reports[0]
+		if got.Envelope.ID != id || string(got.Body) != string(body) || got.Reason != f1.DiscardDropped || !errors.Is(got.Err, cause) {
+			t.Fatalf("discard payload = %+v, want original id/body/drop cause", got)
+		}
+		settled := requireEntry(t, fixture.log, eventSettled, 0, "the discarded delivery")
+		discarded := requireEntry(t, fixture.log, notified, 0, "the discard callback")
+		requireOrdered(t, fixture.log, "discard callback must follow Ack return", settled, discarded)
+	})
 }

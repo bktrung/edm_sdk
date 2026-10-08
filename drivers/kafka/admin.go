@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 
 	"github.com/twmb/franz-go/pkg/kadm"
 	"github.com/twmb/franz-go/pkg/kerr"
@@ -202,11 +203,9 @@ func (a *admin) pruneGuard(ctx context.Context, name string) (string, error) {
 	if a.conn != nil {
 		a.conn.mu.RLock()
 		for csm := range a.conn.consumers {
-			for _, dest := range csm.destinations {
-				if dest == name {
-					a.conn.mu.RUnlock()
-					return "consumer attached", nil
-				}
+			if slices.Contains(csm.destinations, name) {
+				a.conn.mu.RUnlock()
+				return "consumer attached", nil
 			}
 		}
 		a.conn.mu.RUnlock()
@@ -229,10 +228,8 @@ func (a *admin) pruneGuard(ctx context.Context, name string) (string, error) {
 		}
 		for _, member := range group.Members {
 			if joinConsumer, ok := member.Join.AsConsumer(); ok {
-				for _, topic := range joinConsumer.Topics {
-					if topic == name {
-						return "consumer attached", nil
-					}
+				if slices.Contains(joinConsumer.Topics, name) {
+					return "consumer attached", nil
 				}
 			}
 			if assignConsumer, ok := member.Assigned.AsConsumer(); ok {

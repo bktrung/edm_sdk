@@ -1,8 +1,11 @@
 package rabbitmq
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -13,6 +16,16 @@ import (
 
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/driver"
 )
+
+// newManagementClient builds the management client a connection to endpoint
+// would use, so a test can drive or inspect the management API directly.
+func newManagementClient(endpoint string, cfg driver.Config) (*managementClient, error) {
+	resolved, err := resolveEndpoint(endpoint, cfg)
+	if err != nil {
+		return nil, err
+	}
+	return managementClientForEndpoint(resolved, cfg)
+}
 
 func TestManagementClientListsAndDeletesExchanges(t *testing.T) {
 	const username = "management-user"
@@ -178,10 +191,16 @@ func managementVhostCases() []managementVhostCase {
 			want:     "orders/sub",
 		},
 		{
-			name:     "configured option wins over the endpoint",
+			name:     "configured mismatch is refused",
 			endpoint: "amqp://localhost:5672/orders",
 			options:  map[string]string{"rabbitmq.vhost": "configured-vhost"},
-			want:     "configured-vhost",
+			wantErr:  `"configured-vhost" does not match endpoint vhost "orders"`,
+		},
+		{
+			name:     "configured matching vhost",
+			endpoint: "amqp://localhost:5672/orders",
+			options:  map[string]string{"rabbitmq.vhost": "orders"},
+			want:     "orders",
 		},
 		{
 			name:     "authority-less endpoint is refused before any derivation",
@@ -219,16 +238,15 @@ func TestManagementClientDerivesVhostFromEndpoint(t *testing.T) {
 }
 
 // TestManagementClientVhostMatchesAMQPParse is the property the row exists for:
-// with no configured vhost, the management client addresses the vhost the AMQP
-// connection's own parse reads from the same endpoint. It is what makes a
-// hand-written reimplementation of that parse impossible to land quietly.
+// every accepted configuration addresses the vhost the AMQP connection's own
+// parse reads from the same endpoint, including a matching configured option.
 func TestManagementClientVhostMatchesAMQPParse(t *testing.T) {
 	for _, test := range managementVhostCases() {
-		if test.wantErr != "" || test.options["rabbitmq.vhost"] != "" {
-			continue // the property holds only where the endpoint decides the vhost
+		if test.wantErr != "" {
+			continue
 		}
 		t.Run(test.name, func(t *testing.T) {
-			client, err := newManagementClient(test.endpoint, driver.Config{})
+			client, err := newManagementClient(test.endpoint, driver.Config{DriverOptions: test.options})
 			if err != nil {
 				t.Fatalf("newManagementClient(%q): %v", test.endpoint, err)
 			}
@@ -266,8 +284,8 @@ func TestManagementClientRejectsEndpointTheAMQPParserRefuses(t *testing.T) {
 }
 
 // TestManagementClientEndpointValidityDoesNotDependOnConfiguredVhost keeps the
-// AMQP parser as the authority for endpoint validity regardless of whether the
-// management vhost comes from the endpoint or a driver option.
+// AMQP parser as the authority for endpoint validity with an absent or matching
+// configured vhost.
 func TestManagementClientEndpointValidityDoesNotDependOnConfiguredVhost(t *testing.T) {
 	tests := []struct {
 		name     string
@@ -285,7 +303,7 @@ func TestManagementClientEndpointValidityDoesNotDependOnConfiguredVhost(t *testi
 				t.Run(map[bool]string{false: "vhost from endpoint", true: "configured vhost"}[configured], func(t *testing.T) {
 					options := map[string]string{}
 					if configured {
-						options["rabbitmq.vhost"] = "configured-vhost"
+						options["rabbitmq.vhost"] = "orders"
 					}
 					client, err := newManagementClient(test.endpoint, driver.Config{DriverOptions: options})
 					if (err == nil) != test.accepted {
@@ -423,7 +441,7 @@ func TestManagementClientUsesHTTPSWhenTLSEnabled(t *testing.T) {
 func TestManagementClientUsesResolvedVhostCredentialsAndTLS(t *testing.T) {
 	cfg := driver.Config{
 		ConnectTimeout: 7 * time.Second,
-		DriverOptions:  map[string]string{"rabbitmq.vhost": "configured-vhost"},
+		DriverOptions:  map[string]string{"rabbitmq.vhost": "from-url"},
 		TLS:            &driver.TLSConfig{Enabled: true, InsecureSkipVerify: true},
 		SASL:           &driver.SASLConfig{Mechanism: "plain", Username: "configured-user", Password: "configured-pass"},
 	}
@@ -434,11 +452,11 @@ func TestManagementClientUsesResolvedVhostCredentialsAndTLS(t *testing.T) {
 	if client.baseURL != "https://broker.example:15671" {
 		t.Fatalf("management base URL = %q, want configured TLS management endpoint", client.baseURL)
 	}
-	if client.vhost != "configured-vhost" {
-		t.Fatalf("management vhost = %q, want configured-vhost", client.vhost)
+	if client.vhost != "from-url" {
+		t.Fatalf("management vhost = %q, want from-url", client.vhost)
 	}
 	if client.username != "configured-user" || client.password != "configured-pass" {
-		t.Fatalf("management credentials = %q/%q, want configured credentials", client.username, client.password)
+		t.Fatal("management credentials do not match configured PLAIN identity")
 	}
 	transport, ok := client.client.Transport.(*http.Transport)
 	if !ok || transport.TLSClientConfig == nil || !transport.TLSClientConfig.InsecureSkipVerify {
@@ -514,5 +532,219 @@ func TestManagementUnavailableNamesPurposeEndpointAndAction(t *testing.T) {
 				})
 			}
 		})
+	}
+}
+
+type managementResponseTransport struct {
+	status int
+	body   *managementResponseBody
+	err    error
+}
+
+func (r managementResponseTransport) RoundTrip(*http.Request) (*http.Response, error) {
+	if r.err != nil {
+		return nil, r.err
+	}
+	return &http.Response{
+		StatusCode: r.status,
+		Status:     fmt.Sprintf("%d %s", r.status, http.StatusText(r.status)),
+		Body:       r.body,
+		Header:     make(http.Header),
+	}, nil
+}
+
+type managementResponseBody struct {
+	io.Reader
+	read   int
+	closed bool
+}
+
+func (b *managementResponseBody) Read(p []byte) (int, error) {
+	n, err := b.Reader.Read(p)
+	b.read += n
+	return n, err
+}
+
+func (b *managementResponseBody) Close() error {
+	b.closed = true
+	return nil
+}
+
+func requireManagementStatus(t *testing.T, err error, status int, method, resource string) {
+	t.Helper()
+	var httpErr *managementHTTPError
+	if !errors.As(err, &httpErr) {
+		t.Fatalf("error %v lost HTTP status %d", err, status)
+	}
+	if httpErr.statusCode != status || httpErr.method != method || httpErr.resource != resource {
+		t.Fatalf("HTTP error = %v, want status %d, method %s, resource %s", httpErr, status, method, resource)
+	}
+}
+
+func TestManagementHTTPErrorPreservesStatus(t *testing.T) {
+	calls := []struct {
+		resource string
+		method   string
+		call     func(*managementClient) error
+	}{
+		{"queues", http.MethodGet, func(m *managementClient) error { _, err := m.listQueues(t.Context()); return err }},
+		{"exchanges", http.MethodGet, func(m *managementClient) error { _, err := m.listExchanges(t.Context()); return err }},
+		{"bindings", http.MethodGet, func(m *managementClient) error { _, err := m.listBindings(t.Context()); return err }},
+		{`queue "orders/slash"`, http.MethodGet, func(m *managementClient) error { _, err := m.getQueue(t.Context(), "orders/slash"); return err }},
+		{`exchange "orders/slash"`, http.MethodDelete, func(m *managementClient) error { _, err := m.deleteExchange(t.Context(), "orders/slash"); return err }},
+	}
+	for _, call := range calls {
+		for _, status := range []int{401, 403, 503} {
+			t.Run(fmt.Sprintf("%s/%d", call.resource, status), func(t *testing.T) {
+				for _, bodyText := range []string{" denied\n", " " + strings.Repeat("x", 5000)} {
+					body := &managementResponseBody{Reader: strings.NewReader(bodyText)}
+					m := &managementClient{baseURL: "http://localhost", vhost: "/", client: http.Client{
+						Transport: managementResponseTransport{status: status, body: body},
+					}}
+					err := call.call(m)
+					if !body.closed || body.read > 4096 {
+						t.Fatalf("response ownership: closed=%t, read=%d", body.closed, body.read)
+					}
+					wantBody := strings.TrimSpace(bodyText[:min(len(bodyText), 4096)])
+					want := fmt.Sprintf("management API %s %s: %d %s: %s", call.method, call.resource, status, http.StatusText(status), wantBody)
+					if err == nil || err.Error() != want {
+						t.Fatalf("error = %v, want %q", err, want)
+					}
+					admin := &adminOperations{conn: &conn{management: m}}
+					wrapped := classify("prune", driver.KindTransient, admin.managementUnavailable("inspection", err))
+					requireManagementStatus(t, wrapped, status, call.method, call.resource)
+				}
+			})
+		}
+	}
+	t.Run("queue not found", func(t *testing.T) {
+		body := &managementResponseBody{Reader: strings.NewReader("missing")}
+		m := &managementClient{baseURL: "http://localhost", client: http.Client{Transport: managementResponseTransport{status: 404, body: body}}}
+		_, err := m.getQueue(t.Context(), "missing")
+		if !errors.Is(err, errQueueNotFound) || !body.closed {
+			t.Fatalf("getQueue 404 = %v, closed=%t", err, body.closed)
+		}
+	})
+}
+
+func TestPruneManagementAuthorizationErrors(t *testing.T) {
+	for _, stage := range []string{"queues", "exchanges", "bindings", "delete"} {
+		for _, status := range []int{401, 403, 503} {
+			t.Run(fmt.Sprintf("%s/%d", stage, status), func(t *testing.T) {
+				server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					resource := strings.Split(r.URL.Path, "/")[2]
+					if (stage == resource && r.Method == http.MethodGet) || (stage == "delete" && r.Method == http.MethodDelete) {
+						w.WriteHeader(status)
+						_, _ = io.WriteString(w, "denied\n")
+						return
+					}
+					if resource == "exchanges" {
+						_, _ = io.WriteString(w, `[{"name":"orders-exchange"}]`)
+					} else {
+						_, _ = io.WriteString(w, `[]`)
+					}
+				}))
+				defer server.Close()
+				m := &managementClient{baseURL: server.URL, vhost: "/", client: *server.Client()}
+				// These branches stop before channel admission; IsClosed on the
+				// zero connection reads its open-state flag without doing I/O.
+				admin := &adminOperations{conn: &conn{amqp: &amqp.Connection{}, management: m}}
+				_, err := admin.Prune(t.Context(), []string{"orders-exchange"})
+				want := driver.KindPermission
+				if status == 503 {
+					want = driver.KindTransient
+				}
+				if kind, ok := driver.Classify(err); !ok || kind != want {
+					t.Fatalf("Prune = %v, classification %v/%t, want %v", err, kind, ok, want)
+				}
+				var portErr *driver.Error
+				if !errors.As(err, &portErr) || portErr.Driver != "rabbitmq" || portErr.Op != "prune" {
+					t.Fatalf("Prune metadata = %v", err)
+				}
+				resource, method := stage, http.MethodGet
+				if stage == "delete" {
+					resource, method = `exchange "orders-exchange"`, http.MethodDelete
+				}
+				requireManagementStatus(t, err, status, method, resource)
+			})
+		}
+	}
+}
+
+func TestTopologyManagementAuthorizationErrors(t *testing.T) {
+	for _, policy := range []driver.TopologyPolicy{driver.TopologyDeclare, driver.TopologyVerify} {
+		for _, status := range []int{401, 403, 503} {
+			t.Run(fmt.Sprintf("%v/%d", policy, status), func(t *testing.T) {
+				server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+					w.WriteHeader(status)
+					_, _ = io.WriteString(w, "denied\n")
+				}))
+				defer server.Close()
+				m := &managementClient{baseURL: server.URL, vhost: "/", client: *server.Client()}
+				admin := &adminOperations{conn: &conn{management: m, deferred: make(map[string]time.Duration)}}
+				spec := driver.TopologySpec{Policy: policy, Bindings: []driver.BindingSpec{{Source: "source", Destination: "destination"}}}
+				_, err := admin.ensureTopology(context.Background(), spec)
+				want := driver.KindPermission
+				if status == 503 {
+					want = driver.KindTransient
+				}
+				if kind, ok := driver.Classify(err); !ok || kind != want {
+					t.Fatalf("topology = %v, classification %v/%t, want %v", err, kind, ok, want)
+				}
+				requireManagementStatus(t, err, status, http.MethodGet, "bindings")
+			})
+		}
+	}
+}
+
+func TestManagementClientUsesDefaultURIIdentity(t *testing.T) {
+	for _, settings := range []*driver.SASLConfig{nil, {}} {
+		assertManagementLogin(t, "amqp://localhost:5672/", settings, "guest", "guest")
+	}
+}
+
+func TestManagementClientUsesURIIdentityWithoutPassword(t *testing.T) {
+	assertManagementLogin(t, "amqp://orders-user@localhost:5672/", nil, "orders-user", "guest")
+}
+
+func TestManagementClientUsesSelectedSASLIdentity(t *testing.T) {
+	for _, test := range []struct {
+		name     string
+		settings driver.SASLConfig
+		username string
+		password string
+	}{
+		{name: "PLAIN", settings: driver.SASLConfig{Mechanism: "PLAIN", Username: "sasl-user", Password: "sasl-secret"}, username: "sasl-user", password: "sasl-secret"},
+		{name: "AMQPLAIN", settings: driver.SASLConfig{Mechanism: "AMQPLAIN", Username: "sasl-user", Password: "sasl-secret"}, username: "sasl-user", password: "sasl-secret"},
+		{name: "EXTERNAL", settings: driver.SASLConfig{Mechanism: "EXTERNAL", Username: "ignored-user", Password: "ignored-secret"}, username: "uri-user", password: "uri-secret"},
+		{name: "empty PLAIN identity", settings: driver.SASLConfig{Mechanism: "plain"}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			assertManagementLogin(t, "amqp://uri-user:uri-secret@localhost:5672/", &test.settings, test.username, test.password)
+			assertOpenSASL(t, &test.settings)
+		})
+	}
+}
+
+func assertManagementLogin(t *testing.T, endpoint string, settings *driver.SASLConfig, username, password string) {
+	t.Helper()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotUser, gotPassword, ok := r.BasicAuth()
+		if !ok || gotUser != username || gotPassword != password {
+			t.Error("management HTTP Basic Auth does not match the AMQP login")
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, "[]")
+	}))
+	defer server.Close()
+	port := server.URL[strings.LastIndex(server.URL, ":")+1:]
+	client, err := newManagementClient(endpoint, driver.Config{
+		SASL: settings, DriverOptions: map[string]string{managementPortOption: port},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.listQueues(t.Context()); err != nil {
+		t.Fatal(err)
 	}
 }

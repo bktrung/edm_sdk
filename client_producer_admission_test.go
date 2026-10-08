@@ -69,9 +69,11 @@ func (p *admissionProducer) counts() (publish, close int) {
 
 func waitForSignal(t *testing.T, signal <-chan struct{}, what string) {
 	t.Helper()
+	timer := clock.NewReal().Timer(2 * time.Second)
+	defer timer.Stop()
 	select {
 	case <-signal:
-	case <-clock.NewReal().Timer(time.Second).C:
+	case <-timer.C:
 		t.Fatalf("timed out waiting for %s", what)
 	}
 }
@@ -194,11 +196,9 @@ func TestConcurrentFirstPublishesInstallOneProducerAndCloseLoser(t *testing.T) {
 		_ = client.Close(context.Background())
 	})
 	for range 2 {
-		publishers.Add(1)
-		go func() {
-			defer publishers.Done()
+		publishers.Go(func() {
 			results <- publishMessages(client, context.Background(), driver.OutboundMessage{Destination: "orders.created"})
-		}()
+		})
 	}
 	waitForSignal(t, built, "first producer build")
 	waitForSignal(t, built, "second producer build")
@@ -495,9 +495,7 @@ func TestConcurrentFirstBatchPublishesInstallOneProducerAndCloseLoser(t *testing
 		_ = client.Close(context.Background())
 	})
 	for range 2 {
-		publishers.Add(1)
-		go func() {
-			defer publishers.Done()
+		publishers.Go(func() {
 			result, err := client.Publisher().PublishBatch(context.Background(), []Message{
 				{EventType: "orders.created", Payload: "concurrent"},
 			})
@@ -505,7 +503,7 @@ func TestConcurrentFirstBatchPublishesInstallOneProducerAndCloseLoser(t *testing
 				result BatchResult
 				err    error
 			}{result, err}
-		}()
+		})
 	}
 	waitForSignal(t, built, "first batch producer build")
 	waitForSignal(t, built, "second batch producer build")
@@ -608,5 +606,72 @@ func TestPublishBatchPreservesClosedAndReconnectErrors(t *testing.T) {
 	}
 	if len(result.Results) != 1 || result.Results[0].ID != "" || result.Results[0].Err != nil {
 		t.Fatalf("reconnect-error result = %#v, want empty result entry", result.Results)
+	}
+}
+
+type blockingDiscardProducer struct {
+	admissionProducer
+	started chan struct{}
+	release chan struct{}
+}
+
+func (p *blockingDiscardProducer) Close(ctx context.Context) error {
+	_ = p.admissionProducer.Close(ctx)
+	close(p.started)
+	<-p.release
+	return nil
+}
+
+func TestPublishReturnsAfterDiscardedProducerCloseTimeout(t *testing.T) {
+	fake := clock.NewFake(time.Unix(0, 0))
+	built := &blockingDiscardProducer{started: make(chan struct{}), release: make(chan struct{})}
+	var client *Client
+	conn := &producerAdmissionConn{
+		publishConn: &publishConn{info: driver.BrokerInfo{Kind: "test", Version: "1"}},
+		build: func() (driver.Producer, error) {
+			setClientLifecycle(client, lifecycle.Closed)
+			return built, nil
+		},
+	}
+	cfg := testClientConfig(t)
+	cfg.Lifecycle.CloseTimeout = time.Second
+	var err error
+	client, err = New(context.Background(), cfg, WithDriver(&producerAdmissionDriver{conn: conn}), withClock(fake))
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	finished := make(chan struct{})
+	t.Cleanup(func() {
+		close(built.release)
+		waitForSignal(t, finished, "publishing caller cleanup")
+		_ = client.Close(context.Background())
+	})
+	go func() {
+		defer close(finished)
+		done <- publishMessages(client, context.Background(), driver.OutboundMessage{Destination: "orders.created"})
+	}()
+	waitForSignal(t, built.started, "discarded producer close")
+	guard := clock.NewReal().Timer(time.Second)
+	defer guard.Stop()
+	tick := clock.NewReal().Ticker(time.Millisecond)
+	defer tick.Stop()
+	for {
+		if fake.NumWaiters() > 0 {
+			fake.Advance(cfg.Lifecycle.CloseTimeout + time.Nanosecond)
+		}
+		select {
+		case err := <-done:
+			if err == nil || err.Error() != "f1: client is closed" {
+				t.Fatalf("publish after discarded close timeout = %v, want client is closed", err)
+			}
+			if publishCalls, closeCalls := built.counts(); publishCalls != 0 || closeCalls != 1 {
+				t.Fatalf("discarded producer counts = publish %d, close %d, want 0, 1", publishCalls, closeCalls)
+			}
+			return
+		case <-tick.C:
+		case <-guard.C:
+			t.Fatal("publishing call did not return while discarded producer Close was blocked")
+		}
 	}
 }

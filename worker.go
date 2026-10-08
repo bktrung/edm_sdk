@@ -64,21 +64,20 @@ const (
 // deliveryState records attempted versus settled ownership. operation and
 // nackOptions preserve the exact settlement operation for deferred retries.
 type deliveryState struct {
-	id        uint64
 	attempted bool
 	settled   bool
 	// operation records which settlement call was last made, so that a failed
 	// one can be retried in kind rather than guessed at.
-	operation   settlementOperation
-	nackOptions driver.NackOptions
-	poisonDrop  *poisonDropReport
+	operation      settlementOperation
+	nackOptions    driver.NackOptions
+	poisonDrop     *poisonDropReport
+	discard        Discarded
+	discardPending bool
 	// processCtx carries the context Start of ObserverProcess returned, stored
 	// only when an observer is set. The successor publish start uses it as its
 	// context when set and the context at hand otherwise.
-	processCtx       context.Context
-	headerMaxBytes   int
-	envelopeDecoded  bool
-	envelopePriority Priority
+	processCtx     context.Context
+	headerMaxBytes int
 }
 
 type poisonDropReport struct {
@@ -329,11 +328,10 @@ func (o *runnerOwner) startOpen(waitCtx context.Context, prefetch int) {
 	})
 }
 
-// startRebuild waits for the connection rebuild a generation needs on its own
-// goroutine, for the same reason the open runs on one. cause is the failure
-// the runner asks a rebuild for, and nil for a runner that only has a change
-// to wait for.
-func (o *runnerOwner) startRebuild(ctx context.Context, cause error, epoch uint64) {
+// awaitRebuild waits for the connection rebuild while pumping the owner's events.
+// cause is the failure the runner asks a rebuild for, or nil when it only waits
+// for a change. draining distinguishes shutdown from a rebuild failure.
+func (o *runnerOwner) awaitRebuild(ctx context.Context, cause error, epoch uint64) (draining bool, err error) {
 	o.rebuilt = false
 	o.rebuiltErr = nil
 	o.runner.asyncGroup.Go(func() error {
@@ -341,6 +339,8 @@ func (o *runnerOwner) startRebuild(ctx context.Context, cause error, epoch uint6
 		o.events <- runnerEvent{kind: runnerEventRebuilt, err: err}
 		return nil
 	})
+	o.pumpUntil(func() bool { return o.rebuilt })
+	return errors.Is(o.rebuiltErr, errRunnerDraining), o.rebuiltErr
 }
 
 // releaseConsumer releases the generation's consumer on its own goroutine. The
@@ -377,7 +377,7 @@ func (o *runnerOwner) requestDrain() {
 		}
 	}
 	if o.generationEnded() {
-		o.startDrain()
+		o.startDrain(o.base)
 	}
 }
 
@@ -395,13 +395,16 @@ func (o *runnerOwner) generationEnded() bool {
 // the consumer back to the connection it is leaving before the runner reopens
 // on the replacement: ending the runner and handing a consumer back are not
 // the same operation, and the drain is only the first of them.
-func (o *runnerOwner) startDrain() {
+func (o *runnerOwner) startDrain(base context.Context) {
 	if o.drained {
 		return
 	}
 	o.drained = true
+	// A drain event can start teardown while the owner still awaits a rebuild.
+	// If the rebuild reports before this goroutine runs, drain rewrites o.base
+	// while joining teardown. The argument captures it before that interleaving.
 	o.runner.asyncGroup.Go(func() error {
-		o.events <- runnerEvent{kind: runnerEventDrainDone, err: o.runner.drainAfterRun(o.base)}
+		o.events <- runnerEvent{kind: runnerEventDrainDone, err: o.runner.drainAfterRun(base)}
 		return nil
 	})
 }
@@ -413,7 +416,7 @@ func (o *runnerOwner) startDrain() {
 func (o *runnerOwner) drain(base context.Context) error {
 	o.base = base
 	o.requestDrain()
-	o.startDrain()
+	o.startDrain(base)
 	o.pumpUntil(func() bool { return o.drainDone })
 	return o.drainErr
 }
@@ -524,18 +527,19 @@ func (r *Runner) Run(ctx context.Context) (runErr error) {
 		if err != nil {
 			repairCause = nil
 			if errors.Is(err, errRunnerDraining) {
+				// The failed open admitted no consumer or deliveries, so there is nothing to drain.
 				return nil
 			}
 			if owner.abandoned {
 				// An attempt in flight released this consumer, and the open it
 				// cancelled is not a failure of the runner's: it waits for the
 				// attempt and opens again on what it leaves behind.
-				owner.startRebuild(ctx, nil, 0)
-				owner.pumpUntil(func() bool { return owner.rebuilt })
-				if reconnectErr := owner.rebuiltErr; reconnectErr != nil {
-					if errors.Is(reconnectErr, errRunnerDraining) {
-						return nil
-					}
+				draining, reconnectErr := owner.awaitRebuild(ctx, nil, 0)
+				if draining {
+					// The cancelled open admitted no consumer or deliveries, so there is nothing to drain.
+					return nil
+				}
+				if reconnectErr != nil {
 					runErr = reconnectErr
 					break
 				}
@@ -553,12 +557,12 @@ func (r *Runner) Run(ctx context.Context) (runErr error) {
 			// rebuild is asked for, and it is what this runner reports if the
 			// rebuild hands one back.
 			r.transitionToReconnecting()
-			owner.startRebuild(ctx, err, 0)
-			owner.pumpUntil(func() bool { return owner.rebuilt })
-			if reconnectErr := owner.rebuiltErr; reconnectErr != nil {
-				if errors.Is(reconnectErr, errRunnerDraining) {
-					return nil
-				}
+			draining, reconnectErr := owner.awaitRebuild(ctx, err, 0)
+			if draining {
+				// The failed open admitted no consumer or deliveries, so there is nothing to drain.
+				return nil
+			}
+			if reconnectErr != nil {
 				runErr = reconnectErr
 				break
 			}
@@ -738,12 +742,11 @@ func (r *Runner) Run(ctx context.Context) (runErr error) {
 			}
 		}
 		r.transitionToReconnecting()
-		owner.startRebuild(ctx, cause, openedEpoch)
-		owner.pumpUntil(func() bool { return owner.rebuilt })
-		if reconnectErr := owner.rebuiltErr; reconnectErr != nil {
-			if errors.Is(reconnectErr, errRunnerDraining) {
-				return nil
-			}
+		draining, reconnectErr := owner.awaitRebuild(ctx, cause, openedEpoch)
+		if draining {
+			break
+		}
+		if reconnectErr != nil {
 			runErr = reconnectErr
 			break
 		}
@@ -1203,12 +1206,7 @@ func (r *Runner) Drain(ctx context.Context) error {
 	cancel := r.cancel
 	if r.lifecycle != nil {
 		switch r.lifecycle.State() {
-		case lifecycle.Ready:
-			if err := r.lifecycle.Transition(lifecycle.Draining); err != nil {
-				r.mu.Unlock()
-				return err
-			}
-		case lifecycle.Reconnecting:
+		case lifecycle.Ready, lifecycle.Reconnecting:
 			if err := r.lifecycle.Transition(lifecycle.Draining); err != nil {
 				r.mu.Unlock()
 				return err
@@ -1282,9 +1280,6 @@ func (r *Runner) Drain(ctx context.Context) error {
 	}
 	if handlerCancel != nil {
 		drainTimeout := r.client.config.Lifecycle.DrainTimeout
-		if drainTimeout < 0 {
-			return fmt.Errorf("f1: lifecycle.drainTimeout must not be negative")
-		}
 		if drainTimeout > 0 {
 			grace := r.client.config.Lifecycle.HandlerGrace
 			if grace < 0 || grace >= drainTimeout {
@@ -1348,10 +1343,7 @@ func (r *Runner) Drain(ctx context.Context) error {
 // zero so a delivery accepted between the two reads cannot turn the count
 // negative. A nil error finishes ok, else error with its class.
 func finishDrainObservation(guard *observerFinishGuard, inflight int, timeout time.Duration, remaining int, err error) {
-	drained := inflight - remaining
-	if drained < 0 {
-		drained = 0
-	}
+	drained := max(inflight-remaining, 0)
 	counts := DrainCounts{InFlight: inflight, Drained: drained, Remaining: remaining, Timeout: timeout}
 	if err == nil {
 		guard.finishWith(FinishEvent{Outcome: ObserverOutcomeOK, Drain: counts})
@@ -1910,7 +1902,7 @@ func enqueueDelivery(r *Runner, ctx context.Context, dispatch chan<- delivery, m
 		// bounded cleanup the delivery path uses: the registry entry leaves
 		// only once the settlement path finished, so a drain never reads zero
 		// while the broker still owns the message.
-		state := &deliveryState{id: id}
+		state := &deliveryState{}
 		_ = nackDelivery(r, runnerSettlementContext(r, ctx), message, driver.NackOptions{Requeue: true}, state)
 		retryDeliverySettlement(r, ctx, message, state)
 		r.inflight.Remove(id)
@@ -1940,7 +1932,7 @@ func observerEnqueueSource(source driver.EnqueueSource) EnqueuedAtSource {
 
 func processDelivery(r *Runner, ctx context.Context, item delivery) {
 	abandoned := false
-	state := &deliveryState{id: item.id}
+	state := &deliveryState{}
 	var envelope Envelope
 	defer func() {
 		if recovered := recover(); recovered != nil {
@@ -1990,18 +1982,11 @@ func retryDeliverySettlement(r *Runner, ctx context.Context, message driver.Inbo
 		case settlementOperationAck:
 			ackDelivery(r, sctx, message, state)
 			if state.settled {
-				reportPendingPoisonDrop(r, sctx, message, state)
 				return
 			}
 			_ = nackDelivery(r, sctx, message, driver.NackOptions{Requeue: true}, state)
-			if state.settled {
-				state.poisonDrop = nil
-			}
 		case settlementOperationNack:
 			_ = nackDelivery(r, sctx, message, state.nackOptions, state)
-			if state.settled {
-				state.poisonDrop = nil
-			}
 		default:
 			return
 		}
@@ -2024,9 +2009,8 @@ func effectiveMaxAttempts(eventMaxAttempts, policyMaxAttempts int) int {
 // dispatchMessage returns true only after the delivery's settlement path has
 // completed; classification and settlement stay outside middleware. state
 // carries the delivery's settlement bookkeeping and is required: it is where
-// the decode outcome, the header limit and the pending drop report are
-// recorded, so a call site must hold the delivery's own state rather than a
-// temporary nothing else sees.
+// the header limit and the pending drop report are recorded, so a call site
+// must hold the delivery's own state rather than a temporary nothing else sees.
 func dispatchMessage(r *Runner, ctx context.Context, message driver.InboundMessage, envelopeOut *Envelope, abandoned *bool, state *deliveryState) bool {
 	r.client.mu.Lock()
 	headerMaxBytes := effectiveHeaderLimit(r.client.config.Codec.MaxHeaderBytes, r.client.effective.MaxHeaderBytes)
@@ -2037,8 +2021,6 @@ func dispatchMessage(r *Runner, ctx context.Context, message driver.InboundMessa
 	if err != nil {
 		return deadLetterAndSettle(r, ctx, message, Envelope{}, ReasonDecode, err, state)
 	}
-	state.envelopeDecoded = true
-	state.envelopePriority = envelope.Priority
 	if envelope.Attempt < 1 {
 		envelope.Attempt = 1
 	}
@@ -2062,8 +2044,7 @@ func dispatchMessage(r *Runner, ctx context.Context, message driver.InboundMessa
 		if r.subscription.UnmatchedPolicy == DeadLetter {
 			return deadLetterAndSettle(r, ctx, message, envelope, ReasonUnmatched, errors.New("no handler matched event type"), state)
 		}
-		runnerNotifyDiscarded(r, runnerSettlementContext(r, ctx), discardUnmatched(envelope, append([]byte(nil), message.Body...)))
-		return ackDelivery(r, runnerSettlementContext(r, ctx), message, state)
+		return discardAndSettle(r, runnerSettlementContext(r, ctx), message, discardUnmatched(envelope, nil), state)
 	}
 	eventEnvelope := envelope
 	eventEnvelope.MaxAttempts = maxAttempts
@@ -2086,8 +2067,7 @@ func dispatchMessage(r *Runner, ctx context.Context, message driver.InboundMessa
 	outcome := classifyRetryError(result.err)
 	switch outcome {
 	case retryOutcomeDrop:
-		runnerNotifyDiscarded(r, runnerSettlementContext(r, ctx), Discarded{Envelope: envelope, Body: append([]byte(nil), message.Body...), Reason: DiscardDropped, Err: result.err})
-		return ackDelivery(r, runnerSettlementContext(r, ctx), message, state)
+		return discardAndSettle(r, runnerSettlementContext(r, ctx), message, Discarded{Envelope: envelope, Reason: DiscardDropped, Err: result.err}, state)
 	case retryOutcomeTerminal:
 		return deadLetterAndSettle(r, ctx, message, envelope, ReasonTerminal, result.err, state)
 	}
@@ -2279,6 +2259,7 @@ func invokeHandlerMessage(r *Runner, parent context.Context, handler Handler, ev
 			ConsumerGroup: r.subscription.Name,
 			EventType:     eventType,
 			Priority:      priority,
+			PriorityKnown: true,
 			Attempt:       attempt,
 			Destination:   message.Destination,
 
@@ -2402,6 +2383,15 @@ func runnerIsDraining(r *Runner) bool {
 
 // --- Settlement primitives ---
 
+func discardAndSettle(r *Runner, ctx context.Context, message driver.InboundMessage, payload Discarded, state *deliveryState) bool {
+	if r.subscription.OnDiscarded != nil {
+		payload.Body = append([]byte(nil), message.Body...)
+		state.discard = payload
+		state.discardPending = true
+	}
+	return ackDelivery(r, ctx, message, state)
+}
+
 // ackDelivery acknowledges the delivery, recording the outcome on state. state
 // is required: it is the delivery's own settlement bookkeeping, and the
 // deferred cleanup reads the operation it records here.
@@ -2410,12 +2400,11 @@ func ackDelivery(r *Runner, ctx context.Context, message driver.InboundMessage, 
 }
 
 // startSettleObservation starts one settle pair for a single broker settle
-// call. It returns the context to settle on, the guard for its finish, the
-// finish identity, and whether observation is on. A nil runner or a nil
-// observer settles on the caller context with no observation.
-func startSettleObservation(r *Runner, ctx context.Context, message driver.InboundMessage, op SettleOperation, state *deliveryState) (context.Context, observerFinishGuard, FinishEvent, bool) {
+// call. It returns the guard for its finish, the finish identity, and whether
+// observation is on. A nil runner or a nil observer starts nothing.
+func startSettleObservation(r *Runner, ctx context.Context, message driver.InboundMessage, op SettleOperation) (observerFinishGuard, FinishEvent, bool) {
 	if r == nil || r.client == nil || r.client.observer == nil {
-		return ctx, observerFinishGuard{}, FinishEvent{}, false
+		return observerFinishGuard{}, FinishEvent{}, false
 	}
 	topic, priority := runnerDestinationObservation(r, message.Destination)
 	start := StartEvent{
@@ -2428,20 +2417,21 @@ func startSettleObservation(r *Runner, ctx context.Context, message driver.Inbou
 		Destination:   message.Destination,
 		Operation:     op,
 	}
-	nextCtx, token := r.client.observeStart(ctx, start)
+	_, token := r.client.observeStart(ctx, start)
 	guard := r.client.newObserverGuard(ObserverSettle, token)
 	base := FinishEvent{
 		Topic:         topic,
 		Subscription:  r.subscription.Name,
 		ConsumerGroup: r.subscription.Name,
 		Priority:      priority,
+		PriorityKnown: true,
 		Destination:   message.Destination,
 	}
-	return nextCtx, guard, base, true
+	return guard, base, true
 }
 
-// finishSettleObservation emits the settle finish for one broker settle call.
-func finishSettleObservation(guard *observerFinishGuard, base FinishEvent, err error) {
+// finishObservationFromError completes the guard with the operation's outcome.
+func finishObservationFromError(guard *observerFinishGuard, base FinishEvent, err error) {
 	finish := base
 	if err == nil {
 		finish.Outcome = ObserverOutcomeOK
@@ -2462,18 +2452,21 @@ func ackDeliveryAs(r *Runner, ctx context.Context, message driver.InboundMessage
 		return false
 	}
 	state.operation = settlementOperationAck
-	settleCtx, settleGuard, settleBase, observed := startSettleObservation(r, ctx, message, SettleAck, state)
+	settleGuard, settleBase, observed := startSettleObservation(r, ctx, message, SettleAck)
 	if observed {
 		defer settleGuard.abandon()
 	}
-	err := message.Settle.Ack(settleCtx)
+	err := message.Settle.Ack(ctx)
 	state.attempted = true
 	state.settled = err == nil
 	if observed {
-		finishSettleObservation(&settleGuard, settleBase, err)
+		finishObservationFromError(&settleGuard, settleBase, err)
 	}
 	if r != nil && state.settled && handled {
 		r.report(runnerEvent{kind: runnerEventHandledDelivery})
+	}
+	if state.settled {
+		reportPendingAfterAck(r, ctx, message, state)
 	}
 	return state.settled
 }
@@ -2487,15 +2480,20 @@ func nackDelivery(r *Runner, ctx context.Context, message driver.InboundMessage,
 	}
 	state.operation = settlementOperationNack
 	state.nackOptions = options
-	settleCtx, settleGuard, settleBase, observed := startSettleObservation(r, ctx, message, SettleNack, state)
+	settleGuard, settleBase, observed := startSettleObservation(r, ctx, message, SettleNack)
 	if observed {
 		defer settleGuard.abandon()
 	}
-	err := message.Settle.Nack(settleCtx, options)
+	err := message.Settle.Nack(ctx, options)
 	state.attempted = true
 	state.settled = err == nil
 	if observed {
-		finishSettleObservation(&settleGuard, settleBase, err)
+		finishObservationFromError(&settleGuard, settleBase, err)
+	}
+	if state.settled {
+		state.poisonDrop = nil
+		state.discard = Discarded{}
+		state.discardPending = false
 	}
 	return err
 }
@@ -2571,12 +2569,7 @@ func deadLetterAndSettle(r *Runner, ctx context.Context, message driver.InboundM
 			failSuccessorHandoff(r, runnerSettlementContext(r, ctx), "dead_letter", eventFromDelivery(r, message, envelope), err)
 			return false
 		}
-		sctx := runnerSettlementContext(r, ctx)
-		settled := ackDeliveryAs(r, sctx, message, true, state)
-		if settled {
-			reportPendingPoisonDrop(r, sctx, message, state)
-		}
-		return settled
+		return ackDeliveryAs(r, runnerSettlementContext(r, ctx), message, true, state)
 	}
 	return ackDeliveryAs(r, runnerSettlementContext(r, ctx), message, false, state)
 }
@@ -2639,13 +2632,23 @@ func reportPoisonDrop(r *Runner, ctx context.Context, message driver.InboundMess
 	runnerNotifyError(r, ctx, eventFromDelivery(r, message, report.envelope), dropErr)
 }
 
-func reportPendingPoisonDrop(r *Runner, ctx context.Context, message driver.InboundMessage, state *deliveryState) {
-	if state == nil || state.poisonDrop == nil {
+func reportPendingAfterAck(r *Runner, ctx context.Context, message driver.InboundMessage, state *deliveryState) {
+	if state == nil {
 		return
 	}
-	report := *state.poisonDrop
+	poison := state.poisonDrop
+	discard, discardPending := state.discard, state.discardPending
+	// Consume intent before scheduling callbacks; subsequent settlement cleanup
+	// must not report the same delivery a second time.
 	state.poisonDrop = nil
-	reportPoisonDrop(r, ctx, message, report)
+	state.discard = Discarded{}
+	state.discardPending = false
+	if poison != nil {
+		reportPoisonDrop(r, ctx, message, *poison)
+	}
+	if discardPending {
+		runnerNotifyDiscarded(r, ctx, discard)
+	}
 }
 
 // deadLetter republishes message to its dead-letter destination, carrying
@@ -2679,14 +2682,20 @@ func deadLetter(r *Runner, ctx context.Context, message driver.InboundMessage, e
 			defer publishGuard.abandon()
 		}
 		setDeathHeaders(headers, reason, lastErr, r.client.options.clock.Now().UTC(), message.Destination)
+		if err := capMalformedDeathHeaders(headers, headerMaxBytes); err != nil {
+			if observed {
+				finishObservationFromError(&publishGuard, publishBase, err)
+			}
+			return fmt.Errorf("%w: %w", errSuccessorCopyUnencodable, err)
+		}
 		if err := publishSuccessor(r, runnerSettlementContext(r, ctx), driver.OutboundMessage{Destination: destination, Key: append([]byte(nil), message.Key...), Headers: headerSlice(headers), Body: append([]byte(nil), message.Body...)}); err != nil {
 			if observed {
-				finishSuccessorPublish(&publishGuard, publishBase, err)
+				finishObservationFromError(&publishGuard, publishBase, err)
 			}
 			return err
 		}
 		if observed {
-			finishSuccessorPublish(&publishGuard, publishBase, nil)
+			finishObservationFromError(&publishGuard, publishBase, nil)
 			observeDeadLetterPublished(r, message, envelope, reason, destination, topic)
 		}
 		runnerNotifyDeadLetter(r, runnerSettlementContext(r, ctx), DeadLettered{Envelope: Envelope{}, Body: append([]byte(nil), message.Body...), Reason: reason, Attempt: 0, LastErr: lastErr, Destination: destination})
@@ -2739,7 +2748,7 @@ func deadLetter(r *Runner, ctx context.Context, message driver.InboundMessage, e
 	encoded, err := death.EncodeHeaders(headerMaxBytes)
 	if err != nil {
 		if observed {
-			finishSuccessorPublish(&publishGuard, publishBase, err)
+			finishObservationFromError(&publishGuard, publishBase, err)
 		}
 		// Marked rather than returned bare: the caller decides what to do with
 		// an unencodable copy, and it must not have to match on the text to
@@ -2753,15 +2762,39 @@ func deadLetter(r *Runner, ctx context.Context, message driver.InboundMessage, e
 	sort.Slice(out.Headers, func(i, j int) bool { return out.Headers[i].Key < out.Headers[j].Key })
 	if err := publishSuccessor(r, runnerSettlementContext(r, ctx), out); err != nil {
 		if observed {
-			finishSuccessorPublish(&publishGuard, publishBase, err)
+			finishObservationFromError(&publishGuard, publishBase, err)
 		}
 		return err
 	}
 	if observed {
-		finishSuccessorPublish(&publishGuard, publishBase, nil)
+		finishObservationFromError(&publishGuard, publishBase, nil)
 		observeDeadLetterPublished(r, message, envelope, reason, destination, topic)
 	}
 	runnerNotifyDeadLetter(r, runnerSettlementContext(r, ctx), DeadLettered{Envelope: death, Body: append([]byte(nil), message.Body...), Reason: reason, Attempt: death.Attempt, LastErr: lastErr, Destination: destination})
+	return nil
+}
+
+func capMalformedDeathHeaders(headers map[string]string, maxHeaderBytes int) error {
+	limit := CoreMaxHeaderBytes
+	if maxHeaderBytes > 0 && maxHeaderBytes < limit {
+		limit = maxHeaderBytes
+	}
+	if headerBytes(headers) <= limit {
+		return nil
+	}
+	shrinkDeathErrorTo(headers, limit, deathErrorFloor)
+	if headerBytes(headers) <= limit {
+		return nil
+	}
+	for key := range headers {
+		if !knownHeaders[key] {
+			delete(headers, key)
+		}
+	}
+	shrinkDeathError(headers, limit)
+	if headerBytes(headers) > limit {
+		return fmt.Errorf("f1: malformed envelope dead-letter headers exceed cap: %w", ErrEnvelopeTooLarge)
+	}
 	return nil
 }
 
@@ -2963,24 +2996,13 @@ func startSuccessorPublish(r *Runner, ctx context.Context, route PublishRoute, t
 		Topic:         topic,
 		EventType:     eventType,
 		Priority:      priority,
+		PriorityKnown: true,
 		Attempt:       attempt,
 		Destination:   destination,
 		MessageID:     messageID,
 		CorrelationID: correlationID,
 	}
 	return nextCtx, guard, base, true
-}
-
-// finishSuccessorPublish emits the publish finish for one successor handoff.
-func finishSuccessorPublish(guard *observerFinishGuard, base FinishEvent, err error) {
-	finish := base
-	if err == nil {
-		finish.Outcome = ObserverOutcomeOK
-	} else {
-		finish.Outcome = ObserverOutcomeError
-		finish.ErrorClass = errorClassOf(err)
-	}
-	guard.finishWith(finish)
 }
 
 // retryAndSettle republishes message to its retry destination, carrying the
@@ -3033,7 +3055,7 @@ func retryAndSettle(r *Runner, ctx context.Context, message driver.InboundMessag
 	encoded, err := copyEnvelope.EncodeHeaders(state.headerMaxBytes)
 	if err != nil {
 		if observed {
-			finishSuccessorPublish(&publishGuard, publishBase, err)
+			finishObservationFromError(&publishGuard, publishBase, err)
 		}
 		return deadLetterAndSettle(r, ctx, message, envelope, ReasonTerminal,
 			errors.Join(lastErr, fmt.Errorf("f1: retry copy cannot be encoded: %w", err)), state)
@@ -3045,7 +3067,7 @@ func retryAndSettle(r *Runner, ctx context.Context, message driver.InboundMessag
 	sort.Slice(out.Headers, func(i, j int) bool { return out.Headers[i].Key < out.Headers[j].Key })
 	if err := publishSuccessor(r, runnerSettlementContext(r, ctx), out); err != nil {
 		if observed {
-			finishSuccessorPublish(&publishGuard, publishBase, err)
+			finishObservationFromError(&publishGuard, publishBase, err)
 		}
 		if successorNeverPublishable(err) {
 			// The copy is unacceptable on its own terms, so it would be refused
@@ -3058,7 +3080,7 @@ func retryAndSettle(r *Runner, ctx context.Context, message driver.InboundMessag
 		return false
 	}
 	if observed {
-		finishSuccessorPublish(&publishGuard, publishBase, nil)
+		finishObservationFromError(&publishGuard, publishBase, nil)
 		event := successorPoint(r, ObserverRetryScheduled, message, envelope, topic)
 		event.ErrorClass = ErrorClassRetryable
 		event.NextAttempt = copyEnvelope.Attempt

@@ -139,7 +139,7 @@ func (a *adminOperations) ensureTopology(ctx context.Context, spec driver.Topolo
 		var err error
 		actualBindings, err = a.currentBindings(ctx)
 		if err != nil {
-			return driver.TopologyDiff{}, classify("ensure_topology", driver.KindTransient, err)
+			return driver.TopologyDiff{}, classifyManagement("ensure_topology", err)
 		}
 	}
 	for _, binding := range spec.Bindings {
@@ -204,7 +204,7 @@ func (a *adminOperations) verifyTopology(ctx context.Context, spec driver.Topolo
 		drifted, err := a.argumentDrift(ctx, destination.Name, mainArgs)
 		if err != nil {
 			purpose := fmt.Sprintf("argument drift verification for destination %q", destination.Name)
-			return driver.TopologyDiff{}, classify("ensure_topology", driver.KindTransient, a.managementUnavailable(purpose, err))
+			return driver.TopologyDiff{}, classifyManagement("ensure_topology", a.managementUnavailable(purpose, err))
 		}
 		diff.Drifted = append(diff.Drifted, drifted...)
 		if destination.Delay > 0 {
@@ -221,7 +221,7 @@ func (a *adminOperations) verifyTopology(ctx context.Context, spec driver.Topolo
 			parkDrifted, err := a.argumentDrift(ctx, parkName, parkArgs)
 			if err != nil {
 				purpose := fmt.Sprintf("argument drift verification for parking destination %q", parkName)
-				return driver.TopologyDiff{}, classify("ensure_topology", driver.KindTransient, a.managementUnavailable(purpose, err))
+				return driver.TopologyDiff{}, classifyManagement("ensure_topology", a.managementUnavailable(purpose, err))
 			}
 			diff.Drifted = append(diff.Drifted, parkDrifted...)
 		}
@@ -231,7 +231,7 @@ func (a *adminOperations) verifyTopology(ctx context.Context, spec driver.Topolo
 		var err error
 		actualBindings, err = a.currentBindings(ctx)
 		if err != nil {
-			return driver.TopologyDiff{}, classify("ensure_topology", driver.KindTransient, err)
+			return driver.TopologyDiff{}, classifyManagement("ensure_topology", err)
 		}
 	}
 	seenBindings := make(map[bindingKey]struct{}, len(spec.Bindings))
@@ -297,8 +297,8 @@ func (a *adminOperations) managementUnavailable(purpose string, err error) error
 // than folded into an empty result: TopologyVerify must be able to say "this
 // was not checked" instead of silently reporting a clean diff. The client
 // itself is never absent, because newConn is the only construction of a conn
-// the port hands out, it fails Open when newManagementClient cannot build
-// one, and nothing reassigns the field, so the only failure to report here is
+// the port hands out, it fails Open when managementClientForEndpoint cannot
+// build one, and nothing reassigns the field, so the only failure to report here is
 // reaching the broker rather than a missing client.
 func (a *adminOperations) argumentDrift(ctx context.Context, name string, want amqp.Table) ([]driver.ArgumentDrift, error) {
 	if len(want) == 0 {
@@ -424,7 +424,14 @@ func (a *adminOperations) scanOrphans(ctx context.Context, spec driver.TopologyS
 			}
 			if _, parentExists := byName[parent]; parentExists {
 				if _, parentKnown := known[parent]; !parentKnown {
-					add(parent, queue.totalMessages())
+					if matchesScope(parent, spec.Scope) {
+						add(parent, queue.totalMessages())
+					} else {
+						// Folding the parent in would report a name the caller
+						// excluded from the scan, so the parking queue keeps its
+						// own name and count instead.
+						add(queue.Name, queue.totalMessages())
+					}
 				}
 				continue
 			}

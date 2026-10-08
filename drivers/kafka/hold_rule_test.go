@@ -16,6 +16,32 @@ const (
 	holdRuleTimeout     = time.Second
 )
 
+func TestConsumerDeliverHeadClearsPoppedSlot(t *testing.T) {
+	c, key := newHoldRuleConsumer(t, holdRuleBudget)
+	first := holdRuleRecord(key, 0)
+	second := holdRuleRecord(key, 1)
+	third := holdRuleRecord(key, 2)
+	c.tagRecord(first)
+	c.tagRecord(second)
+	c.tagRecord(third)
+	seedQueuedRecords(c, first, second, third)
+	c.mu.Lock()
+	original := c.pending[key]
+	c.mu.Unlock()
+
+	if outcome := c.deliverHead(key); outcome != headDelivered {
+		t.Fatalf("deliverHead = %v, want headDelivered", outcome)
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if original[0] != nil {
+		t.Fatal("popped slot still retains the delivered record")
+	}
+	if queued := c.pending[key]; len(queued) != 2 || queued[0] != second || queued[1] != third {
+		t.Fatalf("pending = %v, want the second and third records in order", queued)
+	}
+}
+
 func TestConsumerHoldRuleRefusesSecondRecordOfPartition(t *testing.T) {
 	c, key := newHoldRuleConsumer(t, holdRuleBudget)
 	first := holdRuleRecord(key, 0)

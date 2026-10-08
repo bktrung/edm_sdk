@@ -9,6 +9,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ### Changed
 
+- RabbitMQ `Open` refuses a `broker.rabbitmq.vhost` that differs from any endpoint's
+  parsed vhost, and SASL credentials set without a mechanism, with a fatal error before dialing.
 - Documentation qualifies shutdown, scheduling, ordering, and retry timing guarantees,
   reconciles RabbitMQ publishing with shared confirm channels, and removes duplicate
   analysis and standalone JavaScript simulators.
@@ -41,6 +43,15 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
   its offset finished.
 - Deferred conformance measures release lateness from a bracket around publication, excluding
   time spent publishing while retaining the never-early and late-delivery checks.
+- Breaking, draft observer API: `FinishEvent.Results` is now `[]ObserverMessageResult`
+  (`ID`, `ErrorClass`) instead of `[]MessageResult`, so observers no longer receive raw
+  per-message errors. An observer that checked `Err == nil` checks `ErrorClass == ""` and
+  `ID != ""` instead. `PublishBatch` results and `MessageResult.Err` returned to the application
+  are unchanged.
+- `f1.New` refuses an f1otel observer that is already attached to another live Client. Create
+  one `f1otel.New` per Client and share the OpenTelemetry providers between them. An observer
+  opts in through the new optional `f1.ObserverBinder` interface; the binding is released when
+  `Close` completes terminal shutdown or when `New` fails.
 
 ### Removed
 
@@ -56,11 +67,82 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ### Fixed
 
+- A reconnect failure classified by the driver as non-transient is terminal, just like
+  exhausted attempts. Publishes, `Client.Health`, and further reconnect requests return
+  that error. After any terminal reconnect failure, `Client.Health` joins the reconnect
+  error with stopped-subscription errors; match it with `errors.Is`, not `==`.
+- Closing a spare producer created by concurrent first publishes is bounded by
+  `Lifecycle.CloseTimeout`, so a stuck broker no longer hangs the publish.
+- Dead letters for messages whose envelope cannot be decoded respect the header size
+  limit. A message whose dead-letter headers can never fit is dropped and reported,
+  and consumption continues.
+- `Envelope.EncodeHeaders` no longer sheds `datacontenttype` to fit the header size
+  limit. Headers that cannot fit with it return `ErrEnvelopeTooLarge`.
+- RabbitMQ management uses the AMQP-parsed URI login, including defaults, or the selected
+  PLAIN/AMQPLAIN SASL identity. EXTERNAL retains the URI login for management.
+- RabbitMQ `Open` bounds TCP connect, TLS and AMQP handshakes by the connect timeout, so a peer
+  that accepts TCP but never answers no longer hangs connection setup. A cancelled connect
+  closes its socket at once instead of leaking it.
+- RabbitMQ consumer `Stop` and `Release` share one teardown. A concurrent or repeated call
+  returns success only after the consumer is unregistered from its connection and `Messages`
+  and `Errors` are closed, so closing the connection afterwards no longer fails.
+- A runner drained while waiting for a connection rebuild completes its terminal
+  consumer teardown before `Run` returns, including when reconnect has already
+  released the consumer.
+- RabbitMQ management 401/403 responses are classified as permission errors and no longer retried.
+- Reconnect retains retired resources after close errors or timeouts, preserving
+  producer/consumer-before-connection order. `Client.Close` returns an error until every
+  retired teardown succeeds, rejoining running attempts or retrying failed retirements
+  once per caller-issued close without background retries. Each retirement wait has its
+  own `Lifecycle.CloseTimeout` bound.
 - Kafka drain and release fence settlement-side handoffs as well as polling, so an in-flight
   handoff cannot send after drain returns.
 - The RabbitMQ consumer's `Stop` and `Release` wait for their goroutines only as long as the
   caller's context allows. A `Release` that ends on its context leaves the consumer registered,
   and the next `Release` finishes the teardown instead of the first being reported as done.
+- A RabbitMQ consumer `Stop` whose drain succeeded no longer returns `ErrDrainTimeout` when its
+  deadline passes just after the drain. It finishes the shutdown and closes the consumer's lanes.
+- A RabbitMQ consumer `Stop` that takes over the shutdown of a failed `Release` is bounded by its
+  own context, and returns a retryable `ErrDrainTimeout` if that context ends. A `Stop` racing a
+  `Release` no longer waits on reader goroutines that only the `Release` could end.
+- The Kafka consumer clears a delivered record's slot in its pending queue, so the delivered
+  record and its fetch data can be freed sooner.
+- f1otel metrics no longer carry `f1.priority=medium` when the priority is unknown: a
+  `PublishBatch` of mixed priorities, or an abandoned stage. The new `FinishEvent.PriorityKnown`
+  field reports whether `Priority` carries the stage's delivery lane; F1 sets it on every Finish
+  that has one. A batch's topic and priority are resolved independently. Metrics and spans name
+  the consumer group by the same rule: `ConsumerGroup`, else `Subscription`.
+- The Kafka consumer re-arms its head-hold timer after it fires for a held retry whose destination
+  is paused, so the next held retry is delivered when its own delay elapses instead of waiting for
+  unrelated traffic.
+- The RabbitMQ orphan scan folds a parking queue into its parent only when the parent is itself in
+  the caller's scope. An out-of-scope parent is no longer reported, and the parking queue is
+  reported under its own name with its own count.
+- A Kafka backlog read whose context ends while another probe holds the shared backlog client
+  returns without waiting for that probe, instead of outliving the deadline the core puts on each
+  backlog poll.
+- The RabbitMQ driver refuses a message whose correlation ID, message ID, type or content type is
+  longer than 255 bytes as too large, before anything is written, instead of letting the AMQP client
+  close the whole shared connection.
+- A RabbitMQ consumer lane's channel death is reported even when it lands before the lane's
+  watcher goroutine runs, and a transient close error survives a full error buffer of consumer
+  cancel notices, so the core repairs a lane that used to die silently.
+- An in-memory purge resets the destination's dispatch bookkeeping, so a message published right
+  after the purge is delivered with its enqueue time and key instead of being skipped.
+- RabbitMQ Open classifies a refused login as a permission error and stops retrying once every
+  endpoint has kept refusing for about 5 seconds of attempts, and every timeout exit keeps the
+  broker's cause. A queue delete refused with 403 during prune is reported as a permission error
+  instead of a transient one.
+- A Kafka requeue that races a partition revoke no longer frees the same in-flight slot twice, so
+  the consumer keeps to its Prefetch limit during rebalances.
+- The RabbitMQ driver refuses a message whose custom header name makes its AMQP table key longer
+  than 255 bytes as too large, before anything is written, instead of letting the client close the
+  whole connection.
+- A retry ladder with a multiplier below 1 decays below MaxInterval when its first delay is already
+  at or above the cap (30s, 15s, 7.5s instead of 30s, 30s, 30s), and a delay that decays to zero
+  stays at zero.
+- RabbitMQ subscription validation refuses a handler timeout so large that three times it
+  overflows, instead of accepting it.
 
 ### Upgrade notes
 

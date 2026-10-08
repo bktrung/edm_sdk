@@ -157,11 +157,9 @@ func TestHeadHoldTimerWakesThePollLoop(t *testing.T) {
 	// The loop is waited on after pollDone is closed, so the test does not leave
 	// it running; the defers run in reverse, which is what puts the close first.
 	var loop sync.WaitGroup
-	loop.Add(1)
-	go func() {
-		defer loop.Done()
+	loop.Go(func() {
 		consumer.headHoldLoop()
-	}()
+	})
 	defer loop.Wait()
 	defer close(pollDone)
 
@@ -170,17 +168,9 @@ func TestHeadHoldTimerWakesThePollLoop(t *testing.T) {
 		t.Fatal("the poll loop woke before the held head came due")
 	}
 	clk.Advance(time.Millisecond)
-	// The loop runs in its own goroutine, so the wake it records is observed by
-	// polling. The wait is a real clock's Sleep, because the fake clock this test
-	// holds only moves when the test advances it, and it is bounded by the
-	// context.
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
-	defer cancel()
-	for !headHoldWoken(consumer) {
-		if err := clock.NewReal().Sleep(ctx, time.Millisecond); err != nil {
-			t.Fatal("the head-hold timer fired and the poll loop was not woken")
-		}
-	}
+	waitHeadHoldState(t, "the head-hold timer to fire and wake the poll loop", func() bool {
+		return headHoldWoken(consumer)
+	})
 
 	// A later held head, with nothing else happening in between, is what the
 	// retained timer has to re-arm for: the loop consumes a wake once, so a fire
@@ -191,11 +181,75 @@ func TestHeadHoldTimerWakesThePollLoop(t *testing.T) {
 	consumer.setHeadHoldLocked(key, clk.Now().Add(time.Second))
 	consumer.mu.Unlock()
 	clk.Advance(time.Second)
-	second, cancelSecond := context.WithTimeout(context.Background(), time.Second)
-	defer cancelSecond()
-	for !headHoldWoken(consumer) {
-		if err := clock.NewReal().Sleep(second, time.Millisecond); err != nil {
-			t.Fatal("the head-hold timer did not re-arm for a later held head")
+	waitHeadHoldState(t, "the head-hold timer to re-arm for a later held head", func() bool {
+		return headHoldWoken(consumer)
+	})
+}
+
+// TestHeadHoldTimerRearmsPastAnExpiredHold pins the wake a fire owes the holds
+// it did not clear. Two holds are set and the first is already due when its
+// timer fires, with nothing clearing it: that is the state a held head reaches
+// when its destination is paused, because only a resume delivers it. The timer
+// must arm for the second hold, whose due is the next one to fire, instead of
+// re-choosing the expired entry, which would arm an immediate timer, or leaving
+// the second hold with no wake at all.
+func TestHeadHoldTimerRearmsPastAnExpiredHold(t *testing.T) {
+	now := time.Unix(100, 0)
+	expired := partitionKey{destination: "expired", partition: 0}
+	live := partitionKey{destination: "live", partition: 0}
+	clk := clock.NewFake(now)
+	pollDone := make(chan struct{})
+	consumer := &consumer{
+		partitionPauses:  make(map[partitionKey]partitionPauseSet),
+		heldUntil:        make(map[partitionKey]time.Time),
+		pollDone:         pollDone,
+		headTimerChanged: make(chan struct{}, 1),
+		clock:            clk,
+	}
+	consumer.mu.Lock()
+	consumer.setHeadHoldLocked(expired, now.Add(time.Second))
+	consumer.setHeadHoldLocked(live, now.Add(time.Minute))
+	consumer.mu.Unlock()
+	// The loop is waited on after pollDone is closed, so the test does not leave
+	// it running; the defers run in reverse, which is what puts the close first.
+	var loop sync.WaitGroup
+	loop.Go(func() {
+		consumer.headHoldLoop()
+	})
+	defer loop.Wait()
+	defer close(pollDone)
+
+	clk.Advance(time.Second)
+	waitHeadHoldState(t, "the timer to re-arm for the next held head", func() bool {
+		return headHoldDue(consumer).Equal(now.Add(time.Minute))
+	})
+	consumer.mu.Lock()
+	consumer.pollWakePending = false
+	consumer.mu.Unlock()
+
+	// An arm at the expired hold would be due at once, so the poll loop would be
+	// woken again before the second hold's due.
+	clk.Advance(time.Minute - time.Millisecond)
+	if headHoldWoken(consumer) {
+		t.Fatal("the timer re-armed at the expired hold and woke polling before the second hold came due")
+	}
+	clk.Advance(time.Millisecond)
+	waitHeadHoldState(t, "the poll loop to wake when the second held head came due", func() bool {
+		return headHoldWoken(consumer)
+	})
+}
+
+// waitHeadHoldState polls state on the real clock until it holds. The waits use
+// a real clock's Sleep because the fake clock these tests hold only moves when
+// the test advances it and the loop that reacts to it runs in its own
+// goroutine; the context bounds every wait.
+func waitHeadHoldState(t *testing.T, description string, state func() bool) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	for !state() {
+		if err := clock.NewReal().Sleep(ctx, time.Millisecond); err != nil {
+			t.Fatalf("timed out waiting for %s", description)
 		}
 	}
 }
@@ -204,6 +258,12 @@ func headHoldWoken(c *consumer) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.pollWakePending
+}
+
+func headHoldDue(c *consumer) time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.headTimerDue
 }
 
 // requeueRevokeConsumer builds the smallest consumer that can answer a
@@ -375,5 +435,75 @@ func TestConsumerRequeueHandsTheRedeliveryOver(t *testing.T) {
 	}
 	if got := consumer.outstanding[key]; got != 0 {
 		t.Fatalf("outstanding = %d after the revoke discarded the buffered redelivery, want 0", got)
+	}
+}
+
+func TestConsumerRequeueRevokeKeepsOtherPartitionCharged(t *testing.T) {
+	first := partitionKey{destination: "topic", partition: 0}
+	second := partitionKey{destination: "topic", partition: 1}
+	c, predecessor := requeueRevokeConsumer(t, first, newAckTracker(4))
+	c.cfg.Prefetch = 2
+	c.budgets[first.destination] = 2
+	c.unsettled[first.destination] = 2
+	c.admitted = 2
+	c.outstanding[second] = 1
+	c.owned[second] = true
+	c.trackers[second] = newAckTracker(4)
+	other := &settler{
+		owner: c, key: second, tracker: c.trackers[second],
+		record: &kgo.Record{Topic: second.destination, Partition: second.partition, Offset: 4},
+	}
+	c.settlers[other] = struct{}{}
+	c.pauseReasons[first.destination] = pauseReasonSet{pauseReasonUserPaused: {}}
+
+	revoked := make(chan struct{})
+	c.beforeRequeueCompletion = func() {
+		// With the old window open, finish revoke before Nack resumes. With
+		// completion still locked, revoke must wait until the predecessor ends.
+		unlocked := c.mu.TryLock()
+		if unlocked {
+			c.mu.Unlock()
+		}
+		go func() {
+			c.dropTracker(first.destination, first.partition)
+			close(revoked)
+		}()
+		if unlocked {
+			<-revoked
+		}
+	}
+	err := predecessor.Nack(context.Background(), driver.NackOptions{Requeue: true})
+	<-revoked
+	if err != nil {
+		t.Fatalf("Nack(requeue) = %v, want nil", err)
+	}
+	c.mu.Lock()
+	if got := c.unsettled[first.destination]; got != 1 {
+		t.Errorf("unsettled = %d with the other partition still live, want 1", got)
+	}
+	if got := c.admitted; got != 1 {
+		t.Errorf("admitted = %d with the other partition still live, want 1", got)
+	}
+	if c.outstanding[first] != 0 || c.outstanding[second] != 1 {
+		t.Errorf("partition charges = (%d, %d), want (0, 1)", c.outstanding[first], c.outstanding[second])
+	}
+	if len(c.pending[first]) != 0 || c.requeued[first] != 0 {
+		t.Error("revoked partition retained a queued redelivery")
+	}
+	_, predecessorRetained := c.settlers[predecessor]
+	_, otherRetained := c.settlers[other]
+	if !predecessor.settled || predecessorRetained || other.settled || !otherRetained {
+		t.Error("requeue/revoke did not end only the predecessor")
+	}
+	c.mu.Unlock()
+
+	c.beforeRequeueCompletion = nil
+	c.dropTracker(second.destination, second.partition)
+	if err := other.Nack(context.Background(), driver.NackOptions{Requeue: true}); err != nil {
+		t.Fatalf("Nack(requeue) of other revoked partition = %v, want nil", err)
+	}
+	if c.unsettled[first.destination] != 0 || c.admitted != 0 || c.outstanding[first] != 0 || c.outstanding[second] != 0 {
+		t.Errorf("charges after both deliveries end = (%d, %d, %d, %d), want (0, 0, 0, 0)",
+			c.unsettled[first.destination], c.admitted, c.outstanding[first], c.outstanding[second])
 	}
 }

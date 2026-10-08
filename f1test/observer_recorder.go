@@ -136,7 +136,7 @@ func cloneCalls(calls []ObserverCall) []ObserverCall {
 
 func cloneCall(call ObserverCall) ObserverCall {
 	if call.Finish.Results != nil {
-		call.Finish.Results = append([]f1.MessageResult(nil), call.Finish.Results...)
+		call.Finish.Results = append([]f1.ObserverMessageResult(nil), call.Finish.Results...)
 	}
 	return call
 }

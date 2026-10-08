@@ -128,9 +128,9 @@ func (s *Scheduler) Next() (Item, Promotion, bool) {
 	totalWeight := 0
 	for _, group := range s.slots {
 		if group.empty() {
-			// An empty group deliberately discards accrued deficit debt. A bursty group
-			// that refills starts with a clean share rather than spending credit
-			// banked before it drained.
+			// An empty group forfeits its whole deficit, positive credit and negative
+			// debt alike. A bursty group that refills starts from zero rather than
+			// spending credit or repaying debt from before it drained.
 			group.deficit = 0
 			continue
 		}
@@ -169,9 +169,9 @@ func (s *Scheduler) mostOverdue() *lane {
 			selectedOverrun = overrun
 		}
 		if groupEmpty {
-			// An empty group deliberately discards accrued deficit debt. A bursty group
-			// that refills starts with a clean share rather than spending credit
-			// banked before it drained.
+			// An empty group forfeits its whole deficit, positive credit and negative
+			// debt alike. A bursty group that refills starts from zero rather than
+			// spending credit or repaying debt from before it drained.
 			group.deficit = 0
 		}
 	}

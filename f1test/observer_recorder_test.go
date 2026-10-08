@@ -22,7 +22,7 @@ func TestRecorderCallsAreOrderedAndCopied(t *testing.T) {
 	if token != wantToken {
 		t.Fatalf("token = %#v, want %#v", token, wantToken)
 	}
-	results := []f1.MessageResult{{ID: "message-1"}}
+	results := []f1.ObserverMessageResult{{ID: "message-1"}}
 	recorder.Finish(token, f1.FinishEvent{
 		Kind:    f1.ObserverProcess,
 		At:      time.Unix(2, 3),

@@ -179,6 +179,52 @@ func TestSmoothWeightedDeficitResetsAfterEmptyLane(t *testing.T) {
 	}
 }
 
+func TestSmoothWeightedEmptyLaneForfeitsPositiveCredit(t *testing.T) {
+	// Pin the forfeiture direction: an empty pick discards positive credit, not only debt.
+	scheduler, err := New([]LaneSpec{
+		{ID: "high", Weight: 4, Capacity: 10},
+		{ID: "low", Weight: 1, Capacity: 10},
+	}, clock.NewFake(time.Unix(0, 0)), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for range 10 {
+		if err := scheduler.Enqueue("high", Item{Value: "high"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := scheduler.Enqueue("low", Item{Value: "low"}); err != nil {
+		t.Fatal(err)
+	}
+	for pick := range 2 {
+		item, _, ok := scheduler.Next()
+		if !ok || item.Value != "high" {
+			t.Fatalf("initial item %d = %#v, %v; want high", pick, item.Value, ok)
+		}
+	}
+	if credit := scheduler.byGroup["low"].deficit; credit != 2 {
+		t.Fatalf("earned low credit = %d; want 2", credit)
+	}
+	// Withdraw the queued item before its weighted turn, preserving the earned credit.
+	scheduler.byID["low"].pop()
+	item, _, ok := scheduler.Next()
+	if !ok || item.Value != "high" {
+		t.Fatalf("empty-lane reset item = %#v, %v; want high", item.Value, ok)
+	}
+	if err := scheduler.Enqueue("low", Item{Value: "low"}); err != nil {
+		t.Fatal(err)
+	}
+	if credit := scheduler.byGroup["low"].deficit; credit != 0 {
+		t.Fatalf("refilled low credit = %d; want 0", credit)
+	}
+	for pick, want := range []string{"high", "low"} {
+		item, _, ok := scheduler.Next()
+		if !ok || item.Value != want {
+			t.Fatalf("refilled item %d = %#v, %v; want %s", pick, item.Value, ok, want)
+		}
+	}
+}
+
 func TestSmoothWeightedDeficitResetSeparatesZeroFromOne(t *testing.T) {
 	scheduler, err := New([]LaneSpec{
 		{ID: "high", Weight: 5, Capacity: 10},

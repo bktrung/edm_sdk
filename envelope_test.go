@@ -187,7 +187,7 @@ func TestEnvelope_EncodeHeadersShedsDescriptiveHeadersInOrder(t *testing.T) {
 
 	all, err := e.EncodeHeaders(0)
 	require.NoError(t, err)
-	order := []string{"f1future", "tracestate", "dataschema", "datacontenttype", "subject", "traceparent"}
+	order := []string{"f1future", "tracestate", "dataschema", "subject", "traceparent"}
 	for i := range order {
 		after := cloneHeaders(all)
 		for _, shed := range order[:i+1] {
@@ -197,6 +197,7 @@ func TestEnvelope_EncodeHeadersShedsDescriptiveHeadersInOrder(t *testing.T) {
 		headers, err := e.EncodeHeaders(headerBytesOf(after))
 		require.NoError(t, err)
 		require.LessOrEqual(t, headerBytesOf(headers), headerBytesOf(after))
+		require.Equal(t, value, headers["datacontenttype"])
 		for j, candidate := range order {
 			if j <= i {
 				require.NotContains(t, headers, candidate)
@@ -205,6 +206,63 @@ func TestEnvelope_EncodeHeadersShedsDescriptiveHeadersInOrder(t *testing.T) {
 			}
 		}
 	}
+}
+
+func TestEnvelope_EncodeHeadersKeepsContentTypeWhenSheddingLaterHeaders(t *testing.T) {
+	t.Parallel()
+
+	const contentType = "application/test-alt"
+	const traceParent = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
+	e := minimalEnvelope()
+	e.DataContentType = contentType
+	e.Subject = strings.Repeat("s", 40)
+	e.TraceParent = traceParent
+
+	for _, tt := range []struct {
+		name      string
+		limit     int
+		keepTrace bool
+	}{
+		{name: "shed subject", limit: 212, keepTrace: true},
+		{name: "shed subject and traceparent", limit: 182},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			expected := map[string]string{
+				"specversion":      "1.0",
+				"id":               "i",
+				"source":           "s",
+				"type":             "t",
+				"time":             "2026-08-05T11:00:00Z",
+				"f1idempotencykey": "",
+				"f1priority":       "medium",
+				"f1attempt":        "0",
+				"f1correlationid":  "i",
+				"datacontenttype":  contentType,
+			}
+			if tt.keepTrace {
+				expected["traceparent"] = traceParent
+			}
+
+			headers, err := e.EncodeHeaders(tt.limit)
+			require.NoError(t, err)
+			require.Equal(t, expected, headers)
+			require.LessOrEqual(t, headerBytesOf(headers), tt.limit)
+		})
+	}
+}
+
+func TestEnvelope_EncodeHeadersRejectsOverflowWithContentType(t *testing.T) {
+	t.Parallel()
+
+	e := minimalEnvelope()
+	e.DataContentType = "application/test-alt"
+	e.Subject = strings.Repeat("s", 40)
+	e.TraceParent = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
+
+	// The mandatory headers total 111 bytes; the codec discriminator adds 35.
+	headers, err := e.EncodeHeaders(145)
+	require.ErrorIs(t, err, f1.ErrEnvelopeTooLarge)
+	require.Nil(t, headers)
 }
 
 func TestEnvelope_EncodeHeadersShedTiersRetainMandatoryHeaders(t *testing.T) {
@@ -343,7 +401,7 @@ func TestEnvelope_HeaderRoundTripIsLossless(t *testing.T) {
 	e.DataContentType = "application/json"
 	e.Subject = "ORD-88213"
 	e.DataSchema = "https://schemas.example/order.v1.json"
-	e.Expiry = timePtr(time.Date(2026, 8, 6, 0, 0, 0, 0, time.UTC))
+	e.Expiry = new(time.Date(2026, 8, 6, 0, 0, 0, 0, time.UTC))
 	e.Extensions = map[string]string{"x-custom-ext": "value"}
 
 	headers, err := e.EncodeHeaders(0)
@@ -400,8 +458,6 @@ func TestEnvelope_InvalidDeathDetailKeyIsSilent(t *testing.T) {
 	require.NotContains(t, headers, "f1detailBAD_KEY")
 	require.Empty(t, logs.String())
 }
-
-func timePtr(t time.Time) *time.Time { return &t }
 
 func TestEnvelope_TracedMessageSurvivesDecodeEncodeRoundTrip(t *testing.T) {
 	t.Parallel()

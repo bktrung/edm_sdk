@@ -181,6 +181,41 @@ func TestStopRejectsOutstandingUntilSettled(t *testing.T) {
 	closeTest(t, ctx, conn, producer, consumer)
 }
 
+func TestPurgeResetsDispatchForLatestConsumer(t *testing.T) {
+	clk := clock.NewFake(time.Unix(0, 0))
+	ctx, opened, producer := openTest(t, clk, driver.DestinationSpec{Name: "orders"})
+	impl := opened.(*conn)
+	// The pump must not observe the empty queue between Purge and Publish,
+	// which would reset the stale cursor before the replacement reaches it.
+	impl.closeOnce.Do(func() { close(impl.done) })
+	<-impl.pumpDone
+	t.Cleanup(func() {
+		_ = producer.Close(ctx)
+		_ = opened.Close(ctx)
+	})
+	require.NoError(t, producer.Publish(ctx, driver.OutboundMessage{Destination: "orders", Body: []byte("purged")}))
+	consumer, err := opened.Consumer(ctx, driver.ConsumerConfig{
+		Group: "latest", Destinations: []string{"orders"}, StartAt: driver.StartLatest, Prefetch: 1,
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = consumer.Release(ctx) })
+	maintenance, ok := opened.Admin().(driver.Maintenance)
+	require.True(t, ok)
+	purged, err := maintenance.Purge(ctx, "orders")
+	require.NoError(t, err)
+	require.Equal(t, int64(1), purged)
+	clk.Advance(time.Second)
+	require.NoError(t, producer.Publish(ctx, driver.OutboundMessage{
+		Destination: "orders", Body: []byte("new"), Key: []byte("customer"),
+	}))
+	message := receiveTest(t, consumer)
+	require.Equal(t, []byte("new"), message.Body)
+	require.Equal(t, clk.Now(), message.EnqueuedAt)
+	require.Equal(t, driver.EnqueueSourceBroker, message.EnqueuedAtSource)
+	require.Equal(t, []byte("customer"), message.Key)
+	require.NoError(t, message.Settle.Ack(ctx))
+}
+
 func TestPruneGuards(t *testing.T) {
 	ctx, conn, producer := openTest(t, clock.NewFake(time.Unix(0, 0)),
 		driver.DestinationSpec{Name: "holds"}, driver.DestinationSpec{Name: "attached"}, driver.DestinationSpec{Name: "empty"})

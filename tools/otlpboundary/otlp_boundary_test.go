@@ -135,7 +135,7 @@ func TestOTLPBoundaryAttachesProcessExemplarToOperationSpan(t *testing.T) {
 		At:      base.Add(time.Second),
 		Topic:   "orders.created",
 		Outcome: f1.ObserverOutcomeOK,
-		Results: []f1.MessageResult{{ID: "published"}},
+		Results: []f1.ObserverMessageResult{{ID: "published"}},
 	})
 	processCtx, parentSpan := tracerProvider.Tracer("test").Start(context.Background(), "parent")
 	_, processToken := observer.Start(processCtx, f1.StartEvent{

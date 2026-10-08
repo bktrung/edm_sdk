@@ -19,6 +19,88 @@ type observerScenario struct {
 	order [][]string
 }
 
+type publishTraceKey struct{}
+
+type canceledPublishObserver struct {
+	*f1test.Recorder
+}
+
+func (o *canceledPublishObserver) Start(ctx context.Context, event f1.StartEvent) (context.Context, f1.Token) {
+	_, token := o.Recorder.Start(ctx, event)
+	if event.Kind == f1.ObserverPublish && event.Route == f1.PublishRoutePrimary {
+		ctx = context.WithValue(ctx, publishTraceKey{}, "publish-span")
+		canceled, cancel := context.WithCancel(ctx)
+		cancel()
+		return canceled, token
+	}
+	return ctx, token
+}
+
+func (o *canceledPublishObserver) InjectTrace(ctx context.Context) (string, string) {
+	if ctx.Value(publishTraceKey{}) != "publish-span" {
+		return "", ""
+	}
+	return "00-0123456789abcdef0123456789abcdef-0123456789abcdef-01", "test=observer"
+}
+
+func TestObserverCanceledPublishContextDoesNotControlPrimaryPublish(t *testing.T) {
+	observer := &canceledPublishObserver{Recorder: f1test.NewRecorder()}
+	publishWithCanceledObservation(t, observer)
+}
+
+func TestObserverPublishValuesSurviveCanceledObservation(t *testing.T) {
+	observer := &canceledPublishObserver{Recorder: f1test.NewRecorder()}
+	capture := publishWithCanceledObservation(t, observer)
+	if got := capture.Headers["traceparent"]; got != "00-0123456789abcdef0123456789abcdef-0123456789abcdef-01" {
+		t.Fatalf("traceparent = %q, want observer trace value", got)
+	}
+	if got := capture.Headers["tracestate"]; got != "test=observer" {
+		t.Fatalf("tracestate = %q, want observer trace value", got)
+	}
+}
+
+func publishWithCanceledObservation(t *testing.T, observer *canceledPublishObserver) f1test.Captured {
+	t.Helper()
+	client := inmemObserverFactory(t, observer)
+	handled := make(chan string, 1)
+	startObserverRunner(t, client, observerSubscription("orders", "orders.created.v1", 1, func(_ context.Context, event *f1.Event) error {
+		var payload string
+		if err := event.Decode(&payload); err != nil {
+			return err
+		}
+		handled <- payload
+		return nil
+	}, f1.Ignore))
+	ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+	defer cancel()
+	id, err := client.Publisher().Publish(ctx, "orders.created.v1", "observed-payload")
+	if err != nil {
+		t.Fatalf("Publish with canceled observer context: %v", err)
+	}
+	select {
+	case payload := <-handled:
+		if payload != "observed-payload" {
+			t.Fatalf("handled payload = %q, want observed-payload", payload)
+		}
+	case <-ctx.Done():
+		t.Fatalf("handler did not receive published payload: %v", ctx.Err())
+	}
+	calls := waitForCounts(t, observer.Recorder, successCounts())
+	assertObserverContract(t, calls, successCounts())
+	assertObserverOrder(t, calls, [][]string{
+		{"start publish", "start message_built", "finish message_built", "finish publish"},
+		{"record delivery_received", "start process", "finish process", "start settle", "finish settle"},
+	})
+	captures := client.Published()
+	if len(captures) != 1 || captures[0].Headers["id"] != id {
+		t.Fatalf("accepted messages = %#v, want one with ID %q", captures, id)
+	}
+	if ctx.Err() != nil || ctx.Value(publishTraceKey{}) != nil {
+		t.Fatal("observation changed the caller context")
+	}
+	return captures[0]
+}
+
 // TestObserverContract drives each scenario through the inmem public API. Decode
 // failure, poison without a route, reconnect and a partial batch failure cannot
 // be produced from there, so the package-internal observer tests own them.
