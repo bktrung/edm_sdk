@@ -11,6 +11,7 @@ import (
 	"github.com/twmb/franz-go/pkg/kmsg"
 
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/driver"
+	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/clock"
 )
 
 func TestKafkaBacklogHeadSelection(t *testing.T) {
@@ -220,6 +221,161 @@ func (p *kafkaBacklogPoller) PollFetches(context.Context) kgo.Fetches {
 	batch := p.batches[0]
 	p.batches = p.batches[1:]
 	return batch
+}
+
+// kafkaTestBacklogProbes returns the one-partition probe map the ownership tests
+// read, which has to be non-empty: a read with nothing to probe returns before
+// it touches probe ownership at all.
+func kafkaTestBacklogProbes() map[string][]backlogPartitionProbe {
+	return map[string][]backlogPartitionProbe{
+		"orders": {{destination: "orders", partition: 0, lag: 1, committed: 0}},
+	}
+}
+
+// TestKafkaBacklogProbeGivesUpWhileAnOwnerHoldsTheClient pins the bound the
+// core puts on a backlog tick (backlog_poll.go): a read whose context ends
+// while another probe owns the shared client returns without waiting for that
+// owner and without starting a probe. The mutex this ownership replaces could
+// not be waited on with a context, so a caller with a deadline waited for the
+// owner instead, and one owner parked on an unreachable partition held every
+// later read past its deadline.
+func TestKafkaBacklogProbeGivesUpWhileAnOwnerHoldsTheClient(t *testing.T) {
+	t.Parallel()
+	pollCtx := t.Context()
+	c := &consumer{
+		conn:              &conn{clientOpts: []kgo.Opt{noDialKafkaOption()}},
+		pollCtx:           pollCtx,
+		backlogProbeToken: make(chan struct{}, 1),
+	}
+	c.backlogProbeToken <- struct{}{} // another probe owns the client
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan kgo.Fetches, 1)
+	go func() { done <- c.probeBacklog(ctx, kafkaTestBacklogProbes()) }()
+	// The owner never returns the client, so the read can only end because its
+	// context does.
+	cancel()
+
+	timer := clock.NewReal().Timer(time.Second)
+	defer timer.Stop()
+	select {
+	case fetches := <-done:
+		if fetches != nil {
+			t.Fatalf("fetches = %v, want nil for a read that gave up", fetches)
+		}
+	case <-timer.C:
+		t.Fatal("probeBacklog waited for the probe that owned the client")
+	}
+	if c.backlogClient != nil {
+		t.Fatal("probeBacklog started a probe for a read that had already given up")
+	}
+}
+
+// TestKafkaBacklogProbeReturnsOwnershipForACallerThatAlreadyGaveUp pins the
+// other half of the give-up: when the client is free and the caller's context
+// has already ended, the read takes the token, sees the ending context and
+// returns the token instead of probing. A select picks at random between ready
+// cases, so the context is checked again after the token arrives; without that
+// check a caller that had given up starts a probe nobody waits for, and the
+// next caller waits on it. The loop is what makes the random pick land on each
+// branch rather than one of them by luck.
+func TestKafkaBacklogProbeReturnsOwnershipForACallerThatAlreadyGaveUp(t *testing.T) {
+	t.Parallel()
+	pollCtx := t.Context()
+	c := &consumer{
+		conn:              &conn{clientOpts: []kgo.Opt{noDialKafkaOption()}},
+		pollCtx:           pollCtx,
+		backlogProbeToken: make(chan struct{}, 1),
+	}
+	probes := kafkaTestBacklogProbes()
+
+	for i := range 50 {
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		if fetches := c.probeBacklog(ctx, probes); fetches != nil {
+			t.Fatalf("iteration %d: fetches = %v, want nil", i, fetches)
+		}
+		if c.backlogClient != nil {
+			t.Fatalf("iteration %d: the read started a probe for a caller that had already given up", i)
+		}
+		select {
+		case c.backlogProbeToken <- struct{}{}:
+			<-c.backlogProbeToken
+		default:
+			t.Fatal("the read kept the client's ownership after its caller gave up")
+		}
+	}
+}
+
+// TestKafkaBacklogProbeTakesOwnershipAfterTheOwnerReleases pins that a give-up
+// leaves the client usable: the owner returns the token, and the next read
+// takes it and probes as before, client and partition set included. The hook on
+// the new client is what says the probe ran, and the caller's context is what
+// ends it, so the test needs no broker.
+func TestKafkaBacklogProbeTakesOwnershipAfterTheOwnerReleases(t *testing.T) {
+	t.Parallel()
+	pollCtx := t.Context()
+	created := make(chan struct{}, 1)
+	c := &consumer{
+		conn: &conn{clientOpts: []kgo.Opt{
+			noDialKafkaOption(),
+			kgo.WithHooks(kafkaTestNewClientHook{created: created}),
+		}},
+		pollCtx:           pollCtx,
+		backlogProbeToken: make(chan struct{}, 1),
+	}
+	c.backlogProbeToken <- struct{}{} // a probe owns the client
+	<-c.backlogProbeToken             // and gives it back
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		c.probeBacklog(ctx, kafkaTestBacklogProbes())
+	}()
+
+	timer := clock.NewReal().Timer(time.Second)
+	defer timer.Stop()
+	select {
+	case <-created:
+	case <-timer.C:
+		t.Fatal("the read after the owner released did not build a probe client")
+	}
+	cancel()
+	settleTimer := clock.NewReal().Timer(time.Second)
+	defer settleTimer.Stop()
+	select {
+	case <-done:
+	case <-settleTimer.C:
+		t.Fatal("the probed read did not end with its context")
+	}
+	if c.backlogClient == nil {
+		t.Fatal("the probed read left no client behind")
+	}
+	t.Cleanup(func() {
+		if client := c.backlogClient; client != nil {
+			client.Close()
+		}
+	})
+	c.closeBacklogClient()
+	if c.backlogClient != nil || c.backlogPartitions != nil {
+		t.Fatal("closeBacklogClient left the probed client in place")
+	}
+}
+
+// kafkaTestNewClientHook reports the client a probe builds, which is the
+// observable point at which a read has taken ownership and started probing.
+type kafkaTestNewClientHook struct {
+	created chan struct{}
+}
+
+func (h kafkaTestNewClientHook) OnNewClient(*kgo.Client) {
+	select {
+	case h.created <- struct{}{}:
+	default:
+	}
 }
 
 var errKafkaBacklogProbe = &kafkaBacklogProbeError{}
