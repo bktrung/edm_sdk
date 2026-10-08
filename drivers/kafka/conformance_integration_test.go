@@ -77,13 +77,13 @@ func kafkaInspector(raw driver.Conn) (conformance.Inspect, error) {
 			}
 			consumer.mu.Unlock()
 		}
-		starts, err := listKafkaOffsets(ctx, func(listCtx context.Context) (kadm.ListedOffsets, error) {
+		starts, err := listKafkaOffsets(ctx, clock.NewReal(), func(listCtx context.Context) (kadm.ListedOffsets, error) {
 			return admin.ListStartOffsets(listCtx, destination)
 		})
 		if err != nil {
 			return conformance.BrokerView{}, classifyKafkaOffsetError("inspect", err)
 		}
-		ends, err := listKafkaOffsets(ctx, func(listCtx context.Context) (kadm.ListedOffsets, error) {
+		ends, err := listKafkaOffsets(ctx, clock.NewReal(), func(listCtx context.Context) (kadm.ListedOffsets, error) {
 			return admin.ListEndOffsets(listCtx, destination)
 		})
 		if err != nil {

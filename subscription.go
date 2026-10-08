@@ -500,8 +500,8 @@ func validateSubscriptionModeAndPolicy(name string, mode Mode, policy UnmatchedP
 }
 
 func cloneFairness(value FairnessConfig) FairnessConfig {
-	value.Weights = clonePriorityWeights(value.Weights)
-	value.Budgets = clonePriorityBudgets(value.Budgets)
+	value.Weights = maps.Clone(value.Weights)
+	value.Budgets = maps.Clone(value.Budgets)
 	return value
 }
 
@@ -512,10 +512,10 @@ func cloneRetry(value RetryConfig) RetryConfig {
 
 func mergeFairness(base, override FairnessConfig) FairnessConfig {
 	if override.Weights != nil {
-		base.Weights = clonePriorityWeights(override.Weights)
+		base.Weights = maps.Clone(override.Weights)
 	}
 	if override.Budgets != nil {
-		base.Budgets = clonePriorityBudgets(override.Budgets)
+		base.Budgets = maps.Clone(override.Budgets)
 	}
 	if override.RetryWeightDivisor != 0 {
 		base.RetryWeightDivisor = override.RetryWeightDivisor
@@ -554,22 +554,4 @@ func fairnessZero(value FairnessConfig) bool {
 
 func retryZero(value RetryConfig) bool {
 	return value.MaxAttempts == 0 && value.InitialInterval == 0 && value.Multiplier == 0 && value.MaxInterval == 0 && value.Tiers == nil
-}
-
-func clonePriorityWeights(value map[Priority]int) map[Priority]int {
-	if value == nil {
-		return nil
-	}
-	result := make(map[Priority]int, len(value))
-	maps.Copy(result, value)
-	return result
-}
-
-func clonePriorityBudgets(value map[Priority]time.Duration) map[Priority]time.Duration {
-	if value == nil {
-		return nil
-	}
-	result := make(map[Priority]time.Duration, len(value))
-	maps.Copy(result, value)
-	return result
 }

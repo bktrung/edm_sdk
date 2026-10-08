@@ -64,7 +64,6 @@ const (
 // deliveryState records attempted versus settled ownership. operation and
 // nackOptions preserve the exact settlement operation for deferred retries.
 type deliveryState struct {
-	id        uint64
 	attempted bool
 	settled   bool
 	// operation records which settlement call was last made, so that a failed
@@ -77,10 +76,8 @@ type deliveryState struct {
 	// processCtx carries the context Start of ObserverProcess returned, stored
 	// only when an observer is set. The successor publish start uses it as its
 	// context when set and the context at hand otherwise.
-	processCtx       context.Context
-	headerMaxBytes   int
-	envelopeDecoded  bool
-	envelopePriority Priority
+	processCtx     context.Context
+	headerMaxBytes int
 }
 
 type poisonDropReport struct {
@@ -1905,7 +1902,7 @@ func enqueueDelivery(r *Runner, ctx context.Context, dispatch chan<- delivery, m
 		// bounded cleanup the delivery path uses: the registry entry leaves
 		// only once the settlement path finished, so a drain never reads zero
 		// while the broker still owns the message.
-		state := &deliveryState{id: id}
+		state := &deliveryState{}
 		_ = nackDelivery(r, runnerSettlementContext(r, ctx), message, driver.NackOptions{Requeue: true}, state)
 		retryDeliverySettlement(r, ctx, message, state)
 		r.inflight.Remove(id)
@@ -1935,7 +1932,7 @@ func observerEnqueueSource(source driver.EnqueueSource) EnqueuedAtSource {
 
 func processDelivery(r *Runner, ctx context.Context, item delivery) {
 	abandoned := false
-	state := &deliveryState{id: item.id}
+	state := &deliveryState{}
 	var envelope Envelope
 	defer func() {
 		if recovered := recover(); recovered != nil {
@@ -2012,9 +2009,8 @@ func effectiveMaxAttempts(eventMaxAttempts, policyMaxAttempts int) int {
 // dispatchMessage returns true only after the delivery's settlement path has
 // completed; classification and settlement stay outside middleware. state
 // carries the delivery's settlement bookkeeping and is required: it is where
-// the decode outcome, the header limit and the pending drop report are
-// recorded, so a call site must hold the delivery's own state rather than a
-// temporary nothing else sees.
+// the header limit and the pending drop report are recorded, so a call site
+// must hold the delivery's own state rather than a temporary nothing else sees.
 func dispatchMessage(r *Runner, ctx context.Context, message driver.InboundMessage, envelopeOut *Envelope, abandoned *bool, state *deliveryState) bool {
 	r.client.mu.Lock()
 	headerMaxBytes := effectiveHeaderLimit(r.client.config.Codec.MaxHeaderBytes, r.client.effective.MaxHeaderBytes)
@@ -2025,8 +2021,6 @@ func dispatchMessage(r *Runner, ctx context.Context, message driver.InboundMessa
 	if err != nil {
 		return deadLetterAndSettle(r, ctx, message, Envelope{}, ReasonDecode, err, state)
 	}
-	state.envelopeDecoded = true
-	state.envelopePriority = envelope.Priority
 	if envelope.Attempt < 1 {
 		envelope.Attempt = 1
 	}
@@ -2408,7 +2402,7 @@ func ackDelivery(r *Runner, ctx context.Context, message driver.InboundMessage, 
 // startSettleObservation starts one settle pair for a single broker settle
 // call. It returns the guard for its finish, the finish identity, and whether
 // observation is on. A nil runner or a nil observer starts nothing.
-func startSettleObservation(r *Runner, ctx context.Context, message driver.InboundMessage, op SettleOperation, state *deliveryState) (observerFinishGuard, FinishEvent, bool) {
+func startSettleObservation(r *Runner, ctx context.Context, message driver.InboundMessage, op SettleOperation) (observerFinishGuard, FinishEvent, bool) {
 	if r == nil || r.client == nil || r.client.observer == nil {
 		return observerFinishGuard{}, FinishEvent{}, false
 	}
@@ -2436,8 +2430,8 @@ func startSettleObservation(r *Runner, ctx context.Context, message driver.Inbou
 	return guard, base, true
 }
 
-// finishSettleObservation emits the settle finish for one broker settle call.
-func finishSettleObservation(guard *observerFinishGuard, base FinishEvent, err error) {
+// finishObservationFromError completes the guard with the operation's outcome.
+func finishObservationFromError(guard *observerFinishGuard, base FinishEvent, err error) {
 	finish := base
 	if err == nil {
 		finish.Outcome = ObserverOutcomeOK
@@ -2458,7 +2452,7 @@ func ackDeliveryAs(r *Runner, ctx context.Context, message driver.InboundMessage
 		return false
 	}
 	state.operation = settlementOperationAck
-	settleGuard, settleBase, observed := startSettleObservation(r, ctx, message, SettleAck, state)
+	settleGuard, settleBase, observed := startSettleObservation(r, ctx, message, SettleAck)
 	if observed {
 		defer settleGuard.abandon()
 	}
@@ -2466,7 +2460,7 @@ func ackDeliveryAs(r *Runner, ctx context.Context, message driver.InboundMessage
 	state.attempted = true
 	state.settled = err == nil
 	if observed {
-		finishSettleObservation(&settleGuard, settleBase, err)
+		finishObservationFromError(&settleGuard, settleBase, err)
 	}
 	if r != nil && state.settled && handled {
 		r.report(runnerEvent{kind: runnerEventHandledDelivery})
@@ -2486,7 +2480,7 @@ func nackDelivery(r *Runner, ctx context.Context, message driver.InboundMessage,
 	}
 	state.operation = settlementOperationNack
 	state.nackOptions = options
-	settleGuard, settleBase, observed := startSettleObservation(r, ctx, message, SettleNack, state)
+	settleGuard, settleBase, observed := startSettleObservation(r, ctx, message, SettleNack)
 	if observed {
 		defer settleGuard.abandon()
 	}
@@ -2494,7 +2488,7 @@ func nackDelivery(r *Runner, ctx context.Context, message driver.InboundMessage,
 	state.attempted = true
 	state.settled = err == nil
 	if observed {
-		finishSettleObservation(&settleGuard, settleBase, err)
+		finishObservationFromError(&settleGuard, settleBase, err)
 	}
 	if state.settled {
 		state.poisonDrop = nil
@@ -2690,18 +2684,18 @@ func deadLetter(r *Runner, ctx context.Context, message driver.InboundMessage, e
 		setDeathHeaders(headers, reason, lastErr, r.client.options.clock.Now().UTC(), message.Destination)
 		if err := capMalformedDeathHeaders(headers, headerMaxBytes); err != nil {
 			if observed {
-				finishSuccessorPublish(&publishGuard, publishBase, err)
+				finishObservationFromError(&publishGuard, publishBase, err)
 			}
 			return fmt.Errorf("%w: %w", errSuccessorCopyUnencodable, err)
 		}
 		if err := publishSuccessor(r, runnerSettlementContext(r, ctx), driver.OutboundMessage{Destination: destination, Key: append([]byte(nil), message.Key...), Headers: headerSlice(headers), Body: append([]byte(nil), message.Body...)}); err != nil {
 			if observed {
-				finishSuccessorPublish(&publishGuard, publishBase, err)
+				finishObservationFromError(&publishGuard, publishBase, err)
 			}
 			return err
 		}
 		if observed {
-			finishSuccessorPublish(&publishGuard, publishBase, nil)
+			finishObservationFromError(&publishGuard, publishBase, nil)
 			observeDeadLetterPublished(r, message, envelope, reason, destination, topic)
 		}
 		runnerNotifyDeadLetter(r, runnerSettlementContext(r, ctx), DeadLettered{Envelope: Envelope{}, Body: append([]byte(nil), message.Body...), Reason: reason, Attempt: 0, LastErr: lastErr, Destination: destination})
@@ -2754,7 +2748,7 @@ func deadLetter(r *Runner, ctx context.Context, message driver.InboundMessage, e
 	encoded, err := death.EncodeHeaders(headerMaxBytes)
 	if err != nil {
 		if observed {
-			finishSuccessorPublish(&publishGuard, publishBase, err)
+			finishObservationFromError(&publishGuard, publishBase, err)
 		}
 		// Marked rather than returned bare: the caller decides what to do with
 		// an unencodable copy, and it must not have to match on the text to
@@ -2768,12 +2762,12 @@ func deadLetter(r *Runner, ctx context.Context, message driver.InboundMessage, e
 	sort.Slice(out.Headers, func(i, j int) bool { return out.Headers[i].Key < out.Headers[j].Key })
 	if err := publishSuccessor(r, runnerSettlementContext(r, ctx), out); err != nil {
 		if observed {
-			finishSuccessorPublish(&publishGuard, publishBase, err)
+			finishObservationFromError(&publishGuard, publishBase, err)
 		}
 		return err
 	}
 	if observed {
-		finishSuccessorPublish(&publishGuard, publishBase, nil)
+		finishObservationFromError(&publishGuard, publishBase, nil)
 		observeDeadLetterPublished(r, message, envelope, reason, destination, topic)
 	}
 	runnerNotifyDeadLetter(r, runnerSettlementContext(r, ctx), DeadLettered{Envelope: death, Body: append([]byte(nil), message.Body...), Reason: reason, Attempt: death.Attempt, LastErr: lastErr, Destination: destination})
@@ -3011,18 +3005,6 @@ func startSuccessorPublish(r *Runner, ctx context.Context, route PublishRoute, t
 	return nextCtx, guard, base, true
 }
 
-// finishSuccessorPublish emits the publish finish for one successor handoff.
-func finishSuccessorPublish(guard *observerFinishGuard, base FinishEvent, err error) {
-	finish := base
-	if err == nil {
-		finish.Outcome = ObserverOutcomeOK
-	} else {
-		finish.Outcome = ObserverOutcomeError
-		finish.ErrorClass = errorClassOf(err)
-	}
-	guard.finishWith(finish)
-}
-
 // retryAndSettle republishes message to its retry destination, carrying the
 // already-received body forward unchanged. Like deadLetter, it deliberately
 // does not apply codec.maxBodyBytes: that limit only guards a publish the
@@ -3073,7 +3055,7 @@ func retryAndSettle(r *Runner, ctx context.Context, message driver.InboundMessag
 	encoded, err := copyEnvelope.EncodeHeaders(state.headerMaxBytes)
 	if err != nil {
 		if observed {
-			finishSuccessorPublish(&publishGuard, publishBase, err)
+			finishObservationFromError(&publishGuard, publishBase, err)
 		}
 		return deadLetterAndSettle(r, ctx, message, envelope, ReasonTerminal,
 			errors.Join(lastErr, fmt.Errorf("f1: retry copy cannot be encoded: %w", err)), state)
@@ -3085,7 +3067,7 @@ func retryAndSettle(r *Runner, ctx context.Context, message driver.InboundMessag
 	sort.Slice(out.Headers, func(i, j int) bool { return out.Headers[i].Key < out.Headers[j].Key })
 	if err := publishSuccessor(r, runnerSettlementContext(r, ctx), out); err != nil {
 		if observed {
-			finishSuccessorPublish(&publishGuard, publishBase, err)
+			finishObservationFromError(&publishGuard, publishBase, err)
 		}
 		if successorNeverPublishable(err) {
 			// The copy is unacceptable on its own terms, so it would be refused
@@ -3098,7 +3080,7 @@ func retryAndSettle(r *Runner, ctx context.Context, message driver.InboundMessag
 		return false
 	}
 	if observed {
-		finishSuccessorPublish(&publishGuard, publishBase, nil)
+		finishObservationFromError(&publishGuard, publishBase, nil)
 		event := successorPoint(r, ObserverRetryScheduled, message, envelope, topic)
 		event.ErrorClass = ErrorClassRetryable
 		event.NextAttempt = copyEnvelope.Attempt

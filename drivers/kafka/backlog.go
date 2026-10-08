@@ -37,13 +37,13 @@ func (c *consumer) readKafkaOffsetSnapshot(ctx context.Context, operation string
 	c.mu.Unlock()
 
 	admin := kadm.NewClient(c.conn.client)
-	starts, err := listKafkaOffsets(ctx, func(listCtx context.Context) (kadm.ListedOffsets, error) {
+	starts, err := listKafkaOffsets(ctx, c.clock, func(listCtx context.Context) (kadm.ListedOffsets, error) {
 		return admin.ListStartOffsets(listCtx, destinations...)
 	})
 	if err != nil {
 		return kafkaOffsetSnapshot{}, classifyKafkaOffsetError(operation, err)
 	}
-	ends, err := listKafkaOffsets(ctx, func(listCtx context.Context) (kadm.ListedOffsets, error) {
+	ends, err := listKafkaOffsets(ctx, c.clock, func(listCtx context.Context) (kadm.ListedOffsets, error) {
 		return admin.ListEndOffsets(listCtx, destinations...)
 	})
 	if err != nil {
