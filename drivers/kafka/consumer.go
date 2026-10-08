@@ -197,8 +197,11 @@ type consumer struct {
 	committer offsetCommitter
 	// commitFn sends a committer round; newConsumer installs sendCommits, and
 	// a test replaces it to settle without a group coordinator.
-	commitFn  commitSender
-	backlogMu sync.Mutex
+	commitFn commitSender
+	// beforeRequeueCompletion lets tests schedule a revoke at the charge handoff.
+	// Install before use; nil in production. It must not wait for c.mu while held.
+	beforeRequeueCompletion func()
+	backlogMu               sync.Mutex
 	// backlogProbeToken is the shared backlog client's one ownership token: a
 	// full slot means one probe has the client, and that token is what a later
 	// probe and the teardown wait on. A mutex would not do, because a sampler
@@ -397,7 +400,6 @@ func (s *settler) Nack(ctx context.Context, options driver.NackOptions) error {
 		if s.owner.owned[s.key] && s.owner.trackers[s.key] == s.tracker && tracker == s.tracker && !draining {
 			s.owner.requeueLocked(s)
 		}
-		s.owner.mu.Unlock()
 		// A queued redelivery inherits the delivery's charge, so the partition
 		// stays held and the destination's slot stays counted until the redelivery
 		// settles. Queueing nothing is the exception, and for the same reason as
@@ -408,7 +410,19 @@ func (s *settler) Nack(ctx context.Context, options driver.NackOptions) error {
 		// revoke reaches the partition, and this settler is gone from c.settlers by
 		// the time the revoke runs, so the revoke's own release has nothing to
 		// release.
-		handOff = !s.owner.completeSettlement(s, !draining)
+		// If Nack unlocked after queueing P, revoke could drop that copy and
+		// release its charge before Nack completed P's predecessor. Completion
+		// would then see the detached tracker and release another slot, stealing
+		// Q's charge. Keep both steps locked so revoke sees P already completed.
+		if s.owner.beforeRequeueCompletion != nil {
+			s.owner.beforeRequeueCompletion()
+		}
+		contended, shouldLeave := s.owner.completeSettlementLocked(s, !draining)
+		s.owner.mu.Unlock()
+		if shouldLeave {
+			s.owner.requestLeave()
+		}
+		handOff = !contended
 		return nil
 	}
 
@@ -1582,6 +1596,17 @@ func (c *consumer) trackerBaseLocked(key partitionKey, base int64) int64 {
 // rather than handing it over (see handOff).
 func (c *consumer) completeSettlement(settler *settler, preserveUnsettled bool) (contended bool) {
 	c.mu.Lock()
+	contended, shouldLeave := c.completeSettlementLocked(settler, preserveUnsettled)
+	c.mu.Unlock()
+	if shouldLeave {
+		c.requestLeave()
+	}
+	return contended
+}
+
+// completeSettlementLocked completes the accounting under c.mu and reports
+// whether the caller must request leave after unlocking.
+func (c *consumer) completeSettlementLocked(settler *settler, preserveUnsettled bool) (contended, shouldLeave bool) {
 	if preserveUnsettled && (settler.tracker == nil || c.trackers[settler.key] != settler.tracker) {
 		preserveUnsettled = false
 	}
@@ -1594,8 +1619,7 @@ func (c *consumer) completeSettlement(settler *settler, preserveUnsettled bool) 
 			settler.slotReleased = true
 		}
 		c.signalSettlerDoneLocked()
-		c.mu.Unlock()
-		return contended
+		return contended, false
 	}
 	delete(c.settlers, settler)
 	if !preserveUnsettled && !settler.slotReleased {
@@ -1608,15 +1632,11 @@ func (c *consumer) completeSettlement(settler *settler, preserveUnsettled bool) 
 		c.setPauseReasonLocked(settler.record.Topic, pauseReasonPrefetch, false)
 	}
 	c.signalSettlerDoneLocked()
-	shouldLeave := c.draining && len(c.settlers) == 0 && !c.leaveRequested
+	shouldLeave = c.draining && len(c.settlers) == 0 && !c.leaveRequested
 	if shouldLeave {
 		c.leaveRequested = true
 	}
-	c.mu.Unlock()
-	if shouldLeave {
-		c.requestLeave()
-	}
-	return contended
+	return contended, shouldLeave
 }
 
 // requeueLocked puts the record a settler delivered back at the head of its

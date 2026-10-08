@@ -437,3 +437,73 @@ func TestConsumerRequeueHandsTheRedeliveryOver(t *testing.T) {
 		t.Fatalf("outstanding = %d after the revoke discarded the buffered redelivery, want 0", got)
 	}
 }
+
+func TestConsumerRequeueRevokeKeepsOtherPartitionCharged(t *testing.T) {
+	first := partitionKey{destination: "topic", partition: 0}
+	second := partitionKey{destination: "topic", partition: 1}
+	c, predecessor := requeueRevokeConsumer(t, first, newAckTracker(4))
+	c.cfg.Prefetch = 2
+	c.budgets[first.destination] = 2
+	c.unsettled[first.destination] = 2
+	c.admitted = 2
+	c.outstanding[second] = 1
+	c.owned[second] = true
+	c.trackers[second] = newAckTracker(4)
+	other := &settler{
+		owner: c, key: second, tracker: c.trackers[second],
+		record: &kgo.Record{Topic: second.destination, Partition: second.partition, Offset: 4},
+	}
+	c.settlers[other] = struct{}{}
+	c.pauseReasons[first.destination] = pauseReasonSet{pauseReasonUserPaused: {}}
+
+	revoked := make(chan struct{})
+	c.beforeRequeueCompletion = func() {
+		// With the old window open, finish revoke before Nack resumes. With
+		// completion still locked, revoke must wait until the predecessor ends.
+		unlocked := c.mu.TryLock()
+		if unlocked {
+			c.mu.Unlock()
+		}
+		go func() {
+			c.dropTracker(first.destination, first.partition)
+			close(revoked)
+		}()
+		if unlocked {
+			<-revoked
+		}
+	}
+	err := predecessor.Nack(context.Background(), driver.NackOptions{Requeue: true})
+	<-revoked
+	if err != nil {
+		t.Fatalf("Nack(requeue) = %v, want nil", err)
+	}
+	c.mu.Lock()
+	if got := c.unsettled[first.destination]; got != 1 {
+		t.Errorf("unsettled = %d with the other partition still live, want 1", got)
+	}
+	if got := c.admitted; got != 1 {
+		t.Errorf("admitted = %d with the other partition still live, want 1", got)
+	}
+	if c.outstanding[first] != 0 || c.outstanding[second] != 1 {
+		t.Errorf("partition charges = (%d, %d), want (0, 1)", c.outstanding[first], c.outstanding[second])
+	}
+	if len(c.pending[first]) != 0 || c.requeued[first] != 0 {
+		t.Error("revoked partition retained a queued redelivery")
+	}
+	_, predecessorRetained := c.settlers[predecessor]
+	_, otherRetained := c.settlers[other]
+	if !predecessor.settled || predecessorRetained || other.settled || !otherRetained {
+		t.Error("requeue/revoke did not end only the predecessor")
+	}
+	c.mu.Unlock()
+
+	c.beforeRequeueCompletion = nil
+	c.dropTracker(second.destination, second.partition)
+	if err := other.Nack(context.Background(), driver.NackOptions{Requeue: true}); err != nil {
+		t.Fatalf("Nack(requeue) of other revoked partition = %v, want nil", err)
+	}
+	if c.unsettled[first.destination] != 0 || c.admitted != 0 || c.outstanding[first] != 0 || c.outstanding[second] != 0 {
+		t.Errorf("charges after both deliveries end = (%d, %d, %d, %d), want (0, 0, 0, 0)",
+			c.unsettled[first.destination], c.admitted, c.outstanding[first], c.outstanding[second])
+	}
+}
