@@ -133,6 +133,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
   endpoint has kept refusing for about 5 seconds of attempts, and every timeout exit keeps the
   broker's cause. A queue delete refused with 403 during prune is reported as a permission error
   instead of a transient one.
+- A Kafka requeue that races a partition revoke no longer frees the same in-flight slot twice, so
+  the consumer keeps to its Prefetch limit during rebalances.
 - The RabbitMQ driver refuses a message whose custom header name makes its AMQP table key longer
   than 255 bytes as too large, before anything is written, instead of letting the client close the
   whole connection.
