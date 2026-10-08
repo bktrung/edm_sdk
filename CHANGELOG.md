@@ -129,6 +129,10 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
   cancel notices, so the core repairs a lane that used to die silently.
 - An in-memory purge resets the destination's dispatch bookkeeping, so a message published right
   after the purge is delivered with its enqueue time and key instead of being skipped.
+- RabbitMQ Open classifies a refused login as a permission error and stops retrying once every
+  endpoint has kept refusing for about 5 seconds of attempts, and every timeout exit keeps the
+  broker's cause. A queue delete refused with 403 during prune is reported as a permission error
+  instead of a transient one.
 - The RabbitMQ driver refuses a message whose custom header name makes its AMQP table key longer
   than 255 bytes as too large, before anything is written, instead of letting the client close the
   whole connection.
