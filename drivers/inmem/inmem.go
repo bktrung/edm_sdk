@@ -238,6 +238,7 @@ type groupState struct {
 }
 
 type queuedMessage struct {
+	// message is immutable; queued and history entries may share its payload.
 	message         driver.OutboundMessage
 	enqueuedAt      time.Time
 	deliveryCount   int
@@ -567,30 +568,10 @@ func (c *conn) requeueDeliveryLocked(delivery *settler, now time.Time) {
 		delivery.mu.Unlock()
 		return
 	}
-	delivery.settled = true
+	delivery.retireLocked()
 	delivery.mu.Unlock()
 	consumer := delivery.consumer
-	delete(consumer.inflight, delivery)
-	if consumer.outstanding > 0 {
-		consumer.outstanding--
-	}
 	name := delivery.message.message.Destination
-	if consumer.unsettled[name] > 0 {
-		consumer.unsettled[name]--
-	}
-	key := string(delivery.message.message.Key)
-	if key != "" {
-		keyID := deliveryKey{destination: name, key: key}
-		if consumer.unsettledKey[keyID] > 1 {
-			consumer.unsettledKey[keyID]--
-		} else {
-			delete(consumer.unsettledKey, keyID)
-			affinity := affinityKey{group: consumer.cfg.Group, key: key}
-			if dest, ok := c.destinations[name]; ok && dest.affinity[affinity] == consumer {
-				delete(dest.affinity, affinity)
-			}
-		}
-	}
 	delivery.message.deliveryCount++
 	delivery.message.due = now
 	if delivery.message.deliveredGroups != nil {

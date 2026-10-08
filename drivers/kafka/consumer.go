@@ -2168,7 +2168,7 @@ func classifyKafkaOffsetError(operation string, err error) error {
 	return classify(operation, kind, err)
 }
 
-func listKafkaOffsets(ctx context.Context, list func(context.Context) (kadm.ListedOffsets, error)) (kadm.ListedOffsets, error) {
+func listKafkaOffsets(ctx context.Context, clk clock.Clock, list func(context.Context) (kadm.ListedOffsets, error)) (kadm.ListedOffsets, error) {
 	retryCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 	for {
@@ -2179,7 +2179,7 @@ func listKafkaOffsets(ctx context.Context, list func(context.Context) (kadm.List
 		if err == nil || !errors.Is(err, kerr.UnknownTopicOrPartition) {
 			return offsets, err
 		}
-		timer := time.NewTimer(50 * time.Millisecond) //nolint:forbidigo // Kafka metadata propagation is broker-driven and requires a wall-clock retry
+		timer := clk.Timer(50 * time.Millisecond)
 		select {
 		case <-retryCtx.Done():
 			timer.Stop()

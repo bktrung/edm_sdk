@@ -212,7 +212,7 @@ boundaries:
 Observer methods run synchronously on these paths, without a client or runner
 lock held. The adapter must therefore be concurrent-safe and non-blocking.
 
-`worker.go:invokeHandlerMessage` calls `observer_call.go:Client.observeStart` for `process`, passes its returned context to the handler, and finishes through `worker.go:finishProcessResult` or guard abandonment. `worker.go:startSettleObservation` and `worker.go:finishSettleObservation` bracket Ack or Nack. `worker.go:startSuccessorPublish` starts retry and DLQ sends; `worker.go:retryAndSettle` and `worker.go:deadLetter` call `observer_call.go:Client.injectTrace`, then `worker.go:finishSuccessorPublish` finishes the send.
+`worker.go:invokeHandlerMessage` calls `observer_call.go:Client.observeStart` for `process`, passes its returned context to the handler, and finishes through `worker.go:finishProcessResult` or guard abandonment. `worker.go:startSettleObservation` starts Ack or Nack observation, and `worker.go:startSuccessorPublish` starts retry and DLQ sends. Both complete through `worker.go:finishObservationFromError`. `worker.go:retryAndSettle` and `worker.go:deadLetter` call `observer_call.go:Client.injectTrace` before sending.
 
 ## Dispatch lanes and scheduler
 
