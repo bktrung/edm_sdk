@@ -197,9 +197,15 @@ type consumer struct {
 	committer offsetCommitter
 	// commitFn sends a committer round; newConsumer installs sendCommits, and
 	// a test replaces it to settle without a group coordinator.
-	commitFn          commitSender
-	backlogMu         sync.Mutex
-	backlogProbeMu    sync.Mutex
+	commitFn  commitSender
+	backlogMu sync.Mutex
+	// backlogProbeToken is the shared backlog client's one ownership token: a
+	// full slot means one probe has the client, and that token is what a later
+	// probe and the teardown wait on. A mutex would not do, because a sampler
+	// with a deadline has to be able to give up on the wait (see probeBacklog).
+	// newConsumer is its only production writer, so a consumer built as a
+	// literal has none.
+	backlogProbeToken chan struct{}
 	backlogClient     *kgo.Client
 	backlogPartitions map[string][]int32
 	// assignmentMu keeps a rebalance callback indivisible against the rest of
@@ -558,6 +564,7 @@ func newConsumer(ctx context.Context, connection *conn, cfg driver.ConsumerConfi
 		requeued:              make(map[partitionKey]int),
 		clock:                 clock.NewReal(),
 		headTimerChanged:      make(chan struct{}, 1),
+		backlogProbeToken:     make(chan struct{}, 1),
 	}
 	consumer.leaveFn = consumer.leaveGroup
 	consumer.commitFn = consumer.sendCommits

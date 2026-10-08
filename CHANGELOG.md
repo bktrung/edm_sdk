@@ -118,6 +118,9 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 - The RabbitMQ orphan scan folds a parking queue into its parent only when the parent is itself in
   the caller's scope. An out-of-scope parent is no longer reported, and the parking queue is
   reported under its own name with its own count.
+- A Kafka backlog read whose context ends while another probe holds the shared backlog client
+  returns without waiting for that probe, instead of outliving the deadline the core puts on each
+  backlog poll.
 - The RabbitMQ driver refuses a message whose correlation ID, message ID, type or content type is
   longer than 255 bytes as too large, before anything is written, instead of letting the AMQP client
   close the whole shared connection.

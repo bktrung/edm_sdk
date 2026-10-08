@@ -239,8 +239,19 @@ func (c *consumer) probeBacklog(ctx context.Context, probes map[string][]backlog
 		cancelProbe()
 	}()
 
-	c.backlogProbeMu.Lock()
-	defer c.backlogProbeMu.Unlock()
+	select {
+	case c.backlogProbeToken <- struct{}{}:
+	case <-probeCtx.Done():
+		return nil
+	}
+	defer func() { <-c.backlogProbeToken }()
+	// Ownership can arrive at the same instant the caller's context ends, and a
+	// select picks at random between ready cases, so the context is checked
+	// again here: a caller that has given up must not start a probe, and must
+	// not leave one behind for the next caller to wait on.
+	if probeCtx.Err() != nil {
+		return nil
+	}
 	c.mu.Lock()
 	stopped := c.stopped
 	c.mu.Unlock()
@@ -319,8 +330,16 @@ func pollKafkaBacklog(ctx context.Context, client kafkaBacklogFetcher, wanted ma
 }
 
 func (c *consumer) closeBacklogClient() {
-	c.backlogProbeMu.Lock()
-	defer c.backlogProbeMu.Unlock()
+	// A consumer built as a literal has no token and never probed, so there is
+	// no owner to wait for; a nil channel send is never ready.
+	if token := c.backlogProbeToken; token != nil {
+		// This send has no context escape of its own: it ends because the Stop
+		// or Release that reached teardown cancelled pollCtx first, which ends
+		// the owning probe's probeCtx through probeBacklog's AfterFunc and makes
+		// that probe return the token.
+		token <- struct{}{}
+		defer func() { <-token }()
+	}
 	c.backlogMu.Lock()
 	client := c.backlogClient
 	c.backlogClient = nil
