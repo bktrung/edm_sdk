@@ -136,6 +136,9 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 - The RabbitMQ driver refuses a message whose custom header name makes its AMQP table key longer
   than 255 bytes as too large, before anything is written, instead of letting the client close the
   whole connection.
+- A retry ladder with a multiplier below 1 decays below MaxInterval when its first delay is already
+  at or above the cap (30s, 15s, 7.5s instead of 30s, 30s, 30s), and a delay that decays to zero
+  stays at zero.
 
 ### Upgrade notes
 
