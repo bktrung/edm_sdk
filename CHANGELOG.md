@@ -121,6 +121,9 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 - The RabbitMQ driver refuses a message whose correlation ID, message ID, type or content type is
   longer than 255 bytes as too large, before anything is written, instead of letting the AMQP client
   close the whole shared connection.
+- A RabbitMQ consumer lane's channel death is reported even when it lands before the lane's
+  watcher goroutine runs, and a transient close error survives a full error buffer of consumer
+  cancel notices, so the core repairs a lane that used to die silently.
 - The RabbitMQ driver refuses a message whose custom header name makes its AMQP table key longer
   than 255 bytes as too large, before anything is written, instead of letting the client close the
   whole connection.

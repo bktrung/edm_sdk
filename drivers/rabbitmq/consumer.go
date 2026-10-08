@@ -205,10 +205,15 @@ func newConsumer(conn *conn, cfg driver.ConsumerConfig) (*consumer, error) {
 			return rollback(classifyAMQP("consumer", driver.KindFatal, err))
 		}
 		tag := nextConsumerTag()
-		// Registered before the consume call so a cancel that races the attach,
-		// such as a queue deleted while the consumer is being created, is not
-		// missed by a listener that does not exist yet.
+		// Both listeners are registered before the consume call so a death that
+		// races the attach, such as a queue deleted while the consumer is being
+		// created, is not missed by a listener that does not exist yet. The close
+		// listener has to be this early for a second reason: the library closes a
+		// listener registered after the channel has shut down without sending it
+		// an error, and watchCancel ends the lane silently once the cancel stream
+		// closes, so a close landing in that gap would kill the lane unheard.
 		cancels := channel.NotifyCancel(make(chan string, 1))
+		closes := channel.NotifyClose(make(chan *amqp.Error, 1))
 		deliveries, err := channel.Consume(destination, tag, false, cfg.Exclusive, false, false, nil)
 		if err != nil {
 			_ = channel.Close()
@@ -243,7 +248,7 @@ func newConsumer(conn *conn, cfg driver.ConsumerConfig) (*consumer, error) {
 		c.events.Add(2)
 		go c.readDeliveries(lane)
 		go c.emitMessages(lane)
-		go c.watchClose(lane)
+		go c.watchClose(closes)
 		go c.watchCancel(lane, cancels)
 		if hook := consumerConstructionHook; hook != nil {
 			hook(c, consumerConstructionLaneReady)
@@ -702,12 +707,16 @@ func (c *consumer) nativeDeliveryCount() bool {
 	return c.cfg.Effective.NativeDeliveryCount
 }
 
-func (c *consumer) watchClose(lane *lane) {
+// watchClose reports a death of the lane's channel from the listener
+// newConsumer registered before Consume. Registering it there is what carries
+// the report across a close that lands before this goroutine runs: the library
+// buffers the abnormal-shutdown error into the listener and then closes it, so
+// a value here is the channel's own error, while a close with no value is the
+// graceful shutdown that needs no report.
+func (c *consumer) watchClose(closes <-chan *amqp.Error) {
 	defer c.events.Done()
-	closeErrors := make(chan *amqp.Error, 1)
-	lane.channel.NotifyClose(closeErrors)
 	select {
-	case err, ok := <-closeErrors:
+	case err, ok := <-closes:
 		if ok && err != nil {
 			c.sendError(classifyAMQP("consumer", driver.KindTransient, err))
 		}
@@ -790,11 +799,15 @@ func (c *consumer) reestablish(lane *lane) {
 	c.attachReplacement(lane, deliveries)
 }
 
-// sendError reports err without blocking. A full buffer drops a transient
-// error or a notification, which the errors already queued stand for. A severe
-// error, one that ends a lane for good, evicts the oldest queued error instead,
-// unless that one is fatal: a failed re-attach may be the only report that a
-// lane stopped, and a burst of consumer cancels must not crowd it out.
+// sendError reports err without blocking. A full buffer drops a notification,
+// and a transient or unclassified error only when a transient, unclassified or
+// fatal error is already queued: any of those makes the core repair the whole
+// generation, so a second one adds no recovery. A transient or unclassified
+// error with no such signal queued evicts one queued entry to take its place,
+// preferring a notification, because a queued notification drives no recovery.
+// A severe error, one that ends a lane for good, evicts the oldest queued error
+// instead, unless that one is fatal: a failed re-attach may be the only report
+// that a lane stopped, and a burst of consumer cancels must not crowd it out.
 func (c *consumer) sendError(err error) {
 	if err == nil {
 		return
@@ -807,7 +820,11 @@ func (c *consumer) sendError(err error) {
 	default:
 	}
 	kind, classified := driver.Classify(err)
-	if !classified || kind == driver.KindTransient || kind == driver.KindNotification {
+	if !classified || kind == driver.KindTransient {
+		c.evictForRecoveryLocked(err)
+		return
+	}
+	if kind == driver.KindNotification {
 		return
 	}
 	select {
@@ -820,6 +837,63 @@ func (c *consumer) sendError(err error) {
 	select {
 	case c.errors <- err:
 	default:
+	}
+}
+
+// evictForRecoveryLocked makes room for a transient or unclassified error that
+// found the buffer full, unless the queued entries already carry a recovery
+// signal. Otherwise the incoming error takes the place of the oldest queued
+// entry, or of the oldest notification when one is queued: a notification only
+// reaches the error handler, while the incoming close is what makes the core
+// repair the lane. With no notification queued the oldest entry goes, severe
+// report or not, because the repair re-attempts the lane and a re-attach that
+// still fails is reported again.
+//
+// The caller holds errorsMu, so sendError is the only sender while the entries
+// are out of the channel. The core reads them concurrently: it can take an
+// entry between the drain and the refill, which is why the survivors go back in
+// their original order. Every entry the caller keeps fits, because the channel
+// held all of them a moment ago and the evicted one is the difference; a drain
+// that comes up empty leaves the whole buffer for err. None of the sends can
+// park a watcher: the drain just emptied the buffer, errorsMu keeps every other
+// sender out until the refill is done, and newConsumer gives the channel room
+// for eight, so the refill plus the one incoming error always have slots.
+func (c *consumer) evictForRecoveryLocked(err error) {
+	queued := make([]error, 0, cap(c.errors))
+drain:
+	for {
+		select {
+		case queuedErr := <-c.errors:
+			queued = append(queued, queuedErr)
+		default:
+			break drain
+		}
+	}
+	recoveryQueued := false
+	for _, queuedErr := range queued {
+		if queuedKind, queuedClassified := driver.Classify(queuedErr); !queuedClassified || queuedKind == driver.KindTransient || queuedKind == driver.KindFatal {
+			recoveryQueued = true
+			break
+		}
+	}
+	victim := -1
+	if !recoveryQueued {
+		victim = 0
+		for index, queuedErr := range queued {
+			if queuedKind, queuedClassified := driver.Classify(queuedErr); queuedClassified && queuedKind == driver.KindNotification {
+				victim = index
+				break
+			}
+		}
+	}
+	for index, queuedErr := range queued {
+		if index == victim {
+			continue
+		}
+		c.errors <- queuedErr
+	}
+	if !recoveryQueued {
+		c.errors <- err
 	}
 }
 
