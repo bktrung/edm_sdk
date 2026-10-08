@@ -4,9 +4,12 @@ package rabbitmq
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"net/url"
 	"strings"
 	"sync"
 	"testing"
@@ -892,4 +895,224 @@ func TestParkingQueueCountsInDescribeAndPurge(t *testing.T) {
 	if after != 0 {
 		t.Fatalf("parking queue %q ready = %d, want 0 after Purge", parkQueue, after)
 	}
+}
+
+// managementRequest issues one management API request with the fixture's own
+// credentials. The driver's management client creates nothing and sends no
+// request body, and the permission test below needs both a user and its
+// permission to exist. A 404 is left to the caller's own check: it is how a
+// cleanup that has nothing to delete ends.
+func managementRequest(t *testing.T, client *managementClient, method, path, body string) {
+	t.Helper()
+	var payload io.Reader
+	if body != "" {
+		payload = strings.NewReader(body)
+	}
+	request, err := http.NewRequestWithContext(context.Background(), method, client.baseURL+path, payload)
+	if err != nil {
+		t.Errorf("management %s %s: %v", method, path, err)
+		return
+	}
+	if body != "" {
+		request.Header.Set("content-type", "application/json")
+	}
+	request.SetBasicAuth(client.username, client.password)
+	response, err := client.client.Do(request)
+	if err != nil {
+		t.Errorf("management %s %s: %v", method, path, err)
+		return
+	}
+	defer response.Body.Close()
+	if response.StatusCode >= http.StatusBadRequest && response.StatusCode != http.StatusNotFound {
+		detail, _ := io.ReadAll(io.LimitReader(response.Body, 4096))
+		t.Errorf("management %s %s: %s: %s", method, path, response.Status, strings.TrimSpace(string(detail)))
+	}
+}
+
+// TestPruneRefusesQueueDeleteWithoutConfigurePermission covers a queue delete
+// the broker answers with 403 because the connected user may not configure the
+// destination. Only the delete reports that refusal: a passive declare needs no
+// configure permission, so the prune guard passes the destination and the
+// failure has to stay a permission error rather than a transient one the core
+// would retry.
+func TestPruneRefusesQueueDeleteWithoutConfigurePermission(t *testing.T) {
+	requireBroker(t)
+	const (
+		user        = "t089-prune-403-user"
+		password    = "t089-prune-403-password" //nolint:gosec // fixture credentials this test creates and removes
+		destination = "t089-prune-403-queue"
+	)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	guest, err := newManagementClient(defaultEndpoint, driver.Config{})
+	if err != nil {
+		t.Fatalf("newManagementClient: %v", err)
+	}
+	// The restricted connection is the fixture endpoint with another identity,
+	// so the test follows the fixture's scheme, host and vhost.
+	restricted, err := url.Parse(defaultEndpoint)
+	if err != nil {
+		t.Fatalf("url.Parse(%q): %v", defaultEndpoint, err)
+	}
+	restricted.User = url.UserPassword(user, password)
+	vhost := url.PathEscape(guest.vhost)
+	managementRequest(t, guest, http.MethodPut, "/api/users/"+user,
+		fmt.Sprintf(`{"password":%q,"tags":"monitoring"}`, password))
+	// The user may configure only names under the allowed prefix, so the queue
+	// below stays visible and declarable to it but not deletable by it.
+	managementRequest(t, guest, http.MethodPut, "/api/permissions/"+vhost+"/"+user,
+		`{"configure":"^t089-prune-403-allowed","write":".*","read":".*"}`)
+	t.Cleanup(func() {
+		managementRequest(t, guest, http.MethodDelete, "/api/permissions/"+vhost+"/"+user, "")
+		managementRequest(t, guest, http.MethodDelete, "/api/users/"+user, "")
+		managementRequest(t, guest, http.MethodDelete, "/api/queues/"+vhost+"/"+destination, "")
+	})
+
+	owner, err := (Driver{}).Open(ctx, driver.Config{Endpoints: []string{defaultEndpoint}})
+	if err != nil {
+		t.Fatalf("Open as the fixture user: %v", err)
+	}
+	t.Cleanup(func() { _ = owner.Close(context.Background()) })
+	if _, err := owner.Admin().EnsureTopology(ctx, driver.TopologySpec{
+		Destinations: []driver.DestinationSpec{{Name: destination, Durable: true}},
+	}); err != nil {
+		t.Fatalf("EnsureTopology: %v", err)
+	}
+
+	maintenanceConn, err := (Driver{}).Open(ctx, driver.Config{Endpoints: []string{restricted.String()}})
+	if err != nil {
+		t.Fatalf("Open as the restricted user: %v", err)
+	}
+	t.Cleanup(func() { _ = maintenanceConn.Close(context.Background()) })
+	maintenance, ok := maintenanceConn.Admin().(driver.Maintenance)
+	if !ok {
+		t.Fatal("Admin does not implement driver.Maintenance")
+	}
+	_, err = maintenance.Prune(ctx, []string{destination})
+	kind, classified := driver.Classify(err)
+	if !classified || kind != driver.KindPermission {
+		t.Fatalf("Prune = %v (kind %v, classified %t), want a permission refusal", err, kind, classified)
+	}
+	var portErr *driver.Error
+	var amqpErr *amqp.Error
+	if !errors.As(err, &portErr) || portErr.Op != "prune" || !errors.As(err, &amqpErr) || amqpErr.Code != 403 {
+		t.Fatalf("Prune = %v, want the broker's 403 reachable under a prune error", err)
+	}
+}
+
+// TestOpenStillConnectsWhenEarlierAttemptsFail covers what endpoint failover and
+// the refusal budget are for: a failed attempt must not end the connect while a
+// remaining endpoint, or the same endpoint after its refusal clears, can still
+// serve it.
+func TestOpenStillConnectsWhenEarlierAttemptsFail(t *testing.T) {
+	requireBroker(t)
+	cases := []struct {
+		name      string
+		endpoints func(*testing.T) []string
+	}{
+		{
+			name: "transient failure first",
+			endpoints: func(t *testing.T) []string {
+				return []string{unreachableLoopbackEndpoint(t), defaultEndpoint}
+			},
+		},
+		{
+			name: "refused credentials first",
+			endpoints: func(t *testing.T) []string {
+				refusing, _ := credentialRefusingEndpoint(t)
+				return []string{refusing, defaultEndpoint}
+			},
+		},
+		{
+			name: "refusal that clears",
+			endpoints: func(t *testing.T) []string {
+				return []string{clearingEndpoint(t, 2)}
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+			defer cancel()
+			conn, err := (Driver{}).Open(ctx, driver.Config{
+				Endpoints:      tc.endpoints(t),
+				ConnectTimeout: 10 * time.Second,
+			})
+			if err != nil {
+				t.Fatalf("Open() = %v, want a connection", err)
+			}
+			if err := conn.Close(context.Background()); err != nil {
+				t.Fatalf("Close: %v", err)
+			}
+		})
+	}
+}
+
+// clearingEndpoint starts a broker stand-in that refuses the first refusals
+// connections the way rejected credentials are refused, and forwards every later
+// connection to the fixture broker. It is how a test watches a refusal clear
+// while the budget that would end the connect is still far from spent, with the
+// real broker answering the handshake that follows.
+func clearingEndpoint(t *testing.T, refusals int) string {
+	t.Helper()
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = listener.Close() })
+	broker := brokerAddress(defaultEndpoint)
+	go func() {
+		refused := 0
+		for {
+			inbound, acceptErr := listener.Accept()
+			if acceptErr != nil {
+				return
+			}
+			if refused < refusals {
+				refused++
+				go refuseAfterStartOk(inbound)
+				continue
+			}
+			go proxyToBroker(inbound, broker)
+		}
+	}()
+	return standInEndpoint(t, listener.Addr().String())
+}
+
+// standInEndpoint points the fixture's own endpoint at a local listener, so a
+// stand-in answers with the credentials and vhost the fixture is configured with
+// rather than with defaults. The stand-in stays plaintext loopback, which the
+// driver accepts without TLS settings, and the fixture publishes no amqps port
+// for it to relay to, so an amqps fixture endpoint is not supported by this
+// case.
+func standInEndpoint(t *testing.T, address string) string {
+	t.Helper()
+	fixture, err := url.Parse(defaultEndpoint)
+	if err != nil {
+		t.Fatalf("url.Parse(%q): %v", defaultEndpoint, err)
+	}
+	fixture.Scheme = "amqp"
+	fixture.Host = address
+	return fixture.String()
+}
+
+// proxyToBroker relays one connection to the fixture broker, so a stand-in can
+// stop refusing without having to answer an AMQP handshake itself.
+func proxyToBroker(inbound net.Conn, broker string) {
+	defer inbound.Close()
+	outbound, err := net.Dial("tcp", broker)
+	if err != nil {
+		return
+	}
+	defer outbound.Close()
+	relayed := make(chan struct{}, 2)
+	go func() {
+		_, _ = io.Copy(outbound, inbound)
+		relayed <- struct{}{}
+	}()
+	go func() {
+		_, _ = io.Copy(inbound, outbound)
+		relayed <- struct{}{}
+	}()
+	<-relayed
 }

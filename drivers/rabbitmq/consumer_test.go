@@ -359,6 +359,31 @@ func TestStopTakesOverFailedReleaseTeardown(t *testing.T) {
 	}
 }
 
+// TestWatchCloseReportsACloseBufferedBeforeTheWatcherRuns pins the contract
+// watchClose keeps with newConsumer: the close listener is registered before
+// Consume and buffered, so a close landing before this goroutine runs still
+// reaches the errors channel as a transient error. newConsumer registers it
+// before Consume, beside NotifyCancel; watchClose only drains what it captured.
+// What this does not cover: the registration order itself, which needs a broker
+// to close a real amqp.Channel in that window.
+func TestWatchCloseReportsACloseBufferedBeforeTheWatcherRuns(t *testing.T) {
+	c := &consumer{errors: make(chan error, 1), stoppedC: make(chan struct{})}
+	closes := make(chan *amqp.Error, 1)
+	closes <- &amqp.Error{Code: 504, Reason: "channel closed"}
+	c.events.Add(1)
+	c.watchClose(closes)
+
+	select {
+	case err := <-c.errors:
+		kind, classified := driver.Classify(err)
+		if !classified || kind != driver.KindTransient {
+			t.Fatalf("close error = %v (kind=%v, classified=%v), want a transient error", err, kind, classified)
+		}
+	default:
+		t.Fatal("a close buffered before the watcher goroutine ran was not reported")
+	}
+}
+
 func TestLockBeforeContextAcquiresLockReleasedDuringFinalSleep(t *testing.T) {
 	fake := clock.NewFake(time.Time{})
 	deadline := fake.Now().Add(500 * time.Microsecond)

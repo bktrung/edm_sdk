@@ -224,28 +224,7 @@ func (s *settler) settle(ctx context.Context, opt driver.NackOptions, nack bool)
 		s.conn.ackFailures++
 		return classify("ack", driver.KindTransient, errors.New("injected ack failure"))
 	}
-	s.settled = true
-	delete(s.consumer.inflight, s)
-	if s.consumer.outstanding > 0 {
-		s.consumer.outstanding--
-	}
-	name := s.message.message.Destination
-	if s.consumer.unsettled[name] > 0 {
-		s.consumer.unsettled[name]--
-	}
-	key := string(s.message.message.Key)
-	if key != "" {
-		deliveryKey := deliveryKey{destination: name, key: key}
-		if s.consumer.unsettledKey[deliveryKey] > 1 {
-			s.consumer.unsettledKey[deliveryKey]--
-		} else {
-			delete(s.consumer.unsettledKey, deliveryKey)
-			affinity := affinityKey{group: s.consumer.cfg.Group, key: key}
-			if dest, ok := s.conn.destinations[name]; ok && dest.affinity[affinity] == s.consumer {
-				delete(dest.affinity, affinity)
-			}
-		}
-	}
+	s.retireLocked()
 	if nack && opt.Requeue {
 		s.message.deliveryCount++
 		s.message.due = s.conn.clock.Now()
@@ -259,4 +238,31 @@ func (s *settler) settle(ctx context.Context, opt driver.NackOptions, nack bool)
 	s.conn.dispatchLocked()
 	s.conn.signalWake()
 	return nil
+}
+
+// retireLocked releases a delivery's credit and key affinity after admission.
+// The caller must hold s.conn.mu and s.mu and reject already-settled deliveries.
+func (s *settler) retireLocked() {
+	s.settled = true
+	delete(s.consumer.inflight, s)
+	if s.consumer.outstanding > 0 {
+		s.consumer.outstanding--
+	}
+	name := s.message.message.Destination
+	if s.consumer.unsettled[name] > 0 {
+		s.consumer.unsettled[name]--
+	}
+	key := string(s.message.message.Key)
+	if key != "" {
+		keyID := deliveryKey{destination: name, key: key}
+		if s.consumer.unsettledKey[keyID] > 1 {
+			s.consumer.unsettledKey[keyID]--
+		} else {
+			delete(s.consumer.unsettledKey, keyID)
+			affinity := affinityKey{group: s.consumer.cfg.Group, key: key}
+			if dest, ok := s.conn.destinations[name]; ok && dest.affinity[affinity] == s.consumer {
+				delete(dest.affinity, affinity)
+			}
+		}
+	}
 }

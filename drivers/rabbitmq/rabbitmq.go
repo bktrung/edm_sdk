@@ -117,10 +117,28 @@ func (Driver) Capabilities() driver.Capabilities {
 	}
 }
 
+// openRefusalPasses is how many consecutive passes every endpoint may refuse a
+// dial for a reason retrying cannot repair before Open returns that refusal.
+// Pinned amqp091-go answers a socket that dies during the credential or vhost
+// exchange with the same 403 it returns for a refusal it decided, so one refused
+// pass cannot be told from a dropped handshake during a broker restart, a
+// load-balancer reset, or a short authentication-backend outage. Counting passes
+// keeps the decision free of wall-clock calls and deterministic for tests; at
+// the 250ms wait between passes this is about 5s, which absorbs those events
+// while a rejection the broker keeps making still ends the connect without
+// waiting the caller's timeout out.
+const openRefusalPasses = 20
+
+// openRetryWait is a test-only wait seam. Production uses waitRetry unchanged.
+var openRetryWait = waitRetry
+
 // Open establishes a RabbitMQ connection and retries failed endpoint dials
-// until the caller's context or ConnectTimeout expires. It refuses a configured
-// vhost that differs from any endpoint, or SASL credentials without a mechanism,
-// with a fatal configuration error before dialing.
+// until the caller's context or ConnectTimeout expires. A reason retrying
+// cannot repair, such as rejected credentials, ends the call with that
+// classified refusal once every endpoint has refused with it on
+// openRefusalPasses consecutive passes. It refuses a configured vhost that
+// differs from any endpoint, or SASL credentials without a mechanism, with a
+// fatal configuration error before dialing.
 func (Driver) Open(ctx context.Context, cfg driver.Config) (driver.Conn, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, classify("open", driver.KindTransient, err)
@@ -168,11 +186,21 @@ func (Driver) Open(ctx context.Context, cfg driver.Config) (driver.Conn, error) 
 		}
 		endpoints[index] = resolved
 	}
+	// lastErr is the last dial error, which a pass that may still recover
+	// reports; refusal is the last dial error retrying cannot repair. Keeping
+	// them apart lets a pass that saw both keep retrying for the endpoint that
+	// may come back, while an abandoned Open still names the refusal that will
+	// not. refusal is not reset per pass: it is a property of the endpoint's
+	// credentials rather than of one attempt, so a later pass that runs out of
+	// time before dialing that endpoint still has the cause to report.
 	var lastErr error
+	var refusal error
+	refusedPasses := 0
 	for {
+		transient := false
 		for _, endpoint := range endpoints {
 			if err := openCtx.Err(); err != nil {
-				return nil, classify("open", driver.KindTransient, err)
+				return nil, classify("open", driver.KindTransient, errors.Join(err, openCause(refusal, lastErr)))
 			}
 			attemptConfig := amqpConfig
 			attemptConfig.SASL = endpoint.sasl
@@ -186,18 +214,43 @@ func (Driver) Open(ctx context.Context, cfg driver.Config) (driver.Conn, error) 
 				return managedConn, nil
 			}
 			lastErr = err
+			if kind, _ := driver.Classify(classifyAMQP("open", driver.KindTransient, err)); kind == driver.KindTransient {
+				transient = true
+				continue
+			}
+			refusal = err
+		}
+		// A pass that could still recover resets the count, and a refusal only
+		// becomes the answer once every endpoint has repeated it, which
+		// openRefusalPasses explains.
+		if transient {
+			refusedPasses = 0
+		} else {
+			refusedPasses++
+			if refusedPasses >= openRefusalPasses {
+				return nil, classifyAMQP("open", driver.KindTransient, refusal)
+			}
 		}
 
 		if err := openCtx.Err(); err != nil {
-			if lastErr != nil {
-				return nil, classify("open", driver.KindTransient, errors.Join(err, lastErr))
-			}
-			return nil, classify("open", driver.KindTransient, err)
+			return nil, classify("open", driver.KindTransient, errors.Join(err, openCause(refusal, lastErr)))
 		}
-		if err := waitRetry(openCtx); err != nil {
-			return nil, classify("open", driver.KindTransient, err)
+		if err := openRetryWait(openCtx); err != nil {
+			return nil, classify("open", driver.KindTransient, errors.Join(err, openCause(refusal, lastErr)))
 		}
 	}
+}
+
+// openCause names the broker error an Open that ran out of time reports under
+// the context error that ended it. A refusal wins over the last dial error: the
+// endpoint that refused will refuse the same credentials on the next attempt,
+// so the more recent transient error of another endpoint would leave out the
+// one cause the caller can act on.
+func openCause(refusal, lastErr error) error {
+	if refusal != nil {
+		return refusal
+	}
+	return lastErr
 }
 
 type conn struct {

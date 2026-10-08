@@ -118,12 +118,31 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 - The RabbitMQ orphan scan folds a parking queue into its parent only when the parent is itself in
   the caller's scope. An out-of-scope parent is no longer reported, and the parking queue is
   reported under its own name with its own count.
+- A Kafka backlog read whose context ends while another probe holds the shared backlog client
+  returns without waiting for that probe, instead of outliving the deadline the core puts on each
+  backlog poll.
 - The RabbitMQ driver refuses a message whose correlation ID, message ID, type or content type is
   longer than 255 bytes as too large, before anything is written, instead of letting the AMQP client
   close the whole shared connection.
+- A RabbitMQ consumer lane's channel death is reported even when it lands before the lane's
+  watcher goroutine runs, and a transient close error survives a full error buffer of consumer
+  cancel notices, so the core repairs a lane that used to die silently.
+- An in-memory purge resets the destination's dispatch bookkeeping, so a message published right
+  after the purge is delivered with its enqueue time and key instead of being skipped.
+- RabbitMQ Open classifies a refused login as a permission error and stops retrying once every
+  endpoint has kept refusing for about 5 seconds of attempts, and every timeout exit keeps the
+  broker's cause. A queue delete refused with 403 during prune is reported as a permission error
+  instead of a transient one.
+- A Kafka requeue that races a partition revoke no longer frees the same in-flight slot twice, so
+  the consumer keeps to its Prefetch limit during rebalances.
 - The RabbitMQ driver refuses a message whose custom header name makes its AMQP table key longer
   than 255 bytes as too large, before anything is written, instead of letting the client close the
   whole connection.
+- A retry ladder with a multiplier below 1 decays below MaxInterval when its first delay is already
+  at or above the cap (30s, 15s, 7.5s instead of 30s, 30s, 30s), and a delay that decays to zero
+  stays at zero.
+- RabbitMQ subscription validation refuses a handler timeout so large that three times it
+  overflows, instead of accepting it.
 
 ### Upgrade notes
 

@@ -711,6 +711,55 @@ func TestConfigAndSubscribeRejectTheSameSubscriptions(t *testing.T) {
 	}
 }
 
+func TestRabbitMQConsumerTimeoutValidation(t *testing.T) {
+	cases := []struct {
+		name            string
+		handlerTimeout  time.Duration
+		consumerTimeout time.Duration
+		wantErr         bool
+	}{
+		{"overflow", 1 << 62, 90 * time.Second, true},
+		{"exact boundary", time.Second + time.Nanosecond, 3*time.Second + 3*time.Nanosecond, false},
+		{"one nanosecond below boundary", time.Second + time.Nanosecond, 3*time.Second + 2*time.Nanosecond, true},
+		{"negative consumer timeout", time.Second, -time.Nanosecond, true},
+	}
+	for _, test := range cases {
+		t.Run(test.name, func(t *testing.T) {
+			cfg := validValidationConfig()
+			cfg.Broker.Driver = "rabbitmq"
+			cfg.Broker.Endpoints = []string{"amqp://broker:5672/"}
+			cfg.Broker.DriverOptions = map[string]string{
+				"rabbitmq.consumerTimeout": test.consumerTimeout.String(),
+			}
+			cfg.Lifecycle.DrainTimeout = test.handlerTimeout + time.Nanosecond
+			sub := cfg.Subscriptions["orders"]
+			sub.HandlerTimeout = test.handlerTimeout
+			cfg.Subscriptions["orders"] = sub
+			for _, validate := range []struct {
+				name string
+				run  func() error
+			}{
+				{"config", func() error { return validateConfiguredConfig(cfg) }},
+				{"subscription", func() error { return validateSubscription(cfg, cfg.Broker.Driver, "orders", sub) }},
+			} {
+				t.Run(validate.name, func(t *testing.T) {
+					err := validate.run()
+					if !test.wantErr {
+						if err != nil {
+							t.Fatalf("validation error = %v, want nil", err)
+						}
+						return
+					}
+					const want = "f1: broker.rabbitmq.consumerTimeout must be at least subscriptions.orders.handlerTimeout x 3"
+					if err == nil || err.Error() != want {
+						t.Fatalf("validation error = %v, want %q", err, want)
+					}
+				})
+			}
+		})
+	}
+}
+
 func TestValidateSubscriptionRejectsInvalidRetryValues(t *testing.T) {
 	cfg := validValidationConfig()
 	for _, test := range invalidRetryValueCases() {

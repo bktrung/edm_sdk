@@ -57,14 +57,15 @@ func (p *producer) Publish(ctx context.Context, messages ...driver.OutboundMessa
 		if dest.spec.Delay > 0 {
 			due = p.conn.clock.Now().Add(dest.spec.Delay)
 		}
+		message = cloneOutbound(message)
 		queued := &queuedMessage{
-			message:  cloneOutbound(message),
+			message:  message,
 			sequence: p.conn.nextMessage.Add(1),
 			due:      due,
 		}
 		dest.messages = append(dest.messages, queued)
 		p.conn.recordHistoryLocked(message.Destination, &queuedMessage{
-			message:  cloneOutbound(message),
+			message:  message,
 			sequence: queued.sequence,
 			due:      due,
 		})

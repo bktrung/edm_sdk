@@ -181,6 +181,7 @@ func (a *adminOperations) Purge(ctx context.Context, name string) (int64, error)
 	}
 	n := int64(len(item.messages))
 	item.messages = nil
+	item.resetDispatchLocked()
 	// Replay history is what a later group attaching from earliest is served
 	// from, so purging the queue without it would resurrect every purged body.
 	delete(a.conn.history, name)
