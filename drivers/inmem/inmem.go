@@ -631,12 +631,16 @@ func (c *conn) dropInFlightLocked(op string) {
 	c.signalWake()
 }
 
+func (d *destination) resetDispatchLocked() {
+	d.dispatchCursor = 0
+	d.dispatchKnownLen = 0
+	d.dispatchPrepends = 0
+	d.dispatchNextDue = time.Time{}
+}
+
 func (d *destination) prepareDispatch(now time.Time) {
 	if len(d.messages) < d.dispatchKnownLen {
-		d.dispatchCursor = 0
-		d.dispatchKnownLen = 0
-		d.dispatchPrepends = 0
-		d.dispatchNextDue = time.Time{}
+		d.resetDispatchLocked()
 	}
 	if d.dispatchPrepends > 0 {
 		d.dispatchCursor = 0

@@ -127,6 +127,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 - A RabbitMQ consumer lane's channel death is reported even when it lands before the lane's
   watcher goroutine runs, and a transient close error survives a full error buffer of consumer
   cancel notices, so the core repairs a lane that used to die silently.
+- An in-memory purge resets the destination's dispatch bookkeeping, so a message published right
+  after the purge is delivered with its enqueue time and key instead of being skipped.
 - The RabbitMQ driver refuses a message whose custom header name makes its AMQP table key longer
   than 255 bytes as too large, before anything is written, instead of letting the client close the
   whole connection.
