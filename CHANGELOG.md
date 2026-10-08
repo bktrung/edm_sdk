@@ -139,6 +139,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 - A retry ladder with a multiplier below 1 decays below MaxInterval when its first delay is already
   at or above the cap (30s, 15s, 7.5s instead of 30s, 30s, 30s), and a delay that decays to zero
   stays at zero.
+- RabbitMQ subscription validation refuses a handler timeout so large that three times it
+  overflows, instead of accepting it.
 
 ### Upgrade notes
 
