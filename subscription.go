@@ -482,7 +482,7 @@ func validateSubscription(cfg Config, driverName, name string, sub SubscriptionC
 		if err != nil {
 			return err
 		}
-		if consumerTimeout < sub.HandlerTimeout*3 {
+		if sub.HandlerTimeout > consumerTimeout/3 {
 			return fmt.Errorf("f1: broker.rabbitmq.consumerTimeout must be at least subscriptions.%s.handlerTimeout x 3", name)
 		}
 	}
