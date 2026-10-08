@@ -698,17 +698,7 @@ func assertOpenSASL(t *testing.T, settings *driver.SASLConfig) {
 	if _, err := io.ReadFull(socket, header); err != nil {
 		t.Fatal(err)
 	}
-	start := []byte{0, 10, 0, 10, 0, 9, 0, 0, 0, 0}
-	const mechanisms = "PLAIN AMQPLAIN EXTERNAL"
-	const startLength = uint32(10 + 4 + len(mechanisms) + 4 + len("en_US"))
-	start = binary.BigEndian.AppendUint32(start, uint32(len(mechanisms)))
-	start = append(start, mechanisms...)
-	start = binary.BigEndian.AppendUint32(start, 5)
-	start = append(start, "en_US"...)
-	frame := binary.BigEndian.AppendUint32([]byte{1, 0, 0}, startLength)
-	frame = append(frame, start...)
-	frame = append(frame, 0xce)
-	if _, err := socket.Write(frame); err != nil {
+	if _, err := socket.Write(connectionStartFrame()); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := io.ReadFull(socket, header[:7]); err != nil {

@@ -243,7 +243,7 @@ func (a *adminOperations) Prune(ctx context.Context, names []string) ([]driver.P
 					break
 				}
 				if deleteErr != nil {
-					return nil, classify("prune", driver.KindTransient, deleteErr)
+					return nil, classifyAMQP("prune", driver.KindTransient, deleteErr)
 				}
 				if !deleted {
 					result.Reason = "parking destination disappeared before deletion"
@@ -281,7 +281,7 @@ func (a *adminOperations) Prune(ctx context.Context, names []string) ([]driver.P
 			continue
 		}
 		if deleteErr != nil {
-			return nil, classify("prune", driver.KindTransient, deleteErr)
+			return nil, classifyAMQP("prune", driver.KindTransient, deleteErr)
 		}
 		if !deleted {
 			result.Reason = "destination disappeared before deletion"
