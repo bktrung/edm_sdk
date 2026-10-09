@@ -12,6 +12,8 @@ linters:
     - govet
     - staticcheck
     - errcheck
+    # Unused unexported code, test helpers included.
+    - unused
     # Naming, package comments, and exported-symbol docs.
     - revive
     # Import boundaries between core, ports, and drivers.
@@ -33,6 +35,8 @@ linters:
     - usestdlibvars
     - intrange
     - copyloopvar
+    # Modern Go idioms with behavior-preserving rewrites.
+    - modernize
 
   settings:
     revive:
@@ -58,7 +62,7 @@ linters:
             - "!**/f1test/**"
             - "!**/cmd/**"
             - "!**/examples/**"
-            - "!**/internal/obs/**"
+            - "!**/f1otel/**"
           deny:
             - pkg: fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/drivers
               desc: "core must not import drivers"
@@ -66,35 +70,8 @@ linters:
               desc: "core must not import a broker client directly"
             - pkg: github.com/rabbitmq/amqp091-go
               desc: "core must not import a broker client directly"
-            # The metric and trace API modules are public type names used by
-            # the provider options. All implementation modules stay private.
-            - pkg: go.opentelemetry.io/otel$
-              desc: "OpenTelemetry global providers belong in internal/obs"
-            - pkg: go.opentelemetry.io/otel/sdk
-              desc: "OpenTelemetry SDK belongs in internal/obs"
-            - pkg: go.opentelemetry.io/otel/semconv
-              desc: "OpenTelemetry semantic conventions belong in internal/obs"
-            - pkg: go.opentelemetry.io/otel/exporters
-              desc: "OpenTelemetry exporters belong in internal/obs"
-            - pkg: go.opentelemetry.io/otel/attribute
-              desc: "OpenTelemetry attributes belong in internal/obs"
-
-        otel-boundary:
-          list-mode: lax
-          files:
-            - "**/*.go"
-            - "!**/internal/obs/**"
-            - "!**/f1test/**"
-          allow:
-            - go.opentelemetry.io/otel/metric
-            - go.opentelemetry.io/otel/trace
-          deny:
-            - pkg: go.opentelemetry.io/otel$
-              desc: "core code must use OpenTelemetry global providers only in internal/obs"
-            - pkg: go.opentelemetry.io/otel/sdk
-              desc: "core code must use the OpenTelemetry SDK only in internal/obs"
-            - pkg: go.opentelemetry.io/otel/semconv
-              desc: "only internal/obs may use OpenTelemetry semantic conventions"
+            - pkg: go.opentelemetry.io/
+              desc: "OpenTelemetry imports belong in f1otel"
 
         driver-port:
           files:
@@ -120,15 +97,6 @@ linters:
             - pkg: $all
               desc: "the conformance suite may import only the port and testify"
 
-        internal-obs:
-          files:
-            - "**/internal/obs/**"
-          allow:
-            - $gostd
-            - go.opentelemetry.io/otel
-          deny:
-            - pkg: $all
-              desc: "observability may import only the standard library and OpenTelemetry"
 
         # cmd/ registers drivers but must not import broker clients directly.
         cmd:
@@ -139,6 +107,8 @@ linters:
               desc: "cmd registers drivers and must not import broker clients directly"
             - pkg: github.com/rabbitmq/amqp091-go
               desc: "cmd registers drivers and must not import broker clients directly"
+            - pkg: go.opentelemetry.io/
+              desc: "OpenTelemetry imports belong in f1otel"
 
         # An example service is a composition root, like cmd/: it is the layer that
         # chooses a driver, so it may import one. It must still reach the broker only
@@ -152,6 +122,8 @@ linters:
               desc: "an example selects a driver and must not import a broker client directly"
             - pkg: github.com/rabbitmq/amqp091-go
               desc: "an example selects a driver and must not import a broker client directly"
+            - pkg: go.opentelemetry.io/
+              desc: "OpenTelemetry imports belong in f1otel"
 
         f1test:
           files:
@@ -164,41 +136,70 @@ linters:
             - fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/drivers/inmem
             - fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/clock
             - fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/testhook
-            - go.opentelemetry.io/otel
           deny:
             - pkg: $all
               desc: "f1test may import only the SDK, in-memory driver, clock, test hook, test assertions, and metric reader"
 
+        # Driver production files use strict allowlists. Test files are a separate
+        # lax rule: tests may import the SDK and their own driver, but the broad
+        # driver deny keeps cross-driver imports visible.
         drivers-kafka:
           files:
             - "**/drivers/kafka/**"
+            - "!$test"
           allow:
             - $gostd
             - github.com/twmb/franz-go
             - fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/driver
             - fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/clock
+            - fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/kafka
+            - fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/version
           deny:
             - pkg: fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/drivers
               desc: "a driver must not import another driver"
             - pkg: $all
-              desc: "a driver may import the standard library, its own broker client, and the shared clock"
+              desc: "a driver may import the standard library, its own broker client, and shared SDK support packages"
+
+        drivers-kafka-tests:
+          list-mode: lax
+          files:
+            - "**/drivers/kafka/*_test.go"
+          allow:
+            - fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/drivers/kafka
+          deny:
+            - pkg: fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/drivers
+              desc: "a Kafka test must not import another driver"
 
         drivers-rabbitmq:
           files:
             - "**/drivers/rabbitmq/**"
+            - "!$test"
           allow:
             - $gostd
             - github.com/rabbitmq/amqp091-go
             - fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/driver
+            - fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/clock
+            - fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/wire
           deny:
             - pkg: fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/drivers
               desc: "a driver must not import another driver"
             - pkg: $all
-              desc: "a driver may import the standard library and its own broker client"
+              desc: "a driver may import the standard library, its own broker client, the shared clock, and the wire header names"
+
+        drivers-rabbitmq-tests:
+          list-mode: lax
+          files:
+            - "**/drivers/rabbitmq/*_test.go"
+          allow:
+            - fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/drivers/rabbitmq
+          deny:
+            - pkg: fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/drivers
+              desc: "a RabbitMQ test must not import another driver"
 
         drivers-inmem:
           files:
             - "**/drivers/inmem/**"
+            - "!$test"
           allow:
             - $gostd
             - fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/driver
@@ -210,6 +211,16 @@ linters:
               desc: "a driver must not import another driver"
             - pkg: $all
               desc: "the in-memory driver may import only the standard library, port, clock, test hook, and test assertions"
+
+        drivers-inmem-tests:
+          list-mode: lax
+          files:
+            - "**/drivers/inmem/*_test.go"
+          allow:
+            - fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/drivers/inmem
+          deny:
+            - pkg: fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/drivers
+              desc: "an in-memory test must not import another driver"
 
     # The forbidden list replaces the defaults, so list every blocked API.
     forbidigo:

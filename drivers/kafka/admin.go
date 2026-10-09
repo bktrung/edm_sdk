@@ -4,11 +4,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 
 	"github.com/twmb/franz-go/pkg/kadm"
 	"github.com/twmb/franz-go/pkg/kerr"
 
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/driver"
+	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/clock"
 )
 
 type admin struct {
@@ -21,26 +23,6 @@ var (
 	_ driver.Maintenance = (*admin)(nil)
 )
 
-// maintenanceGate serializes destructive metadata sequences. Conn.Admin
-// creates a fresh facade for each call, so a receiver mutex would not
-// coordinate two Purge calls sharing the same broker client: without
-// serialization, both can read the same low watermark and both report the
-// same records as removed. Channel acquisition remains context-aware.
-var maintenanceGate = make(chan struct{}, 1)
-
-func acquireMaintenance(ctx context.Context) error {
-	select {
-	case maintenanceGate <- struct{}{}:
-		return nil
-	case <-ctx.Done():
-		return ctx.Err()
-	}
-}
-
-func releaseMaintenance() {
-	<-maintenanceGate
-}
-
 func (a *admin) admission(ctx context.Context, operation string) (func(), error) {
 	if err := ctx.Err(); err != nil {
 		return nil, classify(operation, driver.KindTransient, err)
@@ -48,12 +30,14 @@ func (a *admin) admission(ctx context.Context, operation string) (func(), error)
 	if a.conn == nil {
 		return func() {}, nil
 	}
-	a.conn.lifecycleMu.RLock()
+	if err := a.conn.acquireLifecycle(ctx); err != nil {
+		return nil, classify(operation, driver.KindTransient, err)
+	}
 	if err := a.conn.admissionError(operation); err != nil {
-		a.conn.lifecycleMu.RUnlock()
+		a.conn.releaseLifecycle()
 		return nil, err
 	}
-	return a.conn.lifecycleMu.RUnlock, nil
+	return a.conn.releaseLifecycle, nil
 }
 
 func missingPurgeDestinationError(destination string, cause error) error {
@@ -73,10 +57,10 @@ func (a *admin) Purge(ctx context.Context, destination string) (int64, error) {
 		return 0, err
 	}
 	release()
-	if err := acquireMaintenance(ctx); err != nil {
+	if err := a.conn.acquireMaintenance(ctx); err != nil {
 		return 0, classify("purge", driver.KindTransient, err)
 	}
-	defer releaseMaintenance()
+	defer a.conn.releaseMaintenance()
 	release, err = a.admission(ctx, "purge")
 	if err != nil {
 		return 0, err
@@ -145,10 +129,10 @@ func (a *admin) Prune(ctx context.Context, names []string) ([]driver.PruneResult
 		return nil, err
 	}
 	release()
-	if err := acquireMaintenance(ctx); err != nil {
+	if err := a.conn.acquireMaintenance(ctx); err != nil {
 		return nil, classify("prune", driver.KindTransient, err)
 	}
-	defer releaseMaintenance()
+	defer a.conn.releaseMaintenance()
 	release, err = a.admission(ctx, "prune")
 	if err != nil {
 		return nil, err
@@ -156,16 +140,19 @@ func (a *admin) Prune(ctx context.Context, names []string) ([]driver.PruneResult
 	defer release()
 	results := make([]driver.PruneResult, 0, len(names))
 	deleted := make([]string, 0, len(names))
+	recordRefusal := func(name, reason string) {
+		if reason == "destination does not exist" {
+			a.clearDestinationDelay(name)
+		}
+		results = append(results, driver.PruneResult{Name: name, Reason: reason})
+	}
 	for _, name := range names {
 		reason, err := a.pruneGuard(ctx, name)
 		if err != nil {
 			return nil, err
 		}
 		if reason != "" {
-			if reason == "destination does not exist" {
-				a.clearDestinationDelay(name)
-			}
-			results = append(results, driver.PruneResult{Name: name, Reason: reason})
+			recordRefusal(name, reason)
 			continue
 		}
 
@@ -173,17 +160,6 @@ func (a *admin) Prune(ctx context.Context, names []string) ([]driver.PruneResult
 		// guard and before DeleteTopics, so this check-then-delete window can
 		// still destroy a newly attached destination; the port has no atomic
 		// compare-and-delete operation with which to close it.
-		reason, err = a.pruneGuard(ctx, name)
-		if err != nil {
-			return nil, err
-		}
-		if reason != "" {
-			if reason == "destination does not exist" {
-				a.clearDestinationDelay(name)
-			}
-			results = append(results, driver.PruneResult{Name: name, Reason: reason})
-			continue
-		}
 		responses, err := a.client.DeleteTopics(ctx, name)
 		if err != nil {
 			return nil, classifyAdminError("prune", err)
@@ -194,8 +170,7 @@ func (a *admin) Prune(ctx context.Context, names []string) ([]driver.PruneResult
 		}
 		if response.Err != nil {
 			if errors.Is(response.Err, kerr.UnknownTopicOrPartition) {
-				a.clearDestinationDelay(name)
-				results = append(results, driver.PruneResult{Name: name, Reason: "destination does not exist"})
+				recordRefusal(name, "destination does not exist")
 				continue
 			}
 			return nil, classifyAdminError("prune", response.Err)
@@ -228,11 +203,9 @@ func (a *admin) pruneGuard(ctx context.Context, name string) (string, error) {
 	if a.conn != nil {
 		a.conn.mu.RLock()
 		for csm := range a.conn.consumers {
-			for _, dest := range csm.destinations {
-				if dest == name {
-					a.conn.mu.RUnlock()
-					return "consumer attached", nil
-				}
+			if slices.Contains(csm.destinations, name) {
+				a.conn.mu.RUnlock()
+				return "consumer attached", nil
 			}
 		}
 		a.conn.mu.RUnlock()
@@ -255,10 +228,8 @@ func (a *admin) pruneGuard(ctx context.Context, name string) (string, error) {
 		}
 		for _, member := range group.Members {
 			if joinConsumer, ok := member.Join.AsConsumer(); ok {
-				for _, topic := range joinConsumer.Topics {
-					if topic == name {
-						return "consumer attached", nil
-					}
+				if slices.Contains(joinConsumer.Topics, name) {
+					return "consumer attached", nil
 				}
 			}
 			if assignConsumer, ok := member.Assigned.AsConsumer(); ok {
@@ -273,14 +244,11 @@ func (a *admin) pruneGuard(ctx context.Context, name string) (string, error) {
 	return "", nil
 }
 
-// EnsureTopology accepts exchanges, bindings, DeadLetter, and DeliveryLimit
-// fields, but Kafka does not honor them: routing is FanoutAtConsume, native
-// dead lettering is unavailable, and the core retry ladder owns those semantics.
-//
-// Under TopologyNone it creates nothing and makes no broker request; it still
-// records each destination's delay, which is local bookkeeping the produce path
-// reads to stamp a due time on a publish that carries none of its own, and not a
-// broker round trip.
+// EnsureTopology applies the requested topology policy and returns a topology
+// diff. Kafka uses topics as destinations and does not create exchanges or
+// bindings; routing uses fanout at consume time. The driver does not advertise
+// native dead-letter queue or delay support. Under TopologyNone, it makes no
+// broker request.
 func (a *admin) EnsureTopology(ctx context.Context, spec driver.TopologySpec) (driver.TopologyDiff, error) {
 	release, err := a.admission(ctx, "ensure_topology")
 	if err != nil {
@@ -289,7 +257,7 @@ func (a *admin) EnsureTopology(ctx context.Context, spec driver.TopologySpec) (d
 	defer release()
 	diff, err := a.ensureTopology(ctx, spec)
 	if err != nil {
-		return driver.TopologyDiff{}, err
+		return diff, err
 	}
 	a.recordDestinationDelays(spec.Destinations)
 	return diff, nil
@@ -301,18 +269,19 @@ func (a *admin) recordDestinationDelays(destinations []driver.DestinationSpec) {
 	}
 	a.conn.mu.Lock()
 	defer a.conn.mu.Unlock()
+	// The instant is read under the lock, not before it, because the history is
+	// read as ordered: two EnsureTopology calls that interleave would otherwise
+	// append their declarations in the order they took the clock rather than the
+	// order they appended, and a reader walks the history forward and stops at
+	// the first declaration later than the record it is asked about.
+	now := clock.NewReal().Now()
 	for _, destination := range destinations {
-		a.conn.delays[destination.Name] = destination.Delay
+		history := a.conn.delays[destination.Name]
+		if len(history) > 0 && history[len(history)-1].delay == destination.Delay {
+			continue
+		}
+		a.conn.delays[destination.Name] = append(history, delayDeclaration{at: now, delay: destination.Delay})
 	}
-}
-
-func (a *admin) DescribeTopology(ctx context.Context, names []string) (driver.TopologyState, error) {
-	release, err := a.admission(ctx, "describe_topology")
-	if err != nil {
-		return driver.TopologyState{}, err
-	}
-	defer release()
-	return a.describeTopology(ctx, names)
 }
 
 func (a *admin) clearDestinationDelay(destination string) {
@@ -322,6 +291,16 @@ func (a *admin) clearDestinationDelay(destination string) {
 	a.conn.mu.Lock()
 	defer a.conn.mu.Unlock()
 	delete(a.conn.delays, destination)
+}
+
+// DescribeTopology returns the current topology state for the requested names.
+func (a *admin) DescribeTopology(ctx context.Context, names []string) (driver.TopologyState, error) {
+	release, err := a.admission(ctx, "describe_topology")
+	if err != nil {
+		return driver.TopologyState{}, err
+	}
+	defer release()
+	return a.describeTopology(ctx, names)
 }
 
 func (a *admin) createTopic(ctx context.Context, topic kafkaTopicSpec) (kadm.CreateTopicResponse, error) {

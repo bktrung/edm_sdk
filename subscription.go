@@ -17,13 +17,18 @@ import (
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/lifecycle"
 )
 
-// Subscription declares one consumer group, its delivery policy, and the
-// handlers and lifecycle notifications attached to it.
+// Subscription declares one consumer group, its topics and delivery policy,
+// handlers, and lifecycle callbacks. Client.Subscribe validates it and returns
+// a Runner that has not started consuming.
 type Subscription struct {
-	Name            string
-	Topics          []string
-	Mode            Mode
-	Concurrency     int
+	Name        string
+	Topics      []string
+	Mode        Mode
+	Concurrency int
+	// Prefetch caps total SDK-admitted unsettled deliveries. Zero leaves
+	// configuration overrides in effect, then uses a positive broker fallback
+	// or automatic sizing from the resolved lane capacities.
+	// Broker/client transport buffering is separate from this admission cap.
 	Prefetch        int
 	Priorities      []Priority
 	Fairness        FairnessConfig
@@ -35,7 +40,8 @@ type Subscription struct {
 	Handlers        map[string]Handler
 }
 
-// DeadLettered describes one message whose confirmed copy reached a DLQ.
+// DeadLettered carries the message data passed to OnDeadLetter after its
+// dead-letter copy is confirmed.
 type DeadLettered struct {
 	Envelope Envelope
 	// Body is an independent copy of the message payload, safe to read after
@@ -47,8 +53,10 @@ type DeadLettered struct {
 	Destination string
 }
 
-// Discarded describes one message acknowledged without applying its effect or
-// retaining a copy.
+// Discarded carries the message data passed to OnDiscarded when a message is
+// acknowledged without applying its effect or retaining a copy. The callback
+// is scheduled at most once per delivery, only after an inline or deferred Ack
+// returns success. A requeue fallback or unsettled delivery never schedules it.
 type Discarded struct {
 	Envelope Envelope
 	// Body is an independent copy of the message payload, safe to read after
@@ -58,8 +66,8 @@ type Discarded struct {
 	Err    error
 }
 
-// DiscardReason identifies why a message was acknowledged without a retained
-// copy.
+// DiscardReason identifies why an event without a retained copy was
+// acknowledged. Its zero value means no reason was recorded.
 type DiscardReason string
 
 const (
@@ -73,16 +81,20 @@ func discardUnmatched(envelope Envelope, body []byte) Discarded {
 	return Discarded{Envelope: envelope, Body: body, Reason: DiscardUnmatched}
 }
 
-// Runner owns a validated subscription. Construction and notifications live
-// in subscription.go; dispatch and settlement live in worker.go; abandon and
-// drain-after-run ownership lives in reconnect.go.
+// Runner executes the validated Subscription returned by Client.Subscribe.
+// Call Run once to start delivery and Drain to stop it gracefully. Its zero
+// value is not usable.
 type Runner struct {
 	client       *Client
 	subscription Subscription
 	config       SubscriptionConfig
 	mu           sync.Mutex
 	consumer     driver.Consumer
-	group        *errgroup.Group
+	// consumerEpoch is the connection incarnation the stored consumer was
+	// opened on. A failed Release keeps the consumer against that connection,
+	// because that is the one the driver still carries it on.
+	consumerEpoch uint64
+	group         *errgroup.Group
 	// asyncGroup owns handler and terminal-callback goroutines. finishRunner
 	// cancels their contexts but does not wait: a non-cooperative handler or
 	// callback cannot be force-stopped, and waiting would violate drain's bound.
@@ -91,7 +103,6 @@ type Runner struct {
 	// never waited by the runner, because a non-cooperative callback cannot be
 	// force-stopped without extending shutdown.
 	errorGroup            *errgroup.Group
-	runCtx                context.Context
 	handlerCtx            context.Context
 	handlerCancel         context.CancelFunc
 	handlerShutdownCtx    context.Context
@@ -100,47 +111,32 @@ type Runner struct {
 	settleCancel          context.CancelFunc
 	cancel                context.CancelFunc
 	done                  chan struct{}
-	started               bool
-	draining              bool
-	drainStarted          chan struct{}
-	finished              bool
-	runErr                error
-	reconnectCause        error
+	// events carries every report the runner's other goroutines make to the
+	// one goroutine that owns its state. Run creates it before any source
+	// starts and never replaces it, so a source always has somewhere to report
+	// and the owner always has exactly one thing to read.
+	events       chan runnerEvent
+	started      bool
+	draining     bool
+	drainStarted chan struct{}
+	finished     bool
+	runErr       error
 	// recordedFailure reports whether this runner has already recorded a
 	// failure against its subscription name. It is guarded by client.mu, not
-	// by mu: every record site and the clear already hold that lock, and the
-	// exit record reads it in the same critical section that decides whether
-	// the entry it would replace is still this runner's.
-	recordedFailure bool
-	// reconnectCauseAttempt is set only when the supervisor injects the generic
-	// reconnect cause, so a runner can wait for that exact client attempt.
-	reconnectCauseAttempt *reconnectAttempt
-	// reconnectDecisionHook is a test-only seam for pausing generation decisions.
-	reconnectDecisionHook func()
-	// reconnectWaitHook is a test-only seam, called when a runner is about to wait for a
-	// reconnect in progress before it opens its consumer.
-	reconnectWaitHook func()
-	// consumerError identifies a transient failure from Consumer.Errors in this generation.
-	consumerError bool
-	// successfulDelivery means this generation completed at least one handled delivery.
-	successfulDelivery bool
-	// repairCycleActive means a replacement consumer has been built and the next
-	// transient consumer failure can complete a failed repair cycle.
-	repairCycleActive bool
-	// failedRepairCycles counts consecutive replacement consumers that fail before
-	// any handled delivery; a handled delivery resets it.
-	failedRepairCycles    int
-	inflight              *inflightRegistry
-	retryDestinationTiers map[string]int
-	lifecycle             *lifecycle.Machine
-	dispatchPool          *dispatch.Pool
-
-	// prefetchConfigured records whether the caller named an in-flight budget
-	// on this subscription, as opposed to taking the broker default. A cap on
-	// a budget nobody named is not reported: the default is not the caller's
-	// decision, and the line would fire on nearly every subscription, which is
-	// what leaves it unread when a caller's own budget is capped.
-	prefetchConfigured bool
+	// by mu: every record site holds that lock, and Run refuses a second start,
+	// so a runner records at most once. The exit record reads it in the same
+	// critical section that decides whether the entry it would replace is still
+	// this runner's.
+	recordedFailure     bool
+	inflight            *inflightRegistry
+	destinationMetadata map[string]destinationMetadata
+	// lanePlan is the lane plan the runner's consumer open established: its
+	// destinations are the ones that open declared and its capacities are the
+	// ones the driver's per-destination caps were keyed on. It is nil until the
+	// first open, so a runner that has not opened derives a plan from the
+	// client's live capabilities instead.
+	lanePlan  []runnerLane
+	lifecycle *lifecycle.Machine
 }
 
 const terminalNotificationTimeout = time.Second
@@ -195,7 +191,8 @@ func runnerNotifyError(r *Runner, parent context.Context, event *Event, cause er
 	if !group.TryGo(func() (err error) {
 		defer func() {
 			if recovered := recover(); recovered != nil {
-				logger.Warn("f1 error handler panicked", "panic", recovered)
+				logger.LogAttrs(parent, slog.LevelWarn, "f1 error handler panicked",
+					slog.Any("panic", recovered))
 			}
 		}()
 		ctx, cancel := context.WithTimeout(parent, terminalNotificationTimeout)
@@ -203,7 +200,9 @@ func runnerNotifyError(r *Runner, parent context.Context, event *Event, cause er
 		handler(ctx, event, cause)
 		return nil
 	}) {
-		logger.Error("f1 error handler notification dropped", "subscription", r.subscription.Name, "cause", cause)
+		logger.LogAttrs(parent, slog.LevelError, "f1 error handler notification dropped",
+			slog.String("subscription", r.subscription.Name),
+			slog.Any("cause", cause))
 	}
 }
 
@@ -234,7 +233,9 @@ func notifyOwned(parent context.Context, callback func(context.Context), group *
 		defer close(done)
 		defer func() {
 			if recovered := recover(); recovered != nil {
-				logger.Warn("f1 terminal notification panicked", "kind", kind, "panic", recovered)
+				logger.LogAttrs(parent, slog.LevelWarn, "f1 terminal notification panicked",
+					slog.String("kind", kind),
+					slog.Any("panic", recovered))
 			}
 		}()
 		callback(ctx)
@@ -244,15 +245,18 @@ func notifyOwned(parent context.Context, callback func(context.Context), group *
 		select {
 		case <-done:
 		case <-ctx.Done():
-			logger.Warn("f1 terminal notification timed out", "kind", kind, "timeout", terminalNotificationTimeout)
+			logger.LogAttrs(parent, slog.LevelWarn, "f1 terminal notification timed out",
+				slog.String("kind", kind),
+				slog.Duration("timeout", terminalNotificationTimeout))
 		}
 		cancel()
 		return nil
 	})
 }
 
-// Subscribe validates sub after applying the subscription-specific config
-// precedence and returns a runner ready for the worker phase.
+// Subscribe validates and registers sub, then returns a Runner that has not
+// started consuming. Loaded configuration and environment values are applied
+// before non-zero fields in sub override them.
 func (c *Client) Subscribe(ctx context.Context, sub Subscription) (*Runner, error) {
 	if c == nil {
 		return nil, errors.New("f1: client is not connected")
@@ -261,17 +265,13 @@ func (c *Client) Subscribe(ctx context.Context, sub Subscription) (*Runner, erro
 		return nil, err
 	}
 	c.mu.Lock()
-	if c.closed || c.conn == nil {
+	if err := c.admit(workSubscribe, 0); err != nil {
 		c.mu.Unlock()
-		return nil, errors.New("f1: client is closed")
-	}
-	if c.shutdownStarted {
-		c.mu.Unlock()
-		return nil, errors.New("f1: client is closing")
+		return nil, err
 	}
 	c.mu.Unlock()
 
-	resolved, prefetchConfigured, err := resolveSubscription(c, sub)
+	resolved, err := resolveSubscription(c, sub)
 	if err != nil {
 		return nil, err
 	}
@@ -284,16 +284,6 @@ func (c *Client) Subscribe(ctx context.Context, sub Subscription) (*Runner, erro
 	if resolved.Mode == OrderedByKey && !effectiveCapabilities.OrderedByKey {
 		return nil, fmt.Errorf("f1: subscription %s requests ordered_by_key, but feature is unavailable", sub.Name)
 	}
-	c.mu.Lock()
-	if c.closed || c.conn == nil {
-		c.mu.Unlock()
-		return nil, errors.New("f1: client is closed")
-	}
-	if c.shutdownStarted {
-		c.mu.Unlock()
-		return nil, errors.New("f1: client is closing")
-	}
-	c.mu.Unlock()
 	effective := sub
 	effective.Topics = append([]string(nil), resolved.Topics...)
 	effective.Mode = resolved.Mode
@@ -305,11 +295,11 @@ func (c *Client) Subscribe(ctx context.Context, sub Subscription) (*Runner, erro
 	effective.HandlerTimeout = resolved.HandlerTimeout
 	effective.UnmatchedPolicy = resolved.UnmatchedPolicy
 	effective.Handlers = wrapHandlers(c.options.middleware, sub.Handlers)
-	runner := &Runner{client: c, subscription: effective, config: resolved, prefetchConfigured: prefetchConfigured}
+	runner := &Runner{client: c, subscription: effective, config: resolved}
 	c.mu.Lock()
-	if c.closed || c.shutdownStarted || c.conn == nil {
+	if err := c.admit(workSubscribe, 0); err != nil {
 		c.mu.Unlock()
-		return nil, errors.New("f1: client is closing")
+		return nil, err
 	}
 	c.runners[runner] = struct{}{}
 	c.mu.Unlock()
@@ -327,33 +317,17 @@ func wrapHandlers(middleware []Middleware, handlers map[string]Handler) map[stri
 	return wrapped
 }
 
-func resolveSubscription(c *Client, sub Subscription) (resolved SubscriptionConfig, prefetchConfigured bool, err error) {
-	resolved = defaultSubscription()
-	// Whether the caller named an in-flight budget, as opposed to taking the
-	// broker default. Three things name one: the Subscription, the loaded
-	// configuration block, and the environment overlay. The block is read
-	// through its presence flag rather than its value, because a block that
-	// named no prefetch has already been filled with the broker default by
-	// config normalization, so its value cannot tell the two apart. The
-	// environment overlay writes the value directly, so its key is read beside
-	// it. A budget nobody named is not reported when the lane windows cap it:
-	// that line would fire for every subscription on the shipped defaults.
-	prefetchConfigured = sub.Prefetch != 0
+func resolveSubscription(c *Client, sub Subscription) (SubscriptionConfig, error) {
+	resolved := defaultSubscription()
 	if loaded, ok := c.config.Subscriptions[sub.Name]; ok {
-		prefetchConfigured = prefetchConfigured || loaded.presence.Prefetch
 		overlayLoadedSubscription(&resolved, loaded)
 	}
-	if _, ok := lookupSubscriptionEnv(subscriptionEnvPrefix(sub.Name), "prefetch"); ok {
-		prefetchConfigured = true
-	}
-	if err = applySubscriptionEnvironment(sub.Name, &resolved); err != nil {
-		return SubscriptionConfig{}, false, err
+	if err := applySubscriptionEnvironment(sub.Name, &resolved); err != nil {
+		return SubscriptionConfig{}, err
 	}
 	overlayExplicitSubscription(&resolved, sub)
-	if resolved.Prefetch == 0 {
-		resolved.Prefetch = resolvePrefetch(resolved.Prefetch, c.config.Broker.DefaultPrefetch)
-	}
-	return resolved, prefetchConfigured, nil
+	resolved.Prefetch = resolvePrefetch(resolved.Prefetch, c.config.Broker.DefaultPrefetch)
+	return resolved, nil
 }
 
 func overlayLoadedSubscription(dst *SubscriptionConfig, src SubscriptionConfig) {
@@ -367,9 +341,7 @@ func overlayLoadedSubscription(dst *SubscriptionConfig, src SubscriptionConfig) 
 	if p.Concurrency || src.Concurrency != 0 {
 		dst.Concurrency = src.Concurrency
 	}
-	if p.Prefetch {
-		dst.Prefetch = src.Prefetch
-	} else if src.Prefetch != 0 {
+	if p.Prefetch || src.Prefetch != 0 {
 		dst.Prefetch = src.Prefetch
 	}
 	if p.Priorities || len(src.Priorities) > 0 {
@@ -432,17 +404,29 @@ func overlayExplicitSubscription(dst *SubscriptionConfig, src Subscription) {
 	}
 }
 
+// validateSubscription checks one subscription's settings. Config loading and
+// Subscribe both call it, so a subscription that loads is one that subscribes.
 func validateSubscription(cfg Config, driverName, name string, sub SubscriptionConfig) error {
 	if name == "" {
 		return errors.New("f1: subscription name must not be empty")
 	}
+	if !isNameSegment(name) {
+		return fmt.Errorf("f1: subscription name %q must contain only letters, digits, '-' and '_'", name)
+	}
 	if len(sub.Topics) == 0 {
 		return fmt.Errorf("f1: subscriptions.%s.topics must not be empty", name)
 	}
+	topics := make(map[string]string, len(sub.Topics))
 	for _, topic := range sub.Topics {
 		if strings.TrimSpace(topic) == "" {
 			return fmt.Errorf("f1: subscriptions.%s.topics must not contain an empty topic", name)
 		}
+		// Two entries naming one topic would share its lanes while the
+		// prefetch floor below counted them twice.
+		if first, ok := topics[topicFor(topic)]; ok {
+			return fmt.Errorf("f1: subscriptions.%s.topics %q and %q name the same topic", name, first, topic)
+		}
+		topics[topicFor(topic)] = topic
 	}
 	if sub.Concurrency < 1 || sub.Concurrency > 1024 {
 		return fmt.Errorf("f1: subscriptions.%s.concurrency must be between 1 and 1024", name)
@@ -450,25 +434,13 @@ func validateSubscription(cfg Config, driverName, name string, sub SubscriptionC
 	if err := validateSubscriptionModeAndPolicy(name, sub.Mode, sub.UnmatchedPolicy); err != nil {
 		return err
 	}
-	if len(sub.Priorities) == 0 {
-		return fmt.Errorf("f1: subscriptions.%s.priorities must not be empty", name)
-	}
-	seen := make(map[Priority]struct{}, len(sub.Priorities))
-	for _, priority := range sub.Priorities {
-		if !priority.Valid() {
-			return fmt.Errorf("f1: subscriptions.%s.priorities contains invalid priority %q", name, priority)
-		}
-		if _, ok := seen[priority]; ok {
-			return fmt.Errorf("f1: subscriptions.%s.priorities contains duplicate %s", name, priority)
-		}
-		seen[priority] = struct{}{}
+	if err := validatePriorityList("subscriptions."+name+".priorities", sub.Priorities); err != nil {
+		return err
 	}
 	if err := validateRetryConfig("subscriptions."+name+".retry", sub.Retry); err != nil {
 		return err
 	}
-	tiers := retryTiers(sub.Retry)
-	lanes := len(sub.Topics) * len(sub.Priorities) * (1 + tiers)
-	if err := validatePrefetch(name, sub.Prefetch, lanes); err != nil {
+	if err := validatePrefetch(name, sub.Prefetch); err != nil {
 		return err
 	}
 	if sub.HandlerTimeout <= 0 {
@@ -478,8 +450,8 @@ func validateSubscription(cfg Config, driverName, name string, sub SubscriptionC
 		return fmt.Errorf("f1: lifecycle.drainTimeout must exceed subscriptions.%s.handlerTimeout", name)
 	}
 	for priority, weight := range sub.Fairness.Weights {
-		if !priority.Valid() || weight < 1 {
-			return fmt.Errorf("f1: subscriptions.%s.fairness.weights.%s must be at least 1", name, priority)
+		if !priority.Valid() || weight < 1 || weight > maxFairnessWeight {
+			return fmt.Errorf("f1: subscriptions.%s.fairness.weights.%s must be between 1 and %d", name, priority, maxFairnessWeight)
 		}
 	}
 	for priority, budget := range sub.Fairness.Budgets {
@@ -487,12 +459,30 @@ func validateSubscription(cfg Config, driverName, name string, sub SubscriptionC
 			return fmt.Errorf("f1: subscriptions.%s.fairness.budgets.%s must not be negative", name, priority)
 		}
 	}
+	// Zero leaves the default in place; a negative value is a typo the lane
+	// plan would otherwise replace with the default without a word.
+	if sub.Fairness.RetryWeightDivisor < 0 {
+		return fmt.Errorf("f1: subscriptions.%s.fairness.retryWeightDivisor must not be negative", name)
+	}
+	if sub.Fairness.PrefetchFactor < 0 {
+		return fmt.Errorf("f1: subscriptions.%s.fairness.prefetchFactor must not be negative", name)
+	}
+	prefetch := sub.Prefetch
+	if prefetch == 0 {
+		prefetch = automaticSubscriptionPrefetch(sub)
+		if err := validatePrefetch(name, prefetch); err != nil {
+			return err
+		}
+	}
+	if sub.Mode == OrderedByKey && sub.Concurrency > dispatch.MaxOrderedBufferEntries/prefetch {
+		return fmt.Errorf("f1: subscriptions.%s: ordered mode needs concurrency x prefetch at most %d, got %d x %d", name, dispatch.MaxOrderedBufferEntries, sub.Concurrency, prefetch)
+	}
 	if driverName == "rabbitmq" {
 		consumerTimeout, err := durationOption(cfg.Broker.DriverOptions, "rabbitmq.consumerTimeout", 90*time.Second)
 		if err != nil {
 			return err
 		}
-		if consumerTimeout < sub.HandlerTimeout*3 {
+		if sub.HandlerTimeout > consumerTimeout/3 {
 			return fmt.Errorf("f1: broker.rabbitmq.consumerTimeout must be at least subscriptions.%s.handlerTimeout x 3", name)
 		}
 	}
@@ -510,8 +500,8 @@ func validateSubscriptionModeAndPolicy(name string, mode Mode, policy UnmatchedP
 }
 
 func cloneFairness(value FairnessConfig) FairnessConfig {
-	value.Weights = clonePriorityWeights(value.Weights)
-	value.Budgets = clonePriorityBudgets(value.Budgets)
+	value.Weights = maps.Clone(value.Weights)
+	value.Budgets = maps.Clone(value.Budgets)
 	return value
 }
 
@@ -522,10 +512,10 @@ func cloneRetry(value RetryConfig) RetryConfig {
 
 func mergeFairness(base, override FairnessConfig) FairnessConfig {
 	if override.Weights != nil {
-		base.Weights = clonePriorityWeights(override.Weights)
+		base.Weights = maps.Clone(override.Weights)
 	}
 	if override.Budgets != nil {
-		base.Budgets = clonePriorityBudgets(override.Budgets)
+		base.Budgets = maps.Clone(override.Budgets)
 	}
 	if override.RetryWeightDivisor != 0 {
 		base.RetryWeightDivisor = override.RetryWeightDivisor
@@ -533,8 +523,8 @@ func mergeFairness(base, override FairnessConfig) FairnessConfig {
 	if override.PrefetchFactor != 0 {
 		base.PrefetchFactor = override.PrefetchFactor
 	}
-	if override.DisableAging {
-		base.DisableAging = true
+	if override.DisableDeadlinePromotion {
+		base.DisableDeadlinePromotion = true
 	}
 	return base
 }
@@ -559,27 +549,9 @@ func mergeRetry(base, override RetryConfig) RetryConfig {
 }
 
 func fairnessZero(value FairnessConfig) bool {
-	return value.Weights == nil && value.Budgets == nil && value.RetryWeightDivisor == 0 && value.PrefetchFactor == 0 && !value.DisableAging
+	return value.Weights == nil && value.Budgets == nil && value.RetryWeightDivisor == 0 && value.PrefetchFactor == 0 && !value.DisableDeadlinePromotion
 }
 
 func retryZero(value RetryConfig) bool {
 	return value.MaxAttempts == 0 && value.InitialInterval == 0 && value.Multiplier == 0 && value.MaxInterval == 0 && value.Tiers == nil
-}
-
-func clonePriorityWeights(value map[Priority]int) map[Priority]int {
-	if value == nil {
-		return nil
-	}
-	result := make(map[Priority]int, len(value))
-	maps.Copy(result, value)
-	return result
-}
-
-func clonePriorityBudgets(value map[Priority]time.Duration) map[Priority]time.Duration {
-	if value == nil {
-		return nil
-	}
-	result := make(map[Priority]time.Duration, len(value))
-	maps.Copy(result, value)
-	return result
 }

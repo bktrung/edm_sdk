@@ -1,10 +1,9 @@
 # Source-reading guide
 
-This is the canonical reading order for maintainers and AI collaborators who
-need to understand the F1 repository before changing it. It starts with public
-vocabulary and ports, then follows construction, runtime primitives, concrete
-drivers, and verification. Do not begin in `worker.go`: the worker coordinates
-contracts that are defined elsewhere.
+Read F1's public vocabulary and driver ports before the orchestration that uses
+them. The route then follows construction, runtime primitives, consumption,
+concrete drivers, and verification. Do not begin in `worker.go`: the worker
+coordinates contracts defined elsewhere.
 
 The links below are navigation, not a second source of implementation detail.
 When a claim matters, open the linked source, its nearest tests, and the
@@ -31,6 +30,8 @@ import boundaries, [Publish flow](/development/publish-flow) for the outbound pa
 reconnect. Use [Testing strategy](/development/testing) to choose which tests should
 accompany a change.
 
+Use [Writing style](/development/writing-style) when adding or revising documentation.
+
 ## Pass 1: public vocabulary
 
 Read the public nouns and guarantees before reading orchestration:
@@ -44,6 +45,7 @@ Read the public nouns and guarantees before reading orchestration:
    classification.
 5. [`priority.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/priority.go) - priority values and their public
    ordering meaning.
+6. [`observer.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/observer.go) - observer lifecycle events, pairing, ordering, and trace injection.
 
 Then read the public package comments and the nearest focused tests. The goal
 is to understand what a service author can observe: event identity, headers,
@@ -85,13 +87,14 @@ message:
 1. [`config.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/config.go) - user configuration and resolved defaults.
 2. [`broker_config.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/broker_config.go) - broker connection and driver
    configuration.
-3. [`options.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/options.go) - functional options and runtime option
+3. [`internal/kafka/drain.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/internal/kafka/drain.go) - the standard-library-only Kafka timeout rule shared by core validation and Kafka consumer admission.
+4. [`options.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/options.go) - functional options and runtime option
    resolution.
-4. [`client.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/client.go) - driver opening, topology initialization,
+5. [`client.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/client.go) - driver opening, topology initialization,
    shared producer admission, reconnect ownership, and client close.
-5. [`publisher.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/publisher.go) - publish validation, codec selection,
+6. [`publisher.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/publisher.go) - publish validation, codec selection,
    envelope construction, topic routing, and durable publication.
-6. [`envelope.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/envelope.go) again at `EncodeHeaders` - the wire
+7. [`envelope.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/envelope.go) again at `EncodeHeaders` - the wire
    boundary between core metadata and driver headers.
 
 The goal is to understand which work happens before driver publication and
@@ -107,7 +110,7 @@ Read the small, portable mechanisms before the worker that composes them:
 2. [`internal/retry/`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/tree/main/internal/retry) - backoff tiers and delay
    resolution.
 3. [`internal/sched/`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/tree/main/internal/sched) - bounded weighted lanes,
-   priority, aging, and fairness.
+   priority, deadline promotion, and fairness.
 4. [`internal/dispatch/`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/tree/main/internal/dispatch) - worker pool,
    ordered-key routing, and in-flight registry behavior.
 5. [`internal/lifecycle/`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/tree/main/internal/lifecycle) - runner state and
@@ -127,6 +130,8 @@ Only after the contracts and primitives are clear, read the orchestration:
    handler invocation, retry/dead-letter routing, settlement, and drain.
 3. [`reconnect.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/reconnect.go) - connection replacement and runner
    re-entry after transient driver failure.
+4. [`observer_call.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/observer_call.go) - synchronous observer calls, panic containment, finish guards, and trace injection.
+5. [`backlog_poll.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/backlog_poll.go) - backlog sampling and observer backlog point events.
 
 Use the function map in [Consume flow](/development/consume-flow) while reading
 `worker.go`. Start at `Runner.Run`, then jump to the fetch, dispatch,
@@ -150,6 +155,16 @@ Read adapters in this order:
    management inspection, queue/exchange behavior, reconnect, and settlement.
 4. [`drivers/kafka/`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/tree/main/drivers/kafka) - classic consumer groups,
    partition-bound scaling, offsets, deferral, lag, and rebalance ownership.
+
+For Kafka operations, follow
+[`topology.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/drivers/kafka/topology.go)
+for declaration, verification, and partition floors;
+[`admin.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/drivers/kafka/admin.go)
+for purge/prune ownership guards; and
+[`backlog.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/drivers/kafka/backlog.go)
+for offset snapshots and optional head probes. The
+[Kafka driver guide](/drivers/kafka) explains the operator-owned topic-policy
+and maintenance boundaries.
 
 Read the adapter source beside its tests. The in-memory implementation shows
 the port contract with fewer external moving parts; RabbitMQ and Kafka then
@@ -192,26 +207,27 @@ Publisher.Publish
   -> buildOutbound
   -> codec encode and topic validation
   -> Envelope.EncodeHeaders
-  -> publishMessages
+  -> sharedProducer
   -> driver.Producer.Publish
 ```
 
 Start at [`Publisher.Publish`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/publisher.go), which delegates to
 `PublishBatch`. Then follow `buildOutbound` in the same file for codec
 selection, event identity, envelope fields, routing, allowlists, and headers.
-Follow `publishMessages` in [`client.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/client.go) for producer
-admission, reconnection, and the close barrier. The final durable publication
-contract is the `driver.Producer` implementation in the selected adapter.
+Follow `sharedProducer` in [`client.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/client.go)
+for shared-producer admission and the close barrier. The final durable
+publication contract is the `driver.Producer` implementation in the selected
+adapter.
 
 The short form is:
 
 ```text
-Publisher.Publish -> buildOutbound -> Envelope.EncodeHeaders
-  -> publishMessages -> driver.Producer.Publish
+Publisher.Publish -> Publisher.PublishBatch -> buildOutbound
+  -> Envelope.EncodeHeaders -> sharedProducer -> driver.Producer.Publish
 ```
 
 Use [Publish flow](/development/publish-flow) when the question concerns batch partial
-failure, successor publication, or reconnect behavior.
+failure, retry and dead-letter successor publication, or reconnect behavior.
 
 ## Trace a consume
 
@@ -219,7 +235,7 @@ Use this recipe for a broker delivery:
 
 ```text
 Runner.Run
-  -> openRunnerConsumer
+  -> openRunnerConsumerWith
   -> fetchRunner
   -> runDispatchPipeline
   -> processDelivery
@@ -228,8 +244,10 @@ Runner.Run
   -> retryAndSettle / deadLetterAndSettle / ackDelivery
 ```
 
-`Runner.Run` owns the generation and lifecycle. `fetchRunner` receives from the
-driver consumer and admits deliveries. `runDispatchPipeline` selects lanes and
+`Runner.Run` owns one owner loop, the generation, and the lifecycle.
+`openRunnerConsumerWith` reads the connection and its epoch and opens the
+generation's consumer on it. `fetchRunner` receives from that consumer and
+admits deliveries. `runDispatchPipeline` selects lanes and
 submits work to the dispatch pool. `processDelivery` owns per-delivery cleanup;
 `dispatchMessage` decodes and classifies the event; `invokeHandler` runs the
 handler under its lifecycle context. The final branch publishes a retry or
@@ -275,9 +293,67 @@ When a test fails, use the lowest owning layer to diagnose it: a primitive
 invariant in `internal`, a public orchestration rule in the root package, a
 port rule in conformance, or a broker translation in the provider suite.
 
+## Code behind the deep dives
+
+The deep dives explain mechanisms without naming internals. This is where each
+one lives in the code.
+
+- **Reconnect and generations**: `reconnect.go` (`reconnectSupervisor`,
+  `requestReconnect`, `reconnectOnce`, `awaitRebuild`, `claimReplaced`,
+  `abandonRunners`, `publishQuiescence`, `retireConnection`,
+  `Runner.abandonForReconnect`); `client.go` (the `Client` fields and their
+  comments, `requestReconnectOnTransient`, `sharedProducer`, `beginPublish`,
+  `endPublish`); `admission.go` (`admit`, `connStateLocked`, `staleClaimLocked`);
+  `publisher.go` (`Publisher.PublishBatch` and its captured epoch); `worker.go`
+  (generation opening, consumer admission, repair after a connection error).
+- **One owner per runner**: `worker.go` (`runnerEvent` and its kinds,
+  `runnerOwner`, `pumpUntil`, `handle`, `startOpen`, `awaitRebuild`,
+  `releaseConsumer`, `requestDrain`, `startDrain`, `Runner.Run`, `Runner.Drain`,
+  the source goroutines' deferred reports); `reconnect.go` (the supervisor's
+  abandon); `runner_owner_test.go`.
+- **Retries and dead letters**: `worker.go` (`dispatchMessage`,
+  `classifyRetryError`, `retryAndSettle`, `deadLetterAndSettle`, `deadLetter`,
+  `startSuccessorPublish`); `internal/retry/ladder.go` (`DelayFor`,
+  `ResolveTier`); `internal/retry/sanity.go`
+  (`CounterRunaway`); `deathreason.go`.
+- **Scheduling**: `internal/sched/scheduler.go` (`Next`, `mostOverdue`);
+  `internal/sched/doc_trace_test.go` checks the committed interactive trace;
+  `prefetch.go` and `worker.go` share lane sizing and dispatch admission.
+- **Kafka ack tracker**: `drivers/kafka/acktracker.go` (`Ack`, `AckOwn`,
+  `Drop`, `CommitPoint`); `drivers/kafka/committer.go` batches confirmed
+  settlement points; `drivers/kafka/consumer.go` routes late settlements.
+- **Kafka rebalance ownership**: `drivers/kafka/balancer.go` selects the
+  protocol; `drivers/kafka/consumer.go` (`assignmentWarningsLocked`,
+  `revokeTrackers`, `commitSettledPrefix`) handles assignment and teardown.
+- **RabbitMQ retry parking**: `drivers/rabbitmq/topology.go`
+  (`parkArguments`, `parkDelayMillis`); `drivers/rabbitmq/producer.go`
+  (`target`) translates a delayed destination into parking publication.
+- **Kafka retry delays**: `drivers/kafka/deferral.go` (`dueTime`,
+  `admissionLocked`, `setHeadHoldLocked`, `syncHeadTimerLocked`,
+  `armHeadTimerLocked`, `rearmHeadTimerLocked`, `headHoldLoop`);
+  `drivers/kafka/consumer.go` (the poll loop's head admission,
+  `completeSettlement`); `driver/driver.go` (`ConsumerConfig.Delays`).
+- **RabbitMQ publish channels**: `drivers/rabbitmq/producer.go`
+  (`publishChannelCount`, `publishSegment`, `reserve`, `channelIn`, `write`,
+  `decide`, `sizeRefusalKinds`, `Close`); `drivers/rabbitmq/publish_watcher.go`
+  (`publishWatcher`, `answer`, `registerIDs`).
+- **Header size cap**: `envelope.go` (`CoreMaxHeaderBytes`, `EncodeHeaders`,
+  `shrinkDeathErrorTo`); `config.go` (`effectiveHeaderLimit`); `worker.go`
+  (`deadLetter`, `truncateError`, `successorNeverPublishable`, the retry copy's
+  encode fallback); `errors.go` (`WithDetails`).
+- **Consumer repair**: `worker.go` (`Runner.Run`'s repair decision,
+  `failedRepairCycles`, `repairCycleActive`, `runnerEventHandledDelivery`,
+  `ackDeliveryAs`, `consumeRunnerErrors`).
+
 ## Keep the route current
 
-This development page is the canonical maintainer route and should be updated
+Update this guide
 when package ownership or the source-reading order changes. Keep source links
 close to the decision they explain, and let source, tests, fixtures, API
 manifests, and the Makefile remain authoritative for mutable details.
+
+## Go further
+
+- [Architecture](/development/architecture) - the package map this route walks.
+- [Consume flow](/development/consume-flow) and [Publish flow](/development/publish-flow) - the runtime traces.
+- [Testing](/development/testing) - how to protect a change once you understand it.

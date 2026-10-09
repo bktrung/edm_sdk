@@ -1,102 +1,107 @@
-# Out-of-order handlers, one committed offset: the Kafka ack tracker
+# One in-flight record, one committed offset
 
-*By trungbk, September 2026.*
+*By trungbk.*
 
-A Kafka consumer reads partition 0 of `orders.placed` while sixteen handlers work at once. Offset 7 finishes before offset 5 does. Kafka remembers one number per partition, so the driver must turn those out-of-order finishes into one offset that never skips an unfinished record and never moves backwards. That is the ack tracker's job.
+Suppose records 10, 11, and 12 of one partition were handled at the same time, and the handler for 12 finished first. Committing 13 for it would let a restart skip records 10 and 11. Kafka stores a group position per partition, not an ack per record. F1's safety rule is therefore about records it delivered: a commit must not pass an earlier delivery that is still unfinished.
 
 ## Background
 
-A Kafka topic is split into partitions. Each partition is an append-only log with offsets 0, 1, 2, and so on. A consumer group is the set of consumers that share work, and the group stores one committed offset per partition. That offset means "the next offset to read"; after a restart, or after a rebalance that moves a partition to another consumer, reading resumes there.
+A Kafka topic is split into append-only partitions. A consumer group stores one committed position per partition. That position means "the next offset to read", so a restart or rebalance resumes there.
 
-Kafka has no per-message acknowledgement. Committing offset N tells Kafka that every record below N is done, so the commit represents a whole prefix of the partition log. The Kafka driver is the part of F1 that connects the SDK's consumer to Kafka.
+One delivery at a time per partition makes that rule simple, at the cost of letting a slow record hold up its partition. Offsets Kafka never delivered are different from unfinished deliveries: a gap after compaction does not imply that F1 owes a handler for the missing record.
 
-F1 calls finishing a delivery settlement. An ack settles it as successfully handled; a nack tells the driver to either discard it or requeue it for another delivery. The driver later commits or rewinds Kafka according to that choice.
+## The committed offset
 
-The order of settlement is independent of log order. F1 sends records to a pool of concurrent handlers, so offset 7 can finish before offset 5. Deferred records add another ordering: delivery follows due times, so a record published earlier with a later due time can be delivered after records behind it. The lowest offset the consumer holds can therefore be the last one it delivered.
+Ownership matters as much as offset order. A delivery from the current assignment can commit past offsets Kafka skipped. An old delivery cannot use that permission after the partition is lost and regained: it must match the offset the current ownership owes. Otherwise a late ack could pass a different record that the new assignment has not finished. The [offset tracker](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/drivers/kafka/acktracker.go) and the [consumer's ownership boundary](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/drivers/kafka/consumer.go) are the executable owners.
 
-## How it works
+The figure traces why a stale ack for any offset other than the current one is refused. The refused acks in it come from a delivery whose ownership has ended; a delivery of the current ownership never sends them.
 
-We give each partition owned by this consumer one tracker. The tracker stores five pieces of state:
+<F1KafkaCursorStepper />
 
-- `base`: the lowest offset that is still unacked, and the next possible commit point.
-- `acked`: offsets above `base` that have already been acknowledged.
-- `outstanding`: how many live delivery copies for each offset are currently unsettled.
-- `requeued`: offsets waiting for redelivery.
-- `generation`: the assignment generation to which the tracker belongs.
+<details>
+<summary>The same steps as a table</summary>
 
-The tracker also keeps a revoked tombstone and two mutexes. The tombstone is used when a partition leaves this consumer. The mutexes matter later because bookkeeping and broker I/O have different waiting rules.
+| Step | Attempt | Result | Committed position |
+| ---: | --- | --- | ---: |
+| 1 | offset 10, Ack | moves the committed offset forward | 11 |
+| 2 | offset 12, stale Ack from an earlier ownership | refused, 11 is still current | 11 |
+| 3 | offset 11, Requeue | leaves the record not yet acked | 11 |
+| 4 | offset 11, Ack | moves the committed offset forward | 12 |
+| 5 | offset 12, Ack | moves the committed offset forward | 13 |
+| 6 | offset 13, Nack without requeue | moves the committed offset forward, like an ack | 14 |
+| 7 | offset 15, stale Ack from an earlier ownership | refused, 14 is still current | 14 |
+| 8 | offset 14, Ack | moves the committed offset forward | 15 |
+| 9 | offset 15, Ack | moves the committed offset forward | 16 |
 
-When [`ackTracker.Ack`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/drivers/kafka/acktracker.go) receives an offset, it first records that offset in `acked`. It then walks `base` upward while the current base is in `acked`, removing each passed offset. If the base moved, the new base is committed. That new base is Kafka's "next offset to read", so every offset below it is done.
+</details>
 
-Here is the exact sequence pinned by [`TestAckTrackerOutOfOrderAcks`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/drivers/kafka/acktracker_test.go). For one partition, we start with base 0, track offsets 0 through 3, then ack them in the order 3, 1, 0, 2:
+A crash before a successful commit can deliver the current record again. This is the [at-least-once](/learn/glossary#at-least-once-delivery) boundary, not proof that a handler effect failed. Handler effects must be idempotent.
 
-| Ack | acked set after | base (commit point) | gap |
-| --- | --- | --- | --- |
-| 3 | {3} | 0 | 3 |
-| 1 | {1, 3} | 0 | 3 |
-| 0 | {3} | 2 | 1 |
-| 2 | {} | 4 | 0 |
+## Why commits stay ordered
 
-Acking 3 records the work that finished, yet base stays at 0 because offset 0 is unfinished. Acking 1 also leaves the base at 0. Acking 0 lets the tracker pass offsets 0 and 1, so it commits 2. Acking 2 then closes the remaining prefix and commits 4. The gap is the highest acked offset minus base, with zero returned when there is no higher acked offset.
+F1 first moves its in-memory offset forward, then sends the commit to Kafka, and does both for one partition one at a time. Without that, commits can arrive out of order. One ack could move to 11 and begin `commit(11)`. A second could move to 12 and begin `commit(12)`. If Kafka receives 12 before 11, its position moves backwards.
 
-An ack below base is already covered by an earlier commit. An ack for an offset already in `acked` is also a duplicate. Both cases return "already settled", which the driver exposes as [`driver.ErrAlreadySettled`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/driver/errors.go).
+```mermaid
+sequenceDiagram
+    participant A as ack offset 10
+    participant B as ack offset 11
+    participant K as Kafka
+    Note over A,K: Without ordering
+    A->>K: commit(11) sent
+    B->>K: commit(12) sent
+    Note over K: 12 arrives first, then 11
+    Note over K: position moves back to 11
+    Note over A,K: F1: one move-and-commit at a time
+    A->>K: commit(11)
+    K-->>A: committed
+    B->>K: commit(12)
+    K-->>B: committed
+```
 
-This ordering has a crash cost. If the process dies while base is below some offsets that were already acked, the group resumes at base and Kafka delivers those records again. F1 gives at-least-once delivery, so handlers need to be idempotent. The tracker accepts that redelivery because it keeps unfinished records from being lost.
+Serialization must cover the whole move-and-commit, not just the local offset update. Releasing it before the broker call finishes would admit the out-of-order sequence above. Batching points from different partitions does not remove this requirement; the [commit batching owner](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/drivers/kafka/committer.go) preserves the confirmation boundary.
 
-Committing each record as soon as it finished would lose messages: if record 8 finished first and the settler committed offset 9, then the process died before records 5, 6, and 7 finished, the group would resume at 9 and never deliver 5 through 7 again. That is the defect the prefix walk replaced, in commit `d4c43b1`.
+A failed commit restores the local offset while the partition is still owned. An ambiguous error does not prove whether Kafka stored the request: later commits or a restart can produce duplicate work, and the outcome is not limited to repeating the same offset. Rollback favors replay over skipping work.
 
-## Measured
+If ownership ends while the commit is running, rollback must not revive the old assignment. A successful commit remains successful if ownership ends just after it; an old tracker stays ended even when a fresh assignment is created.
 
-The gap belongs to a partition. It is the highest acked offset minus base. One slow record at base holds the commit back for the whole partition, while later records continue to be acknowledged above it. That same distance describes how much work can be redelivered after a crash.
+## Requeue keeps the original record
 
-The Kafka driver bounds this distance with `maxAckGap`. If any partition of a destination has a gap above that limit, the driver pauses fetching that destination until the gap shrinks. The default is 10000, and the option is documented in [Driver options](/user-guide/driver-options). The check runs when a delivery completes settlement, after a failed ack or nack, and when a partition tracker is dropped or handed over. The source for this check is [`refreshAckGapLocked`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/drivers/kafka/consumer.go).
+A retry creates another record; a requeue keeps the original offset unfinished. Confusing the two would advance the group position before the original was done. If ownership moves first, Kafka's stored position, rather than the old consumer's local queue, determines redelivery.
 
-The pause keeps the number of acked-but-uncommitted records per partition near `maxAckGap`, rather than letting it grow without limit. "Near" matters here: records already fetched before the pause can still arrive. The limit therefore controls new fetching while the tracker drains its existing gap.
-
-## Commits must not go backwards
-
-The tracker protects two different operations with two different locks. The bookkeeping lock, `mu`, protects the maps and `base`. `Ack` does that work under `mu`, releases it, and then calls the broker commit. The second lock, `commitMu`, covers the whole `Ack`, including the commit callback and any rollback. This keeps two commits for one partition in order without making ordinary tracking wait on the network.
-
-Without `commitMu`, two acks could interleave like this:
-
-1. Offsets 0 and 1 are in flight. Goroutine A acks 0, moves base to 1 under `mu`, releases `mu`, and starts the network call `commit(1)`.
-2. Before that call reaches the broker, goroutine B acks 1, moves base to 2 under `mu`, releases it, and starts `commit(2)`.
-3. The broker receives `commit(2)` first and then `commit(1)`.
-4. The committed offset goes from 2 back to 1.
-
-With `commitMu`, goroutine B cannot enter its ack until goroutine A's commit has returned. The broker sees 1 and then 2. The [`TestAckTrackerCommitsNeverRegress`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/drivers/kafka/acktracker_test.go) test holds the older commit open, checks that the newer callback does not start early, then verifies the observed commit points never decrease.
-
-A broker commit can fail after the tracker has advanced its in-memory base. In that case `Ack` rolls the state back: base returns to its old value, the offsets it passed are put back into `acked`, the just-acked offset is removed, and its outstanding count is restored. A later retry of the same ack can then succeed. If that failed commit raced a revocation, `Ack` returns `ErrRevoked`. A commit that succeeds after the partition was dropped still returns nil, because the broker already holds that offset.
-
-The first version of the tracker also made `Track`, which admits a new record, and `Drop`, which revokes a partition, take `commitMu`. That lock stays held through the broker round trip, so admitting the next record and revoking the partition queued behind network I/O. The revoke path called `Drop` while holding the consumer's assignment lock and its main lock, so a commit on the network could make consumer bookkeeping wait on that network call. That was the defect fixed in commit `70e4376`: `Track` and `Drop` now take only `mu`, while `commitMu` still serializes a commit and its rollback. [`TestAckTrackerDropDoesNotWaitOnCommit`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/drivers/kafka/acktracker_test.go) holds a commit callback open, calls `Drop` in another goroutine, and requires the drop to finish before the callback is released; [`TestAckTrackerTrackDoesNotWaitOnCommit`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/drivers/kafka/acktracker_test.go) checks the same boundary for admission.
-
-## Requeue means rewind
-
-A handler never nacks. When a handler returns an error, F1 publishes a retry copy and acks the original. F1 nacks with requeue only for work it hands back to the broker, such as a stuck handler it stopped waiting for, or a delivery cancelled while the dispatch channel was full. In that case [`settler.Nack`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/drivers/kafka/consumer.go) calls `Release`. If the offset is still outstanding, the tracker marks it as requeued. The consumer then finds the lowest requeued offset and moves that partition's fetch position back to it with franz-go `SetOffsets`. Requeue does not move base.
-
-The rewind makes Kafka send every record from that offset again. That can include records already acked and records that are still with a handler. The driver asks `TrackRedelivery` what to do with each one: a requeued offset is delivered again; an offset below base, an already acked offset, or an offset still outstanding is skipped; an offset the tracker has never seen is tracked and delivered.
-
-A nack without requeue is a discard. It follows the same `Ack` path, so the offset is committed past, and the driver logs a warning containing the topic, partition, and offset. Classic Kafka groups keep no per-message delivery count, so F1's `CountAsFailure` option is a no-op in [`settler.Nack`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/drivers/kafka/consumer.go).
+See [Consume flow](/development/consume-flow) for the distinction between retry publication and finishing the original.
 
 ## When the partition moves
 
-A rebalance is the Kafka group event in which partition ownership changes. When a partition is revoked, its tracker becomes a tombstone: `Drop` marks it revoked, and later `Track`, `Ack`, and `Release` calls return `ErrRevoked`. The settler reports that as a fatal settlement error, and this consumer does not commit the record.
+A rebalance can leave a handler running after its partition changes ownership. Waiting indefinitely would prevent the group from making progress; accepting every late ack would let the old assignment change the new one's position. The bounded revoke wait trades possible duplicate work for a finite ownership transfer.
 
-If the partition returns, the consumer creates a tracker for the new generation. It never reuses the revoked tracker because settlers from the old generation still point at it. [`trackerForLocked`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/drivers/kafka/consumer.go) compares the tracker generation with the active generation before reusing anything.
+```mermaid
+sequenceDiagram
+    participant O as old member
+    participant K as Kafka group
+    participant N as new member
+    K->>O: revoke partition
+    Note over O: wait up to rebalanceDrainTimeout
+    Note over O: mark ownership revoked
+    K->>N: assign partition
+    N->>K: read from committed position
+    Note over O: late ack is rejected
+```
 
-The new tracker's base is the lowest offset this consumer still owes a delivery for. That includes records already fetched and waiting to be delivered, along with reserved handoffs. It is not always the first record delivered: deferred delivery follows due times, so an earlier log record can still be held when a later record is delivered. Starting at the delivered record's offset would make the held record look settled and drop it. [`trackerBaseLocked`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/drivers/kafka/consumer.go) scans those owed records when it creates the tracker.
+A late ack or discard is rejected when another member now owns the partition. If this same consumer gets the partition back, a late ack can still succeed, but only for the offset that is current again. That is safe: the ack says the same record is done, and the ack cannot name any other offset.
+
+A late requeue does not commit and cannot be finished through the new member. If the partition comes back, F1 builds a new offset tracker for it, starting from the lowest offset this consumer still owes, instead of reusing the old tracker that old deliveries still point to.
+
+The old tracker stays marked as ended, so an ack sent through it is refused.
+
+The new owner resumes from Kafka's stored position, which can differ from the old owner's local state after an uncertain commit. Cooperative rebalancing reduces how much ownership changes; it does not remove the duplicate window.
 
 ## Limits and trade-offs
 
-- A crash can redeliver records that were already acked but not included in a commit; `maxAckGap` keeps that redelivery window roughly bounded.
-- One slow record can hold back a whole partition and can pause fetching for its destination when the gap exceeds `maxAckGap`.
-- A rewind re-fetches records from the lowest requeued offset, including records the tracker later skips because they are already settled or still outstanding.
-- A late ack for a revoked partition fails with `ErrRevoked` instead of committing through the old consumer assignment.
+One slow record holds its partition. More handler workers cannot bypass that safety boundary; [partition capacity](/drivers/kafka#kafka-parallelism-and-partitions) is a separate deployment decision. Lost ownership or an uncertain commit requires idempotent effects, even when a handler completed successfully.
 
-## Read the code
+## Go further
 
-- [`ackTracker.Ack`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/drivers/kafka/acktracker.go) - prefix advancement, rollback, and the two locks.
-- [`acktracker_test.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/drivers/kafka/acktracker_test.go) - out-of-order acks, commit ordering, and drop timing.
-- [`settler.Ack` and `settler.Nack`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/drivers/kafka/consumer.go) - settlement, discard, and requeue paths.
-- [`emit`, `trackerBaseLocked`, `refreshAckGapLocked`, and `resetOffset`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/drivers/kafka/consumer.go) - admission, generation state, gap pausing, and rewinding.
-- [Driver options](/user-guide/driver-options) - the `maxAckGap` setting.
+- [Driver contract](/development/driver-contract) - the ack and ownership contract every driver implements.
+- [Kafka lane balancer](/deep-dives/kafka-lane-balancer) - how partition ownership changes during a rebalance.
+- [Drivers and capabilities](/drivers-and-capabilities) - Kafka configuration and limits.
+- [Source-reading guide](/development/source-reading-guide) - the maintainer route through the implementation.

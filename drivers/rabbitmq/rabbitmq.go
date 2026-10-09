@@ -6,10 +6,12 @@ import (
 	"crypto/x509"
 	"errors"
 	"fmt"
+	"log/slog"
 	"maps"
 	"net"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -21,6 +23,8 @@ import (
 )
 
 var errMissingEndpoints = errors.New("rabbitmq: broker endpoints must not be empty")
+
+var errUnsupportedHostlessEndpoint = errors.New("rabbitmq: endpoint without a host is unsupported; use an explicit host, for example amqp://localhost/orders")
 
 var _ driver.Driver = Driver{}
 
@@ -37,6 +41,25 @@ const (
 	queueKindClassic queueKind = "classic"
 )
 
+const (
+	brokerPrefetchOption = "rabbitmq.brokerPrefetch"
+	maxBrokerPrefetch    = 1<<16 - 1
+)
+
+const trustBrokerTimestampOption = "rabbitmq.trustBrokerTimestamp"
+
+func resolveTrustBrokerTimestamp(options map[string]string) (bool, error) {
+	configured := strings.TrimSpace(options[trustBrokerTimestampOption])
+	if configured == "" {
+		return false, nil
+	}
+	trusted, err := strconv.ParseBool(configured)
+	if err != nil {
+		return false, fmt.Errorf("rabbitmq: invalid %s %q: want a boolean", trustBrokerTimestampOption, options[trustBrokerTimestampOption])
+	}
+	return trusted, nil
+}
+
 func configuredQueueKind(options map[string]string) (queueKind, error) {
 	switch strings.ToLower(strings.TrimSpace(options["rabbitmq.queueType"])) {
 	case "", string(queueKindQuorum):
@@ -48,6 +71,21 @@ func configuredQueueKind(options map[string]string) (queueKind, error) {
 	}
 }
 
+func resolveBrokerPrefetch(options map[string]string) (int, error) {
+	configured, present := options[brokerPrefetchOption]
+	if !present {
+		return 0, nil
+	}
+	prefetch, err := strconv.Atoi(configured)
+	if err != nil || prefetch < 1 || prefetch > maxBrokerPrefetch {
+		return 0, fmt.Errorf(
+			"rabbitmq: invalid %s %q; want an integer from 1 to %d",
+			brokerPrefetchOption, configured, maxBrokerPrefetch,
+		)
+	}
+	return prefetch, nil
+}
+
 func capabilitiesForQueueKind(kind queueKind) driver.Capabilities {
 	caps := Driver{}.Capabilities()
 	if kind == queueKindClassic {
@@ -57,46 +95,50 @@ func capabilitiesForQueueKind(kind queueKind) driver.Capabilities {
 	return caps
 }
 
-// delayAccuracyForLadder derives the delay accuracy the parking ladder
-// delivers, from the ladder itself rather than from a restatement of it: an
-// edited rung, or a ladder that stops doubling, then changes the reported
-// number instead of leaving a stale literal behind.
-//
-// A delay at or below the first rung parks in that rung, so its lateness is at
-// most the rung. A delay in (previous, rung] parks in rung, so its lateness is
-// at most rung - previous, and the relative bound is the largest such gap as a
-// fraction of the rung below it. The top rung is the last delay with a
-// declared bound: above it a message takes the per-message expiration path,
-// where one parked ahead of it holds it back for as long as that one's due
-// time is later, so no bound is declared there.
-func delayAccuracyForLadder(rungs []time.Duration) driver.DelayAccuracy {
-	accuracy := driver.DelayAccuracy{Floor: rungs[0], MaxDelay: rungs[len(rungs)-1]}
-	for i := 1; i < len(rungs); i++ {
-		previous := rungs[i-1]
-		accuracy.Relative = max(accuracy.Relative, float64(rungs[i]-previous)/float64(previous))
-	}
-	return accuracy
-}
-
-// Capabilities reports the RabbitMQ behavior used by this driver.
+// Capabilities reports the default RabbitMQ capabilities: per-message
+// acknowledgements, key ordering, fanout at publish time, unrestricted
+// consumer scaling, and lag queries. It reports no native priority: the
+// driver declares no x-max-priority queue and sets no AMQP message priority,
+// because the core carries priority in its own per-priority destinations. It
+// does not advertise native delay support: a message on a delayed destination
+// waits in a parking queue until its expiration passes. A connection using
+// classic queues does not report native delivery counts or native dead-letter
+// queues.
 func (Driver) Capabilities() driver.Capabilities {
 	return driver.Capabilities{
-		PerMessageAck:        true,
-		OrderedByKey:         true,
-		NativePriority:       driver.PriorityStrict,
-		NativePriorityLevels: 32,
-		NativeDelay:          false,
-		DelayAccuracy:        delayAccuracyForLadder(parkRungs[:]),
-		NativeDeliveryCount:  true,
-		NativeDLQ:            true,
-		ConsumerScaling:      driver.ScalingFree,
-		Fanout:               driver.FanoutAtPublish,
-		LagQueryable:         true,
+		PerMessageAck:       true,
+		OrderedByKey:        true,
+		NativeDelay:         false,
+		NativeDeliveryCount: true,
+		NativeDLQ:           true,
+		ConsumerScaling:     driver.ScalingFree,
+		Fanout:              driver.FanoutAtPublish,
+		LagQueryable:        true,
 	}
 }
 
+// openRefusalPasses is how many consecutive passes every endpoint may refuse a
+// dial for a reason retrying cannot repair before Open returns that refusal.
+// Pinned amqp091-go answers a socket that dies during the credential or vhost
+// exchange with the same 403 it returns for a refusal it decided, so one refused
+// pass cannot be told from a dropped handshake during a broker restart, a
+// load-balancer reset, or a short authentication-backend outage. Counting passes
+// keeps the decision free of wall-clock calls and deterministic for tests; at
+// the 250ms wait between passes this is about 5s, which absorbs those events
+// while a rejection the broker keeps making still ends the connect without
+// waiting the caller's timeout out.
+const openRefusalPasses = 20
+
+// openRetryWait is a test-only wait seam. Production uses waitRetry unchanged.
+var openRetryWait = waitRetry
+
 // Open establishes a RabbitMQ connection and retries failed endpoint dials
-// until the caller's context or ConnectTimeout expires.
+// until the caller's context or ConnectTimeout expires. A reason retrying
+// cannot repair, such as rejected credentials, ends the call with that
+// classified refusal once every endpoint has refused with it on
+// openRefusalPasses consecutive passes. It refuses a configured vhost that
+// differs from any endpoint, or SASL credentials without a mechanism, with a
+// fatal configuration error before dialing.
 func (Driver) Open(ctx context.Context, cfg driver.Config) (driver.Conn, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, classify("open", driver.KindTransient, err)
@@ -109,6 +151,23 @@ func (Driver) Open(ctx context.Context, cfg driver.Config) (driver.Conn, error) 
 	if err != nil {
 		return nil, classify("open", driver.KindFatal, err)
 	}
+	trustBrokerTimestamp, err := resolveTrustBrokerTimestamp(cfg.DriverOptions)
+	if err != nil {
+		return nil, classify("open", driver.KindFatal, err)
+	}
+	brokerPrefetch, err := resolveBrokerPrefetch(cfg.DriverOptions)
+	if err != nil {
+		return nil, classify("open", driver.KindFatal, err)
+	}
+	// TLS material and connection properties are shared across attempts;
+	// retrying cannot repair a file that fails to load.
+	if len(cfg.Endpoints) == 0 {
+		return nil, classify("open", driver.KindFatal, errMissingEndpoints)
+	}
+	amqpConfig, err := makeAMQPConfig(cfg)
+	if err != nil {
+		return nil, classify("open", driver.KindFatal, err)
+	}
 	openCtx := ctx
 	if cfg.ConnectTimeout > 0 {
 		var cancel context.CancelFunc
@@ -116,22 +175,38 @@ func (Driver) Open(ctx context.Context, cfg driver.Config) (driver.Conn, error) 
 		defer cancel()
 	}
 
-	if len(cfg.Endpoints) == 0 {
-		return nil, classify("open", driver.KindFatal, errMissingEndpoints)
+	endpoints := make([]resolvedEndpoint, len(cfg.Endpoints))
+	for index, endpoint := range cfg.Endpoints {
+		if err := openCtx.Err(); err != nil {
+			return nil, classify("open", driver.KindTransient, err)
+		}
+		resolved, err := resolveEndpoint(endpoint, cfg)
+		if err != nil {
+			return nil, classify("open", driver.KindFatal, err)
+		}
+		endpoints[index] = resolved
 	}
-	endpoints := cfg.Endpoints
+	// lastErr is the last dial error, which a pass that may still recover
+	// reports; refusal is the last dial error retrying cannot repair. Keeping
+	// them apart lets a pass that saw both keep retrying for the endpoint that
+	// may come back, while an abandoned Open still names the refusal that will
+	// not. refusal is not reset per pass: it is a property of the endpoint's
+	// credentials rather than of one attempt, so a later pass that runs out of
+	// time before dialing that endpoint still has the cause to report.
 	var lastErr error
+	var refusal error
+	refusedPasses := 0
 	for {
+		transient := false
 		for _, endpoint := range endpoints {
 			if err := openCtx.Err(); err != nil {
-				return nil, classify("open", driver.KindTransient, err)
+				return nil, classify("open", driver.KindTransient, errors.Join(err, openCause(refusal, lastErr)))
 			}
-			if err := validateEndpoint(endpoint); err != nil {
-				return nil, classify("open", driver.KindFatal, err)
-			}
-			conn, err := dial(openCtx, endpoint, cfg)
+			attemptConfig := amqpConfig
+			attemptConfig.SASL = endpoint.sasl
+			conn, err := dial(openCtx, endpoint.endpoint, attemptConfig, cfg.ConnectTimeout)
 			if err == nil {
-				managedConn, connErr := newConn(conn, capabilitiesForQueueKind(queueKind), endpoint, cfg, queueKind)
+				managedConn, connErr := newConn(conn, capabilitiesForQueueKind(queueKind), endpoint, cfg, queueKind, trustBrokerTimestamp, brokerPrefetch)
 				if connErr != nil {
 					_ = conn.Close()
 					return nil, classify("open", driver.KindFatal, connErr)
@@ -139,27 +214,57 @@ func (Driver) Open(ctx context.Context, cfg driver.Config) (driver.Conn, error) 
 				return managedConn, nil
 			}
 			lastErr = err
+			if kind, _ := driver.Classify(classifyAMQP("open", driver.KindTransient, err)); kind == driver.KindTransient {
+				transient = true
+				continue
+			}
+			refusal = err
+		}
+		// A pass that could still recover resets the count, and a refusal only
+		// becomes the answer once every endpoint has repeated it, which
+		// openRefusalPasses explains.
+		if transient {
+			refusedPasses = 0
+		} else {
+			refusedPasses++
+			if refusedPasses >= openRefusalPasses {
+				return nil, classifyAMQP("open", driver.KindTransient, refusal)
+			}
 		}
 
 		if err := openCtx.Err(); err != nil {
-			if lastErr != nil {
-				return nil, classify("open", driver.KindTransient, errors.Join(err, lastErr))
-			}
-			return nil, classify("open", driver.KindTransient, err)
+			return nil, classify("open", driver.KindTransient, errors.Join(err, openCause(refusal, lastErr)))
 		}
-		if err := waitRetry(openCtx); err != nil {
-			return nil, classify("open", driver.KindTransient, err)
+		if err := openRetryWait(openCtx); err != nil {
+			return nil, classify("open", driver.KindTransient, errors.Join(err, openCause(refusal, lastErr)))
 		}
 	}
 }
 
+// openCause names the broker error an Open that ran out of time reports under
+// the context error that ended it. A refusal wins over the last dial error: the
+// endpoint that refused will refuse the same credentials on the next attempt,
+// so the more recent transient error of another endpoint would leave out the
+// one cause the caller can act on.
+func openCause(refusal, lastErr error) error {
+	if refusal != nil {
+		return refusal
+	}
+	return lastErr
+}
+
 type conn struct {
-	mu         sync.RWMutex
-	topologyMu sync.Mutex
-	amqp       *amqp.Connection
-	caps       driver.Capabilities
-	info       driver.BrokerInfo
-	queueKind  queueKind
+	mu                   sync.RWMutex
+	topologyMu           sync.Mutex
+	amqp                 *amqp.Connection
+	caps                 driver.Capabilities
+	info                 driver.BrokerInfo
+	queueKind            queueKind
+	trustBrokerTimestamp bool
+	logger               *slog.Logger
+	// brokerPrefetch is resolved once at Open and applies to every consumer
+	// created from this connection. Zero preserves the core window.
+	brokerPrefetch int
 	// consumerTimeout is the x-consumer-timeout this connection declares on
 	// quorum destination queues. It is resolved at Open because a queue
 	// argument is fixed at declare time, and the topology and admin paths have
@@ -174,6 +279,10 @@ type conn struct {
 	publishFault    atomic.Int32 // 0 = unset; otherwise driver.Kind + 1
 	closeFault      atomic.Bool
 	deferred        map[string]time.Duration
+	// durabilityUpgrades holds the destinations whose non-durable declaration
+	// this connection has already reported as upgraded to durable, so the
+	// report is one per destination rather than one per ensure topology pass.
+	durabilityUpgrades map[string]struct{}
 	// Publishing-block state, deliberately outside mu: Ping reads it on every
 	// health probe and the publish path reads it before every write, so neither
 	// may queue behind topology or consumer-admission work that wants a write
@@ -185,12 +294,24 @@ type conn struct {
 	// closes.
 	blockMu    sync.Mutex
 	blockWatch sync.WaitGroup
-	// detachWatch tracks the channel closes that outlive the caller that began
-	// them. amqp091's Channel.Close waits for close-ok, which a connection the
-	// broker has stopped reading never sends, so a close that a caller cannot
-	// wait for runs on a goroutine of its own; Close waits on that set once the
-	// connection is actually closed, for the same reason it waits on
-	// blockWatch.
+	// detachMu serializes channel-close registration with the wait in
+	// Conn.Close. detaching becomes true before that wait, so no channel close
+	// can Add to a zero-counter WaitGroup. None of the goroutines detachWatch
+	// tracks takes detachMu, so waitDetached can hold it across the Wait.
+	detachMu  sync.Mutex
+	detaching bool
+	// detachWatch tracks the goroutines that outlive the caller that began
+	// them: channel closes, publish channel watchers, and the releases a
+	// cancelled publish leaves for its channel's watcher. amqp091's
+	// Channel.Close waits for close-ok, which a connection the broker has
+	// stopped reading never sends, so a close that a caller cannot wait for
+	// runs on a goroutine of its own; a watcher lives as long as its channel,
+	// and a release until the confirmations it waits for resolve, which a
+	// closed channel guarantees. Close waits on that set once the connection
+	// is actually closed, for the same reason it waits on blockWatch. The Add
+	// for a watcher or a release can race that Wait only from a publish still
+	// running when the connection closed, and it is benign: the goroutine ends
+	// as soon as the connection's shutdown reaches its channel.
 	detachWatch sync.WaitGroup
 }
 
@@ -237,26 +358,51 @@ const blockedEventBuffer = 4
 // connection the broker has stopped reading never answers, and a caller whose
 // context has run out must not be held by it.
 //
-// The close is tracked so that conn.Close can wait for it: nothing of ours may
-// still be running once the connection is closed. Closing the connection is
-// also what ends one of these, since Channel.Close returns as soon as its
-// connection is gone.
-//
-// Registration is ordered before the connection is asked to drop a producer, so
-// the wait covers every close of a producer that Wait can see; the one window
-// left is the confirm round trip failing on a producer admission then refuses,
-// which is a race with the connection closing rather than with a registered
-// producer. That window is benign for the reason above: the close cannot
-// outlive the connection, which answers it as soon as the shutdown reaches the
-// channel and releases one already inside a kernel write when the socket goes.
+// Producer callers receive the same buffered outcome and no finish callback,
+// so their close behavior is unchanged.
 func (c *conn) startChannelClose(channel *amqp.Channel) <-chan error {
-	c.detachWatch.Add(1)
+	return c.startChannelCloseWithFinish(channel.Close, nil)
+}
+
+// startChannelCloseWithFinish runs closeFn and finish in the one goroutine
+// tracked by detachWatch. finish runs before Done, so a lane close cannot
+// release channelMu or publish its completion after Conn.Close has finished
+// waiting for the detached work.
+func (c *conn) startChannelCloseWithFinish(closeFn func() error, finish func(error)) <-chan error {
 	done := make(chan error, 1)
+	c.detachMu.Lock()
+	if c.detaching {
+		c.detachMu.Unlock()
+		err := closeFn()
+		if finish != nil {
+			finish(err)
+		}
+		done <- err
+		return done
+	}
+	c.detachWatch.Add(1)
+	c.detachMu.Unlock()
 	go func() {
 		defer c.detachWatch.Done()
-		done <- channel.Close()
+		err := closeFn()
+		if finish != nil {
+			finish(err)
+		}
+		done <- err
 	}()
 	return done
+}
+
+// waitDetached closes the registration window before waiting for detached
+// channel work. If registration wins detachMu, Add makes the count non-zero
+// before this Wait. If the wait wins, detaching makes a later close run
+// synchronously against the already-closed AMQP connection, so it cannot add
+// work after Wait returns.
+func (c *conn) waitDetached() {
+	c.detachMu.Lock()
+	c.detaching = true
+	c.detachWatch.Wait()
+	c.detachMu.Unlock()
 }
 
 // awaitChannelClose waits for a close startChannelClose began, for as long as
@@ -350,8 +496,8 @@ func (c *conn) awaitUnblocked(ctx context.Context) error {
 
 var _ driver.Conn = (*conn)(nil)
 
-func newConn(amqpConn *amqp.Connection, caps driver.Capabilities, endpoint string, cfg driver.Config, kind queueKind) (*conn, error) {
-	management, err := newManagementClient(endpoint, cfg)
+func newConn(amqpConn *amqp.Connection, caps driver.Capabilities, endpoint resolvedEndpoint, cfg driver.Config, kind queueKind, trustBrokerTimestamp bool, brokerPrefetch int) (*conn, error) {
+	management, err := managementClientForEndpoint(endpoint, cfg)
 	if err != nil {
 		return nil, err
 	}
@@ -359,16 +505,23 @@ func newConn(amqpConn *amqp.Connection, caps driver.Capabilities, endpoint strin
 	if err != nil {
 		return nil, err
 	}
+	logger := cfg.Logger
+	if logger == nil {
+		logger = slog.Default()
+	}
 	connection := &conn{
-		amqp:            amqpConn,
-		caps:            caps,
-		info:            brokerInfo(amqpConn),
-		queueKind:       kind,
-		consumerTimeout: consumerTimeout,
-		management:      management,
-		active:          make(map[*consumer]struct{}),
-		producers:       make(map[*producer]struct{}),
-		deferred:        make(map[string]time.Duration),
+		amqp:                 amqpConn,
+		caps:                 caps,
+		info:                 brokerInfo(amqpConn),
+		queueKind:            kind,
+		trustBrokerTimestamp: trustBrokerTimestamp,
+		logger:               logger,
+		brokerPrefetch:       brokerPrefetch,
+		consumerTimeout:      consumerTimeout,
+		management:           management,
+		active:               make(map[*consumer]struct{}),
+		producers:            make(map[*producer]struct{}),
+		deferred:             make(map[string]time.Duration),
 	}
 	// One subscription per connection is the whole of the block handling:
 	// c.amqp is set here and never replaced, so this connection's notifications
@@ -380,14 +533,44 @@ func newConn(amqpConn *amqp.Connection, caps driver.Capabilities, endpoint strin
 	return connection, nil
 }
 
+func (c *conn) log() *slog.Logger {
+	if c.logger == nil {
+		return slog.Default()
+	}
+	return c.logger
+}
+
+// reportDurabilityUpgrade records that destination was declared durable
+// although the spec asked for non-durable, and warns about it once. A quorum
+// queue is durable by definition, so a quorum deployment cannot honor the
+// request; the destination is then not what the caller asked for, and a silent
+// upgrade is a destination an operator cannot tell from the one they
+// configured.
+func (c *conn) reportDurabilityUpgrade(destination string) {
+	c.mu.Lock()
+	if c.durabilityUpgrades == nil {
+		c.durabilityUpgrades = make(map[string]struct{})
+	}
+	_, reported := c.durabilityUpgrades[destination]
+	c.durabilityUpgrades[destination] = struct{}{}
+	c.mu.Unlock()
+	if reported {
+		return
+	}
+	c.log().Warn("RabbitMQ quorum queue kind declares a non-durable destination as durable", "destination", destination)
+}
+
+// Capabilities returns the capabilities of this connection.
 func (c *conn) Capabilities() driver.Capabilities { return c.caps }
 
+// BrokerInfo returns a copy of the connected broker metadata.
 func (c *conn) BrokerInfo() driver.BrokerInfo {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	return copyBrokerInfo(c.info)
 }
 
+// Producer creates a producer using cfg.
 func (c *conn) Producer(ctx context.Context, cfg driver.ProducerConfig) (driver.Producer, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, classify("producer", driver.KindTransient, err)
@@ -421,6 +604,7 @@ func (c *conn) Producer(ctx context.Context, cfg driver.ProducerConfig) (driver.
 	return producer, nil
 }
 
+// Consumer creates a consumer using cfg.
 func (c *conn) Consumer(ctx context.Context, cfg driver.ConsumerConfig) (driver.Consumer, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, classify("consumer", driver.KindTransient, err)
@@ -435,7 +619,7 @@ func (c *conn) Consumer(ctx context.Context, cfg driver.ConsumerConfig) (driver.
 		return nil, classify("consumer", driver.KindFatal, errors.New("no destinations"))
 	}
 
-	consumer, err := newConsumer(c, cfg)
+	consumer, err := newConsumer(c, cfg) //nolint:contextcheck // construction rollback must close every opened lane even after caller cancellation.
 	if err != nil {
 		return nil, err
 	}
@@ -482,6 +666,7 @@ func (c *conn) consumerAdmissionLocked(cfg driver.ConsumerConfig) error {
 	return nil
 }
 
+// Admin returns the topology administration surface for this connection.
 func (c *conn) Admin() driver.Admin { return &admin{operations: &adminOperations{conn: c}} }
 
 func (c *conn) removeConsumer(consumer *consumer) {
@@ -490,6 +675,7 @@ func (c *conn) removeConsumer(consumer *consumer) {
 	c.mu.Unlock()
 }
 
+// Ping checks whether the RabbitMQ connection is reachable.
 func (c *conn) Ping(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
 		return classify("ping", driver.KindTransient, err)
@@ -520,6 +706,7 @@ func (c *conn) Ping(ctx context.Context) error {
 	return nil
 }
 
+// Close releases the connection after its producers and consumers have closed.
 func (c *conn) Close(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
 		return classify("close", driver.KindTransient, err)
@@ -535,7 +722,7 @@ func (c *conn) Close(ctx context.Context) error {
 	defer func() {
 		if amqpConn.IsClosed() {
 			c.blockWatch.Wait()
-			c.detachWatch.Wait()
+			c.waitDetached()
 		}
 	}()
 	c.mu.Lock()
@@ -609,17 +796,44 @@ func (c *conn) Close(ctx context.Context) error {
 	return nil
 }
 
-func dial(ctx context.Context, endpoint string, cfg driver.Config) (*amqp.Connection, error) {
-	amqpConfig, err := makeAMQPConfig(cfg)
-	if err != nil {
-		return nil, err
-	}
-	timeout := cfg.ConnectTimeout
+func dial(ctx context.Context, endpoint string, amqpConfig amqp.Config, connectTimeout time.Duration) (*amqp.Connection, error) {
+	timeout := connectTimeout
 	if timeout <= 0 || timeout > 30*time.Second {
 		timeout = 30 * time.Second
 	}
+	handshakeCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	deadline, _ := handshakeCtx.Deadline()
+	var mu sync.Mutex
+	var raw net.Conn
+	var abandoned bool
 	dialer := &net.Dialer{Timeout: timeout}
-	amqpConfig.Dial = dialer.Dial
+	amqpConfig.Dial = func(network, addr string) (net.Conn, error) {
+		socket, err := dialer.DialContext(handshakeCtx, network, addr)
+		if err != nil {
+			return nil, err
+		}
+		// This also bounds TLS and AMQP; amqp091 clears the deadline in
+		// openComplete before a successful connection leaves DialConfig.
+		if err := socket.SetDeadline(deadline); err != nil {
+			_ = socket.Close()
+			return nil, err
+		}
+		mu.Lock()
+		if abandoned {
+			mu.Unlock()
+			_ = socket.Close()
+			return nil, handshakeCtx.Err()
+		}
+		raw = socket
+		mu.Unlock()
+		return socket, nil
+	}
+	if amqpConfig.TLSClientConfig != nil {
+		// amqp091 writes the dialed host into an empty ServerName. Open shares
+		// one config across its endpoints, so each dial gets its own copy.
+		amqpConfig.TLSClientConfig = amqpConfig.TLSClientConfig.Clone()
+	}
 	result := make(chan *amqp.Connection, 1)
 	errResult := make(chan error, 1)
 	go func() {
@@ -630,18 +844,46 @@ func dial(ctx context.Context, endpoint string, cfg driver.Config) (*amqp.Connec
 		}
 		result <- connection
 	}()
+	// If success is queued and selected, the caller detaches the socket before
+	// returning; a later cancel has no watcher that can close the live connection.
+	// If cancel is selected while success is queued, it closes the transport and
+	// the single cleanup goroutine consumes the unreturned AMQP connection.
+	// If TCP connects while cancel selects before socket publication, cancel
+	// marks abandonment under mu; publication then closes instead of handing
+	// that socket to the handshake. A queued result alone never transfers ownership.
 	select {
 	case connection := <-result:
+		mu.Lock()
+		raw = nil
+		mu.Unlock()
 		return connection, nil
 	case err := <-errResult:
+		mu.Lock()
+		socket := raw
+		raw = nil
+		mu.Unlock()
+		if socket != nil {
+			_ = socket.Close()
+		}
 		return nil, err
-	case <-ctx.Done():
+	case <-handshakeCtx.Done():
+		mu.Lock()
+		abandoned = true
+		socket := raw
+		raw = nil
+		mu.Unlock()
+		if socket != nil {
+			_ = socket.Close()
+		}
+		// Interrupt the transport before waiting for either late result.
 		go func() {
-			if connection := <-result; connection != nil {
+			select {
+			case connection := <-result:
 				_ = connection.Close()
+			case <-errResult:
 			}
 		}()
-		return nil, ctx.Err()
+		return nil, handshakeCtx.Err()
 	}
 }
 
@@ -649,6 +891,9 @@ func validateEndpoint(endpoint string) error {
 	parsed, err := url.Parse(endpoint)
 	if err != nil {
 		return errors.New("rabbitmq: invalid endpoint")
+	}
+	if parsed.Hostname() == "" {
+		return errUnsupportedHostlessEndpoint
 	}
 	if parsed.Scheme != "amqps" && !isLoopbackEndpoint(endpoint) {
 		return errors.New("rabbitmq: plaintext connection to non-loopback host requires an amqps:// endpoint")
@@ -660,23 +905,6 @@ func makeAMQPConfig(cfg driver.Config) (amqp.Config, error) {
 	config := amqp.Config{Properties: amqp.NewConnectionProperties()}
 	if cfg.ClientID != "" {
 		config.Properties.SetClientConnectionName(cfg.ClientID)
-	}
-	if cfg.SASL != nil {
-		switch strings.ToLower(cfg.SASL.Mechanism) {
-		case "":
-		case "plain":
-			config.SASL = []amqp.Authentication{&amqp.PlainAuth{
-				Username: cfg.SASL.Username,
-				Password: cfg.SASL.Password,
-			}}
-		case "amqplain":
-			config.SASL = []amqp.Authentication{&amqp.AMQPlainAuth{
-				Username: cfg.SASL.Username,
-				Password: cfg.SASL.Password,
-			}}
-		case "external":
-			config.SASL = []amqp.Authentication{&amqp.ExternalAuth{}}
-		}
 	}
 	if cfg.TLS == nil || !cfg.TLS.Enabled {
 		return config, nil
@@ -697,7 +925,12 @@ func validateSASL(settings *driver.SASLConfig) error {
 		return nil
 	}
 	switch strings.ToLower(settings.Mechanism) {
-	case "", "plain", "amqplain", "external":
+	case "":
+		if settings.Username != "" || settings.Password != "" {
+			return errors.New("rabbitmq: SASL credentials require a mechanism; set PLAIN, AMQPLAIN, or EXTERNAL")
+		}
+		return nil
+	case "plain", "amqplain", "external":
 		return nil
 	default:
 		return fmt.Errorf("rabbitmq: unsupported SASL mechanism %q; supported mechanisms: PLAIN, AMQPLAIN, EXTERNAL, or empty", settings.Mechanism)
@@ -705,7 +938,7 @@ func validateSASL(settings *driver.SASLConfig) error {
 }
 
 func tlsConfig(settings *driver.TLSConfig) (*tls.Config, error) {
-	config := &tls.Config{InsecureSkipVerify: settings.InsecureSkipVerify} //nolint:gosec // explicitly controlled by the driver config
+	config := &tls.Config{InsecureSkipVerify: settings.InsecureSkipVerify, ServerName: settings.ServerName} //nolint:gosec // explicitly controlled by the driver config
 	if settings.CAFile != "" {
 		pem, err := os.ReadFile(settings.CAFile)
 		if err != nil {
@@ -767,7 +1000,7 @@ func isLoopbackEndpoint(endpoint string) bool {
 }
 
 func waitRetry(ctx context.Context) error {
-	timer := time.NewTimer(250 * time.Millisecond) //nolint:forbidigo // connection retries need a wall-clock wait and drivers have no clock port
+	timer := time.NewTimer(250 * time.Millisecond) //nolint:forbidigo // connection retries wait for broker recovery and require a wall-clock delay
 	defer timer.Stop()
 	select {
 	case <-ctx.Done():
@@ -839,9 +1072,9 @@ func classifyAMQP(op string, fallback driver.Kind, err error) error {
 //
 // Only the size refusal is classified here rather than by classifyAMQP. It is
 // the one close that names the limit the broker applies, so it is the one kind
-// a message's own body can answer for: the window that read this close reports
-// every message over that limit as too large, whether or not it is the message
-// the broker refused.
+// a message's own body can answer for: a publish that read this close reports
+// every undecided message over that limit as too large, whether or not it is
+// the message the broker refused.
 //
 // Every other close keeps the transient kind a closed publish channel has
 // always had, whatever code it carried. That includes a server-sent 501-504,

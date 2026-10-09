@@ -19,6 +19,7 @@ import (
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/lifecycle"
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/retry"
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/sched"
+	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/wire"
 )
 
 const (
@@ -39,17 +40,22 @@ const (
 type delivery struct {
 	id      uint64
 	message driver.InboundMessage
+	// enqueuedAt is when the delivery left the fetch channel: the instant its
+	// lane's deadline-promotion budget starts. It is stamped there instead of
+	// on the attempt that finds lane room, so the time a delivery spends
+	// waiting for a full lane counts toward the budget and is reported in the
+	// promoted lane's wait.
+	enqueuedAt time.Time
 }
 
 // settlementOperation identifies the kind of settlement call made for a
-// delivery, so a failed one can be retried in kind rather than guessed at.
+// delivery, so a failed one can be retried in kind rather than guessed at. The
+// zero value means no settlement call has been made.
 type settlementOperation uint8
 
 const (
-	// settlementOperationNone means no settlement call has been made.
-	settlementOperationNone settlementOperation = iota
 	// settlementOperationAck means the delivery was asked to be acknowledged.
-	settlementOperationAck
+	settlementOperationAck settlementOperation = iota + 1
 	// settlementOperationNack means the delivery was asked to be negatively
 	// acknowledged.
 	settlementOperationNack
@@ -58,7 +64,6 @@ const (
 // deliveryState records attempted versus settled ownership. operation and
 // nackOptions preserve the exact settlement operation for deferred retries.
 type deliveryState struct {
-	id        uint64
 	attempted bool
 	settled   bool
 	// operation records which settlement call was last made, so that a failed
@@ -66,11 +71,20 @@ type deliveryState struct {
 	operation      settlementOperation
 	nackOptions    driver.NackOptions
 	poisonDrop     *poisonDropReport
+	discard        Discarded
+	discardPending bool
+	// processCtx carries the context Start of ObserverProcess returned, stored
+	// only when an observer is set. The successor publish start uses it as its
+	// context when set and the context at hand otherwise.
+	processCtx     context.Context
 	headerMaxBytes int
 }
 
 type poisonDropReport struct {
 	envelope Envelope
+	// topic is the delivery's resolved successor topic, carried so the report
+	// does not resolve it again when it emits the poison-rejected event.
+	topic string
 	// reason is the death reason the dropped delivery was settling with.
 	reason DeathReason
 	// headline leads both the report and the last-resort log line, so a drop
@@ -87,14 +101,339 @@ type poisonDropReport struct {
 
 // --- Public runner API and generation lifecycle ---
 
-// Run starts the consumer, owns its fetcher and workers, and returns when the
-// consumer stops, the caller cancels ctx, or a driver error requests shutdown.
-// Cancelling ctx stops the runner immediately: in-flight handlers see their
-// context cancelled at once, and HandlerGrace does not apply. Drain is the
-// graceful stop.
-// A non-nil result after the runner started is recorded against its
-// subscription name for Client.Health, except when the caller cancelled, the
-// runner was drained, or the client is shutting down.
+// runnerEvent is one report a runner's other goroutines make to the goroutine
+// calling Run. Exactly one goroutine reads the channel, and every source sends
+// its report from a deferred function, so a source that panics still reports
+// instead of leaving the owner waiting for an event that never comes.
+type runnerEvent struct {
+	kind runnerEventKind
+	err  error
+	// transient marks a consumer error a replacement consumer may fix, as
+	// opposed to one the runner has to stop for.
+	transient bool
+	// consumer and epoch carry what an open reported: the consumer itself, and
+	// the connection incarnation it was opened on.
+	consumer driver.Consumer
+	epoch    uint64
+}
+
+// runnerEventKind identifies what a runner event reports.
+type runnerEventKind uint8
+
+const (
+	// runnerEventSourceDone reports that one of a generation's source
+	// goroutines has finished, carrying the error it finished with.
+	runnerEventSourceDone runnerEventKind = iota
+	// runnerEventHandledDelivery reports that a handled delivery was
+	// acknowledged. It is what lets the next transient consumer failure reset
+	// the repair budget instead of counting against it.
+	runnerEventHandledDelivery
+	// runnerEventConsumerError reports an error the consumer-error source read.
+	// transient marks the failure a replacement consumer may fix; the error is
+	// the cause this runner asks a rebuild for, and the failure it reports if
+	// the rebuild hands one back.
+	runnerEventConsumerError
+	// runnerEventConsumerOpened reports the result of opening a generation's
+	// consumer. The open runs on its own goroutine, so the owner can answer a
+	// drain or an abandon while a broker call is in flight.
+	runnerEventConsumerOpened
+	// runnerEventRebuilt reports the result of waiting for a connection
+	// rebuild. That wait runs on its own goroutine for the same reason: an
+	// attempt replacing the connection abandons this runner first, and an owner
+	// parked in the wait could not receive the abandon that ends it.
+	runnerEventRebuilt
+	// runnerEventAbandon reports that a reconnect attempt is replacing the
+	// connection and has released this runner's consumer.
+	runnerEventAbandon
+	// runnerEventDrain reports that a caller asked the runner to drain.
+	runnerEventDrain
+	// runnerEventReleased reports the result of releasing the generation's
+	// consumer. The release runs on its own goroutine, so a broker call does
+	// not hold the owner.
+	runnerEventReleased
+	// runnerEventDrainDone reports that the runner's one terminal drain has
+	// finished.
+	runnerEventDrainDone
+	// runnerEventError reports a failure one of the runner's own goroutines
+	// saw. The owner keeps the first one, and it is what the runner reports
+	// through Drain.
+	runnerEventError
+)
+
+// sourcePanicError converts a recovered panic from a source goroutine into the
+// error its report carries. A source runs the fetcher, the dispatch pipeline
+// or the consumer-error reader, so its panic is the generation's failure and
+// not something a caller can tell apart from an ordinary one.
+func sourcePanicError(recovered any) error {
+	return fmt.Errorf("f1: runner source panic: %v\n%s", recovered, debug.Stack())
+}
+
+// report hands one report to the runner's owner. A runner with no owner has
+// nowhere to send: this package's tests call the delivery path directly on a
+// runner they built by hand, and Run is the only thing that creates the owner.
+// Dropping the report there loses nothing, because the owner is the only
+// reader of what it carries.
+func (r *Runner) report(event runnerEvent) {
+	if r.events != nil {
+		r.events <- event
+	}
+}
+
+// runnerOwner is the one goroutine that owns a runner's state. A runner
+// creates one per Run call, and every other goroutine of the runner reports
+// through its event channel instead of writing what the owner keeps.
+type runnerOwner struct {
+	runner *Runner
+	events chan runnerEvent
+
+	// outstanding counts the generation's sources that have not reported yet.
+	outstanding int
+	// sourceErr is the first failure a source of this generation reported.
+	sourceErr error
+	// successfulDelivery records that this generation completed at least one
+	// handled delivery, which is what resets a repair budget.
+	successfulDelivery bool
+	// consumerError records that the consumer's error stream produced a
+	// transient failure in this generation.
+	consumerError bool
+	// failureCause is this runner's own failure: the transient consumer or
+	// open error that a rebuild is asked for, and the failure the runner
+	// reports when a rebuild hands one back. It is a plain error with no
+	// attempt attached, and the supervisor never writes it, so a cause another
+	// runner's reconnect produces cannot replace it.
+	failureCause error
+	// abandoned records that an attempt replacing the connection released this
+	// runner's consumer. It is what tells a generation that ended without a
+	// failure of its own apart from one that simply finished.
+	abandoned bool
+	// runErr is the first failure a source of this run reported. It is never
+	// cleared, so it is the error the runner reports through Drain.
+	runErr error
+	// repairCycleActive means a replacement consumer has been built and the next
+	// transient consumer failure can complete a failed repair cycle.
+	repairCycleActive bool
+	// failedRepairCycles counts consecutive replacement consumers that fail before
+	// any handled delivery; a handled delivery resets it.
+	failedRepairCycles int
+
+	// base is the context the terminal drain runs on: the current generation's
+	// run context, whose values a settlement context has to carry.
+	base context.Context
+	// cancel stops the current generation's sources. The owner holds it so a
+	// drain request stops the generation itself rather than reaching for a
+	// cancel function another goroutine set.
+	cancel context.CancelFunc
+	// openPending is true while an open is in flight.
+	openPending bool
+	// opened records that the opener has reported.
+	opened bool
+	// openConsumer, openEpoch and openErr are what the opener reported.
+	openConsumer driver.Consumer
+	openEpoch    uint64
+	openErr      error
+	// rebuilt records that the rebuild wait has reported.
+	rebuilt    bool
+	rebuiltErr error
+	// released records that an owner-started release has reported.
+	released   bool
+	releaseErr error
+
+	// draining records that a drain was requested. Every caller's wait ends
+	// when the runner reaches terminal, which the one drain below is what
+	// reaches it.
+	draining bool
+	// drained records that the one terminal drain has started, so a second
+	// request joins it instead of releasing the consumer again.
+	drained   bool
+	drainDone bool
+	drainErr  error
+}
+
+// beginGeneration resets what describes one generation. It is the owner's own
+// reset, so no other goroutine has to reach into state it does not own to
+// start the next one.
+func (o *runnerOwner) beginGeneration() {
+	o.outstanding = 0
+	o.sourceErr = nil
+	o.successfulDelivery = false
+	o.consumerError = false
+	o.failureCause = nil
+	o.abandoned = false
+}
+
+// pumpUntil reads and handles events until ready reports true. It is the
+// owner's only blocking read: everything the runner's other goroutines want
+// the owner to know arrives here, and a report this wait is not itself
+// waiting for is handled rather than left for later.
+func (o *runnerOwner) pumpUntil(ready func() bool) {
+	for !ready() {
+		o.handle(<-o.events)
+	}
+}
+
+// handle applies one report to the owner's state.
+func (o *runnerOwner) handle(event runnerEvent) {
+	switch event.kind {
+	case runnerEventSourceDone:
+		o.outstanding--
+		if event.err != nil && o.sourceErr == nil {
+			o.sourceErr = event.err
+		}
+	case runnerEventHandledDelivery:
+		o.successfulDelivery = true
+	case runnerEventConsumerError:
+		if event.transient {
+			o.consumerError = true
+		}
+		if o.failureCause == nil {
+			o.failureCause = event.err
+		}
+	case runnerEventError:
+		if o.runErr == nil {
+			o.runErr = event.err
+		}
+	case runnerEventAbandon:
+		o.abandoned = true
+	case runnerEventConsumerOpened:
+		o.openPending = false
+		o.opened = true
+		o.openConsumer, o.openEpoch, o.openErr = event.consumer, event.epoch, event.err
+	case runnerEventRebuilt:
+		o.rebuilt = true
+		o.rebuiltErr = event.err
+	case runnerEventReleased:
+		o.released = true
+		o.releaseErr = event.err
+	case runnerEventDrain:
+		o.requestDrain()
+	case runnerEventDrainDone:
+		o.drainDone = true
+		o.drainErr = event.err
+	}
+}
+
+// startOpen opens the generation's consumer on the owner's own goroutine pool.
+// A broker call must not hold the owner: an attempt that replaces the
+// connection abandons this runner first, and an owner parked inside the open
+// could not receive the abandon that ends it.
+func (o *runnerOwner) startOpen(waitCtx context.Context, prefetch int) {
+	o.openPending = true
+	o.opened = false
+	o.openConsumer, o.openEpoch, o.openErr = nil, 0, nil
+	runCtx := o.base
+	o.runner.asyncGroup.Go(func() error {
+		consumer, epoch, err := openRunnerConsumerWith(o.runner, waitCtx, runCtx, prefetch)
+		o.events <- runnerEvent{kind: runnerEventConsumerOpened, consumer: consumer, epoch: epoch, err: err}
+		return nil
+	})
+}
+
+// awaitRebuild waits for the connection rebuild while pumping the owner's events.
+// cause is the failure the runner asks a rebuild for, or nil when it only waits
+// for a change. draining distinguishes shutdown from a rebuild failure.
+func (o *runnerOwner) awaitRebuild(ctx context.Context, cause error, epoch uint64) (draining bool, err error) {
+	o.rebuilt = false
+	o.rebuiltErr = nil
+	o.runner.asyncGroup.Go(func() error {
+		err := o.runner.client.awaitRebuild(ctx, cause, epoch, o.runner.drainStarted)
+		o.events <- runnerEvent{kind: runnerEventRebuilt, err: err}
+		return nil
+	})
+	o.pumpUntil(func() bool { return o.rebuilt })
+	return errors.Is(o.rebuiltErr, errRunnerDraining), o.rebuiltErr
+}
+
+// releaseConsumer releases the generation's consumer on its own goroutine. The
+// caller waits for the result, because what it decides next depends on whether
+// the consumer went back to the broker.
+func (o *runnerOwner) releaseConsumer(ctx context.Context) error {
+	o.released = false
+	o.releaseErr = nil
+	o.runner.asyncGroup.Go(func() error {
+		o.events <- runnerEvent{kind: runnerEventReleased, err: releaseRunnerConsumer(o.runner, ctx)}
+		return nil
+	})
+	o.pumpUntil(func() bool { return o.released })
+	return o.releaseErr
+}
+
+// requestDrain records that the runner must end and stops the generation. A
+// request that arrives while the generation is still running is recorded, and
+// the loop reaches its drain when the generation stops; one that arrives after
+// the generation stopped is the drain, taken here. startDrain makes a later
+// request join the first.
+//
+// The settlement window is computed here and nowhere else: this is the moment
+// drain starts, so this is the moment a settlement budget begins. The window
+// is installed before the generation is cancelled, so a settlement the
+// cancellation triggers already runs on the drain's deadline rather than on a
+// context the cancellation ends.
+func (o *runnerOwner) requestDrain() {
+	if !o.draining {
+		o.draining = true
+		o.runner.beginSettlementWindow(o.base)
+		if o.cancel != nil {
+			o.cancel()
+		}
+	}
+	if o.generationEnded() {
+		o.startDrain(o.base)
+	}
+}
+
+// generationEnded reports that no source and no opener of the current
+// generation is left to report.
+func (o *runnerOwner) generationEnded() bool {
+	return o.outstanding == 0 && !o.openPending
+}
+
+// startDrain begins the runner's one terminal drain. It is idempotent, and
+// that is what makes drain one event: the first caller starts it and every
+// later request joins it, so this teardown runs once however many of Close,
+// the supervisor's abandon and the end of Run arrive at once. An abandon that
+// overlaps the drain still calls Release itself, because the supervisor gives
+// the consumer back to the connection it is leaving before the runner reopens
+// on the replacement: ending the runner and handing a consumer back are not
+// the same operation, and the drain is only the first of them.
+func (o *runnerOwner) startDrain(base context.Context) {
+	if o.drained {
+		return
+	}
+	o.drained = true
+	// A drain event can start teardown while the owner still awaits a rebuild.
+	// If the rebuild reports before this goroutine runs, drain rewrites o.base
+	// while joining teardown. The argument captures it before that interleaving.
+	o.runner.asyncGroup.Go(func() error {
+		o.events <- runnerEvent{kind: runnerEventDrainDone, err: o.runner.drainAfterRun(base)}
+		return nil
+	})
+}
+
+// drain starts the runner's one terminal drain and waits for it to finish.
+// startDrain is what joins this call to a drain a request already began: the
+// request path leaves a mid-generation drain recorded but unstarted, and the
+// loop reaches this call exactly when the generation has ended.
+func (o *runnerOwner) drain(base context.Context) error {
+	o.base = base
+	o.requestDrain()
+	o.startDrain(base)
+	o.pumpUntil(func() bool { return o.drainDone })
+	return o.drainErr
+}
+
+// waitSources pumps events until every source of the generation has reported,
+// and returns the first error any of them reported.
+func (o *runnerOwner) waitSources() error {
+	o.pumpUntil(func() bool { return o.outstanding == 0 })
+	return o.sourceErr
+}
+
+// Run starts the consumer and returns when it stops, ctx is canceled, or a
+// driver error requests shutdown. Canceling ctx stops the runner immediately:
+// in-flight handlers see cancellation and HandlerGrace does not apply. Use
+// Drain for a graceful stop. A non-nil error after startup is recorded against
+// the subscription for Client.Health, except after caller cancellation, drain,
+// or client shutdown. A Runner can be started only once.
 func (r *Runner) Run(ctx context.Context) (runErr error) {
 	if r == nil {
 		return errors.New("f1: runner is nil")
@@ -102,35 +441,16 @@ func (r *Runner) Run(ctx context.Context) (runErr error) {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	var preRunReconnect *reconnectAttempt
-	var preRunReconnectErr error
 	r.client.mu.Lock()
-	if r.client.closed || r.client.shutdownStarted || r.client.conn == nil {
+	if err := r.client.admit(workRun, 0); err != nil {
 		r.client.mu.Unlock()
-		return errors.New("f1: client is closing")
+		return err
 	}
 	r.mu.Lock()
 	if r.started {
 		r.mu.Unlock()
 		r.client.mu.Unlock()
 		return errors.New("f1: runner is already running")
-	}
-	if r.reconnectCause == errClientReconnecting && r.reconnectCauseAttempt != nil { //nolint:errorlint // exact sentinel identifies supervisor ownership
-		ownedAttempt := r.reconnectCauseAttempt
-		currentAttempt := r.client.reconnect
-		switch {
-		case currentAttempt != nil && currentAttempt != ownedAttempt:
-			r.reconnectCauseAttempt = currentAttempt
-			preRunReconnect = currentAttempt
-		case currentAttempt == ownedAttempt:
-			preRunReconnect = ownedAttempt
-		default:
-			preRunReconnectErr = ownedAttempt.err
-			if preRunReconnectErr == nil {
-				r.reconnectCause = nil
-				r.reconnectCauseAttempt = nil
-			}
-		}
 	}
 	r.started = true
 	r.done = make(chan struct{})
@@ -143,6 +463,7 @@ func (r *Runner) Run(ctx context.Context) (runErr error) {
 	r.handlerShutdownCtx, r.handlerShutdownCancel = handlerShutdownCtx, handlerShutdownCancel
 	r.asyncGroup = new(errgroup.Group)
 	r.errorGroup = newErrorHandlerGroup(r.subscription.Concurrency)
+	r.events = make(chan runnerEvent)
 	r.mu.Unlock()
 	r.client.mu.Unlock()
 
@@ -152,17 +473,17 @@ func (r *Runner) Run(ctx context.Context) (runErr error) {
 	// after finishRunner so it runs first and reads the result Run is about to
 	// hand back, including an error joined in by drainAfterRun.
 	defer func() { r.recordRunExit(ctx, runErr) }()
-	if preRunReconnectErr != nil {
-		return preRunReconnectErr
-	}
-	if preRunReconnect != nil {
-		if err := r.waitPreRunReconnect(ctx, preRunReconnect); err != nil {
-			if errors.Is(err, errRunnerDraining) {
-				return nil
-			}
-			return err
+	owner := &runnerOwner{runner: r, events: r.events, base: ctx}
+	// The owner's error is published to the runner before the runner's done
+	// channel closes, so a Drain that returns because the runner ended reads
+	// the same failure the run ended with.
+	defer func() {
+		if owner.runErr != nil {
+			r.mu.Lock()
+			r.runErr = owner.runErr
+			r.mu.Unlock()
 		}
-	}
+	}()
 	var runCtx context.Context
 	var cancel context.CancelFunc
 	generation := 0
@@ -170,38 +491,34 @@ func (r *Runner) Run(ctx context.Context) (runErr error) {
 	for {
 		r.mu.Lock()
 		failed := r.lifecycle != nil && r.lifecycle.State() == lifecycle.Failed
-		draining := r.draining
 		r.mu.Unlock()
-		if failed {
+		if failed || owner.draining {
 			break
 		}
-		if draining {
-			return nil
-		}
 		runCtx, cancel = context.WithCancel(ctx)
-		group := beginRunnerGeneration(r, runCtx, cancel)
-		r.mu.Lock()
-		draining = r.draining
-		r.mu.Unlock()
-		if draining {
-			cancel()
-			return nil
-		}
+		owner.base = runCtx
+		owner.cancel = cancel
+		group := beginRunnerGeneration(r, cancel)
+		owner.beginGeneration()
 
 		// The consumer's total in-flight budget, derived once per generation.
 		// The driver enforces it as its outstanding limit, and the pipeline
 		// sizes the ordered worker queues from it, so both read the same number
 		// instead of deriving it again from a formula that could drift.
 		prefetch := runnerConsumerPrefetch(r, r.config.Prefetch, runnerLanePlan(r))
-		consumer, openedOn, err := openRunnerConsumerWith(r, runCtx, prefetch)
-		r.mu.Lock()
-		draining = r.draining
-		r.mu.Unlock()
-		if draining {
+		owner.startOpen(ctx, prefetch)
+		owner.pumpUntil(func() bool { return owner.opened })
+		consumer, openedEpoch, err := owner.openConsumer, owner.openEpoch, owner.openErr
+		if owner.draining {
+			// The runner began draining while the consumer was opening, so the
+			// consumer belongs to no generation: it is released here rather
+			// than becoming the drain's work, and the drain itself waits for
+			// nothing because this generation never delivered anything.
 			if consumer != nil {
-				if closeErr := runWithClockTimeout(context.WithoutCancel(runCtx), r.client.options.clock, r.client.config.Lifecycle.CloseTimeout, "consumer release", func(closeCtx context.Context) error {
-					return consumer.Release(closeCtx)
-				}); closeErr != nil {
+				if closeErr := releaseUnadmittedConsumer(r, context.WithoutCancel(runCtx), consumer, openedEpoch); closeErr != nil {
+					// Published to the runner too, so a Drain caller sees the
+					// release failure the Run caller does.
+					owner.runErr = errors.Join(owner.runErr, closeErr)
 					return closeErr
 				}
 			}
@@ -209,23 +526,26 @@ func (r *Runner) Run(ctx context.Context) (runErr error) {
 		}
 		if err != nil {
 			repairCause = nil
-			kind, classified := driver.Classify(err)
-			var ownedAttempt *reconnectAttempt
-			r.mu.Lock()
-			if r.reconnectCause == errClientReconnecting && r.reconnectCauseAttempt != nil { //nolint:errorlint // exact sentinel identifies supervisor ownership
-				ownedAttempt = r.reconnectCauseAttempt
-			} else if generation > 0 && (!classified || kind == driver.KindTransient) {
-				r.reconnectCause = err
-				r.reconnectCauseAttempt = nil
+			if errors.Is(err, errRunnerDraining) {
+				// The failed open admitted no consumer or deliveries, so there is nothing to drain.
+				return nil
 			}
-			r.mu.Unlock()
-			if ownedAttempt != nil {
-				if reconnectErr := r.waitOwnedReconnect(ctx, ownedAttempt); reconnectErr != nil {
+			if owner.abandoned {
+				// An attempt in flight released this consumer, and the open it
+				// cancelled is not a failure of the runner's: it waits for the
+				// attempt and opens again on what it leaves behind.
+				draining, reconnectErr := owner.awaitRebuild(ctx, nil, 0)
+				if draining {
+					// The cancelled open admitted no consumer or deliveries, so there is nothing to drain.
+					return nil
+				}
+				if reconnectErr != nil {
 					runErr = reconnectErr
 					break
 				}
 				continue
 			}
+			kind, classified := driver.Classify(err)
 			if generation == 0 {
 				return err
 			}
@@ -233,8 +553,16 @@ func (r *Runner) Run(ctx context.Context) (runErr error) {
 				runErr = err
 				break
 			}
+			// The failure that could not open the consumer is the cause the
+			// rebuild is asked for, and it is what this runner reports if the
+			// rebuild hands one back.
 			r.transitionToReconnecting()
-			if reconnectErr := r.requestAndWaitReconnect(ctx, err); reconnectErr != nil {
+			draining, reconnectErr := owner.awaitRebuild(ctx, err, 0)
+			if draining {
+				// The failed open admitted no consumer or deliveries, so there is nothing to drain.
+				return nil
+			}
+			if reconnectErr != nil {
 				runErr = reconnectErr
 				break
 			}
@@ -243,19 +571,29 @@ func (r *Runner) Run(ctx context.Context) (runErr error) {
 		// Admit only a consumer opened on the connection that is still live.
 		// requestReconnect marks the client before abandoning runners, so this
 		// critical section either rejects and releases this consumer or records
-		// it before abandonForReconnect can release it.
+		// it before abandonForReconnect can release it. The epoch the runner
+		// captured with the connection is what the admission compares, and the
+		// current one is read under the same lock, so a rejection is reported
+		// against the incarnation the rejection was taken against.
 		r.client.mu.Lock()
 		r.mu.Lock()
-		admitted := !r.client.reconnecting && sameConnection(r.client.conn, openedOn)
-		if admitted {
+		admissionErr := r.client.admit(workConsumerAdmission, openedEpoch)
+		currentEpoch := r.client.current.epoch
+		if admissionErr == nil {
 			r.consumer = consumer
+			r.consumerEpoch = openedEpoch
 		}
 		r.mu.Unlock()
 		r.client.mu.Unlock()
-		if !admitted {
-			if closeErr := runWithClockTimeout(context.WithoutCancel(runCtx), r.client.options.clock, r.client.config.Lifecycle.CloseTimeout, "consumer release", func(closeCtx context.Context) error {
-				return consumer.Release(closeCtx)
-			}); closeErr != nil {
+		if admissionErr != nil {
+			if currentEpoch != openedEpoch {
+				// A stale open is repaired at once by the next iteration, so it
+				// earns a debug line and not a Health entry: a surface that
+				// reports self-healing states teaches people to ignore it.
+				lastResortRunnerLogger(r).Debug("f1 consumer discarded after the connection was replaced",
+					"subscription", r.subscription.Name, "opened_epoch", openedEpoch, "current_epoch", currentEpoch)
+			}
+			if closeErr := releaseUnadmittedConsumer(r, context.WithoutCancel(runCtx), consumer, openedEpoch); closeErr != nil {
 				lastResortRunnerLogger(r).Warn("f1 consumer release failed during reconnect", "subscription", r.subscription.Name, "error", closeErr)
 			}
 			cancel()
@@ -270,10 +608,8 @@ func (r *Runner) Run(ctx context.Context) (runErr error) {
 		state := r.lifecycle.State()
 		switch state {
 		case lifecycle.Starting, lifecycle.Reconnecting:
-			r.mu.Lock()
-			r.repairCycleActive = false
-			r.failedRepairCycles = 0
-			r.mu.Unlock()
+			owner.repairCycleActive = false
+			owner.failedRepairCycles = 0
 			if err := r.lifecycle.Transition(lifecycle.Ready); err != nil {
 				runErr = err
 			} else if state == lifecycle.Starting {
@@ -298,88 +634,130 @@ func (r *Runner) Run(ctx context.Context) (runErr error) {
 			}
 			return nil
 		}
-		group.Go(func() error {
-			return runPipeline(func() error { return fetchRunner(r, runCtx, deliveries) })
-		})
-		group.Go(func() error {
-			return runPipeline(func() error { return runDispatchPipeline(r, runCtx, deliveries, prefetch) })
-		})
-		group.Go(func() error {
-			return runPipeline(func() error { return consumeRunnerErrors(r, runCtx) })
-		})
+		// Each source reports its own end from a deferred function, which runs
+		// on the way out of a panic too. The report is what the owner waits
+		// for, so a source that dies abnormally still ends the generation
+		// instead of stranding the owner on an event that never arrives.
+		startSource := func(run func() error) {
+			owner.outstanding++
+			group.Go(func() (err error) {
+				defer func() {
+					if recovered := recover(); recovered != nil {
+						// The generation is shared: the sources hand each other
+						// the channels they read, so the one that panicked is
+						// the one that would have closed what the others are
+						// waiting on. Cancel the generation the way an error
+						// return does, or the surviving sources wait for a
+						// close that is never coming and the report below ends
+						// only this goroutine.
+						cancel()
+						err = errors.Join(err, sourcePanicError(recovered))
+					}
+					r.report(runnerEvent{kind: runnerEventSourceDone, err: err})
+				}()
+				return runPipeline(run)
+			})
+		}
+		startSource(func() error { return fetchRunner(r, runCtx, deliveries) })
+		startSource(func() error { return runDispatchPipeline(r, runCtx, deliveries, prefetch) })
+		startSource(func() error { return consumeRunnerErrors(r, runCtx) })
 
-		generationErr := group.Wait()
+		// The backlog poll is per generation but not a source: its end must
+		// not end the generation, and the generation must not end while it
+		// still runs. It runs on its own child context of the generation's
+		// run context, so the teardown stops the poll without touching the
+		// generation's own cancel: whether an observer is set must not
+		// change the runner's state. The teardown cancels that context and
+		// waits, without counting the poll in outstanding. The nil path
+		// starts no goroutine.
+		var pollDone chan struct{}
+		pollCtx, pollCancel := context.WithCancel(runCtx)
+		if client := r.client; client != nil && client.observer != nil && client.backlogPollInterval > 0 {
+			pollDone = make(chan struct{})
+			pollConsumer := consumer
+			go func() {
+				defer close(pollDone)
+				defer func() {
+					if recovered := recover(); recovered != nil {
+						lastResortRunnerLogger(r).Warn("f1 backlog poll panicked",
+							"subscription", r.subscription.Name,
+							"panic", fmt.Sprint(recovered))
+					}
+				}()
+				pollBacklog(r, pollCtx, pollConsumer)
+			}()
+		}
+
+		generationErr := owner.waitSources()
+		pollCancel()
+		if pollDone != nil {
+			<-pollDone
+		}
 		if generationErr == nil {
-			generationErr = runnerError(r)
+			generationErr = owner.runErr
 		}
-		// After group.Wait, this snapshot is the only reader window for the
-		// generation result. The later repair write-back remains a separate lock.
-		r.mu.Lock()
-		reconnectCause := r.reconnectCause
-		reconnectCauseAttempt := r.reconnectCauseAttempt
-		consumerError := r.consumerError
-		successfulDelivery := r.successfulDelivery
-		repairCycleActive := r.repairCycleActive
-		failedRepairCycles := r.failedRepairCycles
-		draining = r.draining
-		failedLifecycle := r.lifecycle != nil && r.lifecycle.State() == lifecycle.Failed
-		decisionHook := r.reconnectDecisionHook
-		r.mu.Unlock()
-		if failedLifecycle {
+		// The lifecycle is the one piece of the generation result that lives
+		// outside the owner: a fatal consumer error transitions it from the
+		// goroutine that saw the error, so it keeps its own lock and this reads
+		// it directly. Everything else the generation decided is on the owner
+		// and is read as a field, with no reader window to arrange.
+		if r.lifecycle != nil && r.lifecycle.State() == lifecycle.Failed {
 			runErr = generationErr
 			break
 		}
-		if decisionHook != nil {
-			decisionHook()
-		}
+		// The runner's own failure is what a rebuild is asked for. A generation
+		// that failed for any other reason - a pipeline or fetcher error, or
+		// the cancellation an attempt abandoning this runner produces - is not
+		// a cause, and the runner stops for that error instead of asking for a
+		// rebuild on its behalf.
+		cause := owner.failureCause
 		clientReconnecting := r.client.isReconnecting()
-		if ctx.Err() != nil || draining || (!clientReconnecting && reconnectCause == nil) {
+		// Three things keep a stopped generation alive. A generation whose
+		// connection has already been replaced reopens on the replacement,
+		// whether or not an attempt is still running for it. One abandoned by an
+		// attempt in flight waits that attempt out and reports its outcome,
+		// which is how a fatal rebuild stops every runner it abandoned. And one
+		// that failed for its own reason asks for a rebuild.
+		if ctx.Err() != nil || owner.draining ||
+			(!clientReconnecting && cause == nil && !owner.abandoned && !r.client.claimReplaced(openedEpoch)) {
 			runErr = generationErr
 			break
 		}
-		if reconnectCauseAttempt != nil && reconnectCause == errClientReconnecting { //nolint:errorlint // exact sentinel identifies supervisor ownership
-			if reconnectErr := r.waitOwnedReconnect(ctx, reconnectCauseAttempt); reconnectErr != nil {
-				runErr = reconnectErr
-				break
+		if owner.consumerError && !clientReconnecting {
+			if owner.successfulDelivery {
+				owner.failedRepairCycles = 0
+				owner.repairCycleActive = false
 			}
-			continue
-		}
-		if consumerError && !clientReconnecting {
-			if successfulDelivery {
-				failedRepairCycles = 0
-				repairCycleActive = false
+			if owner.repairCycleActive {
+				owner.failedRepairCycles++
 			}
-			if repairCycleActive {
-				failedRepairCycles++
-			}
-			repairCycleActive = true
-			r.mu.Lock()
-			r.repairCycleActive = repairCycleActive
-			r.failedRepairCycles = failedRepairCycles
-			r.mu.Unlock()
-			if failedRepairCycles < 2 {
-				if releaseErr := releaseRunnerConsumer(r, context.WithoutCancel(runCtx)); releaseErr == nil {
-					repairCause = reconnectCause
+			owner.repairCycleActive = true
+			if owner.failedRepairCycles < 2 {
+				if releaseErr := owner.releaseConsumer(context.WithoutCancel(runCtx)); releaseErr == nil {
+					repairCause = cause
 					continue
 				} else {
-					reconnectCause = errors.Join(reconnectCause, releaseErr)
+					cause = errors.Join(cause, releaseErr)
 				}
 			}
 		}
-		if reconnectCause == nil {
-			reconnectCause = generationErr
-		}
-		if reconnectCause == nil {
-			reconnectCause = errClientReconnecting
-		}
 		r.transitionToReconnecting()
-		if reconnectErr := r.requestAndWaitReconnect(ctx, reconnectCause); reconnectErr != nil {
+		draining, reconnectErr := owner.awaitRebuild(ctx, cause, openedEpoch)
+		if draining {
+			break
+		}
+		if reconnectErr != nil {
 			runErr = reconnectErr
 			break
 		}
 	}
 
-	shutdownErr := r.drainAfterRun(runCtx)
+	shutdownErr := owner.drain(runCtx)
+	// The drain's own failure is published to the runner with the run's, so a
+	// Drain caller sees the same teardown failure the Run caller does.
+	if shutdownErr != nil {
+		owner.runErr = errors.Join(owner.runErr, shutdownErr)
+	}
 	if runErr == nil {
 		runErr = shutdownErr
 	} else if shutdownErr != nil {
@@ -416,131 +794,21 @@ func (r *Runner) recordRunExit(ctx context.Context, err error) {
 	c := r.client
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.shutdownStarted {
+	if c.lifecycleLocked() != lifecycle.Ready {
 		return
 	}
 	c.recordRunnerExitLocked(r, err)
 }
 
-func (r *Runner) requestAndWaitReconnect(ctx context.Context, cause error) error {
-	attempt, err := r.client.requestReconnect(cause)
-	if err != nil {
-		return err
-	}
-	return r.client.waitReconnect(ctx, attempt)
-}
-
 var errRunnerDraining = errors.New("f1: runner is draining")
 
-func (r *Runner) waitOwnedReconnect(ctx context.Context, attempt *reconnectAttempt) error {
-	return r.waitOwnedReconnectUntil(ctx, attempt, nil)
-}
-
-func (r *Runner) waitPreRunReconnect(ctx context.Context, attempt *reconnectAttempt) error {
-	return r.waitOwnedReconnectUntil(ctx, attempt, r.drainStarted)
-}
-
-func (r *Runner) waitOwnedReconnectUntil(ctx context.Context, attempt *reconnectAttempt, drain <-chan struct{}) error {
-	for {
-		r.mu.Lock()
-		decisionHook := r.reconnectDecisionHook
-		r.mu.Unlock()
-		if decisionHook != nil {
-			decisionHook()
-		}
-		if attempt != nil {
-			select {
-			case <-attempt.done:
-			case <-ctx.Done():
-				return ctx.Err()
-			case <-drain:
-				return errRunnerDraining
-			}
-		}
-		r.client.mu.Lock()
-		var reconnectErr error
-		var currentAttempt *reconnectAttempt
-		if attempt != nil {
-			reconnectErr = attempt.err
-			currentAttempt = r.client.reconnect
-		}
-		// Keep Client.mu while taking Runner.mu. Ownership can move while this
-		// attempt is in flight: the supervisor records the newest attempt on the
-		// runner when it abandons it, and registers that same attempt on the
-		// client. Either record is newer than this attempt, so adopt it before
-		// reading any result, otherwise a superseded attempt's error would fail a
-		// runner the client is already recovering.
-		r.mu.Lock()
-		if attempt != nil &&
-			r.reconnectCause == errClientReconnecting { //nolint:errorlint // exact sentinel identifies supervisor ownership
-			nextAttempt := r.reconnectCauseAttempt
-			if nextAttempt == attempt && currentAttempt != nil && currentAttempt != attempt {
-				nextAttempt = currentAttempt
-			}
-			if nextAttempt != nil && nextAttempt != attempt {
-				r.reconnectCauseAttempt = nextAttempt
-				r.mu.Unlock()
-				r.client.mu.Unlock()
-				attempt = nextAttempt
-				continue
-			}
-		}
-		if reconnectErr != nil {
-			r.mu.Unlock()
-			r.client.mu.Unlock()
-			return reconnectErr
-		}
-		if r.reconnectCause == errClientReconnecting { //nolint:errorlint // exact sentinel identifies supervisor ownership
-			if r.reconnectCauseAttempt == attempt {
-				r.reconnectCause = nil
-				r.reconnectCauseAttempt = nil
-				r.mu.Unlock()
-				r.client.mu.Unlock()
-				return nil
-			}
-			nextAttempt := r.reconnectCauseAttempt
-			r.mu.Unlock()
-			r.client.mu.Unlock()
-			if nextAttempt != nil {
-				attempt = nextAttempt
-				continue
-			}
-			return nil
-		}
-		r.mu.Unlock()
-		r.client.mu.Unlock()
-		return nil
-	}
-}
-
-// beginRunnerGeneration resets the per-generation runner state at the top of
-// Run's loop, where the generation's run context is created. The settlement
-// context belongs to this reset: first-wins installation is correct within
-// one drain, but a context installed during a previous generation's
-// abandonment carries a drain budget that started back then, so every later
-// generation would inherit an already-expired budget and fail every drain
-// settlement at once. The field is cleared without calling the old cancel: a
-// cleanup from the previous generation captured the context value, not the
-// field, and cancelling it under such a caller is the defect first-wins
-// exists to prevent. The dropped cancel function is safe to lose because the
-// context was built over an uncancelable base: with a nil Done channel there
-// is nothing for cancellation to propagate through, no goroutine watching
-// the parent, and the context becomes unreachable once no caller references
-// it. When DrainTimeout is positive the context also carries its own
-// deadline, so its timer fires within one budget period and releases
-// whatever the deadline still holds; that timer is an additional guarantee,
-// not the protection, and it does not exist when the budget is zero.
-func beginRunnerGeneration(r *Runner, runCtx context.Context, cancel context.CancelFunc) *errgroup.Group {
+// beginRunnerGeneration starts a generation: it records the cancel that stops
+// its sources and the group that owns them. It resets nothing else. The
+// settlement window is deliberately not part of it: the window belongs to the
+// drain, and starting a generation is not the drain.
+func beginRunnerGeneration(r *Runner, cancel context.CancelFunc) *errgroup.Group {
 	r.mu.Lock()
-	r.runCtx = runCtx
 	r.cancel = cancel
-	r.settleCtx = nil
-	r.settleCancel = nil
-	if r.reconnectCauseAttempt == nil {
-		r.reconnectCause = nil
-	}
-	r.consumerError = false
-	r.successfulDelivery = false
 	group := new(errgroup.Group)
 	r.group = group
 	r.mu.Unlock()
@@ -581,15 +849,12 @@ func runDispatchPipeline(r *Runner, ctx context.Context, deliveries <-chan deliv
 	if err != nil {
 		return err
 	}
-	r.mu.Lock()
-	r.dispatchPool = pool
-	r.mu.Unlock()
-	defer func() {
-		pool.Close()
-		r.mu.Lock()
-		r.dispatchPool = nil
-		r.mu.Unlock()
-	}()
+	defer pool.Close()
+
+	var limiter *promotionLimiter
+	if r.client != nil && r.client.observer != nil {
+		limiter = newPromotionLimiter(r)
+	}
 
 	var pending *delivery
 	pendingLane := ""
@@ -599,14 +864,20 @@ func runDispatchPipeline(r *Runner, ctx context.Context, deliveries <-chan deliv
 		// an item after the pool reports room, so its answer stays current
 		// instead of being queued behind earlier picks.
 		for pool.Free() {
-			item, ok := scheduler.Next()
+			item, prom, ok := scheduler.Next()
 			if !ok {
 				break
 			}
-			work := item.Value.(delivery)
+			if limiter != nil && prom.LaneID != "" {
+				now := r.client.options.clock.Now()
+				if event, record := limiter.promotionEvent(prom, item.EnqueuedAt, now); record {
+					r.client.observeRecord(event)
+				}
+			}
+			work := item.Value.(*delivery)
 			if err := pool.Submit(pipelineCtx, dispatch.Work{
-				Key: append([]byte(nil), work.message.Key...),
-				Run: func(context.Context) { processDelivery(r, ctx, work) },
+				Key: work.message.Key,
+				Run: func(context.Context) { processDelivery(r, ctx, *work) },
 			}); err != nil {
 				return err
 			}
@@ -651,6 +922,12 @@ func runDispatchPipeline(r *Runner, ctx context.Context, deliveries <-chan deliv
 				open = false
 				continue
 			}
+			// The lane's deadline-promotion budget starts here, when the
+			// delivery leaves the fetch channel, and not on the attempt that
+			// finally finds room in a full lane: the wait for that room is
+			// time the delivery spent queued, and it is what the promotion
+			// decision and the reported lane wait measure.
+			item.enqueuedAt = r.client.options.clock.Now()
 			pending = &item
 			pendingLane = ""
 		}
@@ -662,7 +939,7 @@ func enqueuePendingDelivery(r *Runner, scheduler *sched.Scheduler, pending *deli
 	if laneID == "" {
 		laneID = deliveryLane(r, pending.message)
 	}
-	item := sched.Item{Value: *pending, EnqueuedAt: r.client.options.clock.Now()}
+	item := sched.Item{Value: pending, EnqueuedAt: pending.enqueuedAt}
 	err := scheduler.Enqueue(laneID, item)
 	if err == nil {
 		return "", true, nil
@@ -691,7 +968,9 @@ func schedulerHasItems(scheduler *sched.Scheduler) bool {
 }
 
 // runnerLane is one delivery lane: the scheduler's ID for it, the broker
-// destination that feeds it, and the spec the scheduler is built from.
+// destination that feeds it, and the spec the scheduler is built from. Topic
+// is the logical topic and priority the delivery lane, carried for the
+// deadline promotion event without re-deriving them from the lane ID.
 type runnerLane struct {
 	id          string
 	group       string
@@ -699,12 +978,26 @@ type runnerLane struct {
 	weight      int
 	budget      time.Duration
 	capacity    int
+	topic       string
+	priority    Priority
 }
 
-// runnerLanePlan derives every lane of a subscription from its fairness
-// configuration. It is the single computation behind both the scheduler's
-// lane capacities and the driver's per-destination caps, so a lane can never
-// be asked to hold more than the destination feeding it may have outstanding.
+type destinationMetadata struct {
+	topic    string
+	priority Priority
+	tier     int
+}
+
+// runnerLanePlan returns the plan the pipeline is built from: the plan the
+// runner's consumer open established, or one derived from the client's live
+// capabilities for a runner that has not opened yet.
+//
+// Returning the open's plan is what keeps one computation behind the
+// scheduler's lane capacities and the driver's per-destination caps, so a lane
+// can never be asked to hold more than the destination feeding it may have
+// outstanding. The cached plan also keeps those caps keyed on the destination
+// names this consumer was opened with; a second plan derived from capabilities
+// that moved since the open could name other destinations.
 //
 // A lane's capacity is its weighted share of the handler concurrency, times
 // the prefetch factor, and never less than minimumLaneCapacity shares. The
@@ -720,53 +1013,45 @@ type runnerLane struct {
 // from the naming helpers that declare topology. The two are resolved here,
 // in one place, so neither caller has to re-derive the other.
 func runnerLanePlan(r *Runner) []runnerLane {
+	r.mu.Lock()
+	opened := r.lanePlan
+	r.mu.Unlock()
+	if opened != nil {
+		return opened
+	}
 	r.client.mu.Lock()
 	effective := r.client.effective
 	source := r.client.source
 	r.client.mu.Unlock()
-	weights := r.subscription.Fairness.Weights
+	return runnerLanePlanFor(r, effective, source)
+}
+
+// runnerLanePlanFor builds the lane plan from capabilities the caller already
+// read, so a consumer open sizes its caps from the same read that named its
+// destinations.
+func runnerLanePlanFor(r *Runner, effective driver.Capabilities, source string) []runnerLane {
 	budgets := r.subscription.Fairness.Budgets
-	divisor := r.subscription.Fairness.RetryWeightDivisor
-	if divisor < 1 {
-		divisor = defaultRetryWeightDivisor
-	}
-	factor := r.subscription.Fairness.PrefetchFactor
-	if factor < 1 {
-		factor = defaultPrefetchFactor
-	}
-	meta := make(map[string]runnerLane, len(r.subscription.Topics)*len(r.subscription.Priorities)*(1+retryTiers(r.subscription.Retry)))
-	groups := make(map[string]struct{})
-	totalWeight := 0
-	for _, topic := range r.subscription.Topics {
-		logical := topicFor(topic)
-		for _, priority := range r.subscription.Priorities {
-			weight := max(weights[priority], 1)
-			budget := budgets[priority]
-			for tier := 0; tier <= retryTiers(r.subscription.Retry); tier++ {
-				laneID := schedulerLaneID(logical, priority, tier)
-				group := laneID
-				laneWeight, laneBudget := weight, budget
-				destination := consumeDestination(effective, source, logical, priority, r.subscription.Name)
-				if tier > 0 {
-					group = schedulerRetryGroupID(logical, priority)
-					laneWeight = max(laneWeight/divisor, 1)
-					laneBudget *= retryBudgetMultiplier
-					destination = retryDestinationFor(source, logical, priority, tier, r.subscription.Name)
-				}
-				meta[laneID] = runnerLane{
-					id: laneID, group: group, destination: destination,
-					weight: laneWeight, budget: laneBudget,
-				}
-				if _, exists := groups[group]; !exists {
-					groups[group] = struct{}{}
-					totalWeight += laneWeight
-				}
-			}
+	sizing := subscriptionLaneSizing(SubscriptionConfig{
+		Topics: r.subscription.Topics, Priorities: r.subscription.Priorities,
+		Concurrency: r.subscription.Concurrency, Fairness: r.subscription.Fairness,
+		Retry: r.subscription.Retry,
+	})
+	meta := make(map[string]runnerLane, len(r.subscription.Topics)*len(r.subscription.Priorities)*(1+r.subscription.Retry.tierCount()))
+	forEachDestination(effective, source, r.subscription, func(logical string, priority Priority, tier int, destination string) {
+		laneID := schedulerLaneID(logical, priority, tier)
+		group := laneID
+		laneWeight, laneBudget := sizing.mainWeight(priority), budgets[priority]
+		if tier > 0 {
+			group = schedulerRetryGroupID(logical, priority)
+			laneWeight = sizing.retryWeight(priority)
+			laneBudget *= retryBudgetMultiplier
 		}
-	}
-	if totalWeight < 1 {
-		totalWeight = 1
-	}
+		meta[laneID] = runnerLane{
+			id: laneID, group: group, destination: destination,
+			weight: laneWeight, budget: laneBudget,
+			topic: logical, priority: priority,
+		}
+	})
 	ids := make([]string, 0, len(meta))
 	for id := range meta {
 		ids = append(ids, id)
@@ -775,25 +1060,15 @@ func runnerLanePlan(r *Runner) []runnerLane {
 	plan := make([]runnerLane, 0, len(ids))
 	for _, id := range ids {
 		lane := meta[id]
-		lane.capacity = max((r.subscription.Concurrency*lane.weight+totalWeight-1)/totalWeight, minimumLaneCapacity) * factor
+		lane.capacity = sizing.capacity(lane.weight)
 		plan = append(plan, lane)
 	}
 	return plan
 }
 
-// runnerConsumerPrefetch returns the consumer's total in-flight budget: the
-// configured prefetch, capped by the sum of the lane capacities. A larger
-// total would let the driver fetch work ahead of the lanes that can hold it,
-// which is the buffering the lane bound exists to keep out: fetch must pause
-// on a full destination rather than queue behind it.
-//
-// A cap on a prefetch the caller named is reported, because that is a budget
-// the caller set and the destinations carry less. A prefetch nobody named is
-// not: the broker default is not the caller's decision, and a line that fires
-// on every subscription is unread when a caller's own budget is capped. The
-// report runs on every call rather than holding state to report once, so the
-// line repeats at the rate the caller's own reconnect loop repeats, which is
-// the rate the condition is re-decided.
+// runnerConsumerPrefetch resolves automatic sizing to the lane-capacity sum.
+// A positive configured budget is an admission ceiling; the lane windows may
+// impose a smaller effective ceiling, which is reported rather than hidden.
 func runnerConsumerPrefetch(r *Runner, configured int, lanes []runnerLane) int {
 	total := 0
 	for _, lane := range lanes {
@@ -802,7 +1077,10 @@ func runnerConsumerPrefetch(r *Runner, configured int, lanes []runnerLane) int {
 	if total < 1 {
 		return configured
 	}
-	if configured > total && r.prefetchConfigured {
+	if configured == 0 {
+		return total
+	}
+	if configured > total {
 		lastResortRunnerLogger(r).Warn("f1 configured prefetch exceeds the destination windows",
 			"subscription", r.subscription.Name,
 			"configured", configured,
@@ -823,7 +1101,7 @@ func newRunnerScheduler(r *Runner) (*sched.Scheduler, error) {
 			Budget: lane.budget, Capacity: lane.capacity,
 		})
 	}
-	return sched.New(specs, r.client.options.clock, !r.subscription.Fairness.DisableAging)
+	return sched.New(specs, r.client.options.clock, !r.subscription.Fairness.DisableDeadlinePromotion)
 }
 
 func schedulerLaneID(topic string, priority Priority, tier int) string {
@@ -841,8 +1119,15 @@ func deliveryLane(r *Runner, message driver.InboundMessage) string {
 	envelope, err := DecodeHeaders(inboundHeaders(message.Headers))
 	if err == nil {
 		r.mu.Lock()
-		tier := r.retryDestinationTiers[message.Destination]
+		metadata, known := r.destinationMetadata[message.Destination]
 		r.mu.Unlock()
+		tier := 0
+		if known {
+			tier = metadata.tier
+			if metadata.priority == envelope.Priority {
+				return schedulerLaneID(metadata.topic, metadata.priority, metadata.tier)
+			}
+		}
 		topic := topicFor(envelope.Type)
 		r.client.mu.Lock()
 		effective := r.client.effective
@@ -864,10 +1149,7 @@ func deliveryLane(r *Runner, message driver.InboundMessage) string {
 		}
 		return schedulerLaneID(topic, envelope.Priority, tier)
 	}
-	if len(r.subscription.Topics) > 0 && len(r.subscription.Priorities) > 0 {
-		return fallbackDeliveryLane(r)
-	}
-	return ""
+	return fallbackDeliveryLane(r)
 }
 
 func fallbackDeliveryLane(r *Runner) string {
@@ -881,28 +1163,30 @@ func fallbackDeliveryLane(r *Runner) string {
 // family the delivery came from. Subscription topology is declared from
 // Subscription.Topics, so a successor must stay inside the family the
 // message was consumed from: WithTopic and fan-out make the envelope's event
-// type an unreliable guide to that family. Matching reuses the exact naming
-// helpers that declare topology, so destination strings are never parsed and
-// nothing is derived from the event type here. The bool is false when no
-// configured family owns the destination, letting callers keep their
+// type an unreliable guide to that family. The destination alone decides:
+// the priority and event type come from headers, which a producer controls and
+// which may not decode at all. Matching reuses the exact naming helpers that
+// declare topology, so destination strings are never parsed. The bool is false
+// when no configured family owns the destination, letting callers keep their
 // historical derivation for deliveries outside every declared family.
-func consumingTopicFamily(r *Runner, priority Priority, destination string) (string, bool) {
+func consumingTopicFamily(r *Runner, destination string) (string, bool) {
+	r.mu.Lock()
+	metadata, known := r.destinationMetadata[destination]
+	r.mu.Unlock()
+	if known {
+		return metadata.topic, true
+	}
 	r.client.mu.Lock()
 	effective := r.client.effective
 	source := r.client.source
 	r.client.mu.Unlock()
-	for _, configured := range r.subscription.Topics {
-		logical := topicFor(configured)
-		if consumeDestination(effective, source, logical, priority, r.subscription.Name) == destination {
-			return logical, true
+	family, found := "", false
+	forEachDestination(effective, source, r.subscription, func(topic string, _ Priority, _ int, name string) {
+		if !found && name == destination {
+			family, found = topic, true
 		}
-		for tier := 1; tier <= retryTiers(r.subscription.Retry); tier++ {
-			if retryDestinationFor(source, logical, priority, tier, r.subscription.Name) == destination {
-				return logical, true
-			}
-		}
-	}
-	return "", false
+	})
+	return family, found
 }
 
 // Drain stops fetching and waits for all worker deliveries to settle. A
@@ -916,18 +1200,13 @@ func (r *Runner) Drain(ctx context.Context) error {
 		r.mu.Unlock()
 		return nil
 	}
-	cancel := r.cancel
 	handlerCancel := r.handlerCancel
 	handlerShutdownCancel := r.handlerShutdownCancel
 	done := r.done
+	cancel := r.cancel
 	if r.lifecycle != nil {
 		switch r.lifecycle.State() {
-		case lifecycle.Ready:
-			if err := r.lifecycle.Transition(lifecycle.Draining); err != nil {
-				r.mu.Unlock()
-				return err
-			}
-		case lifecycle.Reconnecting:
+		case lifecycle.Ready, lifecycle.Reconnecting:
 			if err := r.lifecycle.Transition(lifecycle.Draining); err != nil {
 				r.mu.Unlock()
 				return err
@@ -956,15 +1235,51 @@ func (r *Runner) Drain(ctx context.Context) error {
 			close(r.drainStarted)
 		}
 	}
+	events := r.events
 	r.mu.Unlock()
+	drainObserved := r.client != nil && r.client.observer != nil
+	drainInflight := 0
+	var drainTimeoutObserved time.Duration
+	var drainGuard observerFinishGuard
+	if drainObserved {
+		drainTimeoutObserved = r.client.config.Lifecycle.DrainTimeout
+		drainInflight = r.inflight.Len()
+		start := StartEvent{
+			Kind:  ObserverDrain,
+			At:    r.client.options.clock.Now(),
+			Drain: DrainCounts{InFlight: drainInflight, Timeout: drainTimeoutObserved},
+		}
+		_, token := r.client.observeStart(ctx, start)
+		drainGuard = r.client.newObserverGuard(ObserverDrain, token)
+		defer drainGuard.abandon()
+	}
+	// Tell the owner the runner is ending. The field above is what handler
+	// admission reads immediately; this report is what makes the owner compute
+	// the settlement window, stop the generation, and run its one drain. The
+	// report waits only for the owner to read it, and the owner reads its
+	// events between reports rather than inside a broker call, so a request
+	// cannot be waiting for an attempt or a consumer operation this call is
+	// supposed to end. A request that arrives once the runner is past the point
+	// of answering it has nothing to ask for, and the runner's own end releases
+	// this wait.
+	if events != nil {
+		select {
+		case events <- runnerEvent{kind: runnerEventDrain}:
+		case <-done:
+		}
+	}
+	// The generation is stopped here as well as by the owner, and cancelling
+	// twice is what makes the request work for a runner whose owner is not
+	// running the loop: a request that arrives at the end of a run has no
+	// generation left to stop, and a runner built by a test has no owner at
+	// all. The cancel is idempotent, so the second call is free, and a
+	// settlement the cancellation unblocks runs on the runner's own window
+	// whether the owner has computed the drain's yet or not.
 	if cancel != nil {
 		cancel()
 	}
 	if handlerCancel != nil {
 		drainTimeout := r.client.config.Lifecycle.DrainTimeout
-		if drainTimeout < 0 {
-			return fmt.Errorf("f1: lifecycle.drainTimeout must not be negative")
-		}
 		if drainTimeout > 0 {
 			grace := r.client.config.Lifecycle.HandlerGrace
 			if grace < 0 || grace >= drainTimeout {
@@ -1009,9 +1324,31 @@ func (r *Runner) Drain(ctx context.Context) error {
 	}
 	select {
 	case <-done:
-		return runnerError(r)
+		runnerErr := runnerError(r)
+		if drainObserved {
+			finishDrainObservation(&drainGuard, drainInflight, drainTimeoutObserved, r.inflight.Len(), runnerErr)
+		}
+		return runnerErr
 	case <-ctx.Done():
-		return ctx.Err()
+		ctxErr := ctx.Err()
+		if drainObserved {
+			finishDrainObservation(&drainGuard, drainInflight, drainTimeoutObserved, r.inflight.Len(), ctxErr)
+		}
+		return ctxErr
+	}
+}
+
+// finishDrainObservation finishes one started drain with the counts the finish
+// carries. Drained is the start count minus what is still held, floored at
+// zero so a delivery accepted between the two reads cannot turn the count
+// negative. A nil error finishes ok, else error with its class.
+func finishDrainObservation(guard *observerFinishGuard, inflight int, timeout time.Duration, remaining int, err error) {
+	drained := max(inflight-remaining, 0)
+	counts := DrainCounts{InFlight: inflight, Drained: drained, Remaining: remaining, Timeout: timeout}
+	if err == nil {
+		guard.finishWith(FinishEvent{Outcome: ObserverOutcomeOK, Drain: counts})
+	} else {
+		guard.finishWith(FinishEvent{Outcome: ObserverOutcomeError, ErrorClass: errorClassOf(err), Drain: counts})
 	}
 }
 
@@ -1053,15 +1390,14 @@ func runnerError(r *Runner) error {
 	return r.runErr
 }
 
-func setRunnerError(r *Runner, err error) {
+// reportRunnerError hands the owner the first failure a source saw. The owner
+// keeps the first one it is handed and never clears it, so the error a runner
+// reports through Drain is the first failure of the run and not the last.
+func reportRunnerError(r *Runner, err error) {
 	if err == nil {
 		return
 	}
-	r.mu.Lock()
-	if r.runErr == nil {
-		r.runErr = err
-	}
-	r.mu.Unlock()
+	r.report(runnerEvent{kind: runnerEventError, err: err})
 }
 
 //nolint:contextcheck // helper derives the phase context from the caller.
@@ -1091,9 +1427,22 @@ func runWithClockTimeout(parent context.Context, clk clock.Clock, timeout time.D
 	case err := <-done:
 		return err
 	case <-timer.C:
-		return fmt.Errorf("f1: shutdown %s phase timed out: %w", phase, context.DeadlineExceeded)
+		return phaseRaceResult(done, fmt.Errorf("f1: shutdown %s phase timed out: %w", phase, context.DeadlineExceeded))
 	case <-parent.Done():
-		return parent.Err()
+		return phaseRaceResult(done, parent.Err())
+	}
+}
+
+// phaseRaceResult prefers a phase result that is already available to the
+// timeout or cancellation that raced it. A phase that finished must report its
+// own result, so a caller that classifies the error cannot mistake a completed
+// call for one the budget cut short.
+func phaseRaceResult(done <-chan error, raced error) error {
+	select {
+	case err := <-done:
+		return err
+	default:
+		return raced
 	}
 }
 
@@ -1156,19 +1505,67 @@ func contextWithOptionalTimeout(parent context.Context, timeout time.Duration) (
 	return context.WithTimeout(parent, timeout)
 }
 
+// runnerSettlementContext returns the context a settlement call runs on.
+//
+// A live settlement window governs: once the runner has one, every call runs on
+// it, and nothing replaces it while it is live. Before that the caller's own
+// context governs, which keeps a settlement on a healthy generation bounded by
+// the delivery it belongs to.
+//
+// A call whose own context is already finished is the case that needs the
+// runner's window: settling on a context that is already done fails as a
+// cancellation the runner caused rather than as a bounded budget doing its job,
+// so the call is given the runner's own window instead. That rescue happens
+// while the runner is still running, because there is a generation left to
+// keep working; a drain does not do it, because a settlement that starts after
+// the drain's deadline is refused with that deadline rather than moved onto a
+// fresh budget every time it is attempted.
 func runnerSettlementContext(r *Runner, fallback context.Context) context.Context {
 	r.mu.Lock()
-	defer r.mu.Unlock()
-	if r.settleCtx != nil {
-		return r.settleCtx
+	window := r.settleCtx
+	draining := r.draining
+	r.mu.Unlock()
+	switch {
+	case window != nil && window.Err() == nil:
+		return window
+	case fallback != nil && fallback.Err() == nil:
+		return fallback
 	}
-	if fallback != nil && fallback.Err() != nil {
-		drainTimeout := r.client.config.Lifecycle.DrainTimeout
-		base := context.WithoutCancel(fallback)
-		r.settleCtx, r.settleCancel = contextWithOptionalTimeout(base, drainTimeout)
-		return r.settleCtx
+	if draining && window != nil {
+		return window
 	}
-	return fallback
+	r.beginSettlementWindow(fallback)
+	r.mu.Lock()
+	window = r.settleCtx
+	r.mu.Unlock()
+	return window
+}
+
+// beginSettlementWindow installs a fresh settlement window for the runner.
+//
+// The window is built over a base whose cancellation has been removed and
+// bounded by DrainTimeout, so its own timer is the only thing that ends it and
+// the cancellation of whatever context it was derived from cannot reach a
+// settlement it is bounding.
+//
+// A window it replaces is retired, never cancelled: a settlement may be holding
+// it, and cancelling it there would turn a call that is about to reach the
+// driver into a context failure the runner caused. The retired window keeps its
+// own timer, so within one budget period it fires and releases what is left of
+// it.
+//
+// The owner installs the drain's window when the drain starts, so from the
+// drain on every settlement runs on the deadline the drain computed once.
+// Installations before that are the rescue of a settlement whose own context
+// finished first. finishRunner releases the last window's timer at teardown.
+func (r *Runner) beginSettlementWindow(base context.Context) { //nolint:contextcheck // the window is deliberately built with WithoutCancel: the base's cancellation must not reach a settlement the window bounds.
+	if base == nil {
+		base = context.Background()
+	}
+	drainTimeout := r.client.config.Lifecycle.DrainTimeout
+	r.mu.Lock()
+	r.settleCtx, r.settleCancel = contextWithOptionalTimeout(context.WithoutCancel(base), drainTimeout)
+	r.mu.Unlock()
 }
 
 func configuredRunnerLogger(r *Runner) *slog.Logger {
@@ -1185,40 +1582,48 @@ func lastResortRunnerLogger(r *Runner) *slog.Logger {
 	return slog.Default()
 }
 
-// openRunnerConsumer opens the consumer with the budget derived from the
-// runner's own configuration. Run derives that budget once per generation and
-// calls openRunnerConsumerWith, so the driver's limit and the pipeline's
-// ordered queue depth are the same number even when they are not both derived
-// from the configuration at the same point in time.
-func openRunnerConsumer(r *Runner, ctx context.Context) (driver.Consumer, error) {
-	consumer, _, err := openRunnerConsumerWith(r, ctx, runnerConsumerPrefetch(r, r.config.Prefetch, runnerLanePlan(r)))
-	return consumer, err
-}
-
 // openRunnerConsumerWith opens the consumer for a generation whose total
 // in-flight budget is prefetch, as derived by Run, and returns the connection
-// used to open it.
-func openRunnerConsumerWith(r *Runner, ctx context.Context, prefetch int) (driver.Consumer, driver.Conn, error) {
+// incarnation it opened it on. The connection and the incarnation are one value
+// on the client, so the number the caller admits its consumer with later is the
+// number that belongs to the connection it actually used.
+//
+// waitCtx is the runner's own context and genCtx is the generation's. The wait
+// for a rebuild ends on genCtx only when the caller cancels the runner: an
+// attempt that abandons this runner cancels genCtx to release the topology call
+// or consumer open in flight, and a runner waiting for that attempt has to keep
+// waiting, because the attempt is rebuilding the connection it is about to open
+// on. Its drain is what ends that wait early.
+func openRunnerConsumerWith(r *Runner, waitCtx, genCtx context.Context, prefetch int) (driver.Consumer, uint64, error) {
 	var conn driver.Conn
+	var epoch uint64
 	var effective driver.Capabilities
 	var source string
 	for {
 		r.client.mu.Lock()
-		if r.client.reconnecting && r.client.reconnect != nil {
-			attempt := r.client.reconnect
+		if r.client.conn == connReconnecting {
 			r.client.mu.Unlock()
-			r.mu.Lock()
-			waitHook := r.reconnectWaitHook
-			r.mu.Unlock()
-			if waitHook != nil {
-				waitHook()
-			}
-			if err := r.client.waitReconnect(ctx, attempt); err != nil {
-				return nil, nil, err
+			// The runner asks for nothing here: an attempt is already
+			// rebuilding the connection, and this runner waits for it before
+			// it opens a consumer on an incarnation the swap is about to
+			// retire.
+			if err := r.client.awaitRebuild(waitCtx, nil, 0, r.drainStarted); err != nil {
+				return nil, 0, err
 			}
 			continue
 		}
-		conn = r.client.conn
+		if r.client.connStateLocked() == connFailed {
+			// The connection was given up and nothing is rebuilding it. The
+			// runner needs one to open a consumer, and the decision that gave
+			// it up is what it reports instead of opening on a connection the
+			// client has already declared broken.
+			failed := r.client.reconnectErr
+			r.client.mu.Unlock()
+			return nil, 0, failed
+		}
+		current := r.client.current
+		conn = current.conn
+		epoch = current.epoch
 		effective = r.client.effective
 		source = r.client.source
 		r.client.mu.Unlock()
@@ -1226,12 +1631,28 @@ func openRunnerConsumerWith(r *Runner, ctx context.Context, prefetch int) (drive
 	}
 	policy := r.client.topologyPolicy()
 	if conn == nil {
-		return nil, nil, errors.New("f1: client is not connected")
+		return nil, 0, errors.New("f1: client is not connected")
 	}
 	destinations := subscriptionDestinations(effective, source, r.subscription)
-	retryDestinationTiers := retryDestinationTierMap(source, r.subscription)
+	destinationMetadata := buildDestinationMetadataMap(effective, source, r.subscription)
+	// The plan is built from the effective and source read with conn, so a swap
+	// during EnsureTopology cannot rename the destinations this open declares
+	// and caps. It is stored beside the destination metadata so the scheduler
+	// and the promotion table read back the plan this consumer was built from
+	// instead of deriving a second plan from capabilities that have moved.
+	//
+	// Each destination's cap is its lane's capacity, so a lane can never hold
+	// more than the driver lets that destination have outstanding. Reading the
+	// shared delivery channel into lanes then cannot jam behind one full lane
+	// while another lane's work waits in the channel.
+	lanes := runnerLanePlanFor(r, effective, source)
+	perDestination := make(map[string]int, len(lanes))
+	for _, lane := range lanes {
+		perDestination[lane.destination] = lane.capacity
+	}
 	r.mu.Lock()
-	r.retryDestinationTiers = retryDestinationTiers
+	r.destinationMetadata = destinationMetadata
+	r.lanePlan = lanes
 	r.mu.Unlock()
 	// Every policy goes through the admin, TopologyNone included: under None the
 	// driver does no broker work but still records what the spec said, and a
@@ -1239,28 +1660,16 @@ func openRunnerConsumerWith(r *Runner, ctx context.Context, prefetch int) (drive
 	// the call.
 	admin := conn.Admin()
 	if admin == nil {
-		return nil, nil, errors.New("f1: consumer topology requires driver admin")
+		return nil, 0, errors.New("f1: consumer topology requires driver admin")
 	}
 	topology := subscriptionTopologySpecs(effective, source, r.subscription)
 	topology.Policy = policy
-	diff, err := admin.EnsureTopology(ctx, topology)
+	diff, err := admin.EnsureTopology(genCtx, topology)
 	if err != nil {
-		return nil, nil, fmt.Errorf("f1: ensure subscription topology: %w", err)
+		return nil, 0, fmt.Errorf("f1: ensure subscription topology: %w", err)
 	}
 	logTopologyDrift(lastResortRunnerLogger(r), diff)
-	// Each destination's cap is its lane's capacity, so a lane can never hold
-	// more than the driver lets that destination have outstanding. Reading the
-	// shared delivery channel into lanes then cannot jam behind one full lane
-	// while another lane's work waits in the channel. prefetch, the total the
-	// caller derived, is capped by the sum of those caps, so the driver pauses
-	// a full destination instead of fetching ahead of the lanes that hold the
-	// work.
-	lanes := runnerLanePlan(r)
-	perDestination := make(map[string]int, len(lanes))
-	for _, lane := range lanes {
-		perDestination[lane.destination] = lane.capacity
-	}
-	consumer, err := conn.Consumer(ctx, driver.ConsumerConfig{
+	consumer, err := conn.Consumer(genCtx, driver.ConsumerConfig{
 		Group:          r.subscription.Name,
 		Destinations:   destinations,
 		Prefetch:       prefetch,
@@ -1271,12 +1680,12 @@ func openRunnerConsumerWith(r *Runner, ctx context.Context, prefetch int) (drive
 		StartAt:        driver.StartEarliest,
 	})
 	if err != nil {
-		return nil, nil, fmt.Errorf("f1: create subscription %s: %w", r.subscription.Name, err)
+		return nil, 0, fmt.Errorf("f1: create subscription %s: %w", r.subscription.Name, err)
 	}
 	if consumer == nil {
-		return nil, nil, errors.New("f1: driver returned a nil consumer")
+		return nil, 0, errors.New("f1: driver returned a nil consumer")
 	}
-	return consumer, conn, nil
+	return consumer, epoch, nil
 }
 
 func consumeRunnerErrors(r *Runner, ctx context.Context) error {
@@ -1326,31 +1735,35 @@ func consumeRunnerErrors(r *Runner, ctx context.Context) error {
 				lastResortRunnerLogger(r).Error("f1 consumer error", "subscription", r.subscription.Name, "error", err)
 			}
 			var cancel context.CancelFunc
-			if !classified || kind == driver.KindTransient {
+			switch {
+			case !classified || kind == driver.KindTransient:
+				r.report(runnerEvent{
+					kind:      runnerEventConsumerError,
+					err:       err,
+					transient: kind == driver.KindTransient,
+				})
 				r.mu.Lock()
-				if kind == driver.KindTransient {
-					r.consumerError = true
-				}
-				if r.reconnectCause == nil {
-					r.reconnectCause = err
-					r.reconnectCauseAttempt = nil
-				}
 				cancel = r.cancel
 				r.mu.Unlock()
-			} else {
-				setRunnerError(r, err)
-				if kind == driver.KindFatal {
-					recordFatalConsumerError(r, err)
-					r.mu.Lock()
-					cancel = r.cancel
-					r.mu.Unlock()
-				}
+			case kind == driver.KindFatal:
+				recordFatalConsumerError(r, err)
+				r.mu.Lock()
+				cancel = r.cancel
+				r.mu.Unlock()
+			default:
+				reportRunnerError(r, err)
 			}
 			// r.cancel below is about to cancel ctx, so the notification gets its
 			// own detached context: the handler's terminalNotificationTimeout
 			// budget must not collapse to zero just because the same error that
 			// is being reported is also what triggers shutdown.
 			runnerNotifyError(r, context.WithoutCancel(ctx), nil, err)
+			if classified && kind != driver.KindTransient && kind != driver.KindFatal {
+				// A not-found, too-large or permission error is reported without
+				// ending the generation, so keep reading: a later fatal error
+				// must still fail the subscription.
+				continue
+			}
 			if cancel != nil {
 				cancel()
 			}
@@ -1360,10 +1773,10 @@ func consumeRunnerErrors(r *Runner, ctx context.Context) error {
 }
 
 func recordFatalConsumerError(r *Runner, err error) {
-	setRunnerError(r, err)
+	reportRunnerError(r, err)
 	if r.lifecycle != nil {
 		if transitionErr := r.lifecycle.Transition(lifecycle.Failed); transitionErr != nil {
-			setRunnerError(r, errors.Join(err, transitionErr))
+			reportRunnerError(r, errors.Join(err, transitionErr))
 		}
 	}
 	r.client.recordFailedSubscription(r.subscription.Name, err, r)
@@ -1371,7 +1784,14 @@ func recordFatalConsumerError(r *Runner, err error) {
 
 // --- Intake and cancellation ---
 
+// fetchRunner reads the consumer and hands deliveries to the pipeline. It is
+// also the only closer of the channel it hands them over on, and it closes
+// that channel from a deferred function so every way out closes it, a panic
+// included: the pipeline reads the channel until it is closed, so a fetch
+// source that died without closing would leave the pipeline waiting on a
+// channel no one owns any more, and the generation would never end.
 func fetchRunner(r *Runner, ctx context.Context, dispatch chan<- delivery) error {
+	defer close(dispatch)
 	r.mu.Lock()
 	consumer := r.consumer
 	r.mu.Unlock()
@@ -1387,7 +1807,6 @@ func fetchRunner(r *Runner, ctx context.Context, dispatch chan<- delivery) error
 				if r.cancel != nil {
 					r.cancel()
 				}
-				close(dispatch)
 				return nil
 			}
 			if !enqueueDelivery(r, ctx, dispatch, message) {
@@ -1405,53 +1824,107 @@ func fetchRunnerAfterCancel(r *Runner, parent context.Context, messages <-chan d
 	drainBase := context.WithoutCancel(parent)
 	drainCtx, cancel := contextWithOptionalTimeout(drainBase, drainTimeout)
 	defer cancel()
-	r.mu.Lock()
-	// First installation wins. A settlement context installed earlier was
-	// built from an uncancelable base with its own drain budget, so it is
-	// already fit for use; cancelling and replacing it would pull the ground
-	// out from under a settlement call that captured the old context and is
-	// about to reach the driver on it.
-	if r.settleCtx == nil {
-		r.settleCtx, r.settleCancel = contextWithOptionalTimeout(drainBase, drainTimeout)
-	}
-	r.mu.Unlock()
+	// This source installs no settlement context. The drain's settlement window
+	// is the owner's, computed when the drain starts, and installing one here
+	// would put a second deadline under settlements the owner is already
+	// bounding.
 	r.mu.Lock()
 	consumer := r.consumer
 	r.mu.Unlock()
 	if err := consumer.Drain(drainCtx); err != nil {
-		setRunnerError(r, err)
+		reportRunnerError(r, err)
 	}
 	for {
 		select {
 		case message, ok := <-messages:
 			if !ok {
-				close(dispatch)
 				return nil
 			}
 			if !enqueueDelivery(r, drainCtx, dispatch, message) {
-				close(dispatch)
 				return nil
 			}
 		default:
-			close(dispatch)
 			return nil
 		}
 	}
 }
 
+func runnerDestinationObservation(r *Runner, destination string) (string, Priority) {
+	if r == nil {
+		return "", 0
+	}
+	r.mu.Lock()
+	metadata, ok := r.destinationMetadata[destination]
+	r.mu.Unlock()
+	if !ok {
+		return "", 0
+	}
+	return metadata.topic, metadata.priority
+}
+
 func enqueueDelivery(r *Runner, ctx context.Context, dispatch chan<- delivery, message driver.InboundMessage) bool {
-	id := r.inflight.Add(message)
+	id := r.inflight.Add()
 	item := delivery{id: id, message: message}
+	if r.client != nil && r.client.observer != nil {
+		var messageID, correlationID string
+		for _, header := range message.Headers {
+			switch header.Key {
+			case wire.ID:
+				messageID = string(header.Value)
+			case wire.CorrelationID:
+				correlationID = string(header.Value)
+			}
+		}
+		enqueuedAt, enqueuedAtSource := observerEnqueueFields(message)
+		topic, priority := runnerDestinationObservation(r, message.Destination)
+		r.client.observeRecord(PointEvent{
+			Kind:             ObserverDeliveryReceived,
+			At:               r.client.options.clock.Now(),
+			Topic:            topic,
+			Subscription:     r.subscription.Name,
+			ConsumerGroup:    r.subscription.Name,
+			Priority:         priority,
+			Destination:      message.Destination,
+			MessageID:        messageID,
+			CorrelationID:    correlationID,
+			DeliveryCount:    message.DeliveryCount,
+			EnqueuedAt:       enqueuedAt,
+			EnqueuedAtSource: enqueuedAtSource,
+		})
+
+	}
 	select {
 	case dispatch <- item:
 		return true
 	case <-ctx.Done():
 		// A cancellation path may still have a delivery in the channel. Put it
-		// back through the broker rather than losing it locally.
-		state := &deliveryState{id: id}
+		// back through the broker rather than losing it locally, with the same
+		// bounded cleanup the delivery path uses: the registry entry leaves
+		// only once the settlement path finished, so a drain never reads zero
+		// while the broker still owns the message.
+		state := &deliveryState{}
 		_ = nackDelivery(r, runnerSettlementContext(r, ctx), message, driver.NackOptions{Requeue: true}, state)
+		retryDeliverySettlement(r, ctx, message, state)
 		r.inflight.Remove(id)
 		return false
+	}
+}
+
+func observerEnqueueFields(message driver.InboundMessage) (time.Time, EnqueuedAtSource) {
+	if message.EnqueuedAt.IsZero() {
+		return time.Time{}, EnqueuedAtUnknown
+	}
+	return message.EnqueuedAt, observerEnqueueSource(message.EnqueuedAtSource)
+}
+
+func observerEnqueueSource(source driver.EnqueueSource) EnqueuedAtSource {
+	switch source {
+	case driver.EnqueueSourceProducer:
+		return EnqueuedAtProducer
+	case driver.EnqueueSourceBroker:
+		return EnqueuedAtBroker
+	default:
+		return EnqueuedAtUnknown
 	}
 }
 
@@ -1459,7 +1932,7 @@ func enqueueDelivery(r *Runner, ctx context.Context, dispatch chan<- delivery, m
 
 func processDelivery(r *Runner, ctx context.Context, item delivery) {
 	abandoned := false
-	state := &deliveryState{id: item.id}
+	state := &deliveryState{}
 	var envelope Envelope
 	defer func() {
 		if recovered := recover(); recovered != nil {
@@ -1500,24 +1973,20 @@ const settlementRetryBackoff = 20 * time.Millisecond
 // per round. The loop ends when the delivery settles, when the attempt bound
 // is reached, or when the settlement context ends, whichever comes first.
 func retryDeliverySettlement(r *Runner, ctx context.Context, message driver.InboundMessage, state *deliveryState) {
+	// The requeue fallback records a nack in state.operation, so the round's
+	// operation is fixed here to keep retrying a failed ack as an ack.
+	operation := state.operation
 	for round := 0; !state.settled && round < settlementRetryAttempts; round++ {
 		sctx := runnerSettlementContext(r, ctx)
-		switch state.operation {
+		switch operation {
 		case settlementOperationAck:
 			ackDelivery(r, sctx, message, state)
 			if state.settled {
-				reportPendingPoisonDrop(r, sctx, message, state)
 				return
 			}
 			_ = nackDelivery(r, sctx, message, driver.NackOptions{Requeue: true}, state)
-			if state.settled {
-				state.poisonDrop = nil
-			}
 		case settlementOperationNack:
 			_ = nackDelivery(r, sctx, message, state.nackOptions, state)
-			if state.settled {
-				state.poisonDrop = nil
-			}
 		default:
 			return
 		}
@@ -1538,9 +2007,11 @@ func effectiveMaxAttempts(eventMaxAttempts, policyMaxAttempts int) int {
 }
 
 // dispatchMessage returns true only after the delivery's settlement path has
-// completed; classification and settlement stay outside middleware.
-func dispatchMessage(r *Runner, ctx context.Context, message driver.InboundMessage, envelopeOut *Envelope, abandoned *bool, states ...*deliveryState) bool {
-	state := stateFor(states)
+// completed; classification and settlement stay outside middleware. state
+// carries the delivery's settlement bookkeeping and is required: it is where
+// the header limit and the pending drop report are recorded, so a call site
+// must hold the delivery's own state rather than a temporary nothing else sees.
+func dispatchMessage(r *Runner, ctx context.Context, message driver.InboundMessage, envelopeOut *Envelope, abandoned *bool, state *deliveryState) bool {
 	r.client.mu.Lock()
 	headerMaxBytes := effectiveHeaderLimit(r.client.config.Codec.MaxHeaderBytes, r.client.effective.MaxHeaderBytes)
 	r.client.mu.Unlock()
@@ -1573,13 +2044,16 @@ func dispatchMessage(r *Runner, ctx context.Context, message driver.InboundMessa
 		if r.subscription.UnmatchedPolicy == DeadLetter {
 			return deadLetterAndSettle(r, ctx, message, envelope, ReasonUnmatched, errors.New("no handler matched event type"), state)
 		}
-		runnerNotifyDiscarded(r, runnerSettlementContext(r, ctx), discardUnmatched(envelope, append([]byte(nil), message.Body...)))
-		return ackDelivery(r, runnerSettlementContext(r, ctx), message, state)
+		return discardAndSettle(r, runnerSettlementContext(r, ctx), message, discardUnmatched(envelope, nil), state)
 	}
 	eventEnvelope := envelope
 	eventEnvelope.MaxAttempts = maxAttempts
-	event := &Event{envelope: eventEnvelope, raw: append([]byte(nil), message.Body...), codec: eventCodec, headers: headers, headerMaxBytes: state.headerMaxBytes}
-	result := invokeHandler(r, ctx, handler, event)
+	event := &Event{envelope: eventEnvelope, raw: append([]byte(nil), message.Body...), codec: eventCodec, headers: headers}
+	result := invokeHandlerMessage(r, ctx, handler, event, message)
+
+	if result.processCtx != nil {
+		state.processCtx = result.processCtx
+	}
 	if result.stuck {
 		*abandoned = true
 		return false
@@ -1593,8 +2067,7 @@ func dispatchMessage(r *Runner, ctx context.Context, message driver.InboundMessa
 	outcome := classifyRetryError(result.err)
 	switch outcome {
 	case retryOutcomeDrop:
-		runnerNotifyDiscarded(r, runnerSettlementContext(r, ctx), Discarded{Envelope: envelope, Body: append([]byte(nil), message.Body...), Reason: DiscardDropped, Err: result.err})
-		return ackDelivery(r, runnerSettlementContext(r, ctx), message, state)
+		return discardAndSettle(r, runnerSettlementContext(r, ctx), message, Discarded{Envelope: envelope, Reason: DiscardDropped, Err: result.err}, state)
 	case retryOutcomeTerminal:
 		return deadLetterAndSettle(r, ctx, message, envelope, ReasonTerminal, result.err, state)
 	}
@@ -1633,20 +2106,75 @@ func classifyRetryError(err error) retryOutcome {
 	return retryOutcomeRetry
 }
 
-func stateFor(states []*deliveryState) *deliveryState {
-	if len(states) > 0 && states[0] != nil {
-		return states[0]
+// processOutcome maps a handler result to the observer finish it asks for:
+// ok with no class when neither err nor panic is set, f1_panic for a panic,
+// f1_terminal for a terminal error, f1_dropped for a dropped error,
+// f1_max_attempts when a retryable error arrives at the last attempt, and
+// f1_retryable otherwise. Terminal is true unless the class is f1_retryable.
+func processOutcome(result handlerResult, event *Event) (ObserverOutcome, ErrorClass, bool) {
+	if result.panic != nil {
+		return ObserverOutcomeError, ErrorClassPanic, true
 	}
-	return &deliveryState{}
+	if result.err == nil {
+		return ObserverOutcomeOK, "", true
+	}
+	if IsTerminal(result.err) {
+		return ObserverOutcomeError, ErrorClassTerminal, true
+	}
+	if IsDropped(result.err) {
+		return ObserverOutcomeError, ErrorClassDropped, true
+	}
+	if event != nil && event.MaxAttempts() > 0 && event.Attempt() >= event.MaxAttempts() {
+		return ObserverOutcomeError, ErrorClassMaxAttempts, true
+	}
+	return ObserverOutcomeError, ErrorClassRetryable, false
+}
+
+// finishProcessResult emits the process finish for a handler result that is
+// not stuck. A stuck result returns without finishing, so the deferred
+// abandon on the guard emits it instead.
+func finishProcessResult(guard *observerFinishGuard, base FinishEvent, result handlerResult, event *Event) {
+	outcome, class, terminal := processOutcome(result, event)
+	finish := base
+	finish.Outcome = outcome
+	finish.ErrorClass = class
+	finish.Terminal = terminal
+	guard.finishWith(finish)
+}
+
+// deathReasonClass maps a death reason to the bounded error class carried on
+// poison rejected events. Anything outside the known reasons is _OTHER.
+func deathReasonClass(reason DeathReason) ErrorClass {
+	switch reason {
+	case ReasonDecode:
+		return ErrorClassDecode
+	case ReasonPanic:
+		return ErrorClassPanic
+	case ReasonExpired:
+		return ErrorClassExpired
+	case ReasonUnmatched:
+		return ErrorClassUnmatched
+	case ReasonMaxAttempts:
+		return ErrorClassMaxAttempts
+	case ReasonTerminal:
+		return ErrorClassTerminal
+	case ReasonPoison:
+		return ErrorClassPoison
+	default:
+		return ErrorClassOther
+	}
 }
 
 type handlerResult struct {
-	err   error
-	panic error
-	stuck bool
+	err error
+	// processCtx carries the context Start of ObserverProcess returned, set
+	// only when an observer is set.
+	processCtx context.Context
+	panic      error
+	stuck      bool
 }
 
-func invokeHandler(r *Runner, parent context.Context, handler Handler, event *Event) handlerResult {
+func invokeHandlerMessage(r *Runner, parent context.Context, handler Handler, event *Event, message driver.InboundMessage) handlerResult {
 	timeout := r.subscription.HandlerTimeout
 	if timeout <= 0 {
 		timeout = defaultHandlerTimeout
@@ -1664,7 +2192,85 @@ func invokeHandler(r *Runner, parent context.Context, handler Handler, event *Ev
 		return handlerResult{stuck: true}
 	}
 	r.mu.Unlock()
-	handlerCtx, cancel := context.WithTimeout(base, timeout)
+	observerCtx := base
+	eventID := ""
+	if event != nil {
+		eventID = event.envelope.ID
+	}
+	topic := ""
+	topicResolved := false
+	resolveTopic := func() string {
+		if topicResolved {
+			return topic
+		}
+		topicResolved = true
+		if event == nil {
+			return topic
+		}
+		// The topic is the family the delivery came from, not the event
+		// type: a publish with a topic override lands on another family's
+		// destination while keeping its event type. Fall back to the
+		// historical derivation outside every declared family.
+		topic = topicFor(event.envelope.Type)
+		if family, ok := consumingTopicFamily(r, message.Destination); ok {
+			topic = family
+		}
+		return topic
+	}
+	var processGuard observerFinishGuard
+	var processBase FinishEvent
+	observed := false
+	if r.client != nil && r.client.observer != nil && event != nil && base != nil {
+		eventType := event.envelope.Type
+		enqueuedAt, enqueuedAtSource := observerEnqueueFields(message)
+		priority := event.envelope.Priority
+		attempt := event.envelope.Attempt
+		messageID := event.envelope.ID
+		correlationID := event.envelope.CorrelationID
+		if correlationID == "" {
+			correlationID = messageID
+		}
+		resolvedTopic := resolveTopic()
+		start := StartEvent{
+			Kind:          ObserverProcess,
+			At:            r.client.options.clock.Now(),
+			Topic:         resolvedTopic,
+			Subscription:  r.subscription.Name,
+			ConsumerGroup: r.subscription.Name,
+			EventType:     eventType,
+			Priority:      priority,
+			Attempt:       attempt,
+			Destination:   message.Destination,
+
+			MessageID:        messageID,
+			CorrelationID:    correlationID,
+			DeliveryCount:    message.DeliveryCount,
+			EnqueuedAt:       enqueuedAt,
+			EnqueuedAtSource: enqueuedAtSource,
+
+			TraceParent: event.envelope.TraceParent,
+			TraceState:  event.envelope.TraceState,
+		}
+		nextCtx, token := r.client.observeStart(base, start)
+		observerCtx = nextCtx
+		processBase = FinishEvent{
+			Topic:         resolvedTopic,
+			Subscription:  r.subscription.Name,
+			ConsumerGroup: r.subscription.Name,
+			EventType:     eventType,
+			Priority:      priority,
+			PriorityKnown: true,
+			Attempt:       attempt,
+			Destination:   message.Destination,
+
+			MessageID:     messageID,
+			CorrelationID: correlationID,
+		}
+		processGuard = r.client.newObserverGuard(ObserverProcess, token)
+		observed = true
+		defer processGuard.abandon()
+	}
+	handlerCtx, cancel := context.WithTimeout(observerCtx, timeout)
 	defer cancel()
 	done := make(chan handlerResult, 1)
 	// Normal runs attach handlers to asyncGroup; direct tests and pre-Run
@@ -1706,51 +2312,65 @@ func invokeHandler(r *Runner, parent context.Context, handler Handler, event *Ev
 	if shutdownCtx != nil {
 		shutdownDone = shutdownCtx.Done()
 	}
+	// finish records the process finish for a result that is not stuck; a
+	// stuck result keeps the deferred abandon on the guard.
+	finish := func(result handlerResult) handlerResult {
+		if observed && !result.stuck {
+			finishProcessResult(&processGuard, processBase, result, event)
+			result.processCtx = observerCtx
+		}
+		return result
+	}
 	// The first explicit 2x phase warns; only after it completes does the
 	// second explicit 2x phase begin, making the terminal threshold cumulative 4x.
-firstPhase:
-	for {
-		select {
-		case result := <-done:
-			return result
-		case <-drainStarted:
-			parentDone = nil
-			drainStarted = nil
-		case <-parentDone:
-			if runnerIsDraining(r) {
-				parentDone = nil
-				continue
-			}
-			return handlerResult{stuck: true}
-		case <-shutdownDone:
-			return handlerResult{stuck: true}
-		case <-stuck.C:
-			lastResortRunnerLogger(r).Warn("f1 stuck worker", "subscription", r.subscription.Name, "threshold", stuckPhaseMultiplier*timeout)
-			break firstPhase
-		}
+	if result, ended := awaitHandlerPhase(r, done, &parentDone, &drainStarted, shutdownDone, stuck.C); ended {
+		return finish(result)
 	}
+	lastResortRunnerLogger(r).LogAttrs(handlerCtx, slog.LevelWarn, "f1 stuck worker",
+		slog.String("subscription", r.subscription.Name),
+		slog.Duration("threshold", stuckPhaseMultiplier*timeout),
+		slog.String("event_id", eventID),
+		slog.String("topic", resolveTopic()))
 	stackTimer := r.client.options.clock.Timer(timeout * stuckPhaseMultiplier)
 	defer stackTimer.Stop()
-	// Keep result, parent cancellation, shutdown cancellation, and timer order
-	// explicit: this is the second sequential stuck phase.
+	if result, ended := awaitHandlerPhase(r, done, &parentDone, &drainStarted, shutdownDone, stackTimer.C); ended {
+		return finish(result)
+	}
+	lastResortRunnerLogger(r).LogAttrs(handlerCtx, slog.LevelError, "f1 worker exceeded stuck threshold",
+		slog.String("subscription", r.subscription.Name),
+		slog.Duration("threshold", stuckAbortMultiplier*timeout),
+		slog.String("event_id", eventID),
+		slog.String("topic", resolveTopic()))
+	return handlerResult{stuck: true}
+}
+
+// awaitHandlerPhase waits inside one stuck phase for a handler that has not
+// returned. It returns the handler's result and true when that result or a
+// shutdown ends the phase, and false when the phase's own timer fired, which
+// makes the caller move to the next phase.
+//
+// parentDone and drainStarted are pointers because the phase clears each one
+// once it has acted on it: both stay selected on every iteration, so a closed
+// channel left in place would spin this loop. Shutdown ends the phase as stuck
+// and needs no clearing, because it returns.
+func awaitHandlerPhase(r *Runner, done <-chan handlerResult, parentDone *<-chan struct{}, drainStarted *chan struct{}, shutdownDone <-chan struct{}, phase <-chan time.Time) (handlerResult, bool) {
 	for {
 		select {
 		case result := <-done:
-			return result
-		case <-drainStarted:
-			parentDone = nil
-			drainStarted = nil
-		case <-parentDone:
+			return result, true
+		case <-*drainStarted:
+			*parentDone = nil
+			*drainStarted = nil
+		case <-*parentDone:
 			if runnerIsDraining(r) {
-				parentDone = nil
+				*parentDone = nil
 				continue
 			}
-			return handlerResult{stuck: true}
+			return handlerResult{stuck: true}, true
 		case <-shutdownDone:
-			return handlerResult{stuck: true}
-		case <-stackTimer.C:
-			lastResortRunnerLogger(r).Error("f1 worker exceeded stuck threshold", "subscription", r.subscription.Name, "threshold", stuckAbortMultiplier*timeout)
-			return handlerResult{stuck: true}
+			return handlerResult{stuck: true}, true
+		case <-phase:
+			return handlerResult{}, false
 		}
 	}
 }
@@ -1763,51 +2383,171 @@ func runnerIsDraining(r *Runner) bool {
 
 // --- Settlement primitives ---
 
-func ackDelivery(r *Runner, ctx context.Context, message driver.InboundMessage, states ...*deliveryState) bool {
-	return ackDeliveryAs(r, ctx, message, true, states...)
+func discardAndSettle(r *Runner, ctx context.Context, message driver.InboundMessage, payload Discarded, state *deliveryState) bool {
+	if r.subscription.OnDiscarded != nil {
+		payload.Body = append([]byte(nil), message.Body...)
+		state.discard = payload
+		state.discardPending = true
+	}
+	return ackDelivery(r, ctx, message, state)
+}
+
+// ackDelivery acknowledges the delivery, recording the outcome on state. state
+// is required: it is the delivery's own settlement bookkeeping, and the
+// deferred cleanup reads the operation it records here.
+func ackDelivery(r *Runner, ctx context.Context, message driver.InboundMessage, state *deliveryState) bool {
+	return ackDeliveryAs(r, ctx, message, true, state)
+}
+
+// startSettleObservation starts one settle pair for a single broker settle
+// call. It returns the guard for its finish, the finish identity, and whether
+// observation is on. A nil runner or a nil observer starts nothing.
+func startSettleObservation(r *Runner, ctx context.Context, message driver.InboundMessage, op SettleOperation) (observerFinishGuard, FinishEvent, bool) {
+	if r == nil || r.client == nil || r.client.observer == nil {
+		return observerFinishGuard{}, FinishEvent{}, false
+	}
+	topic, priority := runnerDestinationObservation(r, message.Destination)
+	start := StartEvent{
+		Kind:          ObserverSettle,
+		At:            r.client.options.clock.Now(),
+		Topic:         topic,
+		Subscription:  r.subscription.Name,
+		ConsumerGroup: r.subscription.Name,
+		Priority:      priority,
+		Destination:   message.Destination,
+		Operation:     op,
+	}
+	_, token := r.client.observeStart(ctx, start)
+	guard := r.client.newObserverGuard(ObserverSettle, token)
+	base := FinishEvent{
+		Topic:         topic,
+		Subscription:  r.subscription.Name,
+		ConsumerGroup: r.subscription.Name,
+		Priority:      priority,
+		PriorityKnown: true,
+		Destination:   message.Destination,
+	}
+	return guard, base, true
+}
+
+// finishObservationFromError completes the guard with the operation's outcome.
+func finishObservationFromError(guard *observerFinishGuard, base FinishEvent, err error) {
+	finish := base
+	if err == nil {
+		finish.Outcome = ObserverOutcomeOK
+	} else {
+		finish.Outcome = ObserverOutcomeError
+		finish.ErrorClass = errorClassOf(err)
+	}
+	guard.finishWith(finish)
 }
 
 // ackDeliveryAs acknowledges the delivery. handled records whether the ack
 // ends a handled delivery rather than a dead-lettered or retried one; only a
 // handled ack counts the generation's successfulDelivery, which the
-// reconnect decision reads.
-func ackDeliveryAs(r *Runner, ctx context.Context, message driver.InboundMessage, handled bool, states ...*deliveryState) bool {
-	state := stateFor(states)
+// reconnect decision reads. state is the delivery's own settlement
+// bookkeeping and is required.
+func ackDeliveryAs(r *Runner, ctx context.Context, message driver.InboundMessage, handled bool, state *deliveryState) bool {
 	if message.Settle == nil {
 		return false
 	}
 	state.operation = settlementOperationAck
+	settleGuard, settleBase, observed := startSettleObservation(r, ctx, message, SettleAck)
+	if observed {
+		defer settleGuard.abandon()
+	}
 	err := message.Settle.Ack(ctx)
 	state.attempted = true
 	state.settled = err == nil
+	if observed {
+		finishObservationFromError(&settleGuard, settleBase, err)
+	}
 	if r != nil && state.settled && handled {
-		r.mu.Lock()
-		r.successfulDelivery = true
-		r.mu.Unlock()
+		r.report(runnerEvent{kind: runnerEventHandledDelivery})
+	}
+	if state.settled {
+		reportPendingAfterAck(r, ctx, message, state)
 	}
 	return state.settled
 }
 
-func nackDelivery(r *Runner, ctx context.Context, message driver.InboundMessage, options driver.NackOptions, states ...*deliveryState) error {
-	state := stateFor(states)
+// nackDelivery negatively acknowledges the delivery, recording the operation
+// and its options on state so a deferred retry repeats exactly this call. state
+// is required.
+func nackDelivery(r *Runner, ctx context.Context, message driver.InboundMessage, options driver.NackOptions, state *deliveryState) error {
 	if message.Settle == nil {
 		return errors.New("f1: delivered message has no settler")
 	}
 	state.operation = settlementOperationNack
 	state.nackOptions = options
+	settleGuard, settleBase, observed := startSettleObservation(r, ctx, message, SettleNack)
+	if observed {
+		defer settleGuard.abandon()
+	}
 	err := message.Settle.Nack(ctx, options)
 	state.attempted = true
 	state.settled = err == nil
+	if observed {
+		finishObservationFromError(&settleGuard, settleBase, err)
+	}
+	if state.settled {
+		state.poisonDrop = nil
+		state.discard = Discarded{}
+		state.discardPending = false
+	}
 	return err
 }
 
-func deadLetterAndSettle(r *Runner, ctx context.Context, message driver.InboundMessage, envelope Envelope, reason DeathReason, lastErr error, states ...*deliveryState) bool {
-	state := stateFor(states)
-	if err := deadLetter(r, ctx, message, envelope, reason, lastErr, state.headerMaxBytes); err != nil {
+// successorPoint returns the shared identity for consume-side point events.
+// Callers set only their own fields. topic is the delivery's resolved successor
+// topic, passed in so a failed delivery resolves it once rather than per event.
+// Call it only behind the observer check; it must not run on the nil path.
+func successorPoint(r *Runner, kind ObserverKind, message driver.InboundMessage, envelope Envelope, topic string) PointEvent {
+	enqueuedAt, enqueuedAtSource := observerEnqueueFields(message)
+
+	return PointEvent{
+		Kind:             kind,
+		At:               r.client.options.clock.Now(),
+		Topic:            topic,
+		Subscription:     r.subscription.Name,
+		EventType:        envelope.Type,
+		Priority:         envelope.Priority,
+		Attempt:          successorAttempt(envelope),
+		Destination:      message.Destination,
+		MessageID:        envelope.ID,
+		CorrelationID:    successorCorrelationID(envelope),
+		DeliveryCount:    message.DeliveryCount,
+		EnqueuedAt:       enqueuedAt,
+		EnqueuedAtSource: enqueuedAtSource,
+	}
+}
+
+func deadLetterAndSettle(r *Runner, ctx context.Context, message driver.InboundMessage, envelope Envelope, reason DeathReason, lastErr error, state *deliveryState) bool {
+	// One resolution for every successor decision this delivery makes: the
+	// decided and failed events, the dead-letter destination and the copy the
+	// dead-letter publish names.
+	topic := resolveDeliveryTopic(r, envelope, message)
+	if r.client != nil && r.client.observer != nil {
+		destination := deadLetterDestination(r, topic)
+		event := successorPoint(r, ObserverDeadLetterDecided, message, envelope, topic)
+		event.Reason = reason
+		event.DeadLetterDestination = destination
+		r.client.observeRecord(event)
+	}
+	if err := deadLetter(r, ctx, message, envelope, reason, lastErr, topic, state); err != nil {
+		if r.client != nil && r.client.observer != nil {
+			destination := deadLetterDestination(r, topic)
+			event := successorPoint(r, ObserverDeadLetterFailed, message, envelope, topic)
+			event.ErrorClass = errorClassOf(err)
+			event.Reason = reason
+			event.DeadLetterDestination = destination
+			r.client.observeRecord(event)
+		}
 		switch {
 		case reason == ReasonPoison && isMissingDeadLetterRoute(err):
 			state.poisonDrop = &poisonDropReport{
 				envelope:    envelope,
+				topic:       topic,
 				reason:      reason,
 				headline:    "poison message dropped",
 				description: "no dead-letter route available",
@@ -1818,6 +2558,7 @@ func deadLetterAndSettle(r *Runner, ctx context.Context, message driver.InboundM
 			dropped := successorDropDescription(reason, err)
 			state.poisonDrop = &poisonDropReport{
 				envelope:    envelope,
+				topic:       topic,
 				reason:      reason,
 				headline:    "message dropped",
 				description: dropped,
@@ -1825,15 +2566,10 @@ func deadLetterAndSettle(r *Runner, ctx context.Context, message driver.InboundM
 				cause:       err,
 			}
 		default:
-			failSuccessorHandoff(r, runnerSettlementContext(r, ctx), "dead_letter", eventFromDelivery(r, message, envelope, state.headerMaxBytes), err)
+			failSuccessorHandoff(r, runnerSettlementContext(r, ctx), "dead_letter", eventFromDelivery(r, message, envelope), err)
 			return false
 		}
-		sctx := runnerSettlementContext(r, ctx)
-		settled := ackDeliveryAs(r, sctx, message, true, state)
-		if settled {
-			reportPendingPoisonDrop(r, sctx, message, state)
-		}
-		return settled
+		return ackDeliveryAs(r, runnerSettlementContext(r, ctx), message, true, state)
 	}
 	return ackDeliveryAs(r, runnerSettlementContext(r, ctx), message, false, state)
 }
@@ -1876,51 +2612,91 @@ func successorDropDescription(reason DeathReason, err error) string {
 	return fmt.Sprintf("%s (death reason %s)", shape, reason)
 }
 
-func reportPoisonDrop(r *Runner, ctx context.Context, message driver.InboundMessage, report poisonDropReport, headerMaxBytes int) {
+func reportPoisonDrop(r *Runner, ctx context.Context, message driver.InboundMessage, report poisonDropReport) {
+	if r.client != nil && r.client.observer != nil {
+		event := successorPoint(r, ObserverPoisonRejected, message, report.envelope, report.topic)
+		event.ErrorClass = deathReasonClass(report.reason)
+		event.Reason = report.reason
+		r.client.observeRecord(event)
+	}
 	dropErr := fmt.Errorf("f1: %s: event_id=%q destination=%q attempt=%d: %s: %w", report.headline, report.envelope.ID, message.Destination, report.envelope.Attempt, report.description, report.cause)
 	if r.client.options.errorHandler == nil {
-		lastResortRunnerLogger(r).Error("f1 "+report.headline+"; "+report.logMessage,
-			"event_id", report.envelope.ID,
-			"destination", message.Destination,
-			"attempt", report.envelope.Attempt,
-			"reason", report.reason,
-			"error", report.cause,
-		)
+		lastResortRunnerLogger(r).LogAttrs(ctx, slog.LevelError, "f1 "+report.headline+"; "+report.logMessage,
+			slog.String("event_id", report.envelope.ID),
+			slog.String("destination", message.Destination),
+			slog.Int("attempt", report.envelope.Attempt),
+			slog.String("reason", report.reason.String()),
+			slog.Any("error", report.cause))
 		return
 	}
-	runnerNotifyError(r, ctx, eventFromDelivery(r, message, report.envelope, headerMaxBytes), dropErr)
+	runnerNotifyError(r, ctx, eventFromDelivery(r, message, report.envelope), dropErr)
 }
 
-func reportPendingPoisonDrop(r *Runner, ctx context.Context, message driver.InboundMessage, state *deliveryState) {
-	if state == nil || state.poisonDrop == nil {
+func reportPendingAfterAck(r *Runner, ctx context.Context, message driver.InboundMessage, state *deliveryState) {
+	if state == nil {
 		return
 	}
-	report := *state.poisonDrop
+	poison := state.poisonDrop
+	discard, discardPending := state.discard, state.discardPending
+	// Consume intent before scheduling callbacks; subsequent settlement cleanup
+	// must not report the same delivery a second time.
 	state.poisonDrop = nil
-	reportPoisonDrop(r, ctx, message, report, state.headerMaxBytes)
+	state.discard = Discarded{}
+	state.discardPending = false
+	if poison != nil {
+		reportPoisonDrop(r, ctx, message, *poison)
+	}
+	if discardPending {
+		runnerNotifyDiscarded(r, ctx, discard)
+	}
 }
 
 // deadLetter republishes message to its dead-letter destination, carrying
-// the already-received body forward unchanged. It deliberately does not
-// apply codec.maxBodyBytes: that limit is a caller-facing guardrail
-// enforced only on a publish the application originated (publisher.go). A
-// body reaching this function was already accepted onto the broker once;
-// rejecting the same bytes here on their way to the dead-letter destination
-// would turn a successful delivery into a silent message-loss path instead
-// of the visible one dead-lettering exists to provide.
-func deadLetter(r *Runner, ctx context.Context, message driver.InboundMessage, envelope Envelope, reason DeathReason, lastErr error, headerMaxBytes int) error {
+// the already-received body forward unchanged. topic is the delivery's
+// resolved successor topic, so this path never derives it again. It
+// deliberately does not apply codec.maxBodyBytes: that limit is a
+// caller-facing guardrail enforced only on a publish the application
+// originated (publisher.go). A body reaching this function was already
+// accepted onto the broker once; rejecting the same bytes here on their way to
+// the dead-letter destination would turn a successful delivery into a silent
+// message-loss path instead of the visible one dead-lettering exists to
+// provide.
+func deadLetter(r *Runner, ctx context.Context, message driver.InboundMessage, envelope Envelope, reason DeathReason, lastErr error, topic string, state *deliveryState) error {
+	headerMaxBytes := 0
+	if state != nil {
+		headerMaxBytes = state.headerMaxBytes
+	}
 	if reason == ReasonDecode && envelope.ID == "" {
 		// Preserve the raw headers when the envelope itself could not be decoded.
 		headers := inboundHeaders(message.Headers)
 		for key := range headers {
-			if strings.HasPrefix(key, "f1detail") {
+			if strings.HasPrefix(key, wire.DetailPrefix) {
 				delete(headers, key)
 			}
 		}
-		destination := deadLetterDestination(r, envelope, message)
+		destination := deadLetterDestination(r, topic)
+		// The raw-header branch carries headers as received, so it gets the
+		// pair but no injection.
+		_, publishGuard, publishBase, observed := startSuccessorPublish(r, ctx, PublishRouteDeadLetter, topic, destination, envelope.ID, successorCorrelationID(envelope), envelope.Type, envelope.Priority, successorAttempt(envelope), state)
+		if observed {
+			defer publishGuard.abandon()
+		}
 		setDeathHeaders(headers, reason, lastErr, r.client.options.clock.Now().UTC(), message.Destination)
+		if err := capMalformedDeathHeaders(headers, headerMaxBytes); err != nil {
+			if observed {
+				finishObservationFromError(&publishGuard, publishBase, err)
+			}
+			return fmt.Errorf("%w: %w", errSuccessorCopyUnencodable, err)
+		}
 		if err := publishSuccessor(r, runnerSettlementContext(r, ctx), driver.OutboundMessage{Destination: destination, Key: append([]byte(nil), message.Key...), Headers: headerSlice(headers), Body: append([]byte(nil), message.Body...)}); err != nil {
+			if observed {
+				finishObservationFromError(&publishGuard, publishBase, err)
+			}
 			return err
+		}
+		if observed {
+			finishObservationFromError(&publishGuard, publishBase, nil)
+			observeDeadLetterPublished(r, message, envelope, reason, destination, topic)
 		}
 		runnerNotifyDeadLetter(r, runnerSettlementContext(r, ctx), DeadLettered{Envelope: Envelope{}, Body: append([]byte(nil), message.Body...), Reason: reason, Attempt: 0, LastErr: lastErr, Destination: destination})
 		return nil
@@ -1943,21 +2719,37 @@ func deadLetter(r *Runner, ctx context.Context, message driver.InboundMessage, e
 			if len(logged) > maxLoggedDeathDetailKeys {
 				logged = logged[:maxLoggedDeathDetailKeys]
 			}
-			lastResortRunnerLogger(r).Warn("f1 death details discarded",
-				"subscription", r.subscription.Name,
-				"event_id", envelope.ID,
-				"keys", logged,
-				"count", len(discarded),
-			)
+			lastResortRunnerLogger(r).LogAttrs(ctx, slog.LevelWarn, "f1 death details discarded",
+				slog.String("subscription", r.subscription.Name),
+				slog.String("event_id", envelope.ID),
+				slog.Any("keys", logged),
+				slog.Int("count", len(discarded)))
 		}
 	} else {
 		death.DeathDetails = nil
 	}
 	now := r.client.options.clock.Now().UTC()
 	death.DeathTime = &now
-	destination := deadLetterDestination(r, death, message)
+	destination := deadLetterDestination(r, topic)
+	messageID := death.ID
+	correlationID := successorCorrelationID(death)
+	inboundAttempt := successorAttempt(envelope)
+	injectCtx, publishGuard, publishBase, observed := startSuccessorPublish(r, ctx, PublishRouteDeadLetter, topic, destination, messageID, correlationID, death.Type, death.Priority, inboundAttempt, state)
+	if observed {
+		defer publishGuard.abandon()
+	}
+	if r.client != nil && r.client.traceInjector != nil && observed {
+		traceParent, traceState := r.client.injectTrace(injectCtx)
+		if traceParent != "" {
+			death.TraceParent = traceParent
+			death.TraceState = traceState
+		}
+	}
 	encoded, err := death.EncodeHeaders(headerMaxBytes)
 	if err != nil {
+		if observed {
+			finishObservationFromError(&publishGuard, publishBase, err)
+		}
 		// Marked rather than returned bare: the caller decides what to do with
 		// an unencodable copy, and it must not have to match on the text to
 		// tell this apart from a destination refusing the copy.
@@ -1969,10 +2761,54 @@ func deadLetter(r *Runner, ctx context.Context, message driver.InboundMessage, e
 	}
 	sort.Slice(out.Headers, func(i, j int) bool { return out.Headers[i].Key < out.Headers[j].Key })
 	if err := publishSuccessor(r, runnerSettlementContext(r, ctx), out); err != nil {
+		if observed {
+			finishObservationFromError(&publishGuard, publishBase, err)
+		}
 		return err
+	}
+	if observed {
+		finishObservationFromError(&publishGuard, publishBase, nil)
+		observeDeadLetterPublished(r, message, envelope, reason, destination, topic)
 	}
 	runnerNotifyDeadLetter(r, runnerSettlementContext(r, ctx), DeadLettered{Envelope: death, Body: append([]byte(nil), message.Body...), Reason: reason, Attempt: death.Attempt, LastErr: lastErr, Destination: destination})
 	return nil
+}
+
+func capMalformedDeathHeaders(headers map[string]string, maxHeaderBytes int) error {
+	limit := CoreMaxHeaderBytes
+	if maxHeaderBytes > 0 && maxHeaderBytes < limit {
+		limit = maxHeaderBytes
+	}
+	if headerBytes(headers) <= limit {
+		return nil
+	}
+	shrinkDeathErrorTo(headers, limit, deathErrorFloor)
+	if headerBytes(headers) <= limit {
+		return nil
+	}
+	for key := range headers {
+		if !knownHeaders[key] {
+			delete(headers, key)
+		}
+	}
+	shrinkDeathError(headers, limit)
+	if headerBytes(headers) > limit {
+		return fmt.Errorf("f1: malformed envelope dead-letter headers exceed cap: %w", ErrEnvelopeTooLarge)
+	}
+	return nil
+}
+
+// observeDeadLetterPublished emits dead letter published on a confirmed
+// successor publish. topic is the delivery's resolved successor topic. Callers
+// check for nil before building the event.
+func observeDeadLetterPublished(r *Runner, message driver.InboundMessage, envelope Envelope, reason DeathReason, destination, topic string) {
+	if r == nil || r.client == nil || r.client.observer == nil {
+		return
+	}
+	event := successorPoint(r, ObserverDeadLetterPublished, message, envelope, topic)
+	event.Reason = reason
+	event.DeadLetterDestination = destination
+	r.client.observeRecord(event)
 }
 
 // --- Successor publishing ---
@@ -2003,7 +2839,7 @@ func publishSuccessor(r *Runner, ctx context.Context, messages ...driver.Outboun
 			}
 			break
 		}
-		err := publishMessages(r.client, ctx, true, messages...)
+		err := publishMessages(r.client, ctx, messages...)
 		if err == nil {
 			return nil
 		}
@@ -2022,11 +2858,34 @@ func publishSuccessor(r *Runner, ctx context.Context, messages ...driver.Outboun
 // for handing to code outside the normal handler dispatch path (such as the
 // error handler) that still needs to identify which message an async
 // failure is about.
-func eventFromDelivery(r *Runner, message driver.InboundMessage, envelope Envelope, headerMaxBytes int) *Event {
+func eventFromDelivery(r *Runner, message driver.InboundMessage, envelope Envelope) *Event {
 	eventCodec, _ := r.client.codecForContentType(envelope.DataContentType)
 	eventEnvelope := envelope
 	eventEnvelope.MaxAttempts = effectiveMaxAttempts(envelope.MaxAttempts, r.subscription.Retry.MaxAttempts)
-	return &Event{envelope: eventEnvelope, raw: append([]byte(nil), message.Body...), codec: eventCodec, headers: inboundHeaders(message.Headers), headerMaxBytes: headerMaxBytes}
+	return &Event{envelope: eventEnvelope, raw: append([]byte(nil), message.Body...), codec: eventCodec, headers: inboundHeaders(message.Headers)}
+}
+
+// successorHandoffError reports a successor copy the core could not publish
+// within its bounded republish budget. It is the core's own failure, not a
+// driver operation: op names the core operation ("retry" or "dead_letter"), and
+// the error claims no driver op that no driver performed. The cause stays
+// reachable through errors.Is, errors.As and driver.Classify, so a classified
+// cause keeps its kind and an unclassified one is reported as unclassified
+// instead of being presented as a classified transient driver failure.
+type successorHandoffError struct {
+	op    string
+	cause error
+}
+
+// Error returns the handoff failure in one line.
+func (e *successorHandoffError) Error() string {
+	return fmt.Sprintf("f1: %s successor handoff failed: %v", e.op, e.cause)
+}
+
+// Unwrap returns the cause the handoff carried. It is what keeps the cause's
+// own classification readable on this error.
+func (e *successorHandoffError) Unwrap() error {
+	return e.cause
 }
 
 // failSuccessorHandoff runs once a retry or dead-letter successor could not
@@ -2037,19 +2896,113 @@ func eventFromDelivery(r *Runner, message driver.InboundMessage, envelope Envelo
 // delivery unsettled, closes the consumer, and lets the broker redeliver the
 // message, the same mechanism relied on for a crash.
 func failSuccessorHandoff(r *Runner, ctx context.Context, op string, event *Event, cause error) {
-	kind, _ := driver.Classify(cause)
-	classified := &driver.Error{Driver: r.client.options.driver.Name(), Op: op, K: kind, Err: cause}
-	setRunnerError(r, classified)
-	runnerNotifyError(r, ctx, event, classified)
+	failed := &successorHandoffError{op: op, cause: cause}
+	reportRunnerError(r, failed)
+	runnerNotifyError(r, ctx, event, failed)
 	if err := releaseRunnerConsumer(r, ctx); err != nil {
 		if r.client.options.errorHandler == nil {
-			lastResortRunnerLogger(r).Error("f1 failed to release consumer after a successor publish exhausted its republish budget", "op", op, "cause", classified, "release_error", err)
+			lastResortRunnerLogger(r).LogAttrs(ctx, slog.LevelError, "f1 failed to release consumer after a successor publish exhausted its republish budget",
+				slog.String("op", op),
+				slog.Any("cause", failed),
+				slog.Any("release_error", err))
+		}
+		// A released consumer closes its stream, which ends the generation.
+		// This one is still open and still holds the delivery, so the
+		// generation is ended here instead: the runner stops with the hand-off
+		// failure it would have stopped with, and the client keeps the consumer
+		// to release again.
+		r.mu.Lock()
+		cancel := r.cancel
+		r.mu.Unlock()
+		if cancel != nil {
+			cancel()
 		}
 		return
 	}
 	if r.client.options.errorHandler == nil {
-		lastResortRunnerLogger(r).Error("f1 successor publish exhausted its republish budget; consumer released", "op", op, "cause", classified)
+		lastResortRunnerLogger(r).LogAttrs(ctx, slog.LevelError, "f1 successor publish exhausted its republish budget; consumer released",
+			slog.String("op", op),
+			slog.Any("cause", failed))
 	}
+}
+
+// successorObserveCtx returns the context the successor publish start uses:
+// the handed-off process context when set, else the context at hand. Callers
+// pass the result to observeStart only; settlement, the error handler and the
+// dead-letter hook keep the original context.
+func successorObserveCtx(ctx context.Context, state *deliveryState) context.Context {
+	if state != nil && state.processCtx != nil {
+		return state.processCtx
+	}
+	return ctx
+}
+
+// resolveDeliveryTopic returns the logical topic a delivery's successors belong
+// to: the family the delivery was consumed from, which the declared
+// destinations own, so a copy stays inside the family the message came from.
+// Outside every declared family it falls back to the derivation from the event
+// type. Resolving it reads the runner's destination table and, on a miss, the
+// client's capabilities plus a naming loop per configured topic, so a failed
+// delivery resolves it once and hands the result to every successor decision
+// instead of paying for it once per decision.
+func resolveDeliveryTopic(r *Runner, envelope Envelope, message driver.InboundMessage) string {
+	if family, ok := consumingTopicFamily(r, message.Destination); ok {
+		return family
+	}
+	return topicFor(envelope.Type)
+}
+
+// successorCorrelationID returns the correlation ID for successor events,
+// falling back to the message ID like the process start does.
+func successorCorrelationID(envelope Envelope) string {
+	if envelope.CorrelationID != "" {
+		return envelope.CorrelationID
+	}
+	return envelope.ID
+}
+
+// successorAttempt normalizes the inbound attempt for successor events.
+func successorAttempt(envelope Envelope) int {
+	if envelope.Attempt < 1 {
+		return 1
+	}
+	return envelope.Attempt
+}
+
+// startSuccessorPublish starts one publish pair for a successor handoff. It
+// returns the injector context, the guard for its finish, the finish identity
+// and whether observation is on. A nil observer starts nothing.
+func startSuccessorPublish(r *Runner, ctx context.Context, route PublishRoute, topic, destination, messageID, correlationID, eventType string, priority Priority, attempt int, state *deliveryState) (context.Context, observerFinishGuard, FinishEvent, bool) {
+	if r == nil || r.client == nil || r.client.observer == nil {
+		return ctx, observerFinishGuard{}, FinishEvent{}, false
+	}
+	start := StartEvent{
+		Kind:          ObserverPublish,
+		At:            r.client.options.clock.Now(),
+		Topic:         topic,
+		EventType:     eventType,
+		Priority:      priority,
+		Attempt:       attempt,
+		Destination:   destination,
+		MessageID:     messageID,
+		CorrelationID: correlationID,
+		Route:         route,
+		BatchSize:     1,
+	}
+	observeCtx := successorObserveCtx(ctx, state)
+	nextCtx, token := r.client.observeStart(observeCtx, start)
+	guard := r.client.newObserverGuard(ObserverPublish, token)
+	base := FinishEvent{
+		Topic:         topic,
+		EventType:     eventType,
+		Priority:      priority,
+		PriorityKnown: true,
+		Attempt:       attempt,
+		Destination:   destination,
+		MessageID:     messageID,
+		CorrelationID: correlationID,
+	}
+	return nextCtx, guard, base, true
 }
 
 // retryAndSettle republishes message to its retry destination, carrying the
@@ -2059,8 +3012,7 @@ func failSuccessorHandoff(r *Runner, ctx context.Context, op string, event *Even
 // copy that cannot be encoded, or that the broker refuses as too large, is
 // handed to the dead-letter path rather than settled: a copy the message
 // itself makes unacceptable fails the same way on every redelivery.
-func retryAndSettle(r *Runner, ctx context.Context, message driver.InboundMessage, envelope Envelope, lastErr error, states ...*deliveryState) bool {
-	state := stateFor(states)
+func retryAndSettle(r *Runner, ctx context.Context, message driver.InboundMessage, envelope Envelope, lastErr error, state *deliveryState) bool {
 	copyEnvelope := envelope
 	if copyEnvelope.OriginalDest == "" {
 		copyEnvelope.OriginalDest = message.Destination
@@ -2071,38 +3023,52 @@ func retryAndSettle(r *Runner, ctx context.Context, message driver.InboundMessag
 	copyEnvelope.DeathDetails = nil
 	copyEnvelope.Attempt++
 	copyEnvelope.MaxAttempts = effectiveMaxAttempts(copyEnvelope.MaxAttempts, r.subscription.Retry.MaxAttempts)
-	retryConfig := retry.Config{
-		MaxAttempts:     r.subscription.Retry.MaxAttempts,
-		InitialInterval: r.subscription.Retry.InitialInterval,
-		Multiplier:      r.subscription.Retry.Multiplier,
-		MaxInterval:     r.subscription.Retry.MaxInterval,
-		Tiers:           r.subscription.Retry.Tiers,
-	}
+	retryConfig := r.subscription.Retry.ladder()
 	tiers := retryConfig.TierCount()
 	if tiers == 0 {
 		return deadLetterAndSettle(r, ctx, message, envelope, ReasonMaxAttempts, lastErr, state)
 	}
 	tier := retry.ResolveTier(retryConfig, envelope.Attempt)
 	delay := retryConfig.DelayFor(tier)
-	if requested, ok := RetryDelay(lastErr); ok {
-		resolvedTier, resolvedDelay := retry.ResolveRetryAfter(retryConfig, requested)
-		tier, delay = resolvedTier, resolvedDelay
-	}
 	now := r.client.options.clock.Now().UTC()
 	due := now.Add(delay)
 	copyEnvelope.DueTime = &due
+	// The destination is computed once whether or not an observer is set, so
+	// the nil path adds no allocation and the start carries the same value
+	// the copy is published to.
+	topic := resolveDeliveryTopic(r, envelope, message)
+	destination := retryDestination(r, topic, copyEnvelope.Priority, tier)
+	messageID := copyEnvelope.ID
+	correlationID := successorCorrelationID(copyEnvelope)
+	inboundAttempt := successorAttempt(envelope)
+	injectCtx, publishGuard, publishBase, observed := startSuccessorPublish(r, ctx, PublishRouteRetry, topic, destination, messageID, correlationID, copyEnvelope.Type, copyEnvelope.Priority, inboundAttempt, state)
+	if observed {
+		defer publishGuard.abandon()
+	}
+	if r.client != nil && r.client.traceInjector != nil && observed {
+		traceParent, traceState := r.client.injectTrace(injectCtx)
+		if traceParent != "" {
+			copyEnvelope.TraceParent = traceParent
+			copyEnvelope.TraceState = traceState
+		}
+	}
 	encoded, err := copyEnvelope.EncodeHeaders(state.headerMaxBytes)
 	if err != nil {
+		if observed {
+			finishObservationFromError(&publishGuard, publishBase, err)
+		}
 		return deadLetterAndSettle(r, ctx, message, envelope, ReasonTerminal,
 			errors.Join(lastErr, fmt.Errorf("f1: retry copy cannot be encoded: %w", err)), state)
 	}
-	destination := retryDestination(r, copyEnvelope, message, tier)
-	out := driver.OutboundMessage{Destination: destination, Key: append([]byte(nil), message.Key...), Body: append([]byte(nil), message.Body...), DelayUntil: due}
+	out := driver.OutboundMessage{Destination: destination, Key: append([]byte(nil), message.Key...), Body: append([]byte(nil), message.Body...)}
 	for key, value := range encoded {
 		out.Headers = append(out.Headers, driver.Header{Key: key, Value: []byte(value)})
 	}
 	sort.Slice(out.Headers, func(i, j int) bool { return out.Headers[i].Key < out.Headers[j].Key })
 	if err := publishSuccessor(r, runnerSettlementContext(r, ctx), out); err != nil {
+		if observed {
+			finishObservationFromError(&publishGuard, publishBase, err)
+		}
 		if successorNeverPublishable(err) {
 			// The copy is unacceptable on its own terms, so it would be refused
 			// again on every redelivery: hand the message to the dead-letter
@@ -2110,41 +3076,103 @@ func retryAndSettle(r *Runner, ctx context.Context, message driver.InboundMessag
 			return deadLetterAndSettle(r, ctx, message, envelope, ReasonTerminal,
 				errors.Join(lastErr, fmt.Errorf("f1: retry copy cannot be published: %w", err)), state)
 		}
-		failSuccessorHandoff(r, runnerSettlementContext(r, ctx), "retry", eventFromDelivery(r, message, envelope, state.headerMaxBytes), err)
+		failSuccessorHandoff(r, runnerSettlementContext(r, ctx), "retry", eventFromDelivery(r, message, envelope), err)
 		return false
+	}
+	if observed {
+		finishObservationFromError(&publishGuard, publishBase, nil)
+		event := successorPoint(r, ObserverRetryScheduled, message, envelope, topic)
+		event.ErrorClass = ErrorClassRetryable
+		event.NextAttempt = copyEnvelope.Attempt
+		event.MaxAttempts = copyEnvelope.MaxAttempts
+		event.Backoff = delay
+		r.client.observeRecord(event)
 	}
 	return ackDeliveryAs(r, runnerSettlementContext(r, ctx), message, false, state)
 }
 
 // A Stop refusal for outstanding messages is a redelivery case, not a retry
-// case: Release gives those deliveries back to the broker. Keep the refusal
-// joined with the Release result rather than replacing it, so the outstanding
-// count and any teardown failure reach the caller.
+// case: Release gives those deliveries back to the broker. Every other Stop
+// failure releases too, because a driver whose Stop did not finish keeps the
+// consumer registered until it receives Release, and nothing calls it after
+// this terminal drain. A Stop timeout or cancellation releases on a fresh,
+// bounded context. Join the Stop error with any Release error so teardown
+// failures reach the caller.
 func stopRunnerConsumer(r *Runner, ctx context.Context) error {
 	r.mu.Lock()
 	consumer := r.consumer
+	epoch := r.consumerEpoch
 	r.mu.Unlock()
 	if consumer == nil {
 		return nil
 	}
-	if err := consumer.Stop(ctx); err != nil {
-		if !errors.Is(err, driver.ErrResourcesOutstanding) {
-			return err
-		}
-		return errors.Join(err, consumer.Release(ctx))
+	var phaseClock clock.Clock
+	closeTimeout := time.Duration(0)
+	if r.client != nil {
+		phaseClock = r.client.options.clock
+		closeTimeout = r.client.config.Lifecycle.CloseTimeout
 	}
-	return nil
+	stopErr := runWithClockTimeout(ctx, phaseClock, closeTimeout, "close", consumer.Stop)
+	if stopErr == nil {
+		return nil
+	}
+	releaseCtx := ctx
+	if errors.Is(stopErr, driver.ErrDrainTimeout) ||
+		errors.Is(stopErr, context.DeadlineExceeded) ||
+		errors.Is(stopErr, context.Canceled) {
+		releaseCtx = context.WithoutCancel(ctx)
+	}
+	releaseErr := runWithClockTimeout(releaseCtx, phaseClock, closeTimeout, "close", consumer.Release)
+	if releaseErr != nil && !errors.Is(releaseErr, driver.ErrUnsupported) && r.client != nil {
+		// The driver still has this consumer registered, so the connection it
+		// was opened on refuses to close while it is. Keep it, with that
+		// connection, for the release a later close owes it.
+		r.client.keepUnreleasedConsumer(consumer, epoch)
+	}
+	return errors.Join(stopErr, releaseErr)
 }
 
+// releaseUnadmittedConsumer releases a consumer that never became the
+// runner's, bounded by Lifecycle.CloseTimeout. Like releaseRunnerConsumer, a
+// release that fails keeps the consumer on the client with the epoch it was
+// opened on, because the connection carrying it refuses to close until a
+// later release succeeds.
+func releaseUnadmittedConsumer(r *Runner, ctx context.Context, consumer driver.Consumer, epoch uint64) error {
+	err := runWithClockTimeout(ctx, r.client.options.clock, r.client.config.Lifecycle.CloseTimeout, "consumer release", consumer.Release)
+	if err != nil && !errors.Is(err, driver.ErrUnsupported) {
+		r.client.keepUnreleasedConsumer(consumer, epoch)
+	}
+	return err
+}
+
+// releaseRunnerConsumer releases the runner's consumer, bounded by
+// Lifecycle.CloseTimeout the way stopRunnerConsumer is. It runs on the
+// reconnect and lane-repair paths, which bound the work they own by their own
+// context, so a driver Release that ignores that context must not hold a
+// reconnect open behind it.
+//
+// A release that fails keeps the consumer on the client with the epoch it was
+// opened on: the driver still has it registered, so the connection carrying it
+// refuses to close until a later release succeeds.
 func releaseRunnerConsumer(r *Runner, ctx context.Context) error {
 	r.mu.Lock()
 	consumer := r.consumer
+	epoch := r.consumerEpoch
 	r.mu.Unlock()
 	if consumer == nil {
 		return nil
 	}
-	err := consumer.Release(ctx)
+	var phaseClock clock.Clock
+	closeTimeout := time.Duration(0)
+	if r.client != nil {
+		phaseClock = r.client.options.clock
+		closeTimeout = r.client.config.Lifecycle.CloseTimeout
+	}
+	err := runWithClockTimeout(ctx, phaseClock, closeTimeout, "close", consumer.Release)
 	if err != nil && !errors.Is(err, driver.ErrUnsupported) {
+		if r.client != nil {
+			r.client.keepUnreleasedConsumer(consumer, epoch)
+		}
 		return err
 	}
 	// There is no safe fallback: this path has an unsettled delivery, so
@@ -2194,10 +3222,10 @@ func headerSlice(headers map[string]string) []driver.Header {
 }
 
 func setDeathHeaders(headers map[string]string, reason DeathReason, err error, at time.Time, original string) {
-	headers["f1deathreason"] = reason.String()
-	headers["f1deatherror"] = truncateError(err)
-	headers["f1deathtime"] = at.Format(time.RFC3339Nano)
-	headers["f1originaldest"] = original
+	headers[wire.DeathReason] = reason.String()
+	headers[wire.DeathError] = truncateError(err)
+	headers[wire.DeathTime] = at.Format(time.RFC3339Nano)
+	headers[wire.OriginalDest] = original
 }
 
 // truncateError returns error text capped at deathErrorCap bytes. If the cap falls inside
@@ -2218,17 +3246,28 @@ func truncateError(err error) string {
 	return value
 }
 
-func retryDestinationTierMap(source string, sub Subscription) map[string]int {
-	result := make(map[string]int)
+func buildDestinationMetadataMap(effective driver.Capabilities, source string, sub Subscription) map[string]destinationMetadata {
+	result := make(map[string]destinationMetadata, len(sub.Topics)*len(sub.Priorities)*(1+sub.Retry.tierCount()))
+	forEachDestination(effective, source, sub, func(logical string, priority Priority, tier int, destination string) {
+		result[destination] = destinationMetadata{topic: logical, priority: priority, tier: tier}
+	})
+	return result
+}
+
+// forEachDestination calls fn once for every destination sub consumes from:
+// for each topic and priority, the main destination as tier 0 and then each
+// retry tier's destination. It is the one walk of that set, so the lane plan,
+// the destination metadata and the consumer's destination list cannot drift.
+func forEachDestination(effective driver.Capabilities, source string, sub Subscription, fn func(topic string, priority Priority, tier int, destination string)) {
 	for _, topic := range sub.Topics {
 		logical := topicFor(topic)
 		for _, priority := range sub.Priorities {
-			for tier := 1; tier <= retryTiers(sub.Retry); tier++ {
-				result[retryDestinationFor(source, logical, priority, tier, sub.Name)] = tier
+			fn(logical, priority, 0, consumeDestination(effective, source, logical, priority, sub.Name))
+			for tier := 1; tier <= sub.Retry.tierCount(); tier++ {
+				fn(logical, priority, tier, retryDestinationFor(source, logical, priority, tier, sub.Name))
 			}
 		}
 	}
-	return result
 }
 
 // destinationDelays collects the delay each destination in spec declares, keyed
@@ -2249,15 +3288,9 @@ func destinationDelays(spec driver.TopologySpec) map[string]time.Duration {
 
 func subscriptionDestinations(effective driver.Capabilities, source string, sub Subscription) []string {
 	set := make(map[string]struct{})
-	for _, topic := range sub.Topics {
-		logical := topicFor(topic)
-		for _, priority := range sub.Priorities {
-			set[consumeDestination(effective, source, logical, priority, sub.Name)] = struct{}{}
-			for tier := 1; tier <= retryTiers(sub.Retry); tier++ {
-				set[retryDestinationFor(source, logical, priority, tier, sub.Name)] = struct{}{}
-			}
-		}
-	}
+	forEachDestination(effective, source, sub, func(_ string, _ Priority, _ int, destination string) {
+		set[destination] = struct{}{}
+	})
 	result := make([]string, 0, len(set))
 	for name := range set {
 		result = append(result, name)
@@ -2327,7 +3360,7 @@ func subscriptionTopologySpecs(effective driver.Capabilities, source string, sub
 				addExchange(driver.ExchangeSpec{Name: entryPoint, Kind: "fanout", Durable: true})
 				result.Bindings = append(result.Bindings, driver.BindingSpec{Source: entryPoint, Destination: main})
 			}
-			for tier := 1; tier <= retryTiers(sub.Retry); tier++ {
+			for tier := 1; tier <= sub.Retry.tierCount(); tier++ {
 				add(driver.DestinationSpec{Name: retryDestinationFor(source, logical, priority, tier, sub.Name), Kind: driver.DestRetry, Durable: true, Delay: sub.Retry.DelayFor(tier), DeadLetter: route, DeliveryLimit: limit})
 			}
 		}
@@ -2350,23 +3383,21 @@ func subscriptionTopologySpecs(effective driver.Capabilities, source string, sub
 	return result
 }
 
-func deadLetterDestination(r *Runner, envelope Envelope, message driver.InboundMessage) string {
-	topic, ok := consumingTopicFamily(r, envelope.Priority, message.Destination)
-	if !ok {
-		topic = topicFor(envelope.Type)
-	}
+// deadLetterDestination returns the dead-letter destination for a delivery's
+// resolved topic. A delivery whose topic is empty, typically one whose event
+// type names no family because its envelope could not be decoded, still needs
+// a stable destination, so the empty topic becomes "unknown".
+func deadLetterDestination(r *Runner, topic string) string {
 	if topic == "" {
 		topic = "unknown"
 	}
 	return deadLetterDestinationFor(r.client.source, topic, r.subscription.Name)
 }
 
-func retryDestination(r *Runner, envelope Envelope, message driver.InboundMessage, tier int) string {
-	topic, ok := consumingTopicFamily(r, envelope.Priority, message.Destination)
-	if !ok {
-		topic = topicFor(envelope.Type)
-	}
-	return retryDestinationFor(r.client.source, topic, envelope.Priority, tier, r.subscription.Name)
+// retryDestination returns the retry destination for a delivery's resolved
+// topic at one tier.
+func retryDestination(r *Runner, topic string, priority Priority, tier int) string {
+	return retryDestinationFor(r.client.source, topic, priority, tier, r.subscription.Name)
 }
 
 func deadLetterDestinationFor(source, topic, subscription string) string {

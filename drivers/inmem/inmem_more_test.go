@@ -33,7 +33,7 @@ func TestEnsureTopologyIgnoresBindings(t *testing.T) {
 		Bindings:     []driver.BindingSpec{{Source: "orders.exchange", Destination: "orders"}},
 	})
 	require.NoError(t, err)
-	producer, err := conn.Producer(ctx, driver.ProducerConfig{RequireDurableAck: true})
+	producer, err := conn.Producer(ctx, driver.ProducerConfig{})
 	require.NoError(t, err)
 	consumer, err := conn.Consumer(ctx, driver.ConsumerConfig{Destinations: []string{"orders"}})
 	require.NoError(t, err)
@@ -51,7 +51,7 @@ func openTest(t *testing.T, clk clock.Clock, specs ...driver.DestinationSpec) (c
 	require.NoError(t, err)
 	_, err = conn.Admin().EnsureTopology(ctx, driver.TopologySpec{Destinations: specs})
 	require.NoError(t, err)
-	producer, err := conn.Producer(ctx, driver.ProducerConfig{RequireDurableAck: true})
+	producer, err := conn.Producer(ctx, driver.ProducerConfig{})
 	require.NoError(t, err)
 	return ctx, conn, producer
 }
@@ -76,33 +76,6 @@ func closeTest(t *testing.T, ctx context.Context, conn driver.Conn, producer dri
 	}
 	require.NoError(t, producer.Close(ctx))
 	require.NoError(t, conn.Close(ctx))
-}
-
-func TestDelayedDispatchOrdersByDueTime(t *testing.T) {
-	start := time.Unix(0, 0)
-	fake := clock.NewFake(start)
-	ctx, conn, producer := openTest(t, fake, driver.DestinationSpec{Name: "delayed-order"})
-	consumer, err := conn.Consumer(ctx, driver.ConsumerConfig{Destinations: []string{"delayed-order"}, Effective: testCaps()})
-	require.NoError(t, err)
-	t.Cleanup(func() {
-		_ = consumer.Stop(ctx)
-		_ = producer.Close(ctx)
-		_ = conn.Close(ctx)
-	})
-
-	require.NoError(t, producer.Publish(ctx,
-		driver.OutboundMessage{Destination: "delayed-order", DelayUntil: start.Add(10 * time.Second), Body: []byte("long")},
-		driver.OutboundMessage{Destination: "delayed-order", DelayUntil: start.Add(time.Second), Body: []byte("short")},
-	))
-	fake.BlockUntil(1)
-	fake.Advance(time.Second)
-	short := receiveTest(t, consumer)
-	require.Equal(t, []byte("short"), short.Body)
-	require.NoError(t, short.Settle.Ack(ctx))
-	fake.Advance(9 * time.Second)
-	long := receiveTest(t, consumer)
-	require.Equal(t, []byte("long"), long.Body)
-	require.NoError(t, long.Settle.Ack(ctx))
 }
 
 func TestDelayedDelivery_WaitsWithoutBurningCPU(t *testing.T) {
@@ -203,8 +176,44 @@ func TestStopRejectsOutstandingUntilSettled(t *testing.T) {
 	require.True(t, classified)
 	require.Equal(t, driver.KindFatal, kind)
 	require.ErrorContains(t, err, "outstanding messages")
+	require.ErrorIs(t, err, driver.ErrResourcesOutstanding)
 	require.NoError(t, message.Settle.Ack(ctx))
 	closeTest(t, ctx, conn, producer, consumer)
+}
+
+func TestPurgeResetsDispatchForLatestConsumer(t *testing.T) {
+	clk := clock.NewFake(time.Unix(0, 0))
+	ctx, opened, producer := openTest(t, clk, driver.DestinationSpec{Name: "orders"})
+	impl := opened.(*conn)
+	// The pump must not observe the empty queue between Purge and Publish,
+	// which would reset the stale cursor before the replacement reaches it.
+	impl.closeOnce.Do(func() { close(impl.done) })
+	<-impl.pumpDone
+	t.Cleanup(func() {
+		_ = producer.Close(ctx)
+		_ = opened.Close(ctx)
+	})
+	require.NoError(t, producer.Publish(ctx, driver.OutboundMessage{Destination: "orders", Body: []byte("purged")}))
+	consumer, err := opened.Consumer(ctx, driver.ConsumerConfig{
+		Group: "latest", Destinations: []string{"orders"}, StartAt: driver.StartLatest, Prefetch: 1,
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = consumer.Release(ctx) })
+	maintenance, ok := opened.Admin().(driver.Maintenance)
+	require.True(t, ok)
+	purged, err := maintenance.Purge(ctx, "orders")
+	require.NoError(t, err)
+	require.Equal(t, int64(1), purged)
+	clk.Advance(time.Second)
+	require.NoError(t, producer.Publish(ctx, driver.OutboundMessage{
+		Destination: "orders", Body: []byte("new"), Key: []byte("customer"),
+	}))
+	message := receiveTest(t, consumer)
+	require.Equal(t, []byte("new"), message.Body)
+	require.Equal(t, clk.Now(), message.EnqueuedAt)
+	require.Equal(t, driver.EnqueueSourceBroker, message.EnqueuedAtSource)
+	require.Equal(t, []byte("customer"), message.Key)
+	require.NoError(t, message.Settle.Ack(ctx))
 }
 
 func TestPruneGuards(t *testing.T) {

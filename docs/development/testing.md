@@ -14,6 +14,18 @@ The practical default is:
 - use the repository gates in the [Makefile](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/Makefile) before handing off
   a change.
 
+## Formatting
+
+Use `make format` to format Go source with the repository-pinned `gofumpt`
+`v0.9.2`, and `make format-check` to verify that the tree is clean. The
+repository pins `golangci-lint` `v2.12.2`; its bundled `gofumpt` is also
+`v0.9.2`, so the standalone formatter target and `make lint` apply the same
+formatting rules. A `gofumpt` installed on `PATH` is not the repository's
+formatter. Running a newer `gofumpt` from `PATH` once is not always
+idempotent: on some inputs it leaves the tree in a state that neither
+formatter accepts until a second pass. `make format` avoids this by using the
+pinned version.
+
 ```mermaid
 flowchart TB
     PURE[Pure package and internal tests]
@@ -50,7 +62,7 @@ The main pure areas are:
 - [`internal/clock/`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/tree/main/internal/clock) for real and fake time;
 - [`internal/retry/`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/tree/main/internal/retry) for backoff ladders and
   retry sanity checks;
-- [`internal/sched/`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/tree/main/internal/sched) for weighted lanes, aging, and
+- [`internal/sched/`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/tree/main/internal/sched) for weighted lanes, deadline promotion, and
   fairness;
 - [`internal/dispatch/`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/tree/main/internal/dispatch) for worker routing,
   ordered keys, and the in-flight registry; and
@@ -107,6 +119,49 @@ providing deterministic helpers for publishing and observing accepted output.
 It is backed by the in-memory driver and a manually advanced clock; the client
 is cleaned up through `t.Cleanup`.
 
+### Minimal handler test
+
+A handler test can use the normal subscription and runner APIs while the
+in-memory client supplies deterministic delivery:
+
+```go
+func TestOrderHandler(t *testing.T) {
+	client := f1test.NewClient(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	handled := make(chan struct{})
+	runner, err := client.Subscribe(ctx, f1.Subscription{
+		Name:   "orders-worker",
+		Topics: []string{"orders.created"},
+		Handlers: map[string]f1.Handler{
+			"orders.created.v1": f1.HandlerFunc(func(context.Context, *f1.Event) error {
+				close(handled)
+				return nil
+			}),
+		},
+	})
+	require.NoError(t, err)
+
+	runDone := make(chan error, 1)
+	go func() { runDone <- runner.Run(ctx) }()
+	defer func() {
+		cancel()
+		require.NoError(t, <-runDone)
+	}()
+
+	client.Deliver(t, "orders.created.v1", map[string]string{"id": "order-1"})
+	select {
+	case <-handled:
+	case <-time.After(time.Second):
+		t.Fatal("handler did not run")
+	}
+}
+```
+
+The timeout is only a failure bound. For retry tests, wait for the helper's
+publication signal before calling `Advance`, rather than sleeping.
+
 Use it to prove decisions such as:
 
 - a handler succeeds and produces the expected application-visible effect;
@@ -117,18 +172,108 @@ Use it to prove decisions such as:
 - ordered keys, fanout, and handler concurrency have the expected public
   behavior.
 
-The helper's [`Deliver`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/f1test/f1test.go),
-[`Published`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/f1test/f1test.go), [`DLQ`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/f1test/f1test.go), and
-[`Advance`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/f1test/f1test.go) methods are observation and timing tools,
-not alternate production APIs. The examples in
-[`f1test/f1test_test.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/f1test/f1test_test.go),
-[`f1test/fanout_test.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/f1test/fanout_test.go), and
-[`f1test/ordered_test.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/f1test/ordered_test.go) show the intended
-test shape.
+`Deliver`, `Published`, `DLQ`, and `Advance` are observation and timing tools,
+not alternate production APIs; they live in
+[`f1test/f1test.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/f1test/f1test.go).
+
+A publish waits up to one second for its destination to be set up, because a
+runner sets up its topics when `Run` starts. When the handler under test
+publishes to a topic that no subscription in the test consumes, pass that topic
+to `f1.WithPublishTopics` in `NewClient`. Otherwise the publish fails with the
+driver's not-found error after that second, and `Published` does not show it.
+
+For the intended test shape, read the package's own tests: `f1test_test.go` for
+the basics, `fanout_test.go` for fanout, and `ordered_test.go` for ordered keys.
 
 When testing a retry path, wait until the retry publication is observable
 before advancing the fake clock. The helper's capture signal and explicit
 channels are preferable to a real-time sleep.
+
+### Recording observer events
+
+When a test needs to inspect observer traffic, use
+[`f1test.NewRecorder`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/f1test/observer_recorder.go)
+rather than writing a collector observer. It implements `f1.Observer` and keeps
+every call:
+
+```go
+recorder := f1test.NewRecorder()
+client := f1test.NewClient(t, f1.WithObserver(recorder))
+
+// ... run the scenario ...
+
+waitCtx, cancel := context.WithTimeout(context.Background(), time.Second)
+defer cancel()
+
+err := recorder.Wait(waitCtx, func(calls []f1test.ObserverCall) bool {
+	for _, call := range calls {
+		if call.Op == f1test.ObserverOpRecord && call.Kind == f1.ObserverRetryScheduled {
+			return true
+		}
+	}
+	return false
+})
+require.NoError(t, err)
+```
+
+`Wait` snapshots the recorded calls, runs the predicate outside the recorder
+lock, and re-runs it when another call arrives. It returns `nil` once the
+predicate accepts, or `ctx.Err()` when the context ends. Give it a bounded
+context so a missing event fails with a clear timeout instead of hanging.
+
+Each recorded call is an `ObserverCall` with an `Op` of `start`, `finish`, or
+`record`, the `Kind`, and a `Token` where one applies. Exactly one of its
+`Start`, `Finish`, or `Point` fields carries the event; the other two are zero.
+Which event fields are populated for a given kind is a property of the SDK, not
+the recorder: see [Observer events](/development/observer-events).
+
+Three properties matter when writing assertions:
+
+- **Concurrency safe.** The observer methods, `Calls`, and `Wait` can all be
+  used concurrently.
+- **Copied on read.** `Calls` returns a copy of the slice and copies
+  `Finish.Results`, so mutating what you get back cannot corrupt the recorder.
+- **Capture order, not SDK order.** Calls appear in the order the recorder
+  serialized them. F1 guarantees only that one message's `Start` precedes its
+  own `Finish`; calls for different messages interleave freely, so do not assert
+  on the relative order of unrelated events.
+
+Always build one with `NewRecorder`; the zero value cannot wait.
+
+Reach for a custom observer only when the test needs behavior beyond capture,
+such as forwarding events onward or triggering a side effect. A wrapper can
+delegate to both, as
+[`observer_contract_test.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/observer_contract_test.go)
+shows. A hand-rolled observer that only stores calls is reimplementing the
+recorder's locking and copying.
+
+## OTLP metric export boundary tests
+
+Use the OTLP boundary test when a change crosses from observer events, through
+`f1otel`, into the exported metric wire format. Everything below that boundary
+is covered by ordinary unit tests; this one exists because exporter setup can
+look correct while the bytes on the wire are wrong.
+
+[`tools/otlpboundary/otlp_boundary_test.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/tools/otlpboundary/otlp_boundary_test.go)
+runs an in-process `httptest` collector, points the OTLP HTTP exporter at it
+with gzip compression, and captures the request. It then decompresses the body,
+unmarshals the protobuf `ExportMetricsServiceRequest`, and asserts on metric
+count, metric names, data-point attribute keys, and resource attribute keys.
+The assertions run against the decoded payload, so the test covers the real
+compressed request rather than the exporter configuration.
+
+The scenarios drive an in-memory client on a fake clock through deadline
+promotion, backlog sampling with a known head age, retry scheduling, and
+dead-letter publication. A forwarding observer feeds both `f1otel.Observer` and
+a recorder, and the recorder waits synchronize on the observer events before
+the provider is flushed.
+
+The tool is its own Go module, so it does not run under the root `go test
+./...`. Run it with:
+
+```sh
+make otlp-boundary
+```
 
 ## In-memory integration tests
 
@@ -159,8 +304,9 @@ durability.
 
 Use [driver conformance](/development/driver-conformance) when implementing or changing
 an adapter's implementation of the broker-independent port. The shared suite
-checks the same publish, consume, settlement, topology, lifecycle, capability,
-fault, ordering, drain, lag, and rebalance contract against each candidate.
+checks the same publish, consume, settlement, deferred delivery, topology,
+lifecycle, capability, fault, ordering, drain, lag, rebalance, and enqueue
+time/backlog contract against each candidate.
 
 The provider test supplies an inspector and any deterministic fault or deadline
 fixtures. The shared package must not import a concrete driver. A conformance
@@ -204,33 +350,51 @@ at one, four and sixteen concurrent publishers, consume-and-settle throughput
 on one lane at several handler concurrencies and handler hold times, and also
 on an ordered subscription, end-to-end latency, and retry-path throughput
 beside its tier delay. The comment on the `bench` entry in the
-[Makefile](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/Makefile)
-names the cells and says what each shape measures, and it is the enumeration to
-read rather than a copy here that a moved cell leaves silently wrong. Every
-cell prints `dups`, the deliveries it saw beyond what its shape expects, and
-`goroutines-delta`, the goroutines the run left behind; a bench cell fails on a
-duplicate rather than absorb one into its rate, so `dups` prints zero on a
-passing run. The consume cells add `lag-max` and `heap-max`, the largest
-backlog the consumer reported and the largest live heap the process held, and
+[Makefile](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-
+sdk/-/blob/main/Makefile) names the cells and says what each shape measures,
+and it is the enumeration to read rather than a copy here that a moved cell
+leaves silently wrong.
+
+Each broker-backed cell prints `dups`, the deliveries it saw beyond what its shape expects,
+and a bench cell fails on a duplicate rather than absorb one into its rate, so
+`dups` prints zero on a passing run. The in-memory scheduler fairness benchmark
+reports per-priority percentiles instead. The ordinary publish and consume
+benchmarks in `bench_integration_test.go` report `goroutines-delta`, the
+goroutines the run left behind; the consume sweep does not report it.
+
+Only the ordinary consume cells report `lag-max`, the largest backlog the
+consumer reported. Those cells also report `heap-max`, the largest live heap
+the process held. The consume sweep reports `heap-max-B` and no lag, and
 `-benchmem` adds the allocations and the bytes each corpus cost, so a cell can
-show pending work as well as a rate. A Kafka run creates its destinations with
-`F1_KAFKA_PARTITIONS` partitions through the driver's partition-count option,
-so the count its output reports is the one the run asked for rather than one
-the broker chose, and the fixture's own count stands in when the variable is
-unset or unusable. It starts both fixtures, creates only its own namespaced
-destinations and deletes them afterwards, and joins no gate, because a
-throughput number describes the machine it ran on and a gate that fails on a
-busy one is a gate people learn to ignore. Run it on a quiet machine and read
-its output as a comparison between the two drivers, never as a threshold.
+show pending work as well as a rate.
+
+A Kafka run creates its destinations with `F1_KAFKA_PARTITIONS` partitions
+through the driver's partition-count option, so the count its output reports
+is the one the run asked for rather than one the broker chose, and the
+fixture's own count stands in when the variable is unset or unusable.
+
+It starts both fixtures, creates only its own namespaced destinations, and
+asks each driver's maintenance port to delete them afterwards. The harness
+prunes its destinations and its `f1.bench.*` exchanges, retrying a few times;
+RabbitMQ's maintenance port deletes an exchange once nothing is bound to it.
+An exchange that still cannot be removed is reported by `Close` without
+failing the run.
+
+The run joins no gate, because a throughput number describes the machine it
+ran on and a gate that fails on a busy one is a gate people learn to ignore.
+Run it on a quiet machine and read its output as a comparison between the two
+drivers, never as a threshold.
 
 `test-driver-flip` is the driver-flip acceptance: it builds the two
 `examples/acceptance` services once, runs the identical binaries against Kafka
 and RabbitMQ with one corpus, and diffs the behaviour vectors. It needs both
 brokers, takes a few minutes, and writes its artifacts to `.cache/driver-flip`.
+Artifacts include binary digests in the test log, service logs, behaviour vectors,
+arrival order, and reported limits; the harness does not emit source-tree manifests.
 Size the corpus with `F1_DRIVER_FLIP_CORPUS` (default 10 000). It is not a
-required gate: a known Kafka consumer stall can red it at any corpus size, so
-run it deliberately and read a red run as evidence about that defect rather than
-about broker agnosticism.
+required gate; run it deliberately. Each broker run has a 60-second
+no-progress detector, so a stall fails the run with the count consumed so far
+and that consumer's output; read a stall failure alongside that output.
 
 ### Which targets contact a broker
 
@@ -248,10 +412,9 @@ all, so no test in either run connects to a broker. Those two targets are the
 default gate and they stay runnable with nothing listening.
 
 `make test-infra` compiles the integration half, `go test -count=1 -p 1 -tags integration
-./...`, with Kafka and RabbitMQ started first. An unreachable fixture fails the run.
-It leaves Kafka conformance, gated by `F1_KAFKA_CONFORMANCE`, and the driver flip, gated by
-`F1_DRIVER_FLIP`, out; run them with `make test-kafka-conformance` and
-`make test-driver-flip`. Packages run one at a time because the broker-backed suites share both
+-timeout 20m ./...`, with Kafka and RabbitMQ started first. An unreachable fixture fails the run.
+It includes Kafka conformance, which runs under the integration tag and takes about 7 minutes.
+It leaves the driver flip, gated by `F1_DRIVER_FLIP`, out; run it with `make test-driver-flip`. Packages run one at a time because the broker-backed suites share both
 fixtures and the machine.
 
 The per-driver targets are the same tag with a narrower package list:
@@ -263,15 +426,20 @@ keeps running the tests it names.
 `bench` is the same tag as well: it contacts both brokers and starts the
 fixtures it needs. Its package also holds the in-memory harness test, which
 needs no broker and is untagged, so the target passes `-run '^$'` beside
-`-bench` to select the benchmarks and leave that test out.
+`-bench` to select the benchmarks and leave that test out. An integration test
+pointed at an unreachable broker fails rather than skips. The benchmarks in
+`examples/bench` are the exception: they probe their endpoint first and skip
+with a reason when the broker is unreachable.
 
 `F1_KAFKA_ENDPOINT` and `F1_RABBITMQ_ENDPOINT` say *where* a fixture is. Unset
-means the documented default address, and a test pointed at nothing fails rather
-than skipping. Point a run at your own fixture with `F1_KAFKA_ENDPOINT` (for
-example `localhost:19131`) and `F1_RABBITMQ_ENDPOINT` (for example
+means the documented default address. Point a run at your own fixture with
+`F1_KAFKA_ENDPOINT` (for example `localhost:19131`) and
+`F1_RABBITMQ_ENDPOINT` (for example
 `amqp://guest:guest@localhost:15131/`); the broker-backed targets honour both,
 falling back to the port their own `KAFKA_PORT` or `RABBITMQ_PORT` variable
-selects.
+selects. The acceptance run remains env-gated and fails when its required
+brokers are unavailable, because a comparison that never ran is not a
+benchmark result.
 
 Tests that build a `kgo` client only to inspect its resolved options, or to drive
 a path whose network calls are stubbed out, pass `noDialKafkaOption`. franz-go
@@ -297,12 +465,13 @@ error was returned. A useful failure sequence is:
    or lost message.
 
 The shared fault contract is implemented in
-[`driver/conformance/failure.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/driver/conformance/failure.go). Core
-reconnect and lane-repair behavior is covered by
-[`reconnection_test.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/reconnection_test.go) and
-[`lane_repair_test.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/lane_repair_test.go). Provider-specific recovery
-belongs in [`drivers/rabbitmq/reconnect_integration_test.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/drivers/rabbitmq/reconnect_integration_test.go),
-the RabbitMQ fault injector, and the corresponding Kafka or in-memory tests.
+[`driver/conformance/failure.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/driver/conformance/failure.go). Coverage
+splits by layer:
+
+- **Core reconnect and lane repair:** [`reconnection_test.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/reconnection_test.go)
+  and [`lane_repair_test.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/lane_repair_test.go).
+- **Provider-specific recovery:** [`drivers/rabbitmq/reconnect_integration_test.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/drivers/rabbitmq/reconnect_integration_test.go),
+  the RabbitMQ fault injector, and the matching Kafka or in-memory tests.
 
 Delivery is at least once. Duplicate delivery, uncertain acknowledgement, and
 redelivery after a connection or process failure are expected contract paths.
@@ -324,15 +493,17 @@ returns. Assert the public lifecycle result:
 - release abandons outstanding deliveries for redelivery; and
 - successful stop closes the driver message channel at the documented point.
 
-Core lifecycle coverage starts with
-[`client_close_sequencing_test.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/client_close_sequencing_test.go),
-[`client_drain_budget_test.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/client_drain_budget_test.go),
-[`client_producer_admission_test.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/client_producer_admission_test.go),
-[`publish_close_barrier_test.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/publish_close_barrier_test.go),
-[`worker_abort_teardown_test.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/worker_abort_teardown_test.go), and
-the settlement tests linked in the root-package section. Driver-level drain,
-stop, release, and reconnect behavior is covered by the adapter suites and
-the conformance drain group.
+Core lifecycle coverage starts with:
+
+- [`client_close_sequencing_test.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/client_close_sequencing_test.go)
+- [`client_drain_budget_test.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/client_drain_budget_test.go)
+- [`client_producer_admission_test.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/client_producer_admission_test.go)
+- [`publish_close_barrier_test.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/publish_close_barrier_test.go)
+- [`worker_abort_teardown_test.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/worker_abort_teardown_test.go)
+
+plus the settlement tests linked in the root-package section. Driver-level
+drain, stop, release, and reconnect behavior is covered by the adapter suites
+and the conformance drain group.
 
 Do not make shutdown tests pass by adding a longer sleep. Arrange an explicit
 settlement signal, use the lifecycle API under test, and assert the resulting
@@ -342,7 +513,7 @@ state or error.
 
 Use [`internal/clock`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/tree/main/internal/clock) and its fake implementation when
 time is part of the behavior: retry delays, deferred delivery, acknowledgement
-deadlines, drain budgets, backoff, or scheduler aging. `f1test.Client.Advance`
+deadlines, drain budgets, backoff, or deadline promotion. `f1test.Client.Advance`
 advances the same fake clock used by the core and in-memory driver, so a test
 can release due work without waiting for wall time.
 
@@ -385,18 +556,27 @@ Tests protect runtime behavior, but repository gates protect the surfaces that
 make those tests meaningful:
 
 - API-surface checks compare exported symbols in the root package, `codec`,
-  `driver`, and `f1test` with their committed fixtures. The checker lives in
+  `driver`, `f1test`, and `f1otel` with their committed fixtures, including
+  [`testdata/public-api-f1otel.json`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/testdata/public-api-f1otel.json).
+  The checker lives in
   [`tools/apisurface`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/tree/main/tools/apisurface), and the owning Makefile
-  targets are `check-api-surface` and its package-specific variants.
-- API-diff checks compare the current root, driver, and codec surfaces with
-  [`testdata/api-diff/`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/tree/main/testdata/api-diff). An incompatible change fails the
-  check and is a release decision, not a baseline-maintenance detail; record it
-  only through the Makefile's explicitly approved baseline workflow. An
-  addition fails too, until the same commit records it in the baseline with
+  targets are `check-api-surface` and its package-specific variants, including
+  `check-api-surface-f1otel`.
+- API-diff checks compare the current root, driver, codec, and `f1otel`
+  surfaces with their committed baselines in
+  [`testdata/api-diff/`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/tree/main/testdata/api-diff); the
+  `f1otel` baseline is
+  [`f1otel.export`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/testdata/api-diff/f1otel.export).
+  An incompatible change fails the check and is a release decision, not a
+  baseline-maintenance detail; record it only through the Makefile's explicitly
+  approved baseline workflow. An addition fails too, until the same commit
+  records it in the baseline with
   `make record-api-diff-baseline`, which puts the addition in the diff a
   reviewer reads. Either half can be turned off for one local run:
   `API_DIFF_ENFORCE=0` for incompatible changes and `API_DIFF_ADDITIONS_ENFORCE=0`
   for additions.
+- See [API compatibility](/development/api-compatibility) for the public
+  release promise and the surface these checks protect.
 - `verify-agnostic` runs the `depguard` rules in
   [`.golangci.yml`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/.golangci.yml). It prevents core code from importing
   concrete drivers or broker clients and prevents the conformance package from
@@ -404,10 +584,28 @@ make those tests meaningful:
 - `verify-self-contained` checks that repository documentation does not rely on
   unresolved design-record identifiers or paths. Its implementation and
   rationale are in the [Makefile](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/Makefile).
+- `vulncheck` runs the pinned `govulncheck` scanner against the root module and
+  every `tools/*` module. Run it as a release and dependency-change gate with
+  `make vulncheck`; it is network-dependent and is not part of `test-fast` or
+  `check-fixture`.
 
 These are repository contract checks, not substitutes for a handler or broker
 test. Run them when changing exported symbols, package boundaries, driver
 interfaces, or maintainer documentation.
+
+## Test deletion probe
+
+The test deletion probe asks whether one test fails when a covered production
+function or method is replaced by a zero-value body. Run the repeatable sample
+with `make probe-tests`; use `PROBE_SAMPLE=path/to/sample.txt make probe-tests`
+for another package-and-test list.
+
+Read `red` as evidence that the test defends the mutated subject. A `green`
+row means the test still passes, so it does not defend that subject. A
+`nosubject` means no covered production function or method matched the test
+name under the probe's word rule; review that name and its assertion together.
+Other rows identify `nocompile`, `timeout`, `skip`, or a baseline `notgreen`.
+TSV rows go to stdout; summaries and cap counts go to stderr.
 
 ## Choosing a test before changing code
 
@@ -437,3 +635,9 @@ The [Makefile](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-
 [`.gitlab-ci.yml`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/.gitlab-ci.yml) own the current commands and gate
 composition. This page records the strategy and decision rules, not a second
 copy of those command implementations.
+
+## Go further
+
+- [Architecture](/development/architecture) - package ownership and import boundaries.
+- [Driver conformance](/development/driver-conformance) - the shared suite every adapter runs.
+- [Benchmarks](/development/benchmarks) - the benchmark harness and how to reproduce its numbers.

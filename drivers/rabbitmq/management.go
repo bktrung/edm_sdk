@@ -2,6 +2,7 @@ package rabbitmq
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -36,11 +37,15 @@ type managementClient struct {
 }
 
 type managementQueue struct {
-	Name          string         `json:"name"`
-	Messages      int64          `json:"messages"`
-	MessagesReady int64          `json:"messages_ready"`
-	Consumers     int64          `json:"consumers"`
-	Arguments     map[string]any `json:"arguments"` // broker-reported argument values are heterogeneous JSON scalars
+	Name                 string         `json:"name"`
+	Messages             int64          `json:"messages"`
+	MessagesReady        int64          `json:"messages_ready"`
+	Consumers            int64          `json:"consumers"`
+	Arguments            map[string]any `json:"arguments"` // broker-reported argument values are heterogeneous JSON scalars
+	HeadMessageTimestamp int64          `json:"head_message_timestamp"`
+}
+type managementExchange struct {
+	Name string `json:"name"`
 }
 
 type managementBinding struct {
@@ -61,16 +66,84 @@ func invalidEndpointError(err error) error {
 	return fmt.Errorf("rabbitmq: invalid management endpoint: %w", err)
 }
 
-func newManagementClient(endpoint string, cfg driver.Config) (*managementClient, error) {
+// managementTransport returns the transport that reaches the management API
+// over TLS. It starts from a clone of http.DefaultTransport while that is the
+// standard transport, and from a fresh one with the standard transport's
+// timeouts when an application or an instrumentation library has replaced it
+// with another RoundTripper, which has no TLS configuration to set.
+func managementTransport(tlsClientConfig *tls.Config) *http.Transport {
+	transport := &http.Transport{
+		Proxy:                 http.ProxyFromEnvironment,
+		DialContext:           (&net.Dialer{Timeout: 30 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
+		ForceAttemptHTTP2:     true,
+		MaxIdleConns:          100,
+		IdleConnTimeout:       90 * time.Second,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ExpectContinueTimeout: time.Second,
+	}
+	if standard, ok := http.DefaultTransport.(*http.Transport); ok {
+		transport = standard.Clone()
+	}
+	transport.TLSClientConfig = tlsClientConfig
+	return transport
+}
+
+type resolvedEndpoint struct {
+	endpoint string
+	parsed   *url.URL
+	vhost    string
+	username string
+	password string
+	sasl     []amqp.Authentication
+}
+
+func resolveEndpoint(endpoint string, cfg driver.Config) (resolvedEndpoint, error) {
+	resolved := resolvedEndpoint{endpoint: endpoint}
 	parsed, err := url.Parse(endpoint)
 	if err != nil {
-		return nil, invalidEndpointError(err)
+		return resolved, invalidEndpointError(err)
 	}
 	if parsed.Hostname() == "" {
-		// Opaque and path fields can retain raw credential-looking input; keep only the scheme.
 		redacted := url.URL{Scheme: parsed.Scheme}
-		return nil, fmt.Errorf("rabbitmq: invalid management endpoint %q: %w", redacted.String(), errors.New("missing host"))
+		return resolved, fmt.Errorf("rabbitmq: invalid management endpoint %q: %w", redacted.String(), errUnsupportedHostlessEndpoint)
 	}
+	if err := validateEndpoint(endpoint); err != nil {
+		return resolved, err
+	}
+	uri, err := amqp.ParseURI(endpoint)
+	if err != nil {
+		return resolved, invalidEndpointError(err)
+	}
+	if configured := cfg.DriverOptions["rabbitmq.vhost"]; configured != "" && configured != uri.Vhost {
+		return resolved, fmt.Errorf("rabbitmq: rabbitmq.vhost %q does not match endpoint vhost %q", configured, uri.Vhost)
+	}
+	if err := validateSASL(cfg.SASL); err != nil {
+		return resolved, err
+	}
+	resolved.parsed = parsed
+	resolved.vhost = uri.Vhost
+	resolved.username, resolved.password = uri.Username, uri.Password
+	if cfg.SASL != nil {
+		switch strings.ToLower(cfg.SASL.Mechanism) {
+		case "plain", "amqplain":
+			resolved.username, resolved.password = cfg.SASL.Username, cfg.SASL.Password
+			var auth amqp.Authentication
+			if strings.EqualFold(cfg.SASL.Mechanism, "plain") {
+				auth = &amqp.PlainAuth{Username: resolved.username, Password: resolved.password}
+			} else {
+				auth = &amqp.AMQPlainAuth{Username: resolved.username, Password: resolved.password}
+			}
+			resolved.sasl = []amqp.Authentication{auth}
+		case "external":
+			// EXTERNAL authenticates AMQP by certificate, not HTTP Basic Auth.
+			resolved.sasl = []amqp.Authentication{&amqp.ExternalAuth{}}
+		}
+	}
+	return resolved, nil
+}
+
+func managementClientForEndpoint(endpoint resolvedEndpoint, cfg driver.Config) (*managementClient, error) {
+	parsed := endpoint.parsed
 	scheme := "http"
 	if parsed.Scheme == "amqps" || (cfg.TLS != nil && cfg.TLS.Enabled) {
 		scheme = "https"
@@ -79,30 +152,7 @@ func newManagementClient(endpoint string, cfg driver.Config) (*managementClient,
 	if portErr != nil {
 		return nil, portErr
 	}
-	if parsed.Scheme != "amqps" && !isLoopbackEndpoint(endpoint) {
-		return nil, errors.New("rabbitmq: plaintext connection to non-loopback host requires an amqps:// endpoint")
-	}
 	host := net.JoinHostPort(parsed.Hostname(), strconv.Itoa(managementPort))
-	username, password := "", ""
-	if parsed.User != nil {
-		username = parsed.User.Username()
-		password, _ = parsed.User.Password()
-	}
-	if cfg.SASL != nil && (cfg.SASL.Username != "" || cfg.SASL.Password != "") {
-		username = cfg.SASL.Username
-		password = cfg.SASL.Password
-	}
-	vhost := cfg.DriverOptions["rabbitmq.vhost"]
-	if vhost == "" {
-		// The AMQP connection reads its vhost from this same endpoint through
-		// this parse, so re-deriving it here is how the two readers drifted
-		// apart. One parse, one answer.
-		amqpURI, uriErr := amqp.ParseURI(endpoint)
-		if uriErr != nil {
-			return nil, invalidEndpointError(uriErr)
-		}
-		vhost = amqpURI.Vhost
-	}
 	timeout := cfg.ConnectTimeout
 	if timeout <= 0 {
 		timeout = defaultManagementTimeout
@@ -115,15 +165,13 @@ func newManagementClient(endpoint string, cfg driver.Config) (*managementClient,
 		if tlsErr != nil {
 			return nil, tlsErr
 		}
-		transport := http.DefaultTransport.(*http.Transport).Clone()
-		transport.TLSClientConfig = tlsClientConfig
-		client.Transport = transport
+		client.Transport = managementTransport(tlsClientConfig)
 	}
 	return &managementClient{
 		baseURL:  scheme + "://" + host,
-		username: username,
-		password: password,
-		vhost:    vhost,
+		username: endpoint.username,
+		password: endpoint.password,
+		vhost:    endpoint.vhost,
 		client:   client,
 	}, nil
 }
@@ -162,42 +210,93 @@ func (m *managementClient) queuesPath() string {
 	return m.baseURL + "/api/queues/" + url.PathEscape(m.vhost)
 }
 
+func (m *managementClient) exchangePath(name string) string {
+	return m.baseURL + "/api/exchanges/" + url.PathEscape(m.vhost) + "/" + url.PathEscape(name)
+}
+
+func (m *managementClient) exchangesPath() string {
+	return m.baseURL + "/api/exchanges/" + url.PathEscape(m.vhost)
+}
+
 func (m *managementClient) bindingsPath() string {
 	return m.baseURL + "/api/bindings/" + url.PathEscape(m.vhost)
 }
 
-func (m *managementClient) listQueues(ctx context.Context) ([]managementQueue, error) {
-	request, err := http.NewRequestWithContext(ctx, http.MethodGet, m.queuesPath(), nil)
+// do sends an authenticated management request. The caller closes the
+// response body.
+func (m *managementClient) do(ctx context.Context, method, path string) (*http.Response, error) {
+	request, err := http.NewRequestWithContext(ctx, method, path, nil)
 	if err != nil {
 		return nil, err
 	}
 	request.SetBasicAuth(m.username, m.password)
-	response, err := m.client.Do(request)
+	return m.client.Do(request)
+}
+
+type managementHTTPError struct {
+	statusCode int
+	method     string
+	resource   string
+	status     string
+	body       string
+}
+
+// Error preserves the management response's diagnostic text.
+func (e *managementHTTPError) Error() string {
+	return fmt.Sprintf("management API %s %s: %s: %s", e.method, e.resource, e.status, e.body)
+}
+
+func newManagementHTTPError(response *http.Response, method, resource string) error {
+	body, _ := io.ReadAll(io.LimitReader(response.Body, 4096))
+	return &managementHTTPError{
+		statusCode: response.StatusCode,
+		method:     method,
+		resource:   resource,
+		status:     response.Status,
+		body:       strings.TrimSpace(string(body)),
+	}
+}
+
+func classifyManagement(op string, err error) error {
+	kind := driver.KindTransient
+	if httpErr, ok := errors.AsType[*managementHTTPError](err); ok {
+		if httpErr.statusCode == http.StatusUnauthorized || httpErr.statusCode == http.StatusForbidden {
+			kind = driver.KindPermission
+		}
+	}
+	return classify(op, kind, err)
+}
+
+func managementGet[T any](ctx context.Context, m *managementClient, path, resource string) (T, error) {
+	var value T
+	response, err := m.do(ctx, http.MethodGet, path)
 	if err != nil {
-		return nil, err
+		return value, err
 	}
 	defer response.Body.Close()
 	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
-		body, _ := io.ReadAll(io.LimitReader(response.Body, 4096))
-		return nil, fmt.Errorf("management API GET queues: %s: %s", response.Status, strings.TrimSpace(string(body)))
+		return value, newManagementHTTPError(response, http.MethodGet, resource)
 	}
-	var queues []managementQueue
-	if err := json.NewDecoder(response.Body).Decode(&queues); err != nil {
-		return nil, fmt.Errorf("management API decode queues: %w", err)
+	if err := json.NewDecoder(response.Body).Decode(&value); err != nil {
+		var zero T
+		return zero, fmt.Errorf("management API decode %s: %w", resource, err)
 	}
-	return queues, nil
+	return value, nil
+}
+
+func (m *managementClient) listQueues(ctx context.Context) ([]managementQueue, error) {
+	return managementGet[[]managementQueue](ctx, m, m.queuesPath(), "queues")
+}
+
+func (m *managementClient) listExchanges(ctx context.Context) ([]managementExchange, error) {
+	return managementGet[[]managementExchange](ctx, m, m.exchangesPath(), "exchanges")
 }
 
 // getQueue fetches one queue's current state, including its broker-recorded
 // arguments. Unlike QueueDeclarePassive, this reports what the broker
 // actually holds, which is what argument-drift detection compares against.
 func (m *managementClient) getQueue(ctx context.Context, name string) (managementQueue, error) {
-	request, err := http.NewRequestWithContext(ctx, http.MethodGet, m.queuePath(name), nil)
-	if err != nil {
-		return managementQueue{}, err
-	}
-	request.SetBasicAuth(m.username, m.password)
-	response, err := m.client.Do(request)
+	response, err := m.do(ctx, http.MethodGet, m.queuePath(name))
 	if err != nil {
 		return managementQueue{}, err
 	}
@@ -206,8 +305,7 @@ func (m *managementClient) getQueue(ctx context.Context, name string) (managemen
 		return managementQueue{}, fmt.Errorf("management API GET queue %q: %w", name, errQueueNotFound)
 	}
 	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
-		body, _ := io.ReadAll(io.LimitReader(response.Body, 4096))
-		return managementQueue{}, fmt.Errorf("management API GET queue %q: %s: %s", name, response.Status, strings.TrimSpace(string(body)))
+		return managementQueue{}, newManagementHTTPError(response, http.MethodGet, fmt.Sprintf("queue %q", name))
 	}
 	var queue managementQueue
 	if err := json.NewDecoder(response.Body).Decode(&queue); err != nil {
@@ -217,34 +315,11 @@ func (m *managementClient) getQueue(ctx context.Context, name string) (managemen
 }
 
 func (m *managementClient) listBindings(ctx context.Context) ([]managementBinding, error) {
-	request, err := http.NewRequestWithContext(ctx, http.MethodGet, m.bindingsPath(), nil)
-	if err != nil {
-		return nil, err
-	}
-	request.SetBasicAuth(m.username, m.password)
-	response, err := m.client.Do(request)
-	if err != nil {
-		return nil, err
-	}
-	defer response.Body.Close()
-	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
-		body, _ := io.ReadAll(io.LimitReader(response.Body, 4096))
-		return nil, fmt.Errorf("management API GET bindings: %s: %s", response.Status, strings.TrimSpace(string(body)))
-	}
-	var bindings []managementBinding
-	if err := json.NewDecoder(response.Body).Decode(&bindings); err != nil {
-		return nil, fmt.Errorf("management API decode bindings: %w", err)
-	}
-	return bindings, nil
+	return managementGet[[]managementBinding](ctx, m, m.bindingsPath(), "bindings")
 }
 
-func (m *managementClient) deleteQueue(ctx context.Context, name string) (bool, error) {
-	request, err := http.NewRequestWithContext(ctx, http.MethodDelete, m.queuePath(name), nil)
-	if err != nil {
-		return false, err
-	}
-	request.SetBasicAuth(m.username, m.password)
-	response, err := m.client.Do(request)
+func (m *managementClient) deleteExchange(ctx context.Context, name string) (bool, error) {
+	response, err := m.do(ctx, http.MethodDelete, m.exchangePath(name))
 	if err != nil {
 		return false, err
 	}
@@ -253,8 +328,7 @@ func (m *managementClient) deleteQueue(ctx context.Context, name string) (bool, 
 		return false, nil
 	}
 	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
-		body, _ := io.ReadAll(io.LimitReader(response.Body, 4096))
-		return false, fmt.Errorf("management API DELETE queue %q: %s: %s", name, response.Status, strings.TrimSpace(string(body)))
+		return false, newManagementHTTPError(response, http.MethodDelete, fmt.Sprintf("exchange %q", name))
 	}
 	return true, nil
 }
@@ -264,4 +338,11 @@ func (queue managementQueue) totalMessages() int64 {
 		return queue.Messages
 	}
 	return queue.MessagesReady
+}
+
+func (queue managementQueue) headEnqueuedAt() (time.Time, driver.EnqueueSource) {
+	if queue.HeadMessageTimestamp <= 0 {
+		return time.Time{}, driver.EnqueueSourceUnknown
+	}
+	return time.Unix(queue.HeadMessageTimestamp, 0), driver.EnqueueSourceProducer
 }

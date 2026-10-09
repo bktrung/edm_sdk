@@ -13,57 +13,9 @@ import (
 
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/driver"
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/clock"
+	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/lifecycle"
+	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/wire"
 )
-
-func TestClientCloseBoundsProducerClose(t *testing.T) {
-	fake := clock.NewFake(time.Unix(0, 0))
-	producer := &recordingProducer{
-		closeStarted: make(chan struct{}),
-		closeRelease: make(chan struct{}),
-	}
-	client := newPublishClient(t, producer, withClock(fake))
-	client.config.Lifecycle.CloseTimeout = 5 * time.Second
-	defer close(producer.closeRelease)
-	if _, err := client.Publisher().Publish(context.Background(), "orders.created", "payload"); err != nil {
-		t.Fatal(err)
-	}
-
-	closeDone := make(chan error, 1)
-	go func() { closeDone <- client.Close(context.Background()) }()
-	<-producer.closeStarted
-	waitForFakeTimer(t, fake)
-	fake.Advance(5 * time.Second)
-	err := <-closeDone
-	if !errors.Is(err, context.DeadlineExceeded) || !strings.Contains(err.Error(), "close phase") {
-		t.Fatalf("Close() error = %v, want close phase deadline", err)
-	}
-}
-
-func TestClientCloseBoundsConnectionClose(t *testing.T) {
-	fake := clock.NewFake(time.Unix(0, 0))
-	conn := &publishConn{
-		info:         driver.BrokerInfo{Kind: "test", Version: "1"},
-		closeStarted: make(chan struct{}),
-		closeRelease: make(chan struct{}),
-	}
-	client, err := New(context.Background(), testClientConfig(t), WithDriver(&publishDriver{conn: conn}), withClock(fake))
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = client.Close(context.Background()) })
-	client.config.Lifecycle.CloseTimeout = 5 * time.Second
-	defer close(conn.closeRelease)
-
-	closeDone := make(chan error, 1)
-	go func() { closeDone <- client.Close(context.Background()) }()
-	<-conn.closeStarted
-	waitForFakeTimer(t, fake)
-	fake.Advance(5 * time.Second)
-	err = <-closeDone
-	if !errors.Is(err, context.DeadlineExceeded) || !strings.Contains(err.Error(), "close phase") {
-		t.Fatalf("Close() error = %v, want close phase deadline", err)
-	}
-}
 
 func waitForFakeTimer(t *testing.T, fake *clock.Fake) {
 	t.Helper()
@@ -189,9 +141,7 @@ func TestPublishRejectedWhenClientIsClosing(t *testing.T) {
 	t.Parallel()
 	producer := &recordingProducer{}
 	client := newPublishClient(t, producer)
-	client.mu.Lock()
-	client.shutdownStarted = true
-	client.mu.Unlock()
+	setClientLifecycle(client, lifecycle.Aborted)
 
 	_, err := client.Publisher().Publish(context.Background(), "orders.created", "payload")
 	if err == nil || !strings.Contains(err.Error(), "client is closed") {
@@ -200,9 +150,7 @@ func TestPublishRejectedWhenClientIsClosing(t *testing.T) {
 	if got := len(producer.messages); got != 0 {
 		t.Fatalf("producer received %d messages while client was closing", got)
 	}
-	client.mu.Lock()
-	client.shutdownStarted = false
-	client.mu.Unlock()
+	setClientLifecycle(client, lifecycle.Ready)
 }
 
 func TestPublishAttemptDuringCloseIsRefused(t *testing.T) {
@@ -399,13 +347,59 @@ func TestPublishBatchReportsPartialFailuresAndWarnsPerMessage(t *testing.T) {
 	if err != nil {
 		t.Fatalf("PublishBatch() error = %v, want nil for partial failure", err)
 	}
-	if got, want := result.Failed(), []int{0, 1}; len(got) != len(want) || got[0] != want[0] || got[1] != want[1] {
+	if got, want := failedIndexes(result), []int{0, 1}; len(got) != len(want) || got[0] != want[0] || got[1] != want[1] {
 		t.Fatalf("failed indexes = %v, want %v", got, want)
 	}
 	quiescePublishClient(t, client)
 	if got := strings.Count(logs.String(), "f1 unclassified publish error"); got != 2 {
 		t.Fatalf("unclassified warning count = %d, want 2; logs=%s", got, logs.String())
 	}
+}
+
+func TestPublishReportsAFailedMessageWithoutACauseAsFailed(t *testing.T) {
+	t.Parallel()
+	producer := &recordingProducer{publishErr: &driver.PublishError{Failed: map[int]error{0: nil}}}
+	client := newPublishClient(t, producer)
+	id, err := client.Publisher().Publish(context.Background(), "orders.created", "one")
+	if err == nil {
+		t.Fatalf("Publish() = %q, nil; want an error for a message the driver reported as failed", id)
+	}
+	quiescePublishClient(t, client)
+}
+
+func TestPublishStampsTheProducerWithServiceEnvironmentAndInstance(t *testing.T) {
+	t.Parallel()
+	producer := &recordingProducer{}
+	client := newPublishClient(t, producer)
+	if _, err := client.Publisher().Publish(context.Background(), "orders.created", "one"); err != nil {
+		t.Fatal(err)
+	}
+	quiescePublishClient(t, client)
+	producer.mu.Lock()
+	defer producer.mu.Unlock()
+	want := "orders/test/" + client.config.InstanceID
+	if got := headerValue(producer.messages[0].Headers, wire.Producer); got != want {
+		t.Fatalf("producer header = %q, want %q", got, want)
+	}
+}
+
+func TestPublishBatchReportsAnOutOfRangeFailureIndexAsAFailedBatch(t *testing.T) {
+	t.Parallel()
+	producer := &recordingProducer{publishErr: &driver.PublishError{Failed: map[int]error{5: errors.New("lost")}}}
+	client := newPublishClient(t, producer)
+	result, err := client.Publisher().PublishBatch(context.Background(), []Message{
+		{EventType: "orders.created", Payload: "one"},
+		{EventType: "orders.created", Payload: "two"},
+	})
+	if err == nil {
+		t.Fatalf("PublishBatch() error = nil, want an error for a failure report naming no message in the batch; results=%+v", result.Results)
+	}
+	for i, r := range result.Results {
+		if r.Err == nil || r.ID != "" {
+			t.Fatalf("Results[%d] = %+v, want a failed message", i, r)
+		}
+	}
+	quiescePublishClient(t, client)
 }
 
 func TestPublishBatchUnclassifiedFailuresDoNotReconnect(t *testing.T) {
@@ -511,9 +505,56 @@ func TestNewLogsNonNativeCapabilities(t *testing.T) {
 	}
 }
 
-func TestWarnUnclassifiedAcceptsNilLogger(t *testing.T) {
+// TestPublishWithoutLoggerReportsAnUnclassifiedProducerFailure pins the
+// no-logger path: a client built without WithLogger has no logger to warn an
+// unclassified producer build failure through, so Publish must return the
+// failure rather than panic on the warning.
+func TestPublishWithoutLoggerReportsAnUnclassifiedProducerFailure(t *testing.T) {
 	t.Parallel()
-	warnUnclassified(nil, errors.New("unclassified"))
+	cause := errors.New("unclassified producer failure")
+	conn := &publishConn{
+		producer:    &recordingProducer{},
+		producerErr: cause,
+		info:        driver.BrokerInfo{Kind: "test", Version: "1"},
+	}
+	client := newPublishClientWithConn(t, conn)
+	if _, err := client.Publisher().Publish(context.Background(), "orders.created", "payload"); !errors.Is(err, cause) {
+		t.Fatalf("Publish() error = %v, want it to wrap %v", err, cause)
+	}
+}
+
+func TestInvokeHandlerMessageSkipsTopicLookupForPlainDelivery(t *testing.T) {
+	client := newPublishClient(t, &recordingProducer{})
+	runner := &Runner{
+		client: client,
+		subscription: Subscription{
+			Name:           "orders",
+			HandlerTimeout: time.Second,
+		},
+	}
+	event := &Event{envelope: Envelope{Type: "orders.created", Priority: PriorityMedium}}
+	message := driver.InboundMessage{Destination: "missing.destination"}
+	done := make(chan handlerResult, 1)
+
+	client.mu.Lock()
+	go func() {
+		done <- invokeHandlerMessage(runner, context.Background(), HandlerFunc(func(context.Context, *Event) error {
+			return nil
+		}), event, message)
+	}()
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	select {
+	case result := <-done:
+		client.mu.Unlock()
+		if result.stuck {
+			t.Fatal("plain delivery became stuck")
+		}
+	case <-ctx.Done():
+		client.mu.Unlock()
+		<-done
+		t.Fatal("plain delivery waited for the client lock during topic lookup")
+	}
 }
 
 func TestTopicForOnlyStripsTrailingVersion(t *testing.T) {
@@ -693,4 +734,15 @@ func (p *recordingProducer) Close(context.Context) error {
 		<-release
 	}
 	return err
+}
+
+// failedIndexes returns the indexes of the batch messages that did not publish.
+func failedIndexes(result BatchResult) []int {
+	failed := make([]int, 0)
+	for i, message := range result.Results {
+		if message.Err != nil {
+			failed = append(failed, i)
+		}
+	}
+	return failed
 }

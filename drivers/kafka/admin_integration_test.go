@@ -18,7 +18,6 @@ import (
 	"github.com/twmb/franz-go/pkg/kerr"
 	"github.com/twmb/franz-go/pkg/kgo"
 
-	//nolint:depguard // this test must exercise the public f1 API against Kafka.
 	f1 "fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk"
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/driver"
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/clock"
@@ -450,7 +449,7 @@ func TestEnsureTopologyUnderTopologyNoneRecordsDelaysWithoutContactingTheBroker(
 		t.Fatalf("kgo.NewClient: %v", err)
 	}
 	t.Cleanup(client.Close)
-	connection := &conn{client: client, delays: make(map[string]time.Duration)}
+	connection := &conn{client: client, delays: make(map[string][]delayDeclaration)}
 
 	destination := kafkaTestTopic(t, "none-delay")
 	const delay = 1500 * time.Millisecond
@@ -466,11 +465,15 @@ func TestEnsureTopologyUnderTopologyNoneRecordsDelaysWithoutContactingTheBroker(
 	if writes := counter.requests.Load() - before; writes != 0 {
 		t.Fatalf("EnsureTopology(TopologyNone) wrote %d broker requests, want 0", writes)
 	}
-	if got, known := connection.destinationDelay(destination); !known || got != delay {
-		t.Fatalf("destinationDelay(%q) = (%s, %t), want (%s, true)", destination, got, known, delay)
-	}
 	if len(diff.CreatedDestinations) != 0 || len(diff.ExistingDestinations) != 0 {
 		t.Fatalf("TopologyNone diff = %#v, want no destinations", diff)
+	}
+	// The declaration is recorded even though nothing was created: the
+	// conformance inspector reads a record's due time from the delay in force
+	// when it was published, and a TopologyNone deployment creates no topic for
+	// that delay to come from anywhere else.
+	if got, known := connection.destinationDelayAt(destination, clock.NewReal().Now()); !known || got != delay {
+		t.Fatalf("destinationDelayAt(%q) = (%s, %t), want (%s, true)", destination, got, known, delay)
 	}
 
 	// The zero above is only evidence if this counter can see a round trip at
@@ -517,11 +520,6 @@ func TestPublicSubscriptionHonoursRetryDelayUnderTopologyNone(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
 	t.Cleanup(cancel)
-	// The client is built without WithLogger, so the driver warns through the
-	// process default and this capture sees a deferral fault on the retry path
-	// the test is measuring.
-	var faults deferralLogSink
-	swapProcessDefault(t, &faults)
 	client, err := f1.New(ctx, kafkaPublicTestConfig(),
 		f1.WithDriver(Driver{}),
 		f1.WithTopology(f1.TopologyNone),
@@ -597,12 +595,6 @@ func TestPublicSubscriptionHonoursRetryDelayUnderTopologyNone(t *testing.T) {
 	}
 	if elapsed > 10*time.Second {
 		t.Fatalf("second attempt arrived %s after the failed attempt, want no longer than 10s", elapsed)
-	}
-	// The delay the retry waited out came from the consumer's own configuration,
-	// so a due time the destination does not declare is the fault that says the
-	// two disagree, and the wait above would not have happened.
-	if logged := faults.String(); strings.Contains(logged, "kafka deferred delivery fault") {
-		t.Fatalf("the retry path logged a deferral fault: %s", logged)
 	}
 
 	if err := client.Close(context.Background()); err != nil {

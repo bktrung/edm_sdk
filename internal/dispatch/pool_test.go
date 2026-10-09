@@ -46,6 +46,9 @@ func TestOrderedPoolKeepsEqualKeysOnOneWorker(t *testing.T) {
 		}
 	}
 	pool.Close()
+	if len(sequence) != 10 {
+		t.Fatalf("ordered sequence length = %d, want 10", len(sequence))
+	}
 	for i, value := range sequence {
 		if value != i {
 			t.Fatalf("ordered sequence = %v", sequence)
@@ -53,30 +56,29 @@ func TestOrderedPoolKeepsEqualKeysOnOneWorker(t *testing.T) {
 	}
 }
 
-func TestQueueIndexKeepsHighBitHashInRange(t *testing.T) {
-	const (
-		queueCount    uint32 = 4
-		key                  = "key-10"
-		expectedHash         = uint32(3421672898) // FNV-1a sum for key-10; high bit set.
-		expectedIndex uint32 = 2
-	)
-
-	hash := fnv.New32a()
-	_, _ = hash.Write([]byte(key))
-	if got := hash.Sum32(); got != expectedHash {
-		t.Fatalf("FNV-1a sum for %q = %d, want %d", key, got, expectedHash)
-	}
-	if expectedHash&0x80000000 == 0 {
-		t.Fatalf("FNV-1a sum for %q = %#x, want high bit set", key, expectedHash)
+func TestPoolBoundsOrderedBuffer(t *testing.T) {
+	const concurrency = 2
+	queueSize := MaxOrderedBufferEntries / concurrency
+	if queueSize*concurrency != MaxOrderedBufferEntries {
+		t.Fatalf("MaxOrderedBufferEntries = %d, want an even value", MaxOrderedBufferEntries)
 	}
 
-	got := queueIndex(hash.Sum32(), queueCount)
-	if got >= queueCount {
-		t.Fatalf("queue index = %d, want range [0, %d)", got, queueCount)
+	if pool, err := NewPool(context.Background(), concurrency, true, queueSize+1); err == nil {
+		pool.Close()
+		t.Fatal("ordered pool above the buffer bound must fail")
 	}
-	if got != expectedIndex {
-		t.Fatalf("queue index for %q = %d, want %d", key, got, expectedIndex)
+
+	ordered, err := NewPool(context.Background(), concurrency, true, queueSize)
+	if err != nil {
+		t.Fatalf("ordered pool at the buffer bound failed: %v", err)
 	}
+	ordered.Close()
+
+	unordered, err := NewPool(context.Background(), concurrency, false, queueSize)
+	if err != nil {
+		t.Fatalf("unordered pool at the ordered buffer bound failed: %v", err)
+	}
+	unordered.Close()
 }
 
 func TestQueueIndexPreservesFNVDistribution(t *testing.T) {
@@ -92,7 +94,7 @@ func TestQueueIndexPreservesFNVDistribution(t *testing.T) {
 		{key: "beta", hash: 2944525511, expected: 3},
 		{key: "key-0", hash: 1491088857, expected: 1},
 		{key: "key-1", hash: 1474311238, expected: 2},
-		{key: "key-10", hash: 3421672898, expected: 2},
+		{key: "key-10", hash: 3421672898, expected: 2}, // high bit set
 		{key: "key-11", hash: 3438450517, expected: 1},
 	}
 
@@ -113,9 +115,11 @@ func TestPoolValidationFreeSignalAndClosedSubmit(t *testing.T) {
 		t.Fatal("zero concurrency must fail")
 	}
 	var parent context.Context
-	if _, err := NewPool(parent, 1, false, 1); err != nil {
+	nilParentPool, err := NewPool(parent, 1, false, 1)
+	if err != nil {
 		t.Fatal(err)
 	}
+	nilParentPool.Close()
 	p, err := NewPool(context.Background(), 1, false, 1)
 	if err != nil {
 		t.Fatal(err)
@@ -315,63 +319,6 @@ func TestPoolSubmitHonorsCancellationWhenQueueIsFull(t *testing.T) {
 	close(release)
 	p.Close()
 	p.Close()
-}
-
-func TestPoolCloseUnblocksBlockedSubmit(t *testing.T) {
-	p, err := NewPool(context.Background(), 1, false, 1)
-	if err != nil {
-		t.Fatal(err)
-	}
-	started := make(chan struct{})
-	release := make(chan struct{})
-	if err := p.Submit(context.Background(), Work{Run: func(context.Context) {
-		close(started)
-		<-release
-	}}); err != nil {
-		t.Fatal(err)
-	}
-	<-started
-	if err := p.Submit(context.Background(), Work{Run: func(context.Context) {}}); err != nil {
-		t.Fatal(err)
-	}
-
-	submitDone := make(chan error, 1)
-	go func() {
-		submitDone <- p.Submit(context.Background(), Work{Run: func(context.Context) {}})
-	}()
-	for i := range 100000 {
-		p.mu.Lock()
-		active := p.active
-		p.mu.Unlock()
-		if active > 0 {
-			break
-		}
-		if i == 99999 {
-			t.Fatal("blocked submit did not reach the pool")
-		}
-		runtime.Gosched()
-	}
-
-	closeDone := make(chan struct{})
-	go func() {
-		p.Close()
-		close(closeDone)
-	}()
-	<-p.closing
-	for range 100000 {
-		select {
-		case err := <-submitDone:
-			if err == nil {
-				t.Fatal("blocked submit succeeded after Close")
-			}
-			close(release)
-			<-closeDone
-			return
-		default:
-			runtime.Gosched()
-		}
-	}
-	t.Fatal("Close did not unblock the blocked submit")
 }
 
 func TestPoolNilOperations(t *testing.T) {

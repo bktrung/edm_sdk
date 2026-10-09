@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"time"
 
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/driver"
 )
@@ -16,6 +17,7 @@ type producer struct {
 
 var _ driver.Producer = (*producer)(nil)
 
+// Publish sends messages to their configured destinations and waits for the in-memory broker to accept them.
 func (p *producer) Publish(ctx context.Context, messages ...driver.OutboundMessage) error {
 	if err := ctx.Err(); err != nil {
 		return classify("publish", driver.KindTransient, err)
@@ -51,18 +53,19 @@ func (p *producer) Publish(ctx context.Context, messages ...driver.OutboundMessa
 			failed[i] = classify("publish", driver.KindNotFound, driver.ErrDestinationMissing)
 			continue
 		}
-		due := message.DelayUntil
-		if due.IsZero() && dest.spec.Delay > 0 {
+		var due time.Time
+		if dest.spec.Delay > 0 {
 			due = p.conn.clock.Now().Add(dest.spec.Delay)
 		}
+		message = cloneOutbound(message)
 		queued := &queuedMessage{
-			message:  cloneOutbound(message),
+			message:  message,
 			sequence: p.conn.nextMessage.Add(1),
 			due:      due,
 		}
 		dest.messages = append(dest.messages, queued)
 		p.conn.recordHistoryLocked(message.Destination, &queuedMessage{
-			message:  cloneOutbound(message),
+			message:  message,
 			sequence: queued.sequence,
 			due:      due,
 		})
@@ -83,6 +86,7 @@ func headerBytes(headers []driver.Header) int {
 	return total
 }
 
+// Close releases the producer. Further publish calls return an error.
 func (p *producer) Close(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
 		return classify("producer.close", driver.KindTransient, err)

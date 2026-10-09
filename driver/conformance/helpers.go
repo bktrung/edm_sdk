@@ -72,8 +72,8 @@ func unprofileDestination(group *groupContext, destination string) string {
 }
 
 func profileScope(group *groupContext, scope string) string {
-	if strings.HasSuffix(scope, ".") {
-		base := strings.TrimSuffix(scope, ".")
+	if before, ok := strings.CutSuffix(scope, "."); ok {
+		base := before
 		return profileDestination(group, base) + "."
 	}
 	return profileDestination(group, scope)
@@ -457,20 +457,22 @@ func receiveMessage(t *testing.T, group *groupContext, consumer driver.Consumer)
 // the last observed value on failure.
 func waitFor(t *testing.T, group *groupContext, what string, condition func() (bool, string)) {
 	t.Helper()
-	waitForUntil(t, group, what, condition, false)
+	waitForUntil(t, group, what, condition, false, waitTimeout)
 }
 
 func waitForStable(t *testing.T, group *groupContext, what string, condition func() (bool, string)) {
 	t.Helper()
-	waitForUntil(t, group, what, condition, true)
+	waitForUntil(t, group, what, condition, true, stabilityWindow)
 }
 
-func waitForUntil(t *testing.T, group *groupContext, what string, condition func() (bool, string), stable bool) {
+// waitForStableFor is waitForStable over a caller-chosen window.
+func waitForStableFor(t *testing.T, group *groupContext, what string, window time.Duration, condition func() (bool, string)) {
 	t.Helper()
-	timeout := waitTimeout
-	if stable {
-		timeout = stabilityWindow
-	}
+	waitForUntil(t, group, what, condition, true, window)
+}
+
+func waitForUntil(t *testing.T, group *groupContext, what string, condition func() (bool, string), stable bool, timeout time.Duration) {
+	t.Helper()
 	deadline, cancel := context.WithTimeout(group.ctx, timeout)
 	defer cancel()
 	ticker := time.NewTicker(waitInterval) //nolint:forbidigo // conformance is stdlib-only and cannot import internal/clock

@@ -1,5 +1,7 @@
 package f1
 
+import "fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/wire"
+
 // Priority identifies a delivery lane. Its zero value is PriorityMedium;
 // numeric values are identifiers, not an ordering.
 type Priority int
@@ -50,6 +52,6 @@ func ParsePriority(s string) (Priority, error) {
 	case "low":
 		return PriorityLow, nil
 	default:
-		return 0, &UnrecognisedValueError{Attribute: "f1priority", Value: s}
+		return 0, &UnrecognisedValueError{Attribute: wire.Priority, Value: s}
 	}
 }

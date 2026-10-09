@@ -1,0 +1,693 @@
+{
+  "scenarios": [
+    {
+      "id": "weighted",
+      "title": "Weighted pick with weights 8, 4 and 1",
+      "groups": [
+        "high",
+        "medium",
+        "low"
+      ],
+      "lanes": [
+        {
+          "id": "high",
+          "group": "high"
+        },
+        {
+          "id": "medium",
+          "group": "medium"
+        },
+        {
+          "id": "low",
+          "group": "low"
+        }
+      ],
+      "steps": [
+        {
+          "number": 1,
+          "action": "enqueue",
+          "clockOffsetMillis": 0,
+          "winner": "",
+          "promoted": false,
+          "scores": [
+            {
+              "group": "high",
+              "score": 0
+            },
+            {
+              "group": "medium",
+              "score": 0
+            },
+            {
+              "group": "low",
+              "score": 0
+            }
+          ],
+          "depths": [
+            {
+              "lane": "high",
+              "depth": 13
+            },
+            {
+              "lane": "medium",
+              "depth": 13
+            },
+            {
+              "lane": "low",
+              "depth": 13
+            }
+          ],
+          "caption": "Items enter the lanes at 0 ms."
+        },
+        {
+          "number": 2,
+          "action": "pick",
+          "clockOffsetMillis": 0,
+          "winner": "high",
+          "promoted": false,
+          "scores": [
+            {
+              "group": "high",
+              "score": -5
+            },
+            {
+              "group": "medium",
+              "score": 4
+            },
+            {
+              "group": "low",
+              "score": 1
+            }
+          ],
+          "depths": [
+            {
+              "lane": "high",
+              "depth": 12
+            },
+            {
+              "lane": "medium",
+              "depth": 13
+            },
+            {
+              "lane": "low",
+              "depth": 13
+            }
+          ],
+          "caption": "high has the highest score, 8, so it wins and gives back the total active weight, 13, leaving -5."
+        },
+        {
+          "number": 3,
+          "action": "pick",
+          "clockOffsetMillis": 0,
+          "winner": "medium",
+          "promoted": false,
+          "scores": [
+            {
+              "group": "high",
+              "score": 3
+            },
+            {
+              "group": "medium",
+              "score": -5
+            },
+            {
+              "group": "low",
+              "score": 2
+            }
+          ],
+          "depths": [
+            {
+              "lane": "high",
+              "depth": 12
+            },
+            {
+              "lane": "medium",
+              "depth": 12
+            },
+            {
+              "lane": "low",
+              "depth": 13
+            }
+          ],
+          "caption": "medium has the highest score, 8, so it wins and gives back the total active weight, 13, leaving -5."
+        },
+        {
+          "number": 4,
+          "action": "pick",
+          "clockOffsetMillis": 0,
+          "winner": "high",
+          "promoted": false,
+          "scores": [
+            {
+              "group": "high",
+              "score": -2
+            },
+            {
+              "group": "medium",
+              "score": -1
+            },
+            {
+              "group": "low",
+              "score": 3
+            }
+          ],
+          "depths": [
+            {
+              "lane": "high",
+              "depth": 11
+            },
+            {
+              "lane": "medium",
+              "depth": 12
+            },
+            {
+              "lane": "low",
+              "depth": 13
+            }
+          ],
+          "caption": "high has the highest score, 11, so it wins and gives back the total active weight, 13, leaving -2."
+        },
+        {
+          "number": 5,
+          "action": "pick",
+          "clockOffsetMillis": 0,
+          "winner": "high",
+          "promoted": false,
+          "scores": [
+            {
+              "group": "high",
+              "score": -7
+            },
+            {
+              "group": "medium",
+              "score": 3
+            },
+            {
+              "group": "low",
+              "score": 4
+            }
+          ],
+          "depths": [
+            {
+              "lane": "high",
+              "depth": 10
+            },
+            {
+              "lane": "medium",
+              "depth": 12
+            },
+            {
+              "lane": "low",
+              "depth": 13
+            }
+          ],
+          "caption": "high has the highest score, 6, so it wins and gives back the total active weight, 13, leaving -7."
+        },
+        {
+          "number": 6,
+          "action": "pick",
+          "clockOffsetMillis": 0,
+          "winner": "medium",
+          "promoted": false,
+          "scores": [
+            {
+              "group": "high",
+              "score": 1
+            },
+            {
+              "group": "medium",
+              "score": -6
+            },
+            {
+              "group": "low",
+              "score": 5
+            }
+          ],
+          "depths": [
+            {
+              "lane": "high",
+              "depth": 10
+            },
+            {
+              "lane": "medium",
+              "depth": 11
+            },
+            {
+              "lane": "low",
+              "depth": 13
+            }
+          ],
+          "caption": "medium has the highest score, 7, so it wins and gives back the total active weight, 13, leaving -6."
+        },
+        {
+          "number": 7,
+          "action": "pick",
+          "clockOffsetMillis": 0,
+          "winner": "high",
+          "promoted": false,
+          "scores": [
+            {
+              "group": "high",
+              "score": -4
+            },
+            {
+              "group": "medium",
+              "score": -2
+            },
+            {
+              "group": "low",
+              "score": 6
+            }
+          ],
+          "depths": [
+            {
+              "lane": "high",
+              "depth": 9
+            },
+            {
+              "lane": "medium",
+              "depth": 11
+            },
+            {
+              "lane": "low",
+              "depth": 13
+            }
+          ],
+          "caption": "high has the highest score, 9, so it wins and gives back the total active weight, 13, leaving -4."
+        },
+        {
+          "number": 8,
+          "action": "pick",
+          "clockOffsetMillis": 0,
+          "winner": "low",
+          "promoted": false,
+          "scores": [
+            {
+              "group": "high",
+              "score": 4
+            },
+            {
+              "group": "medium",
+              "score": 2
+            },
+            {
+              "group": "low",
+              "score": -6
+            }
+          ],
+          "depths": [
+            {
+              "lane": "high",
+              "depth": 9
+            },
+            {
+              "lane": "medium",
+              "depth": 11
+            },
+            {
+              "lane": "low",
+              "depth": 12
+            }
+          ],
+          "caption": "low has the highest score, 7, so it wins and gives back the total active weight, 13, leaving -6."
+        },
+        {
+          "number": 9,
+          "action": "pick",
+          "clockOffsetMillis": 0,
+          "winner": "high",
+          "promoted": false,
+          "scores": [
+            {
+              "group": "high",
+              "score": -1
+            },
+            {
+              "group": "medium",
+              "score": 6
+            },
+            {
+              "group": "low",
+              "score": -5
+            }
+          ],
+          "depths": [
+            {
+              "lane": "high",
+              "depth": 8
+            },
+            {
+              "lane": "medium",
+              "depth": 11
+            },
+            {
+              "lane": "low",
+              "depth": 12
+            }
+          ],
+          "caption": "high has the highest score, 12, so it wins and gives back the total active weight, 13, leaving -1."
+        },
+        {
+          "number": 10,
+          "action": "pick",
+          "clockOffsetMillis": 0,
+          "winner": "medium",
+          "promoted": false,
+          "scores": [
+            {
+              "group": "high",
+              "score": 7
+            },
+            {
+              "group": "medium",
+              "score": -3
+            },
+            {
+              "group": "low",
+              "score": -4
+            }
+          ],
+          "depths": [
+            {
+              "lane": "high",
+              "depth": 8
+            },
+            {
+              "lane": "medium",
+              "depth": 10
+            },
+            {
+              "lane": "low",
+              "depth": 12
+            }
+          ],
+          "caption": "medium has the highest score, 10, so it wins and gives back the total active weight, 13, leaving -3."
+        },
+        {
+          "number": 11,
+          "action": "pick",
+          "clockOffsetMillis": 0,
+          "winner": "high",
+          "promoted": false,
+          "scores": [
+            {
+              "group": "high",
+              "score": 2
+            },
+            {
+              "group": "medium",
+              "score": 1
+            },
+            {
+              "group": "low",
+              "score": -3
+            }
+          ],
+          "depths": [
+            {
+              "lane": "high",
+              "depth": 7
+            },
+            {
+              "lane": "medium",
+              "depth": 10
+            },
+            {
+              "lane": "low",
+              "depth": 12
+            }
+          ],
+          "caption": "high has the highest score, 15, so it wins and gives back the total active weight, 13, leaving 2."
+        },
+        {
+          "number": 12,
+          "action": "pick",
+          "clockOffsetMillis": 0,
+          "winner": "high",
+          "promoted": false,
+          "scores": [
+            {
+              "group": "high",
+              "score": -3
+            },
+            {
+              "group": "medium",
+              "score": 5
+            },
+            {
+              "group": "low",
+              "score": -2
+            }
+          ],
+          "depths": [
+            {
+              "lane": "high",
+              "depth": 6
+            },
+            {
+              "lane": "medium",
+              "depth": 10
+            },
+            {
+              "lane": "low",
+              "depth": 12
+            }
+          ],
+          "caption": "high has the highest score, 10, so it wins and gives back the total active weight, 13, leaving -3."
+        },
+        {
+          "number": 13,
+          "action": "pick",
+          "clockOffsetMillis": 0,
+          "winner": "medium",
+          "promoted": false,
+          "scores": [
+            {
+              "group": "high",
+              "score": 5
+            },
+            {
+              "group": "medium",
+              "score": -4
+            },
+            {
+              "group": "low",
+              "score": -1
+            }
+          ],
+          "depths": [
+            {
+              "lane": "high",
+              "depth": 6
+            },
+            {
+              "lane": "medium",
+              "depth": 9
+            },
+            {
+              "lane": "low",
+              "depth": 12
+            }
+          ],
+          "caption": "medium has the highest score, 9, so it wins and gives back the total active weight, 13, leaving -4."
+        },
+        {
+          "number": 14,
+          "action": "pick",
+          "clockOffsetMillis": 0,
+          "winner": "high",
+          "promoted": false,
+          "scores": [
+            {
+              "group": "high",
+              "score": 0
+            },
+            {
+              "group": "medium",
+              "score": 0
+            },
+            {
+              "group": "low",
+              "score": 0
+            }
+          ],
+          "depths": [
+            {
+              "lane": "high",
+              "depth": 5
+            },
+            {
+              "lane": "medium",
+              "depth": 9
+            },
+            {
+              "lane": "low",
+              "depth": 12
+            }
+          ],
+          "caption": "high has the highest score, 13, so it wins and gives back the total active weight, 13, leaving 0."
+        }
+      ]
+    },
+    {
+      "id": "promotion",
+      "title": "Jumping the queue when overdue",
+      "groups": [
+        "high",
+        "low"
+      ],
+      "lanes": [
+        {
+          "id": "high",
+          "group": "high"
+        },
+        {
+          "id": "low",
+          "group": "low"
+        }
+      ],
+      "steps": [
+        {
+          "number": 1,
+          "action": "enqueue",
+          "clockOffsetMillis": 0,
+          "winner": "",
+          "promoted": false,
+          "scores": [
+            {
+              "group": "high",
+              "score": 0
+            },
+            {
+              "group": "low",
+              "score": 0
+            }
+          ],
+          "depths": [
+            {
+              "lane": "high",
+              "depth": 2
+            },
+            {
+              "lane": "low",
+              "depth": 1
+            }
+          ],
+          "caption": "Items enter the lanes at 0 ms."
+        },
+        {
+          "number": 2,
+          "action": "pick",
+          "clockOffsetMillis": 0,
+          "winner": "high",
+          "promoted": false,
+          "scores": [
+            {
+              "group": "high",
+              "score": -1
+            },
+            {
+              "group": "low",
+              "score": 1
+            }
+          ],
+          "depths": [
+            {
+              "lane": "high",
+              "depth": 1
+            },
+            {
+              "lane": "low",
+              "depth": 1
+            }
+          ],
+          "caption": "high has the highest score, 8, so it wins and gives back the total active weight, 9, leaving -1."
+        },
+        {
+          "number": 3,
+          "action": "advance",
+          "clockOffsetMillis": 1000,
+          "winner": "",
+          "promoted": false,
+          "scores": [
+            {
+              "group": "high",
+              "score": -1
+            },
+            {
+              "group": "low",
+              "score": 1
+            }
+          ],
+          "depths": [
+            {
+              "lane": "high",
+              "depth": 1
+            },
+            {
+              "lane": "low",
+              "depth": 1
+            }
+          ],
+          "caption": "The oldest low item has waited 1000 ms against its 1000 ms wait limit."
+        },
+        {
+          "number": 4,
+          "action": "pick",
+          "clockOffsetMillis": 1000,
+          "winner": "low",
+          "promoted": true,
+          "scores": [
+            {
+              "group": "high",
+              "score": -1
+            },
+            {
+              "group": "low",
+              "score": 1
+            }
+          ],
+          "depths": [
+            {
+              "lane": "high",
+              "depth": 1
+            },
+            {
+              "lane": "low",
+              "depth": 0
+            }
+          ],
+          "caption": "low waited 1000 ms and reached its 1000 ms wait limit, so it jumps the queue and the scores do not move."
+        },
+        {
+          "number": 5,
+          "action": "pick",
+          "clockOffsetMillis": 1000,
+          "winner": "high",
+          "promoted": false,
+          "scores": [
+            {
+              "group": "high",
+              "score": -1
+            },
+            {
+              "group": "low",
+              "score": 0
+            }
+          ],
+          "depths": [
+            {
+              "lane": "high",
+              "depth": 0
+            },
+            {
+              "lane": "low",
+              "depth": 0
+            }
+          ],
+          "caption": "high has the highest score, 7, so it wins and gives back the total active weight, 8, leaving -1."
+        }
+      ]
+    }
+  ]
+}

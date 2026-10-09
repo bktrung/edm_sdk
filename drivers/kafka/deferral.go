@@ -1,275 +1,330 @@
 package kafka
 
 import (
-	"errors"
-	"fmt"
-	"strconv"
 	"time"
 
 	"github.com/twmb/franz-go/pkg/kgo"
 )
 
+type partitionPauseReason string
+
 const (
-	kafkaTimestampPrecision      = time.Millisecond
-	kafkaDeferralUpperNumerator  = 3
-	kafkaDeferralBandDenominator = 2
-	kafkaMaxDuration             = time.Duration(1<<63 - 1)
-	// kafkaDeferredHoldMinimum is the floor under a destination's hold limit.
-	// One waiting record must never be enough to hold a destination's fetches:
-	// the record behind it can be due sooner, and holding there is what makes
-	// it wait for a due time that is not its own.
-	kafkaDeferredHoldMinimum = 2
+	partitionPauseReadAhead partitionPauseReason = "read-ahead"
+	partitionPauseHeadHold  partitionPauseReason = "head-hold"
 )
 
-type deferralDecision struct {
-	due     time.Time
-	present bool
-	wait    bool
-	err     error
+type partitionPauseSet map[partitionPauseReason]struct{}
+
+func (s partitionPauseSet) add(reason partitionPauseReason) bool {
+	if _, exists := s[reason]; exists {
+		return false
+	}
+	s[reason] = struct{}{}
+	return len(s) == 1
 }
 
-func kafkaNow() time.Time {
-	return time.Now() //nolint:forbidigo // Kafka record timestamps and due headers use wall time.
+func (s partitionPauseSet) remove(reason partitionPauseReason) bool {
+	if _, exists := s[reason]; !exists {
+		return false
+	}
+	delete(s, reason)
+	return len(s) == 0
 }
 
-// evaluateDeferral decides what one record's due-time header means. delay is
-// the destination's declared delay, and zero is a destination that declares
-// none: a due-time header for such a destination is the fault below, not a
-// state to report, because the consumer reads the delay from its own config and
-// an absent destination is the answer rather than a gap in it.
-func evaluateDeferral(record *kgo.Record, delay time.Duration, now time.Time) deferralDecision {
-	due, present, err := recordDelayUntil(record)
-	if err != nil {
-		return deferralDecision{present: present, err: err}
-	}
-	if !present {
-		if delay > 0 {
-			return deferralDecision{err: errors.New("deferred due-time header is missing")}
-		}
-		return deferralDecision{}
-	}
-	if delay <= 0 {
-		return deferralDecision{present: true, err: errors.New("destination delay is zero")}
-	}
-	if record.Timestamp.IsZero() {
-		return deferralDecision{present: true, err: errors.New("record timestamp is missing")}
-	}
-	lower := record.Timestamp.Add(delay / kafkaDeferralBandDenominator)
-	upperOffset, upperRepresentable := kafkaDeferralUpperOffset(delay)
-	upper := time.Time{}
-	if upperRepresentable {
-		upper = record.Timestamp.Add(upperOffset)
-	}
-	if due.Before(lower) || (upperRepresentable && due.After(upper)) {
-		if !upperRepresentable {
-			return deferralDecision{due: due, present: true, err: fmt.Errorf("due time %s is outside destination delay band [%s, unbounded]", due, lower)}
-		}
-		return deferralDecision{due: due, present: true, err: fmt.Errorf("due time %s is outside destination delay band [%s, %s]", due, lower, upper)}
-	}
-	return deferralDecision{due: due, present: true, wait: due.After(now)}
-}
-
-func kafkaDeferralUpperOffset(delay time.Duration) (time.Duration, bool) {
-	// Split before multiplying so a legal delay near MaxInt64 cannot wrap.
-	half := delay / kafkaDeferralBandDenominator
-	remainder := delay % kafkaDeferralBandDenominator
-	available := kafkaMaxDuration - kafkaTimestampPrecision - remainder
-	if half > available/kafkaDeferralUpperNumerator {
-		return 0, false
-	}
-	return half*kafkaDeferralUpperNumerator + remainder + kafkaTimestampPrecision, true
-}
-
-func recordDelayUntil(record *kgo.Record) (time.Time, bool, error) {
-	var (
-		raw   []byte
-		found bool
-	)
-	for _, header := range record.Headers {
-		if header.Key != delayUntilHeader {
-			continue
-		}
-		if found {
-			return time.Time{}, true, errors.New("duplicate deferred due-time headers")
-		}
-		found = true
-		raw = header.Value
-	}
-	if !found {
-		return time.Time{}, false, nil
-	}
-	nanos, err := strconv.ParseInt(string(raw), 10, 64)
-	if err != nil {
-		return time.Time{}, true, fmt.Errorf("invalid deferred due-time header %q: %w", raw, err)
-	}
-	return time.Unix(0, nanos), true, nil
-}
-
-func outboundDue(messageDelay time.Time, destinationDelay time.Duration, known bool, now time.Time) time.Time {
-	if !messageDelay.IsZero() || !known || destinationDelay <= 0 {
-		return messageDelay
-	}
-	return now.Add(destinationDelay)
-}
+func (s partitionPauseSet) empty() bool { return len(s) == 0 }
 
 func (c *consumer) currentTime() time.Time {
 	return c.clock.Now()
 }
 
-func (c *consumer) admissionLocked(record *kgo.Record) bool {
-	destination := record.Topic
-	delay := c.cfg.Delays[destination]
-	decision := evaluateDeferral(record, delay, c.currentTime())
-	if decision.err != nil {
-		c.reportDeferralErrorLocked(record, decision.err)
+// kafkaTimestampPrecision is the resolution Kafka stores a record timestamp
+// at. A producer's CreateTime is written in milliseconds, so the timestamp a
+// consumer reads has already lost the sub-millisecond part of the instant the
+// producer published at; the two differ by less than this constant.
+const kafkaTimestampPrecision = time.Millisecond
+
+// dueTime returns the instant a deferred record becomes due, and whether it is
+// deferred at all.
+//
+// The due time is the record's publish instant plus its destination's declared
+// delay, and the port says a delivery is never earlier than that instant. The
+// stored timestamp is the publish instant rounded down to the resolution the
+// broker keeps, so the earliest instant consistent with it is the next
+// millisecond boundary: a due time taken from the stored value as it stands
+// would deliver up to a millisecond before the instant the publisher meant.
+func (c *consumer) dueTime(record *kgo.Record) (time.Time, bool) {
+	delay, known := c.cfg.Delays[record.Topic]
+	if !known || delay <= 0 || record.Timestamp.IsZero() {
+		return time.Time{}, false
 	}
-	if decision.wait {
-		// The record waits for its due time, and this destination holds it.
-		// The reason gates redelivery of a record this destination already
-		// delivered; it deliberately does not hold the fetches, because a
-		// record behind this one may be due sooner and is only reachable by
-		// reading past it. syncDeferredPauses bounds how many records may wait
-		// and holds the fetches at that bound.
-		c.setPauseReasonLocked(destination, pauseReasonDeferred, true)
+	return record.Timestamp.Truncate(kafkaTimestampPrecision).Add(kafkaTimestampPrecision).Add(delay), true
+}
+
+func (c *consumer) admissionLocked(record *kgo.Record) bool {
+	key := partitionKey{destination: record.Topic, partition: record.Partition}
+	// A requeued record is the head of its partition's queue and has already
+	// been delivered once, so the due-time hold does not apply to it: it is
+	// owed now, and the fetch hold of its partition is about fetching only.
+	requeued := c.requeued[key] > 0
+	if !requeued {
+		if due, deferred := c.dueTime(record); deferred && due.After(c.currentTime()) {
+			c.setHeadHoldLocked(key, due)
+			return false
+		}
 	}
 
-	budget := c.budgets[destination]
+	budget := c.budgets[record.Topic]
 	if budget <= 0 {
 		budget = 1
 	}
-	key := partitionKey{destination: destination, partition: record.Partition}
-	tracker := c.trackers[key]
-	hasRequeue := tracker != nil && tracker.hasRequeue(record.Offset)
-	reasons := c.pauseReasons[destination]
-	if decision.wait && !hasRequeue {
-		return false
-	}
-	if hasRequeue {
-		if !reasons.empty() && !reasons.permitsRedelivery() {
+	reasons := c.pauseReasons[record.Topic]
+	if requeued {
+		// A requeue is the redelivery of a delivery the destination already
+		// has in hand, so the destination's own hold must not refuse it. A
+		// user pause still does: the caller asked for this destination to
+		// stop, and a requeue is not the caller taking that back.
+		if !reasons.permitsRedelivery() {
 			return false
 		}
 	} else if reasons.blocksDelivery() {
 		return false
 	}
-	if c.unsettled[destination] >= budget && !hasRequeue {
-		// A requeue lifts this pause so the rewound partition can be fetched,
-		// and it keeps its slot charged until the redelivery settles. Pausing
-		// again here would forbid the very fetch the requeue is waiting for:
-		// franz-go does not fetch a paused topic, so the redelivery would never
-		// arrive. The pause comes back when the redelivery fills the budget in
-		// emit, or at the next refusal once the requeue has resolved.
-		if !c.hasPendingRequeueLocked(destination) {
-			c.setPauseReasonLocked(destination, pauseReasonPrefetch, true)
-		}
+	if c.unsettled[record.Topic] >= budget && !requeued {
+		// The redelivery enters emission as a reuse of the charge its
+		// predecessor holds, so it is not a second delivery against the
+		// budget. The pause comes back when the redelivery settles.
+		c.setPauseReasonLocked(record.Topic, pauseReasonPrefetch, true)
+		return false
+	}
+	if !requeued && c.cfg.Prefetch > 0 && c.admitted >= c.cfg.Prefetch {
+		return false
+	}
+	if c.outstanding[key] > 0 && !requeued {
+		// The hold rule: this partition already has a delivery outstanding, and
+		// the next one waits for it to settle. A requeue is the exception,
+		// because the redelivery of the outstanding offset is that partition's
+		// one delivery rather than a second one.
 		return false
 	}
 	return true
 }
 
-func (s pauseReasonSet) blocksDelivery() bool {
-	for reason := range s {
-		if !reason.holding() {
-			return true
-		}
+func (c *consumer) setHeadHoldLocked(key partitionKey, due time.Time) {
+	if c.heldUntil == nil {
+		c.heldUntil = make(map[partitionKey]time.Time)
 	}
-	return false
+	if previous, ok := c.heldUntil[key]; !ok || !previous.Equal(due) {
+		c.heldUntil[key] = due
+		c.syncHeadTimerLocked()
+	}
+	c.setPartitionPauseReasonLocked(key, partitionPauseHeadHold, true)
 }
 
-func (c *consumer) reportDeferralErrorLocked(record *kgo.Record, cause error) {
-	destination := record.Topic
-	if c.reportedDeferrals == nil {
-		c.reportedDeferrals = make(map[string]struct{})
+func (c *consumer) clearHeadHoldLocked(key partitionKey) {
+	delete(c.heldUntil, key)
+	c.setPartitionPauseReasonLocked(key, partitionPauseHeadHold, false)
+	c.syncHeadTimerLocked()
+}
+
+func (c *consumer) setPartitionPauseReasonLocked(key partitionKey, reason partitionPauseReason, add bool) {
+	if c.partitionPauses == nil {
+		c.partitionPauses = make(map[partitionKey]partitionPauseSet)
 	}
-	if _, reported := c.reportedDeferrals[destination]; reported {
+	reasons := c.partitionPauses[key]
+	if reasons == nil {
+		reasons = make(partitionPauseSet)
+		c.partitionPauses[key] = reasons
+	}
+	if add {
+		if !reasons.add(reason) {
+			return
+		}
+		if c.client != nil {
+			c.client.PauseFetchPartitions(map[string][]int32{key.destination: {key.partition}})
+		}
 		return
 	}
-	c.reportedDeferrals[destination] = struct{}{}
-	c.conn.log().Warn(
-		"kafka deferred delivery fault",
-		"destination", destination,
-		"condition", cause.Error(),
-		"partition", record.Partition,
-		"offset", record.Offset,
-	)
-}
-
-func (c *consumer) pendingDeadline(pending []*kgo.Record) (time.Time, bool) {
-	now := c.currentTime()
-	var (
-		earliest time.Time
-		found    bool
-	)
-	for _, record := range pending {
-		delay := c.cfg.Delays[record.Topic]
-		decision := evaluateDeferral(record, delay, now)
-		if !decision.wait || (found && !decision.due.Before(earliest)) {
-			continue
-		}
-		earliest = decision.due
-		found = true
+	if !reasons.remove(reason) {
+		return
 	}
-	return earliest, found
+	if reasons.empty() {
+		delete(c.partitionPauses, key)
+		c.resumePartitionIfFreeLocked(key)
+		c.wakePartitionLocked(key)
+	}
 }
 
-// syncDeferredPauses reconciles the deferred pauses with the records the poll
-// loop is holding. The loop runs it before every poll, so both pauses follow
-// the records in hand rather than the last admission.
-//
-// The two pauses are deliberately different. The deferred reason marks a
-// destination that holds a record waiting for its due time and gates
-// redelivery only. The hold reason is what keeps franz-go from fetching a
-// destination that already holds its fill of records waiting for a due time,
-// and that bound is the only thing the driver spends on records it cannot
-// deliver yet. Pausing the fetches at the first waiting record instead, as the
-// marker used to, holds the destination at a due time that is not the next one
-// owed: every record behind that one waits for it, however much sooner its own
-// due time is.
-func (c *consumer) syncDeferredPauses(pending []*kgo.Record) {
-	held := c.heldByDestination(pending)
+func (c *consumer) resumePartitionIfFreeLocked(key partitionKey) {
+	if c.client == nil || c.draining || c.stopped || !c.owned[key] {
+		return
+	}
+	if reasons := c.partitionPauses[key]; !reasons.empty() {
+		return
+	}
+	c.client.ResumeFetchPartitions(map[string][]int32{key.destination: {key.partition}})
+}
 
+// syncReadAheadPauses reconciles every partition's read-ahead reason with its
+// queue: a partition at its read-ahead limit is paused, one below it is not,
+// and a partition with a requeue waiting is never held for read-ahead, because
+// the redelivery it is waiting for has to reach the head.
+func (c *consumer) syncReadAheadPauses() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	// Releases run first, so no destination enters the map while it is ranged.
-	for destination, reasons := range c.pauseReasons {
-		if _, deferred := reasons[pauseReasonDeferred]; deferred && held[destination] == 0 {
-			c.setPauseReasonLocked(destination, pauseReasonDeferred, false)
-		}
-		if _, full := reasons[pauseReasonHold]; full && held[destination] < c.deferredHoldLimit(destination) {
-			c.setPauseReasonLocked(destination, pauseReasonHold, false)
-		}
+	// A held partition may have no queue left, and a queued one may hold no
+	// reason yet, so both sets are walked; reconciling a partition twice
+	// changes nothing the second time.
+	for key := range c.partitionPauses {
+		c.syncReadAheadPauseLocked(key)
 	}
-	for destination, count := range held {
-		c.setPauseReasonLocked(destination, pauseReasonDeferred, true)
-		if count >= c.deferredHoldLimit(destination) {
-			c.setPauseReasonLocked(destination, pauseReasonHold, true)
-		}
+	for key := range c.pending {
+		c.syncReadAheadPauseLocked(key)
 	}
 }
 
-// heldByDestination counts, per destination, the records pending is holding
-// that are not yet due. A record that is due is not one of them: the next
-// flushPending delivers it.
-func (c *consumer) heldByDestination(pending []*kgo.Record) map[string]int {
-	if len(pending) == 0 {
-		return nil
+// syncReadAheadAfterFlush reconciles the read-ahead reasons after the poll
+// loop's flushPending: over every partition when a pass of the flush was full,
+// and otherwise over the partitions the flush visited, the only ones whose
+// queue or requeue count it can have changed. A partition an event changed
+// while the flush ran is marked for the next pass, which reconciles it.
+func (c *consumer) syncReadAheadAfterFlush() {
+	if c.visitedAll {
+		c.syncReadAheadPauses()
+		return
 	}
-	held := make(map[string]int, len(c.destinations))
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for _, key := range c.visitedKeys {
+		c.syncReadAheadPauseLocked(key)
+	}
+}
+
+// syncReadAheadPauseLocked is syncReadAheadPauses for one partition. The caller
+// must hold c.mu.
+func (c *consumer) syncReadAheadPauseLocked(key partitionKey) {
+	count, limit, requeued := len(c.pending[key]), c.readAheadLimit(key.destination), c.requeued[key] > 0
+	if _, held := c.partitionPauses[key][partitionPauseReadAhead]; held && (count < limit || requeued) {
+		c.setPartitionPauseReasonLocked(key, partitionPauseReadAhead, false)
+	}
+	if count >= limit && !requeued {
+		c.setPartitionPauseReasonLocked(key, partitionPauseReadAhead, true)
+	}
+}
+
+const readAheadLimitNoHold = 100
+
+func (c *consumer) readAheadLimit(destination string) int {
+	return max(c.budgets[destination], readAheadLimitNoHold)
+}
+
+// syncHeadTimerLocked points the timer at the earliest held head, expired
+// entries included: it runs on a hold change, where the expired entry a fire
+// left behind is not the hold being armed for, and the fire's own re-arm
+// (rearmHeadTimerLocked) is what skips past it. The caller must hold c.mu.
+func (c *consumer) syncHeadTimerLocked() {
+	var earliest time.Time
+	for _, due := range c.heldUntil {
+		if earliest.IsZero() || due.Before(earliest) {
+			earliest = due
+		}
+	}
+	c.armHeadTimerLocked(earliest)
+}
+
+// rearmHeadTimerLocked points the timer at the earliest held head that is still
+// in the future, which is the wake a fire owes the holds it did not clear. The
+// head that armed the timer can stay held after its due: the caller paused its
+// destination, so the expired entry waits for the resume that delivers it.
+// Choosing that entry as the next due would arm a zero-duration timer, and
+// choosing it on every re-arm would spin the loop, so expired entries are
+// skipped here and the next wake is the next held head that can fire. The
+// caller must hold c.mu.
+func (c *consumer) rearmHeadTimerLocked() {
 	now := c.currentTime()
-	for _, record := range pending {
-		delay := c.cfg.Delays[record.Topic]
-		if evaluateDeferral(record, delay, now).wait {
-			held[record.Topic]++
+	var earliest time.Time
+	for _, due := range c.heldUntil {
+		if !due.After(now) {
+			continue
+		}
+		if earliest.IsZero() || due.Before(earliest) {
+			earliest = due
 		}
 	}
-	return held
+	c.armHeadTimerLocked(earliest)
 }
 
-// deferredHoldLimit is how many records waiting for a due time a destination
-// may hold before its fetches are held. The admission budget is the operator's
-// read-ahead knob and bounds how much work one destination keeps in flight, and
-// the floor keeps the guarantee this pause must not spend: one waiting record
-// is the record the poll loop is waiting for, and holding the fetches at that
-// first record is what hides everything behind it.
-func (c *consumer) deferredHoldLimit(destination string) int {
-	return max(c.budgets[destination], kafkaDeferredHoldMinimum)
+// armHeadTimerLocked points the one head timer at earliest, with the zero time
+// meaning no held head is waiting and the timer left unarmed. The caller must
+// hold c.mu.
+func (c *consumer) armHeadTimerLocked(earliest time.Time) {
+	if earliest.Equal(c.headTimerDue) {
+		return
+	}
+	if c.headTimerSet {
+		c.headTimer.Stop()
+		c.headTimerSet = false
+	}
+	c.headTimerDue = earliest
+	if !earliest.IsZero() && c.clock != nil {
+		delay := max(earliest.Sub(c.currentTime()), 0)
+		c.headTimer = c.clock.Timer(delay)
+		c.headTimerSet = true
+	}
+	if c.headTimerChanged != nil {
+		select {
+		case c.headTimerChanged <- struct{}{}:
+		default:
+		}
+	}
+}
+
+// headHoldLoop wakes the poll loop when the earliest held head record comes
+// due. It lives exactly as long as the poll loop does, because the poll loop is
+// the only writer of the hold set: once that loop has returned there is nothing
+// left to wake, and a consumer whose client was closed without a stop would
+// otherwise leave this goroutine behind.
+func (c *consumer) headHoldLoop() {
+	for {
+		c.mu.Lock()
+		done := c.pollDone
+		changed := c.headTimerChanged
+		var timerC <-chan time.Time
+		if c.headTimerSet {
+			timerC = c.headTimer.C
+		}
+		c.mu.Unlock()
+		select {
+		case <-done:
+			c.mu.Lock()
+			if c.headTimerSet {
+				c.headTimer.Stop()
+				c.headTimerSet = false
+			}
+			c.headTimerDue = time.Time{}
+			c.mu.Unlock()
+			return
+		case <-changed:
+			continue
+		case <-timerC:
+			c.mu.Lock()
+			// A fire that is not the current timer's is one this loop already
+			// replaced: re-arming stops the old timer, but a value it had
+			// already buffered stays readable on its channel. Acting on that
+			// value would stop the timer that replaced it and leave a held head
+			// with no wake of its own, so the loop waits for the next state
+			// change instead.
+			if c.headTimerSet && c.headTimer.C == timerC {
+				c.headTimer.Stop()
+				c.headTimerSet = false
+				c.headTimerDue = time.Time{}
+				// The fire woke polling for the head that armed the timer, but
+				// that head can still be held past its due, so the loop owes the
+				// holds it left behind the next held head's wake before it waits
+				// again.
+				c.rearmHeadTimerLocked()
+				c.wakePollLocked()
+			}
+			c.mu.Unlock()
+		}
+	}
 }

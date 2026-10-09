@@ -146,6 +146,16 @@ func TestConsumerDrainAfterCreationContextCancellation(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("EnsureTopology: %v", err)
 	}
+	t.Cleanup(func() {
+		management, err := newManagementClient(defaultEndpoint, driver.Config{})
+		if err != nil {
+			t.Errorf("cleanup %q: newManagementClient: %v", queue, err)
+			return
+		}
+		if _, err := management.deleteQueue(context.Background(), queue); err != nil {
+			t.Errorf("cleanup %q: delete queue: %v", queue, err)
+		}
+	})
 
 	consumer, err := conn.Consumer(ctx, driver.ConsumerConfig{Destinations: []string{queue}, Prefetch: 1})
 	if err != nil {
@@ -223,7 +233,7 @@ func TestStopReleasesReaderBlockedOnFullLane(t *testing.T) {
 		built.messages <- driver.InboundMessage{}
 	}
 	for deliveryTag := range cap(consumerLane.pending) {
-		consumerLane.pending <- amqp.Delivery{DeliveryTag: uint64(deliveryTag + 1)}
+		consumerLane.pending <- laneDelivery{Delivery: amqp.Delivery{DeliveryTag: uint64(deliveryTag + 1)}, generation: 1}
 	}
 	waitForwarderState(t, "paused forwarder", func() bool {
 		consumerLane.mu.Lock()
@@ -580,7 +590,15 @@ func TestNewConsumerRollsBackAfterLateFailure(t *testing.T) {
 		t.Fatalf("Purge: %v", err)
 	}
 	missing := queue + ".missing"
-	_, _ = maintenance.Prune(context.Background(), []string{missing})
+	results, err := maintenance.Prune(context.Background(), []string{missing})
+	if err != nil {
+		t.Logf("cleanup %q: prune: %v", missing, err)
+	}
+	for _, result := range results {
+		if !result.Deleted {
+			t.Logf("cleanup %q: prune kept %q: %s", missing, result.Name, result.Reason)
+		}
+	}
 
 	laneReady := make(chan struct{})
 	builtC := make(chan *consumer, 1)
@@ -626,13 +644,13 @@ func TestNewConsumerRollsBackAfterLateFailure(t *testing.T) {
 	for range cap(built.messages) {
 		built.messages <- driver.InboundMessage{}
 	}
-	firstLane.pending <- amqp.Delivery{DeliveryTag: 1001}
+	firstLane.pending <- laneDelivery{Delivery: amqp.Delivery{DeliveryTag: 1001}, generation: 1}
 	waitForwarderState(t, "paused first-lane forwarder", func() bool {
 		firstLane.mu.Lock()
 		defer firstLane.mu.Unlock()
 		return firstLane.emitting == 1
 	})
-	firstLane.pending <- amqp.Delivery{DeliveryTag: 1002}
+	firstLane.pending <- laneDelivery{Delivery: amqp.Delivery{DeliveryTag: 1002}, generation: 1}
 
 	raw, err := amqp.Dial(defaultEndpoint)
 	if err != nil {
@@ -856,5 +874,44 @@ func waitConsumerWaitGroupDone(t *testing.T, group *sync.WaitGroup, what string)
 	case <-done:
 	case <-time.After(time.Second): //nolint:forbidigo // bound construction rollback assertions
 		t.Fatalf("%s did not finish", what)
+	}
+}
+
+// TestReleaseRacingDrainCancellationAlwaysReturns proves that a Release whose
+// channel close overlaps a Drain's basic.cancel on the same channel returns.
+// AMQP does not correlate replies, so an unserialized Close could have its
+// close-ok taken by the Cancel and then wait forever.
+func TestReleaseRacingDrainCancellationAlwaysReturns(t *testing.T) {
+	queue := consumerAdmissionQueue(t)
+	connection := openConsumerAdmissionConn(t, queue)
+	const rounds = 100
+	for round := range rounds {
+		sdkConsumer, err := connection.Consumer(context.Background(), driver.ConsumerConfig{
+			Destinations: []string{queue},
+			Prefetch:     1,
+		})
+		if err != nil {
+			t.Fatalf("round %d: Consumer: %v", round, err)
+		}
+		drainDone := make(chan struct{})
+		go func() {
+			defer close(drainDone)
+			_ = sdkConsumer.Drain(context.Background())
+		}()
+		releaseDone := make(chan error, 1)
+		go func() { releaseDone <- sdkConsumer.Release(context.Background()) }()
+		select {
+		case err := <-releaseDone:
+			if err != nil {
+				t.Fatalf("round %d: Release: %v", round, err)
+			}
+		case <-time.After(5 * time.Second): //nolint:forbidigo // bound Release racing a drain cancellation
+			t.Fatalf("round %d: Release did not return while a drain cancellation raced its channel close", round)
+		}
+		select {
+		case <-drainDone:
+		case <-time.After(5 * time.Second): //nolint:forbidigo // bound Drain after Release
+			t.Fatalf("round %d: Drain did not return after Release", round)
+		}
 	}
 }

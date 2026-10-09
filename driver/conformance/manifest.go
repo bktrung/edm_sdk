@@ -15,16 +15,17 @@ type manifestEntry struct {
 
 var groupManifest = []manifestEntry{
 	{name: "publish", declared: 15},
-	{name: "consume", declared: 21},
+	{name: "consume", declared: 22},
 	{name: "settle", declared: 16},
 	{name: "ordering", declared: 8},
-	{name: "deferred", declared: 11},
+	{name: "deferred", declared: 8},
 	{name: "drain", declared: 16},
 	{name: "rebalance", declared: 11},
 	{name: "failure", declared: 23},
 	{name: "topology", declared: 19},
 	{name: "capability", declared: 27},
 	{name: "lag", declared: 5},
+	{name: "enqueue", declared: 6},
 }
 
 // pendingGroups lists groups without registered runners.
@@ -38,7 +39,6 @@ type groupContext struct {
 	profile             Profile
 	effective           driver.Capabilities
 	factoryCapabilities driver.Capabilities
-	deferralModel       DeferralModel
 	vector              BehaviorVector
 	checks              int
 	checkNames          map[string]struct{}

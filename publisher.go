@@ -15,7 +15,9 @@ import (
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/driver"
 )
 
-// Publisher publishes encoded events through a Client's connected driver.
+// Publisher publishes encoded events through a Client's connected driver. A
+// publisher returned by Client.Publisher may be shared by concurrent goroutines;
+// its zero value is not connected.
 type Publisher struct {
 	client *Client
 }
@@ -33,67 +35,59 @@ type publishOptions struct {
 	maxAttempts    int
 }
 
-// PublishOption configures one Publish or PublishBatch call. Construct values
-// with the With* functions; the concrete operation is intentionally private.
+// PublishOption configures one Publish or PublishBatch call. Construct options
+// with the With* functions; the zero value is invalid.
 type PublishOption struct {
 	apply func(*publishOptions) error
 }
 
-// Message is one item in a PublishBatch call, carrying the event type, payload,
-// and options that apply only to that item.
+// Message is one item in PublishBatch, with a required event type, payload, and
+// options that apply only to that item. Its zero value cannot be published.
 type Message struct {
 	EventType string
 	Payload   any
 	Opts      []PublishOption
 }
 
-// BatchResult reports each message's publish outcome in input order. A partial
-// failure is represented by the corresponding MessageResult entries rather
-// than by an atomicity claim.
+// BatchResult reports each message's outcome in input order. Partial failures
+// appear in the corresponding MessageResult entries; the batch is not atomic.
 type BatchResult struct {
 	Results []MessageResult
 }
 
-// MessageResult is one message's publish outcome; ID is empty when Err is set.
+// MessageResult contains one publish outcome. ID is empty when Err is set.
 type MessageResult struct {
 	ID  string
 	Err error
 }
 
-// Failed returns indexes of messages that did not publish.
-func (r BatchResult) Failed() []int {
-	failed := make([]int, 0)
-	for i, result := range r.Results {
-		if result.Err != nil {
-			failed = append(failed, i)
-		}
-	}
-	return failed
-}
-
-// WithTopic overrides what the topic is derived from. The value goes through
-// the same derivation as an event type.
+// WithTopic overrides the topic derived from the event type. A non-empty value
+// is normalized the same way as an event type; an empty value leaves the
+// original event type in use.
 func WithTopic(topic string) PublishOption {
 	return publishOption(func(options *publishOptions) error { options.topic = topic; return nil })
 }
 
-// WithKey sets the partition key; the same envelope value is used to derive
-// the broker routing key. It defaults to the subject and then the event ID.
+// WithKey sets the partition key. An empty key falls back to the subject and
+// then the event ID.
 func WithKey(key string) PublishOption {
 	return publishOption(func(options *publishOptions) error { options.key = key; return nil })
 }
 
-// WithSubject sets the business subject and default partition key.
+// WithSubject sets the business subject and uses it as the default partition
+// key when no key is set.
 func WithSubject(subject string) PublishOption {
 	return publishOption(func(options *publishOptions) error { options.subject = subject; return nil })
 }
 
-// WithPriority selects the delivery lane.
+// WithPriority selects the delivery lane. An undeclared priority returns an
+// error when the message is published.
 func WithPriority(priority Priority) PublishOption {
 	return publishOption(func(options *publishOptions) error { options.priority = priority; return nil })
 }
 
-// WithIdempotencyKey sets the application's stable deduplication key.
+// WithIdempotencyKey sets the application's stable deduplication key. An empty
+// key falls back to the generated event ID.
 func WithIdempotencyKey(key string) PublishOption {
 	return publishOption(func(options *publishOptions) error { options.idempotencyKey = key; return nil })
 }
@@ -109,7 +103,8 @@ func WithCausedBy(event *Event) PublishOption {
 	return publishOption(func(options *publishOptions) error { options.causedBy = event; return nil })
 }
 
-// WithHeader adds a user extension header.
+// WithHeader sets a user extension header. Reserved keys are rejected when the
+// message is published.
 func WithHeader(key, value string) PublishOption {
 	return publishOption(func(options *publishOptions) error {
 		if options.headers == nil {
@@ -120,7 +115,7 @@ func WithHeader(key, value string) PublishOption {
 	})
 }
 
-// WithExpiry sets the event expiration time.
+// WithExpiry sets the event's expiration time.
 func WithExpiry(expiry time.Time) PublishOption {
 	return publishOption(func(options *publishOptions) error { options.expiry = &expiry; return nil })
 }
@@ -179,11 +174,18 @@ func (p *Publisher) PublishBatch(ctx context.Context, messages []Message) (Batch
 	// is rejected immediately; it is never given the chance to slip through
 	// a later check while Close is already tearing the connection down.
 	p.client.mu.Lock()
-	if p.client.closed || p.client.shutdownStarted || p.client.conn == nil {
+	if err := p.client.admit(workPublishEntry, 0); err != nil {
 		p.client.mu.Unlock()
-		return result, errors.New("f1: client is closed")
+		return result, err
 	}
-	conn := p.client.conn
+	// The connection and its incarnation are one value, read in the section
+	// that records this publish as in flight: the admission the producer build
+	// later takes belongs to the connection that was current when the publish
+	// was admitted, and the epoch travels with it as the claim the build is
+	// re-checked against. Reading the epoch anywhere else would compare a claim
+	// about one incarnation against another.
+	current := p.client.current
+	epoch := current.epoch
 	effective := p.client.effective
 	headerMaxBytes := effectiveHeaderLimit(p.client.config.Codec.MaxHeaderBytes, effective.MaxHeaderBytes)
 	options := p.client.options
@@ -194,12 +196,38 @@ func (p *Publisher) PublishBatch(ctx context.Context, messages []Message) (Batch
 	p.client.mu.Unlock()
 	defer endPublish(p.client)
 
+	// The observer is read once after the admission section releases c.mu.
+	// recordObserverPanic takes c.mu, so the publish start must come after
+	// the Unlock above. Values only; nothing escapes on the nil path.
+	observer := p.client.observer
+	observeCtx := ctx
+	var publishGuard observerFinishGuard
+	observed := false
+	if observer != nil {
+		start := StartEvent{
+			Kind:      ObserverPublish,
+			At:        options.clock.Now(),
+			Route:     PublishRoutePrimary,
+			BatchSize: len(messages),
+		}
+		nextCtx, token := p.client.observeStart(ctx, start)
+		observeCtx = nextCtx
+		publishGuard = p.client.newObserverGuard(ObserverPublish, token)
+		observed = true
+		defer publishGuard.abandon()
+	}
+
 	outbound := make([]driver.OutboundMessage, len(messages))
 	ids := make([]string, len(messages))
+	var publishFields primaryPublishFields
 	for i, message := range messages {
-		outboundMessage, id, err := buildOutbound(ctx, options, effective, headerMaxBytes, source, producerIdentity, message)
+		outboundMessage, id, err := buildOutbound(ctx, observeCtx, p.client, options, effective, headerMaxBytes, source, producerIdentity, message, &publishFields)
 		if err != nil {
-			return result, fmt.Errorf("f1: message %d: %w", i, err)
+			methodErr := fmt.Errorf("f1: message %d: %w", i, err)
+			if observed {
+				finishPrimaryPublish(&publishGuard, FinishEvent{Outcome: ObserverOutcomeError, ErrorClass: errorClassOf(methodErr)}, result.Results)
+			}
+			return result, methodErr
 		}
 		// codec.maxBodyBytes is a caller-facing guardrail: it exists so an
 		// application publish with an oversized payload fails fast and
@@ -212,80 +240,71 @@ func (p *Publisher) PublishBatch(ctx context.Context, messages []Message) (Batch
 		// silent message-loss path, which is exactly the class of bug the
 		// SDK's own retry and DLQ handling exists to prevent.
 		if maxBodyBytes > 0 && len(outboundMessage.Body) > maxBodyBytes {
-			return result, fmt.Errorf("f1: message %d: body exceeds codec.maxBodyBytes (%d)", i, maxBodyBytes)
+			methodErr := fmt.Errorf("f1: message %d: body exceeds codec.maxBodyBytes (%d)", i, maxBodyBytes)
+			if observed {
+				finishPrimaryPublish(&publishGuard, FinishEvent{Outcome: ObserverOutcomeError, ErrorClass: errorClassOf(methodErr)}, result.Results)
+			}
+			return result, methodErr
 		}
 		outbound[i] = outboundMessage
 		ids[i] = id
 	}
+	var publishTopic string
+	var publishPriority Priority
+	if publishFields.set && !publishFields.topicMixed {
+		publishTopic = publishFields.topic
+	}
+	priorityKnown := publishFields.set && !publishFields.priorityMixed
+	if priorityKnown {
+		publishPriority = publishFields.priority
+	}
 
-	// This publish was already admitted above and is counted in Close's
-	// idle wait, so closing may legitimately be true here; only a fully
-	// closed client or a torn-down connection stop it from proceeding.
-	// publishAdmissionLocked's producerTeardown branch cannot fire on this
-	// path: beginPublish above already counted this call as in flight, and
-	// producerTeardown is only set once the publish-idle wait observes zero
-	// in-flight publishes, which cannot happen while this call is one of
-	// them. Moving beginPublish to run after this check would break that.
-	p.client.mu.Lock()
-	if err := publishAdmissionLocked(p.client, true); err != nil {
-		p.client.mu.Unlock()
-		return result, err
+	// This publish was already admitted by its entry gate above and is counted
+	// in Close's idle wait, so the lifecycle may legitimately have moved to
+	// Draining by now; only a closed client, a torn-down producer, or a failed
+	// or replaced connection stop it from proceeding. The producer-teardown
+	// refusal cannot fire on this path: beginPublish above already counted this
+	// call as in flight, and producerTeardown is only set once the publish-idle
+	// wait observes zero in-flight publishes, which cannot happen while this
+	// call is one of them. Moving beginPublish to run after this check would
+	// break that.
+	built := p.client.sharedProducer(ctx, workPublish, epoch, nil)
+	if built.refused != nil {
+		if observed {
+			finishPrimaryPublish(&publishGuard, FinishEvent{Topic: publishTopic, Priority: publishPriority, PriorityKnown: priorityKnown, Outcome: ObserverOutcomeError, ErrorClass: errorClassOf(built.refused)}, result.Results)
+		}
+		return result, built.refused
 	}
-	if !sameConnection(p.client.conn, conn) {
-		p.client.mu.Unlock()
-		return result, p.client.reconnectingError("publish")
+	if built.buildErr != nil {
+		warnUnclassifiedWithContext(p.client.options.logger, observeCtx, built.buildErr)
+		requestReconnectOnTransient(ctx, p.client, built.buildErr, epoch)
+		methodErr := fmt.Errorf("f1: create publisher: %w", built.buildErr)
+		if observed {
+			finishPrimaryPublish(&publishGuard, FinishEvent{Topic: publishTopic, Priority: publishPriority, PriorityKnown: priorityKnown, Outcome: ObserverOutcomeError, ErrorClass: errorClassOf(methodErr)}, result.Results)
+		}
+		return result, methodErr
 	}
-	producer := p.client.producerHandle
-	if producer != nil {
-		p.client.mu.Unlock()
-	} else {
-		p.client.mu.Unlock()
-		builtProducer, err := conn.Producer(ctx, driver.ProducerConfig{RequireDurableAck: true, Effective: effective})
-		if err == nil && builtProducer == nil {
-			err = errors.New("driver returned a nil producer")
-		}
-		if err != nil {
-			warnUnclassified(p.client.options.logger, err)
-			requestReconnectOnTransient(p.client, err)
-			return result, fmt.Errorf("f1: create publisher: %w", err)
-		}
-
-		var loser driver.Producer
-		p.client.mu.Lock()
-		err = publishAdmissionLocked(p.client, true)
-		if err == nil && !sameConnection(p.client.conn, conn) {
-			err = p.client.reconnectingError("publish")
-		}
-		if err == nil {
-			if p.client.producerHandle != nil {
-				producer = p.client.producerHandle
-				loser = builtProducer
-			} else {
-				producer = builtProducer
-				p.client.producerHandle = builtProducer
-			}
-		}
-		p.client.mu.Unlock()
-		if loser != nil {
-			closeDiscardedProducer(p.client, loser, ctx)
-		}
-		if err != nil {
-			closeDiscardedProducer(p.client, builtProducer, ctx)
-			return result, err
-		}
-	}
-	publishErr := producer.Publish(ctx, outbound...)
+	publishErr := built.producer.Publish(ctx, outbound...)
 	if publishErr == nil {
 		for i, id := range ids {
 			result.Results[i].ID = id
 		}
+		if observed {
+			finishPrimaryPublish(&publishGuard, FinishEvent{Topic: publishTopic, Priority: publishPriority, PriorityKnown: priorityKnown, Outcome: ObserverOutcomeOK}, result.Results)
+		}
 		return result, nil
 	}
 
-	warnPublishError(p.client.options.logger, publishErr)
-	requestReconnectOnTransient(p.client, publishErr)
+	warnPublishError(p.client.options.logger, observeCtx, publishErr)
+	requestReconnectOnTransient(ctx, p.client, publishErr, epoch)
 	var partial *driver.PublishError
-	if errors.As(publishErr, &partial) && len(partial.Failed) > 0 {
+	if errors.As(publishErr, &partial) && len(partial.Failed) > 0 && !failedIndexesInRange(partial.Failed, len(ids)) {
+		// A failure the report cannot place on a message leaves no way to tell
+		// which messages were published, so the whole batch reads as failed.
+		publishErr = fmt.Errorf("f1: the driver reported a failed message outside the batch: %w", publishErr)
+		partial = nil
+	}
+	if partial != nil && len(partial.Failed) > 0 {
 		for i, id := range ids {
 			result.Results[i].ID = id
 		}
@@ -295,20 +314,61 @@ func (p *Publisher) PublishBatch(ctx context.Context, messages []Message) (Batch
 		}
 		sort.Ints(failed)
 		for _, index := range failed {
-			if index >= 0 && index < len(result.Results) {
-				result.Results[index].ID = ""
-				result.Results[index].Err = partial.Failed[index]
+			cause := partial.Failed[index]
+			if cause == nil {
+				// The driver listed the message as failed without saying
+				// why; it still failed, so it must not read as published.
+				cause = errPublishFailedWithoutCause
 			}
+			result.Results[index].ID = ""
+			result.Results[index].Err = cause
+		}
+		if observed {
+			var firstErr error
+			for _, r := range result.Results {
+				if r.Err != nil {
+					firstErr = r.Err
+					break
+				}
+			}
+			finishPrimaryPublish(&publishGuard, FinishEvent{Topic: publishTopic, Priority: publishPriority, PriorityKnown: priorityKnown, Outcome: ObserverOutcomeError, ErrorClass: errorClassOf(firstErr)}, result.Results)
 		}
 		return result, nil
 	}
 	for i := range result.Results {
 		result.Results[i].Err = publishErr
 	}
+	if observed {
+		finishPrimaryPublish(&publishGuard, FinishEvent{Topic: publishTopic, Priority: publishPriority, PriorityKnown: priorityKnown, Outcome: ObserverOutcomeError, ErrorClass: errorClassOf(publishErr)}, result.Results)
+	}
 	return result, publishErr
 }
 
-func warnPublishError(logger *slog.Logger, err error) {
+// finishPrimaryPublish keeps raw application errors outside the observer
+// boundary. Callers gate it on observation so an unobserved publish does not
+// allocate or classify an additional result slice.
+func finishPrimaryPublish(guard *observerFinishGuard, event FinishEvent, results []MessageResult) {
+	event.Results = make([]ObserverMessageResult, len(results))
+	for i, result := range results {
+		event.Results[i] = ObserverMessageResult{ID: result.ID, ErrorClass: errorClassOf(result.Err)}
+	}
+	guard.finishWith(event)
+}
+
+func failedIndexesInRange(failed map[int]error, size int) bool {
+	for index := range failed {
+		if index < 0 || index >= size {
+			return false
+		}
+	}
+	return true
+}
+
+// errPublishFailedWithoutCause stands in for the nil cause of a message a
+// driver reported as failed.
+var errPublishFailedWithoutCause = errors.New("f1: the driver reported the message as not published without a cause")
+
+func warnPublishError(logger *slog.Logger, ctx context.Context, err error) {
 	if logger == nil {
 		return
 	}
@@ -319,23 +379,45 @@ func warnPublishError(logger *slog.Logger, err error) {
 		}
 		sort.Ints(indexes)
 		for _, index := range indexes {
-			warnUnclassified(logger, partial.Failed[index])
+			warnUnclassifiedWithContext(logger, ctx, partial.Failed[index])
 		}
 		return
 	}
-	warnUnclassified(logger, err)
+	warnUnclassifiedWithContext(logger, ctx, err)
 }
 
-func warnUnclassified(logger *slog.Logger, err error) {
+func warnUnclassifiedWithContext(logger *slog.Logger, ctx context.Context, err error) {
 	if logger == nil || err == nil {
 		return
 	}
 	if _, classified := driver.Classify(err); !classified {
-		logger.Warn("f1 unclassified publish error", "error", err)
+		logger.LogAttrs(ctx, slog.LevelWarn, "f1 unclassified publish error", slog.Any("error", err))
 	}
 }
 
-func buildOutbound(ctx context.Context, options clientOptions, effective driver.Capabilities, headerMaxBytes int, source, producerIdentity string, message Message) (driver.OutboundMessage, string, error) {
+type primaryPublishFields struct {
+	topic         string
+	priority      Priority
+	set           bool
+	topicMixed    bool
+	priorityMixed bool
+}
+
+func (f *primaryPublishFields) record(topic string, priority Priority) {
+	if f == nil {
+		return
+	}
+	if !f.set {
+		f.topic = topic
+		f.priority = priority
+		f.set = true
+		return
+	}
+	f.topicMixed = f.topicMixed || f.topic != topic
+	f.priorityMixed = f.priorityMixed || f.priority != priority
+}
+
+func buildOutbound(ctx, observeCtx context.Context, c *Client, options clientOptions, effective driver.Capabilities, headerMaxBytes int, source, producerIdentity string, message Message, fields *primaryPublishFields) (driver.OutboundMessage, string, error) {
 	if err := ctx.Err(); err != nil {
 		return driver.OutboundMessage{}, "", err
 	}
@@ -373,6 +455,7 @@ func buildOutbound(ctx context.Context, options clientOptions, effective driver.
 	if err := validatePublishTopic(options, topic, topicInput); err != nil {
 		return driver.OutboundMessage{}, "", err
 	}
+	fields.record(topic, publish.priority)
 	partitionKey := publish.key
 	if partitionKey == "" {
 		partitionKey = publish.subject
@@ -412,9 +495,71 @@ func buildOutbound(ctx context.Context, options clientOptions, effective driver.
 		envelope.TraceParent = publish.causedBy.envelope.TraceParent
 		envelope.TraceState = publish.causedBy.envelope.TraceState
 	}
+	// The message_built stage starts after the ID and the envelope identity
+	// are known and before EncodeHeaders. The observer and the injector are
+	// read once from the client; options stays the by-value snapshot the
+	// publish uses. The guard is a value, and nothing escapes when the
+	// observer is nil.
+	observer := c.observer
+	injector := c.traceInjector
+	var guard observerFinishGuard
+	var base FinishEvent
+	observed := false
+	entryPoint := publishEntryPoint(source, topic, publish.priority)
+	if observer != nil {
+		correlationID := envelope.CorrelationID
+		if correlationID == "" {
+			correlationID = id
+		}
+		destination := entryPoint
+		start := StartEvent{
+			Kind:          ObserverMessageBuilt,
+			At:            options.clock.Now(),
+			Topic:         topic,
+			Destination:   destination,
+			MessageID:     id,
+			EventType:     message.EventType,
+			Priority:      publish.priority,
+			Attempt:       1,
+			CorrelationID: correlationID,
+		}
+		nextCtx, token := c.observeStart(observeCtx, start)
+		observeCtx = nextCtx
+		base = FinishEvent{
+			Topic:         topic,
+			Destination:   destination,
+			MessageID:     id,
+			EventType:     message.EventType,
+			Priority:      publish.priority,
+			PriorityKnown: true,
+			Attempt:       1,
+			CorrelationID: correlationID,
+		}
+		guard = c.newObserverGuard(ObserverMessageBuilt, token)
+		observed = true
+		defer guard.abandon()
+	}
+	if injector != nil {
+		traceParent, traceState := c.injectTrace(observeCtx)
+		if traceParent != "" {
+			envelope.TraceParent = traceParent
+			envelope.TraceState = traceState
+		}
+	}
 	headerMap, err := envelope.EncodeHeaders(headerMaxBytes)
 	if err != nil {
+		if observed {
+			finish := base
+			finish.Outcome = ObserverOutcomeError
+			finish.ErrorClass = errorClassOf(err)
+			guard.finishWith(finish)
+		}
 		return driver.OutboundMessage{}, "", err
+	}
+	if observed {
+		finish := base
+		finish.Outcome = ObserverOutcomeOK
+		guard.finishWith(finish)
 	}
 	headers := make([]driver.Header, 0, len(headerMap))
 	keys := make([]string, 0, len(headerMap))
@@ -426,7 +571,7 @@ func buildOutbound(ctx context.Context, options clientOptions, effective driver.
 		headers = append(headers, driver.Header{Key: key, Value: []byte(headerMap[key])})
 	}
 	return driver.OutboundMessage{
-		Destination: publishEntryPoint(source, topic, publish.priority),
+		Destination: entryPoint,
 		EntryPoint:  isFanoutEntryPoint(effective),
 		Key:         []byte(partitionKey),
 		Headers:     headers,
@@ -478,7 +623,7 @@ func sourceEnvironment(source string) string {
 }
 
 func publishEntryPoint(source, topic string, priority Priority) string {
-	return fmt.Sprintf("f1.%s.%s.%s", sourceEnvironment(source), topic, priority.String())
+	return "f1." + sourceEnvironment(source) + "." + topic + "." + priority.String()
 }
 
 // isFanoutEntryPoint reports whether a publish entry point is declared as a

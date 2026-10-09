@@ -2,17 +2,17 @@ package f1
 
 import (
 	"errors"
+	"maps"
 	"slices"
-	"time"
+
+	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/wire"
 )
 
 // classifiedError carries one handler outcome through wrapped error chains.
 type classifiedError struct {
-	err        error
-	terminal   bool
-	dropped    bool
-	retryDelay time.Duration
-	hasDelay   bool
+	err      error
+	terminal bool
+	dropped  bool
 }
 
 const (
@@ -55,7 +55,7 @@ func (e *detailsError) DeathDetails() map[string]string {
 // keys or 1 KiB encoded, is discarded and reported when the message is
 // dead-lettered rather than failing the message. Returns nil for a nil err, so
 // "return f1.WithDetails(doWork(), d)" is safe on the success path. Composes
-// in either direction with the three classification helpers.
+// in either direction with Terminal and Drop.
 func WithDetails(err error, details map[string]string) error {
 	if err == nil {
 		return nil
@@ -69,7 +69,7 @@ func WithDetails(err error, details map[string]string) error {
 			continue
 		}
 		valid[key] = value
-		encodedBytes += len("f1detail") + len(key) + len(value)
+		encodedBytes += len(wire.DetailPrefix) + len(key) + len(value)
 	}
 	if len(valid) > maxDeathDetailKeys || encodedBytes > maxDeathDetailBytes {
 		discarded = make([]string, 0, len(details))
@@ -107,9 +107,7 @@ func collectDeathDetails(err error) (map[string]string, []string) {
 				if details == nil {
 					details = make(map[string]string)
 				}
-				for key, value := range carrier.DeathDetails() {
-					details[key] = value
-				}
+				maps.Copy(details, carrier.DeathDetails())
 			}
 			discarded = append(discarded, carrier.discardedDetails()...)
 			return
@@ -141,7 +139,8 @@ func (e *classifiedError) Unwrap() error {
 	return e.err
 }
 
-// Terminal marks err as permanently failed. A terminal error bypasses retries.
+// Terminal marks err as permanently failed so the message bypasses retries.
+// It returns nil when err is nil.
 func Terminal(err error) error {
 	if err == nil {
 		return nil
@@ -149,17 +148,8 @@ func Terminal(err error) error {
 	return &classifiedError{err: err, terminal: true}
 }
 
-// RetryAfter marks err as retryable and asks for delay on the next attempt.
-// The runtime routes delay to the nearest retry tier and uses that tier's
-// nominal delay, so delay selects a tier rather than the exact wait.
-func RetryAfter(err error, delay time.Duration) error {
-	if err == nil {
-		return nil
-	}
-	return &classifiedError{err: err, retryDelay: delay, hasDelay: true}
-}
-
-// Drop marks err as handled and prevents another delivery attempt.
+// Drop marks err as handled so the message is acknowledged without another
+// delivery attempt. It returns nil when err is nil.
 func Drop(err error) error {
 	if err == nil {
 		return nil
@@ -185,17 +175,9 @@ func IsTerminal(err error) bool {
 	return false
 }
 
-// IsDropped reports the dropped flag on the first classified error errors.As finds in err's error tree.
+// IsDropped reports whether the first classified error in err's error tree is
+// marked dropped.
 func IsDropped(err error) bool {
 	var classified *classifiedError
 	return errors.As(err, &classified) && classified.dropped
-}
-
-// RetryDelay reports the explicit delay on the first classified error errors.As finds in err's error tree.
-func RetryDelay(err error) (time.Duration, bool) {
-	var classified *classifiedError
-	if !errors.As(err, &classified) || !classified.hasDelay {
-		return 0, false
-	}
-	return classified.retryDelay, true
 }

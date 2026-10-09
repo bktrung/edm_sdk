@@ -1,128 +1,84 @@
-# Parking retries without head-of-line delay: the RabbitMQ ladder
+# One queue per retry step keeps short RabbitMQ retries from waiting behind long ones
 
-*By trungbk, September 2026.*
+*By trungbk.*
 
-A retry in F1 is a new copy of a failed message with a due time, the moment before which no handler may see it. On RabbitMQ that copy has to wait somewhere until then, and RabbitMQ has no delayed delivery of its own. The RabbitMQ driver, F1's adapter for that broker, builds the wait out of ordinary queues.
+A retry due in 25 s can hold up one due in 1 s if both share a parking queue. Under RabbitMQ's head-of-queue expiration model, the short-delay copy behind the long-delay copy is not eligible for dead-lettering until the head can expire.
 
-A single parking queue with a per-message expiry created unbounded head-of-line delay: a message due soon could wait behind one due later. The current design uses a ladder of queues, one per fixed delay, and trades that defect for a bounded amount of lateness. It does not guarantee absolute due-time order for messages published at different times.
+F1 gives each [retry step](/learn/glossary#retry-tier) its own [parking queue](/learn/glossary#parking-queue) to avoid that cross-step head-of-line blocking. Copies on the same step normally carry the same delay, so an earlier copy does not have a later expiration than the copies behind it.
+
+Expiration makes a copy eligible to leave the parking queue; it does not promise when dead-letter routing completes or when a consumer runs the handler. The delay is a minimum wait, not an end-to-end completion bound.
+
+The timeline compares copies A and B parked at the same moment with illustrative delays of 25 s and 1 s. It shows expiration eligibility, not measured delivery times.
+
+<div class="f1-timeline">
+<svg viewBox="0 0 640 232" role="img" aria-label="Illustrative expiration eligibility: in a shared queue B waits behind A until 25 s. With separate retry-step queues B is eligible at 1 s and A at 25 s. Actual dead-letter routing and consumption can finish later.">
+<text class="f1-timeline__section" x="10" y="22">One queue shared by every step</text>
+<text class="f1-timeline__row" x="10" y="51">A, due 25 s</text>
+<rect class="f1-timeline__due" x="150" y="36" width="350" height="22" rx="4" />
+<text class="f1-timeline__in" x="158" y="51">eligible at 25 s</text>
+<text class="f1-timeline__row" x="10" y="79">B, due 1 s</text>
+<rect class="f1-timeline__due" x="150" y="64" width="14" height="22" rx="4" />
+<rect class="f1-timeline__late" x="164" y="64" width="336" height="22" rx="4" />
+<text class="f1-timeline__in" x="172" y="79">behind A until 25 s, past its 1 s expiry</text>
+<text class="f1-timeline__section" x="10" y="122">One queue per retry step</text>
+<text class="f1-timeline__row" x="10" y="151">A, due 25 s</text>
+<rect class="f1-timeline__due" x="150" y="136" width="350" height="22" rx="4" />
+<text class="f1-timeline__in" x="158" y="151">separate queue, eligible at 25 s</text>
+<text class="f1-timeline__row" x="10" y="179">B, due 1 s</text>
+<rect class="f1-timeline__due" x="150" y="164" width="14" height="22" rx="4" />
+<text class="f1-timeline__out" x="172" y="179">separate queue, eligible at 1 s</text>
+<line class="f1-timeline__axis" x1="150" y1="200" x2="598" y2="200" />
+<line class="f1-timeline__axis" x1="150" y1="197" x2="150" y2="203" />
+<text class="f1-timeline__tick" x="150" y="220" text-anchor="middle">0 s</text>
+<line class="f1-timeline__axis" x1="262" y1="197" x2="262" y2="203" />
+<text class="f1-timeline__tick" x="262" y="220" text-anchor="middle">8 s</text>
+<line class="f1-timeline__axis" x1="374" y1="197" x2="374" y2="203" />
+<text class="f1-timeline__tick" x="374" y="220" text-anchor="middle">16 s</text>
+<line class="f1-timeline__axis" x1="486" y1="197" x2="486" y2="203" />
+<text class="f1-timeline__tick" x="486" y="220" text-anchor="middle">24 s</text>
+<line class="f1-timeline__axis" x1="598" y1="197" x2="598" y2="203" />
+<text class="f1-timeline__tick" x="598" y="220" text-anchor="middle">32 s</text>
+</svg>
+<p class="f1-timeline__legend"><span class="f1-timeline__key f1-timeline__key--due"></span>waiting until due <span class="f1-timeline__key f1-timeline__key--late"></span>waiting past due</p>
+</div>
 
 ## Background
 
-The driver reports no native delay (`NativeDelay: false` in [`Capabilities`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/drivers/rabbitmq/rabbitmq.go)), so it builds one from two RabbitMQ features. A delayed message is published to a parking queue that sits beside its destination, the queue F1 would otherwise publish it to. The message waits there until its time to live (TTL) runs out. RabbitMQ then dead-letters it: it republishes the expired message to the exchange the parking queue names for that purpose. An exchange is the routing step every RabbitMQ publish passes through on its way to a queue.
+A parking queue dead-letters expired copies to the retry destination, not the original topic queue. The extra queue lets the broker hold the copy without tying up a handler or keeping the original delivery unacked for the entire delay.
 
-[`parkingArguments`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/drivers/rabbitmq/topology.go) points each parking queue at the default exchange, the one with the empty name, which delivers a message to the queue named by its routing key. The dead-letter routing key is the destination's name, so an expired message lands in the destination queue, where the subscription's consumers pick it up like any other.
+The [RabbitMQ driver reference](/drivers/rabbitmq#delayed-and-retried-messages-need-per-destination-parking-queues) owns provisioning policy, durability, expiration rounding, limits, and queue settings. The executable owners are [topology construction](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/drivers/rabbitmq/topology.go) and [publish routing](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/drivers/rabbitmq/producer.go).
+
+## One retry, step by step
+
+1. The handler returns a retryable error. F1 picks the retry step for this attempt and records the copy's due time: the moment it builds the copy plus that step's delay.
+2. It publishes the copy to the step's retry destination, for example `f1.<env>.orders.<subscription>.high.retry.2`. The source delivery is acked only after the copy is confirmed.
+3. The driver routes every message for that destination to `<destination>.park` and sets the step's delay as the message's expiration.
+4. Once expired and at the queue head, the copy is eligible for dead-letter routing to the retry destination. Routing and later consumption are separate steps and can take longer.
 
 ```mermaid
-flowchart LR
-  Producer["Producer"] -->|"publish"| Park["Parking queue<br/>orders.park.2s"]
-  Park -->|"TTL expires<br/>dead-letter"| DefaultEx["Default exchange<br/>(nameless)"]
-  DefaultEx -->|"routing key<br/>orders"| Dest["Destination queue<br/>orders"]
+flowchart TB
+    R[Retry copy] --> Q[Parking queue]
+    Q -->|Expired at head| D[Retry destination]
 ```
 
-In F1 today, every delay comes from the retry path: when a handler fails, F1 publishes a retry copy with a due time. The driver port accepts a due time on any outbound message; F1's public `Publish` never sets one. At publish time, [`target`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/drivers/rabbitmq/producer.go) subtracts now from the due time and picks a parking queue from what remains. A message sent without a due time to a deferred destination, one declared with a fixed delay, gets that destination's delay.
+The delay stays on each message rather than in the queue's name or TTL arguments. This lets a policy change reuse the queue instead of requiring new broker topology. The trade-off appears when the delay decreases: a new short-delay copy can sit behind an older long-delay copy in that step's queue. Rolling deployments can produce the same mixture.
 
-Every publish from the driver is mandatory and uses publisher confirms. Mandatory means RabbitMQ hands back a message it cannot route to any queue instead of dropping it. Publisher confirms means RabbitMQ acknowledges each publish once it has taken responsibility for it. An unroutable message comes back first as a return, then as a confirm, and that return matters later, when a parking queue is missing.
+## Dead-letter safety
 
-The full reference for parking queues and their arguments is in [Drivers and capabilities](/drivers-and-capabilities).
+Confirming the copy in the parking queue protects the first publish, not the later dead-letter transfer. F1 can already have acked the original when that transfer happens, so loss on the parking-to-destination route would lose the retry.
 
-## How it works
-
-The first version, commit `2546ff5`, had one parking queue per destination. For `orders` that was `orders.park`. Every delayed message for `orders` went there with a per-message expiration, a TTL set on the message itself, equal to its remaining delay.
-
-The defect is in how RabbitMQ handles that kind of expiry. It expires a per-message TTL only when the message reaches the head of its queue. A message with a short TTL that sits behind one with a long TTL cannot leave until the one in front of it has.
-
-Commit `8e080c1` replaced the single queue with a ladder. Each deferred destination now has eight parking queues, called rungs, one per fixed delay:
-
-| Rung | 500ms | 1s | 2s | 4s | 8s | 16s | 32s | 64s |
-| --- | --- | --- | --- | --- | --- | --- | --- | --- |
-
-For `orders` they are `orders.park.500ms`, `orders.park.1s`, and so on up to `orders.park.64s`. [`rungParkingArguments`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/drivers/rabbitmq/topology.go) declares each rung queue with a queue-level TTL, `x-message-ttl`, equal to its rung. Messages parked there carry no expiration of their own.
-
-That removes the unbounded head-of-line defect. Every message in a rung queue has the same TTL, so the queue expires messages in enqueue order instead of comparing different per-message TTLs. The ladder still does not guarantee absolute due-time order across messages published at different times: each message is assigned a rung from its remaining delay when it is published.
-
-[`parkRung`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/drivers/rabbitmq/topology.go) rounds the remaining delay up to the smallest rung at least as large. Rounding up ensures a message is never released early, because its rung is at least its remaining delay at publish time.
-
-Back to the running example. "far", 3 s away, goes to `orders.park.4s`, and "near", 0.5 s away, goes to `orders.park.500ms`. They are in different queues now, so "near" leaves at about 0.5 s and "far" at about 4 s.
-
-The cost is lateness of less than one rung. A 5 s delay parks in the 8 s rung and comes out at about 8 s, 3 s late. A 25 s delay parks in the 32 s rung and comes out about 7 s late.
-
-Eight rungs are enough for the retry path at the shipped defaults. The retry delays there are 1 s, 5 s, and 25 s, so no retry delay exceeds the 30 s `MaxInterval`, and the top rung of 64 s covers it with a rung to spare.
-
-## Measured
-
-[`TestDeferredDueOrderSurvivesReversedPublishOrder`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/drivers/rabbitmq/deferred_integration_test.go) pins the fix. It publishes "far" due in 2 s and then "near" due in 500 ms through the driver, and reads arrivals straight from the destination queue. Neither message may arrive before its due time or more than 700 ms after it, and "near" must arrive first. The test runs only against a real broker, under the repository's `integration` build tag.
-
-Reproduce it with:
-
-```sh
-make broker-up
-F1_RABBITMQ_ENDPOINT=amqp://guest:guest@localhost:5672/ go test -count=1 -tags integration -run TestDeferredDueOrderSurvivesReversedPublishOrder ./drivers/rabbitmq/
-```
-
-Commit `4dd4f7e` made the driver declare that cost. It reports a `DelayAccuracy` that [`delayAccuracyForLadder`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/drivers/rabbitmq/rabbitmq.go) computes from the rung table itself. The floor is the first rung, 500 ms, and the ceiling is the last, 64 s. The relative bound is the largest step between two neighbouring rungs as a fraction of the smaller one. Every rung doubles the one before, so `(rungs[i] - rungs[i-1]) / rungs[i-1]` is 1 across the whole ladder. Editing a rung changes the declaration with it, so the two cannot drift.
-
-`Client.Limits()` renders the declaration for this driver as:
-
-> `late by at most the requested delay, or 500ms, whichever is larger, for a delay of at most 1m4s; no bound above that`
-
-Read plainly: a delay under 500 ms can be up to 500 ms late, a delay up to 64 s can be late by as much as the delay itself, and above 64 s nothing bounds the lateness.
-
-## Above the ladder
-
-A delay above 64 s still goes to `orders.park` with a per-message expiration. The comment in `target` gives the reason: rounding such a delay down into the top rung would release it early. The single-queue head-of-line defect therefore still applies above the ladder.
-
-At the shipped defaults the retry path never gets there. Two things can. The configuration puts no upper limit on `MaxInterval`, so a service that raises it far enough produces retry delays above 64 s. And code that uses the driver directly can publish with a due time more than a minute out.
-
-The longest per-message expiration [`expirationMillis`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/drivers/rabbitmq/producer.go) sets is 2147483647 ms, about 24.8 days. A longer delay is cut to that.
-
-## Names that parse one way
-
-A rung queue's name is the destination, then `.park`, then a tag from a closed set: `500ms`, `1s`, `2s`, `4s`, `8s`, `16s`, `32s`, `64s`. The topology path that declares the queues and the publish path that routes to them build the names from the same helpers.
-
-Reading a name back, in [`parkQueueParts`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/drivers/rabbitmq/topology.go), is a lookup in that set. A name that merely has something after `.park.` is not a parking queue, so `orders.park.eligible` stays an ordinary destination. The conformance suite declares a destination called `topology.prune.park.eligible`, and a parser that split on `.park.` would take it for a rung queue of `topology.prune`.
-
-F1 reserves destination names ending in `.park` or in `.park.<rung tag>`.
-
-## Losing a retry quietly
-
-Parking queues take the connection's queue type, classic or quorum. Since commit `fb3b351`, [`parkingArguments`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/drivers/rabbitmq/topology.go) declares a quorum parking queue with these arguments:
-
-- `x-queue-type=quorum`
-- `x-dead-letter-exchange=""`, the default exchange
-- `x-dead-letter-routing-key=<destination>`
-- `x-dead-letter-strategy=at-least-once`
-- `x-overflow=reject-publish`
-
-The code comment records why the last two are there. RabbitMQ dead-letters at least once only when the strategy, the overflow setting and the dead-letter exchange are all set. Remove any one of them and it downgrades to at-most-once, with no error from the broker. The parking queue is the delay mechanism itself, so a message lost on its way out is a retry dropped without a trace.
-
-Classic queues do not support at-least-once dead-lettering. On a classic deployment the delay path stays at-most-once.
-
-## When the parking queue is missing
-
-A publish can reach the broker before its parking queue exists. Because every publish is mandatory, RabbitMQ returns the message with `312 NO_ROUTE`, a reply that does not say a queue is missing or how it should have been created.
-
-Commit `d691990` made that failure readable. The driver matches each return to its message by message ID. When the message was bound for a parking queue, [`parkingFailure`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/drivers/rabbitmq/producer.go) rewrites the error:
-
-```text
-rabbitmq: parking destination "orders.park.2s" is missing: a delayed or retried message is parked there until its delay expires, so the adapter declares the queue durable under TopologyDeclare and requires it under TopologyVerify, and under TopologyNone the operator provisions it with the declare arguments ...
-```
-
-The new message names the queue, says who creates it under each topology policy, and lists its declare arguments. Those arguments are rendered by [`parkArguments`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/drivers/rabbitmq/topology.go), the same function that builds them for the declaration, so the text cannot drift from what the driver declares. The rewritten error keeps its original classification.
-
-Topology policy decides who creates the parking queues. Under `TopologyDeclare` the driver declares them when the subscription starts. Under `TopologyVerify` they must already exist with matching arguments, checked at subscription start. Under `TopologyNone` an operator provisions them and the driver checks nothing.
+Quorum parking queues use at-least-once dead-lettering with reject-publish overflow because the dead-letter strategy depends on that overflow mode. A dead-letter route alone is not enough. Classic parking queues cannot provide that mode, leaving the transfer at-most-once even when the initial publish was confirmed. Queue type therefore changes the failure boundary, not just the storage choice; the driver reference holds the exact declaration settings.
 
 ## Limits and trade-offs
 
-- A delayed message can be late by up to its own delay, or by up to 500 ms when the delay is shorter than that.
-- Messages published at different times can arrive out of absolute due-time order, even though the ladder prevents the unbounded head-of-line delay of the single per-message-TTL queue.
-- Each deferred destination needs nine parking queues: eight rungs and one for delays above the ladder.
-- Above 64 s, a message can still wait behind one due later.
-- On classic queues a dead-lettered message can be lost, so the delay path is at-most-once.
+- Separating retry steps avoids cross-step head-of-line blocking at the cost of an extra queue per delayed destination.
+- Reusing a queue across delay changes avoids topology churn but permits mixed-delay head-of-line blocking within that step.
+- Expiration supplies no maximum for dead-letter transfer, consumer pickup, or handler completion.
 
-## Read the code
+## Go further
 
-- [`drivers/rabbitmq/topology.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/drivers/rabbitmq/topology.go) - `parkRungs` and its comment on why the ladder exists, then `parkRung`, `parkQueueParts`, `parkingArguments`, and `rungParkingArguments`.
-- [`drivers/rabbitmq/producer.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/drivers/rabbitmq/producer.go) - `target` routes by remaining delay; `parkingFailure` rewrites the missing-queue error.
-- [`drivers/rabbitmq/rabbitmq.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/drivers/rabbitmq/rabbitmq.go) - `delayAccuracyForLadder` turns the rung table into the declared bound.
-- [`drivers/rabbitmq/deferred_integration_test.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/drivers/rabbitmq/deferred_integration_test.go) - the reversed-publish-order regression test.
-- [Drivers and capabilities](/drivers-and-capabilities) - the reference for parking queues, their arguments, and topology policies.
+- [RabbitMQ driver](/drivers/rabbitmq#delayed-and-retried-messages-need-per-destination-parking-queues) - topology, durability, expiration rounding, and settings.
+- [Failure handling](/advanced-topics/failure-handling) - retry delays and dead-letter policy.
+- [Consume flow](/development/consume-flow) - where retry copies are created and acked.
+- [Kafka retry delays](/deep-dives/kafka-retry-delays) - the same retry steps on a broker with no parking queue.
+- [Source-reading guide](/development/source-reading-guide) - the maintainer route through the implementation.

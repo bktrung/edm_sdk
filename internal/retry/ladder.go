@@ -15,7 +15,8 @@ type Config struct {
 	Tiers           []time.Duration
 }
 
-// DelayFor returns the nominal delay for a one-based retry number.
+// DelayFor returns the nominal delay for a one-based retry number, capped by a
+// positive MaxInterval. Decaying delays can reach zero.
 func (c Config) DelayFor(attempt int) time.Duration {
 	if attempt < 1 {
 		attempt = 1
@@ -37,10 +38,13 @@ func (c Config) DelayFor(attempt int) time.Duration {
 	}
 	delay := initial
 	for i := 1; i < attempt; i++ {
-		if c.MaxInterval > 0 && delay >= c.MaxInterval {
+		if multiplier >= 1 && c.MaxInterval > 0 && delay >= c.MaxInterval {
 			return c.MaxInterval
 		}
 		next := float64(delay) * multiplier
+		if next == 0 {
+			return 0
+		}
 		if next <= 0 || next >= float64(time.Duration(1<<63-1)) {
 			return c.MaxInterval
 		}
@@ -91,35 +95,4 @@ func ResolveTier(c Config, attempt int) int {
 		return count
 	}
 	return attempt
-}
-
-// ResolveRetryAfter routes an explicit delay to its nearest nominal tier and
-// returns that tier's nominal delay, so a delay a handler asked for still lands
-// on a tier the ladder has a destination for. A zero-tier ladder returns zero
-// values without panicking.
-func ResolveRetryAfter(c Config, requested time.Duration) (tier int, delay time.Duration) {
-	count := c.TierCount()
-	if count == 0 {
-		return 0, 0
-	}
-	if requested < 0 {
-		requested = 0
-	}
-	tier = 1
-	bestDistance := absDuration(requested - c.DelayFor(1))
-	for candidate := 2; candidate <= count; candidate++ {
-		distance := absDuration(requested - c.DelayFor(candidate))
-		if distance < bestDistance {
-			tier = candidate
-			bestDistance = distance
-		}
-	}
-	return tier, c.DelayFor(tier)
-}
-
-func absDuration(value time.Duration) time.Duration {
-	if value < 0 {
-		return -value
-	}
-	return value
 }

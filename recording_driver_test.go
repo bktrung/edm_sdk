@@ -661,7 +661,7 @@ func recordingClientConfig() f1.Config {
 		InstanceID: "recording-order-tests",
 		Broker:     f1.BrokerConfig{Driver: "inmem", ConnectTimeout: 5 * time.Second, DefaultPrefetch: 8},
 		Topology:   f1.TopologyConfig{AutoCreate: true, Priorities: []f1.Priority{f1.PriorityMedium}},
-		Codec:      f1.CodecConfig{Default: "json", ContentMode: "binary", MaxHeaderBytes: f1.CoreMaxHeaderBytes, MaxBodyBytes: 1 << 20},
+		Codec:      f1.CodecConfig{Default: "json", MaxHeaderBytes: f1.CoreMaxHeaderBytes, MaxBodyBytes: 1 << 20},
 		Lifecycle:  f1.LifecycleConfig{DrainTimeout: 10 * time.Second, HandlerGrace: time.Second, CloseTimeout: 5 * time.Second},
 	}
 }

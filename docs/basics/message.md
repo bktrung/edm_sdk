@@ -5,8 +5,17 @@ message model. The model separates the application contract, the wire
 metadata, and the driver transport so application code does not need to know
 which messaging system is underneath it.
 
+New to a term? See the [glossary](/learn/glossary).
+
 If you are new to F1, read [Getting started](/learn/getting-started) first. This
 page explains what the message-related types mean and how to use them safely.
+
+A message travels this path:
+
+```mermaid
+flowchart TB
+    Payload[Typed payload] --> Wire[Envelope and body] --> Transport[Driver message] --> Event[Event] --> H([handler])
+```
 
 ## Start with the right type
 
@@ -17,7 +26,7 @@ F1 has several types with "message" in their role. They are not interchangeable:
 | Handle one delivered event | [`f1.Event`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/event.go) | Application handler |
 | Describe one item in a publish batch | [`f1.Message`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/publisher.go) | Publisher API |
 | Carry canonical metadata | [`f1.Envelope`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/envelope.go) | F1 wire contract |
-| Adapt to a transport | [`driver.InboundMessage`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/driver/message.go) and [`driver.OutboundMessage`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/driver/message.go) | Driver implementation |
+| Adapt to a transport | [`driver.InboundMessage`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/driver/message.go) and `driver.OutboundMessage` | Driver implementation |
 
 The usual application path is:
 
@@ -25,7 +34,7 @@ The usual application path is:
 2. F1 encodes the payload and builds an envelope.
 3. The selected driver transports the encoded body and headers.
 4. F1 reconstructs an `Event` for the matching handler.
-5. The handler returns an outcome, and F1 settles the delivery from that
+5. The handler returns an outcome, and F1 acks or nacks the delivery from that
    outcome.
 
 Application handlers should work with `Event`. Driver implementations work
@@ -62,9 +71,9 @@ log.Printf("published event %s", id)
 returns the generated event ID, not the idempotency key. These identifiers have
 different jobs:
 
-- **Event ID** identifies this published event instance and is available from
+- **[Event ID](/learn/glossary#event-id)** identifies this published event instance and is available from
   `Event.ID()`.
-- **Idempotency key** identifies the business operation that a handler should
+- **[Idempotency key](/learn/glossary#idempotency-key)** identifies the business operation that a handler should
   apply at most once. `Event.IdempotencyKey()` returns the producer-provided
   key, or the event ID when no key was provided.
 
@@ -75,12 +84,22 @@ The most common metadata options are:
 - `WithSubject` - records the business subject and supplies the default key
   when no key is provided;
 - `WithIdempotencyKey` - carries the stable application deduplication key;
-- `WithHeader` - adds a user-defined extension header;
+- `WithHeader` - adds a user-defined extension header (see the size note below);
 - `WithCorrelationID` and `WithCausedBy` - connect events in one workflow; and
 - `WithExpiry` and `WithMaxAttempts` - constrain delivery lifetime and retry
   attempts.
 
 See [`PublishOption`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/publisher.go) for the complete option contract.
+
+Headers have a size cap: `codec.maxHeaderBytes`, 8 KiB by default, or less when
+the broker allows less. When the encoded envelope is over the cap, F1 drops
+your `WithHeader` headers first, then optional descriptive fields such as the
+subject and trace state. The fields F1 needs to deliver, retry, and deduplicate
+are never dropped; if the envelope is still too large, the publish fails. Keep
+extension headers small and do not rely on them arriving when the envelope is
+near the cap.
+The full order, and what happens to a dead-letter copy that grows past the cap,
+is in [Header size cap](/deep-dives/header-budget).
 
 ## Publish a batch
 
@@ -116,13 +135,13 @@ for index, item := range result.Results {
 ```
 
 Batch publishing preserves input order in `BatchResult.Results` and makes no
-atomicity claim. A transport-wide failure is returned as the method error; an
+all-or-nothing promise. A transport-wide failure is returned as the method error; an
 individual item failure is reported in its `MessageResult`.
 
 ## Consume a message
 
 Handlers receive `*f1.Event`, which gives access to the decoded message view
-without exposing the driver settlement mechanism:
+without exposing the driver's [ack and nack](/learn/glossary#settlement) mechanism:
 
 ```go
 func handleOrder(ctx context.Context, event *f1.Event) error {
@@ -144,6 +163,14 @@ payload that matches the event contract instead of making handlers depend on
 raw transport bytes. `Event.Raw()` is available when an application genuinely
 needs the undecoded body, and returns an independent copy.
 
+JSON is the default [codec](/learn/glossary#codec). To use another format,
+implement `codec.Codec` (a name, a content type, `Encode`, and `Decode`) and pass
+it to `f1.WithCodec` when creating the client. The first codec given is used for
+publishing; on consume, F1 picks the codec whose content type matches the
+event's `datacontenttype`, and uses the `codec.default` codec when the event has
+none. A delivery whose content type has no registered codec is dead-lettered
+with the reason `decode`.
+
 The event type is the handler-routing key. Register the same versioned type
 that the publisher emits:
 
@@ -157,14 +184,14 @@ runner, err := client.Subscribe(ctx, f1.Subscription{
 })
 ```
 
-F1 derives the logical topic `orders.placed` from the versioned event type
+F1 derives the [topic](/learn/glossary#logical-topic) `orders.placed` from the versioned event type
 `orders.placed.v1` by removing the trailing `.v1` segment. Use
 `f1.WithTopic` when publishing only if the application intentionally uses a
-different logical topic.
+different topic.
 
 ## Metadata and the envelope
 
-An [`Envelope`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/envelope.go) is the canonical metadata F1 serializes as
+An `Envelope` is the canonical metadata F1 serializes as
 message headers. It is separate from the payload body. The envelope carries
 several kinds of information:
 
@@ -207,7 +234,7 @@ F1 does not store a `context.Context` inside `Event`. Instead:
   acknowledgement;
 - handlers receive a context that carries cancellation and deadlines for the
   current delivery; and
-- shutdown cancels handler work while the runner drains in-flight deliveries.
+- shutdown cancels handler work while the runner [drains](/learn/glossary#drain) in-flight deliveries.
 
 Pass the handler context to downstream calls:
 
@@ -221,21 +248,26 @@ func handleOrder(ctx context.Context, event *f1.Event) error {
 }
 ```
 
+Return when the context is done. At the handler timeout F1 cancels it; the
+handler's return value still chooses ack or retry. F1 can stop waiting for a
+handler, but it cannot stop one: a handler that ignores its context can keep
+running while a redelivered copy executes, so the same work can overlap
+([what happens to a stuck handler](/development/consume-flow#running-the-handler)).
+
 Do not save the handler context for later work. Start asynchronous work only
 when the application owns its lifecycle and can define what delivery
 completion means for that work.
 
-## Settlement is driven by the handler result
+## The handler result decides the ack
 
 F1 intentionally does not expose explicit `Ack()` and `Nack()` methods
-on `Event`. The handler's return value is the application-level settlement
+on `Event`. The handler's return value is the application-level ack or nack
 decision:
 
 | Handler result | F1 behavior |
 | --- | --- |
 | `nil` | Acknowledge the delivery as handled. |
 | Ordinary error | Apply the subscription retry policy. |
-| `f1.RetryAfter(err, delay)` | Retry at the ladder tier nearest the requested delay. |
 | `f1.Terminal(err)` | Stop retrying and dead-letter the event. |
 | `f1.Drop(err)` | Acknowledge the event without applying its effect or retaining a copy. |
 
@@ -257,21 +289,12 @@ a retry, reconnect, or process restart. Design handlers around stable identity:
 
 If the application needs to retain a dead-lettered message, use the
 subscription's `OnDeadLetter` callback. Its `f1.DeadLettered` value contains a
-copy of the envelope and body plus the failure reason and last error.
+copy of the envelope and body plus the failure reason and last error. A message
+that is dropped or unmatched is not dead-lettered; `OnDiscarded` receives its
+copy instead.
 
-## Source contracts
+## Go further
 
-Read these symbols when the behavior matters:
-
-- [`Event`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/event.go) - handler-facing identity, metadata, raw body, and
-  decoding;
-- [`Envelope`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/envelope.go) - canonical wire metadata and header limits;
-- [`Publisher`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/publisher.go) - publish, batch results, and message
-  options;
-- [`HandlerFunc`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/handler.go) - function handlers and context delivery;
-- [`Subscription`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/subscription.go) - routing, retry, and unmatched
-  event policy;
-- [`driver.InboundMessage`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/driver/message.go) - the lower-level driver
-  transport contract; and
-- [`codec.Codec`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/codec/codec.go) - the payload encoding and decoding
-  contract.
+- [Publisher and subscriber](/basics/pubsub) - map handlers to event types and decide each ack.
+- [Failure handling](/advanced-topics/failure-handling) - choose retry, terminal, drop, or dead-letter outcomes.
+- [Publish flow](/development/publish-flow) - follow envelope construction and broker acknowledgement.

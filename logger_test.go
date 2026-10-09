@@ -244,47 +244,70 @@ type retiredCloseProducer struct {
 }
 
 func (*retiredCloseProducer) Publish(context.Context, ...driver.OutboundMessage) error { return nil }
-func (p *retiredCloseProducer) Close(context.Context) error                            { return p.err }
+
+func (p *retiredCloseProducer) Close(context.Context) error { return p.err }
 
 func TestRetiredCloseFailuresUseLastResortLogger(t *testing.T) {
-	cases := []struct {
-		name             string
-		configuredLogger bool
+	producerErr := errors.New("retired producer close failed")
+	connectionErr := errors.New("retired connection close failed")
+	stages := []struct {
+		name            string
+		producerErr     error
+		loggedErr       error
+		connectionCalls int
+	}{
+		{name: "producer", producerErr: producerErr, loggedErr: producerErr},
+		{name: "connection", loggedErr: connectionErr, connectionCalls: 1},
+	}
+	loggers := []struct {
+		name       string
+		configured bool
 	}{
 		{name: "without logger"},
-		{name: "with logger", configuredLogger: true},
+		{name: "with logger", configured: true},
 	}
-	for _, testCase := range cases {
-		t.Run(testCase.name, func(t *testing.T) {
-			defaultOutput := captureProcessDefault(t)
-			var configuredOutput logSink
-			options := []Option{WithDriver(&testDriver{conn: &testConn{}})}
-			if testCase.configuredLogger {
-				options = append(options, WithLogger(slog.New(slog.NewTextHandler(&configuredOutput, nil))))
-			}
-			client, err := New(context.Background(), testClientConfig(t), options...)
-			if err != nil {
-				t.Fatal(err)
-			}
-			t.Cleanup(func() { _ = client.Close(context.Background()) })
-			client.retireConnection(
-				context.Background(),
-				&retiredCloseProducer{err: errors.New("retired producer close failed")},
-				&testConn{closeErr: errors.New("retired connection close failed")},
-				&testConn{},
-			)
-			if testCase.configuredLogger {
-				if got := configuredOutput.String(); !strings.Contains(got, "retired producer close failed") || !strings.Contains(got, "retired connection close failed") {
-					t.Fatalf("configured output = %q, want both retired close failures", got)
+	for _, stage := range stages {
+		for _, logger := range loggers {
+			t.Run(stage.name+"/"+logger.name, func(t *testing.T) {
+				defaultOutput := captureProcessDefault(t)
+				var configuredOutput logSink
+				options := []Option{WithDriver(&testDriver{conn: &testConn{}})}
+				if logger.configured {
+					options = append(options, WithLogger(slog.New(slog.NewTextHandler(&configuredOutput, nil))))
 				}
-				if got := defaultOutput.String(); got != "" {
-					t.Fatalf("process default output = %q, want empty", got)
+				client, err := New(context.Background(), testClientConfig(t), options...)
+				if err != nil {
+					t.Fatal(err)
 				}
-				return
-			}
-			if got := defaultOutput.String(); !strings.Contains(got, "retired producer close failed") || !strings.Contains(got, "retired connection close failed") {
-				t.Fatalf("process default output = %q, want both retired close failures", got)
-			}
-		})
+				t.Cleanup(func() { _ = client.Close(context.Background()) })
+				client.mu.Lock()
+				// Retirement runs after the swap, under the old epoch.
+				retiredEpoch := client.current.epoch
+				client.current.epoch++
+				client.mu.Unlock()
+				retired := &testConn{closeErr: connectionErr}
+				client.retireConnection(
+					context.Background(),
+					&retiredCloseProducer{err: stage.producerErr},
+					retired,
+					retiredEpoch,
+				)
+				if retired.closeCalls != stage.connectionCalls {
+					t.Fatalf("retired connection Close calls = %d, want %d", retired.closeCalls, stage.connectionCalls)
+				}
+				if logger.configured {
+					if got := configuredOutput.String(); !strings.Contains(got, stage.loggedErr.Error()) {
+						t.Fatalf("configured output = %q, want failure %q", got, stage.loggedErr)
+					}
+					if got := defaultOutput.String(); got != "" {
+						t.Fatalf("process default output = %q, want empty", got)
+					}
+					return
+				}
+				if got := defaultOutput.String(); !strings.Contains(got, stage.loggedErr.Error()) {
+					t.Fatalf("process default output = %q, want failure %q", got, stage.loggedErr)
+				}
+			})
+		}
 	}
 }

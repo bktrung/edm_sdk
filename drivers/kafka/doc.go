@@ -1,6 +1,5 @@
-// Package kafka is the Kafka adapter for the F1 driver port.
+// Package kafka provides a Kafka driver for the SDK driver port.
 //
-// The package provides the connected Kafka boundary and declares the
-// capability ceiling the driver can report. Resource factories remain
-// unsupported until their corresponding surfaces are implemented.
+// Destinations are Kafka topics. Consumers use Kafka consumer groups and
+// report lag and backlog for each subscribed topic.
 package kafka

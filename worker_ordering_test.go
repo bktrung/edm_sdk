@@ -41,7 +41,7 @@ func TestOpenRunnerConsumerPropagatesOrderingAsExclusive(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			consumer, err := openRunnerConsumer(runner, context.Background())
+			consumer, err := openRunnerConsumerForTest(runner, context.Background())
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -99,4 +99,12 @@ func (*orderingTestConsumer) Stop(context.Context) error             { return ni
 func (*orderingTestConsumer) Release(context.Context) error          { return nil }
 func (*orderingTestConsumer) Lag(context.Context) (map[string]int64, error) {
 	return nil, driver.ErrUnsupported
+}
+
+// openRunnerConsumerForTest opens a runner's consumer with the in-flight budget
+// Run derives for it, so a test that needs a consumer exercises the same budget
+// the runner would use, without a second copy of the derivation.
+func openRunnerConsumerForTest(runner *Runner, ctx context.Context) (driver.Consumer, error) {
+	consumer, _, err := openRunnerConsumerWith(runner, ctx, ctx, runnerConsumerPrefetch(runner, runner.config.Prefetch, runnerLanePlan(runner)))
+	return consumer, err
 }

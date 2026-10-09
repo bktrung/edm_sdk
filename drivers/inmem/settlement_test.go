@@ -10,7 +10,6 @@ import (
 
 	"github.com/stretchr/testify/require"
 
-	//nolint:depguard // integration tests exercise the SDK through the in-memory driver
 	f1 "fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk"
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/driver"
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/clock"

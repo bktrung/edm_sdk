@@ -1,6 +1,7 @@
 package f1
 
 import (
+	"fmt"
 	"math"
 	"os"
 	"path/filepath"
@@ -9,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/retry"
+	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/dispatch"
 )
 
 func TestLoadConfigUnknownKeyIsStartupError(t *testing.T) {
@@ -21,7 +22,6 @@ f1:
   broker:
     driver: inmem
   codec:
-    contentMode: binary
   unknown: true
 `)
 	_, err := LoadConfig(path)
@@ -51,23 +51,6 @@ f1:
 	}
 }
 
-func TestLoadConfigRejectsUnsupportedKnownValue(t *testing.T) {
-	t.Parallel()
-	path := writeConfig(t, `
-f1:
-  env: test
-  service: orders
-  broker:
-    driver: inmem
-  codec:
-    contentMode: structured
-`)
-	_, err := LoadConfig(path)
-	if err == nil || !strings.Contains(err.Error(), "codec.contentMode") {
-		t.Fatalf("LoadConfig() error = %v, want contentMode error", err)
-	}
-}
-
 func TestLoadConfigFlattensBrokerOptions(t *testing.T) {
 	t.Parallel()
 	path := writeConfig(t, `
@@ -83,7 +66,6 @@ f1:
       sessionTimeout: 60s
       maxExpectedInstances: "3"
   codec:
-    contentMode: binary
 `)
 	cfg, err := LoadConfig(path)
 	if err != nil {
@@ -122,6 +104,12 @@ f1:
 	if got := cfg.Lifecycle.ConsumerDrainTimeout; got != 0 {
 		t.Fatalf("default consumerDrainTimeout = %s, want zero (disabled): a default here would bound Close for callers who never set it", got)
 	}
+	if cfg.Env != "test" || cfg.Service != "orders" || cfg.Broker.Driver != "kafka" {
+		t.Fatalf("LoadConfig() = %#v, want the file's environment, service, and broker", cfg)
+	}
+	if got := cfg.Broker.Endpoints; !reflect.DeepEqual(got, []string{"kafka://broker:9092"}) {
+		t.Fatalf("Broker.Endpoints = %#v, want the configured endpoint", got)
+	}
 }
 
 func TestLoadConfigAcceptsRabbitMQManagementPort(t *testing.T) {
@@ -153,7 +141,6 @@ f1:
   broker:
     driver: inmem
   codec:
-    contentMode: binary
 `)
 	t.Setenv("F1_ENV", "environment")
 	cfg, err := LoadConfig(path)
@@ -194,7 +181,6 @@ f1:
   broker:
     driver: inmem
   codec:
-    contentMode: binary
   subscriptions:
     orders:
       topics: [com.za.order.created]
@@ -277,16 +263,6 @@ func TestLoadConfigSubscriptionUsesBrokerPrefetchFallback(t *testing.T) {
 	}
 }
 
-func TestLoadConfigRejectsExplicitZeroPrefetch(t *testing.T) {
-	t.Parallel()
-	path := writeConfig(t, "f1:\n  env: test\n  service: orders\n  broker:\n    driver: inmem\n  subscriptions:\n    orders:\n      topics: [orders]\n      prefetch: 0\n")
-	_, err := LoadConfig(path)
-	want := "f1: subscriptions.orders.prefetch 0 must be at least lane count 12 (topics x priorities x (1 + retryTiers))"
-	if err == nil || err.Error() != want {
-		t.Fatalf("LoadConfig() error = %v, want %q", err, want)
-	}
-}
-
 func TestLoadConfigRejectsPrefetchAboveCeiling(t *testing.T) {
 	t.Parallel()
 	path := writeConfig(t, `
@@ -304,6 +280,56 @@ f1:
 	want := "f1: subscriptions.orders.prefetch 65536 must be at most 65535"
 	if err == nil || err.Error() != want {
 		t.Fatalf("LoadConfig() error = %v, want %q", err, want)
+	}
+}
+
+func TestLoadConfigRejectsOrderedBufferAboveBound(t *testing.T) {
+	t.Parallel()
+	const concurrency = 1024
+	prefetch := dispatch.MaxOrderedBufferEntries/concurrency + 1
+	path := writeConfig(t, fmt.Sprintf(`
+f1:
+  env: test
+  service: orders
+  broker:
+    driver: inmem
+  subscriptions:
+    orders:
+      topics: [orders]
+      mode: orderedByKey
+      concurrency: %d
+      prefetch: %d
+`, concurrency, prefetch))
+	_, err := LoadConfig(path)
+	want := fmt.Sprintf("f1: subscriptions.orders: ordered mode needs concurrency x prefetch at most %d, got %d x %d", dispatch.MaxOrderedBufferEntries, concurrency, prefetch)
+	if err == nil || err.Error() != want {
+		t.Fatalf("LoadConfig() error = %v, want %q", err, want)
+	}
+}
+
+func TestLoadConfigAcceptsOrderedBufferAtBound(t *testing.T) {
+	t.Parallel()
+	const concurrency = 1024
+	prefetch := dispatch.MaxOrderedBufferEntries / concurrency
+	path := writeConfig(t, fmt.Sprintf(`
+f1:
+  env: test
+  service: orders
+  broker:
+    driver: inmem
+  subscriptions:
+    orders:
+      topics: [orders]
+      mode: orderedByKey
+      concurrency: %d
+      prefetch: %d
+`, concurrency, prefetch))
+	cfg, err := LoadConfig(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := cfg.Subscriptions["orders"].Prefetch, prefetch; got != want {
+		t.Fatalf("Prefetch = %d, want %d", got, want)
 	}
 }
 
@@ -351,8 +377,8 @@ func TestLoadConfigRejectsUnknownFairnessPriority(t *testing.T) {
 
 func TestLoadConfigRejectsUnknownFairnessKey(t *testing.T) {
 	t.Parallel()
-	path := writeConfig(t, "f1:\n  env: test\n  service: orders\n  broker:\n    driver: inmem\n  subscriptions:\n    orders:\n      topics: [orders]\n      fairness:\n        agingEnbaled: false\n")
-	if _, err := LoadConfig(path); err == nil || !strings.Contains(err.Error(), "agingEnbaled") {
+	path := writeConfig(t, "f1:\n  env: test\n  service: orders\n  broker:\n    driver: inmem\n  subscriptions:\n    orders:\n      topics: [orders]\n      fairness:\n        deadlinePromotionEnbaled: false\n")
+	if _, err := LoadConfig(path); err == nil || !strings.Contains(err.Error(), "deadlinePromotionEnbaled") {
 		t.Fatalf("LoadConfig() error = %v, want unknown fairness key error", err)
 	}
 }
@@ -448,6 +474,9 @@ func TestValidateConfigRejectsProductionAliasEnvironments(t *testing.T) {
 		{name: "prd", env: "prd", wantErr: true},
 		{name: "staging", env: "staging", wantErr: false},
 		{name: "dev", env: "dev", wantErr: false},
+		{name: "production with a region suffix", env: "prod/us", wantErr: true},
+		{name: "production with a dotted suffix", env: "prod.us", wantErr: true},
+		{name: "hyphenated", env: "staging-eu", wantErr: false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -528,6 +557,11 @@ func TestValidateConfigAcceptsTLSWithAmqpsEndpoint(t *testing.T) {
 	if err := validateConfiguredConfig(cfg); err != nil {
 		t.Fatalf("validateConfig() error = %v, want amqps TLS endpoint to validate", err)
 	}
+	rejected := cfg
+	rejected.Broker.Endpoints = []string{"amqp://broker:5672/"}
+	if err := validateConfiguredConfig(rejected); err == nil || !strings.Contains(err.Error(), "amqps://") {
+		t.Fatalf("validateConfig() error = %v, want non-amqps TLS endpoint error", err)
+	}
 }
 
 func TestSubscriptionZeroValuesAreDocumentedDefaults(t *testing.T) {
@@ -554,6 +588,37 @@ func TestLoadConfigValidatesBrokerTimeoutRelationships(t *testing.T) {
 				t.Fatalf("LoadConfig() error = %v, want %s", err, test.want)
 			}
 		})
+	}
+}
+
+func TestValidateConfigRejectsDrainBeyondKafkaRebalanceTimeout(t *testing.T) {
+	t.Parallel()
+	cfg := validValidationConfig()
+	cfg.Broker.Driver = "kafka"
+	cfg.Broker.Endpoints = []string{"kafka://broker:9092"}
+	cfg.Broker.DriverOptions = map[string]string{"kafka.rebalanceTimeout": "10s"}
+	cfg.Lifecycle.RebalanceDrainTimeout = 25 * time.Second
+
+	err := validateConfiguredConfig(cfg)
+	if err == nil {
+		t.Fatal("validateConfiguredConfig() error = nil, want kafka.rebalanceTimeout validation")
+	}
+	for _, want := range []string{"kafka.rebalanceTimeout", "10s", "45s", "25s"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("validateConfiguredConfig() error = %v, want %q", err, want)
+		}
+	}
+}
+
+func TestValidateConfigAcceptsKafkaDefaultTimeoutBounds(t *testing.T) {
+	t.Parallel()
+	cfg := validValidationConfig()
+	cfg.Broker.Driver = "kafka"
+	cfg.Broker.Endpoints = []string{"kafka://broker:9092"}
+	cfg.Lifecycle.RebalanceDrainTimeout = 27 * time.Second
+
+	if err := validateConfiguredConfig(cfg); err != nil {
+		t.Fatalf("validateConfiguredConfig() error = %v, want default Kafka timeout bounds to validate", err)
 	}
 }
 
@@ -588,6 +653,110 @@ func TestValidateConfigRejectsInvalidSubscriptionModeAndPolicy(t *testing.T) {
 	cfg.Subscriptions["orders"] = sub
 	if err := validateConfiguredConfig(cfg); err == nil || !strings.Contains(err.Error(), "subscriptions.orders.unmatchedPolicy") {
 		t.Fatalf("validateConfiguredConfig() unmatched policy error = %v, want unsupported policy", err)
+	}
+}
+
+func TestValidateSubscriptionRejectsNamesThatSplitADestinationSegment(t *testing.T) {
+	cfg := validValidationConfig()
+	sub := cfg.Subscriptions["orders"]
+	// "orders.created" + "worker" and "orders" + "created.worker" would name
+	// the same queue if a dot were allowed in the subscription name.
+	for _, name := range []string{"created.worker", "billing/worker", "billing worker"} {
+		if err := validateSubscription(cfg, cfg.Broker.Driver, name, sub); err == nil || !strings.Contains(err.Error(), name) {
+			t.Fatalf("validateSubscription(%q) error = %v, want the name refused", name, err)
+		}
+	}
+	for _, name := range []string{"billing-worker", "billing_worker", "Worker2"} {
+		if err := validateSubscription(cfg, cfg.Broker.Driver, name, sub); err != nil {
+			t.Fatalf("validateSubscription(%q) error = %v, want nil", name, err)
+		}
+	}
+}
+
+func TestConfigAndSubscribeRejectTheSameSubscriptions(t *testing.T) {
+	cases := []struct {
+		name, want string
+		set        func(*SubscriptionConfig)
+	}{
+		{"duplicate topic", "name the same topic", func(sub *SubscriptionConfig) { sub.Topics = []string{"orders", "orders"} }},
+		{"versioned duplicate topic", "name the same topic", func(sub *SubscriptionConfig) { sub.Topics = []string{"orders", "orders.v2"} }},
+		{"negative budget", "fairness.budgets", func(sub *SubscriptionConfig) {
+			sub.Fairness.Budgets = map[Priority]time.Duration{PriorityMedium: -time.Second}
+		}},
+		{"negative retry weight divisor", "retryWeightDivisor", func(sub *SubscriptionConfig) { sub.Fairness.RetryWeightDivisor = -1 }},
+		{"negative prefetch factor", "prefetchFactor", func(sub *SubscriptionConfig) { sub.Fairness.PrefetchFactor = -1 }},
+		{"overflowing automatic prefetch factor", "prefetch 65536", func(sub *SubscriptionConfig) {
+			sub.Prefetch = 0
+			sub.Fairness.PrefetchFactor = int(^uint(0) >> 1)
+		}},
+		{"ordered buffer too large", "ordered mode", func(sub *SubscriptionConfig) {
+			sub.Mode = OrderedByKey
+			sub.Concurrency = 1024
+			sub.Prefetch = maxPrefetch
+		}},
+	}
+	for _, test := range cases {
+		t.Run(test.name, func(t *testing.T) {
+			cfg := validValidationConfig()
+			sub := cfg.Subscriptions["orders"]
+			test.set(&sub)
+			cfg.Subscriptions["orders"] = sub
+			if err := validateConfig(cfg, cfg.Broker.Driver); err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("validateConfig() error = %v, want %s", err, test.want)
+			}
+			if err := validateSubscription(cfg, cfg.Broker.Driver, "orders", sub); err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("validateSubscription() error = %v, want %s", err, test.want)
+			}
+		})
+	}
+}
+
+func TestRabbitMQConsumerTimeoutValidation(t *testing.T) {
+	cases := []struct {
+		name            string
+		handlerTimeout  time.Duration
+		consumerTimeout time.Duration
+		wantErr         bool
+	}{
+		{"overflow", 1 << 62, 90 * time.Second, true},
+		{"exact boundary", time.Second + time.Nanosecond, 3*time.Second + 3*time.Nanosecond, false},
+		{"one nanosecond below boundary", time.Second + time.Nanosecond, 3*time.Second + 2*time.Nanosecond, true},
+		{"negative consumer timeout", time.Second, -time.Nanosecond, true},
+	}
+	for _, test := range cases {
+		t.Run(test.name, func(t *testing.T) {
+			cfg := validValidationConfig()
+			cfg.Broker.Driver = "rabbitmq"
+			cfg.Broker.Endpoints = []string{"amqp://broker:5672/"}
+			cfg.Broker.DriverOptions = map[string]string{
+				"rabbitmq.consumerTimeout": test.consumerTimeout.String(),
+			}
+			cfg.Lifecycle.DrainTimeout = test.handlerTimeout + time.Nanosecond
+			sub := cfg.Subscriptions["orders"]
+			sub.HandlerTimeout = test.handlerTimeout
+			cfg.Subscriptions["orders"] = sub
+			for _, validate := range []struct {
+				name string
+				run  func() error
+			}{
+				{"config", func() error { return validateConfiguredConfig(cfg) }},
+				{"subscription", func() error { return validateSubscription(cfg, cfg.Broker.Driver, "orders", sub) }},
+			} {
+				t.Run(validate.name, func(t *testing.T) {
+					err := validate.run()
+					if !test.wantErr {
+						if err != nil {
+							t.Fatalf("validation error = %v, want nil", err)
+						}
+						return
+					}
+					const want = "f1: broker.rabbitmq.consumerTimeout must be at least subscriptions.orders.handlerTimeout x 3"
+					if err == nil || err.Error() != want {
+						t.Fatalf("validation error = %v, want %q", err, want)
+					}
+				})
+			}
+		})
 	}
 }
 
@@ -627,31 +796,27 @@ func TestValidateConfigRejectsNegativeLifecycleDurations(t *testing.T) {
 	}
 }
 
-func TestRetryConfigDelayForAgreesWithInternalRetryLadder(t *testing.T) {
+// TestRetryConfigDelayForAppliesDocumentedDefaults pins the public DelayFor
+// contract with literal delays: a non-positive InitialInterval becomes one
+// second, a zero Multiplier becomes five, and Tiers select by attempt and hold
+// at the last entry.
+func TestRetryConfigDelayForAppliesDocumentedDefaults(t *testing.T) {
 	cases := []struct {
 		name    string
 		cfg     RetryConfig
 		attempt int
+		want    time.Duration
 	}{
-		{name: "negative initial interval", cfg: RetryConfig{InitialInterval: -time.Second, Multiplier: 2}, attempt: 3},
-		{name: "zero initial interval", cfg: RetryConfig{Multiplier: 2}, attempt: 2},
-		{name: "zero multiplier", cfg: RetryConfig{InitialInterval: time.Second}, attempt: 3},
-		{name: "explicit tiers", cfg: RetryConfig{Tiers: []time.Duration{time.Second, 3 * time.Second, 9 * time.Second}}, attempt: 2},
-		{name: "attempt beyond tier count", cfg: RetryConfig{Tiers: []time.Duration{time.Second, 3 * time.Second}}, attempt: 5},
+		{name: "negative initial interval", cfg: RetryConfig{InitialInterval: -time.Second, Multiplier: 2}, attempt: 3, want: 4 * time.Second},
+		{name: "zero initial interval", cfg: RetryConfig{Multiplier: 2}, attempt: 2, want: 2 * time.Second},
+		{name: "zero multiplier", cfg: RetryConfig{InitialInterval: time.Second}, attempt: 3, want: 25 * time.Second},
+		{name: "explicit tiers", cfg: RetryConfig{Tiers: []time.Duration{time.Second, 3 * time.Second, 9 * time.Second}}, attempt: 2, want: 3 * time.Second},
+		{name: "attempt beyond tier count", cfg: RetryConfig{Tiers: []time.Duration{time.Second, 3 * time.Second}}, attempt: 5, want: 3 * time.Second},
 	}
 	for _, test := range cases {
 		t.Run(test.name, func(t *testing.T) {
-			got := test.cfg.DelayFor(test.attempt)
-			internalCfg := retry.Config{
-				MaxAttempts:     test.cfg.MaxAttempts,
-				InitialInterval: test.cfg.InitialInterval,
-				Multiplier:      test.cfg.Multiplier,
-				MaxInterval:     test.cfg.MaxInterval,
-				Tiers:           test.cfg.Tiers,
-			}
-			want := internalCfg.DelayFor(test.attempt)
-			if got != want {
-				t.Fatalf("RetryConfig.DelayFor(%d) = %v, internal/retry.Config.DelayFor(%d) = %v; want agreement", test.attempt, got, test.attempt, want)
+			if got := test.cfg.DelayFor(test.attempt); got != test.want {
+				t.Fatalf("RetryConfig.DelayFor(%d) = %v, want %v", test.attempt, got, test.want)
 			}
 		})
 	}
@@ -805,6 +970,93 @@ func validValidationConfig() Config {
 	return cfg
 }
 
+func TestAutomaticSubscriptionPrefetchUsesResolvedLaneCapacitySum(t *testing.T) {
+	sub := validValidationConfig().Subscriptions["orders"]
+	sub.Prefetch = 0
+	if got, want := automaticSubscriptionPrefetch(sub), 12; got != want {
+		t.Fatalf("automaticSubscriptionPrefetch() = %d, want %d", got, want)
+	}
+}
+
+// TestAutomaticSubscriptionPrefetchKeepsWeightedSharesExact pins the lane
+// share computed before any clipping. Each row's product of concurrency and
+// weight, or its total weight, passes the prefetch bound, which is where
+// clipping the intermediate values changed a valid answer: the share was
+// computed from the clipped product or divided by the clipped total.
+func TestAutomaticSubscriptionPrefetchKeepsWeightedSharesExact(t *testing.T) {
+	for _, test := range []struct {
+		name        string
+		concurrency int
+		weights     map[Priority]int
+		priorities  []Priority
+		want        int
+	}{
+		{
+			// ceil(256 x 1024 / 1024) x 2; clipped first it was 64 x 2.
+			name:        "product of concurrency and weight past the bound",
+			concurrency: 256,
+			weights:     map[Priority]int{PriorityMedium: 1024},
+			priorities:  []Priority{PriorityMedium},
+			want:        512,
+		},
+		{
+			// Two lanes of ceil(1024 x 40000 / 80000) x 2; a total clipped to
+			// the bound made each share the minimum.
+			name:        "total weight past the bound",
+			concurrency: 1024,
+			weights:     map[Priority]int{PriorityHigh: 40000, PriorityLow: 40000},
+			priorities:  []Priority{PriorityHigh, PriorityLow},
+			want:        2048,
+		},
+		{
+			// ceil(80/13) + ceil(40/13) + max(ceil(10/13), 3), times 2.
+			name:        "uneven weights round each share up",
+			concurrency: 10,
+			weights:     map[Priority]int{PriorityHigh: 8, PriorityMedium: 4, PriorityLow: 1},
+			priorities:  []Priority{PriorityHigh, PriorityMedium, PriorityLow},
+			want:        28,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			sub := validValidationConfig().Subscriptions["orders"]
+			sub.Prefetch = 0
+			sub.Retry = RetryConfig{MaxAttempts: 1}
+			sub.Concurrency = test.concurrency
+			sub.Priorities = test.priorities
+			sub.Fairness.Weights = test.weights
+			sub.Fairness.PrefetchFactor = 2
+			if got := automaticSubscriptionPrefetch(sub); got != test.want {
+				t.Fatalf("automaticSubscriptionPrefetch() = %d, want %d", got, test.want)
+			}
+		})
+	}
+}
+
+// TestFairnessWeightIsBounded pins the bound that keeps the weighted share
+// exact: the largest weight is accepted, and one past it is refused with the
+// range in the message.
+func TestFairnessWeightIsBounded(t *testing.T) {
+	for _, test := range []struct {
+		weight  int
+		wantErr bool
+	}{
+		{weight: maxFairnessWeight},
+		{weight: maxFairnessWeight + 1, wantErr: true},
+	} {
+		cfg := validValidationConfig()
+		sub := cfg.Subscriptions["orders"]
+		sub.Fairness.Weights = map[Priority]int{PriorityMedium: test.weight}
+		cfg.Subscriptions["orders"] = sub
+		err := validateConfiguredConfig(cfg)
+		if test.wantErr != (err != nil) {
+			t.Fatalf("weight %d: validate = %v, want error %t", test.weight, err, test.wantErr)
+		}
+		if test.wantErr && !strings.Contains(err.Error(), "fairness.weights.medium must be between 1 and 65535") {
+			t.Fatalf("weight %d: error = %v, want the allowed range named", test.weight, err)
+		}
+	}
+}
+
 func withRetry(sub SubscriptionConfig, retry RetryConfig) SubscriptionConfig {
 	sub.Retry = retry
 	return sub
@@ -827,6 +1079,16 @@ func invalidRetryValueCases() []struct {
 		{name: "negative infinity multiplier", field: "multiplier", set: func(cfg *RetryConfig) { cfg.Multiplier = math.Inf(-1) }},
 		{name: "negative max interval", field: "maxInterval", set: func(cfg *RetryConfig) { cfg.MaxInterval = -time.Second }},
 		{name: "negative retry tier", field: "tiers", set: func(cfg *RetryConfig) { cfg.Tiers = []time.Duration{-time.Second} }},
+		{name: "retry tier past the longest delay", field: "longest retry delay", set: func(cfg *RetryConfig) {
+			cfg.Tiers = []time.Duration{maxRetryDelay + time.Millisecond}
+		}},
+		{name: "backoff past the longest delay", field: "longest retry delay", set: func(cfg *RetryConfig) {
+			cfg.MaxAttempts = 3
+			cfg.Tiers = nil
+			cfg.InitialInterval = 30 * 24 * time.Hour
+			cfg.Multiplier = 1
+			cfg.MaxInterval = 0
+		}},
 	}
 }
 
@@ -858,6 +1120,7 @@ func TestLoadConfigRejectsRemovedKeys(t *testing.T) {
 		{name: "cost model", key: "costModel", body: subscription + "      fairness:\n        costModel: count\n"},
 		{name: "retry jitter", key: "jitter", body: subscription + "      retry:\n        jitter: 0.2\n"},
 		{name: "aging enabled", key: "agingEnabled", body: subscription + "      fairness:\n        agingEnabled: false\n"},
+		{name: "deadline promotion", key: "disableAging", body: subscription + "      fairness:\n        disableAging: false\n"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			t.Parallel()
@@ -925,7 +1188,7 @@ func TestNormalizeConfigAcceptsMinimalHandBuiltConfig(t *testing.T) {
 		t.Fatalf("validateConfiguredConfig() after normalization: %v", err)
 	}
 	defaults := defaultConfig()
-	if cfg.Codec.ContentMode != defaults.Codec.ContentMode || cfg.Codec.MaxHeaderBytes != defaults.Codec.MaxHeaderBytes || cfg.Codec.MaxBodyBytes != defaults.Codec.MaxBodyBytes {
+	if cfg.Codec.MaxHeaderBytes != defaults.Codec.MaxHeaderBytes || cfg.Codec.MaxBodyBytes != defaults.Codec.MaxBodyBytes {
 		t.Fatalf("codec defaults = %#v, want %#v", cfg.Codec, defaults.Codec)
 	}
 	if !reflect.DeepEqual(cfg.Topology.Priorities, defaults.Topology.Priorities) || cfg.Lifecycle != defaults.Lifecycle {
@@ -975,6 +1238,12 @@ func TestNormalizeConfigPreservesVerifyOnStartFalse(t *testing.T) {
 	cfg := normalizeConfig(Config{Topology: TopologyConfig{VerifyOnStart: false}})
 	if cfg.Topology.VerifyOnStart {
 		t.Fatal("VerifyOnStart = true after normalization, want false")
+	}
+	if got, want := cfg.Codec.Default, "json"; got != want {
+		t.Fatalf("Codec.Default = %q, want %q", got, want)
+	}
+	if got, want := cfg.Lifecycle.DrainTimeout, time.Minute; got != want {
+		t.Fatalf("DrainTimeout = %s, want %s", got, want)
 	}
 }
 

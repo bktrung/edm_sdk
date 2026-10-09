@@ -12,18 +12,23 @@ import (
 )
 
 type consumer struct {
-	conn                    *conn
-	cfg                     driver.ConsumerConfig
-	destinations            []string
-	messages                chan driver.InboundMessage
-	errs                    chan error
-	paused                  map[string]bool
-	draining                bool
-	stopped                 bool
-	startAfter              map[string]uint64
-	outstanding             int
-	unsettled               map[string]int
-	unsettledKey            map[deliveryKey]int
+	conn         *conn
+	cfg          driver.ConsumerConfig
+	destinations []string
+	messages     chan driver.InboundMessage
+	errs         chan error
+	paused       map[string]bool
+	draining     bool
+	stopped      bool
+	startAfter   map[string]uint64
+	outstanding  int
+	unsettled    map[string]int
+	unsettledKey map[deliveryKey]int
+	// ackDeadline is the interval after which an unsettled delivery is
+	// requeued, the in-memory stand-in for the broker's consumer timeout. It is
+	// set only by the conformance deadline fixture, which needs a controllable
+	// ack deadline to prove that a parked delivery never consumes one; a
+	// consumer created through Consumer takes no deadline.
 	ackDeadline             time.Duration
 	inflight                map[*settler]struct{}
 	stopOutstandingFailures uint64
@@ -36,13 +41,18 @@ type deliveryKey struct {
 
 var _ driver.Consumer = (*consumer)(nil)
 
+// Messages returns the channel of delivered messages. The channel closes when Stop or Release completes.
 func (c *consumer) Messages() <-chan driver.InboundMessage { return c.messages }
-func (c *consumer) Errors() <-chan error                   { return c.errs }
 
+// Errors returns asynchronous consumer errors. The channel closes when Stop or Release completes.
+func (c *consumer) Errors() <-chan error { return c.errs }
+
+// Pause pauses delivery from the listed destinations. With no destinations, it pauses all destinations assigned to this consumer.
 func (c *consumer) Pause(destinations ...string) error {
 	return c.setPaused(destinations, true)
 }
 
+// Resume resumes delivery from the listed destinations. With no destinations, it resumes all destinations assigned to this consumer.
 func (c *consumer) Resume(destinations ...string) error {
 	return c.setPaused(destinations, false)
 }
@@ -67,6 +77,7 @@ func (c *consumer) setPaused(destinations []string, paused bool) error {
 	return nil
 }
 
+// Drain stops new deliveries while leaving outstanding messages available for settlement.
 func (c *consumer) Drain(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
 		return classify("drain", driver.KindTransient, err)
@@ -78,6 +89,7 @@ func (c *consumer) Drain(ctx context.Context) error {
 	return nil
 }
 
+// Stop ends the consumer and closes its message and error channels. It returns an error while messages remain unsettled.
 func (c *consumer) Stop(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
 		if errors.Is(err, context.DeadlineExceeded) {
@@ -92,23 +104,10 @@ func (c *consumer) Stop(ctx context.Context) error {
 	}
 	if c.outstanding != 0 {
 		c.stopOutstandingFailures++
-		return classify("stop", driver.KindFatal, fmt.Errorf("cannot stop with %d outstanding messages", c.outstanding))
+		return classify("stop", driver.KindFatal, fmt.Errorf("%w: cannot stop with %d outstanding messages", driver.ErrResourcesOutstanding, c.outstanding))
 	}
 	c.stopped = true
-	for _, name := range c.destinations {
-		delete(c.conn.destinations[name].consumers, c)
-		order := c.conn.destinations[name].order
-		for i, current := range order {
-			if current == c {
-				c.conn.destinations[name].order = append(order[:i], order[i+1:]...)
-				break
-			}
-		}
-		if len(c.conn.destinations[name].consumers) == 0 {
-			c.conn.history[name] = nil
-		}
-	}
-	delete(c.conn.consumers, c)
+	c.detachLocked()
 	close(c.messages)
 	close(c.errs)
 	c.conn.dispatchLocked()
@@ -116,6 +115,7 @@ func (c *consumer) Stop(ctx context.Context) error {
 	return nil
 }
 
+// Release ends the consumer, requeues its unsettled messages, and closes its message and error channels.
 func (c *consumer) Release(ctx context.Context) error {
 	c.conn.mu.Lock()
 	defer c.conn.mu.Unlock()
@@ -129,20 +129,7 @@ func (c *consumer) Release(ctx context.Context) error {
 		c.conn.requeueDeliveryLocked(delivery, c.conn.clock.Now())
 	}
 	c.stopped = true
-	for _, name := range c.destinations {
-		delete(c.conn.destinations[name].consumers, c)
-		order := c.conn.destinations[name].order
-		for i, current := range order {
-			if current == c {
-				c.conn.destinations[name].order = append(order[:i], order[i+1:]...)
-				break
-			}
-		}
-		if len(c.conn.destinations[name].consumers) == 0 {
-			c.conn.history[name] = nil
-		}
-	}
-	delete(c.conn.consumers, c)
+	c.detachLocked()
 	close(c.messages)
 	close(c.errs)
 	c.conn.dispatchLocked()
@@ -150,6 +137,32 @@ func (c *consumer) Release(ctx context.Context) error {
 	return nil
 }
 
+// detachLocked removes the consumer from the connection and from every
+// destination it is attached to, and clears a destination's replay history
+// once its last consumer leaves. History is only a replay source for a group
+// that attaches after every prior consumer has gone, so keeping it past the
+// last detach would hand a later group entries from before the destination
+// went idle. The caller must have marked the consumer stopped and must hold
+// c.conn.mu.
+func (c *consumer) detachLocked() {
+	for _, name := range c.destinations {
+		destination := c.conn.destinations[name]
+		delete(destination.consumers, c)
+		order := destination.order
+		for i, current := range order {
+			if current == c {
+				destination.order = append(order[:i], order[i+1:]...)
+				break
+			}
+		}
+		if len(destination.consumers) == 0 {
+			c.conn.history[name] = nil
+		}
+	}
+	delete(c.conn.consumers, c)
+}
+
+// Lag returns a backlog count for each destination assigned to this consumer.
 func (c *consumer) Lag(ctx context.Context) (map[string]int64, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, classify("lag", driver.KindTransient, err)
@@ -182,8 +195,10 @@ type settler struct {
 
 var _ driver.Settler = (*settler)(nil)
 
+// Ack acknowledges the delivery and releases its outstanding slot.
 func (s *settler) Ack(ctx context.Context) error { return s.settle(ctx, driver.NackOptions{}, false) }
 
+// Nack settles the delivery negatively. When Requeue is true, the message is returned for redelivery.
 func (s *settler) Nack(ctx context.Context, opt driver.NackOptions) error {
 	return s.settle(ctx, opt, true)
 }
@@ -209,28 +224,7 @@ func (s *settler) settle(ctx context.Context, opt driver.NackOptions, nack bool)
 		s.conn.ackFailures++
 		return classify("ack", driver.KindTransient, errors.New("injected ack failure"))
 	}
-	s.settled = true
-	delete(s.consumer.inflight, s)
-	if s.consumer.outstanding > 0 {
-		s.consumer.outstanding--
-	}
-	name := s.message.message.Destination
-	if s.consumer.unsettled[name] > 0 {
-		s.consumer.unsettled[name]--
-	}
-	key := string(s.message.message.Key)
-	if key != "" {
-		deliveryKey := deliveryKey{destination: name, key: key}
-		if s.consumer.unsettledKey[deliveryKey] > 1 {
-			s.consumer.unsettledKey[deliveryKey]--
-		} else {
-			delete(s.consumer.unsettledKey, deliveryKey)
-			affinity := affinityKey{group: s.consumer.cfg.Group, key: key}
-			if dest, ok := s.conn.destinations[name]; ok && dest.affinity[affinity] == s.consumer {
-				delete(dest.affinity, affinity)
-			}
-		}
-	}
+	s.retireLocked()
 	if nack && opt.Requeue {
 		s.message.deliveryCount++
 		s.message.due = s.conn.clock.Now()
@@ -244,4 +238,31 @@ func (s *settler) settle(ctx context.Context, opt driver.NackOptions, nack bool)
 	s.conn.dispatchLocked()
 	s.conn.signalWake()
 	return nil
+}
+
+// retireLocked releases a delivery's credit and key affinity after admission.
+// The caller must hold s.conn.mu and s.mu and reject already-settled deliveries.
+func (s *settler) retireLocked() {
+	s.settled = true
+	delete(s.consumer.inflight, s)
+	if s.consumer.outstanding > 0 {
+		s.consumer.outstanding--
+	}
+	name := s.message.message.Destination
+	if s.consumer.unsettled[name] > 0 {
+		s.consumer.unsettled[name]--
+	}
+	key := string(s.message.message.Key)
+	if key != "" {
+		keyID := deliveryKey{destination: name, key: key}
+		if s.consumer.unsettledKey[keyID] > 1 {
+			s.consumer.unsettledKey[keyID]--
+		} else {
+			delete(s.consumer.unsettledKey, keyID)
+			affinity := affinityKey{group: s.consumer.cfg.Group, key: key}
+			if dest, ok := s.conn.destinations[name]; ok && dest.affinity[affinity] == s.consumer {
+				delete(dest.affinity, affinity)
+			}
+		}
+	}
 }

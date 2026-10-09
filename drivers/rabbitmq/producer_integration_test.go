@@ -23,14 +23,13 @@ func TestProducerConfirmAndReturn(t *testing.T) {
 
 	const queue = "rabbitmq-driver-producer-queue"
 	conn, rawChannel := openProducerFixture(t, ctx, queue)
-	defer func() { _ = rawChannel.Close() }()
 
 	if _, err := conn.Admin().EnsureTopology(ctx, driver.TopologySpec{
 		Destinations: []driver.DestinationSpec{{Name: queue, Durable: true}},
 	}); err != nil {
 		t.Fatalf("EnsureTopology: %v", err)
 	}
-	producer, err := conn.Producer(ctx, driver.ProducerConfig{RequireDurableAck: true})
+	producer, err := conn.Producer(ctx, driver.ProducerConfig{})
 	if err != nil {
 		t.Fatalf("Producer: %v", err)
 	}
@@ -93,79 +92,6 @@ func TestProducerConfirmAndReturn(t *testing.T) {
 	}
 }
 
-// TestProducerAbandonedConfirmationRelay proves the one thing a discarded
-// window must not leave behind: its own confirmation, for the next publish on
-// its channel to read as its own. Message A's confirmation arrives on the
-// channel the driver is not reading, A's window is abandoned, and A's channel
-// is discarded with that confirmation still unread on it, so message B must run
-// on a channel of its own and be confirmed by the broker there.
-func TestProducerAbandonedConfirmationRelay(t *testing.T) {
-	requireBroker(t)
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-	defer cancel()
-
-	const queue = "rabbitmq-driver-producer-confirm-relay"
-	conn, _ := openProducerFixture(t, ctx, queue)
-	if _, err := conn.Admin().EnsureTopology(ctx, driver.TopologySpec{
-		Destinations: []driver.DestinationSpec{{Name: queue, Durable: true}},
-	}); err != nil {
-		t.Fatalf("EnsureTopology: %v", err)
-	}
-	rawProducer, err := conn.Producer(ctx, driver.ProducerConfig{RequireDurableAck: true})
-	if err != nil {
-		t.Fatalf("Producer: %v", err)
-	}
-	t.Cleanup(func() { _ = rawProducer.Close(context.Background()) })
-	p := rawProducer.(*producer)
-	aChannel := producerFreeChannel(t, ctx, p)
-	brokerConfirms := aChannel.confirms
-	aChannel.confirms = make(chan amqp.Confirmation, publishWindowSize)
-
-	aCtx, cancelA := context.WithCancel(ctx)
-	aDone := make(chan error, 1)
-	go func() {
-		aDone <- rawProducer.Publish(aCtx, driver.OutboundMessage{Destination: queue, Body: []byte("message-a")})
-	}()
-	select {
-	case <-brokerConfirms:
-	case <-ctx.Done():
-		t.Fatalf("message A confirmation: %v", ctx.Err())
-	}
-	cancelA()
-	select {
-	case err := <-aDone:
-		if err == nil {
-			t.Fatal("message A Publish succeeded after its context was canceled")
-		}
-		kind, classified := driver.Classify(err)
-		if !classified || kind != driver.KindTransient {
-			t.Fatalf("message A error = %v, kind=%v classified=%t; want transient", err, kind, classified)
-		}
-		if !errors.Is(err, context.Canceled) {
-			t.Fatalf("message A error = %v; want context.Canceled", err)
-		}
-	case <-ctx.Done():
-		t.Fatalf("message A result: %v", ctx.Err())
-	}
-
-	bCtx, cancelB := context.WithTimeout(ctx, 5*time.Second)
-	defer cancelB()
-	if err := rawProducer.Publish(bCtx, driver.OutboundMessage{Destination: queue, Body: []byte("message-b")}); err != nil {
-		t.Fatalf("message B Publish = %v; it must not be answered by message A's abandoned confirmation", err)
-	}
-	replacement := producerFreeChannel(t, ctx, p)
-	if replacement == aChannel {
-		t.Fatal("message B ran on the channel whose confirmation was abandoned")
-	}
-	awaitChannelClosed(t, ctx, aChannel.channel)
-	if err := rawProducer.Close(ctx); err != nil {
-		t.Fatalf("first Producer.Close: %v", err)
-	}
-	if err := rawProducer.Close(ctx); err != nil {
-		t.Fatalf("second Producer.Close: %v", err)
-	}
-}
-
 func TestProducerConfirmedSequence(t *testing.T) {
 	requireBroker(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
@@ -178,7 +104,7 @@ func TestProducerConfirmedSequence(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("EnsureTopology: %v", err)
 	}
-	producer, err := conn.Producer(ctx, driver.ProducerConfig{RequireDurableAck: true})
+	producer, err := conn.Producer(ctx, driver.ProducerConfig{})
 	if err != nil {
 		t.Fatalf("Producer: %v", err)
 	}
@@ -193,162 +119,10 @@ func TestProducerConfirmedSequence(t *testing.T) {
 	}
 }
 
-// TestProducerBatchPublishesWindowBeforeReadingConfirmation proves a batch is
-// pipelined instead of confirmed one message at a time. The confirmation
-// channel is handed to the test, so no message can be confirmed while the
-// window is observed: a driver that published one message and waited for its
-// confirmation could never get a second message onto the broker. It counts
-// publishes in flight, not wall-clock time.
-func TestProducerBatchPublishesWindowBeforeReadingConfirmation(t *testing.T) {
-	requireBroker(t)
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-
-	const queue = "rabbitmq-driver-producer-batch-window"
-	conn, rawChannel := openProducerFixture(t, ctx, queue)
-	if _, err := conn.Admin().EnsureTopology(ctx, driver.TopologySpec{
-		Destinations: []driver.DestinationSpec{{Name: queue, Durable: true}},
-	}); err != nil {
-		t.Fatalf("EnsureTopology: %v", err)
-	}
-	rawProducer, err := conn.Producer(ctx, driver.ProducerConfig{RequireDurableAck: true})
-	if err != nil {
-		t.Fatalf("Producer: %v", err)
-	}
-	p := rawProducer.(*producer)
-	channel := producerFreeChannel(t, ctx, p)
-	confirms := make(chan amqp.Confirmation, publishWindowSize)
-	channel.confirms = confirms
-	t.Cleanup(func() { _ = rawProducer.Close(context.Background()) })
-	deliveries, err := rawChannel.Consume(queue, "producer-batch-window", false, false, false, false, nil)
-	if err != nil {
-		t.Fatalf("Consume: %v", err)
-	}
-	// One window, and every message carries the unique envelope id the core
-	// stamps: a window holds no repeated id, so it is published in one go.
-	messages := make([]driver.OutboundMessage, publishWindowSize)
-	for index := range messages {
-		messages[index] = driver.OutboundMessage{
-			Destination: queue,
-			Headers:     []driver.Header{{Key: "id", Value: fmt.Appendf(nil, "window-%d", index)}},
-			Body:        fmt.Appendf(nil, "window-body-%d", index),
-		}
-	}
-	done := make(chan error, 1)
-	go func() { done <- rawProducer.Publish(ctx, messages...) }()
-
-	// Two publishes in flight is the property that makes a batch cost less
-	// than one confirm round trip per message: with a single publish
-	// outstanding, the second message cannot reach the broker until the first
-	// one is confirmed.
-	awaitUnconfirmedDeliveries(t, ctx, deliveries, 2)
-
-	for index := range messages {
-		select {
-		case confirms <- amqp.Confirmation{DeliveryTag: uint64(index + 1), Ack: true}:
-		case <-ctx.Done():
-			t.Fatalf("confirming the batch: %v", ctx.Err())
-		}
-	}
-	select {
-	case err := <-done:
-		if err != nil {
-			t.Fatalf("batch Publish: %v", err)
-		}
-	case <-ctx.Done():
-		t.Fatalf("batch Publish result: %v", ctx.Err())
-	}
-}
-
-// TestProducerBatchReturnFailsItsOwnIndex proves the one thing a window can get
-// wrong: a broker return must fail the message it belongs to and no other.
-// The returns channel is fed by the test so the interleaving is fixed - the
-// return for the middle message is already queued when the first confirmation
-// is read - which is exactly the interleaving that fails the first index when
-// returns are matched by arrival order instead of by MessageId.
-func TestProducerBatchReturnFailsItsOwnIndex(t *testing.T) {
-	requireBroker(t)
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-
-	const queue = "rabbitmq-driver-producer-batch-return"
-	conn, rawChannel := openProducerFixture(t, ctx, queue)
-	if _, err := conn.Admin().EnsureTopology(ctx, driver.TopologySpec{
-		Destinations: []driver.DestinationSpec{{Name: queue, Durable: true}},
-	}); err != nil {
-		t.Fatalf("EnsureTopology: %v", err)
-	}
-	rawProducer, err := conn.Producer(ctx, driver.ProducerConfig{RequireDurableAck: true})
-	if err != nil {
-		t.Fatalf("Producer: %v", err)
-	}
-	p := rawProducer.(*producer)
-	channel := producerFreeChannel(t, ctx, p)
-	confirms := make(chan amqp.Confirmation, 3)
-	channel.confirms = confirms
-	returns := make(chan amqp.Return, 3)
-	channel.returns = returns
-	t.Cleanup(func() { _ = rawProducer.Close(context.Background()) })
-	deliveries, err := rawChannel.Consume(queue, "producer-batch-return", false, false, false, false, nil)
-	if err != nil {
-		t.Fatalf("Consume: %v", err)
-	}
-	messages := make([]driver.OutboundMessage, 3)
-	for index := range messages {
-		messages[index] = driver.OutboundMessage{
-			Destination: queue,
-			Headers:     []driver.Header{{Key: "id", Value: fmt.Appendf(nil, "return-%d", index)}},
-			Body:        fmt.Appendf(nil, "return-body-%d", index),
-		}
-	}
-	done := make(chan error, 1)
-	go func() { done <- rawProducer.Publish(ctx, messages...) }()
-	awaitUnconfirmedDeliveries(t, ctx, deliveries, len(messages))
-
-	select {
-	case returns <- amqp.Return{ReplyCode: 312, ReplyText: "NO_ROUTE", MessageId: "return-1"}:
-	case <-ctx.Done():
-		t.Fatalf("returning the middle message: %v", ctx.Err())
-	}
-	for index := range messages {
-		select {
-		case confirms <- amqp.Confirmation{DeliveryTag: uint64(index + 1), Ack: true}:
-		case <-ctx.Done():
-			t.Fatalf("confirming the batch: %v", ctx.Err())
-		}
-	}
-
-	var publishErr *driver.PublishError
-	select {
-	case err := <-done:
-		if err == nil {
-			t.Fatal("batch Publish error = nil, want the returned message to fail")
-		}
-		if !errors.As(err, &publishErr) {
-			t.Fatalf("batch Publish error = %v, want *driver.PublishError", err)
-		}
-	case <-ctx.Done():
-		t.Fatalf("batch Publish result: %v", ctx.Err())
-	}
-	if len(publishErr.Failed) != 1 {
-		t.Fatalf("failed indexes = %v, want only the returned message at index 1", publishErr.Failed)
-	}
-	failure, ok := publishErr.Failed[1]
-	if !ok {
-		t.Fatalf("failed indexes = %v, want index 1", publishErr.Failed)
-	}
-	if !errors.Is(failure, driver.ErrDestinationMissing) {
-		t.Fatalf("failed[1] = %v, want ErrDestinationMissing", failure)
-	}
-	if kind, classified := driver.Classify(failure); !classified || kind != driver.KindNotFound {
-		t.Fatalf("failed[1] classification = (%v, %t), want (not found, true)", kind, classified)
-	}
-}
-
-// TestProducerBatchReturnFromBrokerFailsOnlyItsOwnIndex is the same property
-// against a real broker return: one unroutable message in the middle of a
-// batch is reported against its own index and classified not-found, and its
-// neighbours are published in order.
+// TestProducerBatchReturnFromBrokerFailsOnlyItsOwnIndex proves a broker return
+// fails the message it belongs to and no other: one unroutable message in the
+// middle of a batch is reported against its own index and classified
+// not-found, and its neighbours are published in order.
 func TestProducerBatchReturnFromBrokerFailsOnlyItsOwnIndex(t *testing.T) {
 	requireBroker(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -362,7 +136,7 @@ func TestProducerBatchReturnFromBrokerFailsOnlyItsOwnIndex(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("EnsureTopology: %v", err)
 	}
-	rawProducer, err := conn.Producer(ctx, driver.ProducerConfig{RequireDurableAck: true})
+	rawProducer, err := conn.Producer(ctx, driver.ProducerConfig{})
 	if err != nil {
 		t.Fatalf("Producer: %v", err)
 	}
@@ -419,8 +193,12 @@ func TestProducerBatchReturnFromBrokerFailsOnlyItsOwnIndex(t *testing.T) {
 }
 
 // TestProducerNegativeConfirmFailsItsOwnIndex proves a negative confirmation
-// fails only the message it confirms: the two acked neighbours of a nacked
-// message in the middle of a window are published and reported successful.
+// fails only the message it confirms. The broker nacks for real here: a queue
+// declared with a length limit of one and reject-publish overflow takes the
+// first message of the batch and refuses the two behind it, so the first is
+// reported published and the other two fail transient on the channel that is
+// still open. The queue is classic because a quorum queue applies its length
+// limit to committed messages, so a batch in flight can all be accepted.
 func TestProducerNegativeConfirmFailsItsOwnIndex(t *testing.T) {
 	requireBroker(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -428,24 +206,18 @@ func TestProducerNegativeConfirmFailsItsOwnIndex(t *testing.T) {
 
 	const queue = "rabbitmq-driver-producer-batch-negative"
 	conn, rawChannel := openProducerFixture(t, ctx, queue)
-	if _, err := conn.Admin().EnsureTopology(ctx, driver.TopologySpec{
-		Destinations: []driver.DestinationSpec{{Name: queue, Durable: true}},
+	if _, err := rawChannel.QueueDeclare(queue, true, false, false, false, amqp.Table{
+		"x-queue-type": "classic",
+		"x-max-length": int64(1),
+		"x-overflow":   "reject-publish",
 	}); err != nil {
-		t.Fatalf("EnsureTopology: %v", err)
+		t.Fatalf("QueueDeclare: %v", err)
 	}
-	rawProducer, err := conn.Producer(ctx, driver.ProducerConfig{RequireDurableAck: true})
+	producer, err := conn.Producer(ctx, driver.ProducerConfig{})
 	if err != nil {
 		t.Fatalf("Producer: %v", err)
 	}
-	p := rawProducer.(*producer)
-	channel := producerFreeChannel(t, ctx, p)
-	confirms := make(chan amqp.Confirmation, 3)
-	channel.confirms = confirms
-	t.Cleanup(func() { _ = rawProducer.Close(context.Background()) })
-	deliveries, err := rawChannel.Consume(queue, "producer-batch-negative", false, false, false, false, nil)
-	if err != nil {
-		t.Fatalf("Consume: %v", err)
-	}
+	t.Cleanup(func() { _ = producer.Close(context.Background()) })
 	messages := make([]driver.OutboundMessage, 3)
 	for index := range messages {
 		messages[index] = driver.OutboundMessage{
@@ -454,38 +226,25 @@ func TestProducerNegativeConfirmFailsItsOwnIndex(t *testing.T) {
 			Body:        fmt.Appendf(nil, "negative-body-%d", index),
 		}
 	}
-	done := make(chan error, 1)
-	go func() { done <- rawProducer.Publish(ctx, messages...) }()
-	awaitUnconfirmedDeliveries(t, ctx, deliveries, len(messages))
-
-	for index := range messages {
-		select {
-		case confirms <- amqp.Confirmation{DeliveryTag: uint64(index + 1), Ack: index != 1}:
-		case <-ctx.Done():
-			t.Fatalf("confirming the batch: %v", ctx.Err())
-		}
-	}
+	err = producer.Publish(ctx, messages...)
 	var publishErr *driver.PublishError
-	select {
-	case err := <-done:
-		if err == nil {
-			t.Fatal("batch Publish error = nil, want the negatively confirmed message to fail")
+	if !errors.As(err, &publishErr) {
+		t.Fatalf("batch Publish error = %v, want *driver.PublishError", err)
+	}
+	if len(publishErr.Failed) != 2 {
+		t.Fatalf("failed indexes = %v, want the two messages over the queue's limit", publishErr.Failed)
+	}
+	for _, index := range []int{1, 2} {
+		failure, ok := publishErr.Failed[index]
+		if !ok {
+			t.Fatalf("failed indexes = %v, want index %d", publishErr.Failed, index)
 		}
-		if !errors.As(err, &publishErr) {
-			t.Fatalf("batch Publish error = %v, want *driver.PublishError", err)
+		if kind, classified := driver.Classify(failure); !classified || kind != driver.KindTransient {
+			t.Fatalf("failed[%d] classification = (%v, %t), want (transient, true)", index, kind, classified)
 		}
-	case <-ctx.Done():
-		t.Fatalf("batch Publish result: %v", ctx.Err())
-	}
-	if len(publishErr.Failed) != 1 {
-		t.Fatalf("failed indexes = %v, want only the negatively confirmed message at index 1", publishErr.Failed)
-	}
-	failure, ok := publishErr.Failed[1]
-	if !ok {
-		t.Fatalf("failed indexes = %v, want index 1", publishErr.Failed)
-	}
-	if kind, classified := driver.Classify(failure); !classified || kind != driver.KindTransient {
-		t.Fatalf("failed[1] classification = (%v, %t), want (transient, true)", kind, classified)
+		if !strings.Contains(failure.Error(), "negative") {
+			t.Fatalf("failed[%d] = %v, want the negative confirmation, not a lost channel", index, failure)
+		}
 	}
 }
 
@@ -509,7 +268,7 @@ const oversizedBodyBytes = (1 << 24) + 1
 // The destination is the quorum kind this driver defaults to, and the message
 // in front of the refused one is where that shows. A quorum queue commits a
 // persistent message asynchronously, so the close can beat that message's
-// confirmation: the window then finds it undecided and reports it transient,
+// confirmation: the publish then finds it undecided and reports it transient,
 // which is the retry an unconfirmed message gets. What it must never be is too
 // large, and that is what this test pins about it, because the broker published
 // it and a length at or under the limit cannot be refused for its size.
@@ -525,7 +284,7 @@ func TestProducerSizeRefusalFailsOnlyItsOwnIndex(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("EnsureTopology: %v", err)
 	}
-	rawProducer, err := conn.Producer(ctx, driver.ProducerConfig{RequireDurableAck: true})
+	rawProducer, err := conn.Producer(ctx, driver.ProducerConfig{})
 	if err != nil {
 		t.Fatalf("Producer: %v", err)
 	}
@@ -596,7 +355,7 @@ func TestProducerSizeRefusalFailsOnlyItsOwnIndex(t *testing.T) {
 	}
 }
 
-// TestProducerSizeRefusalIsTheOnlyFailure proves the smallest window that can
+// TestProducerSizeRefusalIsTheOnlyFailure proves the smallest batch that can
 // hold a refusal reports it and nothing else. One message, refused for its
 // size, is the case a caller reads a failure map for: a copy that can never be
 // published reaches the caller as that one entry, which is what keeps it from
@@ -613,7 +372,7 @@ func TestProducerSizeRefusalIsTheOnlyFailure(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("EnsureTopology: %v", err)
 	}
-	rawProducer, err := conn.Producer(ctx, driver.ProducerConfig{RequireDurableAck: true})
+	rawProducer, err := conn.Producer(ctx, driver.ProducerConfig{})
 	if err != nil {
 		t.Fatalf("Producer: %v", err)
 	}
@@ -646,175 +405,13 @@ func TestProducerSizeRefusalIsTheOnlyFailure(t *testing.T) {
 	}
 }
 
-// TestProducerConfirmsArriveInPublishOrder asserts the property the window
-// rests on rather than assuming it: the client re-sequences confirmations
-// before delivering them, so the i-th confirmation read from the channel is
-// the i-th message published. It registers a second listener on the same
-// channel, because Publish consumes its own confirmations.
-func TestProducerConfirmsArriveInPublishOrder(t *testing.T) {
-	requireBroker(t)
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-
-	const queue = "rabbitmq-driver-producer-confirm-order"
-	const batch = 8
-	conn, _ := openProducerFixture(t, ctx, queue)
-	if _, err := conn.Admin().EnsureTopology(ctx, driver.TopologySpec{
-		Destinations: []driver.DestinationSpec{{Name: queue, Durable: true}},
-	}); err != nil {
-		t.Fatalf("EnsureTopology: %v", err)
-	}
-	rawProducer, err := conn.Producer(ctx, driver.ProducerConfig{RequireDurableAck: true})
-	if err != nil {
-		t.Fatalf("Producer: %v", err)
-	}
-	t.Cleanup(func() { _ = rawProducer.Close(context.Background()) })
-	p := rawProducer.(*producer)
-	channel := producerFreeChannel(t, ctx, p)
-	captured := channel.channel.NotifyPublish(make(chan amqp.Confirmation, batch))
-	messages := make([]driver.OutboundMessage, batch)
-	for index := range messages {
-		messages[index] = driver.OutboundMessage{
-			Destination: queue,
-			Headers:     []driver.Header{{Key: "id", Value: fmt.Appendf(nil, "order-%d", index)}},
-			Body:        fmt.Appendf(nil, "order-body-%d", index),
-		}
-	}
-	if err := rawProducer.Publish(ctx, messages...); err != nil {
-		t.Fatalf("batch Publish: %v", err)
-	}
-	for index := range batch {
-		select {
-		case confirmation := <-captured:
-			if !confirmation.Ack {
-				t.Fatalf("confirmation %d is negative", index)
-			}
-			if confirmation.DeliveryTag != uint64(index+1) {
-				t.Fatalf("confirmation %d has delivery tag %d, want %d: confirmations are not delivered in publish order", index, confirmation.DeliveryTag, index+1)
-			}
-		case <-ctx.Done():
-			t.Fatalf("reading confirmation %d: %v", index, ctx.Err())
-		}
-	}
-}
-
-// TestProducerCancelledWindowInvalidatesChannel proves a cancelled batch
-// leaves nothing behind: every message the window published is reported
-// failed, the window's channel is closed so its unread confirmations can never
-// be read against a later publish, the producer itself still publishes on a
-// channel of its own, and a fresh producer on the same connection publishes
-// normally.
-func TestProducerCancelledWindowInvalidatesChannel(t *testing.T) {
-	requireBroker(t)
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-
-	const queue = "rabbitmq-driver-producer-cancelled-window"
-	conn, rawChannel := openProducerFixture(t, ctx, queue)
-	if _, err := conn.Admin().EnsureTopology(ctx, driver.TopologySpec{
-		Destinations: []driver.DestinationSpec{{Name: queue, Durable: true}},
-	}); err != nil {
-		t.Fatalf("EnsureTopology: %v", err)
-	}
-	rawProducer, err := conn.Producer(ctx, driver.ProducerConfig{RequireDurableAck: true})
-	if err != nil {
-		t.Fatalf("Producer: %v", err)
-	}
-	p := rawProducer.(*producer)
-	cancelledChannel := producerFreeChannel(t, ctx, p)
-	confirms := make(chan amqp.Confirmation, publishWindowSize)
-	cancelledChannel.confirms = confirms
-	t.Cleanup(func() { _ = rawProducer.Close(context.Background()) })
-	deliveries, err := rawChannel.Consume(queue, "producer-cancelled-window", false, false, false, false, nil)
-	if err != nil {
-		t.Fatalf("Consume: %v", err)
-	}
-	messages := make([]driver.OutboundMessage, 4)
-	for index := range messages {
-		messages[index] = driver.OutboundMessage{
-			Destination: queue,
-			Headers:     []driver.Header{{Key: "id", Value: fmt.Appendf(nil, "cancelled-%d", index)}},
-			Body:        fmt.Appendf(nil, "cancelled-body-%d", index),
-		}
-	}
-	publishCtx, cancelPublish := context.WithCancel(ctx)
-	done := make(chan error, 1)
-	go func() { done <- rawProducer.Publish(publishCtx, messages...) }()
-	awaitUnconfirmedDeliveries(t, ctx, deliveries, len(messages))
-	cancelPublish()
-
-	var publishErr *driver.PublishError
-	select {
-	case err := <-done:
-		if err == nil {
-			t.Fatal("cancelled batch Publish error = nil, want the cancelled window to fail")
-		}
-		if !errors.As(err, &publishErr) {
-			t.Fatalf("cancelled batch Publish error = %v, want *driver.PublishError", err)
-		}
-		if !errors.Is(err, context.Canceled) {
-			t.Fatalf("cancelled batch Publish error = %v, want context.Canceled", err)
-		}
-	case <-ctx.Done():
-		t.Fatalf("cancelled batch Publish result: %v", ctx.Err())
-	}
-	if len(publishErr.Failed) != len(messages) {
-		t.Fatalf("failed indexes = %v, want every index of the cancelled window", publishErr.Failed)
-	}
-	// The confirmations owed to the cancelled window must never be read
-	// against a later publish, so the window's channel is gone. The producer
-	// is not: the next publish on it runs on a channel of its own.
-	awaitChannelClosed(t, ctx, cancelledChannel.channel)
-	if err := rawProducer.Publish(ctx, driver.OutboundMessage{
-		Destination: queue,
-		Headers:     []driver.Header{{Key: "id", Value: []byte("after-discard")}},
-		Body:        []byte("after-discard"),
-	}); err != nil {
-		t.Fatalf("Publish after a cancelled window: %v", err)
-	}
-	select {
-	case delivery := <-deliveries:
-		if string(delivery.Body) != "after-discard" {
-			t.Fatalf("delivered body = %q, want after-discard", delivery.Body)
-		}
-		if err := delivery.Ack(false); err != nil {
-			t.Fatalf("Ack: %v", err)
-		}
-	case <-ctx.Done():
-		t.Fatalf("receiving the publish that followed the cancelled window: %v", ctx.Err())
-	}
-
-	fresh, err := conn.Producer(ctx, driver.ProducerConfig{RequireDurableAck: true})
-	if err != nil {
-		t.Fatalf("Producer: %v", err)
-	}
-	defer func() { _ = fresh.Close(ctx) }()
-	if err := fresh.Publish(ctx, driver.OutboundMessage{
-		Destination: queue,
-		Headers:     []driver.Header{{Key: "id", Value: []byte("after-cancel")}},
-		Body:        []byte("after-cancel"),
-	}); err != nil {
-		t.Fatalf("Publish on a fresh producer: %v", err)
-	}
-	select {
-	case delivery := <-deliveries:
-		if string(delivery.Body) != "after-cancel" {
-			t.Fatalf("delivered body = %q, want after-cancel", delivery.Body)
-		}
-		if err := delivery.Ack(false); err != nil {
-			t.Fatalf("Ack: %v", err)
-		}
-	case <-ctx.Done():
-		t.Fatalf("receiving the fresh producer's message: %v", ctx.Err())
-	}
-}
-
 // TestProducerBatchWithoutMessageIDsFailsOnlyItsOwnIndex covers correlation
 // when no envelope id is available: amqpPublishing only sets the AMQP message
 // id from an "id" header, and the driver port is publishable without one. A
-// basic.return carries no delivery tag, so an id-less window must never hold
-// two messages: the driver shortens such a window to one, which costs one round
-// trip per message and keeps every return on its own index. The batch is
+// basic.return carries no delivery tag, so two id-less messages must never be
+// unresolved on one channel: the driver publishes each as a segment of its
+// own, which costs one round trip per message and keeps every return on its
+// own index. The batch is
 // repeated because the interleaving that would break a wrongly pipelined
 // id-less batch (a return for a later message arriving before an earlier
 // message's confirmation) is a race between two broker frames.
@@ -831,7 +428,7 @@ func TestProducerBatchWithoutMessageIDsFailsOnlyItsOwnIndex(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("EnsureTopology: %v", err)
 	}
-	rawProducer, err := conn.Producer(ctx, driver.ProducerConfig{RequireDurableAck: true})
+	rawProducer, err := conn.Producer(ctx, driver.ProducerConfig{})
 	if err != nil {
 		t.Fatalf("Producer: %v", err)
 	}
@@ -890,13 +487,13 @@ func TestProducerBatchWithoutMessageIDsFailsOnlyItsOwnIndex(t *testing.T) {
 	}
 }
 
-// TestProducerBatchLocalEncodingFailureDoesNotStallWindow covers a window whose
+// TestProducerBatchLocalEncodingFailureDoesNotStall covers a batch whose
 // messages on the wire are fewer than the batch: a message that fails to encode
 // is never published, so it consumes no delivery tag and no confirmation for it
 // will ever arrive. The reader must therefore wait for one confirmation per
 // successful publish, not one per message in the batch. Getting that wrong
 // blocks Publish until its context expires.
-func TestProducerBatchLocalEncodingFailureDoesNotStallWindow(t *testing.T) {
+func TestProducerBatchLocalEncodingFailureDoesNotStall(t *testing.T) {
 	requireBroker(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
@@ -908,7 +505,7 @@ func TestProducerBatchLocalEncodingFailureDoesNotStallWindow(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("EnsureTopology: %v", err)
 	}
-	rawProducer, err := conn.Producer(ctx, driver.ProducerConfig{RequireDurableAck: true})
+	rawProducer, err := conn.Producer(ctx, driver.ProducerConfig{})
 	if err != nil {
 		t.Fatalf("Producer: %v", err)
 	}
@@ -1026,7 +623,7 @@ func TestProducerPublishesToDeclaredFanoutExchange(t *testing.T) {
 	if _, err := conn.Admin().EnsureTopology(ctx, spec); err != nil {
 		t.Fatalf("EnsureTopology: %v", err)
 	}
-	producer, err := conn.Producer(ctx, driver.ProducerConfig{RequireDurableAck: true})
+	producer, err := conn.Producer(ctx, driver.ProducerConfig{})
 	if err != nil {
 		t.Fatalf("Producer: %v", err)
 	}
@@ -1093,21 +690,37 @@ func openProducerFixture(t *testing.T, ctx context.Context, queue string) (drive
 	if err != nil {
 		t.Fatalf("Dial: %v", err)
 	}
-	t.Cleanup(func() { _ = raw.Close() })
+	t.Cleanup(func() {
+		if err := raw.Close(); err != nil && !errors.Is(err, amqp.ErrClosed) {
+			t.Errorf("cleanup raw connection close: %v", err)
+		}
+	})
 	channel, err := raw.Channel()
 	if err != nil {
 		t.Fatalf("Channel: %v", err)
 	}
-	_, _ = channel.QueueDelete(queue, false, false, false)
+	if _, err := channel.QueueDelete(queue, false, false, false); err != nil && !errors.Is(err, amqp.ErrClosed) {
+		t.Fatalf("initial QueueDelete(%q): %v", queue, err)
+	}
 	t.Cleanup(func() {
-		_, _ = channel.QueueDelete(queue, false, false, false)
-		_ = channel.Close()
+		if _, err := channel.QueueDelete(queue, false, false, false); err != nil && !errors.Is(err, amqp.ErrClosed) {
+			t.Errorf("cleanup QueueDelete(%q): %v", queue, err)
+		}
+		if err := channel.Close(); err != nil && !errors.Is(err, amqp.ErrClosed) {
+			t.Errorf("cleanup channel close: %v", err)
+		}
 	})
 	conn, err := (Driver{}).Open(ctx, driver.Config{Endpoints: []string{defaultEndpoint}})
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
-	t.Cleanup(func() { _ = conn.Close(ctx) })
+	t.Cleanup(func() {
+		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+		defer cancel()
+		if err := conn.Close(cleanupCtx); err != nil {
+			t.Errorf("cleanup connection close: %v", err)
+		}
+	})
 	return conn, channel
 }
 
@@ -1128,20 +741,30 @@ func TestProducerParkingFailureNamesMissingQueue(t *testing.T) {
 
 	const destination = "rabbitmq-driver-park-missing"
 	conn, rawChannel := openProducerFixture(t, ctx, destination)
-	parkName := destination + ".park"
+	const delay = time.Hour
+	parkName := parkQueueName(destination)
 
 	raw, err := amqp.Dial(defaultEndpoint)
 	if err != nil {
 		t.Fatalf("Dial: %v", err)
 	}
-	t.Cleanup(func() { _ = raw.Close() })
+	t.Cleanup(func() {
+		if err := raw.Close(); err != nil && !errors.Is(err, amqp.ErrClosed) {
+			t.Errorf("cleanup parking raw connection close: %v", err)
+		}
+	})
 	dropPark := func() {
-		channel, channelErr := raw.Channel()
-		if channelErr != nil {
+		channel, err := raw.Channel()
+		if err != nil {
+			t.Errorf("open parking cleanup channel: %v", err)
 			return
 		}
-		defer func() { _ = channel.Close() }()
-		_, _ = channel.QueueDelete(parkName, false, false, false)
+		if _, err := channel.QueueDelete(parkName, false, false, false); err != nil && !errors.Is(err, amqp.ErrClosed) {
+			t.Errorf("cleanup QueueDelete(%q): %v", parkName, err)
+		}
+		if err := channel.Close(); err != nil && !errors.Is(err, amqp.ErrClosed) {
+			t.Errorf("cleanup parking channel close: %v", err)
+		}
 	}
 	t.Cleanup(dropPark)
 	// The parking queue is removed rather than merely assumed absent, so the
@@ -1152,14 +775,26 @@ func TestProducerParkingFailureNamesMissingQueue(t *testing.T) {
 	if _, err := rawChannel.QueueDeclare(destination, true, false, false, false, nil); err != nil {
 		t.Fatalf("QueueDeclare(%q): %v", destination, err)
 	}
+	// TopologyNone records the delay for routing and declares nothing, which is
+	// the operator-provisioned shape this failure is written for.
+	if _, err := conn.Admin().EnsureTopology(ctx, driver.TopologySpec{
+		Policy:       driver.TopologyNone,
+		Destinations: []driver.DestinationSpec{{Name: destination, Durable: true, Delay: delay}},
+	}); err != nil {
+		t.Fatalf("EnsureTopology(none): %v", err)
+	}
 
-	publisher, err := conn.Producer(ctx, driver.ProducerConfig{RequireDurableAck: true})
+	publisher, err := conn.Producer(ctx, driver.ProducerConfig{})
 	if err != nil {
 		t.Fatalf("Producer: %v", err)
 	}
+	t.Cleanup(func() {
+		if err := publisher.Close(context.Background()); err != nil {
+			t.Errorf("cleanup publisher: %v", err)
+		}
+	})
 	parked := driver.OutboundMessage{
 		Destination: destination,
-		DelayUntil:  time.Now().Add(time.Hour), //nolint:forbidigo // a live delayed publish needs a future due time
 		Headers:     []driver.Header{{Key: "id", Value: []byte("park-missing-1")}},
 		Body:        []byte("parked"),
 	}
@@ -1188,7 +823,7 @@ func TestProducerParkingFailureNamesMissingQueue(t *testing.T) {
 		}
 	}
 
-	if _, err := rawChannel.QueueDeclare(parkName, true, false, false, false, parkingArguments(destination, queueKindQuorum)); err != nil {
+	if _, err := rawChannel.QueueDeclare(parkName, true, false, false, false, parkArguments(destination, queueKindQuorum)); err != nil {
 		t.Fatalf("QueueDeclare(%q): %v", parkName, err)
 	}
 	parked.Headers = []driver.Header{{Key: "id", Value: []byte("park-missing-2")}}
@@ -1213,7 +848,7 @@ func TestProducerParkingFailureNamesMissingQueue(t *testing.T) {
 }
 
 // TestParkingFailureRendersEveryDeclareArgument proves the message is derived
-// from parkingArguments rather than restating it. The test iterates that
+// from parkArguments rather than restating it. The test iterates that
 // function's own output, so an argument added there reaches the message with
 // no second edit, and an argument removed there cannot leave the message
 // telling an operator to create a queue the adapter would then report as
@@ -1230,221 +865,28 @@ func TestParkingFailureRendersEveryDeclareArgument(t *testing.T) {
 	cause := classify("publish", driver.KindNotFound,
 		errors.Join(driver.ErrDestinationMissing, errors.New("rabbitmq: publish returned by broker: 312 NO_ROUTE")))
 
-	// Both parking queue shapes are covered, because their argument sets
-	// differ by more than the kind: a rung queue carries x-message-ttl and the
-	// queue above the ladder does not.
-	parkingQueues := map[string]string{
-		"above the ladder": destination + parkingSuffix,
-		"rung":             parkQueueName(destination, 2*time.Second),
-	}
-	for shape, parking := range parkingQueues {
-		for _, kind := range []queueKind{queueKindQuorum, queueKindClassic} {
-			t.Run(shape+"/"+string(kind), func(t *testing.T) {
-				message := parkingFailure(parking, kind, cause).Error()
-				args := parkArguments(destination, kind, parking)
-				if _, isRung, ok := parkQueueParts(parking); ok && isRung > 0 {
-					if _, present := args["x-message-ttl"]; !present {
-						t.Fatalf("parking failure for the rung queue %q is rendered from an argument set without x-message-ttl", parking)
-					}
+	parking := parkQueueName(destination)
+	for _, kind := range []queueKind{queueKindQuorum, queueKindClassic} {
+		t.Run(string(kind), func(t *testing.T) {
+			message := parkingFailure(parking, kind, cause).Error()
+			args := parkArguments(destination, kind)
+			for key, value := range args {
+				rendered := fmt.Sprint(value)
+				if text, ok := value.(string); ok {
+					rendered = strconv.Quote(text)
 				}
-				for key, value := range args {
-					rendered := fmt.Sprint(value)
-					if text, ok := value.(string); ok {
-						rendered = strconv.Quote(text)
-					}
-					if !strings.Contains(message, key+"="+rendered) {
-						t.Fatalf("parking failure %q does not carry the declare argument %s=%s", message, key, rendered)
-					}
+				if !strings.Contains(message, key+"="+rendered) {
+					t.Fatalf("parking failure %q does not carry the declare argument %s=%s", message, key, rendered)
 				}
-				for _, want := range []string{parking, "declares the queue durable", "TopologyDeclare", "TopologyVerify", "TopologyNone"} {
-					if !strings.Contains(message, want) {
-						t.Fatalf("parking failure %q does not name %q", message, want)
-					}
-				}
-				if !errors.Is(parkingFailure(parking, kind, cause), driver.ErrDestinationMissing) {
-					t.Fatalf("parking failure %q no longer wraps ErrDestinationMissing", message)
-				}
-			})
-		}
-	}
-}
-
-// TestProducerTargetRoutesEntryPointToExchange proves target() routes an
-// entry-point publish to its named exchange with no routing key, purely from
-// OutboundMessage.EntryPoint, and offline: no live broker connection. The
-// table runs once per topology policy to document that this is now true
-// regardless of policy - the defect this replaces was that a pre-provisioned
-// exchange only routed correctly once EnsureTopology had populated a
-// process-local cache, so it broke under exactly the policy where a
-// pre-provisioned exchange is the whole point (no admin call is ever made).
-// target() takes no policy argument any more; the loop asserts the same
-// answer under all three names so a future reintroduction of policy-derived
-// routing would have to change this test to pass.
-func TestProducerTargetRoutesEntryPointToExchange(t *testing.T) {
-	policies := map[string]driver.TopologyPolicy{
-		"TopologyNone":    driver.TopologyNone,
-		"TopologyDeclare": driver.TopologyDeclare,
-		"TopologyVerify":  driver.TopologyVerify,
-	}
-	for name, policy := range policies {
-		t.Run(name, func(t *testing.T) {
-			t.Logf("target() takes no policy argument; asserting under policy %d (%s) for documentation", policy, name)
-			p := &producer{conn: &conn{}}
-			exchange, routingKey, expiration := p.target(driver.OutboundMessage{Destination: "orders.fanout", EntryPoint: true})
-			if exchange != "orders.fanout" {
-				t.Fatalf("target() exchange = %q, want %q", exchange, "orders.fanout")
 			}
-			if routingKey != "" {
-				t.Fatalf("target() routingKey = %q, want empty for a fanout exchange", routingKey)
+			for _, want := range []string{parking, "declares the queue durable", "TopologyDeclare", "TopologyVerify", "TopologyNone"} {
+				if !strings.Contains(message, want) {
+					t.Fatalf("parking failure %q does not name %q", message, want)
+				}
 			}
-			if expiration != "" {
-				t.Fatalf("target() expiration = %q, want empty for a non-deferred publish", expiration)
+			if !errors.Is(parkingFailure(parking, kind, cause), driver.ErrDestinationMissing) {
+				t.Fatalf("parking failure %q no longer wraps ErrDestinationMissing", message)
 			}
 		})
-	}
-}
-
-// TestProducerTargetRetryAndDLQStayConcreteDestinations proves the fix does
-// not pass by routing everything to an exchange: a retry or DLQ publish
-// carries EntryPoint: false, its zero value, and must still route to the
-// AMQP default exchange with the destination as routing key.
-func TestProducerTargetRetryAndDLQStayConcreteDestinations(t *testing.T) {
-	cases := []string{
-		"f1.prod.orders.created.worker.high.retry.1",
-		"f1.prod.orders.created.dlq.worker",
-	}
-	p := &producer{conn: &conn{}}
-	for _, destination := range cases {
-		t.Run(destination, func(t *testing.T) {
-			exchange, routingKey, expiration := p.target(driver.OutboundMessage{Destination: destination})
-			if exchange != "" {
-				t.Fatalf("target() exchange = %q, want empty for a concrete destination", exchange)
-			}
-			if routingKey != destination {
-				t.Fatalf("target() routingKey = %q, want %q", routingKey, destination)
-			}
-			if expiration != "" {
-				t.Fatalf("target() expiration = %q, want empty for a non-deferred publish", expiration)
-			}
-		})
-	}
-}
-
-// TestProducerTargetRungsAndFallThrough pins the routing decision the ladder
-// adds: a remaining delay on the ladder parks in that rung's queue and the
-// message carries no expiration, because the rung queue's own TTL does the
-// delaying. Above the ladder the per-message path is unchanged, which is what
-// keeps a due time up to maxExpirationMillis owed instead of clamped early.
-//
-// The declared-delay path is used so the remaining delay is the table's own
-// value: target reads one clock and derives the due time from it, so no wall
-// time passes between the two.
-func TestProducerTargetRungsAndFallThrough(t *testing.T) {
-	cases := []struct {
-		delay  time.Duration
-		want   string
-		onRung bool
-	}{
-		{delay: 500 * time.Millisecond, want: "orders.deferred.park.500ms", onRung: true},
-		{delay: 501 * time.Millisecond, want: "orders.deferred.park.1s", onRung: true},
-		{delay: time.Second, want: "orders.deferred.park.1s", onRung: true},
-		{delay: 1500 * time.Millisecond, want: "orders.deferred.park.2s", onRung: true},
-		{delay: 3 * time.Second, want: "orders.deferred.park.4s", onRung: true},
-		{delay: 10 * time.Second, want: "orders.deferred.park.16s", onRung: true},
-		{delay: 64 * time.Second, want: "orders.deferred.park.64s", onRung: true},
-		{delay: 64*time.Second + time.Millisecond, want: "orders.deferred.park"},
-		{delay: 24 * time.Hour, want: "orders.deferred.park"},
-	}
-	for _, test := range cases {
-		t.Run(test.delay.String(), func(t *testing.T) {
-			p := &producer{conn: &conn{deferred: map[string]time.Duration{"orders.deferred": test.delay}}}
-			exchange, routingKey, expiration := p.target(driver.OutboundMessage{Destination: "orders.deferred"})
-			if exchange != "" {
-				t.Fatalf("target() exchange = %q, want empty for a parked publish", exchange)
-			}
-			if routingKey != test.want {
-				t.Fatalf("target() routingKey = %q, want %q", routingKey, test.want)
-			}
-			if test.onRung && expiration != "" {
-				t.Fatalf("target() expiration = %q, want empty on the ladder so the rung queue's TTL decides", expiration)
-			}
-			if !test.onRung && expiration == "" {
-				t.Fatalf("target() expiration is empty above the ladder, want a per-message TTL for %s", test.delay)
-			}
-		})
-	}
-}
-
-// TestParkingSuffixParsingIsStrict pins the parse that keeps a rung suffix
-// from being a wildcard tail. The conformance suite declares a destination
-// named topology.prune.park.eligible, and reading that name as a rung queue of
-// topology.prune would both hide a queue from the orphan scan and take a rung
-// queue out of the prune guard.
-func TestParkingSuffixParsingIsStrict(t *testing.T) {
-	cases := []struct {
-		name        string
-		destination string
-		rung        time.Duration
-		ok          bool
-	}{
-		{name: "orders.park", destination: "orders", ok: true},
-		{name: "orders.park.1s", destination: "orders", rung: time.Second, ok: true},
-		{name: "orders.park.500ms", destination: "orders", rung: 500 * time.Millisecond, ok: true},
-		{name: "orders.park.64s", destination: "orders", rung: 64 * time.Second, ok: true},
-		{name: "topology.prune.park.eligible"},
-		{name: "orders.park.65s"},
-		{name: "orders.park.1000"},
-		{name: "orders.park."},
-		{name: "orders.parked"},
-		{name: "orders.deferred.park.1s.park.2s", destination: "orders.deferred.park.1s", rung: 2 * time.Second, ok: true},
-	}
-	for _, test := range cases {
-		t.Run(test.name, func(t *testing.T) {
-			destination, rung, ok := parkQueueParts(test.name)
-			if ok != test.ok || destination != test.destination || rung != test.rung {
-				t.Fatalf("parkQueueParts(%q) = (%q, %s, %t), want (%q, %s, %t)",
-					test.name, destination, rung, ok, test.destination, test.rung, test.ok)
-			}
-		})
-	}
-}
-
-// TestProducerTargetDeferredDestinationParks proves an explicit DelayUntil
-// still parks, with no ensureParking call from the publish path: parking
-// queues are declared once in EnsureTopology, and the publish path only
-// ever asks for one that should already exist.
-func TestProducerTargetDeferredDestinationParks(t *testing.T) {
-	p := &producer{conn: &conn{}}
-	due := time.Now().Add(time.Hour) //nolint:forbidigo // building a fixed future DelayUntil for the test
-	exchange, routingKey, expiration := p.target(driver.OutboundMessage{Destination: "orders.deferred", DelayUntil: due})
-	if exchange != "" {
-		t.Fatalf("target() exchange = %q, want empty for a parked publish", exchange)
-	}
-	if routingKey != "orders.deferred.park" {
-		t.Fatalf("target() routingKey = %q, want %q", routingKey, "orders.deferred.park")
-	}
-	if expiration == "" {
-		t.Fatal("target() expiration is empty, want a positive TTL for a future DelayUntil")
-	}
-}
-
-// TestProducerTargetDestinationDelayFallsBackWhenDelayUntilIsZero proves a
-// declared destination-level delay still supplies the due time when the
-// message carries no DelayUntil. The driver port conformance suite requires
-// this ("a destination-level Delay supplying the due time when DelayUntil
-// is zero"), so target() keeps a read of the delay EnsureTopology already
-// recorded for this one purpose, even though the exchange-routing cache
-// read next to it was removed.
-func TestProducerTargetDestinationDelayFallsBackWhenDelayUntilIsZero(t *testing.T) {
-	p := &producer{conn: &conn{deferred: map[string]time.Duration{"orders.deferred": time.Hour}}}
-	exchange, routingKey, expiration := p.target(driver.OutboundMessage{Destination: "orders.deferred"})
-	if exchange != "" {
-		t.Fatalf("target() exchange = %q, want empty for a parked publish", exchange)
-	}
-	if routingKey != "orders.deferred.park" {
-		t.Fatalf("target() routingKey = %q, want %q", routingKey, "orders.deferred.park")
-	}
-	if expiration == "" {
-		t.Fatal("target() expiration is empty, want a positive TTL derived from the destination's declared delay")
 	}
 }

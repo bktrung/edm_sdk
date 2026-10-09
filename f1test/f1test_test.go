@@ -7,12 +7,37 @@ import (
 	"io"
 	"log/slog"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/stretchr/testify/require"
 
 	f1 "fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk"
+	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/driver"
 )
+
+func TestCaptureStoreWaitPublishedSurvivesInterveningDrain(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		s := &captureStore{signal: make(chan struct{})}
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		done := make(chan error, 1)
+		go func() {
+			done <- s.waitPublished(ctx)
+		}()
+
+		synctest.Wait()
+		s.take(true)
+		s.add(nil, []driver.OutboundMessage{{Destination: "orders.created.v1"}}, nil)
+
+		select {
+		case err := <-done:
+			require.NoError(t, err)
+		case <-ctx.Done():
+			t.Fatal("waitPublished did not wake after publication")
+		}
+	})
+}
 
 func TestClientDeliverAndCapture(t *testing.T) {
 	c := NewClient(t, quietLogger())
@@ -207,6 +232,48 @@ func TestClientCapturesDeadLetterCopies(t *testing.T) {
 	require.Equal(t, f1.ReasonTerminal.String(), dlq[0].Headers["f1deathreason"])
 }
 
+// TestClientOnlyReportsDeclaredDeadLetterDestinations proves a capture is
+// classified by the kind the core declared for the destination rather than by
+// its name: a topic that spells "dlq" in its name is an ordinary published
+// destination, and only a destination the core declared as a dead-letter
+// destination is reported by DLQ.
+func TestClientOnlyReportsDeclaredDeadLetterDestinations(t *testing.T) {
+	c := NewClient(t, quietLogger())
+	ctx, cancel := context.WithCancel(context.Background())
+	handled := make(chan struct{})
+	runner, err := c.Subscribe(ctx, f1.Subscription{
+		Name:           "orders",
+		Topics:         []string{"orders.dlq.created"},
+		Concurrency:    1,
+		Prefetch:       1,
+		Priorities:     []f1.Priority{f1.PriorityMedium},
+		Retry:          f1.RetryConfig{MaxAttempts: 1},
+		HandlerTimeout: time.Second,
+		Handlers: map[string]f1.Handler{
+			"orders.dlq.created.v1": f1.HandlerFunc(func(context.Context, *f1.Event) error {
+				close(handled)
+				return nil
+			}),
+		},
+	})
+	require.NoError(t, err)
+	runDone := make(chan struct{})
+	go func() {
+		defer close(runDone)
+		_ = runner.Run(ctx)
+	}()
+	defer func() {
+		cancel()
+		waitFor(t, runDone, "runner did not stop")
+	}()
+
+	c.Deliver(t, "orders.dlq.created.v1", map[string]string{"id": "order-3"})
+	waitFor(t, handled, "handler did not receive delivered event")
+
+	require.Len(t, c.Published(), 1, "a topic whose name contains dlq must be reported as a published message")
+	require.Empty(t, c.DLQ())
+}
+
 func TestClientAdvanceFiresDriverRetry(t *testing.T) {
 	c := NewClient(t, quietLogger())
 	ctx, cancel := context.WithCancel(context.Background())
@@ -320,4 +387,20 @@ func waitFor(t *testing.T, signal <-chan struct{}, message string) {
 
 func quietLogger() f1.Option {
 	return f1.WithLogger(slog.New(slog.NewTextHandler(io.Discard, nil)))
+}
+
+// TestPublishToAnUndeclaredTopicReturnsTheDriverError pins that the wait for a
+// destination to be declared is bounded. A publish from code under test to a
+// topic no subscription or WithPublishTopics declared returns the driver's
+// error instead of waiting for its context to end.
+func TestPublishToAnUndeclaredTopicReturnsTheDriverError(t *testing.T) {
+	c := NewClient(t, quietLogger())
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	_, err := c.Publisher().Publish(ctx, "invoices.issued.v1", map[string]string{"id": "invoice-1"})
+	require.Error(t, err)
+	require.NoError(t, ctx.Err(), "the publish waited for its context to end")
+	kind, classified := driver.Classify(err)
+	require.True(t, classified, "Publish() = %v, want a classified driver error", err)
+	require.Equal(t, driver.KindNotFound, kind, "Publish() = %v", err)
 }

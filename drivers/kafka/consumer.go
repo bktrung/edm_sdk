@@ -1,15 +1,16 @@
 package kafka
 
 import (
+	"cmp"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"errors"
 	"fmt"
-	"log/slog"
 	"math"
 	"slices"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -20,24 +21,19 @@ import (
 
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/driver"
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/clock"
+	kafkarules "fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/kafka"
 )
 
 type pauseReason string
 
 const (
-	pauseReasonDeferred   pauseReason = "deferred"
-	pauseReasonHold       pauseReason = "hold-full"
 	pauseReasonPrefetch   pauseReason = "prefetch-full"
-	pauseReasonAckGap     pauseReason = "ack-gap"
 	pauseReasonUserPaused pauseReason = "user-paused"
 )
 
 type pauseReasonSet map[pauseReason]struct{}
 
 func (s pauseReasonSet) add(reason pauseReason) bool {
-	if s == nil {
-		return true
-	}
 	if _, exists := s[reason]; exists {
 		return false
 	}
@@ -58,38 +54,13 @@ func (s pauseReasonSet) remove(reason pauseReason) bool {
 
 func (s pauseReasonSet) empty() bool { return len(s) == 0 }
 
-// holding reports whether reason is about records the driver is already holding
-// rather than a condition of the destination that has to clear. A holding
-// reason never keeps a record whose due time has arrived from being delivered:
-// the records it names are the ones that become deliverable.
-func (r pauseReason) holding() bool {
-	return r == pauseReasonDeferred || r == pauseReasonHold
-}
-
-// holdsFetches reports whether reason keeps franz-go from fetching the
-// destination. A deferred reason does not: the records behind the one that is
-// waiting for its due time still have to be reachable, so the fetches are held
-// by pauseReasonHold instead, at the count that bounds them.
-func (r pauseReason) holdsFetches() bool {
-	return r != pauseReasonDeferred
-}
-
-// holdsFetches reports whether any reason in the set keeps franz-go from
-// fetching the destination.
-func (s pauseReasonSet) holdsFetches() bool {
-	for reason := range s {
-		if reason.holdsFetches() {
-			return true
-		}
-	}
-	return false
+func (s pauseReasonSet) blocksDelivery() bool {
+	return len(s) > 0
 }
 
 func (s pauseReasonSet) permitsRedelivery() bool {
-	// A deferred reason remains a correctness gate for a requeued record:
-	// allowing that record through would deliver it before its due time.
 	for reason := range s {
-		if reason != pauseReasonPrefetch && reason != pauseReasonAckGap {
+		if reason != pauseReasonPrefetch {
 			return false
 		}
 	}
@@ -107,16 +78,6 @@ type leaveRequest struct {
 }
 
 type leaveFunc func(context.Context, leaveRequest) error
-
-type consumerHandoff struct {
-	source  *consumer
-	message driver.InboundMessage
-}
-
-type transferReservation struct {
-	key    partitionKey
-	offset int64
-}
 
 type consumer struct {
 	conn             *conn
@@ -138,64 +99,130 @@ type consumer struct {
 	stopDone         chan struct{}
 	pauseReasons     map[string]pauseReasonSet
 	// unsettled counts every delivery admitted to Messages until its settler
-	// reaches a terminal state. An ordinary revoked settler releases its slot
-	// when ownership transfers to the queued handoff; a draining revoked
-	// settler remains counted until its caller reaches a terminal state, so
-	// draining still observes every outstanding delivery.
-	unsettled             map[string]int
-	settlers              map[*settler]struct{}
-	trackers              map[partitionKey]*ackTracker
-	trackerGenerations    map[partitionKey]uint64
-	assignmentGenerations map[partitionKey]uint64
-	activeGenerations     map[partitionKey]uint64
-	fenced                map[partitionKey]bool
-	recordGenerations     map[*kgo.Record]uint64
-	// tenures outlives an assignment generation. A cooperative rebalance that
-	// keeps a partition on the same member bumps the assignment generation
-	// without ending that member's ownership, so records already fetched must
-	// stay deliverable; a revocation ends the tenure instead, which refuses
-	// the records fetched under it. Bumped at revoke, never at assign.
-	tenures map[partitionKey]uint64
-	// settledTransfers contains exact offsets settled after ownership moved;
-	// a higher Kafka offset does not imply that a lower offset was delivered.
-	settledTransfers     map[partitionKey]map[int64]struct{}
-	pendingTransfers     map[partitionKey]map[int64]*ackTracker
-	transferReservations map[partitionKey]map[int64]struct{}
-	// selfTransfers lists settlers this consumer tombstoned and handed off
-	// whose partition can come back to it. A cooperative rebalance revokes a
-	// partition and may re-assign it to the same member across a generation
-	// bump; that member is then the new owner and may settle again.
-	selfTransfers         map[partitionKey][]*settler
-	handoffRecords        map[*kgo.Record]struct{}
-	handoffReservations   map[partitionKey]map[int64]struct{}
-	handoffMarkers        map[partitionKey]map[int64]struct{}
-	handoffs              map[partitionKey]map[int64]driver.InboundMessage
+	// reaches a terminal state. A revoked settler releases its slot when its
+	// settlement completes, whether that settlement committed before the revoke
+	// or was refused as revoked after it; a draining revoked settler remains
+	// counted until its caller reaches a terminal state, so draining still
+	// observes every outstanding delivery.
+	unsettled map[string]int
+	// admitted is the aggregate of destination charges, including requeues
+	// that retain their original charge until redelivery settles.
+	admitted int
+	// outstanding counts, per partition, the deliveries this consumer emitted
+	// for it and has not released. It carries the hold rule: at most one
+	// delivery per partition is outstanding, so the admission gate refuses a
+	// partition's next record while its count is non-zero. It follows the
+	// destination slot's charge and release points exactly, which is what keeps
+	// a requeue's redelivery holding its partition until it settles.
+	outstanding map[partitionKey]int
+	// partitionPauses is the sole source of partition fetch pauses. Keeping
+	// read-ahead and head-hold in one set prevents either release from
+	// reopening a partition still held for the other reason.
+	partitionPauses map[partitionKey]partitionPauseSet
+	pending         map[partitionKey][]*kgo.Record
+	heldUntil       map[partitionKey]time.Time
+	// dirty holds the partitions that a partition-scoped event - a settle that
+	// freed the partition's hold, a requeue, a cleared partition pause, new
+	// records fetched for it - may have made admissible since the last
+	// admission pass. partialScan reports that every event since the last full
+	// pass was one of those, so the next pass may visit the dirty partitions
+	// alone. Its zero value is a full pass, and every other wake, a rebalance
+	// callback, and a poll iteration that was not a wake clear it: an event
+	// that did not name its partition is answered by visiting all of them, as
+	// every pass did before the set existed.
+	//
+	// The set exists for cost, not for correctness: at one settlement per
+	// delivery a full pass per wake made the loop's work per delivery grow
+	// with the partitions owned.
+	dirty       map[partitionKey]struct{}
+	partialScan bool
+	// flushKeys is the admission pass's list of partitions to visit, reused
+	// across passes. Only the poll loop runs a pass, so it reads the list
+	// without c.mu once the list is filled.
+	flushKeys []partitionKey
+	// visitedKeys collects every partition one flushPending call visited, and
+	// visitedAll records that one of its passes was full. The read-ahead
+	// reconciliation after the flush reads them: a queue's length and its
+	// requeue count change only where a pass visited, or through an event
+	// that marks the partition for the next one. Both belong to the poll loop.
+	visitedKeys []partitionKey
+	visitedAll  bool
+	// lastAdmitted is the partition the last fresh admission came from. A full
+	// pass visits partitions in key order starting after it, so when one slot
+	// is contended every waiting partition gets a turn before any gets a
+	// second one. The caller must hold c.mu.
+	lastAdmitted partitionKey
+	settlers     map[*settler]struct{}
+	trackers     map[partitionKey]*ackTracker
+	// owned holds the partitions this consumer currently owns. The rebalance
+	// callbacks are its only writers and admission reads it under c.mu, so a
+	// revoke takes effect over the records the poll loop is already holding.
+	owned map[partitionKey]bool
+	// warned holds the destinations this consumer has already reported as
+	// underprovisioned. It is never cleared: the warning is about the shape of
+	// the subscription and its destination, which a later rebalance does not
+	// change, so a member that churns would otherwise repeat it on every
+	// membership change.
+	warned map[string]bool
+	// inHand holds the records the poll loop has taken from franz-go and not
+	// yet resolved. A fresh tracker for a partition takes its base from the
+	// lowest offset here rather than from the record that created it: the
+	// lowest offset the consumer still owes a delivery for is what the base
+	// means, and the records this loop is holding for the partition are the
+	// ones whose delivery is still owed.
+	inHand map[*kgo.Record]struct{}
+	// fetchScratch holds the records of the fetch response the poll loop took
+	// in hand last time it polled. The loop takes them in hand and collects
+	// them in one pass and queues them in a second pass over this slice, so a
+	// response is walked once for its records rather than once per pass.
+	fetchScratch []*kgo.Record
+	// requeued counts, per partition, the records waiting at the head of the
+	// queue that a caller put back. A redelivery replaces the delivery that
+	// held the partition rather than adding a second one, so the partition's
+	// single outstanding charge stays with the record, the destination's
+	// budget is not charged twice, and the read-ahead pause that counted the
+	// delivery in flight does not block the redelivery it is waiting for.
+	requeued              map[partitionKey]int
 	settlerCh             chan struct{}
 	rebalanceDrainTimeout time.Duration
-	requeued              map[partitionKey]int
-	discarded             map[partitionKey]map[int64]struct{}
-	reportedDeferrals     map[string]struct{}
-	maxAckGap             int64
 	laneFaultDestination  string
 	clock                 clock.Clock
+	headTimer             clock.Timer
+	headTimerSet          bool
+	headTimerDue          time.Time
+	headTimerChanged      chan struct{}
 	// offsetMu serializes CommitOffsetsSync with SetOffsets because franz-go
 	// forbids those operations from running concurrently.
-	offsetMu     sync.Mutex
+	offsetMu  sync.Mutex
+	committer offsetCommitter
+	// commitFn sends a committer round; newConsumer installs sendCommits, and
+	// a test replaces it to settle without a group coordinator.
+	commitFn commitSender
+	// beforeRequeueCompletion lets tests schedule a revoke at the charge handoff.
+	// Install before use; nil in production. It must not wait for c.mu while held.
+	beforeRequeueCompletion func()
+	backlogMu               sync.Mutex
+	// backlogProbeToken is the shared backlog client's one ownership token: a
+	// full slot means one probe has the client, and that token is what a later
+	// probe and the teardown wait on. A mutex would not do, because a sampler
+	// with a deadline has to be able to give up on the wait (see probeBacklog).
+	// newConsumer is its only production writer, so a consumer built as a
+	// literal has none.
+	backlogProbeToken chan struct{}
+	backlogClient     *kgo.Client
+	backlogPartitions map[string][]int32
+	// assignmentMu keeps a rebalance callback indivisible against the rest of
+	// the consumer. A multi-partition revoke holds it so no admission or
+	// settlement can land between two partitions of the same revocation and
+	// observe a half-applied reassignment.
 	assignmentMu sync.Mutex
-	// deliveryMu closes the gap between admission and Messages send so revoke
-	// cleanup cannot tombstone a settler before its message is enqueued.
+	// deliveryMu closes the gap between admission and the Messages send, so a
+	// teardown cannot close the channel under a sender.
 	deliveryMu sync.Mutex
 	leaveMu    sync.Mutex
 	mu         sync.Mutex
 	draining   bool
 	stopped    bool
-	// leftConnection marks a consumer that has left the connection and holds no
-	// queued copies, so requeueHandoff forwards a copy to a registered consumer
-	// instead of storing it. moveQueuedHandoffsOnLeave sets it in the same hold
-	// that takes the queue, so a copy is either carried by that snapshot or sees
-	// the flag. Deliberately not c.stopped, whose meaning is "accepts no new
-	// work" and which is set while the consumer is still registered.
-	leftConnection bool
 	// pollCancel interrupts the poll wait in flight and pollWakePending holds a
 	// wake that arrived while no wait was running. The loop keeps records
 	// admission refused in its own pending queue, and franz-go never offers
@@ -229,68 +256,66 @@ type consumer struct {
 type settler struct {
 	owner  *consumer
 	record *kgo.Record
-	// handoffDelivered marks a delivery this consumer emitted as a handoff, so
-	// a later emission of the same offset recognizes it as the copy already
-	// delivered. Guarded by owner.mu, like tracker.
-	handoffDelivered bool
-	tracker          *ackTracker
-	handoff          driver.InboundMessage
-	// commitSuppressed marks a delivery another consumer already committed.
-	// The broker no longer holds the offset, so the caller's settlement
-	// completes successfully instead of reporting a revocation it did not
-	// cause. Guarded by owner.mu, like tracker.
-	commitSuppressed bool
-	// forceRevoked marks a delivery the shed path must not retain: the
-	// ownership decision already went against it.
-	forceRevoked bool
-	// transferSettled marks a retained settler whose offset also travels as a
-	// queued handoff, so a commit that wins suppresses the queued copy.
-	transferSettled bool
+	// tracker is the partition's tracker at the moment this delivery was
+	// admitted. A revoke drops that tracker, and holding the pointer is what
+	// makes a settlement that arrives after the partition moved fail with the
+	// classified revoked error instead of committing. Guarded by owner.mu, like
+	// tracker.
+	tracker *ackTracker
+	// drainingRevoked marks a delivery whose partition was revoked while this
+	// consumer was draining. Nothing can redeliver it by then, so its requeue
+	// completes without an error rather than reporting a revocation the caller
+	// can do nothing about. Guarded by owner.mu, like tracker.
 	drainingRevoked bool
-	requeued        bool
 	slotReleased    bool
-	tombstoned      bool
 	key             partitionKey
 	mu              sync.Mutex
 	settled         bool
 }
 
-// clearHandoffDelivered reports whether this delivery had been emitted as a
-// handoff, and clears the flag under owner.mu, which guards it. The marker the
-// flag stands for is cleared separately, through owner.clearHandoffMarker,
-// which takes owner.mu itself and so cannot be called from under it.
-func (s *settler) clearHandoffDelivered() bool {
-	s.owner.mu.Lock()
-	defer s.owner.mu.Unlock()
-	delivered := s.handoffDelivered
-	s.handoffDelivered = false
-	return delivered
-}
-
+// completeRevocation ends a delivery whose partition this consumer no longer
+// owns: its settlement has been refused, so the delivery completes on the
+// caller's side and releases the charge it holds on the partition.
 func (s *settler) completeRevocation() {
-	if s.clearHandoffDelivered() {
-		s.owner.clearHandoffMarker(s.key, s.record.Offset)
-	}
-	// A tombstoned source is detached from c.settlers immediately so the
-	// destination slot can be reused. Its public settlement still completes
-	// the settler lifecycle; slotReleased prevents a second production
-	// counter decrement.
 	s.owner.mu.Lock()
 	_, retained := s.owner.settlers[s]
-	tombstoned := s.tombstoned
 	s.owner.mu.Unlock()
-	if retained || tombstoned {
+	if retained {
 		s.owner.completeSettlement(s, false)
 	}
 }
 
-// Ack commits the next offset after the contiguous acknowledged prefix and
-// releases this delivery's destination prefetch slot. An out-of-order
-// acknowledgement waits for every lower offset before committing.
+// commitRecord commits this delivery's offset through the selected tracker.
+// Only the tracker that admitted it may skip offsets franz-go did not deliver;
+// a renewed owner must still settle its exact base offset. admitted is
+// s.tracker read under owner.mu in the same section that selected tracker,
+// because a draining revoke clears s.tracker under that lock.
+func (s *settler) commitRecord(ctx context.Context, tracker, admitted *ackTracker) error {
+	commit := func(commitPoint int64) error {
+		return s.owner.commitOffset(ctx, s.key, commitPoint)
+	}
+	if tracker == admitted {
+		return tracker.AckOwn(s.record.Offset, commit)
+	}
+	return tracker.Ack(s.record.Offset, commit)
+}
+
+// Ack acknowledges this delivery and commits the Kafka offset after its record.
+// Each partition permits only one outstanding delivery at a time. The tracker
+// that admitted the delivery may skip offsets franz-go never delivered, but a
+// settlement routed through a newer tracker must match that tracker's cursor.
 func (s *settler) Ack(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
 		return classify("ack", driver.KindTransient, err)
 	}
+	// The handoff runs after s.mu is released, which the defer order gives: it
+	// takes deliveryMu, and a settler's lock is no part of that order.
+	handOff := false
+	defer func() {
+		if handOff {
+			s.owner.handOff(s.key)
+		}
+	}()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -299,58 +324,53 @@ func (s *settler) Ack(ctx context.Context) error {
 		s.owner.mu.Unlock()
 		return classify("ack", driver.KindFatal, driver.ErrAlreadySettled)
 	}
-	tracker := s.tracker
-	suppressed := s.commitSuppressed
+	tracker := s.owner.settlementTrackerLocked(s)
+	admitted := s.tracker
 	s.owner.mu.Unlock()
-	if suppressed {
-		// A peer's commit already removed the offset from the broker. The
-		// caller's acknowledgement is correct and completes without error.
-		s.owner.completeSettlement(s, false)
-		return nil
-	}
 	if tracker == nil {
 		s.completeRevocation()
 		return classify("ack", driver.KindFatal, ErrRevoked)
 	}
 
-	if err := tracker.Ack(s.record.Offset, func(commitPoint int64) error {
-		return s.owner.commitOffset(ctx, s.key, commitPoint)
-	}); err != nil {
+	if err := s.commitRecord(ctx, tracker, admitted); err != nil {
 		if errors.Is(err, ErrRevoked) {
 			s.completeRevocation()
-		} else if !errors.Is(err, errAckTrackerAlreadySettled) {
-			s.owner.refreshAckGap(s.record.Topic)
 		}
 		return classifySettlement("ack", err)
 	}
-	s.owner.completeSettlement(s, false)
+	handOff = !s.owner.completeSettlement(s, false)
 	return nil
 }
 
-// Nack either commits and discards a record or rewinds its active partition
-// cursor for an in-run redelivery. Requeue does not advance the tracker base.
+// Nack either commits and discards a record or puts it back at the head of its
+// partition's queue for an in-run redelivery. Requeue does not advance the
+// cursor: the record's offset is still unsettled, so a partition's next owner
+// redelivers it.
 // CountAsFailure is a no-op because classic Kafka groups expose no delivery count.
 func (s *settler) Nack(ctx context.Context, options driver.NackOptions) error {
 	if err := ctx.Err(); err != nil {
 		return classify("nack", driver.KindTransient, err)
 	}
+	// The handoff runs after s.mu is released, as in Ack.
+	handOff := false
+	defer func() {
+		if handOff {
+			s.owner.handOff(s.key)
+		}
+	}()
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
 	s.owner.mu.Lock()
 	if s.settled {
 		s.owner.mu.Unlock()
 		return classify("nack", driver.KindFatal, driver.ErrAlreadySettled)
 	}
-	tracker := s.tracker
-	suppressed := s.commitSuppressed
-	drainingRevoked := s.drainingRevoked && s.owner.draining
+	tracker := s.owner.settlementTrackerLocked(s)
+	admitted := s.tracker
+	draining := s.owner.draining
+	drainingRevoked := s.drainingRevoked && draining
 	s.owner.mu.Unlock()
-	if suppressed {
-		// The offset is already committed, so neither a discard nor a
-		// requeue can change the broker's state.
-		s.owner.completeSettlement(s, false)
-		return nil
-	}
 	if tracker == nil {
 		if drainingRevoked && options.Requeue {
 			s.owner.completeSettlement(s, false)
@@ -361,71 +381,97 @@ func (s *settler) Nack(ctx context.Context, options driver.NackOptions) error {
 	}
 
 	if options.Requeue {
-		s.requeued = true
-		if s.clearHandoffDelivered() {
-			s.owner.clearHandoffMarker(s.key, s.record.Offset)
-		}
 		s.owner.mu.Lock()
-		if err := tracker.Release(s.record.Offset); err != nil {
-			s.owner.mu.Unlock()
-			if errors.Is(err, ErrRevoked) {
-				s.completeRevocation()
-			}
-			return classifySettlement("nack", err)
+		// A requeue queues the redelivery this consumer owes, and it owes one
+		// here only while the partition is still this consumer's and the delivery
+		// is still settling under the tracker that admitted it, and nothing has
+		// stopped this consumer admitting. All three conditions are needed.
+		// settlementTrackerLocked returns the admitted tracker when the partition
+		// is not owned, so identity alone would queue a redelivery on a revoked
+		// partition; it returns the current ownership's tracker for a retained
+		// partition whose ownership was renewed, so the map's tracker alone would
+		// queue a redelivery whose charge completeSettlement has already released.
+		// Every other case leaves the offset uncommitted for the ownership in
+		// force, which fetches the record itself: the poll loop drops a record of a
+		// partition this consumer does not own through its stale pass, but the
+		// count this added is not the stale pass's to drop, and a queued redelivery
+		// admitted as a reuse would take the hold rule and the budget with no
+		// charge behind it.
+		if s.owner.owned[s.key] && s.owner.trackers[s.key] == s.tracker && tracker == s.tracker && !draining {
+			s.owner.requeueLocked(s)
 		}
-		s.owner.requeued[s.key]++
+		// A queued redelivery inherits the delivery's charge, so the partition
+		// stays held and the destination's slot stays counted until the redelivery
+		// settles. Queueing nothing is the exception, and for the same reason as
+		// above: a charge kept here has nothing left to hold and would shrink the
+		// destination's window for the rest of this consumer's life. Draining is
+		// part of that condition because the two are not the same instant: a
+		// requeue can arrive after Drain marked the consumer and before the leave's
+		// revoke reaches the partition, and this settler is gone from c.settlers by
+		// the time the revoke runs, so the revoke's own release has nothing to
+		// release.
+		// If Nack unlocked after queueing P, revoke could drop that copy and
+		// release its charge before Nack completed P's predecessor. Completion
+		// would then see the detached tracker and release another slot, stealing
+		// Q's charge. Keep both steps locked so revoke sees P already completed.
+		if s.owner.beforeRequeueCompletion != nil {
+			s.owner.beforeRequeueCompletion()
+		}
+		contended, shouldLeave := s.owner.completeSettlementLocked(s, !draining)
 		s.owner.mu.Unlock()
-		resetOffset := s.record.Offset
-		if lowest, ok := tracker.lowestRequeue(); ok {
-			resetOffset = lowest
+		if shouldLeave {
+			s.owner.requestLeave()
 		}
-		if !s.owner.resetOffset(s.key, tracker, resetOffset) {
-			if drainingRevoked {
-				s.owner.completeSettlement(s, false)
-				return nil
-			}
-			// The key moved to another consumer, so this consumer cannot
-			// rewind it. A queued handoff for the offset is the redelivery
-			// path the caller asked for, and it delivers the record once the
-			// source slot is released here.
-			s.owner.mu.Lock()
-			_, queued := s.owner.handoffs[s.key][s.record.Offset]
-			s.owner.mu.Unlock()
-			if queued {
-				s.owner.completeSettlement(s, false)
-				go s.owner.redriveHandoffs(s.key)
-				return nil
-			}
-			s.completeRevocation()
-			return classifySettlement("nack", ErrRevoked)
-		}
-		s.owner.resumeForRedelivery(s.record.Topic)
-		s.owner.mu.Lock()
-		draining := s.owner.draining
-		s.owner.mu.Unlock()
-		s.owner.completeSettlement(s, !draining)
+		handOff = !contended
 		return nil
 	}
 
-	if err := tracker.Ack(s.record.Offset, func(commitPoint int64) error {
-		return s.owner.commitOffset(ctx, s.key, commitPoint)
-	}); err != nil {
+	if err := s.commitRecord(ctx, tracker, admitted); err != nil {
 		if errors.Is(err, ErrRevoked) {
 			s.completeRevocation()
-		} else if !errors.Is(err, errAckTrackerAlreadySettled) {
-			s.owner.refreshAckGap(s.record.Topic)
 		}
 		return classifySettlement("nack", err)
 	}
-	s.owner.noteDiscarded(s.key, tracker, s.record.Offset)
-	slog.Default().Warn(
+	s.owner.conn.log().Warn(
 		"discarding Kafka record",
 		"topic", s.record.Topic,
 		"partition", s.record.Partition,
 		"offset", s.record.Offset,
 	)
-	s.owner.completeSettlement(s, false)
+	handOff = !s.owner.completeSettlement(s, false)
 	return nil
+}
+
+// settlementTrackerLocked returns the tracker a settlement of s commits
+// through, or nil when this consumer has to refuse it. The caller must hold
+// c.mu.
+//
+// A delivery is admitted under the tracker of the ownership in force, and a
+// revoke detaches and revokes that tracker, so a settlement arriving after the
+// revoke fails. One case is not a partition that moved away, and both protocol
+// families reach it: an eager balancer ("sticky", "range") revokes every
+// partition on every membership change and reassigns the ones this member
+// keeps, and a cooperative one re-assigns a partition to this member out of
+// another member's hands and revokes it here first. A delivery the caller still
+// holds then outlives the ownership it was made under while its partition never
+// left this consumer. The partition is owned here again, so the live settlement
+// path is the tracker of the current ownership. An ownership that has not
+// admitted a record yet has no tracker, and the delivery's own offset is where
+// that tracker starts, which is what builds one; the offset a settlement
+// commits is the base the new ownership owes, so a commit through it cannot
+// pass a record this consumer still has to deliver.
+func (c *consumer) settlementTrackerLocked(s *settler) *ackTracker {
+	tracker := c.trackers[s.key]
+	if tracker != nil && tracker == s.tracker {
+		return tracker
+	}
+	if !c.owned[s.key] {
+		return s.tracker
+	}
+	if tracker == nil {
+		tracker = c.trackerForLocked(s.record)
+	}
+	return tracker
 }
 
 func classifySettlement(operation string, err error) error {
@@ -453,10 +499,7 @@ func newConsumer(ctx context.Context, connection *conn, cfg driver.ConsumerConfi
 	if err := connection.admissionError("consumer"); err != nil {
 		return nil, err
 	}
-	maxAckGap, err := resolveMaxAckGap(connection.driverOptions)
-	if err != nil {
-		return nil, classify("consumer", driver.KindFatal, err)
-	}
+	var err error
 	seen := make(map[string]struct{}, len(cfg.Destinations))
 	for _, destination := range cfg.Destinations {
 		if _, exists := seen[destination]; exists {
@@ -485,7 +528,16 @@ func newConsumer(ctx context.Context, connection *conn, cfg driver.ConsumerConfi
 
 	drainTimeout := connection.rebalanceDrainTimeout
 	if drainTimeout == 0 {
-		drainTimeout = 25 * time.Second
+		drainTimeout = defaultKafkaRebalanceDrainTimeout
+	}
+	// The revoke wait holds the whole rebalance open, so the pair is refused
+	// here, where the bound in force is known, rather than surfacing as a lost
+	// assignment on the first rebalance.
+	if err := validateKafkaDrainTimeout(connection.driverOptions, drainTimeout); err != nil {
+		return nil, classify("consumer", driver.KindFatal, err)
+	}
+	if _, err := resolveRebalanceTimeout(connection.driverOptions, drainTimeout); err != nil {
+		return nil, classify("consumer", driver.KindFatal, err)
 	}
 
 	pollCtx, cancelPoll := context.WithCancel(context.Background())
@@ -512,33 +564,26 @@ func newConsumer(ctx context.Context, connection *conn, cfg driver.ConsumerConfi
 		forwarderStopC:        make(chan struct{}),
 		pauseReasons:          make(map[string]pauseReasonSet, len(cfg.Destinations)),
 		unsettled:             make(map[string]int, len(cfg.Destinations)),
+		outstanding:           make(map[partitionKey]int),
+		partitionPauses:       make(map[partitionKey]partitionPauseSet),
+		pending:               make(map[partitionKey][]*kgo.Record),
+		heldUntil:             make(map[partitionKey]time.Time),
 		settlers:              make(map[*settler]struct{}),
 		trackers:              make(map[partitionKey]*ackTracker),
-		trackerGenerations:    make(map[partitionKey]uint64),
-		handoffRecords:        make(map[*kgo.Record]struct{}),
-		handoffReservations:   make(map[partitionKey]map[int64]struct{}),
-		handoffMarkers:        make(map[partitionKey]map[int64]struct{}),
-		assignmentGenerations: make(map[partitionKey]uint64),
-		activeGenerations:     make(map[partitionKey]uint64),
-		fenced:                make(map[partitionKey]bool),
-		recordGenerations:     make(map[*kgo.Record]uint64),
-		tenures:               make(map[partitionKey]uint64),
-		settledTransfers:      make(map[partitionKey]map[int64]struct{}),
-		pendingTransfers:      make(map[partitionKey]map[int64]*ackTracker),
-		handoffs:              make(map[partitionKey]map[int64]driver.InboundMessage),
-		transferReservations:  make(map[partitionKey]map[int64]struct{}),
-		selfTransfers:         make(map[partitionKey][]*settler),
+		owned:                 make(map[partitionKey]bool),
+		warned:                make(map[string]bool),
+		inHand:                make(map[*kgo.Record]struct{}),
 		settlerCh:             make(chan struct{}, 1),
 		rebalanceDrainTimeout: drainTimeout,
 		requeued:              make(map[partitionKey]int),
-		discarded:             make(map[partitionKey]map[int64]struct{}),
-		reportedDeferrals:     make(map[string]struct{}),
-		maxAckGap:             maxAckGap,
 		clock:                 clock.NewReal(),
+		headTimerChanged:      make(chan struct{}, 1),
+		backlogProbeToken:     make(chan struct{}, 1),
 	}
 	consumer.leaveFn = consumer.leaveGroup
+	consumer.commitFn = consumer.sendCommits
 	for index, destination := range cfg.Destinations {
-		consumer.budgets[destination] = destinationPrefetch(cfg, destination, index)
+		consumer.budgets[destination] = cfg.DestinationPrefetch(index)
 	}
 
 	opts, err := consumerClientOpts(connection, cfg, group, consumer)
@@ -551,7 +596,11 @@ func newConsumer(ctx context.Context, connection *conn, cfg driver.ConsumerConfi
 		cancelPoll()
 		return nil, classify("consumer", driver.KindFatal, err)
 	}
+	// kgo.NewClient already started the group goroutines, and onPartitionsAssigned
+	// reaches resumePartitionIfFreeLocked, which reads c.client under this lock.
+	consumer.mu.Lock()
 	consumer.client = client
+	consumer.mu.Unlock()
 	reserved := false
 	defer func() {
 		if !reserved {
@@ -579,12 +628,17 @@ func newConsumer(ctx context.Context, connection *conn, cfg driver.ConsumerConfi
 	}
 	reserved = true
 	// The poll context is owned by the consumer and canceled by Drain or Stop.
+	go consumer.headHoldLoop()
 	//nolint:contextcheck // this goroutine uses the consumer-owned cancellation context.
 	go consumer.poll(pollCtx)
 	return consumer, nil
 }
 
 func consumerClientOpts(connection *conn, cfg driver.ConsumerConfig, group string, consumer *consumer) ([]kgo.Opt, error) {
+	fetchMaxWait, err := resolveFetchMaxWait(connection.driverOptions)
+	if err != nil {
+		return nil, err
+	}
 	staticMembership := connection.staticMembership
 	if connection.driverOptions != nil {
 		if resolved, err := resolveStaticMembership(connection.driverOptions); err == nil {
@@ -608,15 +662,11 @@ func consumerClientOpts(connection *conn, cfg driver.ConsumerConfig, group strin
 		kgo.DisableAutoCommit(),
 		consumerStartOffset(cfg.StartAt),
 		kgo.Balancers(balancer),
-		// Franz-go defaults FetchMaxWait to 5000ms for non-share groups. When a
-		// multi-destination consumer settles a message on a destination whose
-		// broker partition is currently exhausted, franz-go issues a Fetch
-		// request for that destination which the broker holds for up to
-		// MaxWaitMillis. While that single-broker request is held, other unpaused
-		// destinations on the same broker cannot be fetched, stalling refill
-		// deliveries for up to 5 seconds. Bounding FetchMaxWait prevents an
-		// exhausted destination from starving ready destinations.
-		kgo.FetchMaxWait(50*time.Millisecond),
+		// An exhausted destination cannot block a sibling destination on the same
+		// broker for longer than this value. franz-go defaults FetchMaxWait to
+		// 5000ms; this driver's 50ms default is deliberately below Kafka's own
+		// 500ms default because it multiplexes destinations over one client.
+		kgo.FetchMaxWait(fetchMaxWait),
 		kgo.BlockRebalanceOnPoll(),
 		kgo.OnPartitionsAssigned(func(ctx context.Context, cl *kgo.Client, partitions map[string][]int32) {
 			consumer.onPartitionsAssigned(ctx, cl, partitions)
@@ -634,33 +684,23 @@ func consumerClientOpts(connection *conn, cfg driver.ConsumerConfig, group strin
 	return opts, nil
 }
 
-const defaultKafkaMaxAckGap int64 = 10000
-
-func resolveMaxAckGap(options map[string]string) (int64, error) {
-	value, ok := options["kafka.maxAckGap"]
-	if !ok {
-		return defaultKafkaMaxAckGap, nil
-	}
-	gap, err := strconv.ParseInt(value, 10, 64)
-	if err != nil || gap <= 0 {
-		return 0, fmt.Errorf("kafka: invalid maxAckGap %q; must be a positive integer", value)
-	}
-	return gap, nil
-}
-
-// Consume-path knob defaults. They are franz-go's own defaults, passed
-// explicitly so an unset key still has a value the driver chose and a test can
-// observe.
+// Consume-path knob defaults. Values are passed explicitly so an unset key
+// still has a value the driver chose and tests can observe.
 //
 // defaultKafkaSessionTimeout matches the fallback that config validation uses
 // to bound lifecycle.rebalanceDrainTimeout. That bound is only meaningful if
 // the session timeout the broker enforces is the one validation measured, so
 // the two values must move together.
 const (
-	defaultKafkaFetchMaxBytes    int32 = 50 << 20
-	defaultKafkaSessionTimeout         = 45 * time.Second
-	defaultKafkaRebalanceTimeout       = 60 * time.Second
+	defaultKafkaFetchMaxWait                = 50 * time.Millisecond
+	maxKafkaFetchMaxWait                    = time.Duration(math.MaxInt32) * time.Millisecond
+	defaultKafkaFetchMaxBytes         int32 = 50 << 20
+	defaultKafkaSessionTimeout              = 45 * time.Second
+	defaultKafkaRebalanceTimeout            = 60 * time.Second
+	defaultKafkaRebalanceDrainTimeout       = 25 * time.Second
 )
+
+const fetchMaxWaitOption = "kafka.fetchMaxWait"
 
 // resolveConsumerOptions translates the broker.kafka.* keys that govern the
 // consume path into franz-go options. It returns an option for every knob,
@@ -675,7 +715,7 @@ func resolveConsumerOptions(options map[string]string) ([]kgo.Opt, error) {
 	if err != nil {
 		return nil, err
 	}
-	rebalanceTimeout, err := resolveRebalanceTimeout(options)
+	rebalanceTimeout, err := resolveRebalanceTimeoutOption(options)
 	if err != nil {
 		return nil, err
 	}
@@ -702,6 +742,27 @@ func resolveFetchMaxBytes(options map[string]string) (int32, error) {
 	return int32(bytes), nil
 }
 
+// resolveFetchMaxWait maps kafka.fetchMaxWait onto the maximum time Kafka
+// holds an empty fetch. The value must be a whole number of milliseconds in
+// franz-go's int32 wire range, so an invalid operator value cannot silently
+// become zero or wrap around.
+func resolveFetchMaxWait(options map[string]string) (time.Duration, error) {
+	value, ok := options[fetchMaxWaitOption]
+	if !ok {
+		return defaultKafkaFetchMaxWait, nil
+	}
+	wait, err := time.ParseDuration(value)
+	if err != nil || wait < time.Millisecond || wait > maxKafkaFetchMaxWait || wait%time.Millisecond != 0 {
+		return 0, fmt.Errorf(
+			"kafka: invalid %s %q; must be a whole-millisecond duration from 1ms to %s",
+			fetchMaxWaitOption,
+			value,
+			maxKafkaFetchMaxWait,
+		)
+	}
+	return wait, nil
+}
+
 // resolveSessionTimeout maps kafka.sessionTimeout onto the group member session
 // timeout. The member carries the value in its join request, so it is the
 // timeout the coordinator expires the member on rather than a local
@@ -718,10 +779,69 @@ func resolveSessionTimeout(options map[string]string) (time.Duration, error) {
 	return timeout, nil
 }
 
+// validateKafkaDrainTimeout rejects a revoke wait that can outlive either
+// broker group timeout. Direct driver callers need the same protection as the
+// root configuration path.
+func validateKafkaDrainTimeout(options map[string]string, drainTimeout time.Duration) error {
+	sessionTimeout, err := resolveSessionTimeout(options)
+	if err != nil {
+		return err
+	}
+	rebalanceTimeout, err := resolveRebalanceTimeoutOption(options)
+	if err != nil {
+		return err
+	}
+	if kafkarules.ExceedsKafkaDrainBound(drainTimeout, sessionTimeout) {
+		return fmt.Errorf(
+			"kafka: revoke wait bound %s exceeds 0.6 x kafka.sessionTimeout %s (kafka.rebalanceTimeout=%s)",
+			drainTimeout,
+			sessionTimeout,
+			rebalanceTimeout,
+		)
+	}
+	if kafkarules.ExceedsKafkaDrainBound(drainTimeout, rebalanceTimeout) {
+		return fmt.Errorf(
+			"kafka: revoke wait bound %s exceeds 0.6 x kafka.rebalanceTimeout %s (kafka.sessionTimeout=%s)",
+			drainTimeout,
+			rebalanceTimeout,
+			sessionTimeout,
+		)
+	}
+	return nil
+}
+
 // resolveRebalanceTimeout maps kafka.rebalanceTimeout onto the group member
 // rebalance timeout: the window the broker allows a member to complete a
-// rebalance before removing it from the group.
-func resolveRebalanceTimeout(options map[string]string) (time.Duration, error) {
+// rebalance before removing it from the group, and refuses a timeout that does
+// not contain the revoke wait.
+//
+// drainTimeout is the bound a revoke wait runs under, or zero when the caller
+// does not know it. The bound is a lifecycle setting rather than a
+// broker.kafka.* key, so the option path resolves the timeout alone and the
+// consumer build, which knows the bound in force, is where the pair is refused.
+// A rebalance callback that waits for a delivery holds the whole rebalance
+// open, and the broker boots a member whose callback outlives this timeout;
+// what the drain had not committed then arrives as a loss, not as the duplicate
+// at-least-once permits. A timeout at or below the bound is refused because the
+// wait is then allowed to outlast the window that has to contain it.
+func resolveRebalanceTimeout(options map[string]string, drainTimeout time.Duration) (time.Duration, error) {
+	timeout, err := resolveRebalanceTimeoutOption(options)
+	if err != nil {
+		return 0, err
+	}
+	if drainTimeout > 0 && timeout <= drainTimeout {
+		return 0, fmt.Errorf(
+			"kafka: kafka.rebalanceTimeout %s must be above the revoke wait bound %s; a rebalance callback that outlives the timeout loses the assignment",
+			timeout, drainTimeout,
+		)
+	}
+	return timeout, nil
+}
+
+// resolveRebalanceTimeoutOption parses kafka.rebalanceTimeout against its
+// default, with no opinion on the revoke wait: resolveRebalanceTimeout is where
+// the pair is judged.
+func resolveRebalanceTimeoutOption(options map[string]string) (time.Duration, error) {
 	value, ok := options["kafka.rebalanceTimeout"]
 	if !ok {
 		return defaultKafkaRebalanceTimeout, nil
@@ -750,8 +870,11 @@ func consumerStartOffset(start driver.StartPosition) kgo.ConsumerOpt {
 
 func totalPrefetch(cfg driver.ConsumerConfig) int {
 	total := 0
-	for index, destination := range cfg.Destinations {
-		total += destinationPrefetch(cfg, destination, index)
+	for index := range cfg.Destinations {
+		total += cfg.DestinationPrefetch(index)
+	}
+	if cfg.Prefetch > 0 && total > cfg.Prefetch {
+		total = cfg.Prefetch
 	}
 	if total < 1 {
 		return 1
@@ -759,24 +882,11 @@ func totalPrefetch(cfg driver.ConsumerConfig) int {
 	return total
 }
 
-func destinationPrefetch(cfg driver.ConsumerConfig, destination string, index int) int {
-	if value := cfg.PerDestination[destination]; value > 0 {
-		return value
-	}
-	if cfg.Prefetch > 0 && len(cfg.Destinations) > 0 {
-		base := cfg.Prefetch / len(cfg.Destinations)
-		if index < cfg.Prefetch%len(cfg.Destinations) {
-			base++
-		}
-		if base > 0 {
-			return base
-		}
-	}
-	return 1
-}
-
+// Messages returns the channel of delivered messages. The channel closes when Stop or Release completes.
 func (c *consumer) Messages() <-chan driver.InboundMessage { return c.messages }
-func (c *consumer) Errors() <-chan error                   { return c.errors }
+
+// Errors returns asynchronous consumer errors. The channel closes when Stop or Release completes.
+func (c *consumer) Errors() <-chan error { return c.errors }
 
 func (c *consumer) requestLeaveLocked() {
 	if c.leaveClosed {
@@ -785,7 +895,7 @@ func (c *consumer) requestLeaveLocked() {
 	if !c.leaveStarted {
 		timeout := c.rebalanceDrainTimeout
 		if timeout <= 0 {
-			timeout = 25 * time.Second
+			timeout = defaultKafkaRebalanceDrainTimeout
 		}
 		c.leaveCtx, c.leaveCancel = context.WithTimeout(context.Background(), timeout)
 		c.leaveStarted = true
@@ -801,14 +911,6 @@ func (c *consumer) requestLeave() {
 	c.leaveMu.Lock()
 	c.requestLeaveLocked()
 	c.leaveMu.Unlock()
-}
-
-// requestLeaveAndWait asks the leave loop to leave the group and returns the
-// leave's error alone. A caller whose decision also depends on whether the
-// leave finished, rather than on the wait being abandoned, uses waitForLeave.
-func (c *consumer) requestLeaveAndWait(ctx context.Context) error {
-	_, err := c.waitForLeave(ctx)
-	return err
 }
 
 // waitForLeave asks the leave loop to leave the group and waits for the
@@ -937,10 +1039,32 @@ func (c *consumer) releasePollWake() {
 	c.mu.Unlock()
 }
 
-// wakePollLocked interrupts the poll wait so the loop admits again over the
-// records it is holding. It never blocks: a wake that finds no wait in progress
-// records itself for the next one. The caller must hold c.mu.
+// wakePollLocked interrupts the poll wait so the loop admits again over all
+// the records it is holding. It never blocks: a wake that finds no wait in
+// progress records itself for the next one. The caller must hold c.mu.
 func (c *consumer) wakePollLocked() {
+	c.partialScan = false
+	c.interruptPollLocked()
+}
+
+// wakePartitionLocked is wakePollLocked for an event that can only have made
+// key's own head admissible, so the pass the wake starts may visit key alone.
+// The caller must hold c.mu.
+func (c *consumer) wakePartitionLocked(key partitionKey) {
+	c.markDirtyLocked(key)
+	c.interruptPollLocked()
+}
+
+// markDirtyLocked adds key to the partitions the next admission pass visits.
+// The caller must hold c.mu.
+func (c *consumer) markDirtyLocked(key partitionKey) {
+	if c.dirty == nil {
+		c.dirty = make(map[partitionKey]struct{})
+	}
+	c.dirty[key] = struct{}{}
+}
+
+func (c *consumer) interruptPollLocked() {
 	c.pollWakePending = true
 	if c.pollCancel != nil {
 		c.pollCancel()
@@ -950,58 +1074,62 @@ func (c *consumer) wakePollLocked() {
 func (c *consumer) poll(ctx context.Context) {
 	defer close(c.pollDone)
 	defer c.client.AllowRebalance()
-	pending := make([]*kgo.Record, 0, 1)
 	for {
-		if !c.flushPending(&pending) {
+		if !c.flushPending() {
 			return
 		}
-		c.syncDeferredPauses(pending)
+		c.syncReadAheadAfterFlush()
 
-		fetchCtx := ctx
-		bounded := false
-		var cancelFetch context.CancelFunc
-		if due, ok := c.pendingDeadline(pending); ok {
-			fetchCtx, cancelFetch = context.WithDeadline(ctx, due)
-			bounded = true
-		} else {
-			fetchCtx, cancelFetch = context.WithCancel(ctx)
-		}
+		fetchCtx, cancelFetch := context.WithCancel(ctx)
 		if c.claimPollWake(cancelFetch) {
 			cancelFetch()
 			continue
 		}
-
-		// The whole response is taken, not one record of it. Whatever is left
-		// buffered in the client is what the next prefetch pause throws away:
-		// franz-go strips a paused topic's buffered records and rewinds its
-		// cursor, so the read-ahead is fetched and buffered again, once per
-		// pause. Draining each fetch into pending leaves the pause nothing to
-		// strip, and pending is bounded by the records one response carried,
-		// because while a destination is at budget for the prefetch reason no
-		// further fetch for it is issued.
 		fetches := c.client.PollRecords(fetchCtx, 0)
-		// A wake ends the wait with a synthetic cancellation fetch. It reports
-		// no broker fault; it reports that admission has to run over pending
-		// again, which is what a bounded poll's own timeout also asks for.
 		woken := fetchCtx.Err() != nil && ctx.Err() == nil
 		cancelFetch()
 		c.releasePollWake()
+		if !woken {
+			// A broker response, not a wake, ended the wait: the pass after it
+			// visits every partition, which bounds how long anything a
+			// partition-scoped mark missed can wait to one response.
+			c.mu.Lock()
+			c.partialScan = false
+			c.mu.Unlock()
+		}
 		if ctx.Err() != nil || fetches.IsClientClosed() {
 			c.client.AllowRebalance()
 			return
 		}
-		if !c.handleFetches(&pending, fetches, bounded || woken) {
+		if !c.handleFetches(fetches, woken) {
 			return
 		}
 	}
 }
 
-func (c *consumer) handleFetches(pending *[]*kgo.Record, fetches kgo.Fetches, bounded bool) bool {
+func (c *consumer) handleFetches(fetches kgo.Fetches, bounded bool) bool {
 	c.mu.Lock()
-	if c.recordGenerations == nil {
-		c.recordGenerations = make(map[*kgo.Record]uint64)
+	records := c.fetchScratch[:0]
+	if count := fetches.NumRecords(); count > cap(records) {
+		records = make([]*kgo.Record, 0, count)
 	}
-	fetches.EachRecord(c.tagRecordLocked)
+	// One pass takes every record of the response in hand and collects it, so
+	// the queueing pass walks the collected records rather than the response a
+	// second time.
+	fetches.EachRecord(func(record *kgo.Record) {
+		c.tagRecordLocked(record)
+		records = append(records, record)
+	})
+	for _, record := range records {
+		key := partitionKey{destination: record.Topic, partition: record.Partition}
+		c.pending[key] = append(c.pending[key], record)
+		c.markDirtyLocked(key)
+	}
+	// The records belong to in-hand and to the queues from here on, and holding
+	// the slice of them past this point would keep the response they came from
+	// alive until the next poll with nothing left to read them for.
+	clear(records)
+	c.fetchScratch = records[:0]
 	c.mu.Unlock()
 	defer c.client.AllowRebalance()
 
@@ -1011,9 +1139,6 @@ func (c *consumer) handleFetches(pending *[]*kgo.Record, fetches kgo.Fetches, bo
 		}
 		kind := kafkaErrorKind(fetchErr.Err)
 		if kind != driver.KindTransient {
-			// A non-retryable fetch error cannot recover by polling again.
-			// Reclassify it as fatal for this subscription while retaining
-			// the Kafka cause.
 			kind = driver.KindFatal
 		}
 		c.sendError(classify("consumer", kind, fmt.Errorf("kafka fetch %s[%d]: %w", fetchErr.Topic, fetchErr.Partition, fetchErr.Err)))
@@ -1021,446 +1146,359 @@ func (c *consumer) handleFetches(pending *[]*kgo.Record, fetches kgo.Fetches, bo
 			return false
 		}
 	}
-	for record := range fetches.RecordsAll() {
-		if c.isRecordStale(record) {
-			c.discardStaleRecord(record)
-			continue
+	return true
+}
+
+// flushPending admits the head record of every partition whose head is due and
+// whose partition and destination admit a delivery, and repeats until no
+// further admission is possible. A queue whose head belongs to a partition this
+// consumer no longer owns is dropped whole: a not-owned partition's records are
+// never delivered, and every record behind that head belongs to the same
+// partition.
+func (c *consumer) flushPending() bool {
+	c.visitedKeys = c.visitedKeys[:0]
+	c.visitedAll = false
+	for {
+		c.mu.Lock()
+		keys := c.flushKeys[:0]
+		full := !c.partialScan
+		if full {
+			for key := range c.pending {
+				keys = append(keys, key)
+			}
+			// Map order is random, which shares a contended slot out only on
+			// average. Key order, starting after the partition admitted last,
+			// shares it out in turn: a partition waiting behind a busy one is
+			// reached before the busy one is visited again.
+			slices.SortFunc(keys, comparePartitionKeys)
+			start, found := slices.BinarySearchFunc(keys, c.lastAdmitted, comparePartitionKeys)
+			if found {
+				start++
+			}
+			slices.Reverse(keys[:start])
+			slices.Reverse(keys[start:])
+			slices.Reverse(keys)
+		} else {
+			for key := range c.dirty {
+				if _, queued := c.pending[key]; queued {
+					keys = append(keys, key)
+				}
+			}
 		}
-		if !c.canDeliver(record) {
-			*pending = append(*pending, record)
-			continue
+		clear(c.dirty)
+		c.partialScan = true
+		c.flushKeys = keys
+		c.mu.Unlock()
+		c.visitedAll = c.visitedAll || full
+		c.visitedKeys = append(c.visitedKeys, keys...)
+		if len(keys) == 0 {
+			break
 		}
-		delivered, active, _ := c.emit(record)
-		if !active {
-			return false
+		progress := false
+		for _, key := range keys {
+			outcome := c.deliverHead(key)
+			if outcome == headStopped {
+				return false
+			}
+			if outcome == headHeld {
+				continue
+			}
+			if !full {
+				// A head that left its queue can leave the next record of its
+				// partition admissible at once: a head whose offset is already
+				// committed is skipped without charging the partition. A full
+				// pass repeats and finds it; a partial pass visits only what is
+				// marked, so the partition marks itself.
+				c.mu.Lock()
+				c.markDirtyLocked(key)
+				c.mu.Unlock()
+			}
+			progress = true
 		}
-		if !delivered {
-			*pending = append(*pending, record)
+		if !progress {
+			break
+		}
+		if full {
+			// A full pass that admitted something repeats in full, as every
+			// pass did before the partition-scoped wake. A partial pass
+			// repeats only over what was marked while it ran: the partitions
+			// it admitted from now hold a delivery, and nothing else changed
+			// that did not mark itself.
+			c.mu.Lock()
+			c.partialScan = false
+			c.mu.Unlock()
 		}
 	}
 	return true
 }
 
-func (c *consumer) flushPending(pending *[]*kgo.Record) bool {
-	for len(*pending) > 0 {
-		records := *pending
-		index := -1
-		for i, record := range records {
-			if c.isRecordStale(record) {
-				copy(records[i:], records[i+1:])
-				records[len(records)-1] = nil
-				*pending = records[:len(records)-1]
-				c.discardStaleRecord(record)
-				index = -2
-				break
-			}
-			if c.canDeliver(record) {
-				index = i
-				break
-			}
-		}
-		if index == -2 {
-			continue
-		}
-		if index < 0 {
-			return true
-		}
-		record := records[index]
-		copy(records[index:], records[index+1:])
-		records[len(records)-1] = nil
-		*pending = records[:len(records)-1]
-		delivered, active, _ := c.emit(record)
-		if !active {
-			return false
-		}
-		if !delivered {
-			*pending = append(*pending, record)
-		}
+func comparePartitionKeys(a, b partitionKey) int {
+	if order := strings.Compare(a.destination, b.destination); order != 0 {
+		return order
 	}
-	return true
+	return cmp.Compare(a.partition, b.partition)
 }
 
-func (c *consumer) canDeliver(record *kgo.Record) bool {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.stopped || c.draining {
-		return false
-	}
-	if c.laneFaultDestination == record.Topic {
-		return false
-	}
-	if c.isRecordStaleLocked(record) {
-		return false
-	}
-	return c.admissionLocked(record)
-}
-
-func (c *consumer) isRecordStale(record *kgo.Record) bool {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.isRecordStaleLocked(record)
-}
-
-func (c *consumer) tagRecord(record *kgo.Record) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.recordGenerations == nil {
-		c.recordGenerations = make(map[*kgo.Record]uint64)
-	}
-	c.tagRecordLocked(record)
-}
-
+// tagRecordLocked records a record the poll loop has taken from franz-go and
+// not yet resolved. The caller holds c.mu. A fresh tracker for the record's partition takes its base from the
+// lowest offset in hand, which is why the loop tags every record of a fetch
+// response before it admits any of them.
 func (c *consumer) tagRecordLocked(record *kgo.Record) {
-	key := partitionKey{destination: record.Topic, partition: record.Partition}
-	c.recordGenerations[record] = c.tenureLocked(key)
-}
-
-// tenureLocked reports the ownership tenure records for key are tagged with.
-// A consumer built without assignment callbacks has no tenure map entry, so
-// the assignment generation stands in for it.
-func (c *consumer) tenureLocked(key partitionKey) uint64 {
-	if tenure := c.tenures[key]; tenure != 0 {
-		return tenure
+	if c.inHand == nil {
+		c.inHand = make(map[*kgo.Record]struct{})
 	}
-	return c.activeGenerations[key]
+	c.inHand[record] = struct{}{}
 }
 
+// isRecordStaleLocked reports whether a record the loop is holding is one this
+// consumer must drop rather than deliver: it belongs to a partition this
+// consumer does not own. The poll loop asks before it admits a record and
+// again before it keeps one, so a revoke empties the pending list of the
+// partitions it took away on the loop's next pass, and the broker's own
+// redelivery to the new owner is the copy that remains. The caller must hold
+// c.mu.
 func (c *consumer) isRecordStaleLocked(record *kgo.Record) bool {
-	key := partitionKey{destination: record.Topic, partition: record.Partition}
-	if offsets := c.settledTransfers[key]; offsets != nil {
-		if _, settled := offsets[record.Offset]; settled {
-			return true
-		}
-	}
-	if offsets := c.transferReservations[key]; offsets != nil {
-		if _, reserved := offsets[record.Offset]; reserved {
-			if _, handoff := c.handoffRecords[record]; !handoff {
-				return true
-			}
-		}
-	}
-	if offsets := c.handoffMarkers[key]; offsets != nil {
-		if _, marked := offsets[record.Offset]; marked {
-			if _, handoff := c.handoffRecords[record]; !handoff {
-				return true
-			}
-		}
-	}
-	if c.fenced != nil && c.fenced[key] {
-		return true
-	}
-	activeGen, ok := c.activeGenerations[key]
-	if !ok || activeGen == 0 {
-		return true
-	}
-	// Compare against the tenure, not the assignment generation: a record
-	// fetched before a cooperative reassignment of a partition this member
-	// kept is still this member's to deliver.
-	recordGen, ok := c.recordGenerations[record]
-	if !ok || recordGen == 0 || recordGen != c.tenureLocked(key) {
-		return true
-	}
-	return false
-}
-
-func (c *consumer) discardStaleRecord(record *kgo.Record) {
-	c.mu.Lock()
-	delete(c.recordGenerations, record)
-	c.mu.Unlock()
-}
-
-func (c *consumer) markSettledTransfer(key partitionKey, offset int64) {
-	if c.conn == nil {
-		return
-	}
-	c.conn.mu.RLock()
-	consumers := make([]*consumer, 0, len(c.conn.consumers))
-	for consumer := range c.conn.consumers {
-		if consumer == c {
-			continue
-		}
-		consumers = append(consumers, consumer)
-	}
-	c.conn.mu.RUnlock()
-	for _, consumer := range consumers {
-		consumer.suppressSettledTransfer(key, offset)
-	}
-}
-
-func (c *consumer) reserveTransfer(key partitionKey, offset int64) {
-	if c.conn == nil {
-		return
-	}
-	c.conn.mu.RLock()
-	consumers := make([]*consumer, 0, len(c.conn.consumers))
-	for consumer := range c.conn.consumers {
-		if consumer != c {
-			consumers = append(consumers, consumer)
-		}
-	}
-	c.conn.mu.RUnlock()
-	for _, consumer := range consumers {
-		consumer.reserveTransferOffset(key, offset)
-	}
-}
-
-func (c *consumer) reserveTransferOffset(key partitionKey, offset int64) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.transferReservations == nil {
-		c.transferReservations = make(map[partitionKey]map[int64]struct{})
-	}
-	offsets := c.transferReservations[key]
-	if offsets == nil {
-		offsets = make(map[int64]struct{})
-		c.transferReservations[key] = offsets
-	}
-	offsets[offset] = struct{}{}
-}
-
-func (c *consumer) clearTransferReservation(key partitionKey, offset int64) {
-	if c.conn == nil {
-		return
-	}
-	c.conn.mu.RLock()
-	consumers := make([]*consumer, 0, len(c.conn.consumers))
-	for consumer := range c.conn.consumers {
-		if consumer != c {
-			consumers = append(consumers, consumer)
-		}
-	}
-	c.conn.mu.RUnlock()
-	for _, consumer := range consumers {
-		consumer.clearTransferReservationOffset(key, offset)
-	}
-}
-
-func (c *consumer) clearTransferReservationOffset(key partitionKey, offset int64) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	offsets := c.transferReservations[key]
-	delete(offsets, offset)
-	if len(offsets) == 0 {
-		delete(c.transferReservations, key)
-	}
+	return !c.owned[partitionKey{destination: record.Topic, partition: record.Partition}]
 }
 
 // releaseSlotsLocked returns up to slots destination slots that unsettled deliveries were
-// charged, and makes queued handoffs dispatchable when the return takes the destination from
-// full to not-full. That crossing is the only event that can reopen a full destination: a
-// delivery holds its slot from admission until terminal settlement, so nothing else returns it,
-// and the offset a queued handoff carries stays filtered from the broker's own redelivery by its
-// reservation until a target owns it. Without the trigger a handoff queued while every eligible
-// owner was at budget is stranded, never delivered and never settled.
+// charged, and clears the pause that stopped fetching for the destination when the return takes
+// it from full to not-full.
 //
-// The dispatch is launched on its own goroutine rather than inline, because this runs under c.mu
-// while the dispatch path takes the connection lock and then peer consumer locks, and that order
-// cannot be taken in reverse from here.
+// It reports whether the return freed a slot other partitions may be waiting for: the aggregate
+// was full, or the destination's budget was. Either way it wakes the poll loop for a pass over
+// every partition, since any of them may be the one that was refused.
 //
 // The caller must hold c.mu.
-func (c *consumer) releaseSlotsLocked(destination string, slots int) {
+func (c *consumer) releaseSlotsLocked(destination string, slots int) (contended bool) {
 	charged := c.unsettled[destination]
 	if slots > charged {
 		slots = charged
 	}
+	budget := c.budgets[destination]
 	if slots > 0 {
 		c.unsettled[destination] = charged - slots
+		wasFull := c.cfg.Prefetch > 0 && c.admitted >= c.cfg.Prefetch
+		c.admitted -= slots
+		if wasFull && c.admitted < c.cfg.Prefetch {
+			contended = true
+		}
+		if budget > 0 && charged >= budget && charged-slots < budget {
+			contended = true
+		}
+		if contended {
+			c.wakePollLocked()
+		}
 	}
-	budget := c.budgets[destination]
 	if budget > 0 && charged-slots < budget {
-		// The destination is not full any more: the pause that stopped fetching has to
-		// go before the dispatch, or every eligible target refuses the handoff it is
-		// being offered.
+		// The destination is not full any more, so the pause that stopped
+		// fetching has to go.
 		if c.client != nil {
 			c.setPauseReasonLocked(destination, pauseReasonPrefetch, false)
 		}
 	}
-	if slots == 0 || budget <= 0 || charged < budget || charged-slots >= budget || c.conn == nil {
-		return
-	}
-	go c.redriveDestinationHandoffs(destination)
+	return contended
 }
 
-func (c *consumer) suppressSettledTransfer(key partitionKey, offset int64) {
-	c.deliveryMu.Lock()
-	defer c.deliveryMu.Unlock()
-	c.mu.Lock()
-	if c.stopped || c.messages == nil {
-		c.mu.Unlock()
-		return
+// chargeDeliveryLocked records that key's partition has one more delivery
+// outstanding. It is called once per emitted delivery, at the destination
+// slot's own charge: a redelivery a requeue admitted re-enters emission as a
+// reuse and is not charged again, because the slot its predecessor charged is
+// still held.
+//
+// A consumer built as a literal by a test has no counter and no charged
+// delivery, which is what a nil map means here. The caller must hold c.mu.
+func (c *consumer) chargeDeliveryLocked(key partitionKey) {
+	if c.outstanding == nil {
+		c.outstanding = make(map[partitionKey]int)
 	}
-	if c.settledTransfers == nil {
-		c.settledTransfers = make(map[partitionKey]map[int64]struct{})
-	}
-	offsets := c.settledTransfers[key]
-	if offsets == nil {
-		offsets = make(map[int64]struct{})
-		c.settledTransfers[key] = offsets
-	}
-	offsets[offset] = struct{}{}
-	reservations := c.transferReservations[key]
-	delete(reservations, offset)
-	if len(reservations) == 0 {
-		delete(c.transferReservations, key)
-	}
-	// A target settlement also resolves the source's pending commit
-	// coverage. The source handoff may already have been taken from its
-	// queue, so this independent entry must be cleared here.
-	pending := c.pendingTransfers[key]
-	delete(pending, offset)
-	if len(pending) == 0 {
-		delete(c.pendingTransfers, key)
-	}
-	kept := make([]driver.InboundMessage, 0, len(c.messages))
-drain:
-	for {
-		select {
-		case message, ok := <-c.messages:
-			if !ok {
-				break drain
-			}
-			settler, ok := message.Settle.(*settler)
-			if ok && settler.key == key && settler.record.Offset == offset {
-				continue
-			}
-			kept = append(kept, message)
-		default:
-			break drain
-		}
-	}
-	var tracker *ackTracker
-	reconcile := false
-	if current := c.trackers[key]; current != nil {
-		tracker = current
-	}
-	for settler := range c.settlers {
-		if settler.key != key || settler.record.Offset != offset {
-			continue
-		}
-		if tracker == nil {
-			tracker = settler.tracker
-		}
-		settler.handoffDelivered = false
-		settler.tombstoned = true
-		settler.commitSuppressed = true
-		delete(c.settlers, settler)
-		if !settler.slotReleased {
-			c.releaseSlotsLocked(key.destination, 1)
-			settler.slotReleased = true
-		}
-		reconcile = true
-	}
-	if c.client != nil && c.budgets[key.destination] > 0 && c.unsettled[key.destination] < c.budgets[key.destination] {
-		c.setPauseReasonLocked(key.destination, pauseReasonPrefetch, false)
-	}
-	c.signalSettlerDoneLocked()
-	c.mu.Unlock()
-	if reconcile && tracker != nil {
-		_ = tracker.Ack(offset, nil)
-	}
-	for _, message := range kept {
-		c.messages <- message
-	}
+	c.outstanding[key]++
 }
 
-func (c *consumer) clearHandoffMarker(key partitionKey, offset int64) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	markers := c.handoffMarkers[key]
-	if _, ok := markers[offset]; !ok {
+// releasePartitionLocked returns up to slots of one partition's outstanding
+// deliveries, and marks the partition for the next admission pass when that
+// takes the count to zero.
+//
+// The mark does not wake the poll loop. A settlement made through Ack or Nack
+// hands the partition's next record over itself (handOff), or, when it freed
+// a full slot, has already woken the loop through releaseSlotsLocked; every other
+// release comes from a revoke or a teardown, which leaves nothing on the
+// partition to deliver. The mark is the fallback that bounds the wait for a
+// record the handoff did not reach to the loop's next pass.
+//
+// The charge and the release are the destination slot's own, so a second
+// release is already refused by slotReleased and the clamp here only keeps the
+// two counters in step. The caller must hold c.mu.
+func (c *consumer) releasePartitionLocked(key partitionKey, slots int) {
+	charged := c.outstanding[key]
+	if slots > charged {
+		slots = charged
+	}
+	if slots == 0 {
 		return
 	}
-	delete(markers, offset)
-	if len(markers) == 0 {
-		delete(c.handoffMarkers, key)
+	remaining := charged - slots
+	if remaining == 0 {
+		delete(c.outstanding, key)
+		c.markDirtyLocked(key)
+		return
 	}
+	c.outstanding[key] = remaining
 }
 
-func (c *consumer) emit(record *kgo.Record) (delivered, active, created bool) {
+// headOutcome is what deliverHead did with the head of a partition's queue.
+type headOutcome uint8
+
+const (
+	// headHeld: the head stayed, or the queue was empty or stale and dropped.
+	headHeld headOutcome = iota
+	// headSkipped: the head's offset was already committed, so it left the
+	// queue without a delivery or a charge.
+	headSkipped
+	// headDelivered: the head was charged and sent on Messages.
+	headDelivered
+	// headStopped: the consumer is stopping or draining and admits nothing.
+	headStopped
+)
+
+// deliverHead delivers the head record of key's queue when its partition and
+// destination admit it. It is the one admission step, and two goroutines run
+// it: the poll loop over the partitions a pass visits, and a settling caller
+// over its own partition (handOff).
+//
+// The admission check, the removal of the head and the charge happen in one
+// critical section under deliveryMu and c.mu, and that is what keeps a
+// partition's order with two admitting goroutines. Were the head removed
+// before the admission taking the charge, the interleaving that breaks it is:
+// the poll loop removes record 1 and releases c.mu; the settling caller removes
+// record 2, which is now the head, and also sees no delivery outstanding; the
+// settling caller takes deliveryMu first and delivers record 2 before record 1.
+// Here the second caller finds record 1's charge, or record 1 still at the head.
+//
+// The send on Messages happens under deliveryMu, so a teardown cannot close the
+// channel under it, and it does not block: every message in the channel holds
+// an admission slot, and the channel is sized to the effective aggregate budget.
+func (c *consumer) deliverHead(key partitionKey) headOutcome {
 	c.deliveryMu.Lock()
 	defer c.deliveryMu.Unlock()
 	c.mu.Lock()
 	if c.stopped || c.draining {
 		c.mu.Unlock()
-		return false, false, false
+		return headStopped
 	}
-	if c.isRecordStaleLocked(record) {
+	records := c.pending[key]
+	if len(records) == 0 {
+		delete(c.pending, key)
 		c.mu.Unlock()
-		return false, true, false
+		return headHeld
+	}
+	record := records[0]
+	if c.isRecordStaleLocked(record) {
+		// Every record of the queue belongs to the same partition, and offsets
+		// increase along it, so a stale head makes the whole queue stale. Each
+		// one leaves the in-hand set with it: a record left there would be read
+		// as an offset this consumer still owes a delivery for, and the
+		// partition's next tracker would start its cursor below the offset it is
+		// delivered from.
+		for _, queued := range records {
+			delete(c.inHand, queued)
+		}
+		delete(c.pending, key)
+		c.clearHeadHoldLocked(key)
+		c.mu.Unlock()
+		return headHeld
 	}
 	if !c.admissionLocked(record) {
 		c.mu.Unlock()
-		return false, true, false
+		return headHeld
+	}
+	if len(records) == 1 {
+		delete(c.pending, key)
+	} else {
+		// Keep the backing array from retaining the delivered record and its fetch data.
+		records[0] = nil
+		c.pending[key] = records[1:]
 	}
 	budget := c.budgets[record.Topic]
 	if budget <= 0 {
 		budget = 1
 	}
-	key := partitionKey{destination: record.Topic, partition: record.Partition}
-	tracker := c.trackers[key]
-	if tracker == nil || c.trackerGenerations[key] != c.activeGenerations[key] {
-		tracker = c.trackerForLocked(record)
-	}
-	reused, deliver, err := tracker.TrackRedelivery(record.Offset)
-	if err != nil {
+	tracker := c.trackerForLocked(record)
+	reused := c.requeued[key] > 0
+	if !reused && tracker.CommitPoint() > record.Offset {
+		delete(c.inHand, record)
 		c.mu.Unlock()
-		return false, true, false
-	}
-	if !deliver {
-		if _, handoff := c.handoffRecords[record]; handoff {
-			for settler := range c.settlers {
-				if settler.key == key && settler.record.Offset == record.Offset {
-					settler.handoffDelivered = true
-					break
-				}
-			}
-		}
-		delete(c.recordGenerations, record)
-		c.mu.Unlock()
-		return true, true, false
+		return headSkipped
 	}
 	if reused {
 		c.requeued[key]--
 		if c.requeued[key] == 0 {
 			delete(c.requeued, key)
 		}
-		c.pauseAfterRedeliveryLocked(record.Topic)
 	}
-	_, handoffDelivered := c.handoffRecords[record]
 	settler := &settler{
-		owner: c,
-		record: &kgo.Record{
-			Topic:       record.Topic,
-			Partition:   record.Partition,
-			Offset:      record.Offset,
-			LeaderEpoch: record.LeaderEpoch,
-		},
-		tracker:          tracker,
-		handoffDelivered: handoffDelivered,
-		key:              key,
+		owner:   c,
+		record:  retainedRecord(record),
+		tracker: tracker,
+		key:     key,
 	}
 	c.settlers[settler] = struct{}{}
-	delete(c.recordGenerations, record)
+	delete(c.inHand, record)
 	if !reused {
 		c.unsettled[record.Topic]++
+		c.admitted++
+		c.chargeDeliveryLocked(key)
+		c.lastAdmitted = key
 	}
 	if c.unsettled[record.Topic] >= budget {
 		c.setPauseReasonLocked(record.Topic, pauseReasonPrefetch, true)
 	}
-	// No transfer guard is needed here. A record for a fenced or revoked key is
-	// already stale before this point (isRecordStaleLocked), and a settler
-	// created below cannot be tombstoned from another goroutine because the
-	// tombstones are set under c.mu, which is held until the handover below.
-	message := inboundMessage(record, settler)
-	settler.handoff = message
+	message := inboundMessage(record, settler, c.currentTime())
 	c.mu.Unlock()
 	select {
 	case <-c.forwarderStopC:
-		c.abortSettler(settler, reused)
-		return false, false, false
+		c.abortSettler(settler)
+		return headStopped
 	case c.messages <- message:
-		return true, true, true
+		return headDelivered
 	}
+}
+
+// handOff delivers key's next record from the goroutine that just settled the
+// partition's delivery, which is the event that made the record admissible.
+// The poll loop is not woken for it: waking it cost a cancelled fetch wait and
+// an admission pass per settlement, for the one partition this caller already
+// knows. An admission the handoff finds refused is one another event releases,
+// and that event wakes the loop: a destination slot freed, a pause lifted, a
+// held head coming due.
+//
+// A settlement that freed a full slot does not hand off: other partitions may
+// be waiting for that slot, and the handoff would win it every time. Walk the
+// race: partition A holds the one slot of a full aggregate or destination
+// budget and has a backlog, and partition B's head was refused for want of
+// that slot. A's Ack releases the slot and wakes the poll loop, which is
+// parked in its fetch wait. The settling goroutine goes straight on to the
+// handoff and admits A's next record before the loop has even returned from
+// the wait, so the loop's pass finds the slot taken again and B is refused
+// again, for as long as A has records. The loop owns that slot instead: its
+// pass visits partitions in turn (see lastAdmitted), and the release already
+// woke it, so skipping the handoff costs no extra wake.
+//
+// The read-ahead reason of the partition is reconciled here too, because the
+// loop that reconciles it after its passes may stay parked in its fetch wait: a
+// partition held at its read-ahead limit whose queue the handoffs drain would
+// otherwise stay paused with nothing left to deliver.
+func (c *consumer) handOff(key partitionKey) {
+	outcome := c.deliverHead(key)
+	for outcome == headSkipped {
+		outcome = c.deliverHead(key)
+	}
+	if outcome == headStopped {
+		return
+	}
+	c.mu.Lock()
+	c.syncReadAheadPauseLocked(key)
+	c.mu.Unlock()
 }
 
 func (c *consumer) stopForwarders() {
@@ -1469,12 +1507,13 @@ func (c *consumer) stopForwarders() {
 	})
 }
 
-func (c *consumer) abortSettler(settler *settler, reused bool) {
+func (c *consumer) abortSettler(settler *settler) {
 	c.mu.Lock()
 	delete(c.settlers, settler)
-	if !reused {
-		c.releaseSlotsLocked(settler.record.Topic, 1)
-	}
+	// Even a redelivery must return its retained charge: this emission never
+	// reached a caller, and no remaining settler can release it during drain.
+	c.releaseSlotsLocked(settler.record.Topic, 1)
+	c.releasePartitionLocked(settler.key, 1)
 	c.signalSettlerDoneLocked()
 	shouldLeave := c.draining && len(c.settlers) == 0 && !c.leaveRequested
 	if shouldLeave {
@@ -1495,38 +1534,33 @@ func (c *consumer) detachAllTrackersLocked() []*ackTracker {
 	for settler := range c.settlers {
 		delete(c.settlers, settler)
 	}
-	clear(c.pendingTransfers)
 	clear(c.requeued)
-	clear(c.discarded)
 	clear(c.unsettled)
-	clear(c.recordGenerations)
-	clear(c.tenures)
-	clear(c.activeGenerations)
-	clear(c.fenced)
+	c.admitted = 0
+	clear(c.outstanding)
+	clear(c.partitionPauses)
+	clear(c.pending)
+	clear(c.heldUntil)
+	c.syncHeadTimerLocked()
+	clear(c.inHand)
+	clear(c.owned)
 	return trackers
 }
 
+// trackerForLocked returns the tracker of the record's partition, building one
+// when the partition has none. A partition has one tracker for as long as this
+// consumer owns it: a revoke detaches the tracker, so the partition's next
+// assignment builds a fresh one instead of inheriting the commit point of an
+// ownership that ended.
 func (c *consumer) trackerForLocked(record *kgo.Record) *ackTracker {
 	key := partitionKey{destination: record.Topic, partition: record.Partition}
-	// A reassigned key must not reuse the revoked generation's tracker: the
-	// captured snapshot still points at the old tracker, and a later
-	// transfer drops exactly that generation. Fall through and create a
-	// fresh tracker when the generations disagree.
-	if tracker := c.trackers[key]; tracker != nil && c.trackerGenerations[key] == c.activeGenerations[key] {
+	if tracker := c.trackers[key]; tracker != nil {
 		return tracker
-	}
-	generation := c.activeGenerations[key]
-	if generation == 0 {
-		return nil
 	}
 	if c.trackers == nil {
 		c.trackers = make(map[partitionKey]*ackTracker)
 	}
-	if c.trackerGenerations == nil {
-		c.trackerGenerations = make(map[partitionKey]uint64)
-	}
-	c.trackerGenerations[key] = generation
-	tracker := newAckTracker(c.trackerBaseLocked(key, record.Offset), generation)
+	tracker := newAckTracker(c.trackerBaseLocked(key, record.Offset))
 	c.trackers[key] = tracker
 	return tracker
 }
@@ -1535,818 +1569,229 @@ func (c *consumer) trackerForLocked(record *kgo.Record) *ackTracker {
 // Offsets below the base count as settled, so the base is the lowest offset on
 // the partition this consumer still owes a delivery for.
 //
-// The first record delivered is not that offset, because delivery follows due
-// times rather than log order: a record published ahead of a nearer due time is
-// delivered after it, so the lowest offset the consumer holds can be the last
-// one delivered. Starting the tracker at the delivered record's own offset
-// would then report the held record as already settled and drop it, losing the
-// offset. The records fetched for this partition and not delivered yet, which
-// is every record whose delivery is still owed, are what the base is taken from
-// instead. A record the loop is about to discard does not count, so an offset
-// that will never be delivered cannot hold the base down.
-//
-// A reserved offset below them still has no live path on this consumer: its
-// handoff is queued, or taken and not yet emitted. Starting the tracker past it
-// would make TrackRedelivery report the handoff as already settled, dropping
-// the offset's only live settlement path.
+// The delivered record is the head of its partition's queue, so it is normally
+// that lowest offset. The records the loop has in hand for the partition, and
+// the ones still queued behind its head, are what the base is taken from
+// instead: a base above a record whose delivery is still owed would report that
+// record as already settled and drop it, losing the offset and letting the
+// commit pass over it.
 func (c *consumer) trackerBaseLocked(key partitionKey, base int64) int64 {
-	for record := range c.recordGenerations {
-		if record.Topic != key.destination || record.Partition != key.partition || record.Offset >= base {
-			continue
+	for record := range c.inHand {
+		if record.Topic == key.destination && record.Partition == key.partition && record.Offset < base {
+			base = record.Offset
 		}
-		if c.isRecordStaleLocked(record) {
-			continue
-		}
-		base = record.Offset
 	}
-	settled := c.settledTransfers[key]
-	for offset := range c.transferReservations[key] {
-		if _, done := settled[offset]; done || offset >= base {
-			continue
+	for _, record := range c.pending[key] {
+		if record.Offset < base {
+			base = record.Offset
 		}
-		base = offset
 	}
 	return base
 }
 
-func (c *consumer) discardBufferedSettlersLocked(tracker *ackTracker) (map[*settler]struct{}, []driver.InboundMessage) {
-	buffered := make(map[*settler]struct{})
-	kept := make([]driver.InboundMessage, 0, len(c.messages))
-drain:
-	for {
-		select {
-		case message, ok := <-c.messages:
-			if !ok {
-				break drain
-			}
-			settler, ok := message.Settle.(*settler)
-			// A nil tracker matches nothing: only a live generation owns
-			// buffered messages, and draining tombstones leave no channel
-			// copies behind.
-			if ok && tracker != nil && settler.tracker == tracker {
-				buffered[settler] = struct{}{}
-				continue
-			}
-			kept = append(kept, message)
-		default:
-			break drain
-		}
-	}
-	return buffered, kept
-}
-
-func (c *consumer) storeHandoffLocked(settler *settler) {
-	if c.handoffs == nil {
-		c.handoffs = make(map[partitionKey]map[int64]driver.InboundMessage)
-	}
-	offsets := c.handoffs[settler.key]
-	if offsets == nil {
-		offsets = make(map[int64]driver.InboundMessage)
-		c.handoffs[settler.key] = offsets
-	}
-	offsets[settler.record.Offset] = settler.handoff
-	// Record commit coverage for the transferred offset: if the source's
-	// in-flight commit succeeds after the handoff is taken, the pending
-	// entry makes completeSettlement broadcast suppression before the
-	// target admits it.
-	if settler.tracker != nil {
-		if c.pendingTransfers == nil {
-			c.pendingTransfers = make(map[partitionKey]map[int64]*ackTracker)
-		}
-		pending := c.pendingTransfers[settler.key]
-		if pending == nil {
-			pending = make(map[int64]*ackTracker)
-			c.pendingTransfers[settler.key] = pending
-		}
-		pending[settler.record.Offset] = settler.tracker
-	}
-}
-
-func (c *consumer) removeHandoffLocked(key partitionKey, offset int64) {
-	offsets := c.handoffs[key]
-	delete(offsets, offset)
-	if len(offsets) == 0 {
-		delete(c.handoffs, key)
-	}
-}
-
-// revokedPartition captures the exact generation owned at revoke time: the
-// tracker and every live settler seen before the fence went up. The transfer
-// below detaches only this generation, so a reassigned generation emitting
-// concurrently is never mistaken for abandoned ownership.
-type revokedPartition struct {
-	key     partitionKey
-	tracker *ackTracker
-	owned   map[*settler]*ackTracker
-}
-
-// snapshotRevokedLocked fences every revoked partition and captures the live
-// settlers owned before the fence. The caller must hold c.mu.
-func (c *consumer) snapshotRevokedLocked(partitions map[string][]int32) ([]revokedPartition, map[partitionKey]struct{}) {
-	if c.fenced == nil {
-		c.fenced = make(map[partitionKey]bool)
-	}
-	if c.tenures == nil {
-		c.tenures = make(map[partitionKey]uint64)
-	}
-	revoked := make([]revokedPartition, 0, len(partitions))
-	keys := make(map[partitionKey]struct{}, len(partitions))
-	for topic, partitionList := range partitions {
-		for _, partition := range partitionList {
-			key := partitionKey{destination: topic, partition: partition}
-			keys[key] = struct{}{}
-			c.fenced[key] = true
-			c.tenures[key]++
-			delete(c.activeGenerations, key)
-			rp := revokedPartition{key: key, tracker: c.trackers[key]}
-			if rp.tracker == nil {
-				for held := range c.settlers {
-					if held.key == key && held.tracker != nil && !held.tombstoned {
-						rp.tracker = held.tracker
-						break
-					}
-				}
-			}
-			for held := range c.settlers {
-				if held.key != key || held.tracker == nil || held.tombstoned || held.tracker != rp.tracker {
-					continue
-				}
-				if rp.owned == nil {
-					rp.owned = make(map[*settler]*ackTracker)
-				}
-				rp.owned[held] = held.tracker
-				if !c.draining && held.handoff.Settle != nil {
-					if c.pendingTransfers == nil {
-						c.pendingTransfers = make(map[partitionKey]map[int64]*ackTracker)
-					}
-					pending := c.pendingTransfers[key]
-					if pending == nil {
-						pending = make(map[int64]*ackTracker)
-						c.pendingTransfers[key] = pending
-					}
-					pending[held.record.Offset] = held.tracker
-				}
-			}
-			revoked = append(revoked, rp)
-		}
-	}
-	return revoked, keys
-}
-
-// reserveRevoked transfers the exact offsets captured at revoke to every
-// peer before the callback returns. A cooperative target may poll the
-// broker immediately after assignment, so asynchronous handoff alone is
-// too late to prevent it from exposing the source offset first.
-func (c *consumer) reserveRevoked(revoked []revokedPartition) {
-	reserved := make(map[partitionKey]map[int64]struct{})
-	for _, rp := range revoked {
-		offsets := reserved[rp.key]
-		if offsets == nil {
-			offsets = make(map[int64]struct{})
-			reserved[rp.key] = offsets
-		}
-		for settler := range rp.owned {
-			offsets[settler.record.Offset] = struct{}{}
-		}
-	}
-	for key, offsets := range reserved {
-		for offset := range offsets {
-			c.reserveTransfer(key, offset)
-		}
-	}
-}
-
-// revokeAndTransfer waits out in-flight callers off the assignment callback,
-// then transfers each revoked generation. The wait is bounded by the caller's
-// drain timeout and runs inside the callback, so a caller that can no longer
-// settle observes ErrRevoked before the new assignment delivers; handoff
-// emission stays asynchronous, and the bound is what keeps a slow caller from
-// holding the group open for the whole rebalance.
-func (c *consumer) revokeAndTransfer(revoked []revokedPartition, keys map[partitionKey]struct{}, timeout time.Duration) {
-	// A caller-held delivery the bound does not reach is transferred, not
-	// retained: its exact offset travels as the queued handoff and the source
-	// caller observes ErrRevoked, so one offset never has two live settlement
-	// paths.
-	c.waitForSettlers(keys, timeout)
-	for _, rp := range revoked {
-		c.dropTrackerAfterRevoke(rp)
-	}
-}
-
-func (c *consumer) dropTrackerAfterRevoke(rp revokedPartition) {
-	c.dropTrackerExclusive(rp)
-}
-
-func (c *consumer) dropTrackerAfterLost(rp revokedPartition) {
-	// Lost assignments never wait: revoke immediately, then transfer.
-	if rp.tracker != nil {
-		rp.tracker.Drop()
-	}
-	c.dropTrackerExclusive(rp)
-}
-
-// transferResult carries post-unlock work out of the transfer critical
-// section: peer reservations, unrelated buffered messages, and dispatch.
-type transferResult struct {
-	key          partitionKey
-	reservations []int64
-	kept         []driver.InboundMessage
-	dispatch     bool
-}
-
-func (c *consumer) dropTracker(destination string, partition int32) {
-	key := partitionKey{destination: destination, partition: partition}
-	c.assignmentMu.Lock()
-	defer c.assignmentMu.Unlock()
-	c.deliveryMu.Lock()
-	defer c.deliveryMu.Unlock()
+// completeSettlement ends a settler's delivery and releases its charge, unless
+// preserveUnsettled keeps the charge for a queued redelivery. It reports
+// whether the release freed a slot other partitions may be waiting for, in
+// which case the caller leaves the partition's next record to the poll loop
+// rather than handing it over (see handOff).
+func (c *consumer) completeSettlement(settler *settler, preserveUnsettled bool) (contended bool) {
 	c.mu.Lock()
-	tracker := c.trackers[key]
-	if tracker == nil {
-		for settler := range c.settlers {
-			if settler.key != key {
-				continue
-			}
-			tracker = settler.tracker
-			if tracker != nil {
-				break
-			}
-		}
-	}
-	if tracker == nil {
-		c.mu.Unlock()
-		return
-	}
-	buffered, kept := c.discardBufferedSettlersLocked(tracker)
-	reservations := make([]int64, 0)
-	retainTracker := false
-	if !c.draining {
-		for settler := range c.settlers {
-			if settler.key != key || settler.forceRevoked {
-				continue
-			}
-			if _, wasBuffered := buffered[settler]; wasBuffered {
-				continue
-			}
-			if settler.tracker == tracker && tracker.holds(settler.record.Offset) {
-				retainTracker = true
-				break
-			}
-		}
-	}
-	if !retainTracker {
-		tracker.Drop()
-		delete(c.pendingTransfers, key)
-	}
-	pending := tracker.Unacked()
-	for settler := range c.settlers {
-		if settler.key != key {
-			continue
-		}
-		settlerTracker := settler.tracker
-		if settlerTracker == nil {
-			continue
-		}
-		if settlerTracker == tracker && tracker.holds(settler.record.Offset) {
-			pending--
-		}
-		if settlerTracker != tracker {
-			settlerTracker.Drop()
-		}
-		if _, wasBuffered := buffered[settler]; wasBuffered {
-			delete(c.settlers, settler)
-			c.releaseSlotsLocked(destination, 1)
-			continue
-		}
-		if retainTracker && !settler.forceRevoked && settlerTracker == tracker && tracker.holds(settler.record.Offset) {
-			if settler.handoff.Settle != nil {
-				c.storeHandoffLocked(settler)
-			}
-			reservations = append(reservations, settler.record.Offset)
-			settler.transferSettled = true
-			settler.tombstoned = false
-			settler.drainingRevoked = false
-			continue
-		}
-		if settlerTracker == tracker && settler.handoff.Settle != nil {
-			c.storeHandoffLocked(settler)
-			reservations = append(reservations, settler.record.Offset)
-		}
-		settler.drainingRevoked = c.draining
-		settler.tombstoned = true
-		settler.tracker = nil
-	}
-	delete(c.trackers, key)
-	delete(c.requeued, key)
-	delete(c.discarded, key)
-	delete(c.activeGenerations, key)
-	if pending < 0 {
-		pending = 0
-	}
-	if pending > c.unsettled[destination] {
-		pending = c.unsettled[destination]
-	}
-	c.releaseSlotsLocked(destination, pending)
-	budget := c.budgets[destination]
-	if budget > 0 && c.unsettled[destination] < budget {
-		c.setPauseReasonLocked(destination, pauseReasonPrefetch, false)
-	}
-	c.refreshAckGapLocked(destination)
+	contended, shouldLeave := c.completeSettlementLocked(settler, preserveUnsettled)
 	c.mu.Unlock()
-	for _, offset := range reservations {
-		c.reserveTransfer(key, offset)
+	if shouldLeave {
+		c.requestLeave()
 	}
-	for _, message := range kept {
-		c.messages <- message
-	}
-	go c.dispatchHandoffs(key)
+	return contended
 }
 
-// dropTrackerExclusive transfers exactly the generation captured at revoke
-// time. Settlers admitted under a newer generation after reassignment are
-// not in the snapshot and are never detached.
-func (c *consumer) dropTrackerExclusive(rp revokedPartition) {
-	c.assignmentMu.Lock()
-	defer c.assignmentMu.Unlock()
-	c.deliveryMu.Lock()
-	defer c.deliveryMu.Unlock()
-	c.mu.Lock()
-	if rp.tracker == nil && len(rp.owned) == 0 {
-		c.mu.Unlock()
-		return
-	}
-	result := c.transferOwnershipLocked(rp)
-	c.mu.Unlock()
-	c.finishTransfer(result)
-}
-
-// transferOwnershipLocked preserves the queued handoff first, then tombstones
-// and detaches every revoked source settler and releases its destination
-// prefetch slot exactly once. The queued copy becomes the offset's only live
-// settlement path and one active target delivers it. The old caller observes
-// ErrRevoked unless a broker commit already succeeded, whose success stands
-// and suppresses the queued copy before it can become a second live delivery.
-// A buffered delivery is removed from Messages here; a delivery the caller
-// already holds settles through its detached settler, which never re-charges
-// the released slot. Draining settlers stay retained until their caller
-// reaches a terminal state so Nack during drain still succeeds. The caller
-// must hold assignmentMu, deliveryMu, and c.mu.
-func (c *consumer) transferOwnershipLocked(rp revokedPartition) transferResult {
-	key := rp.key
-	destination := key.destination
-	tracker := rp.tracker
-	result := transferResult{key: key, reservations: make([]int64, 0), dispatch: !c.draining}
-	if c.selfTransfers == nil {
-		// Initialized here rather than only in newConsumer because tests
-		// build consumers directly as well.
-		c.selfTransfers = make(map[partitionKey][]*settler)
-	}
-
-	var kept []driver.InboundMessage
-	discardedBuffered := map[*settler]struct{}(nil)
-	if !c.draining {
-		discardedBuffered, kept = c.discardBufferedSettlersLocked(tracker)
-		result.kept = kept
-	}
-	for settler, snapTracker := range rp.owned {
-		if _, ok := c.settlers[settler]; !ok {
-			continue
-		}
-		if settler.tracker != snapTracker {
-			continue
-		}
-		if settler.tracker != tracker {
-			settler.tracker.Drop()
-		}
-		if c.draining {
-			// Drain keeps revoked settlers, including buffered deliveries,
-			// until their caller reaches a terminal state. No handoff is
-			// queued during shutdown, and the existing message stays in
-			// Messages for its caller to Nack or Ack.
-			settler.drainingRevoked = true
-			settler.tombstoned = true
-			settler.tracker = nil
-			continue
-		}
-		if settler.handoff.Settle != nil {
-			c.storeHandoffLocked(settler)
-			result.reservations = append(result.reservations, settler.record.Offset)
-		}
-		// Detach after queueing: the queued copy, not this settler, is the
-		// offset's live path from here on. The destination slot stays charged
-		// until the caller's terminal settlement releases it, which is the
-		// admission-until-settlement accounting every other delivery uses.
-		// Releasing the slot here would let the source refill its budget while
-		// its caller still holds a delivery that occupies a slot.
-		settler.tombstoned = true
-		settler.tracker = nil
-		delete(c.settlers, settler)
-		// Keep the settler reachable for the assignment path: if this member
-		// is handed the partition back, it is the new owner and may settle
-		// this delivery again.
-		c.selfTransfers[key] = append(c.selfTransfers[key], settler)
-		// A buffered delivery discarded above never reached a caller, so no
-		// terminal settlement can release its slot; release it here.
-		if _, dropped := discardedBuffered[settler]; dropped {
-			c.forgetSelfTransferLocked(settler)
-			if !settler.slotReleased {
-				c.releaseSlotsLocked(destination, 1)
-				settler.slotReleased = true
-			}
-		}
-	}
-	if tracker != nil {
-		tracker.Drop()
-	}
-	delete(c.trackers, key)
-	delete(c.trackerGenerations, key)
-	delete(c.requeued, key)
-	delete(c.discarded, key)
-	delete(c.activeGenerations, key)
-	budget := c.budgets[destination]
-	if budget > 0 && c.unsettled[destination] < budget {
-		c.setPauseReasonLocked(destination, pauseReasonPrefetch, false)
-	}
-	c.refreshAckGapLocked(destination)
-	c.signalSettlerDoneLocked()
-	return result
-}
-
-// regrantSelfTransfersLocked re-grants settlement authority when a revoked
-// partition comes back to the member that transferred it. A cooperative
-// rebalance revokes a partition and can re-assign it to the same member across
-// a generation bump, and the new owner is then this consumer: the delivery the
-// caller still holds keeps its one live settlement path instead of staying
-// revoked, and the queued handoff for the offset is cleared rather than
-// delivered as a second copy of a record the caller already has. The offset
-// stays reserved until that settlement commits, so a broker redelivery of the
-// same offset is still filtered.
-// The caller must hold assignmentMu and c.mu.
-func (c *consumer) regrantSelfTransfersLocked(partitions map[string][]int32) {
-	if len(c.selfTransfers) == 0 {
-		return
-	}
-	for topic, partitionList := range partitions {
-		for _, partition := range partitionList {
-			key := partitionKey{destination: topic, partition: partition}
-			pending := c.selfTransfers[key]
-			if len(pending) == 0 {
-				continue
-			}
-			delete(c.selfTransfers, key)
-			for _, settler := range pending {
-				if settler.settled || !settler.tombstoned {
-					continue
-				}
-				// A handoff already taken by another owner means that owner
-				// holds the offset's live path; re-granting here would give
-				// the offset two.
-				if _, queued := c.handoffs[key][settler.record.Offset]; !queued {
-					continue
-				}
-				tracker := c.trackers[key]
-				if tracker == nil {
-					tracker = c.trackerForLocked(settler.record)
-				}
-				settler.tombstoned = false
-				settler.tracker = tracker
-				c.settlers[settler] = struct{}{}
-				c.removeHandoffLocked(key, settler.record.Offset)
-			}
-		}
-	}
-}
-
-// forgetSelfTransferLocked drops a settled settler from the re-grant list so
-// the list cannot grow with every transfer. The caller must hold c.mu.
-func (c *consumer) forgetSelfTransferLocked(settler *settler) {
-	pending := c.selfTransfers[settler.key]
-	if len(pending) == 0 {
-		return
-	}
-	kept := pending[:0]
-	for _, candidate := range pending {
-		if candidate != settler {
-			kept = append(kept, candidate)
-		}
-	}
-	if len(kept) == 0 {
-		delete(c.selfTransfers, settler.key)
-		return
-	}
-	c.selfTransfers[settler.key] = kept
-}
-
-func (c *consumer) finishTransfer(result transferResult) {
-	for _, offset := range result.reservations {
-		c.reserveTransfer(result.key, offset)
-	}
-	for _, message := range result.kept {
-		c.messages <- message
-	}
-	if result.dispatch {
-		go c.dispatchHandoffs(result.key)
-	}
-}
-
-func (c *consumer) dropAllTrackers() {
-	c.assignmentMu.Lock()
-	c.mu.Lock()
-	keySet := make(map[partitionKey]struct{}, len(c.trackers)+len(c.settlers))
-	for key := range c.trackers {
-		keySet[key] = struct{}{}
-	}
-	for settler := range c.settlers {
-		keySet[settler.key] = struct{}{}
-	}
-	keys := make([]partitionKey, 0, len(keySet))
-	for key := range keySet {
-		keys = append(keys, key)
-	}
-	c.mu.Unlock()
-	c.assignmentMu.Unlock()
-
-	for _, key := range keys {
-		c.dropTracker(key.destination, key.partition)
-	}
-}
-
-func (c *consumer) completeSettlement(settler *settler, preserveUnsettled bool) {
-	c.mu.Lock()
+// completeSettlementLocked completes the accounting under c.mu and reports
+// whether the caller must request leave after unlocking.
+func (c *consumer) completeSettlementLocked(settler *settler, preserveUnsettled bool) (contended, shouldLeave bool) {
 	if preserveUnsettled && (settler.tracker == nil || c.trackers[settler.key] != settler.tracker) {
 		preserveUnsettled = false
 	}
 	settler.settled = true
-	tracker := settler.tracker
-	transferSettled := settler.transferSettled || settler.handoffDelivered
-	markerOffsets := make(map[int64]struct{})
-	clearReservation := false
-	commitPoint := int64(-1)
-	if tracker != nil {
-		commitPoint = tracker.CommitPoint()
-		if pending := c.pendingTransfers[settler.key]; pending != nil {
-			for offset, pendingTracker := range pending {
-				if pendingTracker == tracker && commitPoint > offset {
-					markerOffsets[offset] = struct{}{}
-					delete(pending, offset)
-				}
-			}
-			if len(pending) == 0 {
-				delete(c.pendingTransfers, settler.key)
-			}
-		}
-		if transferSettled {
-			if commitPoint > settler.record.Offset {
-				markerOffsets[settler.record.Offset] = struct{}{}
-			} else {
-				pending := c.pendingTransfers[settler.key]
-				if pending == nil {
-					pending = make(map[int64]*ackTracker)
-					c.pendingTransfers[settler.key] = pending
-				}
-				pending[settler.record.Offset] = tracker
-			}
-		}
-		// A commit that won before the transfer detached this settler must
-		// suppress the queued copy: the broker already has the offset, so
-		// the target must never observe a second live delivery for it.
-		if commitPoint > settler.record.Offset {
-			if _, queued := c.handoffs[settler.key][settler.record.Offset]; queued {
-				markerOffsets[settler.record.Offset] = struct{}{}
-			}
-		}
-	}
-	if settler.requeued && !settler.tombstoned && tracker != nil {
-		if pending := c.pendingTransfers[settler.key]; pending != nil {
-			if pending[settler.record.Offset] == tracker {
-				delete(pending, settler.record.Offset)
-				clearReservation = true
-			}
-			if len(pending) == 0 {
-				delete(c.pendingTransfers, settler.key)
-			}
-		}
-	}
-	if len(markerOffsets) > 0 {
-		if c.settledTransfers == nil {
-			c.settledTransfers = make(map[partitionKey]map[int64]struct{})
-		}
-		offsets := c.settledTransfers[settler.key]
-		if offsets == nil {
-			offsets = make(map[int64]struct{})
-			c.settledTransfers[settler.key] = offsets
-		}
-		for offset := range markerOffsets {
-			offsets[offset] = struct{}{}
-		}
-	}
-	for offset := range markerOffsets {
-		c.removeHandoffLocked(settler.key, offset)
-	}
-	if tracker != nil && c.trackers[settler.key] == tracker {
-		c.reconcileDiscardedLocked(settler.key, tracker)
-	}
+	c.clearHeadHoldLocked(settler.key)
 	if _, exists := c.settlers[settler]; !exists {
-		c.forgetSelfTransferLocked(settler)
 		if !preserveUnsettled && !settler.slotReleased {
-			c.releaseSlotsLocked(settler.record.Topic, 1)
+			contended = c.releaseSlotsLocked(settler.record.Topic, 1)
+			c.releasePartitionLocked(settler.key, 1)
 			settler.slotReleased = true
 		}
-		c.refreshAckGapLocked(settler.record.Topic)
 		c.signalSettlerDoneLocked()
-		c.mu.Unlock()
-		if clearReservation {
-			c.clearTransferReservation(settler.key, settler.record.Offset)
-		}
-		for offset := range markerOffsets {
-			c.markSettledTransfer(settler.key, offset)
-		}
-		go c.redriveHandoffs(settler.key)
-		return
+		return contended, false
 	}
 	delete(c.settlers, settler)
 	if !preserveUnsettled && !settler.slotReleased {
-		c.releaseSlotsLocked(settler.record.Topic, 1)
+		contended = c.releaseSlotsLocked(settler.record.Topic, 1)
+		c.releasePartitionLocked(settler.key, 1)
+		settler.slotReleased = true
 	}
 	budget := c.budgets[settler.record.Topic]
 	if budget > 0 && (preserveUnsettled || c.unsettled[settler.record.Topic] < budget) {
 		c.setPauseReasonLocked(settler.record.Topic, pauseReasonPrefetch, false)
 	}
-	c.refreshAckGapLocked(settler.record.Topic)
 	c.signalSettlerDoneLocked()
-	shouldLeave := c.draining && len(c.settlers) == 0 && !c.leaveRequested
+	shouldLeave = c.draining && len(c.settlers) == 0 && !c.leaveRequested
 	if shouldLeave {
 		c.leaveRequested = true
 	}
-	c.mu.Unlock()
-	if clearReservation {
-		c.clearTransferReservation(settler.key, settler.record.Offset)
-	}
-	for offset := range markerOffsets {
-		c.markSettledTransfer(settler.key, offset)
-	}
-	if shouldLeave {
-		c.requestLeave()
-	}
-	go c.redriveHandoffs(settler.key)
+	return contended, shouldLeave
 }
 
-func (c *consumer) noteDiscarded(key partitionKey, tracker *ackTracker, offset int64) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.trackers[key] != tracker || tracker.CommitPoint() > offset {
-		return
+// requeueLocked puts the record a settler delivered back at the head of its
+// partition's queue. The queue's other records keep their order behind it, so
+// the partition redelivers the requeued record before them, and the committed
+// cursor does not move: the record's offset is still unsettled, so if this
+// consumer leaves before the redelivery settles, the partition's next owner
+// redelivers it too. The Nack that requeued hands the redelivery over itself
+// (handOff) once it has released its locks.
+func (c *consumer) requeueLocked(s *settler) {
+	c.requeued[s.key]++
+	if c.pending == nil {
+		c.pending = make(map[partitionKey][]*kgo.Record)
 	}
-	if c.discarded == nil {
-		c.discarded = make(map[partitionKey]map[int64]struct{})
-	}
-	if c.discarded[key] == nil {
-		c.discarded[key] = make(map[int64]struct{})
-	}
-	c.discarded[key][offset] = struct{}{}
-	c.reconcileDiscardedLocked(key, tracker)
+	c.pending[s.key] = append([]*kgo.Record{s.record}, c.pending[s.key]...)
+	c.markDirtyLocked(s.key)
 }
 
-func (c *consumer) hasPendingRequeueLocked(destination string) bool {
-	for key, count := range c.requeued {
-		if key.destination == destination && count > 0 {
-			return true
-		}
-	}
-	return false
-}
-
-func (c *consumer) reconcileDiscardedLocked(key partitionKey, tracker *ackTracker) {
-	if tracker == nil || len(c.discarded[key]) == 0 {
-		return
-	}
-	base := tracker.CommitPoint()
-	for offset := range c.discarded[key] {
-		if offset < base {
-			delete(c.discarded[key], offset)
-		}
-	}
-	if len(c.discarded[key]) == 0 {
-		delete(c.discarded, key)
-	}
-}
-
-func (c *consumer) refreshAckGap(destination string) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.refreshAckGapLocked(destination)
-}
-
-func (c *consumer) refreshAckGapLocked(destination string) {
-	exceeded := false
-	for key, tracker := range c.trackers {
-		if key.destination == destination && tracker.Gap() > c.maxAckGap {
-			exceeded = true
-			break
-		}
-	}
-	c.setPauseReasonLocked(destination, pauseReasonAckGap, exceeded)
-}
-
+// commitOffset commits one partition's cursor through the consumer's
+// committer, which sends it in one request with the other partitions' commits
+// that are waiting at the same time, and returns once that request finished.
 func (c *consumer) commitOffset(ctx context.Context, key partitionKey, commitPoint int64) error {
+	send := c.commitFn
+	if send == nil {
+		// A consumer built as a literal by a test has no seam installed.
+		send = c.sendCommits
+	}
+	return c.committer.commit(ctx, key, commitPoint, send)
+}
+
+// sendCommits sends one commit request for every point of a committer round.
+// A revoke callback reaches this through commitSettledPrefix, so the client is
+// read under c.mu and a nil client fails the round instead of panicking; the
+// lock is released before the commit, which is a broker call. The nil branch is
+// defensive: the client has one writer and a commit follows an admitted
+// delivery, so nothing depends on the kind it carries, and both call sites
+// re-classify a commit failure anyway.
+func (c *consumer) sendCommits(ctx context.Context, points map[partitionKey]int64) map[partitionKey]error {
+	results := make(map[partitionKey]error, len(points))
+	fail := func(err error) map[partitionKey]error {
+		for key := range points {
+			results[key] = err
+		}
+		return results
+	}
+	c.mu.Lock()
+	client := c.client
+	c.mu.Unlock()
+	if client == nil {
+		return fail(classify("consumer", driver.KindFatal, errors.New("consumer has no client")))
+	}
+	offsets := make(map[string]map[int32]kgo.EpochOffset, 1)
+	for key, point := range points {
+		if offsets[key.destination] == nil {
+			offsets[key.destination] = make(map[int32]kgo.EpochOffset)
+		}
+		offsets[key.destination][key.partition] = kgo.EpochOffset{Epoch: -1, Offset: point}
+	}
 	c.offsetMu.Lock()
 	defer c.offsetMu.Unlock()
-	var commitErr error
-	c.client.CommitOffsetsSync(ctx, map[string]map[int32]kgo.EpochOffset{
-		key.destination: {
-			key.partition: {Epoch: -1, Offset: commitPoint},
-		},
-	}, func(_ *kgo.Client, _ *kmsg.OffsetCommitRequest, response *kmsg.OffsetCommitResponse, err error) {
+	client.CommitOffsetsSync(ctx, offsets, func(_ *kgo.Client, _ *kmsg.OffsetCommitRequest, response *kmsg.OffsetCommitResponse, err error) {
 		if err != nil {
-			commitErr = err
+			fail(err)
 			return
 		}
+		// A partition the response leaves out was not committed; the broker
+		// answers every partition of a request, so this is defensive.
+		fail(errCommitResponseMissing)
 		for _, topic := range response.Topics {
 			for _, partition := range topic.Partitions {
-				if err := kerr.ErrorForCode(partition.ErrorCode); err != nil {
-					commitErr = err
-					return
+				key := partitionKey{destination: topic.Topic, partition: partition.Partition}
+				if _, sent := points[key]; sent {
+					results[key] = kerr.ErrorForCode(partition.ErrorCode)
 				}
 			}
 		}
 	})
-	return commitErr
+	return results
 }
 
-func (c *consumer) resetOffset(key partitionKey, tracker *ackTracker, offset int64) bool {
-	c.assignmentMu.Lock()
-	defer c.assignmentMu.Unlock()
-	c.mu.Lock()
-	current := c.trackers[key] == tracker
-	c.mu.Unlock()
-	if !current {
-		return false
+// errCommitResponseMissing is the result of a partition an offset commit
+// response did not answer.
+var errCommitResponseMissing = errors.New("kafka: offset commit response omitted the partition")
+
+// retainedRecord copies the fetch record into memory this consumer owns. A
+// settler keeps the copy so a requeue can redeliver the record the broker
+// carried: franz-go reuses fetch buffers, and the delivered message is the
+// application's copy to change, so neither the fetch buffer nor the message the
+// handler held is a sound source for a redelivery.
+func retainedRecord(record *kgo.Record) *kgo.Record {
+	retained := &kgo.Record{
+		Topic:       record.Topic,
+		Partition:   record.Partition,
+		Offset:      record.Offset,
+		LeaderEpoch: record.LeaderEpoch,
+		Timestamp:   record.Timestamp,
+		Key:         append([]byte(nil), record.Key...),
+		Value:       append([]byte(nil), record.Value...),
 	}
-	c.offsetMu.Lock()
-	defer c.offsetMu.Unlock()
-	c.client.SetOffsets(map[string]map[int32]kgo.EpochOffset{
-		key.destination: {
-			key.partition: {Epoch: -1, Offset: offset},
-		},
-	})
-	return true
+	if len(record.Headers) > 0 {
+		retained.Headers = make([]kgo.RecordHeader, len(record.Headers))
+		for index, header := range record.Headers {
+			retained.Headers[index] = kgo.RecordHeader{
+				Key:   header.Key,
+				Value: append([]byte(nil), header.Value...),
+			}
+		}
+	}
+	return retained
 }
 
-func (c *consumer) resumeForRedelivery(destination string) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.resumeForRedeliveryLocked(destination)
-}
-
-func (c *consumer) resumeForRedeliveryLocked(destination string) {
-	if c.draining || c.stopped || !c.hasPendingRequeueLocked(destination) {
-		return
+func kafkaEnqueueFields(timestamp time.Time, timestampType int8) (time.Time, driver.EnqueueSource) {
+	if timestamp.IsZero() {
+		return time.Time{}, driver.EnqueueSourceUnknown
 	}
-	reasons := c.pauseReasons[destination]
-	if !reasons.empty() && reasons.permitsRedelivery() {
-		c.client.ResumeFetchTopics(destination)
+	switch timestampType {
+	case 0:
+		return timestamp, driver.EnqueueSourceProducer
+	case 1:
+		return timestamp, driver.EnqueueSourceBroker
+	default:
+		return time.Time{}, driver.EnqueueSourceUnknown
 	}
 }
 
-func (c *consumer) pauseAfterRedeliveryLocked(destination string) {
-	if c.draining || c.stopped || c.hasPendingRequeueLocked(destination) {
-		return
-	}
-	reasons := c.pauseReasons[destination]
-	if !reasons.empty() && reasons.permitsRedelivery() {
-		c.client.PauseFetchTopics(destination)
-	}
-}
-
-func inboundMessage(record *kgo.Record, settler *settler) driver.InboundMessage {
+func inboundMessage(record *kgo.Record, settler *settler, receivedAt time.Time) driver.InboundMessage {
 	headers := make([]driver.Header, 0, len(record.Headers))
 	for _, header := range record.Headers {
-		if header.Key == delayUntilHeader {
-			continue
-		}
 		headers = append(headers, driver.Header{Key: header.Key, Value: append([]byte(nil), header.Value...)})
 	}
-	receivedAt := kafkaNow()
+	enqueuedAt, enqueuedAtSource := kafkaEnqueueFields(record.Timestamp, record.Attrs.TimestampType())
 	return driver.InboundMessage{
-		Destination:   record.Topic,
-		Key:           append([]byte(nil), record.Key...),
-		Headers:       headers,
-		Body:          append([]byte(nil), record.Value...),
-		DeliveryCount: -1,
-		ReceivedAt:    receivedAt,
+		Destination:      record.Topic,
+		Key:              append([]byte(nil), record.Key...),
+		Headers:          headers,
+		Body:             append([]byte(nil), record.Value...),
+		DeliveryCount:    -1,
+		ReceivedAt:       receivedAt,
+		EnqueuedAt:       enqueuedAt,
+		EnqueuedAtSource: enqueuedAtSource,
 		Ref: driver.BrokerRef{
 			Partition: record.Partition,
 			Offset:    record.Offset,
-			Raw:       fmt.Sprintf("%s/%d/%d", record.Topic, record.Partition, record.Offset),
+			Raw:       record.Topic + "/" + strconv.FormatInt(int64(record.Partition), 10) + "/" + strconv.FormatInt(record.Offset, 10),
 		},
 		Settle: settler,
 	}
 }
 
+// Pause pauses delivery from the listed topics. With no topics, it pauses every topic this consumer subscribes to.
 func (c *consumer) Pause(destinations ...string) error {
 	return c.setUserPaused(destinations, true)
 }
 
+// Resume resumes delivery from the listed topics. With no topics, it resumes every topic this consumer subscribes to.
 func (c *consumer) Resume(destinations ...string) error {
 	return c.setUserPaused(destinations, false)
 }
@@ -2375,9 +1820,6 @@ func (c *consumer) setUserPaused(destinations []string, paused bool) error {
 		if laneFaulted && c.pauseReasons[destination].empty() && !c.draining && !c.stopped {
 			c.client.ResumeFetchTopics(destination)
 		}
-		if !paused {
-			c.resumeForRedeliveryLocked(destination)
-		}
 	}
 	return nil
 }
@@ -2391,37 +1833,27 @@ func (c *consumer) setPauseReasonLocked(destination string, reason pauseReason, 
 	if _, present := reasons[reason]; present == add {
 		return
 	}
-	paused := reasons.holdsFetches()
 	if add {
-		reasons.add(reason)
-	} else {
-		reasons.remove(reason)
+		if !reasons.add(reason) {
+			return
+		}
+		if c.client != nil {
+			c.client.PauseFetchTopics(destination)
+		}
+		return
 	}
-	switch {
-	case !paused && reasons.holdsFetches():
-		c.client.PauseFetchTopics(destination)
-	case !add && !reasons.holdsFetches() && !c.draining && !c.stopped:
-		// A removal that leaves the fetches unheld releases them, whether or
-		// not the set ever held them. The deferred reason is the only reason
-		// that does not hold the fetches itself: it is the gate that refuses
-		// a requeued record before its due time, so a record the poll loop
-		// took out of franz-go and could not admit is waiting for exactly
-		// this removal, and resuming fetch does not reach it.
-		//
-		// Ending the wait is part of the release. The poll that follows a
-		// release with nothing waiting has no deadline, so a broker with
-		// nothing left to hand over produces no other wake and the record is
-		// never admitted again.
-		//
-		// The resume is unconditional because fetching can also be paused on
-		// this destination from outside this bookkeeping, which a lane fault
-		// does; resuming a destination that is not paused is a no-op in
-		// franz-go.
-		c.client.ResumeFetchTopics(destination)
+	if !reasons.remove(reason) {
+		return
+	}
+	if reasons.empty() && !c.draining && !c.stopped {
+		if c.client != nil {
+			c.client.ResumeFetchTopics(destination)
+		}
 		c.wakePollLocked()
 	}
 }
 
+// Drain stops fetching new messages while keeping outstanding messages settleable.
 func (c *consumer) Drain(ctx context.Context) error {
 	_, err := c.drain(ctx)
 	return err
@@ -2436,9 +1868,15 @@ func (c *consumer) drain(ctx context.Context) (leaveFinished bool, err error) {
 		return false, classify("drain", driver.KindTransient, err)
 	}
 	c.stopForwarders()
+	// A handoff can have passed admission and released c.mu without sending
+	// yet. Stop its blocked send before taking deliveryMu, then fence draining
+	// with that send: otherwise Drain can return while the handoff still has
+	// both the stop channel and Messages ready and chooses to send.
+	c.deliveryMu.Lock()
 	c.mu.Lock()
 	if c.stopped {
 		c.mu.Unlock()
+		c.deliveryMu.Unlock()
 		return false, nil
 	}
 	if !c.draining {
@@ -2450,6 +1888,7 @@ func (c *consumer) drain(ctx context.Context) (leaveFinished bool, err error) {
 	}
 	pollDone := c.pollDone
 	c.mu.Unlock()
+	c.deliveryMu.Unlock()
 	if err := c.waitPoll(ctx, "drain", pollDone); err != nil {
 		return false, err
 	}
@@ -2475,6 +1914,8 @@ func (c *consumer) waitPoll(ctx context.Context, operation string, pollDone <-ch
 	}
 }
 
+// Stop drains the consumer and closes its channels after every delivered message has been settled.
+// It returns ErrResourcesOutstanding if deliveries remain unsettled.
 func (c *consumer) Stop(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
 		return stopContextError(err)
@@ -2578,11 +2019,8 @@ func (c *consumer) closeTeardown(ctx context.Context) {
 	if c.client != nil {
 		c.client.Close()
 	}
+	c.closeBacklogClient()
 	c.conn.removeConsumer(c)
-	// The move runs after the client is closed, so no rebalance callback can
-	// queue another handoff here, and after the consumer is unregistered, so no
-	// peer can take one from this queue. The snapshot is then complete.
-	c.moveQueuedHandoffsOnLeave()
 	if c.synthesizedGroup {
 		if err := c.deleteGroup(ctx); err != nil {
 			c.sendError(err)
@@ -2621,16 +2059,19 @@ func (c *consumer) deleteGroup(ctx context.Context) error {
 	return nil
 }
 
+// Release abandons unsettled deliveries without committing their offsets, then closes the consumer.
 func (c *consumer) Release(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
 		return classify("release", driver.KindTransient, err)
 	}
 	c.stopForwarders()
+	c.deliveryMu.Lock()
 
 	c.mu.Lock()
 	if c.stopped {
 		stopDone := c.stopDone
 		c.mu.Unlock()
+		c.deliveryMu.Unlock()
 		select {
 		case <-stopDone:
 			return nil
@@ -2645,34 +2086,17 @@ func (c *consumer) Release(ctx context.Context) error {
 	}
 	pollDone := c.pollDone
 	c.mu.Unlock()
+	c.deliveryMu.Unlock()
 
 	if err := c.waitPoll(ctx, "release", pollDone); err != nil {
 		return err
 	}
 	c.assignmentMu.Lock()
 	c.mu.Lock()
-	// Every settler still here is a live settlement path this Release is about
-	// to abandon without settling, its offset uncommitted, so the peer
-	// reservation that filtered the broker's copy has to go while this member
-	// still owns the partition: a peer assigned the partition after the leave
-	// fetches from the committed offset and moves past a record the reservation
-	// hid. An offset with a queued handoff is left out, because that copy still
-	// needs the reservation until it is delivered or settled. Stop cannot reach
-	// any of this: it refuses while a settler is outstanding.
-	reservations := make([]transferReservation, 0)
-	for settler := range c.settlers {
-		if _, queued := c.handoffs[settler.key][settler.record.Offset]; queued {
-			continue
-		}
-		reservations = append(reservations, transferReservation{key: settler.key, offset: settler.record.Offset})
-	}
 	trackers := c.detachAllTrackersLocked()
 	c.mu.Unlock()
 	c.assignmentMu.Unlock()
 
-	for _, reservation := range reservations {
-		c.clearTransferReservation(reservation.key, reservation.offset)
-	}
 	for _, tracker := range trackers {
 		tracker.Drop()
 	}
@@ -2715,6 +2139,9 @@ func (c *consumer) Release(ctx context.Context) error {
 	return nil
 }
 
+// Lag returns the backlog count for each topic this consumer subscribes to,
+// summed across all of its partitions against the group's committed offsets.
+// It is the group's lag, not only this member's share.
 func (c *consumer) Lag(ctx context.Context) (map[string]int64, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, classify("lag", driver.KindTransient, err)
@@ -2722,61 +2149,15 @@ func (c *consumer) Lag(ctx context.Context) (map[string]int64, error) {
 	if !c.effectiveCapabilities().LagQueryable {
 		return nil, classify("lag", driver.KindFatal, driver.ErrUnsupported)
 	}
-	c.mu.Lock()
-	destinations := append([]string(nil), c.destinations...)
-	group := c.group
-	c.mu.Unlock()
-
-	admin := kadm.NewClient(c.conn.client)
-	starts, err := listKafkaOffsets(ctx, func(listCtx context.Context) (kadm.ListedOffsets, error) {
-		return admin.ListStartOffsets(listCtx, destinations...)
-	})
+	snapshot, err := c.readKafkaOffsetSnapshot(ctx, "lag")
 	if err != nil {
-		return nil, classifyLagError(err)
+		return nil, err
 	}
-	ends, err := listKafkaOffsets(ctx, func(listCtx context.Context) (kadm.ListedOffsets, error) {
-		return admin.ListEndOffsets(listCtx, destinations...)
-	})
+	lag, _, err := snapshot.lagAndProbes("lag")
 	if err != nil {
-		return nil, classifyLagError(err)
-	}
-	committed, err := admin.FetchOffsets(ctx, group)
-	if err != nil && !errors.Is(err, kerr.GroupIDNotFound) {
-		return nil, classify("lag", kafkaErrorKind(err), err)
-	}
-
-	lag := make(map[string]int64, len(destinations))
-	for _, destination := range destinations {
-		partitions, ok := ends[destination]
-		if !ok {
-			return nil, classify("lag", driver.KindNotFound, fmt.Errorf("destination %q is missing: %w", destination, driver.ErrDestinationMissing))
-		}
-		var total int64
-		for partition, end := range partitions {
-			start, ok := starts.Lookup(destination, partition)
-			if !ok {
-				return nil, classify("lag", driver.KindNotFound, fmt.Errorf("destination %q partition %d has no start offset", destination, partition))
-			}
-			committedOffset := start.Offset
-			if response, exists := committed.Lookup(destination, partition); exists {
-				if response.Err != nil {
-					return nil, classifyKafkaOffsetError("lag", response.Err)
-				}
-				if response.At >= 0 {
-					committedOffset = response.At
-				}
-			}
-			if end.Offset > committedOffset {
-				total += end.Offset - committedOffset
-			}
-		}
-		lag[destination] = total
+		return nil, err
 	}
 	return lag, nil
-}
-
-func classifyLagError(err error) error {
-	return classifyKafkaOffsetError("lag", err)
 }
 
 func classifyKafkaOffsetError(operation string, err error) error {
@@ -2787,7 +2168,7 @@ func classifyKafkaOffsetError(operation string, err error) error {
 	return classify(operation, kind, err)
 }
 
-func listKafkaOffsets(ctx context.Context, list func(context.Context) (kadm.ListedOffsets, error)) (kadm.ListedOffsets, error) {
+func listKafkaOffsets(ctx context.Context, clk clock.Clock, list func(context.Context) (kadm.ListedOffsets, error)) (kadm.ListedOffsets, error) {
 	retryCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 	for {
@@ -2798,7 +2179,7 @@ func listKafkaOffsets(ctx context.Context, list func(context.Context) (kadm.List
 		if err == nil || !errors.Is(err, kerr.UnknownTopicOrPartition) {
 			return offsets, err
 		}
-		timer := time.NewTimer(50 * time.Millisecond) //nolint:forbidigo // Kafka metadata propagation is broker-driven and requires a wall-clock retry
+		timer := clk.Timer(50 * time.Millisecond)
 		select {
 		case <-retryCtx.Done():
 			timer.Stop()
@@ -2835,10 +2216,8 @@ func (c *conn) reserveConsumer(csm *consumer) error {
 			continue
 		}
 		for _, destination := range csm.destinations {
-			for _, activeDestination := range active.destinations {
-				if destination == activeDestination {
-					return fmt.Errorf("%w on destination %q", errExclusiveConsumer, destination)
-				}
+			if slices.Contains(active.destinations, destination) {
+				return fmt.Errorf("%w on destination %q", errExclusiveConsumer, destination)
 			}
 		}
 	}
@@ -2868,8 +2247,14 @@ func (c *consumer) sendError(err error) {
 			return
 		default:
 		}
+		// Make room by evicting the oldest error, unless that one is fatal:
+		// the core fails the subscription only on a fatal error, so a
+		// merely severe one must not push it out.
 		select {
-		case <-c.errors:
+		case evicted := <-c.errors:
+			if evictedKind, evictedClassified := driver.Classify(evicted); evictedClassified && evictedKind == driver.KindFatal && kind != driver.KindFatal {
+				err = evicted
+			}
 		default:
 		}
 		select {
@@ -2906,7 +2291,11 @@ func (c *consumer) signalSettlerDoneLocked() {
 	}
 }
 
-func (c *consumer) waitForSettlers(keys map[partitionKey]struct{}, timeout time.Duration) map[partitionKey]struct{} {
+// waitForSettlers waits until no settler of keys is outstanding, or until the
+// bound expires. It is a condition wait and not a poll: signalSettlerDoneLocked
+// runs in the same critical section that takes a revoked partition's charge to
+// zero, so the delivery that settles during the window wakes this wait.
+func (c *consumer) waitForSettlers(keys map[partitionKey]struct{}, timeout time.Duration) {
 	timer := c.clock.Timer(timeout)
 	defer timer.Stop()
 	for {
@@ -2914,32 +2303,18 @@ func (c *consumer) waitForSettlers(keys map[partitionKey]struct{}, timeout time.
 		has := c.hasSettlersForLocked(keys)
 		c.mu.Unlock()
 		if !has {
-			return nil
+			return
 		}
 		select {
 		case <-c.settlerCh:
 		case <-timer.C:
-			c.mu.Lock()
-			timedOut := make(map[partitionKey]struct{})
-			for settler := range c.settlers {
-				if settler.tombstoned {
-					continue
-				}
-				if _, ok := keys[settler.key]; ok {
-					timedOut[settler.key] = struct{}{}
-				}
-			}
-			c.mu.Unlock()
-			return timedOut
+			return
 		}
 	}
 }
 
 func (c *consumer) hasSettlersForLocked(keys map[partitionKey]struct{}) bool {
 	for s := range c.settlers {
-		if s.tombstoned {
-			continue
-		}
 		if _, ok := keys[s.key]; ok {
 			return true
 		}
@@ -2947,498 +2322,395 @@ func (c *consumer) hasSettlersForLocked(keys map[partitionKey]struct{}) bool {
 	return false
 }
 
-func (c *consumer) takeHandoffs(partitions map[string][]int32) []consumerHandoff {
-	if c.conn == nil {
-		return nil
+// revokedAssignment is one partition a rebalance callback took away, carrying
+// the tracker that ownership ran under so the callback can commit what that
+// ownership settled once the wait is over.
+type revokedAssignment struct {
+	key     partitionKey
+	tracker *ackTracker
+}
+
+// dropTracker marks one partition not owned and detaches its tracker, which it
+// returns. A partition this consumer does not own is one admission drops
+// pending records for and one whose deliveries fail their settlement, so
+// revocation wins over a commit; detaching the tracker is what makes both true
+// without tombstoning the deliveries themselves.
+//
+// A delivery the revoke finds still in Messages has never reached its caller,
+// so the settlement its charge waits for can never arrive: it is dropped and
+// its charge released, because the partition's next owner has to be able to
+// admit its first record and nothing is left here that could settle it. A
+// delivery the caller already holds keeps its charge, which is the settlement
+// the revoke wait waits for.
+//
+// A draining consumer detaches the deliveries too: nothing will redeliver them
+// by then, so a requeue of one completes without an error instead of reporting
+// a revocation the caller can do nothing about.
+//
+// It takes deliveryMu and then c.mu, and a caller that must keep a whole
+// multi-partition revoke indivisible takes assignmentMu around it. A revoke
+// that is not indivisible is still safe: the partitions are marked one at a
+// time and an admission in between lands on a partition whose revocation is
+// about to be applied to it.
+func (c *consumer) dropTracker(destination string, partition int32) *ackTracker {
+	c.deliveryMu.Lock()
+	defer c.deliveryMu.Unlock()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	key := partitionKey{destination: destination, partition: partition}
+	delete(c.owned, key)
+	tracker := c.trackers[key]
+	delete(c.trackers, key)
+	for _, record := range c.pending[key] {
+		delete(c.inHand, record)
 	}
-	wanted := make(map[partitionKey]struct{})
-	for destination, partitionList := range partitions {
-		for _, partition := range partitionList {
-			wanted[partitionKey{destination: destination, partition: partition}] = struct{}{}
-		}
+	delete(c.pending, key)
+	delete(c.heldUntil, key)
+	delete(c.partitionPauses, key)
+	queuedRequeues := c.requeued[key]
+	delete(c.requeued, key)
+	c.syncHeadTimerLocked()
+	if queuedRequeues > 0 {
+		// A queued requeue held its delivery's destination slot and its
+		// partition's charge for the redelivery this consumer owed, and the
+		// partition is leaving, so nothing here will make that redelivery and the
+		// charges have nothing left to hold. The offset is still uncommitted, so
+		// the copy the partition's next owner fetches is the redelivery.
+		c.releaseSlotsLocked(destination, queuedRequeues)
+		c.releasePartitionLocked(key, queuedRequeues)
 	}
-	// Every consumer that holds a queue for these partitions is a source,
-	// including this one: a key reassigned back to its previous owner must
-	// re-adopt the handoff it queued, or the offset keeps a reservation and
-	// no live settlement path while no peer owns the key.
-	c.conn.mu.RLock()
-	consumers := make([]*consumer, 0, len(c.conn.consumers))
-	for consumer := range c.conn.consumers {
-		consumers = append(consumers, consumer)
+	buffered := c.discardBufferedLocked(key)
+	for _, settler := range buffered {
+		delete(c.settlers, settler)
+		c.releaseSlotsLocked(destination, 1)
+		c.releasePartitionLocked(key, 1)
 	}
-	c.conn.mu.RUnlock()
-	var handoffs []consumerHandoff
-	for _, source := range consumers {
-		source.mu.Lock()
-		for key, offsets := range source.handoffs {
-			if _, ok := wanted[key]; !ok {
+	if len(buffered) > 0 {
+		c.signalSettlerDoneLocked()
+	}
+	if c.draining {
+		for settler := range c.settlers {
+			if settler.key != key {
 				continue
 			}
-			for offset, message := range offsets {
-				handoffs = append(handoffs, consumerHandoff{source: source, message: message})
-				delete(offsets, offset)
-			}
-			if len(offsets) == 0 {
-				delete(source.handoffs, key)
-			}
+			settler.drainingRevoked = true
+			settler.tracker = nil
 		}
-		source.mu.Unlock()
 	}
-	slices.SortFunc(handoffs, func(left, right consumerHandoff) int {
-		if left.message.Destination < right.message.Destination {
-			return -1
-		}
-		if left.message.Destination > right.message.Destination {
-			return 1
-		}
-		if left.message.Ref.Partition < right.message.Ref.Partition {
-			return -1
-		}
-		if left.message.Ref.Partition > right.message.Ref.Partition {
-			return 1
-		}
-		if left.message.Ref.Offset < right.message.Ref.Offset {
-			return -1
-		}
-		if left.message.Ref.Offset > right.message.Ref.Offset {
-			return 1
-		}
-		return 0
-	})
-	return handoffs
+	return tracker
 }
 
-func (c *consumer) requeueHandoff(message driver.InboundMessage) {
-	key := partitionKey{destination: message.Destination, partition: message.Ref.Partition}
-	c.mu.Lock()
-	if c.leftConnection {
-		// This consumer has left the connection, so a copy stored here would sit
-		// in a queue no dispatch scans. Forward it instead; forwardHandoffs takes
-		// its own locks, so c.mu is released first.
-		c.mu.Unlock()
-		c.forwardHandoffs(message)
-		return
-	}
-	if c.handoffs == nil {
-		c.handoffs = make(map[partitionKey]map[int64]driver.InboundMessage)
-	}
-	offsets := c.handoffs[key]
-	if offsets == nil {
-		offsets = make(map[int64]driver.InboundMessage)
-		c.handoffs[key] = offsets
-	}
-	offsets[message.Ref.Offset] = message
-	c.mu.Unlock()
-}
-
-// forwardHandoffs places copies this consumer can no longer queue on a
-// registered consumer, which offers each one to whichever consumer is eligible,
-// now or at that consumer's next capacity release.
-//
-// It takes its own locks: the caller must hold none. The peer snapshot is taken
-// under conn.mu.RLock and released before any consumer lock is taken, and each
-// requeue and dispatch takes one consumer's mutex at a time.
-func (c *consumer) forwardHandoffs(handoffs ...driver.InboundMessage) {
-	if c.conn == nil || len(handoffs) == 0 {
-		return
-	}
-	keys := make(map[partitionKey]struct{}, len(handoffs))
-	for _, message := range handoffs {
-		keys[partitionKey{destination: message.Destination, partition: message.Ref.Partition}] = struct{}{}
-	}
-	c.conn.mu.RLock()
-	var peer *consumer
-	for candidate := range c.conn.consumers {
-		if candidate != c {
-			peer = candidate
-			break
+// discardBufferedLocked takes the deliveries of key that are still in Messages,
+// which are the ones the caller has not read, and returns them. Every other
+// message is put back in the order it was drained, so one partition's revoke
+// does not reorder another's deliveries. The caller holds deliveryMu, so no
+// admission is between a delivery's charge and its send, and c.mu.
+func (c *consumer) discardBufferedLocked(key partitionKey) []*settler {
+	buffered := make([]*settler, 0, 1)
+	var kept []driver.InboundMessage
+drain:
+	for {
+		select {
+		case message, ok := <-c.messages:
+			if !ok {
+				break drain
+			}
+			settler, ok := message.Settle.(*settler)
+			if ok && settler.key == key {
+				buffered = append(buffered, settler)
+				continue
+			}
+			kept = append(kept, message)
+		default:
+			break drain
 		}
 	}
-	c.conn.mu.RUnlock()
-	if peer == nil {
-		// Nothing is left to filter these offsets, so dropping the copies loses
-		// nothing. Every reservation for them lived on a consumer that has since
-		// left the connection, and a reservation stops filtering the moment its
-		// holder stops fetching; the broker's own redelivery of each uncommitted
-		// offset is therefore visible again and arrives at the next start. A copy
-		// kept here instead would sit in a queue no dispatch scans.
-		return
+	// The channel cannot be full: it held every drained message a moment ago
+	// and the dropped ones are the difference.
+	for _, message := range kept {
+		c.messages <- message
 	}
-	for _, message := range handoffs {
-		peer.requeueHandoff(message)
+	return buffered
+}
+
+// unown marks every partition of a rebalance callback not owned, one call to
+// dropTracker per partition. The caller must hold assignmentMu and must not
+// hold c.mu.
+func (c *consumer) unown(partitions map[string][]int32) []revokedAssignment {
+	revoked := make([]revokedAssignment, 0, len(partitions))
+	for topic, partitionList := range partitions {
+		for _, partition := range partitionList {
+			key := partitionKey{destination: topic, partition: partition}
+			revoked = append(revoked, revokedAssignment{key: key, tracker: c.dropTracker(topic, partition)})
+		}
 	}
-	for key := range keys {
-		go peer.dispatchHandoffs(key)
+	return revoked
+}
+
+// revokeTrackers tombstones the trackers of a revoke, so a settlement that
+// arrives after the wait fails with the classified revoked error and commits
+// nothing.
+func (c *consumer) revokeTrackers(revoked []revokedAssignment) {
+	for _, assignment := range revoked {
+		if assignment.tracker != nil {
+			assignment.tracker.Drop()
+		}
 	}
 }
 
-// moveQueuedHandoffsOnLeave hands the queued copies held by c to a registered
-// consumer before c leaves the connection, so each offset keeps a live
-// settlement path. It marks c as left in the same hold that takes the queue, so
-// no copy can be stored here after the snapshot: a concurrent requeue either
-// takes c.mu before that hold, and its copy travels in the snapshot, or takes it
-// after, and its copy is forwarded.
-func (c *consumer) moveQueuedHandoffsOnLeave() {
-	if c.conn == nil {
-		return
-	}
-	c.mu.Lock()
-	handoffs := make([]driver.InboundMessage, 0)
-	keys := make(map[partitionKey]struct{})
-	for key, offsets := range c.handoffs {
-		for _, message := range offsets {
-			handoffs = append(handoffs, message)
-		}
-		keys[key] = struct{}{}
-	}
-	clear(c.handoffs)
-	for key := range keys {
-		// This consumer never commits again, so its commit coverage cannot
-		// suppress a moved copy and means nothing to a peer.
-		delete(c.pendingTransfers, key)
-	}
-	c.leftConnection = true
-	c.mu.Unlock()
-	c.forwardHandoffs(handoffs...)
-}
-
-func (c *consumer) emitHandoff(source *consumer, message driver.InboundMessage) {
-	key := partitionKey{destination: message.Destination, partition: message.Ref.Partition}
-	// The source is checked before the target's lock is taken: no consumer's mu
-	// is held while another consumer's mu is acquired. Two emissions in
-	// opposite directions would otherwise take the same two locks in opposite
-	// orders, and nothing is lost by checking first, because the source
-	// snapshot is already stale the moment its lock is released: the decision
-	// below acts on a snapshot taken earlier either way.
-	sourceHolds := false
-	if source != nil && source != c {
-		source.mu.Lock()
-		for settler := range source.settlers {
-			if settler.key == key && settler.record.Offset == message.Ref.Offset &&
-				!settler.tombstoned && settler.tracker != nil {
-				sourceHolds = true
-				break
-			}
-		}
-		source.mu.Unlock()
-	}
-	c.mu.Lock()
-	if offsets := c.settledTransfers[key]; offsets != nil {
-		if _, marked := offsets[message.Ref.Offset]; marked {
-			reservations := c.transferReservations[key]
-			delete(reservations, message.Ref.Offset)
-			if len(reservations) == 0 {
-				delete(c.transferReservations, key)
-			}
-			c.mu.Unlock()
-			return
-		}
-	}
-	if offsets := c.handoffMarkers[key]; offsets != nil {
-		if _, marked := offsets[message.Ref.Offset]; marked {
-			reservations := c.transferReservations[key]
-			delete(reservations, message.Ref.Offset)
-			if len(reservations) == 0 {
-				delete(c.transferReservations, key)
-			}
-			c.mu.Unlock()
-			return
-		}
-	}
-	// The offset keeps exactly one live settlement path until the source's
-	// caller releases it. A live settler here that already carries this
-	// handoff means the copy is obsolete; any other live settler here would
-	// charge this consumer's prefetch budget for an offset it can already
-	// settle, and a live settler on the source means the source's caller can
-	// still settle the offset, so delivering a second copy would lose the
-	// one-delivery-per-record accounting the target's budget depends on.
-	// Keep the copy queued and the reservation in place: the source's Ack
-	// suppresses the copy, and its Nack or drain releases the offset.
-	liveSettler := false
-	handoffLive := false
-	for settler := range c.settlers {
-		if settler.key == key && settler.record.Offset == message.Ref.Offset &&
-			!settler.tombstoned && settler.tracker != nil {
-			liveSettler = true
-			handoffLive = settler.handoffDelivered
-			break
-		}
-	}
-	if (liveSettler && !handoffLive) || sourceHolds {
-		c.mu.Unlock()
-		if source != nil {
-			source.requeueHandoff(message)
-		}
-		return
-	}
-	if liveSettler {
-		reservations := c.transferReservations[key]
-		delete(reservations, message.Ref.Offset)
-		if len(reservations) == 0 {
-			delete(c.transferReservations, key)
-		}
-		c.mu.Unlock()
-		return
-	}
-	c.mu.Unlock()
-	record := &kgo.Record{
-		Topic:     message.Destination,
-		Partition: message.Ref.Partition,
-		Offset:    message.Ref.Offset,
-		Key:       append([]byte(nil), message.Key...),
-		Value:     append([]byte(nil), message.Body...),
-		Headers:   make([]kgo.RecordHeader, len(message.Headers)),
-	}
-	for index, header := range message.Headers {
-		record.Headers[index] = kgo.RecordHeader{
-			Key:   header.Key,
-			Value: append([]byte(nil), header.Value...),
-		}
-	}
-	c.tagRecord(record)
-	c.mu.Lock()
-	for settler := range c.settlers {
-		if settler.key == key && settler.record.Offset == message.Ref.Offset &&
-			!settler.tombstoned && settler.tracker != nil {
-			transferReservations := c.transferReservations[key]
-			delete(transferReservations, message.Ref.Offset)
-			if len(transferReservations) == 0 {
-				delete(c.transferReservations, key)
-			}
-			delete(c.recordGenerations, record)
-			c.mu.Unlock()
-			return
-		}
-	}
-	if c.handoffReservations == nil {
-		c.handoffReservations = make(map[partitionKey]map[int64]struct{})
-	}
-	reservations := c.handoffReservations[key]
-	if reservations == nil {
-		reservations = make(map[int64]struct{})
-		c.handoffReservations[key] = reservations
-	}
-	reservations[message.Ref.Offset] = struct{}{}
-	if c.handoffRecords == nil {
-		c.handoffRecords = make(map[*kgo.Record]struct{})
-	}
-	c.handoffRecords[record] = struct{}{}
-	c.mu.Unlock()
-	delivered, _, created := c.emit(record)
-	c.mu.Lock()
-	requeue := !delivered && source != nil
-	if !requeue {
-		// Only a delivered or suppressed ownership result clears the exact
-		// reservation. A requeued handoff keeps it so broker redelivery
-		// stays filtered until one target owns the offset.
-		transferReservations := c.transferReservations[key]
-		delete(transferReservations, message.Ref.Offset)
-		if len(transferReservations) == 0 {
-			delete(c.transferReservations, key)
-		}
-	}
-	delete(c.recordGenerations, record)
-	delete(c.handoffRecords, record)
-	reservations = c.handoffReservations[key]
-	delete(reservations, message.Ref.Offset)
-	if len(reservations) == 0 {
-		delete(c.handoffReservations, key)
-	}
-	if created {
-		if c.handoffMarkers == nil {
-			c.handoffMarkers = make(map[partitionKey]map[int64]struct{})
-		}
-		markers := c.handoffMarkers[key]
-		if markers == nil {
-			markers = make(map[int64]struct{})
-			c.handoffMarkers[key] = markers
-		}
-		markers[message.Ref.Offset] = struct{}{}
-	}
-	c.mu.Unlock()
-	// Every failed emission returns ownership to the queue: fenced, stale,
-	// inactive, and full targets all keep the handoff alive for the next
-	// eligible target instead of dropping it.
-	if requeue {
-		source.requeueHandoff(message)
-	}
-}
-
-func (c *consumer) redriveHandoffs(key partitionKey) {
-	if c.conn == nil {
-		return
-	}
-	c.conn.mu.RLock()
-	sources := make([]*consumer, 0, len(c.conn.consumers))
-	for source := range c.conn.consumers {
-		sources = append(sources, source)
-	}
-	c.conn.mu.RUnlock()
-	for _, source := range sources {
-		source.dispatchHandoffs(key)
-	}
-}
-
-// redriveDestinationHandoffs re-offers every queued handoff for destination. It is the capacity
-// release's half of the handoff protocol: a queued handoff is proof the record has no other path
-// back, since its offset reservation keeps the broker's redelivery filtered, so it must be
-// offered again whenever the destination it belongs to stops being full.
-func (c *consumer) redriveDestinationHandoffs(destination string) {
-	if c.conn == nil {
-		return
-	}
-	c.conn.mu.RLock()
-	consumers := make([]*consumer, 0, len(c.conn.consumers))
-	for consumer := range c.conn.consumers {
-		consumers = append(consumers, consumer)
-	}
-	c.conn.mu.RUnlock()
-	keys := make(map[partitionKey]struct{})
-	for _, consumer := range consumers {
-		consumer.mu.Lock()
-		for key := range consumer.handoffs {
-			if key.destination == destination {
-				keys[key] = struct{}{}
-			}
-		}
-		consumer.mu.Unlock()
-	}
-	for key := range keys {
-		c.dispatchHandoffs(key)
-	}
-}
-
-func (c *consumer) dispatchHandoffs(key partitionKey) {
-	if c.conn == nil {
-		return
-	}
-	c.conn.mu.RLock()
-	consumers := make([]*consumer, 0, len(c.conn.consumers))
-	for consumer := range c.conn.consumers {
-		consumers = append(consumers, consumer)
-	}
-	c.conn.mu.RUnlock()
-	partitions := map[string][]int32{key.destination: {key.partition}}
-	for _, target := range consumers {
-		target.mu.Lock()
-		_, assigned := target.activeGenerations[key]
-		fenced := target.fenced[key]
-		target.mu.Unlock()
-		if !assigned || fenced {
+// commitSettledPrefix commits what each revoked ownership had settled. The
+// offset a revoked tracker advanced to is the first record this consumer did not
+// deliver, so the partition's next owner starts there and redelivers whatever
+// the revoke did not reach. A commit that fails is reported on Errors() and
+// changes nothing else: the next owner then redelivers from the offset the
+// broker does have committed.
+func (c *consumer) commitSettledPrefix(ctx context.Context, revoked []revokedAssignment) {
+	for _, assignment := range revoked {
+		if assignment.tracker == nil {
 			continue
 		}
-		for _, handoff := range target.takeHandoffs(partitions) {
-			target.reserveTransferOffset(key, handoff.message.Ref.Offset)
-			target.emitHandoff(handoff.source, handoff.message)
+		if err := c.commitOffset(ctx, assignment.key, assignment.tracker.CommitPoint()); err != nil {
+			c.sendError(classify("consumer.revoke", kafkaErrorKind(err), err))
 		}
 	}
 }
 
+// settleBound is the bound a revoke wait runs under.
+func (c *consumer) settleBound() time.Duration {
+	if c.rebalanceDrainTimeout > 0 {
+		return c.rebalanceDrainTimeout
+	}
+	return defaultKafkaRebalanceDrainTimeout
+}
+
+// partitionWarning is one destination this member cannot fill: it holds fewer
+// partitions of it than the subscription gives the destination delivery slots,
+// so the slots the partitions cannot back stay idle however much work is
+// waiting. The count is collected under c.mu and the warning is written after
+// c.mu is released.
+type partitionWarning struct {
+	destination string
+	held        int
+	budget      int
+}
+
+// assignmentWarningsLocked reports the destinations this assignment leaves this
+// member short of, once each, and records them as warned. The caller holds c.mu.
+//
+// The count compared is the partitions this member holds for the destination
+// rather than the partitions this callback carried. A cooperative rebalance
+// calls the callback once per round and names only the partitions that changed
+// hands, so a member's retained partitions are never named again and the
+// callback's own payload is a share of the assignment rather than the whole of
+// it. Accumulating in c.owned is what makes the count the member's real ceiling.
+//
+// The budget is the destination's resolved prefetch, which is the same number
+// the admission gate charges: a destination with a PerDestination entry uses it,
+// and every other destination uses the subscription's prefetch divided across
+// the destinations. A destination whose assignment meets its budget is not
+// recorded, so a member that grows into its budget on a later rebalance is
+// silent then.
+//
+// A destination named by an assignment that leaves this member short is warned
+// on that callback, and the warning is not retracted. For a cooperative
+// protocol the first callback of a rebalance can carry a part of the
+// destination's final assignment, the partitions no other member held, with the
+// rest arriving in a later callback of the same rebalance, so a member whose
+// first callback is short and whose second fills its budget is warned about a
+// shortfall it does not end up with. Nothing in the callback says whether
+// another round follows it, so the choice is between this false positive and
+// not warning at all until a round that may never come. It is accepted, and the
+// remedy is on the operator's side: a deployment that really did scale past its
+// partition count warns on every member on every rebalance, and one that
+// rebalanced a partition into place warns once.
+func (c *consumer) assignmentWarningsLocked(assigned map[string][]int32) []partitionWarning {
+	if c.warned == nil {
+		c.warned = make(map[string]bool)
+	}
+	var warnings []partitionWarning
+	for destination := range assigned {
+		if c.warned[destination] {
+			continue
+		}
+		budget := c.budgets[destination]
+		if budget <= 0 {
+			continue
+		}
+		// A retry-tier destination is fed by the retry ladder rather than by the
+		// partition count, and the records on it are ones a handler has to wait
+		// out: its slots describe a delay budget, so a short partition count
+		// there is not the throughput ceiling this warning is about.
+		if c.cfg.Delays[destination] > 0 {
+			continue
+		}
+		held := c.ownedPartitionsLocked(destination)
+		if held >= budget {
+			continue
+		}
+		c.warned[destination] = true
+		warnings = append(warnings, partitionWarning{destination: destination, held: held, budget: budget})
+	}
+	return warnings
+}
+
+// ownedPartitionsLocked counts the partitions of one destination this consumer
+// holds. The caller holds c.mu.
+func (c *consumer) ownedPartitionsLocked(destination string) int {
+	held := 0
+	for key := range c.owned {
+		if key.destination == destination {
+			held++
+		}
+	}
+	return held
+}
+
+// logPartitionWarnings writes one warning per destination this member cannot
+// fill. It is called with no lock held. The destination's partition count is the
+// ceiling, and the levers an operator has are that count, which re-maps the keys
+// already published to the destination, and the instance count the subscription
+// was sized for: the lever attribute names the configured one.
+func (c *consumer) logPartitionWarnings(warnings []partitionWarning) {
+	if c.conn == nil {
+		// Unit consumers that exercise assignment accounting without opening a
+		// connection have nowhere to send the diagnostic. A live consumer always
+		// has conn; keep the zero-value test harness from turning the accounting
+		// check into a nil dereference.
+		return
+	}
+	for _, warning := range warnings {
+		lever := "destination partition count"
+		if floor, err := resolveMaxExpectedInstances(c.conn.driverOptions); err == nil && floor > 0 {
+			lever = "broker.kafka.maxExpectedInstances"
+		}
+		c.conn.log().Warn(
+			"Kafka consumer holds fewer partitions than the subscription's slot budget; raising the destination's partition count gives this member more of them and re-maps the keys published to it",
+			"destination", warning.destination,
+			"assigned_partitions", warning.held,
+			"budget", warning.budget,
+			"lever", lever,
+		)
+	}
+}
+
+// onPartitionsAssigned marks the partitions this consumer now owns and resumes
+// their fetches, which the revoke that preceded them paused. Ownership is the
+// one fact the assignment and the revoke write, and a fresh assignment starts
+// the partition's tracker over: the tracker of the ownership that ended is not
+// this one's to inherit.
 func (c *consumer) onPartitionsAssigned(_ context.Context, _ *kgo.Client, partitions map[string][]int32) {
 	if len(partitions) == 0 {
 		return
 	}
 	c.assignmentMu.Lock()
 	c.mu.Lock()
-	if c.assignmentGenerations == nil {
-		c.assignmentGenerations = make(map[partitionKey]uint64)
-	}
-	if c.activeGenerations == nil {
-		c.activeGenerations = make(map[partitionKey]uint64)
-	}
-	if c.fenced == nil {
-		c.fenced = make(map[partitionKey]bool)
-	}
-	if c.tenures == nil {
-		c.tenures = make(map[partitionKey]uint64)
+	if c.owned == nil {
+		c.owned = make(map[partitionKey]bool)
 	}
 	for topic, partitionList := range partitions {
 		for _, partition := range partitionList {
 			key := partitionKey{destination: topic, partition: partition}
-			c.assignmentGenerations[key]++
-			gen := c.assignmentGenerations[key]
-			c.activeGenerations[key] = gen
-			c.fenced[key] = false
-			if c.tenures[key] == 0 {
-				c.tenures[key] = 1
-			}
+			c.owned[key] = true
+			delete(c.heldUntil, key)
+			delete(c.partitionPauses, key)
+			c.resumePartitionIfFreeLocked(key)
 		}
 	}
-	c.regrantSelfTransfersLocked(partitions)
+	warnings := c.assignmentWarningsLocked(partitions)
+	c.syncHeadTimerLocked()
+	// Ownership changed, which no partition-scoped mark describes.
+	c.partialScan = false
 	c.mu.Unlock()
 	c.assignmentMu.Unlock()
-	go c.emitAssignedHandoffs(partitions)
+	// The log is written with both locks released: the handler is the caller's,
+	// so it may block, and c.mu is the lock the poll loop and every settler of
+	// this consumer need.
+	c.logPartitionWarnings(warnings)
 	c.sendRebalanceError("assigned", partitions)
 }
 
-func (c *consumer) emitAssignedHandoffs(partitions map[string][]int32) {
-	for _, handoff := range c.takeHandoffs(partitions) {
-		c.reserveTransferOffset(partitionKey{
-			destination: handoff.message.Destination,
-			partition:   handoff.message.Ref.Partition,
-		}, handoff.message.Ref.Offset)
-		c.emitHandoff(handoff.source, handoff.message)
-	}
-}
-
-func (c *consumer) onPartitionsRevoked(_ context.Context, _ *kgo.Client, partitions map[string][]int32) {
+// onPartitionsRevoked pauses the revoked partitions, marks them not owned, waits
+// under one deadline for the deliveries they still hold, marks their trackers
+// revoked and commits the settled prefix. A delivery the deadline does not reach
+// is left to the partition's next owner, which redelivers it: a duplicate, which
+// is the direction at-least-once permits. A loss is not, which is what the wait
+// and the commit are here to prevent.
+func (c *consumer) onPartitionsRevoked(ctx context.Context, _ *kgo.Client, partitions map[string][]int32) {
 	if len(partitions) == 0 {
 		return
 	}
-	// Capture under assignmentMu in assignmentMu -> c.mu order: the snapshot
-	// then fences the same generation the transfer later detaches, and a
-	// concurrent assignment cannot slip a new generation into it.
 	c.assignmentMu.Lock()
 	c.mu.Lock()
+	for topic, partitionList := range partitions {
+		for _, partition := range partitionList {
+			key := partitionKey{destination: topic, partition: partition}
+			c.setPartitionPauseReasonLocked(key, partitionPauseHeadHold, true)
+		}
+	}
+	c.mu.Unlock()
+	revoked := c.unown(partitions)
+	c.mu.Lock()
+	// The next pass visits every partition, so it drops the queues of the
+	// partitions this callback took away whatever woke it.
+	c.partialScan = false
 	draining := c.draining
 	requestLeave := draining && !c.leaveRequested
 	if requestLeave {
 		c.leaveRequested = true
 	}
-	revoked, keys := c.snapshotRevokedLocked(partitions)
 	c.mu.Unlock()
 	c.assignmentMu.Unlock()
-	if !draining {
-		c.reserveRevoked(revoked)
-	}
 	c.sendRebalanceError("revoked", partitions)
 	if draining {
-		c.dropAllTrackers()
+		// A draining consumer commits nothing more, so the revoked trackers are
+		// tombstoned without the wait: the deliveries still in hand are the
+		// caller's to abandon.
+		c.revokeTrackers(revoked)
 		if requestLeave {
 			c.requestLeave()
 		}
 		return
 	}
-	timeout := c.rebalanceDrainTimeout
-	if timeout <= 0 {
-		timeout = 25 * time.Second
+	keys := make(map[partitionKey]struct{}, len(revoked))
+	for _, assignment := range revoked {
+		keys[assignment.key] = struct{}{}
 	}
-	// The settle window is bounded and runs here so the caller of this
-	// callback sees the transfer complete before it returns. Handoff emission
-	// stays asynchronous.
-	c.revokeAndTransfer(revoked, keys, timeout)
+	c.waitForSettlers(keys, c.settleBound())
+	c.revokeTrackers(revoked)
+	c.commitSettledPrefix(ctx, revoked)
 }
 
+// onPartitionsLost marks the lost partitions not owned, drops their pending
+// records and tombstones their trackers, then returns. It does not wait and does
+// not commit: a lost assignment means the coordinator can no longer accept this
+// member's commits, which is why franz-go's own default here is a no-op. What
+// this consumer did not commit is redelivered by the partition's next owner.
 func (c *consumer) onPartitionsLost(_ context.Context, _ *kgo.Client, partitions map[string][]int32) {
 	if len(partitions) == 0 {
 		return
 	}
 	c.assignmentMu.Lock()
 	c.mu.Lock()
+	for topic, partitionList := range partitions {
+		for _, partition := range partitionList {
+			key := partitionKey{destination: topic, partition: partition}
+			c.setPartitionPauseReasonLocked(key, partitionPauseHeadHold, true)
+		}
+	}
+	c.mu.Unlock()
+	revoked := c.unown(partitions)
+	c.mu.Lock()
+	// The next pass visits every partition, so it drops the queues of the
+	// partitions this callback took away whatever woke it.
+	c.partialScan = false
 	draining := c.draining
 	requestLeave := draining && !c.leaveRequested
 	if requestLeave {
 		c.leaveRequested = true
 	}
-	revoked, _ := c.snapshotRevokedLocked(partitions)
 	c.mu.Unlock()
 	c.assignmentMu.Unlock()
-	if !draining {
-		c.reserveRevoked(revoked)
-	}
-	for _, rp := range revoked {
-		c.dropTrackerAfterLost(rp)
-	}
+	c.revokeTrackers(revoked)
 	if requestLeave {
 		c.requestLeave()
 	}

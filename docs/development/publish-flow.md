@@ -1,7 +1,8 @@
 # Publish flow
 
-This page is the maintainer trace for publishing. It follows an application
-call from `Publisher.Publish` or `Publisher.PublishBatch` through validation,
+F1 checks and encodes each application message, builds its envelope, and hands
+a broker-neutral outbound message to the driver's producer. This maintainer trace
+follows an application call from `Publisher.Publish` or `Publisher.PublishBatch` through validation,
 encoding, envelope construction, producer admission, and the
 `driver.Producer` boundary.
 
@@ -11,7 +12,7 @@ decisions that matter when changing the path.
 ## End-to-end path
 
 ```mermaid
-flowchart LR
+flowchart TB
     CALL[Publisher.Publish] --> BATCH[Publisher.PublishBatch]
     BATCH --> ADMIT[Client admission]
     ADMIT --> BUILD[buildOutbound per message]
@@ -37,6 +38,27 @@ The main executable path is split across:
 - [`driver.Producer`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/driver/driver.go) for the broker-independent
   publication contract.
 
+## Observer call sites
+
+When a client has an observer, the publish path emits events at these
+boundaries:
+
+- `PublishBatch` pairs `ObserverPublish` around one admitted call, from
+  admission through the producer result.
+- `buildOutbound` pairs `ObserverMessageBuilt` around each outbound message
+  build.
+- Core-generated retry and dead-letter successors use `ObserverPublish` with
+  their route, then record the corresponding retry or dead-letter point after
+  the successor result is known.
+
+Observer methods run synchronously on these paths, without a client or runner
+lock held. A panic in an observer is contained and does not change the publish
+result. A slow observer still delays the publish, and if the context its
+`Start` returns has already expired, building the outbound message fails with
+that context's error.
+
+`publisher.go:Publisher.PublishBatch` calls `observer_call.go:Client.observeStart` for the publish stage, and `observer_call.go:observerFinishGuard.finishWith` invokes `Observer.Finish` after the producer result. `publisher.go:buildOutbound` starts the message-built stage, calls `observer_call.go:Client.injectTrace` with the returned context, and finishes after `Envelope.EncodeHeaders`; successor sends use `worker.go:startSuccessorPublish` and inject in `worker.go:retryAndSettle` or `worker.go:deadLetter`.
+
 ## Public entry points
 
 `Publisher.Publish` does not have a separate transport path. It creates a
@@ -44,14 +66,15 @@ single-item `Message`, delegates to `PublishBatch`, and returns the first
 successful event ID or error.
 
 `Publisher.PublishBatch` is synchronous and makes no atomicity claim. It
-returns a `BatchResult` in input order. An empty batch is a no-op. The method
-first checks that the publisher and client are connected, then admits the
-whole call before building outbound messages.
+returns a `BatchResult` in input order. The method first rejects a publisher
+with no client. An empty batch then returns successfully without checking
+whether the client is still open. A non-empty batch is admitted as a whole
+before any outbound message is built.
 
 That early admission is deliberate: caller-supplied codec work can take time,
 and `Client.Close` must be able to wait for an already-admitted publish rather
 than close the producer underneath it. The entry-point implementation is in
-[`publisher.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/publisher.go); the admission and quiescence tests are
+[`publisher.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/publisher.go); the tests for admission and for waiting until active publishes finish are
 in [`client_producer_admission_test.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/client_producer_admission_test.go)
 and [`client_publish_quiescence_test.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/client_publish_quiescence_test.go).
 
@@ -204,18 +227,28 @@ The connection recheck prevents a publish from using a producer built against
 a connection that reconnect has already replaced.
 
 `beginPublish`/`endPublish` maintain the active-publish count. `Client.Close`
-uses that count as a barrier: it drains runners, waits until active publishes
-reach zero, atomically prevents further producer admission, then closes the
-producer and connection. The close path is owned by
+uses that count as a barrier: it closes the application publish entry gate,
+drains runners, waits until active publishes reach zero, waits up to
+`Lifecycle.CloseTimeout` for a reconnect in progress to stop, then closes the
+producer and connection.
+
+The entry gate is what refuses a new application publish; the successor handoff
+keeps using the same producer, and the same count, until the producer itself is
+closed. The close path is owned by
 [`Client.Close`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/client.go), with focused coverage in
 [`client_publish_quiescence_test.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/client_publish_quiescence_test.go)
 and [`publish_test.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/publish_test.go).
 
-Core-generated retry and dead-letter successors use
-[`publishMessages`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/client.go) with an internal `allowClosing` path. This
-allows a delivery already being drained to finish its successor handoff while
-the producer-teardown barrier is still open; application publishes do not get
-that exception.
+Core-generated retry and dead-letter successors go through
+[`publishMessages`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/client.go), which builds the shared producer with the same
+`workPublish` admission and the same constructor an application publish uses.
+
+What differs is the entry gate: `Publisher.Publish` first requires a `Ready`
+client, so a publish entered after `Close` began is refused, while the
+successor handoff has no such gate and is admitted while the client drains as
+long as the producer still stands. That is what lets a delivery already being
+drained finish its handoff instead of being lost to shutdown. Both paths
+discard a producer built across a connection swap rather than installing it.
 
 ## The `driver.Producer` boundary
 
@@ -227,7 +260,7 @@ The port contract is intentionally small:
 - a partial outcome is returned as `*driver.PublishError`, whose `Failed` map
   identifies per-message failures by input index;
 - `Close` releases producer resources and is the only teardown call the core
-  makes on the producer, once application publishes reach quiescence;
+  makes on the producer, once no application publish is still in flight;
 - implementations must be safe for concurrent use.
 
 The contract is defined in [`driver/driver.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/driver/driver.go), and

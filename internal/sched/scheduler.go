@@ -7,16 +7,21 @@ import (
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/clock"
 )
 
-// Scheduler selects queued items using deficit weighted round robin and
-// optional age-based promotion. All methods are intended for one goroutine.
+// Scheduler selects queued items using smooth weighted round robin and
+// optional deadline promotion. Smoothness costs a full scan of every group on
+// each weighted pick, so selection work grows linearly with group count. In the
+// disabled-promotion weighted-pick benchmark's six-group, two-lanes-per-group
+// shape, this implementation measured 21.53 ns/op and the previous scheme
+// measured 17.84 ns/op; their three-run spreads overlapped. At sixty groups,
+// the disabled-promotion weighted-pick measurements were 118.8 ns/op and
+// 16.59 ns/op, respectively. The zero value has no selectable item, and all
+// methods are intended for one goroutine.
 type Scheduler struct {
-	clock   clock.Clock
-	aging   bool
-	slots   []*slot
-	byID    map[string]*lane
-	byGroup map[string]*slot
-	cursor  int
-	quantum int
+	clock          clock.Clock
+	promoteOverdue bool
+	slots          []*slot
+	byID           map[string]*lane
+	byGroup        map[string]*slot
 }
 
 type slot struct {
@@ -28,14 +33,14 @@ type slot struct {
 }
 
 // New creates a scheduler from lane specifications.
-func New(specs []LaneSpec, clk clock.Clock, aging bool) (*Scheduler, error) {
+func New(specs []LaneSpec, clk clock.Clock, promoteOverdue bool) (*Scheduler, error) {
 	if len(specs) == 0 {
 		return nil, errors.New("sched: at least one lane is required")
 	}
 	if clk == nil {
 		return nil, errors.New("sched: clock is required")
 	}
-	s := &Scheduler{clock: clk, aging: aging, byID: make(map[string]*lane), byGroup: make(map[string]*slot), quantum: 1}
+	s := &Scheduler{clock: clk, promoteOverdue: promoteOverdue, byID: make(map[string]*lane), byGroup: make(map[string]*slot)}
 	for _, spec := range specs {
 		if _, exists := s.byID[spec.ID]; exists {
 			return nil, errors.New("sched: duplicate lane id")
@@ -96,38 +101,53 @@ func (s *Scheduler) Pending() int {
 	return total
 }
 
-// Next returns the next item, or false when every lane is empty.
-func (s *Scheduler) Next() (Item, bool) {
+// Promotion reports a deadline promotion decision from Next. LaneID is the
+// overdue lane that was served and Depth is that lane's depth before the pop,
+// so it counts the promoted head. The zero value means the pick was not a
+// deadline promotion.
+type Promotion struct {
+	LaneID string
+	Depth  int
+}
+
+// Next returns the next item, the promotion that produced it, and whether an
+// item was available. Promotion is zero when the pick was not a deadline
+// promotion.
+func (s *Scheduler) Next() (Item, Promotion, bool) {
 	if len(s.slots) == 0 {
-		return Item{}, false
+		return Item{}, Promotion{}, false
 	}
-	if s.aging {
-		if promoted := s.promoted(); promoted != nil {
-			return promoted.pop(), true
+	if s.promoteOverdue {
+		if promoted := s.mostOverdue(); promoted != nil {
+			depth := len(promoted.items)
+			item := promoted.pop()
+			return item, Promotion{LaneID: promoted.spec.ID, Depth: depth}, true
 		}
 	}
-	for checked := range len(s.slots) {
-		index := (s.cursor + checked) % len(s.slots)
-		group := s.slots[index]
+	var selected *slot
+	totalWeight := 0
+	for _, group := range s.slots {
 		if group.empty() {
+			// An empty group forfeits its whole deficit, positive credit and negative
+			// debt alike. A bursty group that refills starts from zero rather than
+			// spending credit or repaying debt from before it drained.
 			group.deficit = 0
 			continue
 		}
-		if group.deficit == 0 {
-			group.deficit += group.weight * s.quantum
+		group.deficit += group.weight
+		totalWeight += group.weight
+		if selected == nil || group.deficit > selected.deficit {
+			selected = group
 		}
-		group.deficit--
-		if group.deficit == 0 {
-			s.cursor = (index + 1) % len(s.slots)
-		} else {
-			s.cursor = index
-		}
-		return group.pop(), true
 	}
-	return Item{}, false
+	if selected == nil {
+		return Item{}, Promotion{}, false
+	}
+	selected.deficit -= totalWeight
+	return selected.pop(), Promotion{}, true
 }
 
-func (s *Scheduler) promoted() *lane {
+func (s *Scheduler) mostOverdue() *lane {
 	now := s.clock.Now()
 	var selected *lane
 	var selectedOverrun time.Duration
@@ -149,6 +169,9 @@ func (s *Scheduler) promoted() *lane {
 			selectedOverrun = overrun
 		}
 		if groupEmpty {
+			// An empty group forfeits its whole deficit, positive credit and negative
+			// debt alike. A bursty group that refills starts from zero rather than
+			// spending credit or repaying debt from before it drained.
 			group.deficit = 0
 		}
 	}
@@ -162,21 +185,6 @@ func (s *slot) empty() bool {
 		}
 	}
 	return true
-}
-
-func (s *slot) head() Item {
-	var head Item
-	set := false
-	for _, lane := range s.lanes {
-		if len(lane.items) == 0 {
-			continue
-		}
-		if !set || lane.items[0].EnqueuedAt.Before(head.EnqueuedAt) {
-			head = lane.items[0]
-			set = true
-		}
-	}
-	return head
 }
 
 func (s *slot) pop() Item {

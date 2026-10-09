@@ -14,32 +14,6 @@ func TestResolveTierHoldsAtLastTier(t *testing.T) {
 	}
 }
 
-func TestResolveRetryAfterRoutesToNearestTierNominalDelay(t *testing.T) {
-	cfg := Config{Tiers: []time.Duration{time.Second, 2 * time.Second}}
-	tier, delay := ResolveRetryAfter(cfg, 5*time.Minute)
-	if tier != 2 || delay != 2*time.Second {
-		t.Fatalf("far ResolveRetryAfter() = tier %d delay %s", tier, delay)
-	}
-	tier, delay = ResolveRetryAfter(cfg, 1900*time.Millisecond)
-	if tier != 2 || delay != 2*time.Second {
-		t.Fatalf("near-top ResolveRetryAfter() = tier %d delay %s", tier, delay)
-	}
-	tier, delay = ResolveRetryAfter(cfg, 1200*time.Millisecond)
-	if tier != 1 || delay != time.Second {
-		t.Fatalf("near-bottom ResolveRetryAfter() = tier %d delay %s", tier, delay)
-	}
-}
-
-func TestResolveRetryAfterHandlesEmptyAndSingleTier(t *testing.T) {
-	if tier, delay := ResolveRetryAfter(Config{}, time.Second); tier != 0 || delay != 0 {
-		t.Fatalf("empty ladder = %d, %s", tier, delay)
-	}
-	cfg := Config{Tiers: []time.Duration{2 * time.Second}}
-	if tier, delay := ResolveRetryAfter(cfg, 5*time.Second); tier != 1 || delay != 2*time.Second {
-		t.Fatalf("single ladder = %d, %s", tier, delay)
-	}
-}
-
 func TestDelayForUsesExponentialDefaultsAndMaximum(t *testing.T) {
 	if got := (Config{}).DelayFor(0); got != time.Second {
 		t.Fatalf("zero config first delay = %s, want 1s", got)
@@ -142,16 +116,51 @@ func TestDelayForDefensiveDefaults(t *testing.T) {
 	}
 }
 
-func TestResolveRetryAfterClampsNegativeRequest(t *testing.T) {
-	if tier, delay := ResolveRetryAfter(Config{Tiers: []time.Duration{time.Second}}, -time.Second); tier != 1 || delay != time.Second {
-		t.Fatalf("negative request = %d, %s", tier, delay)
-	}
-}
-
 func TestDelayForCapsBeforeDurationOverflow(t *testing.T) {
 	cfg := Config{InitialInterval: time.Second, Multiplier: 2, MaxInterval: 30 * time.Second}
 	if got := cfg.DelayFor(1000); got != 30*time.Second {
 		t.Fatalf("DelayFor(1000) = %s, want 30s", got)
+	}
+	cfg = Config{InitialInterval: time.Duration(1 << 62), Multiplier: 4, MaxInterval: time.Duration(1<<63 - 1)}
+	if got := cfg.DelayFor(2); got != cfg.MaxInterval {
+		t.Fatalf("overflow-clamped delay = %s, want %s", got, cfg.MaxInterval)
+	}
+}
+
+func TestDelayForDecaysBelowMaximum(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		initial time.Duration
+		want    []time.Duration
+	}{
+		{name: "at cap", initial: 30 * time.Second, want: []time.Duration{30 * time.Second, 15 * time.Second, 7500 * time.Millisecond}},
+		{name: "above cap", initial: 40 * time.Second, want: []time.Duration{30 * time.Second, 20 * time.Second, 10 * time.Second}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			cfg := Config{InitialInterval: test.initial, Multiplier: 0.5, MaxInterval: 30 * time.Second}
+			for i, want := range test.want {
+				if got := cfg.DelayFor(i + 1); got != want {
+					t.Errorf("DelayFor(%d) = %s, want %s", i+1, got, want)
+				}
+			}
+		})
+	}
+}
+
+func TestDelayForDecayReachesZeroWithoutRebounding(t *testing.T) {
+	for _, cap := range []time.Duration{0, 30 * time.Second} {
+		cfg := Config{InitialInterval: time.Second, Multiplier: 0.5, MaxInterval: cap}
+		previous := cfg.DelayFor(1)
+		for attempt := 2; attempt <= 1000; attempt++ {
+			got := cfg.DelayFor(attempt)
+			if got < 0 || got > previous {
+				t.Fatalf("cap %s: DelayFor(%d) = %s, previous %s", cap, attempt, got, previous)
+			}
+			previous = got
+		}
+		if previous != 0 {
+			t.Fatalf("cap %s: final delay = %s, want zero", cap, previous)
+		}
 	}
 }
 

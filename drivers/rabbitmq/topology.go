@@ -18,7 +18,42 @@ type bindingKey struct {
 	destination string
 }
 
+// recordDelays records the delay each destination declares, under every
+// topology policy. The producer routes a delayed publish by it, and Purge,
+// DescribeTopology and Prune find a destination's parking queue through it.
+// Under TopologyNone the operator provisions the queues, but they are the
+// queues this spec describes, so routing must follow the spec all the same.
+// The first spec for a name wins, as it does when the queues are declared.
+func (c *conn) recordDelays(destinations []driver.DestinationSpec) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	seen := make(map[string]struct{}, len(destinations))
+	for _, destination := range destinations {
+		if destination.Name == "" {
+			continue
+		}
+		if _, ok := seen[destination.Name]; ok {
+			continue
+		}
+		seen[destination.Name] = struct{}{}
+		if destination.Delay > 0 {
+			c.deferred[destination.Name] = destination.Delay
+		} else {
+			delete(c.deferred, destination.Name)
+		}
+	}
+}
+
 func (a *adminOperations) ensureTopology(ctx context.Context, spec driver.TopologySpec) (driver.TopologyDiff, error) {
+	// Refused before anything is recorded, under every policy: a delay no
+	// message expiration can carry would otherwise be released early.
+	for _, destination := range spec.Destinations {
+		if destination.Delay > 0 && !parkDelayFits(destination.Delay) {
+			return driver.TopologyDiff{}, classify("ensure_topology", driver.KindFatal,
+				fmt.Errorf("destination %q delay %s exceeds the longest message expiration, %dms", destination.Name, destination.Delay, maxParkDelayMillis))
+		}
+	}
+	a.conn.recordDelays(spec.Destinations)
 	if spec.Policy == driver.TopologyNone {
 		return driver.TopologyDiff{}, nil
 	}
@@ -67,13 +102,6 @@ func (a *adminOperations) ensureTopology(ctx context.Context, spec driver.Topolo
 			continue
 		}
 		seenDestinations[destination.Name] = struct{}{}
-		a.conn.mu.Lock()
-		if destination.Delay > 0 {
-			a.conn.deferred[destination.Name] = destination.Delay
-		} else {
-			delete(a.conn.deferred, destination.Name)
-		}
-		a.conn.mu.Unlock()
 		args := queueArguments(destination, a.conn.queueKind, a.conn.consumerTimeout)
 		exists, err := a.queueExists(ctx, destination.Name, destination.Durable, args)
 		if err != nil {
@@ -88,16 +116,15 @@ func (a *adminOperations) ensureTopology(ctx context.Context, spec driver.Topolo
 			diff.CreatedDestinations = append(diff.CreatedDestinations, destination.Name)
 		}
 		if destination.Delay > 0 {
-			for _, parkName := range parkQueueNames(destination.Name) {
-				parkArgs := parkArguments(destination.Name, a.conn.queueKind, parkName)
-				parkExists, err := a.queueExists(ctx, parkName, true, parkArgs)
-				if err != nil {
-					return driver.TopologyDiff{}, err
-				}
-				if parkExists {
-					diff.ExistingDestinations = append(diff.ExistingDestinations, parkName)
-					continue
-				}
+			parkName := parkQueueName(destination.Name)
+			parkArgs := parkArguments(destination.Name, a.conn.queueKind)
+			parkExists, err := a.queueExists(ctx, parkName, true, parkArgs)
+			if err != nil {
+				return driver.TopologyDiff{}, err
+			}
+			if parkExists {
+				diff.ExistingDestinations = append(diff.ExistingDestinations, parkName)
+			} else {
 				if err := a.declareQueue(ctx, parkName, true, parkArgs); err != nil {
 					return driver.TopologyDiff{}, err
 				}
@@ -112,7 +139,7 @@ func (a *adminOperations) ensureTopology(ctx context.Context, spec driver.Topolo
 		var err error
 		actualBindings, err = a.currentBindings(ctx)
 		if err != nil {
-			return driver.TopologyDiff{}, classify("ensure_topology", driver.KindTransient, err)
+			return driver.TopologyDiff{}, classifyManagement("ensure_topology", err)
 		}
 	}
 	for _, binding := range spec.Bindings {
@@ -177,32 +204,26 @@ func (a *adminOperations) verifyTopology(ctx context.Context, spec driver.Topolo
 		drifted, err := a.argumentDrift(ctx, destination.Name, mainArgs)
 		if err != nil {
 			purpose := fmt.Sprintf("argument drift verification for destination %q", destination.Name)
-			return driver.TopologyDiff{}, classify("ensure_topology", driver.KindTransient, a.managementUnavailable(purpose, err))
+			return driver.TopologyDiff{}, classifyManagement("ensure_topology", a.managementUnavailable(purpose, err))
 		}
 		diff.Drifted = append(diff.Drifted, drifted...)
-		a.conn.mu.Lock()
 		if destination.Delay > 0 {
-			a.conn.deferred[destination.Name] = destination.Delay
-		}
-		a.conn.mu.Unlock()
-		if destination.Delay > 0 {
-			for _, parkName := range parkQueueNames(destination.Name) {
-				parkArgs := parkArguments(destination.Name, a.conn.queueKind, parkName)
-				exists, err := a.queueExists(ctx, parkName, true, parkArgs)
-				if err != nil {
-					return driver.TopologyDiff{}, err
-				}
-				if !exists {
-					return driver.TopologyDiff{}, classify("ensure_topology", driver.KindNotFound, fmt.Errorf("parking destination %q is missing: %w", parkName, driver.ErrDestinationMissing))
-				}
-				diff.ExistingDestinations = append(diff.ExistingDestinations, parkName)
-				parkDrifted, err := a.argumentDrift(ctx, parkName, parkArgs)
-				if err != nil {
-					purpose := fmt.Sprintf("argument drift verification for parking destination %q", parkName)
-					return driver.TopologyDiff{}, classify("ensure_topology", driver.KindTransient, a.managementUnavailable(purpose, err))
-				}
-				diff.Drifted = append(diff.Drifted, parkDrifted...)
+			parkName := parkQueueName(destination.Name)
+			parkArgs := parkArguments(destination.Name, a.conn.queueKind)
+			exists, err := a.queueExists(ctx, parkName, true, parkArgs)
+			if err != nil {
+				return driver.TopologyDiff{}, err
 			}
+			if !exists {
+				return driver.TopologyDiff{}, classify("ensure_topology", driver.KindNotFound, fmt.Errorf("parking destination %q is missing: %w", parkName, driver.ErrDestinationMissing))
+			}
+			diff.ExistingDestinations = append(diff.ExistingDestinations, parkName)
+			parkDrifted, err := a.argumentDrift(ctx, parkName, parkArgs)
+			if err != nil {
+				purpose := fmt.Sprintf("argument drift verification for parking destination %q", parkName)
+				return driver.TopologyDiff{}, classifyManagement("ensure_topology", a.managementUnavailable(purpose, err))
+			}
+			diff.Drifted = append(diff.Drifted, parkDrifted...)
 		}
 	}
 	actualBindings := make(map[bindingKey]struct{})
@@ -210,7 +231,7 @@ func (a *adminOperations) verifyTopology(ctx context.Context, spec driver.Topolo
 		var err error
 		actualBindings, err = a.currentBindings(ctx)
 		if err != nil {
-			return driver.TopologyDiff{}, classify("ensure_topology", driver.KindTransient, err)
+			return driver.TopologyDiff{}, classifyManagement("ensure_topology", err)
 		}
 	}
 	seenBindings := make(map[bindingKey]struct{}, len(spec.Bindings))
@@ -276,8 +297,8 @@ func (a *adminOperations) managementUnavailable(purpose string, err error) error
 // than folded into an empty result: TopologyVerify must be able to say "this
 // was not checked" instead of silently reporting a clean diff. The client
 // itself is never absent, because newConn is the only construction of a conn
-// the port hands out, it fails Open when newManagementClient cannot build
-// one, and nothing reassigns the field, so the only failure to report here is
+// the port hands out, it fails Open when managementClientForEndpoint cannot
+// build one, and nothing reassigns the field, so the only failure to report here is
 // reaching the broker rather than a missing client.
 func (a *adminOperations) argumentDrift(ctx context.Context, name string, want amqp.Table) ([]driver.ArgumentDrift, error) {
 	if len(want) == 0 {
@@ -370,6 +391,12 @@ func (a *adminOperations) scanOrphans(ctx context.Context, spec driver.TopologyS
 	for _, destination := range spec.Destinations {
 		known[destination.Name] = struct{}{}
 	}
+	expectedPark := make(map[string]struct{})
+	for _, destination := range spec.Destinations {
+		if destination.Delay > 0 {
+			expectedPark[parkQueueName(destination.Name)] = struct{}{}
+		}
+	}
 	for _, queue := range queues {
 		byName[queue.Name] = queue
 	}
@@ -388,10 +415,23 @@ func (a *adminOperations) scanOrphans(ctx context.Context, spec driver.TopologyS
 		if _, exists := known[queue.Name]; exists {
 			continue
 		}
-		if parent, _, ok := parkQueueParts(queue.Name); ok {
+		if parent, ok := parkQueueParts(queue.Name); ok {
+			if _, parentKnown := known[parent]; parentKnown {
+				if _, expected := expectedPark[queue.Name]; !expected {
+					add(queue.Name, queue.totalMessages())
+					continue
+				}
+			}
 			if _, parentExists := byName[parent]; parentExists {
 				if _, parentKnown := known[parent]; !parentKnown {
-					add(parent, queue.totalMessages())
+					if matchesScope(parent, spec.Scope) {
+						add(parent, queue.totalMessages())
+					} else {
+						// Folding the parent in would report a name the caller
+						// excluded from the scan, so the parking queue keeps its
+						// own name and count instead.
+						add(queue.Name, queue.totalMessages())
+					}
 				}
 				continue
 			}
@@ -512,123 +552,68 @@ func queueArguments(spec driver.DestinationSpec, kind queueKind, consumerTimeout
 	return args
 }
 
-// parkRungs is the delay ladder the parking queues of one deferred
-// destination are cut along, ascending.
+// parkDelayFits reports whether delay can be a parked message's expiration:
+// positive, and no more than the broker's limit once rounded up to whole
+// milliseconds.
+func parkDelayFits(delay time.Duration) bool {
+	millis := parkDelayMillis(delay)
+	return millis >= 1 && millis <= maxParkDelayMillis
+}
+
+// parkDelayMillis rounds delay up to whole milliseconds, so a parked message
+// is never released before its delay.
+func parkDelayMillis(delay time.Duration) int64 {
+	millis := int64(delay / time.Millisecond)
+	if delay%time.Millisecond != 0 {
+		millis++
+	}
+	return millis
+}
+
+// parkQueueName names the parking queue of a delayed destination. The name
+// carries no delay: the wait is each message's own expiration, so a changed
+// delay reuses the same queue rather than declaring a new one.
+func parkQueueName(destination string) string {
+	return destination + parkingSuffix
+}
+
+// parkQueueParts returns the destination a parking queue parks for, and ok is
+// false for a name that is not a parking queue at all. The suffix is read from
+// the end, so a destination whose own name contains ".park." still resolves to
+// itself.
+func parkQueueParts(name string) (destination string, ok bool) {
+	destination, ok = strings.CutSuffix(name, parkingSuffix)
+	return destination, ok && destination != ""
+}
+
+// parkingOf names the parking queue this connection knows a destination's
+// messages may sit in, or returns false for a destination without a delay. It
+// takes the read lock itself, so a caller must not hold c.mu.
+func (c *conn) parkingOf(destination string) (string, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if _, isDeferred := c.deferred[destination]; !isDeferred {
+		return "", false
+	}
+	return parkQueueName(destination), true
+}
+
+// parkArguments builds the declare-time arguments for a destination's parking
+// queue, the holding queue a delayed message sits in until its expiration
+// passes and RabbitMQ dead-letters it onward to destination. The queue carries
+// no TTL of its own: each message carries its destination's delay as its
+// expiration, so a changed delay needs no change to the queue, which RabbitMQ
+// would refuse anyway because a queue's arguments are fixed at declare.
 //
-// A per-message expiration expires only when the message reaches the head of
-// its queue, so a message parked behind a later one waits for the one in
-// front of it and the lateness is the difference between two due times, which
-// is unbounded. A queue-level x-message-ttl expires in FIFO order for every
-// message in the queue and for every queue, so a bucket whose messages share
-// one TTL cannot construct that case at all. Routing rounds the remaining
-// delay up to the smallest rung at least as large, which buys two properties:
-// a due time is never released early, because every rung is at least its own
-// delay, and due-time order is preserved across buckets, because rounding up
-// is non-decreasing. The cost is lateness below one rung, which the caller
-// absorbs: the conformance band for a due time is wider than the rung its
-// delay rounds into.
-//
-// Eight rungs cover every delay the retry path can produce with a rung to
-// spare. Config.DelayFor tops out at MaxInterval, and ResolveRetryAfter
-// returns the nominal delay of the tier it picks, so the largest delay at the
-// shipped defaults is MaxInterval 30s while the top rung is 64s. A delay
-// above the top rung routes to no rung at all: see target.
-var parkRungs = [...]time.Duration{
-	500 * time.Millisecond,
-	1 * time.Second,
-	2 * time.Second,
-	4 * time.Second,
-	8 * time.Second,
-	16 * time.Second,
-	32 * time.Second,
-	64 * time.Second,
-}
-
-// parkRungTags names each rung inside a parking queue name. A rung is spelled
-// as a fixed tag rather than as a rendering of its duration, so that reading
-// a name back is a lookup in a closed set and never a wildcard tail: the
-// conformance suite declares destinations named topology.prune.park.eligible,
-// and a parser that accepted anything after ".park." would read that name as
-// a rung queue of topology.prune.
-var parkRungTags = map[time.Duration]string{
-	500 * time.Millisecond: "500ms",
-	1 * time.Second:        "1s",
-	2 * time.Second:        "2s",
-	4 * time.Second:        "4s",
-	8 * time.Second:        "8s",
-	16 * time.Second:       "16s",
-	32 * time.Second:       "32s",
-	64 * time.Second:       "64s",
-}
-
-// parkRungByTag is parkRungTags reversed, so parsing is one map read.
-var parkRungByTag = func() map[string]time.Duration {
-	byTag := make(map[string]time.Duration, len(parkRungTags))
-	for rung, tag := range parkRungTags {
-		byTag[tag] = rung
-	}
-	return byTag
-}()
-
-// parkRung rounds a remaining delay up to the rung that holds it, or returns
-// zero when the delay is above the ladder and belongs on the per-message path
-// instead. Rounding up is what keeps a parked message from being released
-// before its due time.
-func parkRung(delay time.Duration) time.Duration {
-	for _, rung := range parkRungs {
-		if delay <= rung {
-			return rung
-		}
-	}
-	return 0
-}
-
-// parkQueueName is the queue one rung of one destination parks in.
-func parkQueueName(destination string, rung time.Duration) string {
-	return destination + parkingSuffix + "." + parkRungTags[rung]
-}
-
-// parkQueueNames lists every parking queue of a deferred destination: one per
-// rung, then the queue that a delay above the ladder parks in.
-func parkQueueNames(destination string) []string {
-	names := make([]string, 0, len(parkRungs)+1)
-	for _, rung := range parkRungs {
-		names = append(names, parkQueueName(destination, rung))
-	}
-	return append(names, destination+parkingSuffix)
-}
-
-// parkQueueParts splits a parking queue name into the destination it parks for
-// and the rung it belongs to. A rung of zero means the queue for delays above
-// the ladder, and ok is false for a name that is not a parking queue at all.
-//
-// The rung suffix has to be one of the known tags. A name that merely carries
-// something after ".park." is not a parking queue, which is what keeps a
-// destination named "orders.park.eligible" a destination rather than a rung of
-// "orders". The tag is read from the last separator, so a destination whose own
-// name contains ".park." still resolves to itself.
-func parkQueueParts(name string) (destination string, rung time.Duration, ok bool) {
-	if index := strings.LastIndex(name, parkingSuffix+"."); index >= 0 {
-		known, isRung := parkRungByTag[name[index+len(parkingSuffix)+1:]]
-		if !isRung {
-			return "", 0, false
-		}
-		return name[:index], known, true
-	}
-	if before, found := strings.CutSuffix(name, parkingSuffix); found {
-		return before, 0, true
-	}
-	return "", 0, false
-}
-
-// parkingArguments builds the declare-time arguments for a destination's
-// parking queue, the holding queue a delayed or retried message sits in until
-// its per-message TTL expires and RabbitMQ dead-letters it onward to
-// destination. This is the queue a delay above the ladder parks in; a delay on
-// the ladder parks in a rung queue declared by rungParkingArguments instead.
-// kind follows the connection's configured queue kind so a classic-configured
-// deployment gets classic park queues rather than a hardcoded quorum type it
-// may not support.
+// RabbitMQ expires a message only once it reaches the head of its queue. Every
+// message on one destination normally carries the same delay, so expiry order
+// is publish order and none is held past its due time by the one ahead of it.
+// The exception is a delay change: messages published under the old delay
+// still sit ahead of the new ones, so right after a decrease, or while a rolling
+// deploy publishes both delays, a new message can wait behind an old one, for
+// at most the old delay. kind follows the connection's configured queue kind so
+// a classic-configured deployment gets classic park queues rather than a
+// hardcoded quorum type it may not support.
 //
 // On quorum, x-dead-letter-strategy and x-overflow are added alongside the
 // dead-letter exchange and routing key. All three are required together to
@@ -639,7 +624,7 @@ func parkQueueParts(name string) (destination string, rung time.Duration, ok boo
 // Classic queues do not support at-least-once dead-lettering, so both are
 // omitted there and the delay path stays at-most-once on a classic
 // deployment.
-func parkingArguments(destination string, kind queueKind) amqp.Table {
+func parkArguments(destination string, kind queueKind) amqp.Table {
 	args := amqp.Table{
 		"x-queue-type":              string(kind),
 		"x-dead-letter-exchange":    "",
@@ -650,30 +635,6 @@ func parkingArguments(destination string, kind queueKind) amqp.Table {
 		args["x-overflow"] = "reject-publish"
 	}
 	return args
-}
-
-// rungParkingArguments adds the queue-level TTL that makes expiry order FIFO
-// order for every message in a rung queue. That TTL is the entire difference
-// between this shape and the per-message one: a message parked here carries no
-// expiration of its own, so nothing in the queue can outlive the message
-// behind it and no message can be held past its own due time by one ahead of
-// it. Rounding the delay up to the rung is what keeps that from releasing
-// anything early.
-func rungParkingArguments(destination string, kind queueKind, rung time.Duration) amqp.Table {
-	args := parkingArguments(destination, kind)
-	args["x-message-ttl"] = int32(rung.Milliseconds()) //nolint:gosec // the ladder is a fixed set of small durations
-	return args
-}
-
-// parkArguments is the declare argument set of one parking queue, chosen by
-// the queue's own name: a rung queue carries the rung's queue-level TTL, and
-// the queue above the ladder carries a per-message expiration instead and
-// declares none.
-func parkArguments(destination string, kind queueKind, parkName string) amqp.Table {
-	if _, rung, ok := parkQueueParts(parkName); ok && rung > 0 {
-		return rungParkingArguments(destination, kind, rung)
-	}
-	return parkingArguments(destination, kind)
 }
 
 func (a *adminOperations) exchangeExists(ctx context.Context, spec driver.ExchangeSpec) (bool, error) {
@@ -731,9 +692,17 @@ func (a *adminOperations) declareQueue(ctx context.Context, name string, durable
 	if _, err := channel.QueueDeclare(name, declaredDurable, autoDelete, exclusive, false, args); err != nil {
 		return classifyAMQP("ensure_topology", driver.KindFatal, err)
 	}
+	if declaredDurable != durable {
+		a.conn.reportDurabilityUpgrade(name)
+	}
 	return nil
 }
 
+// queueFlags resolves the declare flags for one destination: the durability
+// the spec asked for, except that a quorum queue is durable by definition, so
+// kind upgrades a non-durable request instead of leaving the broker to refuse
+// the declare. The caller reports that upgrade rather than applying it
+// silently.
 func queueFlags(durable bool, kind queueKind) (bool, bool, bool) {
 	if kind == queueKindQuorum {
 		return true, false, false

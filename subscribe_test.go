@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"reflect"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -74,43 +75,42 @@ func TestSubscribeAcceptsOrderedByKeyWhenNative(t *testing.T) {
 	}
 }
 
-func TestSubscribeRejectsPrefetchBelowLaneCount(t *testing.T) {
-	t.Parallel()
-	client := newPublishClient(t, &recordingProducer{})
-	_, err := client.Subscribe(context.Background(), Subscription{
-		Name:     "orders",
-		Topics:   []string{"orders.created"},
-		Prefetch: 11,
-	})
-	if err == nil || !strings.Contains(err.Error(), "prefetch 11") || !strings.Contains(err.Error(), "lane count 12") || !strings.Contains(err.Error(), "topics x priorities x (1 + retryTiers)") {
-		t.Fatalf("Subscribe() error = %v, want lane-floor validation", err)
+func TestSubscribeRejectsPrefetchAboveCeiling(t *testing.T) {
+	for _, test := range []struct {
+		name     string
+		env      string
+		prefetch int
+	}{
+		{name: "explicit config", prefetch: 65536},
+		{name: "environment", env: "65536"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if test.env != "" {
+				t.Setenv("F1_SUBSCRIPTIONS_ORDERS_PREFETCH", test.env)
+			}
+			client := newPublishClient(t, &recordingProducer{})
+			_, err := client.Subscribe(context.Background(), Subscription{
+				Name:     "orders",
+				Topics:   []string{"orders.created"},
+				Prefetch: test.prefetch,
+			})
+			want := "f1: subscriptions.orders.prefetch 65536 must be at most 65535"
+			if err == nil || err.Error() != want {
+				t.Fatalf("Subscribe() error = %v, want %q", err, want)
+			}
+		})
 	}
 }
 
-func TestSubscribeRejectsPrefetchAboveCeilingFromExplicitConfig(t *testing.T) {
-	t.Parallel()
-	client := newPublishClient(t, &recordingProducer{})
-	_, err := client.Subscribe(context.Background(), Subscription{
-		Name:     "orders",
-		Topics:   []string{"orders.created"},
-		Prefetch: 65536,
-	})
-	want := "f1: subscriptions.orders.prefetch 65536 must be at most 65535"
-	if err == nil || err.Error() != want {
-		t.Fatalf("Subscribe() error = %v, want %q", err, want)
-	}
-}
-
-func TestSubscribeRejectsPrefetchAboveCeilingFromEnvironment(t *testing.T) {
-	t.Setenv("F1_SUBSCRIPTIONS_ORDERS_PREFETCH", "65536")
+func TestSubscribeRejectsUnknownSubscriptionKeyFromEnvironment(t *testing.T) {
+	t.Setenv("F1_SUBSCRIPTIONS_ORDERS_HANDLER_TIMEOUT_MS", "5s")
 	client := newPublishClient(t, &recordingProducer{})
 	_, err := client.Subscribe(context.Background(), Subscription{
 		Name:   "orders",
 		Topics: []string{"orders.created"},
 	})
-	want := "f1: subscriptions.orders.prefetch 65536 must be at most 65535"
-	if err == nil || err.Error() != want {
-		t.Fatalf("Subscribe() error = %v, want %q", err, want)
+	if err == nil || !strings.Contains(err.Error(), "F1_SUBSCRIPTIONS_ORDERS_HANDLER_TIMEOUT_MS") {
+		t.Fatalf("Subscribe() error = %v, want the unknown variable named", err)
 	}
 }
 
@@ -217,12 +217,156 @@ func TestApplySubscriptionEnvironmentAllocatesFairnessMapsLazily(t *testing.T) {
 	}
 }
 
+func TestApplySubscriptionEnvironmentRejectsUnknownKey(t *testing.T) {
+	name := t.Name()
+	clearSubscriptionEnvironment(t, name)
+	prefix := subscriptionEnvPrefix(name)
+	t.Setenv(envKey(prefix, "concurrency"), "4")
+	t.Setenv(prefix+"CONCURENCY", "8")
+
+	cfg := SubscriptionConfig{}
+	err := applySubscriptionEnvironment(name, &cfg)
+	if err == nil || !strings.Contains(err.Error(), prefix+"CONCURENCY") {
+		t.Fatalf("applySubscriptionEnvironment() error = %v, want the unknown variable named", err)
+	}
+	if got, want := cfg.Concurrency, 4; got != want {
+		t.Fatalf("concurrency = %d, want %d from the variable the same call read", got, want)
+	}
+}
+
+func TestApplySubscriptionEnvironmentNamesReplacementForKeyRenamedSinceConfig(t *testing.T) {
+	name := t.Name()
+	clearSubscriptionEnvironment(t, name)
+	prefix := subscriptionEnvPrefix(name)
+	t.Setenv(prefix+"FAIRNESS_AGING_ENABLED", "true")
+
+	cfg := SubscriptionConfig{}
+	err := applySubscriptionEnvironment(name, &cfg)
+	if err == nil {
+		t.Fatal("applySubscriptionEnvironment() error = nil, want the renamed key rejected")
+	}
+	if !strings.Contains(err.Error(), prefix+"FAIRNESS_AGING_ENABLED") || !strings.Contains(err.Error(), "FAIRNESS_DISABLE_DEADLINE_PROMOTION=false") {
+		t.Fatalf("applySubscriptionEnvironment() error = %v, want the variable and the value that replaces it named", err)
+	}
+	if cfg.Fairness.DisableDeadlinePromotion {
+		t.Fatal("DisableDeadlinePromotion = true, want the rejected variable to leave the configuration alone")
+	}
+}
+
+func TestApplySubscriptionEnvironmentRejectsOldDeadlinePromotionKey(t *testing.T) {
+	name := t.Name()
+	clearSubscriptionEnvironment(t, name)
+	prefix := subscriptionEnvPrefix(name)
+	t.Setenv(prefix+"FAIRNESS_DISABLE_AGING", "true")
+
+	err := applySubscriptionEnvironment(name, &SubscriptionConfig{})
+	if err == nil {
+		t.Fatal("applySubscriptionEnvironment() error = nil, want the old key rejected")
+	}
+	if !strings.Contains(err.Error(), prefix+"FAIRNESS_DISABLE_AGING") || !strings.Contains(err.Error(), "FAIRNESS_DISABLE_DEADLINE_PROMOTION") {
+		t.Fatalf("applySubscriptionEnvironment() error = %v, want the old and replacement keys named", err)
+	}
+}
+
+func TestApplySubscriptionEnvironmentAcceptsDeadlinePromotion(t *testing.T) {
+	name := t.Name()
+	clearSubscriptionEnvironment(t, name)
+	prefix := subscriptionEnvPrefix(name)
+	t.Setenv(prefix+"FAIRNESS_DISABLE_DEADLINE_PROMOTION", "true")
+
+	cfg := SubscriptionConfig{}
+	if err := applySubscriptionEnvironment(name, &cfg); err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.Fairness.DisableDeadlinePromotion {
+		t.Fatal("DisableDeadlinePromotion = false, want true from the new environment key")
+	}
+}
+
+func TestApplySubscriptionEnvironmentAcceptsVariableTwoSubscriptionNamesShare(t *testing.T) {
+	clearSubscriptionEnvironment(t, "orders")
+	clearSubscriptionEnvironment(t, "ordersRetry")
+	t.Setenv("F1_SUBSCRIPTIONS_ORDERS_RETRY_MAX_ATTEMPTS", "3")
+
+	orders := SubscriptionConfig{}
+	if err := applySubscriptionEnvironment("orders", &orders); err != nil {
+		t.Fatalf("applySubscriptionEnvironment(orders) error = %v, want the shared variable accepted", err)
+	}
+	if got, want := orders.Retry.MaxAttempts, 3; got != want {
+		t.Fatalf("orders retry.maxAttempts = %d, want %d", got, want)
+	}
+
+	ordersRetry := SubscriptionConfig{}
+	if err := applySubscriptionEnvironment("ordersRetry", &ordersRetry); err != nil {
+		t.Fatalf("applySubscriptionEnvironment(ordersRetry) error = %v, want the other subscription's variable accepted", err)
+	}
+	if got := ordersRetry.Retry.MaxAttempts; got != 0 {
+		t.Fatalf("ordersRetry retry.maxAttempts = %d, want the variable left to orders", got)
+	}
+}
+
+func TestApplySubscriptionEnvironmentAcceptsPerPriorityKeys(t *testing.T) {
+	name := t.Name()
+	clearSubscriptionEnvironment(t, name)
+	prefix := subscriptionEnvPrefix(name)
+	for _, test := range []struct {
+		key  string
+		want int
+	}{
+		{"fairness.weights.high", 5},
+		{"fairness.weights.medium", 6},
+		{"fairness.weights.low", 7},
+	} {
+		t.Setenv(envKey(prefix, test.key), strconv.Itoa(test.want))
+	}
+
+	cfg := SubscriptionConfig{}
+	if err := applySubscriptionEnvironment(name, &cfg); err != nil {
+		t.Fatalf("applySubscriptionEnvironment() error = %v, want every per-priority key accepted", err)
+	}
+	want := map[Priority]int{PriorityHigh: 5, PriorityMedium: 6, PriorityLow: 7}
+	if !reflect.DeepEqual(cfg.Fairness.Weights, want) {
+		t.Fatalf("weights = %#v, want %#v", cfg.Fairness.Weights, want)
+	}
+}
+
+func TestApplySubscriptionEnvironmentReportsTheFirstUnknownKeyInNameOrder(t *testing.T) {
+	name := t.Name()
+	clearSubscriptionEnvironment(t, name)
+	prefix := subscriptionEnvPrefix(name)
+	first, later := prefix+"AAA_CONCURENCY", prefix+"ZZZ_CONCURENCY"
+	t.Setenv(later, "8")
+	t.Setenv(first, "9")
+
+	cfg := SubscriptionConfig{}
+	err := applySubscriptionEnvironment(name, &cfg)
+	if err == nil || !strings.Contains(err.Error(), first) {
+		t.Fatalf("applySubscriptionEnvironment() error = %v, want %q reported", err, first)
+	}
+	if strings.Contains(err.Error(), later) {
+		t.Fatalf("applySubscriptionEnvironment() error = %v, want only the name that sorts first", err)
+	}
+}
+
+func TestApplySubscriptionEnvironmentRejectsDoubledUnderscoreBoundary(t *testing.T) {
+	name := t.Name()
+	clearSubscriptionEnvironment(t, name)
+	prefix := subscriptionEnvPrefix(name)
+	t.Setenv(prefix+"_CONCURRENCY", "8")
+
+	cfg := SubscriptionConfig{}
+	err := applySubscriptionEnvironment(name, &cfg)
+	if err == nil || !strings.Contains(err.Error(), prefix+"_CONCURRENCY") {
+		t.Fatalf("applySubscriptionEnvironment() error = %v, want the name no subscription can spell rejected", err)
+	}
+}
+
 func clearSubscriptionEnvironment(t *testing.T, name string) {
 	t.Helper()
 	keys := []string{
 		"topics", "mode", "concurrency", "prefetch", "priorities",
 		"handlerTimeout", "unmatchedPolicy", "fairness.retryWeightDivisor",
-		"fairness.prefetchFactor", "fairness.disableAging",
+		"fairness.prefetchFactor", "fairness.disableDeadlinePromotion",
 		"fairness.weights.high", "fairness.weights.medium", "fairness.weights.low",
 		"fairness.budgets.high", "fairness.budgets.medium", "fairness.budgets.low",
 		"retry.maxAttempts", "retry.initialInterval", "retry.multiplier",
@@ -273,7 +417,7 @@ f1:
 	}
 }
 
-func TestSubscribePreservesExplicitYAMLDisableAging(t *testing.T) {
+func TestSubscribePreservesExplicitYAMLDisableDeadlinePromotion(t *testing.T) {
 	t.Parallel()
 	cfg, err := LoadConfig(writeConfig(t, `
 f1:
@@ -285,7 +429,7 @@ f1:
     orders:
       topics: [orders.created]
       fairness:
-        disableAging: true
+        disableDeadlinePromotion: true
 `))
 	if err != nil {
 		t.Fatal(err)
@@ -299,8 +443,8 @@ f1:
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !runner.config.Fairness.DisableAging {
-		t.Fatal("explicit YAML disableAging: true was replaced by the default")
+	if !runner.config.Fairness.DisableDeadlinePromotion {
+		t.Fatal("explicit YAML disableDeadlinePromotion: true was replaced by the default")
 	}
 }
 

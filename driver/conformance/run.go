@@ -39,7 +39,38 @@ func realTimer(duration time.Duration) *time.Timer {
 	return time.NewTimer(duration)
 }
 
-// Run opens one connection, executes both profiles, and compares their vectors.
+// deliveryCeiling reports how many deliveries a driver declaring capabilities
+// may hold unsettled at once on one destination, given that a check's traffic
+// reaches partitions distinct broker-side partitions, and capped at want.
+//
+// The cap needs both declarations the inference rests on. ScalingPartitionBound
+// says one consumer holds one delivery per partition; OrderedByKey says a
+// message key reaches one partition, so the key count a caller has is a
+// partition count. A driver that denies key ordering has no key-to-partition
+// map, so a key count cannot be converted into a partition count for it and it
+// keeps the count it was asked for, which is the count the checks asked for
+// before the waiver. Reading the partition bound off ScalingPartitionBound
+// alone would take a per-partition admission ceiling from a driver that need
+// not have partitions at all.
+//
+// A check derives its count here instead of hard-coding one because the port
+// carries no partition count. A driver satisfying both declarations decides a
+// destination's outstanding capacity from partitions the check cannot see, and
+// a check that asks for more than the placement allows fails on the placement
+// rather than on the behaviour it asserts. The result is compared with the
+// inspector's view for equality, so partitions must be the number of partitions
+// the traffic reaches and at least one.
+func deliveryCeiling(capabilities driver.Capabilities, partitions, want int) int {
+	if capabilities.OrderedByKey && capabilities.ConsumerScaling == driver.ScalingPartitionBound {
+		return min(want, partitions)
+	}
+	return want
+}
+
+// Run opens one connection and runs the registered checks under the full and
+// strict profiles described by suite. Suite.Driver and Suite.NewInspector are
+// required. It returns the collected report, compares behavior vectors when
+// both profiles complete, and reports check failures through t.
 func Run(t *testing.T, suite Suite) Report {
 	t.Helper()
 	if suite.Driver == nil {
@@ -109,7 +140,7 @@ func Run(t *testing.T, suite Suite) Report {
 		profileCompleted := false
 		t.Run(profile.String(), func(profileTest *testing.T) {
 			profileStarted = true
-			result = runProfile(profileTest, ctx, conn, inspect, runID, profile, factoryCapabilities, inject, deadline, &report, suite.Driver, suite.Config, suite.NewFaultInjector, suite.DeferralModel)
+			result = runProfile(profileTest, ctx, conn, inspect, runID, profile, factoryCapabilities, inject, deadline, &report, suite.Driver, suite.Config, suite.NewFaultInjector)
 			profileCompleted = true
 		})
 		if profileCompleted {
@@ -154,7 +185,6 @@ func runProfile(
 	drv driver.Driver,
 	cfg driver.Config,
 	injectFactory func(driver.Conn) (FaultInjector, error),
-	deferralModel DeferralModel,
 ) ProfileReport {
 	effective := effectiveCapabilities(conn.Capabilities(), profile)
 	inspectScope := "conformance.inspect." + runID + "." + profile.String() + "."
@@ -174,8 +204,7 @@ func runProfile(
 		t.Fatalf("ensure topology: %v", err)
 	}
 	producer, err = conn.Producer(ctx, driver.ProducerConfig{
-		RequireDurableAck: true,
-		Effective:         effective,
+		Effective: effective,
 	})
 	if err != nil {
 		t.Fatalf("create producer: %v", err)
@@ -184,7 +213,21 @@ func runProfile(
 	if err != nil {
 		t.Fatalf("inspect baseline: %v", err)
 	}
-	const n = 2
+	// A partition-bound driver decides how many records a destination can carry
+	// unsettled from a partition count the port does not carry, and this probe
+	// creates its destination by name alone, so the count is the driver's and may
+	// be one: a single partition cannot admit its next record before the first
+	// settles, and the check below requires all n of them outstanding at the same
+	// instant, so settling in between is not available either. The plurality
+	// check is therefore waived for such a driver, which asks for one outstanding
+	// record, and kept for a driver declaring free consumer scaling, whose
+	// destinations no partition count bounds. The waiver is a loss and not a
+	// simplification: two records also show Ready and Unsettled to be sums over
+	// more than one record, and one only shows the arithmetic.
+	n := 2
+	if factoryCapabilities.ConsumerScaling == driver.ScalingPartitionBound {
+		n = 1
+	}
 	for i := range n {
 		if err := producer.Publish(ctx, driver.OutboundMessage{
 			Destination: destination,
@@ -278,7 +321,7 @@ func runProfile(
 			groupResult = &groupContext{
 				t: groupTest, ctx: ctx, conn: tracked, inspect: inspect,
 				profile: profile, effective: effective, factoryCapabilities: factoryCapabilities, inject: inject, report: report,
-				drv: drv, cfg: cfg, injectFactory: injectFactory, deferralModel: deferralModel,
+				drv: drv, cfg: cfg, injectFactory: injectFactory,
 				checkNames: make(map[string]struct{}),
 				skips:      make(map[string]string), deadline: deadline,
 				runID: runID,
@@ -559,10 +602,35 @@ func (c *trackedConn) reclaim(ctx context.Context, consumers []*trackedConsumer,
 			errs = append(errs, err)
 		}
 	}
-	for _, destination := range destinations {
-		if err := purgeAndPruneIfSupported(ctx, c.Conn, destination); err != nil {
-			errs = append(errs, err)
+	// Destinations follow Prune's dependency order: a destination that other
+	// destinations are bound to must be pruned after them, so retry refusals
+	// after each pass that deletes something.
+	pending := slices.Clone(destinations)
+	for len(pending) > 0 {
+		next := make([]string, 0, len(pending))
+		var refused []error
+		progressed := false
+		for _, destination := range pending {
+			if err := purgeAndPruneIfSupported(ctx, c.Conn, destination); err != nil {
+				var refusal *pruneRefusalError
+				if errors.As(err, &refusal) {
+					next = append(next, destination)
+					refused = append(refused, err)
+					continue
+				}
+				errs = append(errs, err)
+				continue
+			}
+			progressed = true
 		}
+		if len(next) == 0 {
+			break
+		}
+		if !progressed {
+			errs = append(errs, refused...)
+			break
+		}
+		pending = next
 	}
 	for _, producer := range producers {
 		if err := producer.Close(ctx); err != nil {
@@ -951,8 +1019,7 @@ func validateDeadlineFixture(t *testing.T, ctx context.Context, conn driver.Conn
 		t.Fatalf("conformance: deadline fixture topology: %v", err)
 	}
 	producer, err := conn.Producer(ctx, driver.ProducerConfig{
-		RequireDurableAck: true,
-		Effective:         conn.Capabilities(),
+		Effective: conn.Capabilities(),
 	})
 	if err != nil {
 		_ = purgeAndPruneIfSupported(ctx, conn, destination)
@@ -1062,6 +1129,15 @@ func cleanupProfileErrors(ctx context.Context, conn driver.Conn, producer driver
 	return errs
 }
 
+type pruneRefusalError struct {
+	destination string
+	reason      string
+}
+
+func (e *pruneRefusalError) Error() string {
+	return fmt.Sprintf("prune profile destination %q refused: %s", e.destination, e.reason)
+}
+
 func pruneProfileDestination(ctx context.Context, maintenance driver.Maintenance, destination string) error {
 	retryCtx, cancel := context.WithTimeout(ctx, pruneRetryBudget)
 	defer cancel()
@@ -1109,7 +1185,7 @@ func pruneProfileDestination(ctx context.Context, maintenance driver.Maintenance
 			return fmt.Errorf("prune profile destination %q reported not deleted without a reason", destination)
 		}
 		if !transientPruneReason(last.Reason) {
-			return fmt.Errorf("prune profile destination %q refused: %s", destination, last.Reason)
+			return &pruneRefusalError{destination: destination, reason: last.Reason}
 		}
 		if attempt == pruneRetryAttempts {
 			break
@@ -1158,14 +1234,16 @@ func transientPruneReason(reason string) bool {
 		strings.Contains(reason, "no longer prunable")
 }
 
-// WriteJSON writes an indented JSON report.
+// WriteJSON writes the report as indented JSON followed by a newline and
+// returns any encoding or writer error.
 func (r Report) WriteJSON(w io.Writer) error {
 	encoder := json.NewEncoder(w)
 	encoder.SetIndent("", "  ")
 	return encoder.Encode(r)
 }
 
-// WriteMarkdown writes a Markdown report.
+// WriteMarkdown writes the driver name, capability results, and pending groups
+// as Markdown, and returns any writer error.
 func (r Report) WriteMarkdown(w io.Writer) error {
 	if _, err := fmt.Fprintf(w, "# Conformance report: %s\n\n", r.Driver); err != nil {
 		return err

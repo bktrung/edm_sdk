@@ -48,12 +48,13 @@ func TestClassifyTopicDeletionDisabledAsFatal(t *testing.T) {
 }
 
 func TestMaintenanceGateHonorsContext(t *testing.T) {
-	maintenanceGate <- struct{}{}
-	defer releaseMaintenance()
+	_, connection, _ := openKafkaAdminTest(t)
+	connection.maintenanceGate <- struct{}{}
+	defer func() { <-connection.maintenanceGate }()
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	if err := acquireMaintenance(ctx); !errors.Is(err, context.Canceled) {
+	if err := connection.acquireMaintenance(ctx); !errors.Is(err, context.Canceled) {
 		t.Fatalf("acquireMaintenance canceled error = %v, want context.Canceled", err)
 	}
 }
@@ -151,12 +152,10 @@ func TestConcurrentPurgeCountsRecordsOnce(t *testing.T) {
 	results := make(chan purgeResult, 2)
 	var group sync.WaitGroup
 	for range 2 {
-		group.Add(1)
-		go func() {
-			defer group.Done()
+		group.Go(func() {
 			removed, err := connection.Admin().(driver.Maintenance).Purge(ctx, topic)
 			results <- purgeResult{removed: removed, err: err}
-		}()
+		})
 	}
 	group.Wait()
 	close(results)
@@ -170,6 +169,69 @@ func TestConcurrentPurgeCountsRecordsOnce(t *testing.T) {
 	}
 	if total != 5 {
 		t.Fatalf("concurrent Purge removed %d records in total, want 5", total)
+	}
+}
+
+func TestConcurrentPurgeAcrossConnectionsDoesNotShareGate(t *testing.T) {
+	ctx1, connection1, admin1 := openKafkaAdminTest(t)
+	ctx2, connection2, admin2 := openKafkaAdminTest(t)
+	topic1 := kafkaTestTopic(t, "purge-separate-1")
+	topic2 := kafkaTestTopic(t, "purge-separate-2")
+	cleanupKafkaTopics(t, admin1, topic1)
+	cleanupKafkaTopics(t, admin2, topic2)
+	createKafkaTopic(t, admin1, ctx1, topic1, 1)
+	createKafkaTopic(t, admin2, ctx2, topic2, 1)
+	produceKafkaRecords(t, connection1.client, ctx1, topic1, 1)
+	produceKafkaRecords(t, connection2.client, ctx2, topic2, 1)
+
+	maintenance1 := connection1.Admin().(driver.Maintenance)
+	maintenance2 := connection2.Admin().(driver.Maintenance)
+	connection1.maintenanceGate <- struct{}{}
+	releaseFirst := true
+	defer func() {
+		if releaseFirst {
+			<-connection1.maintenanceGate
+		}
+	}()
+
+	firstDone := make(chan error, 1)
+	go func() {
+		_, err := maintenance1.Purge(ctx1, topic1)
+		firstDone <- err
+	}()
+	select {
+	case err := <-firstDone:
+		t.Fatalf("first Purge completed while its connection gate was held: %v", err)
+	default:
+	}
+
+	secondCtx, cancel := context.WithTimeout(ctx2, 3*time.Second)
+	defer cancel()
+	secondDone := make(chan error, 1)
+	go func() {
+		_, err := maintenance2.Purge(secondCtx, topic2)
+		secondDone <- err
+	}()
+
+	var secondErr error
+	select {
+	case secondErr = <-secondDone:
+	case <-secondCtx.Done():
+		secondErr = secondCtx.Err()
+	}
+	<-connection1.maintenanceGate
+	releaseFirst = false
+
+	if secondErr != nil {
+		t.Fatalf("second Purge waited on the first connection gate: %v", secondErr)
+	}
+	select {
+	case err := <-firstDone:
+		if err != nil {
+			t.Fatalf("first Purge: %v", err)
+		}
+	case <-ctx1.Done():
+		t.Fatalf("first Purge did not finish after its gate was released: %v", ctx1.Err())
 	}
 }
 

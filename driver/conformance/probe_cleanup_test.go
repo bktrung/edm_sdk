@@ -5,6 +5,7 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/driver"
@@ -14,7 +15,7 @@ func TestInspectProbeSurvivesADirtyBroker(t *testing.T) {
 	withoutConformanceGroups(t)
 	conn := newProbeTestConn()
 	for _, profile := range []Profile{ProfileFull, ProfileStrictPortability} {
-		conn.queues["conformance.inspect."+profile.String()+".probe"] = []driver.OutboundMessage{{Body: []byte("old residue")}}
+		conn.queues["conformance.inspect."+profile.String()+".probe"] = []runTestMessage{{message: driver.OutboundMessage{Body: []byte("old residue")}}}
 	}
 
 	Run(t, Suite{
@@ -51,7 +52,7 @@ func TestInspectProbeReclaimsItsDestination(t *testing.T) {
 	const destination = "conformance.inspect.reclaim-test-run.full.probe"
 
 	if !t.Run("completed profile", func(t *testing.T) {
-		runProfile(t, context.Background(), conn, probeTestInspect(conn), runID, ProfileFull, driver.Capabilities{}, nil, nil, &Report{}, probeTestDriver{conn: conn}, driver.Config{}, nil, DeferralExact)
+		runProfile(t, context.Background(), conn, probeTestInspect(conn), runID, ProfileFull, driver.Capabilities{}, nil, nil, &Report{}, probeTestDriver{conn: conn}, driver.Config{}, nil)
 	}) {
 		t.Fatal("completed profile failed")
 	}
@@ -82,47 +83,39 @@ func TestInspectProbeReclaimsItsDestination(t *testing.T) {
 	}
 }
 
-func TestInspectProbeReclaimsItsDestinationDespiteARefusedPrune(t *testing.T) {
-	conn := newProbeTestConn()
-	conn.pruneRefusals = 2
-	const destination = "conformance.inspect.refused-prune.probe"
-	if _, err := conn.Admin().EnsureTopology(context.Background(), driver.TopologySpec{
-		Destinations: []driver.DestinationSpec{{Name: destination}},
-	}); err != nil {
-		t.Fatalf("EnsureTopology(%q): %v", destination, err)
-	}
+func TestProbeReclaimRetriesARefusedOrTransientPrune(t *testing.T) {
+	for _, test := range []struct {
+		name        string
+		destination string
+		fault       func(*probeTestConn, int)
+	}{
+		{name: "refused", destination: "conformance.inspect.refused-prune.probe", fault: func(conn *probeTestConn, n int) { conn.pruneRefusals = n }},
+		{name: "transient error", destination: "conformance.inspect.transient.probe", fault: func(conn *probeTestConn, n int) { conn.pruneTransientErrors = n }},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			// The bubble runs the cleanup's real retry waits on virtual time.
+			synctest.Test(t, func(t *testing.T) {
+				conn := newProbeTestConn()
+				const faults = 2
+				test.fault(conn, faults)
+				if _, err := conn.Admin().EnsureTopology(context.Background(), driver.TopologySpec{
+					Destinations: []driver.DestinationSpec{{Name: test.destination}},
+				}); err != nil {
+					t.Fatalf("EnsureTopology(%q): %v", test.destination, err)
+				}
 
-	errs := cleanupProfileErrors(context.Background(), conn, &recordingProbeProducer{events: &conn.events}, nil, destination)
-	if len(errs) != 0 {
-		t.Fatalf("cleanup errors = %v, want none", errs)
-	}
-	if want := conn.pruneRefusals + 1; conn.pruneCalls != want {
-		t.Fatalf("Prune calls = %d, want %d", conn.pruneCalls, want)
-	}
-	if _, err := conn.Admin().DescribeTopology(context.Background(), []string{destination}); !errors.Is(err, driver.ErrDestinationMissing) {
-		t.Fatalf("DescribeTopology(%q) after refused Prune = %v, want ErrDestinationMissing", destination, err)
-	}
-}
-
-func TestProbeReclaimSurvivesATransientPruneError(t *testing.T) {
-	conn := newProbeTestConn()
-	conn.pruneTransientErrors = 2
-	const destination = "conformance.inspect.transient.probe"
-	if _, err := conn.Admin().EnsureTopology(context.Background(), driver.TopologySpec{
-		Destinations: []driver.DestinationSpec{{Name: destination}},
-	}); err != nil {
-		t.Fatalf("EnsureTopology(%q): %v", destination, err)
-	}
-
-	errs := cleanupProfileErrors(context.Background(), conn, &recordingProbeProducer{events: &conn.events}, nil, destination)
-	if len(errs) != 0 {
-		t.Fatalf("cleanup errors = %v, want none", errs)
-	}
-	if want := conn.pruneTransientErrors + 1; conn.pruneCalls != want {
-		t.Fatalf("Prune calls = %d, want %d", conn.pruneCalls, want)
-	}
-	if _, err := conn.Admin().DescribeTopology(context.Background(), []string{destination}); !errors.Is(err, driver.ErrDestinationMissing) {
-		t.Fatalf("DescribeTopology(%q) after transient Prune errors = %v, want ErrDestinationMissing", destination, err)
+				errs := cleanupProfileErrors(context.Background(), conn, &recordingProbeProducer{events: &conn.events}, nil, test.destination)
+				if len(errs) != 0 {
+					t.Fatalf("cleanup errors = %v, want none", errs)
+				}
+				if want := faults + 1; conn.pruneCalls != want {
+					t.Fatalf("Prune calls = %d, want %d", conn.pruneCalls, want)
+				}
+				if _, err := conn.Admin().DescribeTopology(context.Background(), []string{test.destination}); !errors.Is(err, driver.ErrDestinationMissing) {
+					t.Fatalf("DescribeTopology(%q) after %s Prune = %v, want ErrDestinationMissing", test.destination, test.name, err)
+				}
+			})
+		})
 	}
 }
 
@@ -222,7 +215,7 @@ func (c *probeRetryBudgetContext) Deadline() (time.Time, bool) {
 func TestInspectProbeTeardownSurvivesARefusedStop(t *testing.T) {
 	conn := newProbeTestConn()
 	const destination = "conformance.inspect.refused-stop.probe"
-	conn.queues[destination] = []driver.OutboundMessage{{Body: []byte("unsettled")}}
+	conn.queues[destination] = []runTestMessage{{message: driver.OutboundMessage{Body: []byte("unsettled")}}}
 	consumer := &refusingProbeConsumer{events: &conn.events, conn: conn.runTestConn, destination: destination, attached: &conn.attached}
 	producer := &recordingProbeProducer{events: &conn.events}
 
@@ -295,7 +288,7 @@ type probeTestConn struct {
 
 func newProbeTestConn() *probeTestConn {
 	return &probeTestConn{runTestConn: &runTestConn{
-		queues:    make(map[string][]driver.OutboundMessage),
+		queues:    make(map[string][]runTestMessage),
 		unsettled: make(map[string]int),
 		specs:     make(map[string]driver.DestinationSpec),
 	}}
@@ -408,7 +401,7 @@ func (c *refusingProbeConsumer) Stop(context.Context) error {
 func (c *refusingProbeConsumer) Release(context.Context) error {
 	*c.events = append(*c.events, "release")
 	*c.attached = false
-	c.conn.queues[c.destination] = append(c.conn.queues[c.destination], driver.OutboundMessage{Body: []byte("released")})
+	c.conn.queues[c.destination] = append(c.conn.queues[c.destination], runTestMessage{message: driver.OutboundMessage{Body: []byte("released")}})
 	return nil
 }
 func (*refusingProbeConsumer) Lag(context.Context) (map[string]int64, error) { return nil, nil }
@@ -418,6 +411,7 @@ type recordingProbeProducer struct {
 }
 
 func (*recordingProbeProducer) Publish(context.Context, ...driver.OutboundMessage) error { return nil }
+
 func (p *recordingProbeProducer) Close(context.Context) error {
 	*p.events = append(*p.events, "producer-close")
 	return nil

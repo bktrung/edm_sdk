@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"reflect"
 	"strings"
+	"time"
 
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/codec"
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/driver"
@@ -13,10 +14,11 @@ import (
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/testhook"
 )
 
-// Option configures a Client during New.
+// Option configures a Client during New. A nil Option is rejected by New.
 type Option func(*clientOptions) error
 
-// TopologyPolicy selects how the SDK handles required broker topology.
+// TopologyPolicy selects how the SDK handles required broker topology. Its zero
+// value, TopologyDeclare, creates missing topology.
 type TopologyPolicy = driver.TopologyPolicy
 
 const (
@@ -44,9 +46,12 @@ type clientOptions struct {
 	publishTopicsSet    bool
 	topologyPolicy      driver.TopologyPolicy
 	topologyPolicySet   bool
+	observer            Observer
+	backlogPollInterval time.Duration
 }
 
-// WithDriver supplies the broker driver New opens eagerly.
+// WithDriver supplies the non-nil broker driver that New opens before it
+// returns.
 func WithDriver(d driver.Driver) Option {
 	return func(options *clientOptions) error {
 		if isNil(d) {
@@ -57,17 +62,30 @@ func WithDriver(d driver.Driver) Option {
 	}
 }
 
-// WithCodec registers codecs for inbound decoding. The first codec is used
-// for publishing; all codecs are selected by their content type on reads.
+// WithCodec registers codecs for inbound decoding. The first codec is used for
+// publishing; reads select a codec by content type. New rejects an empty list,
+// a nil codec, and two codecs in the list that share a content type or a name,
+// since publishing would use the first and reading the last. A codec may
+// replace the built-in JSON codec by using its content type.
 func WithCodec(codecs ...codec.Codec) Option {
 	return func(options *clientOptions) error {
 		if len(codecs) == 0 {
 			return fmt.Errorf("f1: WithCodec requires at least one codec")
 		}
+		contentTypes := make(map[string]struct{}, len(codecs))
+		names := make(map[string]struct{}, len(codecs))
 		for _, c := range codecs {
 			if isNil(c) {
 				return fmt.Errorf("f1: WithCodec requires a non-nil codec")
 			}
+			if _, dup := contentTypes[c.ContentType()]; dup {
+				return fmt.Errorf("f1: WithCodec lists two codecs for content type %q", c.ContentType())
+			}
+			if _, dup := names[c.Name()]; dup {
+				return fmt.Errorf("f1: WithCodec lists two codecs named %q", c.Name())
+			}
+			contentTypes[c.ContentType()] = struct{}{}
+			names[c.Name()] = struct{}{}
 		}
 		if options.codecsByContentType == nil {
 			options.codecsByContentType = make(map[string]codec.Codec)
@@ -84,7 +102,7 @@ func WithCodec(codecs ...codec.Codec) Option {
 	}
 }
 
-// WithLogger sets the structured logger used by the Client.
+// WithLogger sets the non-nil structured logger used by the Client.
 func WithLogger(logger *slog.Logger) Option {
 	return func(options *clientOptions) error {
 		if logger == nil {
@@ -115,7 +133,9 @@ func withClock(c clock.Clock) Option {
 
 func init() { testhook.RegisterClientOption(func(c clock.Clock) any { return withClock(c) }) }
 
-// WithStrictPortability disables native capability shortcuts for this Client.
+// WithStrictPortability asks the Client to use portable implementations instead
+// of optional native driver capabilities. Physical broker constraints remain
+// in force.
 func WithStrictPortability() Option {
 	return func(options *clientOptions) error {
 		options.strictPortability = true
@@ -123,8 +143,9 @@ func WithStrictPortability() Option {
 	}
 }
 
-// WithMiddleware records middleware for the handler pipeline.
-// Handler composition is implemented with dispatch.
+// WithMiddleware adds middleware to the handler chain in the order supplied.
+// The first middleware wraps the later middleware and handler. A nil middleware
+// returns an error when New applies this option.
 func WithMiddleware(middleware ...Middleware) Option {
 	return func(options *clientOptions) error {
 		for _, item := range middleware {
@@ -190,7 +211,8 @@ func WithPublishTopics(topics ...string) Option {
 
 // WithTopology selects how the SDK handles required broker topology and
 // overrides configured policy. Without it, autoCreate selects declare,
-// verifyOnStart selects verify, and neither setting selects none.
+// verifyOnStart selects verify, and neither setting selects none. An unsupported
+// policy returns an error when New applies this option.
 func WithTopology(p TopologyPolicy) Option {
 	return func(options *clientOptions) error {
 		if p < TopologyDeclare || p > TopologyNone {
@@ -198,6 +220,27 @@ func WithTopology(p TopologyPolicy) Option {
 		}
 		options.topologyPolicy = p
 		options.topologyPolicySet = true
+		return nil
+	}
+}
+
+// WithObserver installs the observer that receives this Client's lifecycle and
+// point events. A nil observer disables these callbacks. An observer that
+// implements [ObserverBinder] is bound to the Client by New and released when
+// the Client closes; New fails if the observer refuses the binding.
+func WithObserver(observer Observer) Option {
+	return func(options *clientOptions) error {
+		options.observer = observer
+		return nil
+	}
+}
+
+// WithBacklogPollInterval sets how often the backlog poll loop samples one
+// destination. Zero selects the default. A negative value disables the loop.
+// Values in (0, 1s) are rejected by New.
+func WithBacklogPollInterval(interval time.Duration) Option {
+	return func(options *clientOptions) error {
+		options.backlogPollInterval = interval
 		return nil
 	}
 }

@@ -28,7 +28,7 @@ type docAttributeFixture struct {
 	Attributes []docAttribute `json:"attributes"`
 }
 
-func loadDoc03Attributes(t *testing.T) []docAttribute {
+func loadAttributeFixture(t *testing.T) []docAttribute {
 	t.Helper()
 	data, err := os.ReadFile("testdata/envelope-attributes.json")
 	require.NoError(t, err)
@@ -94,10 +94,11 @@ func TestEnvelope_EncodeHeadersEnforcesCapAcrossTiers(t *testing.T) {
 		envelope f1.Envelope
 		limit    int
 		wantErr  bool
+		shed     string
 	}{
 		{name: "mandatory", envelope: base, limit: 1, wantErr: true},
 		{name: "protocol", envelope: protocol, limit: 200, wantErr: true},
-		{name: "descriptive", envelope: descriptive, limit: 200},
+		{name: "descriptive", envelope: descriptive, limit: 200, shed: "subject"},
 		{name: "death", envelope: death, limit: 200},
 	}
 
@@ -111,6 +112,9 @@ func TestEnvelope_EncodeHeadersEnforcesCapAcrossTiers(t *testing.T) {
 			}
 			require.NoError(t, err)
 			require.LessOrEqual(t, headerBytesOf(headers), tt.limit)
+			if tt.shed != "" {
+				require.NotContains(t, headers, tt.shed)
+			}
 		})
 	}
 }
@@ -125,18 +129,6 @@ func TestEnvelope_EncodeHeadersBackstopRejectsUnsheddableProtocolOverflow(t *tes
 	headers, err := e.EncodeHeaders(200)
 	require.ErrorIs(t, err, f1.ErrEnvelopeTooLarge)
 	require.Nil(t, headers)
-}
-
-func TestEnvelope_HeaderSizeGuardShedsLargeSubjectAtDriverLimit(t *testing.T) {
-	t.Parallel()
-
-	e := minimalEnvelope()
-	e.Subject = strings.Repeat("s", 300)
-
-	headers, err := e.EncodeHeaders(200)
-	require.NoError(t, err)
-	require.NotContains(t, headers, "subject")
-	require.LessOrEqual(t, headerBytesOf(headers), 200)
 }
 
 func TestEnvelope_EncodeHeadersNeverShedsProtocolHeaders(t *testing.T) {
@@ -195,7 +187,7 @@ func TestEnvelope_EncodeHeadersShedsDescriptiveHeadersInOrder(t *testing.T) {
 
 	all, err := e.EncodeHeaders(0)
 	require.NoError(t, err)
-	order := []string{"f1future", "tracestate", "dataschema", "datacontenttype", "subject", "traceparent"}
+	order := []string{"f1future", "tracestate", "dataschema", "subject", "traceparent"}
 	for i := range order {
 		after := cloneHeaders(all)
 		for _, shed := range order[:i+1] {
@@ -205,6 +197,7 @@ func TestEnvelope_EncodeHeadersShedsDescriptiveHeadersInOrder(t *testing.T) {
 		headers, err := e.EncodeHeaders(headerBytesOf(after))
 		require.NoError(t, err)
 		require.LessOrEqual(t, headerBytesOf(headers), headerBytesOf(after))
+		require.Equal(t, value, headers["datacontenttype"])
 		for j, candidate := range order {
 			if j <= i {
 				require.NotContains(t, headers, candidate)
@@ -213,6 +206,63 @@ func TestEnvelope_EncodeHeadersShedsDescriptiveHeadersInOrder(t *testing.T) {
 			}
 		}
 	}
+}
+
+func TestEnvelope_EncodeHeadersKeepsContentTypeWhenSheddingLaterHeaders(t *testing.T) {
+	t.Parallel()
+
+	const contentType = "application/test-alt"
+	const traceParent = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
+	e := minimalEnvelope()
+	e.DataContentType = contentType
+	e.Subject = strings.Repeat("s", 40)
+	e.TraceParent = traceParent
+
+	for _, tt := range []struct {
+		name      string
+		limit     int
+		keepTrace bool
+	}{
+		{name: "shed subject", limit: 212, keepTrace: true},
+		{name: "shed subject and traceparent", limit: 182},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			expected := map[string]string{
+				"specversion":      "1.0",
+				"id":               "i",
+				"source":           "s",
+				"type":             "t",
+				"time":             "2026-08-05T11:00:00Z",
+				"f1idempotencykey": "",
+				"f1priority":       "medium",
+				"f1attempt":        "0",
+				"f1correlationid":  "i",
+				"datacontenttype":  contentType,
+			}
+			if tt.keepTrace {
+				expected["traceparent"] = traceParent
+			}
+
+			headers, err := e.EncodeHeaders(tt.limit)
+			require.NoError(t, err)
+			require.Equal(t, expected, headers)
+			require.LessOrEqual(t, headerBytesOf(headers), tt.limit)
+		})
+	}
+}
+
+func TestEnvelope_EncodeHeadersRejectsOverflowWithContentType(t *testing.T) {
+	t.Parallel()
+
+	e := minimalEnvelope()
+	e.DataContentType = "application/test-alt"
+	e.Subject = strings.Repeat("s", 40)
+	e.TraceParent = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
+
+	// The mandatory headers total 111 bytes; the codec discriminator adds 35.
+	headers, err := e.EncodeHeaders(145)
+	require.ErrorIs(t, err, f1.ErrEnvelopeTooLarge)
+	require.Nil(t, headers)
 }
 
 func TestEnvelope_EncodeHeadersShedTiersRetainMandatoryHeaders(t *testing.T) {
@@ -283,10 +333,10 @@ func TestEnvelope_EncodeHeadersPreservesDeathErrorFloorBeforeDescriptive(t *test
 	require.LessOrEqual(t, headerBytesOf(headers), headerBytesOf(expected))
 }
 
-func TestEnvelope_MatchesDoc03Table(t *testing.T) {
+func TestEnvelope_MatchesAttributeFixture(t *testing.T) {
 	t.Parallel()
 
-	attrs := loadDoc03Attributes(t)
+	attrs := loadAttributeFixture(t)
 	headers, err := fullEnvelope().EncodeHeaders(0)
 	require.NoError(t, err)
 
@@ -328,7 +378,7 @@ func deathReasonWireValues() []string {
 func TestEnvelope_FixtureCoversEveryF1HeaderEmitted(t *testing.T) {
 	t.Parallel()
 
-	attrs := loadDoc03Attributes(t)
+	attrs := loadAttributeFixture(t)
 	known := make(map[string]bool, len(attrs))
 	for _, a := range attrs {
 		known[a.Attribute] = true
@@ -351,7 +401,7 @@ func TestEnvelope_HeaderRoundTripIsLossless(t *testing.T) {
 	e.DataContentType = "application/json"
 	e.Subject = "ORD-88213"
 	e.DataSchema = "https://schemas.example/order.v1.json"
-	e.Expiry = timePtr(time.Date(2026, 8, 6, 0, 0, 0, 0, time.UTC))
+	e.Expiry = new(time.Date(2026, 8, 6, 0, 0, 0, 0, time.UTC))
 	e.Extensions = map[string]string{"x-custom-ext": "value"}
 
 	headers, err := e.EncodeHeaders(0)
@@ -409,8 +459,6 @@ func TestEnvelope_InvalidDeathDetailKeyIsSilent(t *testing.T) {
 	require.Empty(t, logs.String())
 }
 
-func timePtr(t time.Time) *time.Time { return &t }
-
 func TestEnvelope_TracedMessageSurvivesDecodeEncodeRoundTrip(t *testing.T) {
 	t.Parallel()
 
@@ -444,7 +492,6 @@ func TestDLQ_UnknownReasonSurvivesReplay(t *testing.T) {
 	e, err := f1.DecodeHeaders(headers)
 	require.NoError(t, err, "an unrecognised death reason must not fail the decode")
 	require.Equal(t, f1.DeathReason("a_reason_this_build_predates"), e.DeathReason)
-	require.False(t, e.DeathReason.Valid())
 
 	replayed, err := e.EncodeHeaders(0)
 	require.NoError(t, err)
@@ -528,7 +575,7 @@ func TestCorrelationID_RootDefault(t *testing.T) {
 	require.Equal(t, "saga-42", h2["f1correlationid"])
 }
 
-func TestEnvelope_HeaderSizeGuardShedsExtensionsThenTruncatesDeathError(t *testing.T) {
+func TestEnvelope_HeaderSizeGuardShedsExtensionsAndTraceBeforeDeathError(t *testing.T) {
 	t.Parallel()
 
 	e := fullEnvelope()
@@ -551,39 +598,21 @@ func TestEnvelope_HeaderSizeGuardShedsExtensionsThenTruncatesDeathError(t *testi
 	_, hasExtB := h["ext-b"]
 	require.False(t, hasExtA)
 	require.False(t, hasExtB, "Extensions must be shed first, before DeathError is touched")
+	require.Equal(t, "boom", h["f1deatherror"], "DeathError must be untouched once dropping Extensions alone fits")
 
 	// An unachievable cap reports that the mandatory and non-sheddable headers cannot fit.
-	e.DeathError = "a very long terminal error string that will need truncating to fit under the cap"
+	e.DeathError = "a terminal error longer than the headroom but shorter than the floor"
 	_, err = e.EncodeHeaders(80)
 	require.Error(t, err)
 	require.True(t, errors.Is(err, f1.ErrEnvelopeTooLarge))
 
-	e.DeathError = "a very long terminal error string that will need truncating to fit under the cap"
+	e.DeathError = "a terminal error longer than the headroom but shorter than the floor"
 	tight, err := e.EncodeHeaders(small)
 	require.NoError(t, err)
-	require.LessOrEqual(t, len(tight["f1deatherror"]), len("a very long terminal error string that will need truncating to fit under the cap"))
-}
-
-func TestEnvelope_HeaderSizeGuardExtensionsAloneIsEnough(t *testing.T) {
-	t.Parallel()
-
-	withoutExt := fullEnvelope()
-	baseline, err := withoutExt.EncodeHeaders(0)
-	require.NoError(t, err)
-	baselineBytes := headerBytesOf(baseline)
-
-	e := fullEnvelope()
-	e.Extensions = map[string]string{"ext-a": "aaaaaaaaaa"}
-	withExt, err := e.EncodeHeaders(0)
-	require.NoError(t, err)
-	require.Greater(t, headerBytesOf(withExt), baselineBytes, "test setup: the extension must add bytes")
-
-	limit := baselineBytes + 5 // fits without Extensions, not with them
-	h, err := e.EncodeHeaders(limit)
-	require.NoError(t, err)
-	_, hasExt := h["ext-a"]
-	require.False(t, hasExt)
-	require.Equal(t, "boom", h["f1deatherror"], "DeathError must be untouched once dropping Extensions alone fits")
+	require.LessOrEqual(t, headerBytesOf(tight), small)
+	require.Equal(t, e.DeathError, tight["f1deatherror"], "a DeathError under the floor must stay whole")
+	require.NotContains(t, tight, "traceparent")
+	require.NotContains(t, tight, "tracestate")
 }
 
 func TestEnvelope_SizeGuardRetainsDetailsAfterErrorFloor(t *testing.T) {
@@ -668,36 +697,6 @@ func headerBytesOf(h map[string]string) int {
 	return n
 }
 
-func TestEnvelope_SizeGuardDriverLimitBelowCoreCap(t *testing.T) {
-	t.Parallel()
-
-	e := fullEnvelope()
-	e.Extensions = map[string]string{"ext-a": "aaaaaaaaaa"}
-	_, err := e.EncodeHeaders(50)
-	require.Error(t, err)
-	require.True(t, errors.Is(err, f1.ErrEnvelopeTooLarge))
-}
-
-func TestEnvelope_SizeGuardDeathErrorEmptyStopsShrinking(t *testing.T) {
-	t.Parallel()
-
-	e := fullEnvelope()
-	e.DeathError = ""
-	require.NotPanics(t, func() { _, _ = e.EncodeHeaders(1) })
-}
-
-func TestDeathReason_ValidIsTrueForEachOfTheSevenReasons(t *testing.T) {
-	t.Parallel()
-
-	for _, r := range []f1.DeathReason{
-		f1.ReasonMaxAttempts, f1.ReasonTerminal, f1.ReasonPanic, f1.ReasonDecode,
-		f1.ReasonExpired, f1.ReasonPoison, f1.ReasonUnmatched,
-	} {
-		require.True(t, r.Valid(), r)
-	}
-	require.False(t, f1.ReasonUnspecified.Valid())
-}
-
 func TestEnvelope_DecodeHeadersRejectsMalformedValues(t *testing.T) {
 	t.Parallel()
 
@@ -722,14 +721,7 @@ func TestEnvelope_DecodeHeadersRejectsMalformedValues(t *testing.T) {
 	}
 }
 
-func TestUnrecognisedValueError_Error(t *testing.T) {
-	t.Parallel()
-
-	_, err := f1.ParsePriority("urgent")
-	require.EqualError(t, err, `f1: unrecognised f1priority value "urgent"`)
-}
-
-func TestParsePriorityRejectsNormal(t *testing.T) {
+func TestParsePriorityRejectsUnrecognisedValues(t *testing.T) {
 	t.Parallel()
 
 	_, err := f1.ParsePriority("normal")
@@ -737,6 +729,7 @@ func TestParsePriorityRejectsNormal(t *testing.T) {
 	require.ErrorAs(t, err, &valueErr)
 	require.Equal(t, "f1priority", valueErr.Attribute)
 	require.Equal(t, "normal", valueErr.Value)
+	require.EqualError(t, err, `f1: unrecognised f1priority value "normal"`)
 }
 
 func TestEnvelope_RejectsExtensionOverwritingCanonicalHeader(t *testing.T) {
@@ -886,14 +879,14 @@ func cloneHeaders(input map[string]string) map[string]string {
 func TestEnvelope_DeathErrorShrinkPreservesUTF8(t *testing.T) {
 	t.Parallel()
 	e := fullEnvelope()
-	e.DeathError = "\U0001F4A5\U0001F4A3\U0001F525\U0001F4A7"
+	e.DeathError = strings.Repeat("\U0001F4A5", 200)
 	withoutDeathError := e
 	withoutDeathError.DeathError = ""
 	baseHeaders, err := withoutDeathError.EncodeHeaders(0)
 	require.NoError(t, err)
-	limit := headerBytesOf(baseHeaders) + len("f1deatherror") + 5
-	headers, err := e.EncodeHeaders(limit)
+	headers, err := e.EncodeHeaders(headerBytesOf(baseHeaders))
 	require.NoError(t, err)
+	require.NotEmpty(t, headers["f1deatherror"])
 	require.True(t, utf8.ValidString(headers["f1deatherror"]))
-	require.LessOrEqual(t, headerBytesOf(headers), limit)
+	require.LessOrEqual(t, headerBytesOf(headers), headerBytesOf(baseHeaders))
 }

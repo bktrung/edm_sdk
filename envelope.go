@@ -7,9 +7,13 @@ import (
 	"strings"
 	"time"
 	"unicode/utf8"
+
+	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/wire"
 )
 
-// Envelope contains the canonical message headers.
+// Envelope carries the CloudEvents and F1 metadata serialized as message
+// headers. Use EncodeHeaders and DecodeHeaders to cross the wire boundary. Its
+// zero Priority is PriorityMedium.
 type Envelope struct {
 	// CloudEvents attributes.
 	SpecVersion     string
@@ -30,8 +34,8 @@ type Envelope struct {
 	OriginalDest   string
 	CorrelationID  string
 	CausationID    string
-	Producer       string
-	PartitionKey   string
+	Producer       string // "service/env/instanceID" of the client that published
+	PartitionKey   string // the WithKey value; empty when the broker key fell back to the subject or the event ID
 	Expiry         *time.Time
 
 	// Dead-letter metadata.
@@ -61,23 +65,23 @@ type Envelope struct {
 // timeLayout preserves sub-second precision while accepting RFC3339 values.
 const timeLayout = time.RFC3339Nano
 
-// CoreMaxHeaderBytes is the SDK's maximum encoded header size.
+// CoreMaxHeaderBytes is the largest encoded header set the SDK permits. A
+// configured or broker-specific limit may lower the effective cap.
 const CoreMaxHeaderBytes = 8 * 1024
 
-// EncodeHeaders serializes e to canonical wire headers. A non-positive
-// maxHeaderBytes or a value above CoreMaxHeaderBytes uses CoreMaxHeaderBytes.
-// If the encoding exceeds the cap, user-defined Extensions are dropped first.
-// DeathError is then preserved down to a floor and DeathDetails are shed.
-// Descriptive attributes are then shed in this order: Forwarded, tracestate,
-// dataschema, datacontenttype, subject, and traceparent. DeathError is then
-// truncated further without a floor. The mandatory tier (specversion, id,
-// source, type, and time) and the protocol tier (f1idempotencykey, f1priority,
-// f1attempt, f1maxattempts, f1duetime, f1originaldest, f1correlationid,
-// f1causationid, f1producer, f1partitionkey, and f1expiry) are never shed.
-// Forwarded is shed despite carrying unknown reserved attributes so an older
-// hop can drop newer producer attributes under cap pressure. If the remaining
-// encoded headers exceed the cap, EncodeHeaders returns ErrEnvelopeTooLarge.
-// Invalid priorities and reserved extension keys return errors.
+// EncodeHeaders serializes e as canonical wire headers. A positive
+// maxHeaderBytes below CoreMaxHeaderBytes lowers the cap; non-positive or larger
+// values use CoreMaxHeaderBytes.
+//
+// When headers exceed the cap, EncodeHeaders drops Extensions, shrinks
+// DeathError to a 512-byte floor, drops DeathDetails, drops unknown Forwarded
+// fields, then removes tracestate, dataschema, subject, and traceparent in that
+// order. It then truncates DeathError without a floor. datacontenttype is never
+// removed because the consumer selects its decoder from it.
+// Required CloudEvents and F1 protocol headers are never removed. If the
+// remaining headers still exceed the cap, EncodeHeaders returns
+// ErrEnvelopeTooLarge. Invalid priorities and reserved extension keys return
+// errors.
 func (e Envelope) EncodeHeaders(maxHeaderBytes int) (map[string]string, error) {
 	if !e.Priority.Valid() {
 		return nil, ErrInvalidPriority
@@ -95,45 +99,45 @@ func (e Envelope) EncodeHeaders(maxHeaderBytes int) (map[string]string, error) {
 
 	h := make(map[string]string, len(e.Forwarded)+32)
 	maps.Copy(h, e.Forwarded)
-	h["specversion"] = e.SpecVersion
-	h["id"] = e.ID
-	h["source"] = e.Source
-	h["type"] = e.Type
-	h["time"] = e.Time.Format(timeLayout)
-	h["f1idempotencykey"] = e.IdempotencyKey
-	h["f1priority"] = e.Priority.String()
-	h["f1attempt"] = strconv.Itoa(e.Attempt)
-	setOpt(h, "datacontenttype", e.DataContentType)
-	setOpt(h, "subject", e.Subject)
-	setOpt(h, "dataschema", e.DataSchema)
+	h[wire.SpecVersion] = e.SpecVersion
+	h[wire.ID] = e.ID
+	h[wire.Source] = e.Source
+	h[wire.Type] = e.Type
+	h[wire.Time] = e.Time.Format(timeLayout)
+	h[wire.IdempotencyKey] = e.IdempotencyKey
+	h[wire.Priority] = e.Priority.String()
+	h[wire.Attempt] = strconv.Itoa(e.Attempt)
+	setOpt(h, wire.DataContentType, e.DataContentType)
+	setOpt(h, wire.Subject, e.Subject)
+	setOpt(h, wire.DataSchema, e.DataSchema)
 	if e.MaxAttempts != 0 {
-		h["f1maxattempts"] = strconv.Itoa(e.MaxAttempts)
+		h[wire.MaxAttempts] = strconv.Itoa(e.MaxAttempts)
 	}
-	setOptTime(h, "f1duetime", e.DueTime)
-	setOpt(h, "f1originaldest", e.OriginalDest)
+	setOptTime(h, wire.DueTime, e.DueTime)
+	setOpt(h, wire.OriginalDest, e.OriginalDest)
 	if e.CorrelationID != "" {
-		h["f1correlationid"] = e.CorrelationID
+		h[wire.CorrelationID] = e.CorrelationID
 	} else {
-		h["f1correlationid"] = e.ID // Root events use their ID as the correlation ID.
+		h[wire.CorrelationID] = e.ID // Root events use their ID as the correlation ID.
 	}
-	setOpt(h, "f1causationid", e.CausationID)
-	setOpt(h, "f1producer", e.Producer)
-	setOpt(h, "f1partitionkey", e.PartitionKey)
-	setOptTime(h, "f1expiry", e.Expiry)
-	setOpt(h, "f1deatherror", e.DeathError)
+	setOpt(h, wire.CausationID, e.CausationID)
+	setOpt(h, wire.Producer, e.Producer)
+	setOpt(h, wire.PartitionKey, e.PartitionKey)
+	setOptTime(h, wire.Expiry, e.Expiry)
+	setOpt(h, wire.DeathError, e.DeathError)
 	if e.DeathReason != ReasonUnspecified {
-		h["f1deathreason"] = e.DeathReason.String()
+		h[wire.DeathReason] = e.DeathReason.String()
 	}
-	setOptTime(h, "f1deathtime", e.DeathTime)
+	setOptTime(h, wire.DeathTime, e.DeathTime)
 	for key, value := range e.DeathDetails {
 		if !validDeathDetailKey(key) {
 			// This final wire guard has no logger; discarded keys are reported when the dead-letter copy is built.
 			continue
 		}
-		h["f1detail"+key] = value
+		h[wire.DetailPrefix+key] = value
 	}
-	setOpt(h, "traceparent", e.TraceParent)
-	setOpt(h, "tracestate", e.TraceState)
+	setOpt(h, wire.TraceParent, e.TraceParent)
+	setOpt(h, wire.TraceState, e.TraceState)
 
 	maps.Copy(h, e.Extensions)
 
@@ -151,7 +155,7 @@ func (e Envelope) EncodeHeaders(maxHeaderBytes int) (map[string]string, error) {
 		return h, nil
 	}
 	for k := range h {
-		if strings.HasPrefix(k, "f1detail") {
+		if strings.HasPrefix(k, wire.DetailPrefix) {
 			delete(h, k)
 		}
 	}
@@ -166,7 +170,7 @@ func (e Envelope) EncodeHeaders(maxHeaderBytes int) (map[string]string, error) {
 	if headerBytes(h) <= limit {
 		return h, nil
 	}
-	for _, k := range []string{"tracestate", "dataschema", "datacontenttype", "subject", "traceparent"} {
+	for _, k := range []string{wire.TraceState, wire.DataSchema, wire.Subject, wire.TraceParent} {
 		delete(h, k)
 		if headerBytes(h) <= limit {
 			return h, nil
@@ -209,13 +213,14 @@ func shrinkDeathError(h map[string]string, limit int) {
 // shrinkDeathErrorTo trims f1deatherror until h fits limit or its value
 // cannot be trimmed below floor; a floor of zero means no lower bound.
 func shrinkDeathErrorTo(h map[string]string, limit, floor int) {
-	for headerBytes(h) > limit {
-		v, ok := h["f1deatherror"]
+	size := headerBytes(h)
+	for size > limit {
+		v, ok := h[wire.DeathError]
 		if !ok || v == "" {
 			return // There is no remaining field to shrink.
 		}
 		previousLen := len(v)
-		over := headerBytes(h) - limit
+		over := size - limit
 		cut := max(previousLen-over, floor)
 		if cut >= previousLen {
 			return // The floor prevents further shrinking.
@@ -232,7 +237,8 @@ func shrinkDeathErrorTo(h map[string]string, limit, floor int) {
 		if cut >= previousLen {
 			return // The floor falls inside the final rune.
 		}
-		h["f1deatherror"] = v[:cut]
+		h[wire.DeathError] = v[:cut]
+		size = headerBytes(h)
 	}
 }
 
@@ -249,16 +255,18 @@ func validDeathDetailKey(key string) bool {
 	return true
 }
 
-// DecodeHeaders parses canonical wire headers into an Envelope. Unknown
-// broker-internal headers are dropped, reserved-prefix headers are kept in
-// Forwarded, and other unknown headers are stored in Extensions. Priority is
-// validated; DeathReason is preserved as received.
+// DecodeHeaders parses canonical wire headers into an Envelope. It requires
+// specversion "1.0", id, source, and type, and returns errors for malformed
+// values or an invalid priority. Unknown broker-internal headers are dropped;
+// f1detail headers populate DeathDetails, other reserved-prefix headers are
+// kept in Forwarded, and other unknown headers are stored in Extensions.
+// DeathReason is preserved as received.
 func DecodeHeaders(h map[string]string) (Envelope, error) {
 	var e Envelope
-	e.SpecVersion = h["specversion"]
-	e.ID = h["id"]
-	e.Source = h["source"]
-	e.Type = h["type"]
+	e.SpecVersion = h[wire.SpecVersion]
+	e.ID = h[wire.ID]
+	e.Source = h[wire.Source]
+	e.Type = h[wire.Type]
 	if e.SpecVersion == "" {
 		return Envelope{}, fmt.Errorf("f1: header specversion must not be empty")
 	}
@@ -274,33 +282,33 @@ func DecodeHeaders(h map[string]string) (Envelope, error) {
 	if e.Type == "" {
 		return Envelope{}, fmt.Errorf("f1: header type must not be empty")
 	}
-	if v, ok := h["time"]; ok {
+	if v, ok := h[wire.Time]; ok {
 		t, err := time.Parse(timeLayout, v)
 		if err != nil {
 			return Envelope{}, fmt.Errorf("f1: header time: %w", err)
 		}
 		e.Time = t
 	}
-	e.DataContentType = h["datacontenttype"]
-	e.Subject = h["subject"]
-	e.DataSchema = h["dataschema"]
-	e.IdempotencyKey = h["f1idempotencykey"]
+	e.DataContentType = h[wire.DataContentType]
+	e.Subject = h[wire.Subject]
+	e.DataSchema = h[wire.DataSchema]
+	e.IdempotencyKey = h[wire.IdempotencyKey]
 
-	if v, ok := h["f1priority"]; ok {
+	if v, ok := h[wire.Priority]; ok {
 		p, err := ParsePriority(v)
 		if err != nil {
 			return Envelope{}, err
 		}
 		e.Priority = p
 	}
-	if v, ok := h["f1attempt"]; ok {
+	if v, ok := h[wire.Attempt]; ok {
 		n, err := strconv.Atoi(v)
 		if err != nil {
 			return Envelope{}, fmt.Errorf("f1: header f1attempt: %w", err)
 		}
 		e.Attempt = n
 	}
-	if v, ok := h["f1maxattempts"]; ok {
+	if v, ok := h[wire.MaxAttempts]; ok {
 		n, err := strconv.Atoi(v)
 		if err != nil {
 			return Envelope{}, fmt.Errorf("f1: header f1maxattempts: %w", err)
@@ -311,34 +319,34 @@ func DecodeHeaders(h map[string]string) (Envelope, error) {
 		e.MaxAttempts = n
 	}
 	var err error
-	if e.DueTime, err = parseOptTime(h, "f1duetime"); err != nil {
+	if e.DueTime, err = parseOptTime(h, wire.DueTime); err != nil {
 		return Envelope{}, err
 	}
-	e.OriginalDest = h["f1originaldest"]
-	e.CorrelationID = h["f1correlationid"]
-	e.CausationID = h["f1causationid"]
-	e.Producer = h["f1producer"]
-	e.PartitionKey = h["f1partitionkey"]
-	if e.Expiry, err = parseOptTime(h, "f1expiry"); err != nil {
+	e.OriginalDest = h[wire.OriginalDest]
+	e.CorrelationID = h[wire.CorrelationID]
+	e.CausationID = h[wire.CausationID]
+	e.Producer = h[wire.Producer]
+	e.PartitionKey = h[wire.PartitionKey]
+	if e.Expiry, err = parseOptTime(h, wire.Expiry); err != nil {
 		return Envelope{}, err
 	}
-	e.DeathError = h["f1deatherror"]
-	e.DeathReason = DeathReason(h["f1deathreason"])
-	if e.DeathTime, err = parseOptTime(h, "f1deathtime"); err != nil {
+	e.DeathError = h[wire.DeathError]
+	e.DeathReason = DeathReason(h[wire.DeathReason])
+	if e.DeathTime, err = parseOptTime(h, wire.DeathTime); err != nil {
 		return Envelope{}, err
 	}
-	e.TraceParent = h["traceparent"]
-	e.TraceState = h["tracestate"]
+	e.TraceParent = h[wire.TraceParent]
+	e.TraceState = h[wire.TraceState]
 
 	for k, v := range h {
 		if knownHeaders[k] {
 			continue
 		}
-		if strings.HasPrefix(k, "f1detail") {
+		if strings.HasPrefix(k, wire.DetailPrefix) {
 			if e.DeathDetails == nil {
 				e.DeathDetails = map[string]string{}
 			}
-			e.DeathDetails[strings.TrimPrefix(k, "f1detail")] = v
+			e.DeathDetails[strings.TrimPrefix(k, wire.DetailPrefix)] = v
 			continue
 		}
 		if isBrokerReserved(k) {
@@ -367,7 +375,7 @@ func isBrokerReserved(k string) bool {
 // isReservedExtensionKey reports whether k is a known header or uses a
 // reserved extension prefix.
 func isReservedExtensionKey(k string) bool {
-	return knownHeaders[k] || strings.HasPrefix(k, "f1") || strings.HasPrefix(k, "ce_") || strings.HasPrefix(k, "ce-")
+	return knownHeaders[k] || strings.HasPrefix(k, wire.Prefix) || strings.HasPrefix(k, "ce_") || strings.HasPrefix(k, "ce-")
 }
 
 func parseOptTime(h map[string]string, key string) (*time.Time, error) {
@@ -383,12 +391,12 @@ func parseOptTime(h map[string]string, key string) (*time.Time, error) {
 }
 
 var knownHeaders = map[string]bool{
-	"specversion": true, "id": true, "source": true, "type": true, "time": true,
-	"datacontenttype": true, "subject": true, "dataschema": true,
-	"f1idempotencykey": true, "f1priority": true, "f1attempt": true,
-	"f1maxattempts": true, "f1duetime": true,
-	"f1originaldest": true, "f1correlationid": true, "f1causationid": true,
-	"f1producer": true, "f1partitionkey": true, "f1expiry": true,
-	"f1deatherror": true, "f1deathreason": true, "f1deathtime": true,
-	"traceparent": true, "tracestate": true,
+	wire.SpecVersion: true, wire.ID: true, wire.Source: true, wire.Type: true, wire.Time: true,
+	wire.DataContentType: true, wire.Subject: true, wire.DataSchema: true,
+	wire.IdempotencyKey: true, wire.Priority: true, wire.Attempt: true,
+	wire.MaxAttempts: true, wire.DueTime: true,
+	wire.OriginalDest: true, wire.CorrelationID: true, wire.CausationID: true,
+	wire.Producer: true, wire.PartitionKey: true, wire.Expiry: true,
+	wire.DeathError: true, wire.DeathReason: true, wire.DeathTime: true,
+	wire.TraceParent: true, wire.TraceState: true,
 }

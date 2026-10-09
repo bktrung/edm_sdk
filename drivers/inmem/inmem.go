@@ -3,7 +3,6 @@ package inmem
 import (
 	"context"
 	"errors"
-	"math"
 	"slices"
 	"sort"
 	"sync"
@@ -15,9 +14,8 @@ import (
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/testhook"
 )
 
-// Driver is an in-memory driver factory. New returns isolated connections;
-// NewShared returns connections over one broker. The minimal capability mode is
-// conformance-only and intentionally unexported.
+// Driver opens in-memory broker connections. Its zero value and the value returned by New create an isolated broker for each Open call.
+// NewShared returns a driver whose connections share one broker.
 type Driver struct {
 	clock   clock.Clock
 	minimal bool
@@ -65,20 +63,14 @@ func init() {
 // Name returns the stable in-memory driver key.
 func (Driver) Name() string { return "inmem" }
 
-// Capabilities reports the behavior implemented by the in-memory driver. Native DLQ,
-// priority, transactions, and server-side filtering are intentionally false.
+// Capabilities reports the features provided by the in-memory driver. It supports per-message acknowledgements, key ordering, native delays, delivery counts, unrestricted consumer scaling, and lag queries.
 //
-// DelayAccuracy is zero lateness with no delay excluded: the pump holds every
-// message it has accepted and releases one in the pass that the connection's
-// clock reaches its due time, so nothing between the due time and the release
-// can put the message late. MaxDelay at the largest duration is how the
-// declaration says no requested delay is above the bound.
+// The driver also reports a 1 MiB message-body limit and a 64 KiB header limit.
 func (d Driver) Capabilities() driver.Capabilities {
 	caps := driver.Capabilities{
 		PerMessageAck:       true,
 		OrderedByKey:        true,
 		NativeDelay:         true,
-		DelayAccuracy:       driver.DelayAccuracy{MaxDelay: time.Duration(math.MaxInt64)},
 		NativeDeliveryCount: true,
 		ConsumerScaling:     driver.ScalingFree,
 		LagQueryable:        true,
@@ -153,6 +145,8 @@ type sharedConn struct {
 	closed bool
 }
 
+// Close releases this handle to a shared broker. The underlying connection
+// closes when the last handle closes and its producers and consumers are closed.
 func (c *sharedConn) Close(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
 		return err
@@ -216,7 +210,13 @@ type destination struct {
 	order     []*consumer
 	// next holds one round-robin cursor per group, created with the
 	// destination.
-	next map[string]int
+	next             map[string]int
+	dispatchCursor   int
+	dispatchKnownLen int
+	dispatchPrepends int
+	dispatchStates   map[*consumer]dispatchConsumerState
+	dispatchNextDue  time.Time
+	dispatchScanned  uint64
 }
 
 // affinityKey identifies one group's key affinity on one destination. Holding
@@ -238,17 +238,34 @@ type groupState struct {
 }
 
 type queuedMessage struct {
+	// message is immutable; queued and history entries may share its payload.
 	message         driver.OutboundMessage
+	enqueuedAt      time.Time
 	deliveryCount   int
 	sequence        uint64
 	due             time.Time
+	key             string
 	deliveredGroups map[string]bool
 }
 
-func (c *conn) Capabilities() driver.Capabilities { return c.caps }
-func (c *conn) BrokerInfo() driver.BrokerInfo     { return c.info }
-func (c *conn) Admin() driver.Admin               { return &admin{operations: &adminOperations{conn: c}} }
+type dispatchConsumerState struct {
+	stopped     bool
+	draining    bool
+	paused      bool
+	outstanding int
+	unsettled   int
+}
 
+// Capabilities returns the capabilities of this connection.
+func (c *conn) Capabilities() driver.Capabilities { return c.caps }
+
+// BrokerInfo returns broker metadata for this connection.
+func (c *conn) BrokerInfo() driver.BrokerInfo { return c.info }
+
+// Admin returns the topology administration surface for this connection.
+func (c *conn) Admin() driver.Admin { return &admin{operations: &adminOperations{conn: c}} }
+
+// Producer creates a producer using cfg.
 func (c *conn) Producer(ctx context.Context, cfg driver.ProducerConfig) (driver.Producer, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, classify("producer", driver.KindTransient, err)
@@ -262,6 +279,7 @@ func (c *conn) Producer(ctx context.Context, cfg driver.ProducerConfig) (driver.
 	return &producer{conn: c, cfg: cfg}, nil
 }
 
+// Consumer creates a consumer using cfg.
 func (c *conn) Consumer(ctx context.Context, cfg driver.ConsumerConfig) (driver.Consumer, error) {
 	return c.newConsumer(ctx, cfg, 0)
 }
@@ -370,6 +388,7 @@ func (c *conn) replayHistoryLocked(group string, destinations []string, startAft
 			}
 			dest.messages = append(dest.messages, &queuedMessage{
 				message:         cloneOutbound(original.message),
+				enqueuedAt:      original.enqueuedAt,
 				deliveryCount:   original.deliveryCount,
 				sequence:        original.sequence,
 				due:             original.due,
@@ -379,19 +398,29 @@ func (c *conn) replayHistoryLocked(group string, destinations []string, startAft
 	}
 }
 
-// recordHistoryLocked appends entry to destination's replay history,
-// evicting the oldest entries first once maxDestinationHistory is exceeded.
-// The caller must hold c.mu.
+// recordHistoryLocked appends entry to destination's replay history, evicting
+// the oldest entry once the history holds maxDestinationHistory of them. The
+// caller must hold c.mu.
+//
+// Eviction drops the oldest entry and appends the new one to what is left, so
+// the copy the append needs happens only when the backing array runs out of
+// room rather than on every publish at the cap: the slice the readers see stays
+// exactly maxDestinationHistory entries, holding the newest ones, while the
+// capacity the append consumes shrinks by one per publish and is rebuilt once
+// per fraction of the cap.
 func (c *conn) recordHistoryLocked(destination string, entry *queuedMessage) {
-	entries := append(c.history[destination], entry)
-	if overflow := len(entries) - maxDestinationHistory; overflow > 0 {
-		kept := make([]*queuedMessage, len(entries)-overflow)
-		copy(kept, entries[overflow:])
-		entries = kept
+	entry.enqueuedAt = c.clock.Now()
+	entries := c.history[destination]
+	if len(entries) == maxDestinationHistory {
+		entries[0] = nil
+		entries = append(entries[1:], entry)
+	} else {
+		entries = append(entries, entry)
 	}
 	c.history[destination] = entries
 }
 
+// Ping checks whether the connection is still open.
 func (c *conn) Ping(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
 		return classify("ping", driver.KindTransient, err)
@@ -404,6 +433,7 @@ func (c *conn) Ping(ctx context.Context) error {
 	return nil
 }
 
+// Close releases the connection after its producers and consumers have closed.
 func (c *conn) Close(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
 		return classify("close", driver.KindTransient, err)
@@ -444,9 +474,7 @@ func (c *conn) signalWake() {
 	}
 }
 
-// ReleaseDue dispatches deferred messages whose due time has arrived.
-// It lets deterministic test helpers coordinate fake time with the driver's
-// deferred-delivery storage without adding test methods to the driver port.
+// ReleaseDue dispatches deferred messages whose scheduled delivery time has arrived.
 func (c *conn) ReleaseDue() {
 	if c == nil {
 		return
@@ -540,30 +568,10 @@ func (c *conn) requeueDeliveryLocked(delivery *settler, now time.Time) {
 		delivery.mu.Unlock()
 		return
 	}
-	delivery.settled = true
+	delivery.retireLocked()
 	delivery.mu.Unlock()
 	consumer := delivery.consumer
-	delete(consumer.inflight, delivery)
-	if consumer.outstanding > 0 {
-		consumer.outstanding--
-	}
 	name := delivery.message.message.Destination
-	if consumer.unsettled[name] > 0 {
-		consumer.unsettled[name]--
-	}
-	key := string(delivery.message.message.Key)
-	if key != "" {
-		keyID := deliveryKey{destination: name, key: key}
-		if consumer.unsettledKey[keyID] > 1 {
-			consumer.unsettledKey[keyID]--
-		} else {
-			delete(consumer.unsettledKey, keyID)
-			affinity := affinityKey{group: consumer.cfg.Group, key: key}
-			if dest, ok := c.destinations[name]; ok && dest.affinity[affinity] == consumer {
-				delete(dest.affinity, affinity)
-			}
-		}
-	}
 	delivery.message.deliveryCount++
 	delivery.message.due = now
 	if delivery.message.deliveredGroups != nil {
@@ -585,6 +593,8 @@ func (d *destination) requeueLocked(message *queuedMessage) {
 		return
 	}
 	d.messages = append([]*queuedMessage{message}, d.messages...)
+	d.dispatchCursor = 0
+	d.dispatchPrepends++
 }
 
 func (c *conn) dropInFlightLocked(op string) {
@@ -602,49 +612,158 @@ func (c *conn) dropInFlightLocked(op string) {
 	c.signalWake()
 }
 
+func (d *destination) resetDispatchLocked() {
+	d.dispatchCursor = 0
+	d.dispatchKnownLen = 0
+	d.dispatchPrepends = 0
+	d.dispatchNextDue = time.Time{}
+}
+
+func (d *destination) prepareDispatch(now time.Time) {
+	if len(d.messages) < d.dispatchKnownLen {
+		d.resetDispatchLocked()
+	}
+	if d.dispatchPrepends > 0 {
+		d.dispatchCursor = 0
+	}
+	newMessages := len(d.messages) - d.dispatchKnownLen - d.dispatchPrepends
+	if newMessages <= 0 {
+		d.dispatchKnownLen = len(d.messages)
+		d.dispatchPrepends = 0
+		return
+	}
+	start := len(d.messages) - newMessages
+	for _, message := range d.messages[start:] {
+		if message.enqueuedAt.IsZero() {
+			message.enqueuedAt = now
+		}
+		if message.key == "" && len(message.message.Key) != 0 {
+			message.key = string(message.message.Key)
+		}
+		if !message.due.IsZero() &&
+			(d.dispatchNextDue.IsZero() || message.due.Before(d.dispatchNextDue)) {
+			d.dispatchNextDue = message.due
+		}
+	}
+	d.dispatchKnownLen = len(d.messages)
+	d.dispatchPrepends = 0
+}
+
+func (d *destination) hasEligibleConsumer() bool {
+	for _, consumer := range d.order {
+		if consumer.stopped || consumer.draining || consumer.paused[d.spec.Name] {
+			continue
+		}
+		if consumer.canReceive(d.spec.Name) {
+			return true
+		}
+	}
+	return false
+}
+
+func (d *destination) dispatchStateChanged() bool {
+	if d.dispatchStates == nil {
+		d.dispatchStates = make(map[*consumer]dispatchConsumerState)
+		return true
+	}
+	if len(d.dispatchStates) != len(d.order) {
+		return true
+	}
+	for _, consumer := range d.order {
+		previous, ok := d.dispatchStates[consumer]
+		if !ok || previous != d.consumerState(consumer) {
+			return true
+		}
+	}
+	return false
+}
+
+func (d *destination) rememberDispatchState() {
+	clear(d.dispatchStates)
+	for _, consumer := range d.order {
+		d.dispatchStates[consumer] = d.consumerState(consumer)
+	}
+}
+
+func (d *destination) consumerState(consumer *consumer) dispatchConsumerState {
+	return dispatchConsumerState{
+		stopped:     consumer.stopped,
+		draining:    consumer.draining,
+		paused:      consumer.paused[d.spec.Name],
+		outstanding: consumer.outstanding,
+		unsettled:   consumer.unsettled[d.spec.Name],
+	}
+}
+
 func (c *conn) dispatchLocked() {
 	now := c.clock.Now()
 destinationLoop:
 	for _, name := range c.destinationNamesLocked() {
 		dest := c.destinations[name]
-		for len(dest.messages) > 0 {
-			delivered := false
-			for i, msg := range dest.messages {
-				if !msg.due.IsZero() && now.Before(msg.due) {
-					continue
-				}
-				cs := dest.pickConsumer(msg)
-				if cs == nil {
-					continue
-				}
-				inbound, delivery := c.inboundLocked(cs, dest.spec.Name, msg)
-				select {
-				case cs.messages <- inbound:
-					cs.outstanding++
-					cs.unsettled[dest.spec.Name]++
-					cs.inflight[delivery] = struct{}{}
-					if msg.deliveredGroups == nil {
-						msg.deliveredGroups = make(map[string]bool)
-					}
-					msg.deliveredGroups[cs.cfg.Group] = true
-					key := string(msg.message.Key)
-					if key != "" {
-						dest.affinity[affinityKey{group: cs.cfg.Group, key: key}] = cs
-						cs.unsettledKey[deliveryKey{destination: dest.spec.Name, key: key}]++
-					}
-					if c.messageComplete(dest, msg) {
-						dest.messages = append(dest.messages[:i], dest.messages[i+1:]...)
-					}
-					delivered = true
-				default:
-					continue destinationLoop
-				}
-				break
-			}
-			if !delivered {
-				break
+		dest.prepareDispatch(now)
+		stateChanged := dest.dispatchStateChanged()
+		if stateChanged {
+			dest.dispatchCursor = 0
+			if !dest.dispatchNextDue.IsZero() && !now.Before(dest.dispatchNextDue) {
+				dest.dispatchNextDue = time.Time{}
 			}
 		}
+		if !dest.hasEligibleConsumer() {
+			dest.rememberDispatchState()
+			continue
+		}
+		if !dest.dispatchNextDue.IsZero() && !now.Before(dest.dispatchNextDue) {
+			dest.dispatchCursor = 0
+			dest.dispatchNextDue = time.Time{}
+		}
+		if dest.dispatchCursor > len(dest.messages) {
+			dest.dispatchCursor = 0
+		}
+	dispatchLoop:
+		for dest.dispatchCursor < len(dest.messages) {
+			i := dest.dispatchCursor
+			msg := dest.messages[i]
+			dest.dispatchCursor++
+			dest.dispatchScanned++
+			if !msg.due.IsZero() && now.Before(msg.due) {
+				if dest.dispatchNextDue.IsZero() || msg.due.Before(dest.dispatchNextDue) {
+					dest.dispatchNextDue = msg.due
+				}
+				continue
+			}
+			cs := dest.pickConsumer(msg)
+			if cs == nil {
+				continue
+			}
+			inbound, delivery := c.inboundLocked(cs, dest.spec.Name, msg)
+			select {
+			case cs.messages <- inbound:
+				cs.outstanding++
+				cs.unsettled[dest.spec.Name]++
+				cs.inflight[delivery] = struct{}{}
+				if msg.deliveredGroups == nil {
+					msg.deliveredGroups = make(map[string]bool)
+				}
+				msg.deliveredGroups[cs.cfg.Group] = true
+				key := msg.key
+				if key != "" {
+					dest.affinity[affinityKey{group: cs.cfg.Group, key: key}] = cs
+					cs.unsettledKey[deliveryKey{destination: dest.spec.Name, key: key}]++
+				}
+				if c.messageComplete(dest, msg) {
+					dest.messages = append(dest.messages[:i], dest.messages[i+1:]...)
+					dest.dispatchKnownLen = len(dest.messages)
+				}
+				dest.dispatchCursor = i
+				if !dest.hasEligibleConsumer() {
+					break dispatchLoop
+				}
+			default:
+				continue destinationLoop
+			}
+		}
+		dest.dispatchKnownLen = len(dest.messages)
+		dest.rememberDispatchState()
 	}
 }
 
@@ -668,7 +787,7 @@ func (c *conn) destinationNamesLocked() []string {
 // eligible consumers, so one group's keys never select another group's
 // consumer.
 func (d *destination) pickConsumer(message *queuedMessage) *consumer {
-	key := string(message.message.Key)
+	key := message.key
 	for index, cs := range d.order {
 		group := cs.cfg.Group
 		if message.deliveredGroups[group] {
@@ -787,15 +906,48 @@ func (c *conn) inboundLocked(cs *consumer, destination string, msg *queuedMessag
 	c.nextRef.Add(1)
 	delivery := &settler{conn: c, consumer: cs, message: msg, deliveredAt: c.clock.Now()}
 	return driver.InboundMessage{
-		Destination:   destination,
-		Key:           cloneBytes(msg.message.Key),
-		Headers:       cloneHeaders(msg.message.Headers),
-		Body:          cloneBytes(msg.message.Body),
-		DeliveryCount: deliveryCount(cs.cfg.Effective, msg.deliveryCount),
-		ReceivedAt:    c.clock.Now(),
-		Ref:           driver.BrokerRef{Tag: c.nextRef.Load(), Raw: destination},
-		Settle:        delivery,
+		Destination:      destination,
+		Key:              cloneBytes(msg.message.Key),
+		Headers:          cloneHeaders(msg.message.Headers),
+		Body:             cloneBytes(msg.message.Body),
+		DeliveryCount:    deliveryCount(cs.cfg.Effective, msg.deliveryCount),
+		ReceivedAt:       c.clock.Now(),
+		EnqueuedAt:       msg.enqueuedAt,
+		EnqueuedAtSource: driver.EnqueueSourceBroker,
+		Ref:              driver.BrokerRef{Tag: c.nextRef.Load(), Raw: destination},
+		Settle:           delivery,
 	}, delivery
+}
+
+// Backlog reports queue depth and, when available, the enqueue time of each destination's head message.
+func (c *consumer) Backlog(ctx context.Context) (map[string]driver.BacklogSample, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, classify("backlog", driver.KindTransient, err)
+	}
+	if !c.cfg.Effective.LagQueryable {
+		return nil, classify("backlog", driver.KindFatal, driver.ErrUnsupported)
+	}
+	c.conn.mu.Lock()
+	defer c.conn.mu.Unlock()
+	c.conn.dispatchLocked()
+	out := make(map[string]driver.BacklogSample, len(c.destinations))
+	for _, name := range c.destinations {
+		messages := c.conn.destinations[name].messages
+		sample := driver.BacklogSample{Lag: int64(len(messages))}
+		for _, message := range messages {
+			if message.enqueuedAt.IsZero() {
+				continue
+			}
+			if sample.HeadEnqueuedAt.IsZero() || message.enqueuedAt.Before(sample.HeadEnqueuedAt) {
+				sample.HeadEnqueuedAt = message.enqueuedAt
+			}
+		}
+		if !sample.HeadEnqueuedAt.IsZero() {
+			sample.HeadSource = driver.EnqueueSourceBroker
+		}
+		out[name] = sample
+	}
+	return out, nil
 }
 
 func deliveryCount(caps driver.Capabilities, count int) int {

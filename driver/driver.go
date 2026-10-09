@@ -55,15 +55,14 @@ type Conn interface {
 
 // BrokerInfo contains free-form broker metadata for logs and diagnostics.
 type BrokerInfo struct {
-	Kind    string            // broker type, such as "kafka" or "rabbitmq"
-	Version string            // best-effort broker version
-	Nodes   []string          // broker nodes, when known
-	Extra   map[string]string // driver-specific metadata
+	Kind    string            // Kind is the broker type, such as "kafka" or "rabbitmq".
+	Version string            // Version is the best-effort broker version.
+	Nodes   []string          // Nodes lists broker nodes when known.
+	Extra   map[string]string // Extra contains driver-specific metadata.
 }
 
-// Display renders "kind version" for logs.
-//
-// Core code must use Display rather than reading Version directly.
+// Display returns the broker kind and version as "kind version", omitting
+// either part when it is empty.
 func (b BrokerInfo) Display() string {
 	switch {
 	case b.Kind == "":
@@ -79,9 +78,9 @@ func (b BrokerInfo) Display() string {
 // Implementations must be safe for concurrent use.
 type Producer interface {
 	// Publish sends messages and must not return nil until the broker has
-	// durably acknowledged every message. Partial failure returns a
-	// PublishError carrying per-message results, so the core retries only the
-	// failed subset. Publish must be safe for concurrent use.
+	// durably acknowledged every message. On partial failure it returns a
+	// [PublishError] with per-message results. Publish must be safe for
+	// concurrent use.
 	Publish(ctx context.Context, msgs ...OutboundMessage) error
 
 	// Close releases producer resources.
@@ -91,13 +90,13 @@ type Producer interface {
 // Consumer delivers messages from a set of destinations.
 // Implementations must be safe for concurrent use.
 type Consumer interface {
-	// Messages yields delivered messages. The channel is closed only after Stop
-	// completes. Drivers must not close it on transient errors.
+	// Messages yields delivered messages. The channel is closed only after Stop or
+	// Release completes. Drivers must not close it on transient errors.
 	Messages() <-chan InboundMessage
 
-	// Errors yields asynchronous driver errors: connection loss, rebalance
-	// notifications, and transport decode failures. The core logs and counts
-	// these; fatal ones stop only the subscription that received the error.
+	// Errors returns asynchronous errors reported for this consumer, such as
+	// connection loss, rebalance notifications, or transport decode failures.
+	// The core logs and counts these; fatal errors stop only this subscription.
 	Errors() <-chan error
 
 	// Pause stops delivery without leaving the consumer group. Accumulation must
@@ -113,29 +112,24 @@ type Consumer interface {
 	// settleable. Messages yields nothing new after Drain returns.
 	Drain(ctx context.Context) error
 
-	// Stop performs final settlement and then closes Messages. It must not be
-	// called before every delivered message has been settled. Stop must flush
+	// Stop performs final settlement and then closes Messages. It refuses while
+	// any delivered message is still unsettled. Stop must flush
 	// committed positions before returning; if ctx expires first, it returns
-	// ErrDrainTimeout.
+	// ErrDrainTimeout. A Stop refused because messages are still unsettled
+	// wraps ErrResourcesOutstanding. After any Stop error the core calls
+	// Release, which must then give back the unsettled messages. Stop after
+	// Release returns nil.
 	Stop(ctx context.Context) error
 
-	// Release abandons every outstanding delivery WITHOUT settling it and then
-	// closes the consumer. The broker redelivers, to the same consumer group,
-	// whatever this consumer was given and did not settle. Release is the port
-	// verb for "give these back"; Stop is the verb for "I am finished with
-	// these", and the two must not be conflated.
+	// Release abandons outstanding deliveries without settling them and then
+	// closes the consumer. The broker redelivers un-settled deliveries to the
+	// same consumer group. Release makes no durability promise about committed
+	// positions.
 	//
-	// Release makes NO durability promise about committed positions. That is the
-	// difference from Stop, and it is why it is a separate verb rather than a
-	// flag: a driver that flushed positions here would commit past a message it
-	// is deliberately handing back.
-	//
-	// On a consumer with nothing outstanding Release behaves as Stop does.
-	// Release is idempotent, and on an already-released or already-stopped
-	// consumer it returns nil.
-	//
-	// A driver that genuinely cannot return unsettled deliveries returns
-	// ErrUnsupported.
+	// Release on a consumer with no outstanding deliveries behaves like Stop.
+	// Release is idempotent and returns nil when the consumer is already stopped
+	// or released. A driver that cannot return unsettled deliveries returns
+	// [ErrUnsupported].
 	Release(ctx context.Context) error
 
 	// Lag reports per-destination backlog. Drivers that cannot determine lag
@@ -159,87 +153,128 @@ type Admin interface {
 // Maintenance provides optional destructive destination operations.
 // Implementations must be safe for concurrent use.
 type Maintenance interface {
-	// Purge empties a destination and keeps it.
+	// Purge empties a destination, keeps it, and returns the number of messages
+	// removed.
 	Purge(ctx context.Context, destination string) (int64, error)
 
 	// Prune is the only deletion operation in the port and reports the result
 	// for each requested name.
 	//
+	// A nil error means the batch was processed, not that every requested
+	// destination was deleted. A refused destination is reported in its own
+	// PruneResult with Deleted false and a non-empty Reason. Callers must
+	// inspect every result.
+	//
 	// A destination is prunable only when it is empty, its driver-managed
 	// auxiliary destinations are empty, and no consumer is attached. Drivers
 	// must recheck these guards before each delete and delete auxiliaries first.
+	// The recheck and the delete are not atomic on every broker: a message
+	// published or a consumer attached between them can be deleted with the
+	// destination, so Prune only destinations traffic has already left.
 	Prune(ctx context.Context, names []string) ([]PruneResult, error)
 }
 
 // Config contains connection settings shared by all drivers.
 type Config struct {
-	Endpoints             []string      // broker endpoints
-	ClientID              string        // stable client identity
-	InstanceID            string        // stable group instance identity
-	RebalanceDrainTimeout time.Duration // bound for in-flight settlement during rebalance drain
-	ConnectTimeout        time.Duration // timeout for Open retries
-	TLS                   *TLSConfig    // nil disables TLS
-	SASL                  *SASLConfig   // nil disables SASL
-	// Logger receives driver diagnostics: conditions the driver survives and
-	// reports without failing the operation that met them. A nil Logger means
-	// the driver falls back to slog.Default(), so every driver must accept a
-	// nil Logger; inmem opens with a zero Config.
+	Endpoints             []string      // Endpoints lists the broker endpoints used when opening a connection.
+	ClientID              string        // ClientID is the stable client identity presented to the broker.
+	InstanceID            string        // InstanceID is the stable identity of this consumer group instance.
+	RebalanceDrainTimeout time.Duration // RebalanceDrainTimeout bounds in-flight settlement during a rebalance drain.
+	ConnectTimeout        time.Duration // ConnectTimeout bounds retries performed by Open.
+	TLS                   *TLSConfig    // TLS configures transport security; nil disables TLS.
+	SASL                  *SASLConfig   // SASL configures authentication; nil disables SASL.
+	// Logger receives driver diagnostics that do not fail the operation that
+	// encountered them. A nil Logger uses [slog.Default].
 	Logger *slog.Logger
-	// DriverOptions carries driver-specific knobs untouched by the core.
+	// DriverOptions contains driver-specific settings that the core does not
+	// interpret.
 	DriverOptions map[string]string
 }
 
 // TLSConfig contains the portable subset of TLS settings exposed by the port.
 type TLSConfig struct {
-	Enabled            bool   // whether TLS is enabled
-	CAFile             string // trusted CA file
-	CertFile           string // client certificate file
-	KeyFile            string // client key file
-	InsecureSkipVerify bool   // never true outside a test fixture
+	Enabled            bool   // Enabled reports whether TLS is enabled.
+	CAFile             string // CAFile names the trusted CA certificate file.
+	CertFile           string // CertFile names the client certificate file.
+	KeyFile            string // KeyFile names the client private key file.
+	ServerName         string // ServerName overrides the host name used to verify the broker certificate; empty derives it from the endpoint.
+	InsecureSkipVerify bool   // InsecureSkipVerify disables broker certificate verification and is intended only for test fixtures.
 }
 
 // SASLConfig selects a SASL mechanism and carries credentials.
 // Empty Mechanism means no SASL. Credentials must not be logged.
 type SASLConfig struct {
-	Mechanism string // SASL mechanism, such as "plain" or "scram-sha-256"
-	Username  string
-	Password  string
+	Mechanism string // Mechanism selects the SASL mechanism, such as "plain" or "scram-sha-256".
+	Username  string // Username is the credential name supplied to the SASL mechanism.
+	Password  string // Password is the credential secret supplied to the SASL mechanism.
 }
 
 // ProducerConfig configures a Producer.
 type ProducerConfig struct {
-	// RequireDurableAck must be honored. The core always sets it true in v1.
-	RequireDurableAck bool
-
 	// Effective is the capability set selected by the core.
 	Effective Capabilities
 }
 
 // ConsumerConfig configures a Consumer over one subscription's destinations.
 type ConsumerConfig struct {
-	Group        string   // consumer group or queue-set identity
-	Destinations []string // main and retry lanes for this subscription
+	Group        string   // Group is the consumer group or queue-set identity.
+	Destinations []string // Destinations lists this subscription's main and retry destinations.
 
-	// Prefetch is the subscription-wide in-flight budget. The core divides it
-	// across destinations with a minimum of one per lane and passes each lane's
-	// result in PerDestination. Prefetch below the lane count is rejected by
-	// the core rather than silently changing the budget.
-	Prefetch       int
+	// Prefetch bounds total SDK-admitted unsettled deliveries across all
+	// destinations when positive. The core always supplies a positive budget:
+	// automatic sizing uses the sum of lane capacities, and explicit budgets
+	// are capped by that sum. Broker/client transport read-ahead is separate.
+	// In ordered mode, the effective prefetch is also the worker queue depth.
+	Prefetch int
+	// PerDestination gives an additional admission ceiling for each physical
+	// destination. Its entries may sum above Prefetch; both bounds apply.
 	PerDestination map[string]int
 
-	// Delays is the delay each destination in Destinations declares, keyed by
-	// the physical destination name the records on it carry. A destination
-	// absent from the map has no delay. The core fills it from the same topology
-	// it passes to EnsureTopology, so a consumer that defers reads the delay it
-	// needs here rather than from state an earlier call left on the connection.
-	// A driver that defers on the producer side may ignore it.
+	// Delays maps physical destination names to their declared delays. A
+	// destination absent from the map has no delay. The core derives these
+	// values from the same topology it passes to EnsureTopology, not from state
+	// left on the connection by an earlier call. Drivers that defer delivery on
+	// the consumer side use these values; drivers that defer on publish may
+	// ignore them.
 	Delays map[string]time.Duration
 
-	Exclusive bool          // request single-active-consumer semantics
-	StartAt   StartPosition // Earliest or Latest for a new group only
+	Exclusive bool          // Exclusive requests single-active-consumer semantics.
+	StartAt   StartPosition // StartAt selects the start position for a new group.
 
-	// Effective is the capability set selected by the core.
+	// Effective is the capability set selected by the core. The zero value is
+	// the unset sentinel: the driver resolves a capability it also learns from
+	// the connection there instead of from this field. The Kafka consumer
+	// resolves every capability that way and the RabbitMQ consumer resolves its
+	// delivery count that way; a capability a driver reads only from this field
+	// is taken as it stands, so a zero value asks for the driver's unset
+	// behaviour rather than for what the connection can do. The core sets it
+	// on every call, but a strict-portability profile can itself be all zero,
+	// and a driver cannot tell that apart from unset.
 	Effective Capabilities
+}
+
+// DestinationPrefetch returns the in-flight capacity of Destinations[index]:
+// its PerDestination entry when that is positive, otherwise an even share of
+// Prefetch with the remainder going to the first destinations. index must be
+// in range. It is never less than 1, so when Prefetch is smaller than the
+// number of destinations the windows add up to more than Prefetch. These
+// destination ceilings do not replace the positive aggregate Prefetch cap.
+func (c ConsumerConfig) DestinationPrefetch(index int) int {
+	if index >= 0 && index < len(c.Destinations) {
+		if value := c.PerDestination[c.Destinations[index]]; value > 0 {
+			return value
+		}
+	}
+	if c.Prefetch > 0 && len(c.Destinations) > 0 {
+		base := c.Prefetch / len(c.Destinations)
+		if index < c.Prefetch%len(c.Destinations) {
+			base++
+		}
+		if base > 0 {
+			return base
+		}
+	}
+	return 1
 }
 
 // StartPosition controls where a new consumer group begins. It never
