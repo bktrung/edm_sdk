@@ -1,3 +1,5 @@
+# Slide: [`slide/presentation.html`](slide/presentation.html) - project presentation deck.
+
 # F1 - Event-Driven Messaging SDK
 
 F1 is a Go SDK for publishing and consuming events without writing broker code.
@@ -193,6 +195,7 @@ and the [Google Go Style Guide](https://google.github.io/styleguide/go/guide.htm
 Start with these local documents:
 
 - [`docs/index.md`](docs/index.md) - documentation home: guarantees at a glance and a path for service authors, runtime readers, and driver authors.
+- [`slide/presentation.html`](slide/presentation.html) - project presentation deck.
 - [`docs/learn/getting-started.md`](docs/learn/getting-started.md) - install and connect the SDK in a Go service.
 - [`docs/advanced-topics/running-in-production.md`](docs/advanced-topics/running-in-production.md) - production configuration, probes, shutdown, observability, and launch checklist.
 - [`docs/development/architecture.md`](docs/development/architecture.md) - current package boundaries and invariants.
