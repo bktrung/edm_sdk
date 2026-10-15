@@ -611,6 +611,28 @@ func newConsumer(ctx context.Context, connection *conn, cfg driver.ConsumerConfi
 	// Install the membership operations before any goroutine can read them:
 	// the poll loop starts below, and the leave loop starts on first use.
 	consumer.leaveStatic = func(ctx context.Context, group, instanceID string) error {
+		// This member's own group loop has to be gone before the broker is told
+		// the member is gone. The admin leave below only removes it from the
+		// coordinator's view; the loop is what re-joins, and with an instance ID
+		// configured franz-go sends no leave of its own on Close either, so a
+		// loop that outlives the admin leave takes the partitions straight back
+		// and holds them until teardown while it no longer polls. So: stop the
+		// loop, then leave by instance ID. client.LeaveGroupContext is the only
+		// call that stops group management without closing the client, and for a
+		// static member it deliberately sends no LeaveGroup request, leaving the
+		// admin call below as the one removal.
+		//
+		// The stop reports a context error alone, and the leave loop runs its
+		// operation once: a later Stop or Release meets the finished leave and
+		// tears down without retrying either half. A stop that fails is therefore
+		// not papered over by leaving anyway, because the member would then be
+		// removed while its loop may still re-join and hand it the partitions
+		// back. The cost is that the broker expires the member on its session
+		// timeout instead of releasing the partitions at once, and that cost is
+		// reported: the stop error reaches Errors() and the caller.
+		if err := client.LeaveGroupContext(ctx); err != nil {
+			return err
+		}
 		responses, err := kadm.NewClient(connection.client).LeaveGroup(ctx, kadm.LeaveGroup(group).InstanceIDs(instanceID))
 		if err != nil {
 			return err
@@ -2458,20 +2480,82 @@ func (c *consumer) revokeTrackers(revoked []revokedAssignment) {
 	}
 }
 
-// commitSettledPrefix commits what each revoked ownership had settled. The
-// offset a revoked tracker advanced to is the first record this consumer did not
-// deliver, so the partition's next owner starts there and redelivers whatever
-// the revoke did not reach. A commit that fails is reported on Errors() and
-// changes nothing else: the next owner then redelivers from the offset the
-// broker does have committed.
+// errRevokeCommitBound is the result of every partition of a revoke commit
+// batch the commit bound ended before the broker answered.
+var errRevokeCommitBound = errors.New("kafka: revoke commit bound expired")
+
+// commitSettledPrefix commits what each revoked ownership had settled, in one
+// request carrying every revoked partition's finished offset. The offset a
+// revoked tracker advanced to is the first record this consumer did not deliver,
+// so the partition's next owner starts there and redelivers whatever the revoke
+// did not reach.
+//
+// The commit runs under its own bound rather than sharing the wait's:
+// rebalanceDrainTimeout is the handler wait, and a broker that answers a commit
+// slowly must not push the callback past the rebalance and shutdown budgets the
+// wait was sized to fit inside. A commit that fails or does not finish in its
+// bound is reported on Errors() and changes nothing else: the next owner then
+// redelivers from the offset the broker does have committed.
 func (c *consumer) commitSettledPrefix(ctx context.Context, revoked []revokedAssignment) {
+	points := make(map[partitionKey]int64, len(revoked))
 	for _, assignment := range revoked {
+		// A partition this consumer never tracked has nothing to commit, and it
+		// is left out rather than sent as offset 0, which would commit a mature
+		// partition backward.
 		if assignment.tracker == nil {
 			continue
 		}
-		if err := c.commitOffset(ctx, assignment.key, assignment.tracker.CommitPoint()); err != nil {
-			c.sendError(classify("consumer.revoke", kafkaErrorKind(err), err))
+		// The point is read here, after the wait and after the tracker was
+		// tombstoned, so what a settlement advanced during the wait is the
+		// prefix this request commits. Drop only rejects later settlements; a
+		// tombstoned tracker still reports what its ownership finished.
+		points[assignment.key] = assignment.tracker.CommitPoint()
+	}
+	if len(points) == 0 {
+		return
+	}
+	bound := c.commitBound()
+	if bound <= 0 {
+		// A bound with no room in it cannot carry a round trip, so no request
+		// is started and the partitions' next owners replay what was settled.
+		c.reportRevokeCommitExpired(points, bound)
+		return
+	}
+	send := c.commitFn
+	if send == nil {
+		send = c.sendCommits
+	}
+	commitCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	timer := c.clock.Timer(bound)
+	defer timer.Stop()
+	done := make(chan map[partitionKey]error, 1)
+	go func() { done <- send(commitCtx, points) }()
+	select {
+	case results := <-done:
+		for key := range points {
+			if err := results[key]; err != nil {
+				c.sendError(classify("consumer.revoke", kafkaErrorKind(err), err))
+			}
 		}
+	case <-timer.C:
+		// The sender can be waiting for the offset lock of a commit it does not
+		// own, which no context ends, so the callback returns on the timer
+		// instead of waiting for it. The abandoned request carries settled
+		// offsets only, so one that lands after this return turns a replay into
+		// a non-replay and never loses an offset.
+		cancel()
+		c.reportRevokeCommitExpired(points, bound)
+	}
+}
+
+// reportRevokeCommitExpired reports a revoke commit the bound ended, once per
+// partition of the batch: the partitions share the one request, so they share
+// the one reason and each of their next owners has to replay.
+func (c *consumer) reportRevokeCommitExpired(points map[partitionKey]int64, bound time.Duration) {
+	err := classify("consumer.revoke", driver.KindTransient, fmt.Errorf("%w after %s", errRevokeCommitBound, bound))
+	for range points {
+		c.sendError(err)
 	}
 }
 
@@ -2482,6 +2566,13 @@ func (c *consumer) settleBound() time.Duration {
 	}
 	return defaultKafkaRebalanceDrainTimeout
 }
+
+// commitBound is the bound a revoke's final commit runs under: one third of the
+// wait, so a whole revoke stays at or under 80% of the smaller group timeout the
+// wait is itself capped against. It is separate from the wait because
+// rebalanceDrainTimeout means the handler wait; folding the commit into it would
+// change what an operator configured.
+func (c *consumer) commitBound() time.Duration { return c.settleBound() / 3 }
 
 // partitionWarning is one destination this member cannot fill: it holds fewer
 // partitions of it than the subscription gives the destination delivery slots,

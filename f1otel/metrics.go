@@ -19,6 +19,7 @@ type metrics struct {
 	laneWait           metric.Float64Histogram
 	retries            metric.Int64Counter
 	deadLetters        metric.Int64Counter
+	poisonDropped      metric.Int64Counter
 }
 
 func newMetrics(meter metric.Meter) *metrics {
@@ -64,6 +65,9 @@ func newMetrics(meter metric.Meter) *metrics {
 		otel.Handle(err)
 	}
 	if out.deadLetters, err = meter.Int64Counter("f1.messaging.dead_letters"); err != nil {
+		otel.Handle(err)
+	}
+	if out.poisonDropped, err = meter.Int64Counter("f1.messaging.poison_dropped"); err != nil {
 		otel.Handle(err)
 	}
 	return out

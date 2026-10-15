@@ -131,6 +131,49 @@ func TestMetricsOnlyFinishHasNoExemplar(t *testing.T) {
 	require.True(t, ok)
 	require.Len(t, histogram.DataPoints, 1)
 	require.Empty(t, histogram.DataPoints[0].Exemplars)
+
+	for _, tc := range []struct {
+		kind        f1.ObserverKind
+		deadLetters int64
+		poisonDrops int64
+	}{
+		{f1.ObserverPoisonRejected, 0, 1},
+		{f1.ObserverDeadLetterPublished, 1, 0},
+	} {
+		t.Run(string(tc.kind), func(t *testing.T) {
+			reader := sdkmetric.NewManualReader()
+			provider := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
+			t.Cleanup(func() { require.NoError(t, provider.Shutdown(context.Background())) })
+			observer, err := New(WithMeterProvider(provider))
+			require.NoError(t, err)
+			observer.Record(f1.PointEvent{
+				Kind: f1.ObserverDriverSelected, DriverName: "inmem",
+				ServerAddress: "127.0.0.1", ServerPort: 19092,
+			})
+			observer.Record(f1.PointEvent{
+				Kind: tc.kind, Topic: "orders.created", ConsumerGroup: "orders",
+				Priority: f1.PriorityHigh, ErrorClass: f1.ErrorClassPoison, Reason: f1.ReasonPoison,
+			})
+			var collected metricdata.ResourceMetrics
+			require.NoError(t, reader.Collect(context.Background(), &collected))
+			counts := map[string]int64{}
+			for _, scope := range collected.ScopeMetrics {
+				for _, instrument := range scope.Metrics {
+					sum := asSum[int64](t, instrument)
+					require.Len(t, sum.DataPoints, 1)
+					counts[instrument.Name] = sum.DataPoints[0].Value
+					require.Equal(t, map[string]string{
+						"messaging.system": "f1.inmem", "messaging.destination.name": "orders.created",
+						"messaging.consumer.group.name": "orders", "f1.priority": "high",
+						"error.type": "f1_poison", "reason": "poison",
+						"server.address": "127.0.0.1", "server.port": "19092",
+					}, stringAttributes(sum.DataPoints[0].Attributes))
+				}
+			}
+			require.Equal(t, tc.deadLetters, counts["f1.messaging.dead_letters"])
+			require.Equal(t, tc.poisonDrops, counts["f1.messaging.poison_dropped"])
+		})
+	}
 }
 
 type scopeRecordingMeterProvider struct {

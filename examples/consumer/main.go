@@ -39,7 +39,7 @@ func main() {
 
 func run() (runErr error) {
 	configPath := flag.String("config", "examples/config.yaml", "path to the F1 YAML configuration")
-	readyAddr := flag.String("ready-addr", ":8081", "address for the readiness endpoint")
+	readyAddr := flag.String("ready-addr", ":8081", "address for the /readyz and /healthz probes")
 	flag.Parse()
 
 	ctx := context.Background()
@@ -76,8 +76,9 @@ func run() (runErr error) {
 
 	// Shutdown budgets are 5s readiness + 15s drain + 5s close + 2s telemetry flush = 27s,
 	// below the pod's terminationGracePeriodSeconds (30s by default).
-	// Liveness must not depend on broker reachability.
-	server := &http.Server{Addr: *readyAddr, Handler: readinessHandler(client), ReadHeaderTimeout: 5 * time.Second}
+	// The probe server runs for the life of the process, so /readyz answers
+	// while the subscription is still attaching its consumer.
+	server := &http.Server{Addr: *readyAddr, Handler: probeHandler(client), ReadHeaderTimeout: 5 * time.Second}
 	serverErr := make(chan error, 1)
 	go func() {
 		if err := server.ListenAndServe(); !errors.Is(err, http.ErrServerClosed) {
@@ -140,16 +141,35 @@ func run() (runErr error) {
 	}
 }
 
-func readinessHandler(client *f1.Client) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+// probeHandler serves the two probes a deployment asks of this consumer.
+// /healthz is liveness: Client.Health reports a client that still takes work,
+// any subscription that stopped, and a client that cannot reach the broker, so
+// a liveness probe here restarts the process through a broker outage; a
+// deployment that must not restart for a broker it is reconnecting to should
+// point liveness at the process's own loop instead. /readyz is readiness:
+// Client.Ready reports ready only once every registered subscription's runner
+// has admitted a consumer, so a process that has not attached yet, or one
+// reconnecting, stays out of the traffic pool.
+func probeHandler(client *f1.Client) http.Handler {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/healthz", probe(client.Health))
+	mux.HandleFunc("/readyz", probe(client.Ready))
+	return mux
+}
+
+// probe turns a client probe into the handler a deployment calls: 204 when the
+// probe reports nil, and 503 carrying the probe's error otherwise, with a
+// two-second deadline for the request.
+func probe(check func(context.Context) error) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
 		ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
 		defer cancel()
-		if err := client.Health(ctx); err != nil {
-			http.Error(w, "not ready", http.StatusServiceUnavailable)
+		if err := check(ctx); err != nil {
+			http.Error(w, err.Error(), http.StatusServiceUnavailable)
 			return
 		}
 		w.WriteHeader(http.StatusNoContent)
-	})
+	}
 }
 
 func handleMessage(_ context.Context, event *f1.Event) error {

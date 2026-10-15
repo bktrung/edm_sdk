@@ -675,3 +675,119 @@ func TestPublishReturnsAfterDiscardedProducerCloseTimeout(t *testing.T) {
 		}
 	}
 }
+
+type ownedAdmissionProducer struct {
+	admissionProducer
+	firstCloseErr error
+	closed        atomic.Bool
+}
+
+func (p *ownedAdmissionProducer) Close(ctx context.Context) error {
+	_ = p.admissionProducer.Close(ctx)
+	_, calls := p.counts()
+	if calls == 1 && p.firstCloseErr != nil {
+		return p.firstCloseErr
+	}
+	p.closed.Store(true)
+	return nil
+}
+
+type ownedAdmissionConn struct {
+	*producerAdmissionConn
+	producers  []*ownedAdmissionProducer
+	closeCalls atomic.Int32
+}
+
+func (c *ownedAdmissionConn) Close(context.Context) error {
+	c.closeCalls.Add(1)
+	for _, producer := range c.producers {
+		if !producer.closed.Load() {
+			return driver.ErrResourcesOutstanding
+		}
+	}
+	return nil
+}
+
+func TestDiscardedProducerFailureIsRetriedBeforeConnection(t *testing.T) {
+	closeErr := errors.New("discarded producer first close failed")
+	producers := []*ownedAdmissionProducer{
+		{firstCloseErr: closeErr},
+		{firstCloseErr: closeErr},
+	}
+	built := make(chan struct{}, 2)
+	buildRelease := make(chan struct{})
+	var releaseOnce sync.Once
+	releaseBuild := func() { releaseOnce.Do(func() { close(buildRelease) }) }
+	t.Cleanup(releaseBuild)
+	var buildCalls atomic.Int32
+	conn := &ownedAdmissionConn{
+		producerAdmissionConn: &producerAdmissionConn{
+			publishConn: &publishConn{info: driver.BrokerInfo{Kind: "test", Version: "1"}},
+			build: func() (driver.Producer, error) {
+				index := buildCalls.Add(1) - 1
+				built <- struct{}{}
+				<-buildRelease
+				return producers[index], nil
+			},
+		},
+		producers: producers,
+	}
+	fake := clock.NewFake(time.Unix(950, 0))
+	client, err := New(context.Background(), testClientConfig(t),
+		WithDriver(&producerAdmissionDriver{conn: conn}), withClock(fake))
+	if err != nil {
+		t.Fatal(err)
+	}
+	results := make(chan error, 2)
+	var publishers sync.WaitGroup
+	t.Cleanup(func() {
+		releaseBuild()
+		finished := make(chan struct{})
+		go func() { publishers.Wait(); close(finished) }()
+		waitForSignal(t, finished, "first publishes cleanup")
+		_ = client.Close(context.Background())
+	})
+	for range 2 {
+		publishers.Go(func() {
+			results <- publishMessages(client, context.Background(), driver.OutboundMessage{Destination: "orders.created"})
+		})
+	}
+	waitForSignal(t, built, "first gated build")
+	waitForSignal(t, built, "second gated build")
+	releaseBuild()
+	for range 2 {
+		if err := assertReturns(t, results, "concurrent first publish"); err != nil {
+			t.Fatalf("publish = %v, want nil despite losing producer cleanup failure", err)
+		}
+	}
+	var loser, winner *ownedAdmissionProducer
+	for _, producer := range producers {
+		publishes, closes := producer.counts()
+		switch {
+		case publishes == 0 && closes == 1:
+			loser = producer
+		case publishes == 2 && closes == 0:
+			winner = producer
+		default:
+			t.Fatalf("producer counts = publish %d, close %d, want loser 0/1 or winner 2/0", publishes, closes)
+		}
+	}
+	if loser == nil || winner == nil {
+		t.Fatal("publish counts did not identify one winner and one discarded producer")
+	}
+	// Only the discarded producer has a failing first close. The installed
+	// producer must close normally so a failure identifies lost ownership.
+	winner.firstCloseErr = nil
+	if err := client.Close(context.Background()); err != nil {
+		t.Fatalf("Close = %v, want retained loser retried before connection", err)
+	}
+	if _, calls := loser.counts(); calls != 2 {
+		t.Fatalf("discarded producer Close calls = %d, want 2", calls)
+	}
+	if calls := conn.closeCalls.Load(); calls != 1 {
+		t.Fatalf("parent connection Close calls = %d, want 1 after all producers closed", calls)
+	}
+	if !loser.closed.Load() || !winner.closed.Load() {
+		t.Fatal("connection shutdown succeeded without closing both owned producers")
+	}
+}

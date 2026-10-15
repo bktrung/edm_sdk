@@ -93,7 +93,7 @@ The process span is a new root linked to the inbound trace context, and the cont
 
 ## OpenTelemetry metrics
 
-`f1otel` records eleven instruments. Names below are the OpenTelemetry names emitted by the adapter. `messaging.destination.name` is the [topic name from your code](/learn/glossary#logical-topic), not the [broker queue or topic name](/learn/glossary#physical-destination). `messaging.system` is `f1.<driver>` when the driver is known.
+`f1otel` records the following instruments. Names below are the OpenTelemetry names emitted by the adapter. `messaging.destination.name` is the [topic name from your code](/learn/glossary#logical-topic), not the [broker queue or topic name](/learn/glossary#physical-destination). `messaging.system` is `f1.<driver>` when the driver is known.
 
 | Name | Kind | Unit | Recorded when |
 | --- | --- | --- | --- |
@@ -108,16 +108,17 @@ The process span is a new root linked to the inbound trace context, and the cont
 | `f1.messaging.lane.wait.duration` | histogram | `s` | A lane [jumping the queue when overdue](/learn/glossary#deadline-promotion) reports the lane wait. |
 | `f1.messaging.retries` | sum | none | A retry schedule is confirmed. |
 | `f1.messaging.dead_letters` | sum | none | A dead-letter publication is confirmed. |
+| `f1.messaging.poison_dropped` | sum | none | F1 acknowledges a message with no retained copy (`ObserverPoisonRejected`). |
 | Attribute | Meaning | Instruments |
 | --- | --- | --- |
 | `messaging.system` | Driver system, `f1.<driver>` when known | All instruments |
 | `messaging.destination.name` | Topic name from your code | All instruments |
 | `messaging.operation.name` | Operation name | `messaging.client.sent.messages` (`publish`), `messaging.client.consumed.messages` (`receive`), `messaging.client.operation.duration` (`publish` or `settle`), and `messaging.process.duration` (`process`) |
-| `messaging.consumer.group.name` | Consumer group | `messaging.client.consumed.messages`, `messaging.client.operation.duration` for `settle` only, `messaging.process.duration`, `f1.messaging.broker.wait.duration`, `f1.messaging.backlog.messages`, `f1.messaging.backlog.oldest.age`, `f1.messaging.deadline.promotions`, `f1.messaging.lane.wait.duration`, `f1.messaging.retries`, and `f1.messaging.dead_letters`; omitted from sent messages |
+| `messaging.consumer.group.name` | Consumer group | `messaging.client.consumed.messages`, `messaging.client.operation.duration` for `settle` only, `messaging.process.duration`, `f1.messaging.broker.wait.duration`, `f1.messaging.backlog.messages`, `f1.messaging.backlog.oldest.age`, `f1.messaging.deadline.promotions`, `f1.messaging.lane.wait.duration`, `f1.messaging.retries`, `f1.messaging.dead_letters`, and `f1.messaging.poison_dropped`; omitted from sent messages |
 | `f1.priority` | F1 priority | All instruments |
 | `server.address`, `server.port` | Broker endpoint when known | All instruments |
-| `error.type` | Classified error | `messaging.process.duration` when classified, `f1.messaging.retries`, and `f1.messaging.dead_letters` |
-| `reason` | Dead-letter reason when known | `f1.messaging.dead_letters` |
+| `error.type` | Classified error | `messaging.process.duration` when classified, `f1.messaging.retries`, `f1.messaging.dead_letters`, and `f1.messaging.poison_dropped` |
+| `reason` | Dead-letter reason when known | `f1.messaging.dead_letters` and `f1.messaging.poison_dropped` |
 
 Attributes are omitted when empty or undefined for an event kind. The adapter does not emit a duration when its required timestamp source is unavailable. Primary publish calls omit `f1.priority` when priorities are mixed or unresolved; a uniform priority is retained even across mixed topics. Mixed-topic publish calls omit the destination name, while a uniform topic is retained even across mixed priorities. Primary send spans set a known priority at Finish, not at the unresolved Start.
 
@@ -127,6 +128,14 @@ Connection changes are not metrics. The observer receives `connection_lost` and
 `connection_restored` point events from the reconnect supervisor, but `f1otel`
 does not turn them into instruments. To alert on reconnects, handle those kinds
 in your own [observer](/basics/observer), or watch `Client.Health`.
+
+`Client.Health` is the liveness probe and `Client.Ready` is the readiness probe. Health answers
+whether the client still takes work and reports any subscription that stopped, so a client whose
+consumer has not attached yet, and one reconnecting, are live. Ready answers the stricter question
+a router asks: it is nil only while Health is nil and every registered subscription's runner has
+admitted a consumer. Probe readiness with `Client.Ready`; a process that is starting up, or
+rebuilding a connection, otherwise receives traffic it cannot serve. A client with no registered
+subscriptions is ready as soon as Health is.
 
 ## Use enqueue timestamps correctly
 

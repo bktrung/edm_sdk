@@ -147,9 +147,20 @@ f1 worker exceeded stuck threshold
 rabbitmq: broker cancelled the consumer for destination %q
 ```
 
-**Why** RabbitMQ cancelled a consumer, commonly because the queue's consumer-timeout argument expired while a delivery was in progress.
+**Why** RabbitMQ cancelled a consumer, commonly because the queue's consumer-timeout argument expired while a delivery was in progress. F1 then attaches a replacement consumer; when that attach fails because the destination is gone or refuses it, F1 ends the consumer generation and rebuilds the consumer instead, which is the entry below.
 
 **Fix** Compare handler timeout, `broker.rabbitmq.consumerTimeout`, and the queue's existing timeout argument; increase the broker setting and recreate the queue if required. See [RabbitMQ options](/drivers/rabbitmq#rabbitmq-options).
+
+### RabbitMQ cannot reattach to a destination
+
+```text
+re-establishing destination %q: ... NOT_FOUND - no queue %q in vhost '/'
+f1: subscription %q failed: ... NOT_FOUND - no queue %q in vhost '/'
+```
+
+**Why** A lane's consumer was cancelled and its replacement could not attach, because the destination no longer exists or the connected user may not consume from it. F1 ends that consumer generation and rebuilds the consumer, rather than leaving a subscription that reads healthy while one of its destinations silently delivers nothing. A destination that is back by the time the rebuilt consumer opens resumes every lane, including the subscription's other destinations, which pause while the consumer reopens; a destination that is still gone fails the subscription, which `Health` reports.
+
+**Fix** Recreate the destination, or restore the declaration that owns it, and start the subscription again. A destination that returns before the rebuild finishes needs no action, and with `Topology.AutoCreate` the rebuild re-declares it. See [RabbitMQ options](/drivers/rabbitmq#rabbitmq-options).
 
 ## Messages are redelivered or duplicated
 

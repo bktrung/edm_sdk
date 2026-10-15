@@ -485,6 +485,18 @@ A failed wait or a `Stop`/`Release` error ends the runner `Aborted`; success end
 `Release` is not a retry disposition: it returns broker-owned work without
 claiming that the message was handled.
 
+Every runner consumer has one teardown owner. The first of the terminal drain,
+a reconnect abandon, a lane-repair release and a successor-handoff release
+claims it and makes the driver calls; every later caller joins that claim,
+waits for it under its own `Lifecycle.CloseTimeout`, and reports the owner's
+result, so the driver is never asked to tear the same consumer down twice. An
+abandon that loses the claim therefore hands the consumer back through the
+drain: a Stop the driver refuses for unsettled messages is followed by the
+drain's own `Release`, and a drain with nothing outstanding has nothing to hand
+back. A caller whose wait ends by its own bound reports the phase deadline and
+makes no driver call, and the owner's result stays readable for the next
+caller.
+
 A `Release` that failed leaves the consumer registered on the driver, and a
 driver refuses to close the connection that still carries one. The client keeps
 that consumer with the connection it was opened on, so the release it owes is
@@ -532,10 +544,14 @@ that arrived after the change it would have waited for had already happened.
 
 [`Runner.abandonForReconnect`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/reconnect.go)
 is how the attempt takes a runner that is still on the old connection: it
-cancels the generation and calls `Consumer.Release` under
+cancels the generation and hands the consumer back under
 `Lifecycle.CloseTimeout`, deliberately leaving
 unsettled deliveries for broker redelivery rather than classifying them as
 application retries, and reports the abandon to the owner loop as an event. The
+handback is the runner's one consumer teardown: an abandon that reaches it
+first releases the consumer, and one that arrives after the terminal drain, a
+lane repair or a handoff already claimed it joins that claim under the same
+`Lifecycle.CloseTimeout` and reports the claimer's result. The
 open that the abandon cancelled is not a failure of the runner's: it waits for
 the attempt, then opens again on what the attempt leaves behind.
 

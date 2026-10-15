@@ -12,6 +12,7 @@ import (
 
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/driver"
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/clock"
+	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/lifecycle"
 )
 
 func TestNewValidatesOptionsEagerly(t *testing.T) {
@@ -391,6 +392,97 @@ func TestHealthPropagatesPingError(t *testing.T) {
 	}
 }
 
+func TestReadyWithoutSubscriptionsFollowsHealth(t *testing.T) {
+	t.Parallel()
+	client, err := New(context.Background(), testClientConfig(t), WithDriver(&testDriver{conn: &testConn{}}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = client.Close(context.Background()) })
+	if err := client.Ready(context.Background()); err != nil {
+		t.Fatalf("Ready() with no registered subscriptions = %v, want nil", err)
+	}
+}
+
+// TestReadyRequiresEveryRunnerToConsume pins what a readiness probe sees across
+// a runner's states: a registered runner that has not started, one held inside
+// its consumer open, one consuming, and one waiting for a rebuild. Health stays
+// nil for every state but the rebuild, so Ready is the signal that separates a
+// live client from one that can receive traffic.
+func TestReadyRequiresEveryRunnerToConsume(t *testing.T) {
+	fake := clock.NewFake(time.Unix(950, 0))
+	recorded := &recordingClock{Fake: fake}
+	d := &reconnectTestDriver{created: make(chan *reconnectTestConsumer, 8)}
+	client := newReconnectTestClient(t, d, recorded, 0)
+	client.reconnectRandom = func() float64 { return 1 }
+	handled := new(atomic.Int32)
+	runner := namedRunner(t, client, "orders", handled)
+	ctx := context.Background()
+
+	if err := client.Health(ctx); err != nil {
+		t.Fatalf("Health() with a registered runner that has not started = %v, want nil", err)
+	}
+	assertNotConsuming(t, client, "not started")
+
+	// Held inside the consumer open: Run has started, nothing consumes yet.
+	openEntered := make(chan struct{})
+	openRelease := make(chan struct{})
+	var enterOnce sync.Once
+	d.consumerOpenHook = func(context.Context, string) error {
+		enterOnce.Do(func() { close(openEntered) })
+		<-openRelease
+		return nil
+	}
+	runCtx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	runDone := make(chan error, 1)
+	go func() { runDone <- runner.Run(runCtx) }()
+	<-openEntered
+	if err := client.Health(ctx); err != nil {
+		t.Fatalf("Health() while the consumer open is pending = %v, want nil", err)
+	}
+	assertNotConsuming(t, client, "starting")
+
+	close(openRelease)
+	first := <-d.created
+	waitReconnectCondition(t, func() bool { return runnerState(runner) == lifecycle.Ready })
+	if err := client.Ready(ctx); err != nil {
+		t.Fatalf("Ready() while the subscription consumes = %v, want nil", err)
+	}
+
+	// The replacement consumer cannot open, so the runner waits for a rebuild.
+	// The subscription is not consuming for that whole window.
+	d.setFailConsumersWithError(1, errors.New("consumer unavailable"))
+	first.sendError(consumerTransient(d, "consumer disconnected"))
+	waitReconnectCondition(t, func() bool { return runnerState(runner) == lifecycle.Reconnecting })
+	assertNotConsuming(t, client, "reconnecting")
+
+	advanceReconnect(t, recorded, 500*time.Millisecond, 1)
+	waitReconnectCondition(t, func() bool { return runnerState(runner) == lifecycle.Ready && !client.isReconnecting() })
+	if err := client.Ready(ctx); err != nil {
+		t.Fatalf("Ready() after the rebuild = %v, want nil", err)
+	}
+	cancel()
+	select {
+	case <-runDone:
+	case <-clock.NewReal().Timer(time.Second).C:
+		t.Fatal("runner did not stop after context cancellation")
+	}
+}
+
+// assertNotConsuming fails unless Ready reports the orders subscription as not
+// consuming in the named lifecycle state.
+func assertNotConsuming(t *testing.T, client *Client, state string) {
+	t.Helper()
+	err := client.Ready(context.Background())
+	if err == nil {
+		t.Fatalf("Ready() = nil, want the orders subscription reported as %s", state)
+	}
+	if !strings.Contains(err.Error(), "orders") || !strings.Contains(err.Error(), state) {
+		t.Fatalf("Ready() = %v, want the orders subscription reported as %s", err, state)
+	}
+}
+
 func featureStatus(limits Limits, name string) FeatureStatus {
 	for _, feature := range limits.Features {
 		if feature.Feature == name {
@@ -626,4 +718,123 @@ func TestCloseStaysDrainingWhileObserverUnbinds(t *testing.T) {
 		t.Fatalf("first Close() = %v", err)
 	}
 	rec.requireState(t, false, 1, 1)
+}
+
+type rollbackRecordingConn struct {
+	driver.Conn
+	admin        driver.Admin
+	closeErr     error
+	closeStarted chan struct{}
+	closeRelease <-chan struct{}
+	closeDone    chan struct{}
+	mu           sync.Mutex
+	contexts     []error
+	closed       atomic.Bool
+}
+
+func (c *rollbackRecordingConn) Admin() driver.Admin { return c.admin }
+
+func (c *rollbackRecordingConn) Close(ctx context.Context) error {
+	c.mu.Lock()
+	c.contexts = append(c.contexts, ctx.Err())
+	c.mu.Unlock()
+	close(c.closeStarted)
+	if c.closeRelease != nil {
+		<-c.closeRelease
+	}
+	if ctx.Err() == nil {
+		c.closed.Store(true)
+	}
+	close(c.closeDone)
+	return c.closeErr
+}
+
+func TestCancelledNewBoundsRollbackAndJoinsErrors(t *testing.T) {
+	for _, hung := range []bool{false, true} {
+		name := "cleanup failure"
+		if hung {
+			name = "hung raw close"
+		}
+		t.Run(name, func(t *testing.T) {
+			topologyErr := errors.New("topology refused after cancellation")
+			cleanupErr := errors.New("rollback close failed")
+			ctx, cancel := context.WithCancel(context.Background())
+			t.Cleanup(cancel)
+			topologyEntered := make(chan struct{})
+			topologyRelease := make(chan struct{})
+			rawRelease := make(chan struct{})
+			var topologyOnce, rawOnce sync.Once
+			releaseTopology := func() { topologyOnce.Do(func() { close(topologyRelease) }) }
+			releaseRaw := func() { rawOnce.Do(func() { close(rawRelease) }) }
+			t.Cleanup(releaseTopology)
+			t.Cleanup(releaseRaw)
+			conn := &rollbackRecordingConn{
+				Conn:         &testConn{},
+				closeErr:     cleanupErr,
+				closeStarted: make(chan struct{}),
+				closeDone:    make(chan struct{}),
+				admin: &reconnectTestAdmin{refuse: func(driver.TopologySpec) error {
+					close(topologyEntered)
+					<-topologyRelease
+					return topologyErr
+				}},
+			}
+			if hung {
+				conn.closeRelease = rawRelease
+			}
+			fake := clock.NewFake(time.Unix(940, 0))
+			recorded := &recordingClock{Fake: fake, timerStarted: make(chan time.Duration, 32)}
+			cfg := testClientConfig(t)
+			cfg.Lifecycle.CloseTimeout = 100 * time.Millisecond
+			type newResult struct {
+				client *Client
+				err    error
+			}
+			result := make(chan newResult, 1)
+			go func() {
+				client, err := New(ctx, cfg, WithDriver(&producerAdmissionDriver{conn: conn}),
+					WithPublishTopics("orders.created"), withClock(recorded))
+				result <- newResult{client: client, err: err}
+			}()
+			waitForSignal(t, topologyEntered, "initial topology after Open")
+			cancel()
+			releaseTopology()
+			waitForSignal(t, conn.closeStarted, "rollback raw Close")
+			if hung {
+				if duration := nextRetirementTimer(t, recorded); duration != cfg.Lifecycle.CloseTimeout {
+					t.Fatalf("rollback timer = %v, want %v", duration, cfg.Lifecycle.CloseTimeout)
+				}
+				fake.Advance(cfg.Lifecycle.CloseTimeout)
+			}
+			var got newResult
+			select {
+			case got = <-result:
+			case <-oneSecondTimer(t).C:
+				t.Fatal("New did not return after rollback's bound")
+			}
+			if got.client != nil || !errors.Is(got.err, topologyErr) {
+				t.Fatalf("New = (%v, %v), want nil and topology error", got.client, got.err)
+			}
+			conn.mu.Lock()
+			contexts := append([]error(nil), conn.contexts...)
+			conn.mu.Unlock()
+			if len(contexts) != 1 || contexts[0] != nil {
+				t.Fatalf("rollback Close contexts = %v, want one live context", contexts)
+			}
+			if hung {
+				if !errors.Is(got.err, context.DeadlineExceeded) {
+					t.Fatalf("New error = %v, want joined rollback deadline", got.err)
+				}
+				releaseRaw()
+				waitForSignal(t, conn.closeDone, "hung rollback cleanup")
+			} else {
+				if !errors.Is(got.err, cleanupErr) {
+					t.Fatalf("New error = %v, want joined cleanup error", got.err)
+				}
+				if !conn.closed.Load() {
+					t.Fatal("rollback Close did not execute its live-context side effect")
+				}
+			}
+		})
+	}
 }

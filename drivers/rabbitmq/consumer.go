@@ -762,7 +762,10 @@ func (c *consumer) watchCancel(lane *lane, cancels <-chan string) {
 // reestablish attaches a fresh consumer to a lane the broker cancelled, and
 // tells the application that the cancel happened. A failure to attach ends the
 // lane and is reported as an error, because a lane that neither delivers nor
-// says why is the defect this whole path exists to remove.
+// says why is the defect this whole path exists to remove. That report is
+// transient, so the core ends the generation and rebuilds the consumer instead
+// of leaving the generation running with a lane that can never deliver again;
+// the destination's other lanes pause while the consumer reopens.
 func (c *consumer) reestablish(lane *lane) {
 	if c.ending() {
 		// Teardown already began; the lane is going away because the
@@ -791,12 +794,37 @@ func (c *consumer) reestablish(lane *lane) {
 	lane.channelMu.Unlock()
 	if err != nil {
 		if !errors.Is(err, amqp.ErrClosed) {
-			c.sendError(classifyAMQP("consumer", driver.KindNotFound, fmt.Errorf("re-establishing destination %q: %w", lane.destination, err)))
+			c.sendError(reestablishFailure(lane.destination, err))
 		}
 		c.attachReplacement(lane, nil)
 		return
 	}
 	c.attachReplacement(lane, deliveries)
+}
+
+// reestablishFailure builds the report for a lane whose replacement consumer
+// could not be attached, which ends that lane for good.
+//
+// The kind is transient, which is the broker's own classification only when the
+// Consume failed for a network or channel reason. A 404 or 403 is deliberately
+// reclassified: a transient consumer error is the one signal the core turns into
+// a consumer rebuild, ending the generation so the runner reopens the consumer
+// through its repair path, where a destination that is back resumes every lane
+// and one that is still gone fails the subscription. The not-found and
+// permission kinds that classifyAMQP derives from those codes do the opposite -
+// the core reports them and keeps the generation, which then runs with no
+// delivery source and no failure anyone can see.
+//
+// The broker's diagnostic survives the reclassification: the text names the
+// destination and carries the broker's reason, a 404 also joins
+// ErrDestinationMissing, and the *amqp.Error stays reachable through errors.As,
+// so a caller can still read the AMQP code.
+func reestablishFailure(destination string, err error) error {
+	cause := err
+	if isNotFound(err) {
+		cause = errors.Join(driver.ErrDestinationMissing, err)
+	}
+	return classify("consumer", driver.KindTransient, fmt.Errorf("re-establishing destination %q: %w", destination, cause))
 }
 
 // sendError reports err without blocking. A full buffer drops a notification,
@@ -805,9 +833,10 @@ func (c *consumer) reestablish(lane *lane) {
 // generation, so a second one adds no recovery. A transient or unclassified
 // error with no such signal queued evicts one queued entry to take its place,
 // preferring a notification, because a queued notification drives no recovery.
-// A severe error, one that ends a lane for good, evicts the oldest queued error
-// instead, unless that one is fatal: a failed re-attach may be the only report
-// that a lane stopped, and a burst of consumer cancels must not crowd it out.
+// A severe error, one the core reports without recovering the generation, such
+// as a channel that closed with the broker's own 404 or 403, evicts the oldest
+// queued error instead, unless that one is fatal: it may be the only report that
+// a lane stopped, and a burst of consumer cancels must not crowd it out.
 func (c *consumer) sendError(err error) {
 	if err == nil {
 		return

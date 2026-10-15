@@ -273,7 +273,7 @@ type conn struct {
 	management      *managementClient
 	closed          bool
 	closing         bool
-	closeAttempt    bool
+	closeAttempt    *connectionCloseOutcome
 	active          map[*consumer]struct{}
 	producers       map[*producer]struct{}
 	publishFault    atomic.Int32 // 0 = unset; otherwise driver.Kind + 1
@@ -294,24 +294,14 @@ type conn struct {
 	// closes.
 	blockMu    sync.Mutex
 	blockWatch sync.WaitGroup
-	// detachMu serializes channel-close registration with the wait in
-	// Conn.Close. detaching becomes true before that wait, so no channel close
-	// can Add to a zero-counter WaitGroup. None of the goroutines detachWatch
-	// tracks takes detachMu, so waitDetached can hold it across the Wait.
-	detachMu  sync.Mutex
-	detaching bool
-	// detachWatch tracks the goroutines that outlive the caller that began
-	// them: channel closes, publish channel watchers, and the releases a
-	// cancelled publish leaves for its channel's watcher. amqp091's
-	// Channel.Close waits for close-ok, which a connection the broker has
-	// stopped reading never sends, so a close that a caller cannot wait for
-	// runs on a goroutine of its own; a watcher lives as long as its channel,
-	// and a release until the confirmations it waits for resolve, which a
-	// closed channel guarantees. Close waits on that set once the connection
-	// is actually closed, for the same reason it waits on blockWatch. The Add
-	// for a watcher or a release can race that Wait only from a publish still
-	// running when the connection closed, and it is benign: the goroutine ends
-	// as soon as the connection's shutdown reaches its channel.
+	// detachMu gates registration, not the RPCs or the shutdown join.
+	detachMu   sync.Mutex
+	detaching  bool
+	detachDone chan struct{}
+	// detachWatch owns channel opens and closes that outlive their callers,
+	// publish watchers, and deferred confirmation releases. The latter two
+	// still register outside detachMu; they must not be assumed to obey the
+	// channel-work registration gate.
 	detachWatch sync.WaitGroup
 }
 
@@ -393,16 +383,121 @@ func (c *conn) startChannelCloseWithFinish(closeFn func() error, finish func(err
 	return done
 }
 
-// waitDetached closes the registration window before waiting for detached
-// channel work. If registration wins detachMu, Add makes the count non-zero
-// before this Wait. If the wait wins, detaching makes a later close run
-// synchronously against the already-closed AMQP connection, so it cannot add
-// work after Wait returns.
-func (c *conn) waitDetached() {
+// waitDetached seals registration after transport shutdown. A channel opener
+// registers while holding mu's read lock; Close cannot mark closing until that
+// registration finishes. If Close marks closing first, admission rejects the
+// opener before it can Add. Channel-close registration instead races this gate
+// directly: a close that loses runs synchronously on the closed transport.
+// The one waiter survives a caller's deadline; a retry joins the same waiter,
+// without holding either mutex while the tracked workers finish.
+func (c *conn) waitDetached(ctx context.Context) error {
 	c.detachMu.Lock()
-	c.detaching = true
-	c.detachWatch.Wait()
+	start := c.detachDone == nil
+	if start {
+		c.detaching = true
+		c.detachDone = make(chan struct{})
+	}
+	done := c.detachDone
 	c.detachMu.Unlock()
+	if start {
+		go func() {
+			c.blockWatch.Wait()
+			c.detachWatch.Wait()
+			close(done)
+		}()
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+type channelOpenResult struct {
+	channel *amqp.Channel
+	err     error
+}
+
+// openChannel bounds the caller's wait, not amqp091's contextless RPC.
+// A registers its worker before releasing mu; B's Close can then mark closing
+// and shut down the transport while A waits for open-ok. If A's context ends
+// first, its worker retains the channel and closes any late open before Done.
+// An unbuffered send transfers ownership only to a caller that is receiving;
+// otherwise a buffered late success could leave nobody responsible for close.
+func (c *conn) openChannel(ctx context.Context) (*amqp.Channel, error) {
+	c.mu.RLock()
+	if err := c.channelOpenErrorLocked(ctx); err != nil {
+		c.mu.RUnlock()
+		return nil, err
+	}
+	raw := c.amqp
+	c.detachMu.Lock()
+	if c.detaching {
+		c.detachMu.Unlock()
+		c.mu.RUnlock()
+		return nil, amqp.ErrClosed
+	}
+	c.detachWatch.Add(1)
+	c.detachMu.Unlock()
+	c.mu.RUnlock()
+
+	result := make(chan channelOpenResult)
+	go func() {
+		defer c.detachWatch.Done()
+		channel, err := raw.Channel()
+		if err == nil {
+			c.mu.RLock()
+			err = c.channelOpenErrorLocked(ctx)
+			c.mu.RUnlock()
+			if err != nil {
+				_ = channel.Close()
+				channel = nil
+			}
+		}
+		select {
+		case result <- channelOpenResult{channel: channel, err: err}:
+		case <-ctx.Done():
+			if channel != nil {
+				// This worker is already registered. Registering a second close
+				// would let shutdown seal the gate between the two owners.
+				_ = channel.Close()
+			}
+		}
+	}()
+
+	select {
+	case opened := <-result:
+		if opened.err != nil {
+			return nil, opened.err
+		}
+		// B may mark closing after the worker checked admission but before A
+		// receives its channel. Ownership has transferred, so A, not the
+		// worker, closes it if this final admission check loses to B.
+		c.mu.RLock()
+		err := c.channelOpenErrorLocked(ctx)
+		c.mu.RUnlock()
+		if err != nil {
+			_ = c.awaitChannelClose(ctx, c.startChannelClose(opened.channel))
+			return nil, err
+		}
+		return opened.channel, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+func (c *conn) channelOpenErrorLocked(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if c.closed || c.closing || c.amqp.IsClosed() {
+		return amqp.ErrClosed
+	}
+	return nil
 }
 
 // awaitChannelClose waits for a close startChannelClose began, for as long as
@@ -695,105 +790,122 @@ func (c *conn) Ping(ctx context.Context) error {
 		c.mu.RUnlock()
 		return classify("ping", driver.KindTransient, errors.New(blocked.message()))
 	}
-	channel, err := c.amqp.Channel()
 	c.mu.RUnlock()
+	channel, err := c.openChannel(ctx)
 	if err != nil {
 		return classifyAMQP("ping", driver.KindTransient, err)
 	}
-	if err := channel.Close(); err != nil && !errors.Is(err, amqp.ErrClosed) {
+	if err := c.awaitChannelClose(ctx, c.startChannelClose(channel)); err != nil && !errors.Is(err, amqp.ErrClosed) {
 		return classifyAMQP("ping", driver.KindTransient, err)
 	}
 	return nil
 }
 
+// connectionCloseOutcome publishes one library close result to every waiter.
+type connectionCloseOutcome struct {
+	done chan struct{}
+	err  error
+	real bool
+}
+
 // Close releases the connection after its producers and consumers have closed.
+// Concurrent callers join one connection-owned close within their own contexts;
+// cancellation leaves that close running, and retries also join detached work.
+// When the library closed itself without an owned attempt, ErrClosed retains its
+// historical success meaning; it does not prove external transport shutdown.
 func (c *conn) Close(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
 		return classify("close", driver.KindTransient, err)
 	}
-	amqpConn := c.amqp
-	// The block watcher and any channel close that outlived its caller are the
-	// goroutines this connection owns. amqp091 closes the notify channel and
-	// answers a close with ErrClosed when the connection shuts down, so waiting
-	// here is what makes "Close leaves nothing of ours running" true rather
-	// than probable. A close attempt that did not close the connection - an
-	// injected fault, or a deadline that ran out - leaves them where they
-	// belong, running against a connection that is still up.
-	defer func() {
-		if amqpConn.IsClosed() {
-			c.blockWatch.Wait()
-			c.waitDetached()
-		}
-	}()
 	c.mu.Lock()
+	if attempt := c.closeAttempt; attempt != nil {
+		// A failed initiating close keeps its diagnostic; a later retry can
+		// acknowledge the completed transport without a second library close.
+		select {
+		case <-attempt.done:
+			c.closed = attempt.real
+			c.closeAttempt = nil
+		default:
+		}
+	}
 	if c.closed {
 		c.mu.Unlock()
+		if err := c.waitDetached(ctx); err != nil {
+			return classify("close", driver.KindTransient, err)
+		}
 		return nil
 	}
-	if c.closeAttempt {
-		c.mu.Unlock()
-		return classify("close", driver.KindTransient, errors.New("close already in progress"))
-	}
-	// Reject the precondition before marking teardown started so admission
-	// remains open when resources are still outstanding.
-	if !c.closing && (len(c.active) != 0 || len(c.producers) != 0) {
-		c.mu.Unlock()
-		return classify("close", driver.KindFatal, driver.ErrResourcesOutstanding)
-	}
-	if !c.closing {
+	attempt := c.closeAttempt
+	initiating := attempt == nil
+	if attempt == nil {
+		// Rejection must leave admission open when resources are outstanding.
+		if !c.closing && (len(c.active) != 0 || len(c.producers) != 0) {
+			c.mu.Unlock()
+			return classify("close", driver.KindFatal, driver.ErrResourcesOutstanding)
+		}
 		c.closing = true
-	}
-	c.closeAttempt = true
-	deadline, hasDeadline := ctx.Deadline()
-	var injectedErr error
-	if c.closeFault.Swap(false) {
-		if hasDeadline {
-			c.mu.Unlock()
-			<-ctx.Done()
-			c.mu.Lock()
-			c.closeAttempt = false
-			c.mu.Unlock()
-			return classify("close", driver.KindTransient, ctx.Err())
+		attempt = &connectionCloseOutcome{done: make(chan struct{}), real: !c.closeFault.Swap(false)}
+		c.closeAttempt = attempt
+		c.mu.Unlock()
+		if !attempt.real {
+			// No library work survives this synthetic failure; retire it before
+			// returning so the fault's caller can immediately retry teardown.
+			c.runConnectionClose(ctx, attempt)
+		} else {
+			go c.runConnectionClose(ctx, attempt)
 		}
-		injectedErr = errors.New("injected close failure")
-	}
-	c.mu.Unlock()
-
-	var err error
-	if injectedErr != nil {
-		err = injectedErr
-	} else if hasDeadline {
-		err = amqpConn.CloseDeadline(deadline)
 	} else {
-		done := make(chan error, 1)
-		go func() { done <- amqpConn.Close() }()
-		select {
-		case err = <-done:
-		case <-ctx.Done():
-			c.mu.Lock()
-			c.closeAttempt = false
-			c.mu.Unlock()
-			return classify("close", driver.KindTransient, ctx.Err())
+		c.mu.Unlock()
+	}
+	// A installs the attempt and blocks in library Close; its caller then
+	// cancels while the library still owns closeInit. B captures this same
+	// attempt instead of issuing a second Close that would return ErrClosed.
+	// Only the worker's completed shutdown publishes done and releases B.
+	select {
+	case <-attempt.done:
+		closeErr := attempt.err
+		if attempt.real {
+			// The initiator retains its handshake error. A joining caller only
+			// needs shutdown completion: both real library close methods defer
+			// shutdown even when the initiating deadline interrupts the RPC.
+			if !initiating {
+				closeErr = nil
+			}
+			if err := c.waitDetached(ctx); err != nil {
+				closeErr = errors.Join(closeErr, classify("close", driver.KindTransient, err))
+			}
 		}
+		return closeErr
+	case <-ctx.Done():
+		return classify("close", driver.KindTransient, ctx.Err())
 	}
-	if errors.Is(err, amqp.ErrClosed) {
-		c.mu.Lock()
-		c.closeAttempt = false
-		c.closed = true
-		c.mu.Unlock()
-		return nil
+}
+
+func (c *conn) runConnectionClose(ctx context.Context, attempt *connectionCloseOutcome) {
+	deadline, hasDeadline := ctx.Deadline()
+	var err error
+	if !attempt.real {
+		if hasDeadline {
+			<-ctx.Done()
+			err = ctx.Err()
+		} else {
+			err = errors.New("injected close failure")
+		}
+	} else if hasDeadline {
+		err = c.amqp.CloseDeadline(deadline)
+	} else {
+		err = c.amqp.Close()
 	}
-	if err != nil {
-		c.mu.Lock()
-		c.closeAttempt = false
-		c.mu.Unlock()
-		return classifyAMQP("close", driver.KindTransient, err)
+	if err != nil && !errors.Is(err, amqp.ErrClosed) {
+		attempt.err = classifyAMQP("close", driver.KindTransient, err)
 	}
 	c.mu.Lock()
-	c.closeAttempt = false
-	c.closed = true
+	c.closed = attempt.real && attempt.err == nil
+	if !attempt.real || attempt.err == nil {
+		c.closeAttempt = nil
+	}
+	close(attempt.done)
 	c.mu.Unlock()
-	return nil
 }
 
 func dial(ctx context.Context, endpoint string, amqpConfig amqp.Config, connectTimeout time.Duration) (*amqp.Connection, error) {

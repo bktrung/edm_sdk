@@ -2,7 +2,7 @@ module fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk
 
 go 1.26.0
 
-toolchain go1.26.6
+toolchain go1.26.9
 
 require (
 	github.com/rabbitmq/amqp091-go v1.13.0
@@ -15,8 +15,8 @@ require (
 	go.opentelemetry.io/otel/sdk v1.45.0
 	go.opentelemetry.io/otel/sdk/metric v1.45.0
 	go.opentelemetry.io/otel/trace v1.45.0
+	go.yaml.in/yaml/v3 v3.0.5
 	golang.org/x/sync v0.20.0
-	gopkg.in/yaml.v3 v3.0.1
 )
 
 require (
@@ -31,4 +31,5 @@ require (
 	go.opentelemetry.io/auto/sdk v1.2.1 // indirect
 	golang.org/x/crypto v0.56.0 // indirect
 	golang.org/x/sys v0.47.0 // indirect
+	gopkg.in/yaml.v3 v3.0.1 // indirect
 )

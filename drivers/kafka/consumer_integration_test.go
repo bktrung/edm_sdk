@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/twmb/franz-go/pkg/kadm"
+	"github.com/twmb/franz-go/pkg/kerr"
 	"github.com/twmb/franz-go/pkg/kgo"
 
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/driver"
@@ -2273,6 +2274,115 @@ func TestConsumerRealRebalanceNoGoroutineOrTimerLeak(t *testing.T) {
 	// Ensure final is not significantly higher than baseline (allow up to 2 for background runtime noise)
 	if diff := finalGoroutines - baselineGoroutines; diff > 3 {
 		t.Fatalf("goroutine count grew from %d to %d (delta %d)", baselineGoroutines, finalGoroutines, diff)
+	}
+}
+
+// staticGroupAssignment reports whether the coordinator still holds a member
+// with the instance ID, and how many partitions that member is assigned.
+// DescribeGroups answers for a group that has no members yet, and reports
+// GroupIDNotFound before the first join creates it.
+func staticGroupAssignment(t *testing.T, ctx context.Context, admin *kadm.Client, group, instance string) (present bool, assigned int) {
+	t.Helper()
+	described, err := admin.DescribeGroups(ctx, group)
+	if err != nil {
+		t.Fatalf("DescribeGroups(%q): %v", group, err)
+	}
+	detail, ok := described[group]
+	if !ok {
+		t.Fatalf("DescribeGroups(%q) returned no group", group)
+	}
+	if detail.Err != nil && !errors.Is(detail.Err, kerr.GroupIDNotFound) {
+		t.Fatalf("DescribeGroups(%q) group error: %v", group, detail.Err)
+	}
+	for _, member := range detail.Members {
+		if member.InstanceID == nil || *member.InstanceID != instance {
+			continue
+		}
+		present = true
+		if assignment, ok := member.Assigned.AsConsumer(); ok {
+			for _, topic := range assignment.Topics {
+				assigned += len(topic.Partitions)
+			}
+		}
+	}
+	return present, assigned
+}
+
+// TestConsumerStaticDrainGivesUpAssignment pins the order that makes a static
+// drain hand its partitions over at once: the consumer stops its own group loop
+// before the leave by instance ID. The admin leave alone only removes the
+// member from the coordinator's view, and the loop then re-joins with the same
+// instance ID, so the coordinator assigns the partitions back to a member that
+// has stopped polling. That re-join is what the observation window below
+// catches: it follows the member's next heartbeat, and franz-go's default
+// heartbeat interval is 3s (the driver overrides neither it nor the re-join
+// backoff), so the window spans several heartbeats.
+func TestConsumerStaticDrainGivesUpAssignment(t *testing.T) {
+	ctx, connection, admin := openKafkaAdminTest(t)
+	topic := kafkaTestTopic(t, "static-drain")
+	group := kafkaTestTopic(t, "static-drain-group")
+	cleanupKafkaTopics(t, admin, topic)
+	cleanupKafkaGroups(t, admin, group)
+	createKafkaTopic(t, admin, ctx, topic, 2)
+
+	instance := "static-drain-member"
+	childConn := &conn{
+		client:                connection.client,
+		clientOpts:            connection.clientOpts,
+		driverOptions:         map[string]string{"kafka.staticMembership": "true"},
+		rebalanceDrainTimeout: time.Second,
+		caps:                  connection.caps,
+		info:                  connection.info,
+		instanceID:            instance,
+		consumers:             make(map[*consumer]struct{}),
+	}
+	c, err := newConsumer(ctx, childConn, driver.ConsumerConfig{
+		Group:        group,
+		Destinations: []string{topic},
+		Prefetch:     2,
+		Effective:    connection.Capabilities(),
+	})
+	if err != nil {
+		t.Fatalf("newConsumer: %v", err)
+	}
+	// The release runs before the group cleanup registered above, so the leave
+	// it performs is what empties the group the cleanup then deletes.
+	t.Cleanup(func() {
+		releaseCtx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		defer cancel()
+		if err := c.Release(releaseCtx); err != nil {
+			t.Errorf("Release: %v", err)
+		}
+	})
+
+	// The member has to hold the topic's partitions before the drain, or an
+	// empty assignment afterwards would prove nothing.
+	joinedAt := time.Now() //nolint:forbidigo // the join wait is bounded in wall-clock time
+	for {
+		if _, assigned := staticGroupAssignment(t, ctx, admin, group, instance); assigned > 0 {
+			break
+		}
+		if time.Since(joinedAt) > 20*time.Second { //nolint:forbidigo // the join wait is bounded in wall-clock time
+			t.Fatalf("static member of %q never held a partition", group)
+		}
+		time.Sleep(250 * time.Millisecond) //nolint:forbidigo // bounded wait for the join
+	}
+
+	drainCtx, cancelDrain := context.WithTimeout(ctx, 20*time.Second)
+	defer cancelDrain()
+	if err := c.Drain(drainCtx); err != nil {
+		t.Fatalf("Drain: %v", err)
+	}
+
+	// Drain has returned and teardown has not run: the coordinator must not
+	// hand this instance a partition again for the rest of the window.
+	observedUntil := time.Now().Add(10 * time.Second) //nolint:forbidigo // the observation window is bounded in wall-clock time
+	for time.Now().Before(observedUntil) {            //nolint:forbidigo // the observation window is bounded in wall-clock time
+		present, assigned := staticGroupAssignment(t, ctx, admin, group, instance)
+		if present && assigned > 0 {
+			t.Fatalf("a drained static member was assigned %d partition(s) of %q while it no longer polls", assigned, topic)
+		}
+		time.Sleep(250 * time.Millisecond) //nolint:forbidigo // bounded observation window
 	}
 }
 

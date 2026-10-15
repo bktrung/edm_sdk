@@ -13,6 +13,7 @@ import (
 
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/driver"
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/clock"
+	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/lifecycle"
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/sched"
 )
 
@@ -562,5 +563,567 @@ func TestRetryAndDeadLetterCopiesBothUnencodableDropOnce(t *testing.T) {
 	}
 	if err := client.Health(context.Background()); err != nil {
 		t.Fatalf("Health() = %v, want nil: a dropped message does not stop the subscription", err)
+	}
+}
+
+// These regressions exercise runner-lifetime failure through the driver port:
+// the budget is a terminal threshold, not a cap on already-admitted work.
+type leftoverRunnerFixture struct {
+	client   *Client
+	runner   *Runner
+	driver   *laneRepairDriver
+	clock    *recordingClock
+	consumer *laneRepairConsumer
+	done     chan error
+}
+
+func newLeftoverRunnerFixture(t *testing.T, sub Subscription) *leftoverRunnerFixture {
+	t.Helper()
+	recorded := &recordingClock{
+		Fake:         clock.NewFake(time.Unix(0, 0)),
+		timerStarted: make(chan time.Duration, 128),
+	}
+	d := &laneRepairDriver{created: make(chan *laneRepairConsumer, 16)}
+	client, err := New(context.Background(), testClientConfig(t), WithDriver(d), withClock(recorded))
+	if err != nil {
+		t.Fatal(err)
+	}
+	runner, err := client.Subscribe(context.Background(), sub)
+	if err != nil {
+		_ = client.Close(context.Background())
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	fixture := &leftoverRunnerFixture{
+		client: client, runner: runner, driver: d, clock: recorded, done: make(chan error, 1),
+	}
+	finished := make(chan struct{})
+	go func() {
+		fixture.done <- runner.Run(ctx)
+		close(finished)
+	}()
+	t.Cleanup(func() {
+		cancel()
+		select {
+		case <-finished:
+		case <-oneSecondTimer(t).C:
+			t.Error("Run did not finish during cleanup")
+		}
+		_ = client.Close(context.Background())
+	})
+	fixture.consumer = waitLaneConsumer(t, d, sub.Name)
+	return fixture
+}
+
+func waitLeftoverTimer(t *testing.T, recorded *recordingClock, duration time.Duration) {
+	t.Helper()
+	watchdog := oneSecondTimer(t)
+	for {
+		select {
+		case got := <-recorded.timerStarted:
+			if got == duration {
+				return
+			}
+		case <-watchdog.C:
+			t.Fatalf("timer %v was not registered", duration)
+		}
+	}
+}
+
+func waitLeftoverSignal(t *testing.T, signal <-chan struct{}, description string) {
+	t.Helper()
+	select {
+	case <-signal:
+	case <-oneSecondTimer(t).C:
+		t.Fatalf("timed out waiting for %s", description)
+	}
+}
+
+func abandonLeftoverHandler(t *testing.T, fixture *leftoverRunnerFixture) {
+	t.Helper()
+	phase := fixture.runner.subscription.HandlerTimeout * stuckPhaseMultiplier
+	waitLeftoverTimer(t, fixture.clock, phase)
+	fixture.clock.Advance(phase)
+	waitLeftoverTimer(t, fixture.clock, phase)
+	fixture.clock.Advance(phase)
+}
+
+func assertLeftoverFailure(t *testing.T, fixture *leftoverRunnerFixture) {
+	t.Helper()
+	select {
+	case err := <-fixture.done:
+		kind, classified := driver.Classify(err)
+		if err == nil || !classified || kind != driver.KindFatal {
+			t.Fatalf("Run() = %v, want classified fatal leftover-budget failure", err)
+		}
+		if !strings.Contains(err.Error(), fixture.runner.subscription.Name) {
+			t.Fatalf("Run() = %v, want subscription name", err)
+		}
+	case <-oneSecondTimer(t).C:
+		t.Fatal("Run did not fail while leftover user functions remained blocked")
+	}
+	if err := fixture.client.Health(context.Background()); err == nil || !strings.Contains(err.Error(), fixture.runner.subscription.Name) {
+		t.Fatalf("Health() = %v, want failed subscription %q", err, fixture.runner.subscription.Name)
+	}
+	select {
+	case _, open := <-fixture.consumer.Messages():
+		if open {
+			t.Fatal("failed consumer still handed over a delivery")
+		}
+	default:
+		t.Fatal("failed consumer intake was not stopped")
+	}
+}
+
+func leftoverMessage(t *testing.T, id string, settler driver.Settler) driver.InboundMessage {
+	t.Helper()
+	message := laneRepairMessage(t, id, "orders.created")
+	message.Settle = settler
+	return message
+}
+
+func TestRunnerFailsAtLeftoverHandlerBudget(t *testing.T) {
+	started := make(chan struct{}, 3)
+	release := make(chan struct{})
+	sub := pipelineTestSubscription(func(context.Context, *Event) error {
+		started <- struct{}{}
+		<-release
+		return nil
+	})
+	sub.Concurrency = 2
+	sub.Prefetch = 2
+	sub.HandlerTimeout = 10 * time.Millisecond
+	fixture := newLeftoverRunnerFixture(t, sub)
+	t.Cleanup(func() { close(release) })
+
+	firstSettled := make(chan struct{})
+	first := &dispatchSettler{onSettle: func() { close(firstSettled) }}
+	fixture.consumer.send(leftoverMessage(t, "always-hangs", first))
+	waitLeftoverSignal(t, started, "first hanging handler")
+	abandonLeftoverHandler(t, fixture)
+	waitLeftoverSignal(t, firstSettled, "first abandoned delivery requeue")
+	first.mu.Lock()
+	nacked, acked := first.nacked, first.acked
+	first.mu.Unlock()
+	if !nacked || acked {
+		t.Fatalf("first settlement = nack %v, ack %v, want requeue", nacked, acked)
+	}
+	if err := fixture.client.Health(context.Background()); err != nil {
+		t.Fatalf("Health below threshold = %v, want nil", err)
+	}
+
+	fixture.consumer.send(leftoverMessage(t, "always-hangs", &dispatchSettler{}))
+	waitLeftoverSignal(t, started, "redelivered hanging handler")
+	abandonLeftoverHandler(t, fixture)
+	assertLeftoverFailure(t, fixture)
+	select {
+	case <-started:
+		t.Fatal("a third handler started after budget failure")
+	default:
+	}
+	shutdown := make(chan struct{})
+	go func() {
+		_ = fixture.runner.Drain(context.Background())
+		_ = fixture.client.Close(context.Background())
+		close(shutdown)
+	}()
+	waitLeftoverSignal(t, shutdown, "bounded Drain and Close with both handlers blocked")
+}
+
+func TestDiscardedCallbackSharesLeftoverBudget(t *testing.T) {
+	for _, terminal := range []string{"discarded", "dead-letter"} {
+		t.Run(terminal, func(t *testing.T) {
+			handlerStarted := make(chan struct{}, 1)
+			callbackStarted := make(chan struct{})
+			callbackExpired := make(chan struct{})
+			callbackContexts := make(chan context.Context, 1)
+			release := make(chan struct{})
+			sub := pipelineTestSubscription(func(_ context.Context, event *Event) error {
+				if event.ID() == "handler-leftover" {
+					handlerStarted <- struct{}{}
+					<-release
+					return nil
+				}
+				if terminal == "dead-letter" {
+					return Terminal(errors.New("dead-letter this delivery"))
+				}
+				return Drop(errors.New("discard this delivery"))
+			})
+			sub.Concurrency = 2
+			sub.Prefetch = 2
+			sub.HandlerTimeout = 10 * time.Millisecond
+			callback := func(ctx context.Context) {
+				callbackContexts <- ctx
+				close(callbackStarted)
+				<-ctx.Done()
+				close(callbackExpired)
+				<-release
+			}
+			if terminal == "dead-letter" {
+				sub.OnDeadLetter = func(ctx context.Context, _ DeadLettered) { callback(ctx) }
+			} else {
+				sub.OnDiscarded = func(ctx context.Context, _ Discarded) { callback(ctx) }
+			}
+			fixture := newLeftoverRunnerFixture(t, sub)
+			t.Cleanup(func() { close(release) })
+			requeued := make(chan struct{})
+			fixture.consumer.send(leftoverMessage(t, "handler-leftover", &dispatchSettler{
+				onSettle: func() { close(requeued) },
+			}))
+			waitLeftoverSignal(t, handlerStarted, "hanging handler")
+			abandonLeftoverHandler(t, fixture)
+			waitLeftoverSignal(t, requeued, "handler requeue")
+
+			settled := make(chan struct{})
+			publishedBeforeAck := make(chan bool, 1)
+			settler := &dispatchSettler{onSettle: func() {
+				fixture.driver.mu.Lock()
+				publishedBeforeAck <- fixture.driver.publishCalls > 0
+				fixture.driver.mu.Unlock()
+				close(settled)
+			}}
+			fixture.consumer.send(leftoverMessage(t, "terminal-callback", settler))
+			waitLeftoverSignal(t, settled, "terminal delivery Ack")
+			settler.mu.Lock()
+			acked, nacked := settler.acked, settler.nacked
+			settler.mu.Unlock()
+			if !acked || nacked {
+				t.Fatalf("terminal settlement = ack %v, nack %v, want Ack", acked, nacked)
+			}
+			if got := <-publishedBeforeAck; terminal == "dead-letter" && !got {
+				t.Fatal("dead-letter original was acknowledged before successor publication")
+			}
+			waitLeftoverSignal(t, callbackStarted, "terminal callback")
+			waitLeftoverTimer(t, fixture.clock, time.Second)
+			callbackCtx := <-callbackContexts
+			deadline, ok := callbackCtx.Deadline()
+			if want := fixture.clock.Now().Add(time.Second); !ok || !deadline.Equal(want) {
+				t.Fatalf("callback Deadline() = %v, %v, want %v", deadline, ok, want)
+			}
+			fixture.clock.Advance(time.Second - time.Nanosecond)
+			select {
+			case <-callbackExpired:
+				t.Fatal("callback context expired before its one-second deadline")
+			default:
+			}
+			if err := fixture.client.Health(context.Background()); err != nil {
+				t.Fatalf("Health before callback expiry = %v, want nil", err)
+			}
+			fixture.clock.Advance(time.Nanosecond)
+			waitLeftoverSignal(t, callbackExpired, "callback context expiry")
+			if err := callbackCtx.Err(); !errors.Is(err, context.DeadlineExceeded) {
+				t.Fatalf("callback Err() after fake expiry = %v, want DeadlineExceeded", err)
+			}
+			assertLeftoverFailure(t, fixture)
+		})
+	}
+}
+
+func TestCallbackBurstStopsNewUserWorkAtThreshold(t *testing.T) {
+	callbackStarted := make(chan struct{}, 3)
+	callbackExpired := make(chan struct{}, 3)
+	callbackReturned := make(chan struct{}, 3)
+	handlerStarted := make(chan struct{}, 3)
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	sub := pipelineTestSubscription(func(context.Context, *Event) error {
+		handlerStarted <- struct{}{}
+		return Drop(errors.New("discard"))
+	})
+	sub.HandlerTimeout = 10 * time.Millisecond
+	sub.OnDiscarded = func(ctx context.Context, _ Discarded) {
+		callbackStarted <- struct{}{}
+		select {
+		case <-release:
+			return
+		case <-ctx.Done():
+		}
+		callbackExpired <- struct{}{}
+		<-release
+		callbackReturned <- struct{}{}
+	}
+	fixture := newLeftoverRunnerFixture(t, sub)
+	t.Cleanup(func() { releaseOnce.Do(func() { close(release) }) })
+	for _, id := range []string{"burst-a", "burst-b"} {
+		settled := make(chan struct{})
+		fixture.consumer.send(leftoverMessage(t, id, &dispatchSettler{onSettle: func() { close(settled) }}))
+		waitLeftoverSignal(t, settled, "burst delivery Ack")
+		waitLeftoverSignal(t, handlerStarted, "burst handler")
+		waitLeftoverSignal(t, callbackStarted, "pre-expiry callback admission")
+		waitLeftoverTimer(t, fixture.clock, time.Second)
+	}
+	fixture.clock.Advance(time.Second)
+	waitLeftoverSignal(t, callbackExpired, "first callback expiry")
+	waitLeftoverSignal(t, callbackExpired, "already-admitted second callback expiry")
+	assertLeftoverFailure(t, fixture)
+	releaseOnce.Do(func() { close(release) })
+	waitLeftoverSignal(t, callbackReturned, "first callback return")
+	waitLeftoverSignal(t, callbackReturned, "second callback return")
+
+	// Replay the existing notification and dispatch seams after Run has failed:
+	// returning leftovers must not reopen admission, even with a live parent.
+	runnerNotifyDiscarded(fixture.runner, context.Background(), Discarded{})
+	settled := make(chan struct{})
+	dispatchMessage(fixture.runner, context.Background(),
+		leftoverMessage(t, "after-threshold", &dispatchSettler{onSettle: func() { close(settled) }}),
+		&Envelope{}, new(bool), &deliveryState{})
+	joined := make(chan struct{})
+	go func() {
+		_ = fixture.runner.asyncGroup.Wait()
+		close(joined)
+	}()
+	waitLeftoverSignal(t, joined, "late user work completion")
+	select {
+	case <-callbackStarted:
+		t.Fatal("callback admission resumed after leftovers returned")
+	default:
+	}
+	select {
+	case <-handlerStarted:
+		t.Fatal("handler admission resumed after leftovers returned")
+	default:
+	}
+	if err := fixture.client.Health(context.Background()); err == nil {
+		t.Fatal("returning leftovers cleared the failed subscription")
+	}
+}
+
+func TestLeftoversSurviveConsumerGenerationRebuild(t *testing.T) {
+	handlerStarted := make(chan struct{}, 1)
+	callbackStarted := make(chan struct{})
+	callbackExpired := make(chan struct{})
+	release := make(chan struct{})
+	sub := pipelineTestSubscription(func(_ context.Context, event *Event) error {
+		if event.ID() == "old-generation-leftover" {
+			handlerStarted <- struct{}{}
+			<-release
+			return nil
+		}
+		return Drop(errors.New("new generation callback"))
+	})
+	sub.Concurrency = 2
+	sub.Prefetch = 2
+	sub.HandlerTimeout = 10 * time.Millisecond
+	sub.OnDiscarded = func(ctx context.Context, _ Discarded) {
+		close(callbackStarted)
+		<-ctx.Done()
+		close(callbackExpired)
+		<-release
+	}
+	fixture := newLeftoverRunnerFixture(t, sub)
+	t.Cleanup(func() { close(release) })
+	requeued := make(chan struct{})
+	fixture.consumer.send(leftoverMessage(t, "old-generation-leftover", &dispatchSettler{
+		onSettle: func() { close(requeued) },
+	}))
+	waitLeftoverSignal(t, handlerStarted, "old generation handler")
+	abandonLeftoverHandler(t, fixture)
+	waitLeftoverSignal(t, requeued, "old generation requeue")
+	fixture.consumer.sendError(transientLaneError(fixture.driver))
+	replacement := waitLaneConsumer(t, fixture.driver, sub.Name)
+	if replacement == fixture.consumer || !fixture.consumer.released.Load() {
+		t.Fatal("consumer generation was not replaced after transient failure")
+	}
+	if fixture.driver.openCount() != 1 {
+		t.Fatal("consumer repair unexpectedly replaced the connection")
+	}
+	fixture.consumer = replacement
+	settled := make(chan struct{})
+	replacement.send(leftoverMessage(t, "new-generation-callback", &dispatchSettler{
+		onSettle: func() { close(settled) },
+	}))
+	waitLeftoverSignal(t, settled, "new generation delivery Ack")
+	waitLeftoverSignal(t, callbackStarted, "new generation callback")
+	waitLeftoverTimer(t, fixture.clock, time.Second)
+	fixture.clock.Advance(time.Second)
+	waitLeftoverSignal(t, callbackExpired, "new generation callback expiry")
+	assertLeftoverFailure(t, fixture)
+}
+
+// A callback whose context is cancelled before its own deadline is not a
+// leftover: only a callback still running when that deadline passes counts. A
+// transient consumer error ends the generation under the callback, and the
+// runner must keep serving afterwards.
+func TestCallbackCancelledByRepairIsNotCounted(t *testing.T) {
+	callbackStarted := make(chan struct{}, 2)
+	callbackCancelled := make(chan struct{}, 2)
+	release := make(chan struct{})
+	sub := pipelineTestSubscription(func(context.Context, *Event) error {
+		return Drop(errors.New("discard"))
+	})
+	sub.Concurrency = 1
+	sub.Prefetch = 1
+	sub.HandlerTimeout = 10 * time.Millisecond
+	sub.OnDiscarded = func(ctx context.Context, _ Discarded) {
+		callbackStarted <- struct{}{}
+		<-ctx.Done()
+		callbackCancelled <- struct{}{}
+		// Still running with its context cancelled and its deadline ahead:
+		// the test holds it here until the runner has been observed serving
+		// the generation that replaced this one.
+		<-release
+	}
+	fixture := newLeftoverRunnerFixture(t, sub)
+	t.Cleanup(func() { close(release) })
+
+	settled := make(chan struct{})
+	fixture.consumer.send(leftoverMessage(t, "cancelled-before-deadline", &dispatchSettler{
+		onSettle: func() { close(settled) },
+	}))
+	waitLeftoverSignal(t, settled, "pre-repair delivery Ack")
+	waitLeftoverSignal(t, callbackStarted, "callback admission")
+
+	fixture.consumer.sendError(transientLaneError(fixture.driver))
+	replacement := waitLaneConsumer(t, fixture.driver, sub.Name)
+	if replacement == fixture.consumer || !fixture.consumer.released.Load() {
+		t.Fatal("consumer generation was not replaced after transient failure")
+	}
+	waitLeftoverSignal(t, callbackCancelled, "callback cancellation")
+	fixture.consumer = replacement
+
+	settled = make(chan struct{})
+	replacement.send(leftoverMessage(t, "after-cancellation", &dispatchSettler{
+		onSettle: func() { close(settled) },
+	}))
+	waitLeftoverSignal(t, settled, "post-repair delivery Ack")
+	select {
+	case err := <-fixture.done:
+		t.Fatalf("Run() = %v, want a runner still consuming after the repair", err)
+	default:
+	}
+	if err := fixture.client.Health(context.Background()); err != nil {
+		t.Fatalf("Health() = %v, want nil: a callback that has not reached its deadline is not a leftover", err)
+	}
+}
+
+// A callback that ignores both its parent cancellation and its deadline is a
+// leftover, counted when its own deadline passes and not before.
+func TestCallbackOutlivingItsDeadlineAfterCancellationIsCounted(t *testing.T) {
+	callbackStarted := make(chan struct{}, 2)
+	release := make(chan struct{})
+	sub := pipelineTestSubscription(func(context.Context, *Event) error {
+		return Drop(errors.New("discard"))
+	})
+	sub.Concurrency = 1
+	sub.Prefetch = 1
+	sub.HandlerTimeout = 10 * time.Millisecond
+	sub.OnDiscarded = func(context.Context, Discarded) {
+		callbackStarted <- struct{}{}
+		<-release
+	}
+	fixture := newLeftoverRunnerFixture(t, sub)
+	t.Cleanup(func() { close(release) })
+
+	settled := make(chan struct{})
+	fixture.consumer.send(leftoverMessage(t, "blocking-callback", &dispatchSettler{
+		onSettle: func() { close(settled) },
+	}))
+	waitLeftoverSignal(t, settled, "blocking delivery Ack")
+	waitLeftoverSignal(t, callbackStarted, "blocking callback admission")
+	waitLeftoverTimer(t, fixture.clock, time.Second)
+
+	fixture.consumer.sendError(transientLaneError(fixture.driver))
+	replacement := waitLaneConsumer(t, fixture.driver, sub.Name)
+	if replacement == fixture.consumer {
+		t.Fatal("consumer generation was not replaced after transient failure")
+	}
+	fixture.consumer = replacement
+
+	// The cancellation alone is not counted: the runner still serves while the
+	// callback is inside its one-second deadline.
+	settled = make(chan struct{})
+	replacement.send(leftoverMessage(t, "after-cancellation", &dispatchSettler{
+		onSettle: func() { close(settled) },
+	}))
+	waitLeftoverSignal(t, settled, "post-repair delivery Ack")
+	if err := fixture.client.Health(context.Background()); err != nil {
+		t.Fatalf("Health() = %v, want nil: a parent cancellation is not a deadline the callback outlived", err)
+	}
+
+	fixture.clock.Advance(time.Second)
+	assertLeftoverFailure(t, fixture)
+}
+
+// blockingStopConsumer holds the runner's own end-of-run drain in flight.
+// stopRunnerConsumer reads the runner's consumer, so wrapping the fake consumer
+// is what keeps the drain open while the test advances the clock.
+type blockingStopConsumer struct {
+	*laneRepairConsumer
+	stopStarted chan struct{}
+	stopRelease chan struct{}
+	stopOnce    sync.Once
+}
+
+func (c *blockingStopConsumer) Stop(ctx context.Context) error {
+	c.stopOnce.Do(func() { close(c.stopStarted) })
+	select {
+	case <-c.stopRelease:
+	case <-ctx.Done():
+	}
+	return c.laneRepairConsumer.Stop(ctx)
+}
+
+// A runner that ends on its own end-of-run drain does not fail for a callback
+// the drain left running. That drain sets only the owner's draining flag, never
+// the exported one, so the lifecycle is the only signal that the runner has
+// begun ending while both handler contexts are still live.
+func TestRunnerOwnDrainDoesNotCountCallbackAtItsDeadline(t *testing.T) {
+	callbackStarted := make(chan struct{}, 2)
+	release := make(chan struct{})
+	sub := pipelineTestSubscription(func(context.Context, *Event) error {
+		return Drop(errors.New("discard"))
+	})
+	sub.Concurrency = 1
+	sub.Prefetch = 1
+	sub.HandlerTimeout = 10 * time.Second
+	sub.OnDiscarded = func(context.Context, Discarded) {
+		callbackStarted <- struct{}{}
+		<-release
+	}
+	fixture := newLeftoverRunnerFixture(t, sub)
+	t.Cleanup(func() { close(release) })
+
+	settled := make(chan struct{})
+	fixture.consumer.send(leftoverMessage(t, "callback-at-own-drain", &dispatchSettler{
+		onSettle: func() { close(settled) },
+	}))
+	waitLeftoverSignal(t, settled, "delivery Ack")
+	waitLeftoverSignal(t, callbackStarted, "callback admission")
+	waitLeftoverTimer(t, fixture.clock, time.Second)
+
+	blocking := &blockingStopConsumer{
+		laneRepairConsumer: fixture.consumer,
+		stopStarted:        make(chan struct{}),
+		stopRelease:        make(chan struct{}),
+	}
+	fixture.runner.mu.Lock()
+	fixture.runner.consumer = blocking
+	fixture.runner.mu.Unlock()
+	releaseStop := sync.OnceFunc(func() { close(blocking.stopRelease) })
+	t.Cleanup(releaseStop)
+
+	// The consumer stream closes with the callback still running, which ends the
+	// run from the source side rather than through a caller's Drain.
+	fixture.consumer.close()
+	waitLeftoverSignal(t, blocking.stopStarted, "own drain stopping the consumer")
+	waitReconnectCondition(t, func() bool { return fixture.runner.lifecycle.State() == lifecycle.Draining })
+
+	fixture.clock.Advance(time.Second)
+	select {
+	case err := <-fixture.done:
+		t.Fatalf("Run() = %v, want the run held open by the consumer stop", err)
+	default:
+	}
+	releaseStop()
+	select {
+	case err := <-fixture.done:
+		if err != nil {
+			t.Fatalf("Run() = %v, want nil: a runner that ended on its own does not fail for a callback its drain left running", err)
+		}
+	case <-oneSecondTimer(t).C:
+		t.Fatal("Run did not finish after the drain was released")
+	}
+	if err := fixture.client.Health(context.Background()); err != nil {
+		t.Fatalf("Health() = %v, want nil", err)
 	}
 }

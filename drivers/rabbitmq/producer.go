@@ -99,32 +99,16 @@ func newProducer(ctx context.Context, conn *conn, cfg driver.ProducerConfig) (*p
 // told about its own message through the DeferredConfirmation the client hands
 // back, and a listener nobody read would stall the client's frame reader.
 //
-// A block is waited out before anything is opened: the two round trips below
-// are synchronous, and a broker that is blocking publishers has stopped
-// reading this connection, so neither can complete until the block clears.
-// The wait is outside the connection lock because it can last as long as the
-// caller's context, and holding the read lock across it would park every
-// other call on the connection behind an alarm - a Close that only wanted to
-// report outstanding resources included. Nothing is decided here: a
-// connection that closed during the wait is caught by the check below, and
-// one that closed after the channel was opened is caught by the caller's
-// re-check, which closes the channel it never added to the producer.
-//
-// What this cannot cover is a connection the broker has just begun blocking
-// for its own publishing and has not told us about yet: there is no state to
-// wait on during that gap, and the channel open that follows is a round trip
-// amqp091 gives no context to end.
+// A known publishing block is waited out before opening: Confirm is still a
+// contextless round trip, and a blocking broker has stopped reading publishers.
+// The shared opener bounds channel.open even before a block notification arrives.
+// Both waits run outside the connection lock; caller-side installation checks
+// close a channel that lost a race with producer or connection shutdown.
 func (p *producer) openChannel(ctx context.Context) (*publishChannel, error) {
 	if err := p.conn.awaitUnblocked(ctx); err != nil {
 		return nil, classify("producer", driver.KindTransient, err)
 	}
-	p.conn.mu.RLock()
-	if p.conn.closed || p.conn.amqp.IsClosed() {
-		p.conn.mu.RUnlock()
-		return nil, classify("producer", driver.KindTransient, amqp.ErrClosed)
-	}
-	raw, err := p.conn.amqp.Channel()
-	p.conn.mu.RUnlock()
+	raw, err := p.conn.openChannel(ctx)
 	if err != nil {
 		return nil, classifyAMQP("producer", driver.KindTransient, err)
 	}
@@ -267,8 +251,8 @@ const maxSegmentMessages = 4096
 // segment with it: the channel closed, or the context ended, and nothing
 // behind the segment was published.
 func (p *producer) publishSegment(ctx context.Context, msgs []driver.OutboundMessage, base int, failed map[int]error) (int, error) {
-	pending := make([]outboundMessage, 0, len(msgs)-base)
-	seen := make(map[string]struct{}, len(msgs)-base)
+	var pending []outboundMessage
+	seen := make(map[string]struct{})
 	consumed := 0
 	for offset, message := range msgs[base:] {
 		publishing, err := amqpPublishing(message)

@@ -7,6 +7,18 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
+### Added
+
+- `Client.Ready` reports readiness only once the client is healthy and every registered
+  subscription's runner is consuming, so a readiness probe withholds traffic until messages
+  can actually be handled. `Client.Health` is unchanged.
+- The f1otel observer counts poison messages that F1 acknowledges without retaining a copy in
+  `f1.messaging.poison_dropped`, separate from the dead-letter counter, so a drop can be alerted
+  on instead of showing up only in logs.
+- The Kafka driver documentation states a pre-deploy topic policy checklist for main, retry and
+  dead-letter topics: replication factor, minimum in-sync replicas, `cleanup.policy=delete`, and
+  retention longer than the longest retry delay.
+
 ### Changed
 
 - RabbitMQ `Open` refuses a `broker.rabbitmq.vhost` that differs from any endpoint's
@@ -52,6 +64,31 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
   one `f1otel.New` per Client and share the OpenTelemetry providers between them. An observer
   opts in through the new optional `f1.ObserverBinder` interface; the binding is released when
   `Close` completes terminal shutdown or when `New` fails.
+- Kafka retry and dead-letter topics that F1 creates use `cleanup.policy=delete`, and topology
+  setup now refuses to start a subscription whose retry or dead-letter topic compacts: on an
+  existing compacting topic the subscription fails with an error naming the topic and the setting
+  to change. Reading a topic's effective policy needs the `DescribeConfigs` ACL; without it,
+  startup fails with a permission error.
+- A subscription fails, and `Health` names it, when the handlers or dead-letter callbacks that
+  are still running past their own deadline reach its `Concurrency`. A handler counts once it is
+  still running four times past its `HandlerTimeout` (a dead-letter or discard callback, one
+  second past its deadline) and stops counting when it returns. The limit is a trigger, not a
+  hard cap: work already started can exceed it briefly. Raise `HandlerTimeout` for handlers that
+  are slow but finish.
+- After eight retired connections or discarded producers fail to close, the next reconnect is
+  refused: the client stops publishing, subscriptions stop, and `Health` reports
+  `f1: N retired connections failed to close`, so a restart is required. While the client runs,
+  a background loop retries a failed close with growing waits; a caller-issued `Close` does not
+  start background retries of its own.
+- YAML configuration is parsed with `go.yaml.in/yaml/v3`, the maintained continuation of the
+  archived parser. The config format and every `f1` config key are unchanged; only the module
+  path a dependency audit sees changed.
+- Documentation states the poison-quarantine loss exceptions: F1 acknowledges a poison message
+  without keeping a copy when it has no dead-letter route, the broker refuses the copy as too
+  large, or the copy's headers cannot be encoded, and the guide says how to avoid each case.
+- RabbitMQ documentation corrects how the 4.3 delivery limit counts: a graceful shutdown, which
+  returns unstarted messages with a requeue nack, does not use up a message's broker retries,
+  while losing the channel or connection does.
 
 ### Removed
 
@@ -143,6 +180,34 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
   stays at zero.
 - RabbitMQ subscription validation refuses a handler timeout so large that three times it
   overflows, instead of accepting it.
+- RabbitMQ channel opens no longer hold the connection lock: a broker that never answers an open
+  no longer freezes shutdown or every other call on that connection, and each caller stops waiting
+  when its own deadline ends.
+- A RabbitMQ connection close started again after a cancelled one now reports closed only once the
+  socket is really shut, instead of reporting success while the close is still in progress.
+- A failed RabbitMQ consumer reattach ends the consumer's generation and rebuilds it, so a deleted
+  queue that comes back resumes consumption instead of leaving a subscription running with a dead
+  lane, and a still-missing queue fails the subscription with the broker's message.
+- RabbitMQ publish segment buffers grow with the segment rather than reserving room for the whole
+  remaining batch, so a batch of messages without IDs no longer allocates gigabytes.
+- A Kafka partition revoke commits every revoked partition's settled offsets in one request bounded
+  within the rebalance drain, instead of committing them one at a time with no time limit, so a
+  slow broker no longer overruns the rebalance deadline.
+- A Kafka static-membership leave stops the consumer's group loop first, so a drained pod no longer
+  takes its partitions back while shutting down.
+- A runner drain that started is joined on every exit from `Run`, including a failure while waiting
+  for a connection rebuild, so teardown always completes before `Run` returns.
+- Consumer teardown has one owner between a drain and a reconnect: the first caller performs it and
+  every later caller waits for and reports its result, so the driver is asked to tear down a
+  consumer exactly once.
+- Connections and producers whose cleanup fails stay owned by the client and are closed before the
+  client finishes, instead of being forgotten and leaked.
+
+### Security
+
+- The Go toolchain and CI image move to Go 1.26.9, which fixes the standard-library
+  vulnerabilities `govulncheck` reported. Callers may still build with any Go 1.26 release, though
+  an older patch keeps those holes in their own binary.
 
 ### Upgrade notes
 

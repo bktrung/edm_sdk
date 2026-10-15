@@ -10,6 +10,11 @@ import (
 // Handler processes one delivered Event. Returning nil acknowledges the
 // delivery; errors are retried unless marked with [Terminal] or [Drop]. F1 may
 // call Handle concurrently according to Subscription.Concurrency.
+// Handlers should honor ctx: F1 cannot stop user code that ignores cancellation.
+// A handler still running when abandoned at 4x HandlerTimeout counts toward
+// the subscription's leftover failure threshold until it returns, except on a
+// runner that is already draining or has stopped. Already admitted handlers can
+// finish after Run or Drain returns.
 type Handler interface {
 	// Handle processes one delivery and returns its outcome.
 	Handle(context.Context, *Event) error

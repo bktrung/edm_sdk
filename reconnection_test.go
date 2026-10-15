@@ -38,6 +38,13 @@ type reconnectTestDriver struct {
 	// closed, the way a driver whose teardown hangs on a dead broker does.
 	firstCloseGate    chan struct{}
 	firstCloseEntered atomic.Bool
+	// newConnCloseFailures and newConnCloseErr arm every connection this driver
+	// opens with a failing Close, the way a broker that will not close any
+	// connection behaves. It is set before a test opens its first replacement,
+	// and the connection has not been handed to anyone yet in Open, so no lock
+	// is needed beyond the driver's own.
+	newConnCloseFailures int
+	newConnCloseErr      error
 }
 
 func (d *reconnectTestDriver) Name() string { return "reconnect-test" }
@@ -62,6 +69,9 @@ func (d *reconnectTestDriver) Open(context.Context, driver.Config) (driver.Conn,
 		admin.refuse = d.refuseTopology
 	}
 	conn := &reconnectTestConn{driver: d, admin: admin}
+	if d.newConnCloseFailures > 0 {
+		conn.closeFailures, conn.closeErr = d.newConnCloseFailures, d.newConnCloseErr
+	}
 	d.connections = append(d.connections, conn)
 	return conn, nil
 }
@@ -144,6 +154,18 @@ type reconnectTestConn struct {
 	producerErr              error
 	closeFailures            int
 	closeErr                 error
+	// closeGate and closeHook apply to this connection, including replacements.
+	// closeMu protects configuration; neither runs while the mutex is held.
+	closeGate    *attemptGate
+	closeHook    func()
+	closeContext context.Context
+	// closeGateHold and closeInFlight instrument the connection's Close for
+	// the concurrency test: closeGateHold, when non-nil, holds a close in
+	// flight, and closeInFlight counts closes that are inside Close at once, so
+	// a test can prove the client never started two. closeMu guards the hold;
+	// the counter is atomic.
+	closeGateHold *chan struct{}
+	closeInFlight atomic.Int32
 }
 
 func (c *reconnectTestConn) Capabilities() driver.Capabilities { return c.driver.Capabilities() }
@@ -199,8 +221,24 @@ func (c *reconnectTestConn) Consumer(ctx context.Context, cfg driver.ConsumerCon
 }
 func (c *reconnectTestConn) Admin() driver.Admin      { return c.admin }
 func (*reconnectTestConn) Ping(context.Context) error { return nil }
-func (c *reconnectTestConn) Close(context.Context) error {
+func (c *reconnectTestConn) Close(ctx context.Context) error {
 	c.closeCalls.Add(1)
+	c.closeInFlight.Add(1)
+	defer c.closeInFlight.Add(-1)
+	c.closeMu.Lock()
+	closeGate, closeHook := c.closeGate, c.closeHook
+	closeGateHold := c.closeGateHold
+	c.closeContext = ctx
+	c.closeMu.Unlock()
+	if closeHook != nil {
+		closeHook()
+	}
+	if closeGate != nil {
+		closeGate.hold()
+	}
+	if closeGateHold != nil {
+		<-*closeGateHold
+	}
 	c.driver.mu.Lock()
 	gate := c.driver.firstCloseGate
 	first := len(c.driver.connections) > 0 && c.driver.connections[0] == c
@@ -625,6 +663,9 @@ func newReconnectTestClientWithLogger(t *testing.T, d *reconnectTestDriver, c cl
 	cfg.Lifecycle.DrainTimeout = 500 * time.Millisecond
 	cfg.Lifecycle.HandlerGrace = 100 * time.Millisecond
 	cfg.Lifecycle.CloseTimeout = 100 * time.Millisecond
+	if d != nil && d.newConnCloseFailures > 0 {
+		cfg.Lifecycle.CloseTimeout = time.Minute
+	}
 	options := []Option{WithDriver(d)}
 	if logger != nil {
 		options = append(options, WithLogger(logger))
@@ -1225,6 +1266,53 @@ func holdRetirementProducer(t *testing.T, conn *reconnectTestConn) (<-chan struc
 	release := func() { once.Do(func() { close(gate) }) }
 	t.Cleanup(release)
 	return entered, release
+}
+
+// waitRetirementScheduled waits until a held entry has a failed attempt and a
+// retry time, which is the state the retry loop reads to register its timer.
+func waitRetirementScheduled(t *testing.T, client *Client) {
+	t.Helper()
+	waitReconnectCondition(t, func() bool {
+		client.mu.Lock()
+		defer client.mu.Unlock()
+		for _, entry := range client.retirements {
+			if entry.attempt == nil && !entry.retryAt.IsZero() {
+				return true
+			}
+		}
+		return false
+	})
+}
+
+// waitCloseCalls waits until a connection has made want close attempts.
+func waitCloseCalls(t *testing.T, conn *reconnectTestConn, want int32) {
+	t.Helper()
+	waitReconnectCondition(t, func() bool { return conn.closeCalls.Load() >= want })
+}
+
+// TestRetirementBackoffCapsAtTheRetryLimit proves the retry backoff doubles
+// from one CloseTimeout and stops growing at the cap.
+func TestRetirementBackoffCapsAtTheRetryLimit(t *testing.T) {
+	timeout := 100 * time.Millisecond
+	want := []time.Duration{
+		100 * time.Millisecond,
+		200 * time.Millisecond,
+		400 * time.Millisecond,
+		800 * time.Millisecond,
+		1600 * time.Millisecond,
+		3200 * time.Millisecond,
+		6400 * time.Millisecond,
+		12800 * time.Millisecond,
+		25600 * time.Millisecond,
+		51200 * time.Millisecond,
+		maxRetirementRetryInterval,
+		maxRetirementRetryInterval,
+	}
+	for retries, wait := range want {
+		if got := retirementBackoff(retries, timeout); got != wait {
+			t.Fatalf("backoff after %d retries = %s, want %s", retries, got, wait)
+		}
+	}
 }
 
 func nextRetirementTimer(t *testing.T, recorded *recordingClock) time.Duration {
@@ -4220,4 +4308,420 @@ func TestPublishStartedDuringReconnectIsRefusedAtEntry(t *testing.T) {
 		t.Fatalf("first Publish() = %v, want errClientReconnecting", err)
 	}
 	waitReconnectCondition(t, func() bool { return recorded.sleepCount() == 1 })
+}
+
+// newRetirementTestClientWithCloseTimeout builds the retirement harness with an
+// explicit teardown bound, so a test can keep the background retry from firing
+// (a long bound) or drive it at a known wait (a short one).
+func newRetirementTestClientWithCloseTimeout(t *testing.T, closeTimeout time.Duration) (*Client, *reconnectTestDriver, *recordingClock) {
+	t.Helper()
+	recorded := &recordingClock{
+		Fake:         clock.NewFake(time.Unix(940, 0)),
+		sleepStarted: make(chan chan struct{}, 8),
+		timerStarted: make(chan time.Duration, 64),
+	}
+	d := &reconnectTestDriver{created: make(chan *reconnectTestConsumer, 8)}
+	client := newReconnectTestClient(t, d, recorded, 0)
+	client.config.Lifecycle.CloseTimeout = closeTimeout
+	client.reconnectRandom = func() float64 { return 1 }
+	publishRetirementMessage(t, client)
+	return client, d, recorded
+}
+
+// armRetirementFailures makes the connection the client already holds fail its
+// close, and arms every replacement the driver opens to fail its close too, so
+// each swap leaves a held retirement. pass is the number of closes the first
+// held connection fails before one succeeds.
+func armRetirementFailures(t *testing.T, client *Client, d *reconnectTestDriver, pass int) {
+	t.Helper()
+	d.newConnCloseFailures, d.newConnCloseErr = pass, errors.New("connection close failed")
+	initial := retirementConnection(d, 0)
+	initial.closeMu.Lock()
+	initial.closeFailures, initial.closeErr = pass, errors.New("connection close failed")
+	initial.closeMu.Unlock()
+}
+
+// retirementEntry returns the entry the client holds for epoch, or nil.
+func retirementEntry(client *Client, epoch uint64) *retiredConnection {
+	client.mu.Lock()
+	defer client.mu.Unlock()
+	for _, entry := range client.retirements {
+		if entry.epoch == epoch {
+			return entry
+		}
+	}
+	return nil
+}
+
+// heldRetirementCount returns the number of retirements the client owns.
+func heldRetirementCount(client *Client) int {
+	client.mu.Lock()
+	defer client.mu.Unlock()
+	return len(client.retirements)
+}
+
+// waitHeldRetirements waits until the client holds exactly want retirements.
+func waitHeldRetirements(t *testing.T, client *Client, want int) {
+	t.Helper()
+	waitReconnectCondition(t, func() bool { return heldRetirementCount(client) == want })
+}
+
+// driveRetirementReconnect runs one supervisor attempt to its end without
+// requiring a new retirement, so a caller can drive an attempt that is refused
+// instead of one that swaps.
+func driveRetirementReconnect(t *testing.T, client *Client, recorded *recordingClock) {
+	t.Helper()
+	client.mu.Lock()
+	epoch := client.current.epoch
+	client.mu.Unlock()
+	if err := client.requestReconnect(errors.New("retirement transport failure"), epoch); err != nil {
+		t.Fatalf("reconnect request was refused early: %v", err)
+	}
+	waitReconnectCondition(t, func() bool { return len(recorded.sleepStarted) > 0 })
+	token := <-recorded.sleepStarted
+	waitForSignal(t, token, "recorded.sleepStarted")
+	recorded.Advance(reconnectDriverInitialInterval)
+	waitReconnectCondition(t, func() bool { return !client.isReconnecting() })
+}
+
+// requestRefusedReconnect asks for one more reconnect at the retirement ceiling
+// and returns the retained error. The ceiling is checked at the start of an
+// attempt, so a refused request opens nothing, starts no backoff, and leaves the
+// client in its failed connection state; both the request and every later one
+// report the same retained error.
+func requestRefusedReconnect(t *testing.T, client *Client, recorded *recordingClock) error {
+	t.Helper()
+	client.mu.Lock()
+	epoch := client.current.epoch
+	client.mu.Unlock()
+	err := client.requestReconnect(errors.New("ceiling reconnect"), epoch)
+	waitReconnectCondition(t, func() bool { return !client.isReconnecting() })
+	if errors.Is(err, errRetirementsExhausted) {
+		return err
+	}
+	client.mu.Lock()
+	defer client.mu.Unlock()
+	return client.reconnectErr
+}
+
+// reconnectLeavingRetirement drives one reconnect of the connection the client
+// holds, waits for the replacement to install, and returns once the retirement
+// the swap creates has been appended, so a caller driving several in a row does
+// not race the next cycle against the async append.
+func reconnectLeavingRetirement(t *testing.T, client *Client, recorded *recordingClock) {
+	t.Helper()
+	before := heldRetirementCount(client)
+	driveRetirementReconnect(t, client, recorded)
+	// The swap appends the retirement on its own goroutine after it installs
+	// the replacement, so wait for the entry rather than for the swap.
+	waitReconnectCondition(t, func() bool { return heldRetirementCount(client) > before })
+}
+
+// TestRetirementCeilingRefusesTheNinthReconnect proves the client stops
+// reconnecting once it holds the ceiling's worth of failed retirements, reports
+// the retained error through Health, and never opens another connection.
+//
+// Seven reconnects each retire one connection whose close fails, so the client
+// holds seven. The next request opens a replacement and is refused at the
+// ceiling check before the swap can install it, retiring that replacement too,
+// which is the eighth entry. A further request is refused before it opens
+// anything. Health and a publish then report the retained ceiling error, and a
+// broker that keeps failing its closes leaves the count where it was.
+func TestRetirementCeilingRefusesTheNinthReconnect(t *testing.T) {
+	client, d, recorded := newRetirementTestClientWithCloseTimeout(t, time.Minute)
+	armRetirementFailures(t, client, d, 1000)
+
+	for range retirementCeiling - 1 {
+		reconnectLeavingRetirement(t, client, recorded)
+	}
+	if got := heldRetirementCount(client); got != retirementCeiling-1 {
+		t.Fatalf("held retirements after %d reconnects = %d, want %d", retirementCeiling-1, got, retirementCeiling-1)
+	}
+	if got := d.OpenCount(); got != retirementCeiling {
+		t.Fatalf("Open count after %d reconnects = %d, want %d", retirementCeiling-1, got, retirementCeiling)
+	}
+
+	// One more reconnect opens a replacement whose close fails and swaps it in,
+	// which is the eighth held entry. The request that follows meets the
+	// ceiling: the supervisor opens nothing, refuses, and leaves the retained
+	// error the failed connection axis carries.
+	driveRetirementReconnect(t, client, recorded)
+	waitHeldRetirements(t, client, retirementCeiling)
+	opensAtCeiling := d.OpenCount()
+	if retained := requestRefusedReconnect(t, client, recorded); !errors.Is(retained, errRetirementsExhausted) {
+		t.Fatalf("retained error after the refusal = %v, want errRetirementsExhausted", retained)
+	}
+	if got := d.OpenCount(); got != opensAtCeiling {
+		t.Fatalf("Open count after the refused reconnect = %d, want %d", got, opensAtCeiling)
+	}
+
+	// Every later reconnect is refused before it opens anything, and reports
+	// that same retained error.
+	client.mu.Lock()
+	epoch := client.current.epoch
+	client.mu.Unlock()
+	if err := client.requestReconnect(errors.New("ceiling reconnect again"), epoch); !errors.Is(err, errRetirementsExhausted) {
+		t.Fatalf("reconnect at the ceiling = %v, want errRetirementsExhausted", err)
+	}
+	if got := d.OpenCount(); got != opensAtCeiling {
+		t.Fatalf("Open count after a refused request = %d, want %d", got, opensAtCeiling)
+	}
+	if healthErr := client.Health(context.Background()); !errors.Is(healthErr, errRetirementsExhausted) {
+		t.Fatalf("Health at the ceiling = %v, want errRetirementsExhausted", healthErr)
+	}
+	if _, publishErr := client.Publisher().Publish(context.Background(), "orders.created", map[string]string{"value": "refused"}); !errors.Is(publishErr, errRetirementsExhausted) {
+		t.Fatalf("Publish at the ceiling = %v, want errRetirementsExhausted", publishErr)
+	}
+
+	recorded.Advance(time.Minute)
+	waitHeldRetirements(t, client, retirementCeiling)
+	if healthErr := client.Health(context.Background()); !errors.Is(healthErr, errRetirementsExhausted) {
+		t.Fatalf("Health after refused retries = %v, want errRetirementsExhausted", healthErr)
+	}
+	if got := d.OpenCount(); got != opensAtCeiling {
+		t.Fatalf("Open count after refused retries = %d, want %d", got, opensAtCeiling)
+	}
+}
+
+// TestFailedDiscardedProducerIsHeldCountedAndRetried proves a discarded
+// producer whose close failed becomes a held, counted retirement that the
+// running client retries, and that a later success releases it.
+func TestFailedDiscardedProducerIsHeldCountedAndRetried(t *testing.T) {
+	client, d, recorded := newRetirementTestClient(t)
+	old := retirementConnection(d, 0)
+	producer, err := old.Producer(context.Background(), driver.ProducerConfig{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	old.closeMu.Lock()
+	old.producerFailures, old.producerErr = 1, errors.New("discarded producer close failed")
+	old.closeMu.Unlock()
+
+	closeDiscardedProducer(client, producer, 1, context.Background())
+
+	entry := retirementEntry(client, 1)
+	if entry == nil {
+		t.Fatal("failed discarded producer was not held")
+	}
+	if entry.producer == nil || entry.conn != nil {
+		t.Fatalf("discarded producer entry = %+v, want producer set and conn nil", entry)
+	}
+	if entry.err == nil || entry.retryAt.IsZero() {
+		t.Fatalf("discarded producer entry = %+v, want a failed entry with a scheduled retry", entry)
+	}
+	if got := heldRetirementCount(client); got != 1 {
+		t.Fatalf("held retirements = %d, want 1", got)
+	}
+	if calls := old.producerCloseCalls.Load(); calls != 1 {
+		t.Fatalf("producer close calls = %d, want the failed attempt", calls)
+	}
+
+	recorded.Advance(100 * time.Millisecond)
+	waitReconnectCondition(t, func() bool { return heldRetirementCount(client) == 0 })
+	if calls := old.producerCloseCalls.Load(); calls != 2 {
+		t.Fatalf("producer close calls after retry = %d, want the retry", calls)
+	}
+}
+
+// TestRetirementRetrySucceedsWhileTheClientRuns proves the running client
+// releases a retirement whose close later succeeds, before any Close call.
+func TestRetirementRetrySucceedsWhileTheClientRuns(t *testing.T) {
+	client, d, recorded := newRetirementTestClient(t)
+	old := retirementConnection(d, 0)
+	// Only the connection the client already holds fails its close, so the
+	// replacement it swaps to still shuts down cleanly at the end.
+	old.closeMu.Lock()
+	old.closeFailures, old.closeErr = 1, errors.New("connection close failed")
+	old.closeMu.Unlock()
+
+	// The first close fails and the retry the loop schedules at once CloseTimeout
+	// later succeeds, all while the client runs. The released entry stays owned
+	// until the next pass deletes it, so advance again to let that happen.
+	driveRetirementReconnect(t, client, recorded)
+	// The retry ran during the reconnect's own advance; one more fires it and
+	// the pass that follows deletes the released entry.
+	recorded.Advance(time.Minute)
+	waitHeldRetirements(t, client, 0)
+	if calls := old.closeCalls.Load(); calls != 2 {
+		t.Fatalf("close calls = %d, want the failed attempt and its retry", calls)
+	}
+	// The replacement the reconnect installed now stands in for the live
+	// connection; no failure is armed for it, so Close shuts down cleanly.
+	if err := client.Close(context.Background()); err != nil {
+		t.Fatalf("Close after the retry released the entry = %v", err)
+	}
+}
+
+// TestRetirementRetryBacksOffOnTheFakeClock proves the first retry waits one
+// CloseTimeout and each later one doubles.
+func TestRetirementRetryBacksOffOnTheFakeClock(t *testing.T) {
+	client, d, recorded := newRetirementTestClient(t)
+	initial := retirementConnection(d, 0)
+	initial.closeMu.Lock()
+	initial.closeFailures, initial.closeErr = 1000, errors.New("connection close failed")
+	initial.closeMu.Unlock()
+	client.config.Lifecycle.CloseTimeout = 100 * time.Millisecond
+
+	driveRetirementReconnect(t, client, recorded)
+	waitReconnectCondition(t, func() bool { return heldRetirementCount(client) == 1 })
+
+	// Each retry is scheduled from the fake time its failure is recorded, so
+	// wait for that schedule before advancing: an advance that runs first would
+	// move the deadline rather than expire it. The first wait is one
+	// CloseTimeout.
+	step := 100 * time.Millisecond
+	waitRetirementScheduled(t, client)
+	recorded.Advance(step)
+	waitCloseCalls(t, initial, 2)
+
+	// The second wait is two CloseTimeouts, so a single step is not enough.
+	waitRetirementScheduled(t, client)
+	recorded.Advance(step)
+	if got := initial.closeCalls.Load(); got != 2 {
+		t.Fatalf("close calls after a 100ms step = %d, want 2: the second retry waited less than twice the first", got)
+	}
+	recorded.Advance(step)
+	waitCloseCalls(t, initial, 3)
+
+	// The third wait is four CloseTimeouts; three steps still fall short.
+	waitRetirementScheduled(t, client)
+	recorded.Advance(step)
+	recorded.Advance(step)
+	recorded.Advance(step)
+	if got := initial.closeCalls.Load(); got != 3 {
+		t.Fatalf("close calls after 300ms = %d, want 3: the third retry did not wait twice the second", got)
+	}
+	recorded.Advance(step)
+	waitCloseCalls(t, initial, 4)
+}
+
+// TestRetirementRetryNeverClosesOneConnectionConcurrently proves a retry does
+// not start a second close while one is in flight, including Close's.
+func TestRetirementRetryNeverClosesOneConnectionConcurrently(t *testing.T) {
+	client, d, recorded := newRetirementTestClient(t)
+	armRetirementFailures(t, client, d, 1000)
+	client.config.Lifecycle.CloseTimeout = 100 * time.Millisecond
+
+	reconnectLeavingRetirement(t, client, recorded)
+	old := retirementConnection(d, 0)
+
+	gate := make(chan struct{})
+	var release sync.Once
+	t.Cleanup(func() { release.Do(func() { close(gate) }) })
+	old.closeMu.Lock()
+	old.closeGateHold = &gate
+	old.closeMu.Unlock()
+
+	recorded.Advance(100 * time.Millisecond)
+	waitReconnectCondition(t, func() bool { return old.closeInFlight.Load() == 1 })
+
+	// The held attempt is this connection's one failed close. Let the next one
+	// succeed so the test can assert Close returns nil while it joins, not
+	// starts, the retry.
+	old.closeMu.Lock()
+	old.closeFailures, old.closeErr = 0, nil
+	old.closeMu.Unlock()
+	// The current connection is the replacement the reconnect installed; no
+	// failure is armed for it, so its own shutdown succeeds.
+	for _, conn := range d.connections {
+		conn.closeMu.Lock()
+		conn.closeFailures, conn.closeErr = 0, nil
+		conn.closeMu.Unlock()
+	}
+
+	closed := make(chan error, 1)
+	go func() { closed <- client.Close(context.Background()) }()
+	realTimer := clock.NewReal().Timer(50 * time.Millisecond)
+	defer realTimer.Stop()
+	<-realTimer.C
+	if got := old.closeInFlight.Load(); got != 1 {
+		t.Fatalf("closes in flight = %d, want 1: Close and the retry both entered", got)
+	}
+	old.closeMu.Lock()
+	old.closeFailures, old.closeErr = 0, nil
+	old.closeMu.Unlock()
+	release.Do(func() { close(gate) })
+	select {
+	case err := <-closed:
+		if err != nil {
+			t.Fatalf("Close = %v, want nil", err)
+		}
+	case <-clock.NewReal().Timer(2 * time.Second).C:
+		t.Fatal("Close did not return after the held close was released")
+	}
+	if got := old.closeCalls.Load(); got != 2 {
+		t.Fatalf("close calls = %d, want the one attempt and its retry", got)
+	}
+}
+
+// TestRetirementRetryStopsAtClose proves no retry starts once Close has
+// cancelled the supervisor, so the retry loop does not outlive Close.
+func TestRetirementRetryStopsAtClose(t *testing.T) {
+	baseline := runtime.NumGoroutine()
+	client, d, recorded := newRetirementTestClient(t)
+	armRetirementFailures(t, client, d, 1000)
+	client.config.Lifecycle.CloseTimeout = 100 * time.Millisecond
+
+	reconnectLeavingRetirement(t, client, recorded)
+
+	closed := make(chan error, 1)
+	go func() { closed <- client.Close(context.Background()) }()
+	if duration := nextRetirementTimer(t, recorded); duration != 100*time.Millisecond {
+		t.Fatalf("Close timer = %s, want the close bound", duration)
+	}
+	recorded.Advance(100 * time.Millisecond)
+	select {
+	case <-closed:
+	case <-clock.NewReal().Timer(2 * time.Second).C:
+		t.Fatal("Close did not return")
+	}
+
+	before := retirementConnection(d, 0).closeCalls.Load()
+	recorded.Advance(time.Hour)
+	if got := retirementConnection(d, 0).closeCalls.Load(); got != before {
+		t.Fatalf("close calls after Close = %d, want %d: the retry loop outlived Close", got, before)
+	}
+	assertRetirementGoroutinesReturned(t, baseline)
+}
+
+// TestRetirementRetryAfterTheCeilingReleasesWithoutRecovering proves the retry
+// loop keeps releasing handles while the client is in its failed connection
+// state, and that releasing them does not by itself bring the client back: a
+// restart is what clears the refusal.
+func TestRetirementRetryAfterTheCeilingReleasesWithoutRecovering(t *testing.T) {
+	client, d, recorded := newRetirementTestClientWithCloseTimeout(t, time.Minute)
+	armRetirementFailures(t, client, d, 1000)
+
+	for range retirementCeiling - 1 {
+		reconnectLeavingRetirement(t, client, recorded)
+	}
+	// One more reconnect swaps in a replacement whose close fails, which is the
+	// eighth held entry; the request after it meets the ceiling and is refused
+	// before it opens anything.
+	driveRetirementReconnect(t, client, recorded)
+	waitHeldRetirements(t, client, retirementCeiling)
+	opensAtCeiling := d.OpenCount()
+	if retained := requestRefusedReconnect(t, client, recorded); !errors.Is(retained, errRetirementsExhausted) {
+		t.Fatalf("retained error at the ceiling = %v, want errRetirementsExhausted", retained)
+	}
+
+	// One held entry's close now succeeds. The running loop releases it, so the
+	// count drops below the ceiling; the connection state and the retained
+	// error do not move.
+	released := retirementConnection(d, 0)
+	released.closeMu.Lock()
+	released.closeFailures, released.closeErr = 0, nil
+	released.closeMu.Unlock()
+	recorded.Advance(time.Minute)
+	waitHeldRetirements(t, client, retirementCeiling-1)
+
+	if !released.closed.Load() {
+		t.Fatal("retry did not release the entry it could close")
+	}
+	if healthErr := client.Health(context.Background()); !errors.Is(healthErr, errRetirementsExhausted) {
+		t.Fatalf("Health after a released entry = %v, want the retained ceiling error", healthErr)
+	}
+	if got := d.OpenCount(); got != opensAtCeiling {
+		t.Fatalf("Open count after a released entry = %d, want %d: the client recovered", got, opensAtCeiling)
+	}
 }

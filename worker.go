@@ -183,8 +183,10 @@ func (r *Runner) report(event runnerEvent) {
 // creates one per Run call, and every other goroutine of the runner reports
 // through its event channel instead of writing what the owner keeps.
 type runnerOwner struct {
-	runner *Runner
-	events chan runnerEvent
+	runner        *Runner
+	events        chan runnerEvent
+	leftoverLimit <-chan struct{}
+	leftoverErr   error
 
 	// outstanding counts the generation's sources that have not reported yet.
 	outstanding int
@@ -266,8 +268,54 @@ func (o *runnerOwner) beginGeneration() {
 // the owner to know arrives here, and a report this wait is not itself
 // waiting for is handled rather than left for later.
 func (o *runnerOwner) pumpUntil(ready func() bool) {
-	for !ready() {
-		o.handle(<-o.events)
+	for {
+		// A final source report can race the threshold. Consume the sticky
+		// signal before accepting a satisfied predicate, even if its sender
+		// has already returned and released its leftover count.
+		select {
+		case <-o.leftoverLimit:
+			o.failLeftoverBudget()
+		default:
+		}
+		if ready() {
+			return
+		}
+		select {
+		case event := <-o.events:
+			o.handle(event)
+		case <-o.leftoverLimit:
+			o.failLeftoverBudget()
+		}
+	}
+}
+
+type leftoverBudgetError struct {
+	subscription string
+	limit        int
+}
+
+func (e *leftoverBudgetError) Error() string {
+	return fmt.Sprintf("f1: subscription %s leftover goroutine budget exhausted (limit=%d)", e.subscription, e.limit)
+}
+
+func (*leftoverBudgetError) Kind() driver.Kind { return driver.KindFatal }
+
+func (o *runnerOwner) failLeftoverBudget() {
+	o.leftoverLimit = nil
+	r := o.runner
+	err := &leftoverBudgetError{subscription: r.subscription.Name, limit: r.subscription.Concurrency}
+	o.leftoverErr = err
+	o.runErr = errors.Join(err, o.runErr)
+	r.mu.Lock()
+	if r.lifecycle != nil {
+		if transitionErr := r.lifecycle.Transition(lifecycle.Failed); transitionErr != nil {
+			o.runErr = errors.Join(o.runErr, transitionErr)
+		}
+	}
+	r.mu.Unlock()
+	r.client.recordFailedSubscription(r.subscription.Name, o.runErr, r)
+	if o.cancel != nil {
+		o.cancel()
 	}
 }
 
@@ -390,11 +438,17 @@ func (o *runnerOwner) generationEnded() bool {
 // startDrain begins the runner's one terminal drain. It is idempotent, and
 // that is what makes drain one event: the first caller starts it and every
 // later request joins it, so this teardown runs once however many of Close,
-// the supervisor's abandon and the end of Run arrive at once. An abandon that
-// overlaps the drain still calls Release itself, because the supervisor gives
-// the consumer back to the connection it is leaving before the runner reopens
-// on the replacement: ending the runner and handing a consumer back are not
-// the same operation, and the drain is only the first of them.
+// the supervisor's abandon and the end of Run arrive at once.
+//
+// The consumer underneath it has one owner as well, and the drain is not
+// always that owner: an abandon, a lane repair or a handoff that reached
+// teardownRunnerConsumer first releases the consumer, and this drain then
+// joins that release instead of stopping a consumer that is already gone.
+// Whichever way that goes, the handback the supervisor owes the connection it
+// is leaving still happens: the drain's own Stop followed by the Release every
+// Stop error triggers gives the deliveries back exactly when the driver has
+// any to give (driver/driver.go Stop), and a release that claimed first is the
+// handback itself.
 func (o *runnerOwner) startDrain(base context.Context) {
 	if o.drained {
 		return
@@ -428,10 +482,12 @@ func (o *runnerOwner) waitSources() error {
 	return o.sourceErr
 }
 
-// Run starts the consumer and returns when it stops, ctx is canceled, or a
-// driver error requests shutdown. Canceling ctx stops the runner immediately:
-// in-flight handlers see cancellation and HandlerGrace does not apply. Use
-// Drain for a graceful stop. A non-nil error after startup is recorded against
+// Run starts the consumer and returns when it stops, ctx is canceled, a
+// driver error requests shutdown, or the shared leftover user-goroutine
+// threshold fails the subscription with driver.KindFatal. Canceling ctx stops
+// the runner immediately: in-flight handlers see cancellation and
+// HandlerGrace does not apply. Use Drain for a graceful stop. A non-nil error
+// after startup is recorded against
 // the subscription for Client.Health, except after caller cancellation, drain,
 // or client shutdown. A Runner can be started only once.
 func (r *Runner) Run(ctx context.Context) (runErr error) {
@@ -464,6 +520,9 @@ func (r *Runner) Run(ctx context.Context) (runErr error) {
 	r.asyncGroup = new(errgroup.Group)
 	r.errorGroup = newErrorHandlerGroup(r.subscription.Concurrency)
 	r.events = make(chan runnerEvent)
+	if r.leftoverLimit == nil {
+		r.leftoverLimit = make(chan struct{})
+	}
 	r.mu.Unlock()
 	r.client.mu.Unlock()
 
@@ -473,7 +532,7 @@ func (r *Runner) Run(ctx context.Context) (runErr error) {
 	// after finishRunner so it runs first and reads the result Run is about to
 	// hand back, including an error joined in by drainAfterRun.
 	defer func() { r.recordRunExit(ctx, runErr) }()
-	owner := &runnerOwner{runner: r, events: r.events, base: ctx}
+	owner := &runnerOwner{runner: r, events: r.events, base: ctx, leftoverLimit: r.leftoverLimit}
 	// The owner's error is published to the runner before the runner's done
 	// channel closes, so a Drain that returns because the runner ended reads
 	// the same failure the run ended with.
@@ -482,6 +541,27 @@ func (r *Runner) Run(ctx context.Context) (runErr error) {
 			r.mu.Lock()
 			r.runErr = owner.runErr
 			r.mu.Unlock()
+		}
+	}()
+	defer func() {
+		if owner.cancel != nil {
+			owner.cancel()
+		}
+		// Drain can start teardown while a failed open waits for Rebuilt.
+		// If Rebuilt arrives before DrainDone, that wait returns and Run exits
+		// while teardown still owns an unbuffered send. Join it before publishing
+		// the errors and closing done, or Drain misses its failure and the sender
+		// has no reader left.
+		if owner.drained {
+			owner.pumpUntil(func() bool { return owner.drainDone })
+			if owner.drainErr != nil {
+				if runErr == nil {
+					runErr = owner.drainErr
+				} else {
+					runErr = errors.Join(runErr, owner.drainErr)
+				}
+				owner.runErr = errors.Join(owner.runErr, owner.drainErr)
+			}
 		}
 	}()
 	var runCtx context.Context
@@ -509,6 +589,29 @@ func (r *Runner) Run(ctx context.Context) (runErr error) {
 		owner.startOpen(ctx, prefetch)
 		owner.pumpUntil(func() bool { return owner.opened })
 		consumer, openedEpoch, err := owner.openConsumer, owner.openEpoch, owner.openErr
+		if owner.leftoverErr != nil {
+			// The threshold was reached after the check above the loop and
+			// while this consumer was opening: a leftover is marked by a user
+			// goroutine, so it can land anywhere the owner is not looking, and
+			// the generation must not start on a runner that has already
+			// failed. Releasing the consumer is the exit the drain case below
+			// takes, and the error Run returns is joined after the loop.
+			//
+			// The window cannot be forced by a test: the mark that reaches it
+			// is driven by the same cancellation that ends the previous
+			// generation, so the owner may instead observe it before this open
+			// begins, and TestLeftoversSurviveConsumerGenerationRebuild covers
+			// the rebuild it belongs to from outside. What the branch protects
+			// is only this: a latched runner starts no generation of its own.
+			// A delivery already handed over in the same generation as the
+			// latch is still requeued rather than run - refused work is never
+			// acknowledged and never dropped - until the owner consumes the
+			// signal and cancels that generation.
+			if consumer != nil {
+				owner.runErr = errors.Join(owner.runErr, releaseUnadmittedConsumer(r, context.WithoutCancel(runCtx), consumer, openedEpoch))
+			}
+			break
+		}
 		if owner.draining {
 			// The runner began draining while the consumer was opening, so the
 			// consumer belongs to no generation: it is released here rather
@@ -527,7 +630,7 @@ func (r *Runner) Run(ctx context.Context) (runErr error) {
 		if err != nil {
 			repairCause = nil
 			if errors.Is(err, errRunnerDraining) {
-				// The failed open admitted no consumer or deliveries, so there is nothing to drain.
+				// No consumer was admitted; the exit defer joins any drain already started.
 				return nil
 			}
 			if owner.abandoned {
@@ -536,7 +639,7 @@ func (r *Runner) Run(ctx context.Context) (runErr error) {
 				// attempt and opens again on what it leaves behind.
 				draining, reconnectErr := owner.awaitRebuild(ctx, nil, 0)
 				if draining {
-					// The cancelled open admitted no consumer or deliveries, so there is nothing to drain.
+					// Drain may have started while this wait pumped events; the exit defer joins it.
 					return nil
 				}
 				if reconnectErr != nil {
@@ -559,7 +662,7 @@ func (r *Runner) Run(ctx context.Context) (runErr error) {
 			r.transitionToReconnecting()
 			draining, reconnectErr := owner.awaitRebuild(ctx, err, 0)
 			if draining {
-				// The failed open admitted no consumer or deliveries, so there is nothing to drain.
+				// Drain may have started while this wait pumped events; the exit defer joins it.
 				return nil
 			}
 			if reconnectErr != nil {
@@ -582,6 +685,12 @@ func (r *Runner) Run(ctx context.Context) (runErr error) {
 		if admissionErr == nil {
 			r.consumer = consumer
 			r.consumerEpoch = openedEpoch
+			// A consumer the runner has not held before gets its own teardown.
+			// The attempt that belongs to the consumer this generation
+			// replaces has already run, or is running, and a caller for this
+			// one must not join it: the driver would never be asked about the
+			// consumer it now carries.
+			r.teardown = nil
 		}
 		r.mu.Unlock()
 		r.client.mu.Unlock()
@@ -752,16 +861,15 @@ func (r *Runner) Run(ctx context.Context) (runErr error) {
 		}
 	}
 
-	shutdownErr := owner.drain(runCtx)
-	// The drain's own failure is published to the runner with the run's, so a
-	// Drain caller sees the same teardown failure the Run caller does.
-	if shutdownErr != nil {
-		owner.runErr = errors.Join(owner.runErr, shutdownErr)
-	}
-	if runErr == nil {
-		runErr = shutdownErr
-	} else if shutdownErr != nil {
-		runErr = errors.Join(runErr, shutdownErr)
+	_ = owner.drain(runCtx)
+	// A leftover-budget failure is this runner's own, not a source error the
+	// generation happened to report first, so it is joined here where every
+	// exit path passes: the latent return is what recordRunExit reads, and a
+	// Drain caller reading the runner's error sees it in the same value. The
+	// owner already put it into the error a generation reports, and that is the
+	// same value here, so the join happens only when the exit path left it out.
+	if owner.leftoverErr != nil && !errors.Is(runErr, owner.leftoverErr) {
+		runErr = errors.Join(owner.leftoverErr, runErr)
 	}
 	return runErr
 }
@@ -2284,7 +2392,7 @@ func invokeHandlerMessage(r *Runner, parent context.Context, handler Handler, ev
 		group = new(errgroup.Group)
 	}
 	r.mu.Unlock()
-	group.Go(func() error {
+	invocation := r.startUserInvocation(group, func(inv *userInvocation) error {
 		result := handlerResult{}
 		func() {
 			defer func() {
@@ -2298,9 +2406,13 @@ func invokeHandlerMessage(r *Runner, parent context.Context, handler Handler, ev
 			result.panic = panicErr
 			result.err = nil
 		}
+		r.completeUserInvocation(inv)
 		done <- result
 		return nil
 	})
+	if invocation == nil {
+		return handlerResult{stuck: true}
+	}
 	stuck := r.client.options.clock.Timer(timeout * stuckPhaseMultiplier)
 	defer stuck.Stop()
 	parentDone := parent.Done()
@@ -2336,6 +2448,7 @@ func invokeHandlerMessage(r *Runner, parent context.Context, handler Handler, ev
 	if result, ended := awaitHandlerPhase(r, done, &parentDone, &drainStarted, shutdownDone, stackTimer.C); ended {
 		return finish(result)
 	}
+	r.markUserLeftover(invocation)
 	lastResortRunnerLogger(r).LogAttrs(handlerCtx, slog.LevelError, "f1 worker exceeded stuck threshold",
 		slog.String("subscription", r.subscription.Name),
 		slog.Duration("threshold", stuckAbortMultiplier*timeout),
@@ -3091,6 +3204,100 @@ func retryAndSettle(r *Runner, ctx context.Context, message driver.InboundMessag
 	return ackDeliveryAs(r, runnerSettlementContext(r, ctx), message, false, state)
 }
 
+// consumerTeardown is one conversation with a driver about one consumer. The
+// first caller of the terminal drain, a reconnect abandon, a lane-repair
+// release or a successor-handoff release claims it and makes the driver calls;
+// every later caller joins the same completion and reports its result. done
+// closes after the claimer has reported, and err is that result, written before
+// the close so a joiner that observes the close reads it without another lock.
+type consumerTeardown struct {
+	consumer driver.Consumer
+	epoch    uint64
+	done     chan struct{}
+	err      error
+}
+
+// consumerTeardownBudget returns the clock and the per-phase budget a consumer
+// teardown runs under. A runner this package's tests built by hand has no
+// client, and the zero budget then leaves the caller's context as the only
+// bound, which is the shape those tests already rely on.
+func consumerTeardownBudget(r *Runner) (clock.Clock, time.Duration) {
+	if r.client == nil {
+		return nil, 0
+	}
+	return r.client.options.clock, r.client.config.Lifecycle.CloseTimeout
+}
+
+// teardownRunnerConsumer runs body exactly once for the runner's consumer.
+//
+// Which caller wins is decided here and nowhere else, under the same lock that
+// guards r.consumer, because the two sequences a runner performs on one
+// consumer are not interchangeable: the drain stops the consumer and releases
+// only what Stop refuses, while an abandon, a lane repair and a handoff
+// release the consumer at once. A loser joins the winner's completion instead
+// of starting a second sequence, which is what keeps the driver from being
+// asked to tear the same consumer down twice.
+//
+// body runs without mu. It makes driver calls bounded by their own phase
+// budgets and, on a failed release, records the consumer against its epoch
+// through client.mu, and worker.go's admission critical section already takes
+// client.mu before mu, so taking mu here and calling into the client would
+// invert that order. The claim is published and mu released before body runs.
+//
+// The attempt stays installed for the consumer's lifetime, completion
+// included. r.consumer is never cleared, so a caller that arrives late, such
+// as an abandonRunners snapshot of a runner that already drained, a second
+// Client.Close re-entering drainRunners or a handoff after a drain, reads the
+// owner's result instead of calling the driver again. Admitting the next
+// consumer installs a fresh attempt, which is what re-arms teardown for the
+// generation that follows.
+func teardownRunnerConsumer(r *Runner, ctx context.Context,
+	body func(consumer driver.Consumer, epoch uint64) error,
+) error {
+	r.mu.Lock()
+	consumer, epoch := r.consumer, r.consumerEpoch
+	if consumer == nil {
+		r.mu.Unlock()
+		return nil
+	}
+	if attempt := r.teardown; attempt != nil {
+		r.mu.Unlock()
+		return joinConsumerTeardown(r, ctx, attempt)
+	}
+	attempt := &consumerTeardown{consumer: consumer, epoch: epoch, done: make(chan struct{})}
+	r.teardown = attempt
+	r.mu.Unlock()
+	err := body(consumer, epoch)
+	r.mu.Lock()
+	attempt.err = err
+	close(attempt.done)
+	r.mu.Unlock()
+	return err
+}
+
+// joinConsumerTeardown waits for the claimer's result, bounded by the caller's
+// own context and Lifecycle.CloseTimeout the way the claimer bounds each of its
+// phases. It makes no driver call: a wait that ends by its own bound reports
+// the phase deadline and leaves the attempt installed, so a later caller reads
+// the real result instead of starting the sequence again. The claimer is the
+// one that owns the consumer, so its context supplies the sequence's budgets
+// and a loser waits for as long as its own budget allows.
+func joinConsumerTeardown(r *Runner, ctx context.Context, attempt *consumerTeardown) error {
+	clk, closeTimeout := consumerTeardownBudget(r)
+	err := runWithClockTimeout(ctx, clk, closeTimeout, "consumer teardown", func(waitCtx context.Context) error {
+		select {
+		case <-attempt.done:
+			return nil
+		case <-waitCtx.Done():
+			return waitCtx.Err()
+		}
+	})
+	if err != nil {
+		return err
+	}
+	return attempt.err
+}
+
 // A Stop refusal for outstanding messages is a redelivery case, not a retry
 // case: Release gives those deliveries back to the broker. Every other Stop
 // failure releases too, because a driver whose Stop did not finish keeps the
@@ -3098,20 +3305,23 @@ func retryAndSettle(r *Runner, ctx context.Context, message driver.InboundMessag
 // this terminal drain. A Stop timeout or cancellation releases on a fresh,
 // bounded context. Join the Stop error with any Release error so teardown
 // failures reach the caller.
+//
+// This is the sequence for whichever caller claims the consumer first. A
+// reconnect abandon that claims it instead releases at once, and the drain
+// joins that release: Stop followed by the Release every Stop error triggers
+// is the same handback (driver/driver.go Stop), so an abandon that loses the
+// claim hands the consumer back through the drain rather than beside it.
 func stopRunnerConsumer(r *Runner, ctx context.Context) error {
-	r.mu.Lock()
-	consumer := r.consumer
-	epoch := r.consumerEpoch
-	r.mu.Unlock()
-	if consumer == nil {
-		return nil
-	}
-	var phaseClock clock.Clock
-	closeTimeout := time.Duration(0)
-	if r.client != nil {
-		phaseClock = r.client.options.clock
-		closeTimeout = r.client.config.Lifecycle.CloseTimeout
-	}
+	return teardownRunnerConsumer(r, ctx, func(consumer driver.Consumer, epoch uint64) error {
+		return stopConsumerSequence(r, ctx, consumer, epoch)
+	})
+}
+
+// stopConsumerSequence is the sequence stopRunnerConsumer claims: one Stop, and
+// the Release that follows any Stop error. It runs on the runner's consumer
+// that the claim captured.
+func stopConsumerSequence(r *Runner, ctx context.Context, consumer driver.Consumer, epoch uint64) error {
+	phaseClock, closeTimeout := consumerTeardownBudget(r)
 	stopErr := runWithClockTimeout(ctx, phaseClock, closeTimeout, "close", consumer.Stop)
 	if stopErr == nil {
 		return nil
@@ -3151,23 +3361,24 @@ func releaseUnadmittedConsumer(r *Runner, ctx context.Context, consumer driver.C
 // context, so a driver Release that ignores that context must not hold a
 // reconnect open behind it.
 //
+// It is the second of the four callers that reach the runner's one teardown,
+// so a drain that already claimed the consumer keeps it and this call reports
+// that claim's result instead of releasing beside it.
+//
 // A release that fails keeps the consumer on the client with the epoch it was
 // opened on: the driver still has it registered, so the connection carrying it
 // refuses to close until a later release succeeds.
 func releaseRunnerConsumer(r *Runner, ctx context.Context) error {
-	r.mu.Lock()
-	consumer := r.consumer
-	epoch := r.consumerEpoch
-	r.mu.Unlock()
-	if consumer == nil {
-		return nil
-	}
-	var phaseClock clock.Clock
-	closeTimeout := time.Duration(0)
-	if r.client != nil {
-		phaseClock = r.client.options.clock
-		closeTimeout = r.client.config.Lifecycle.CloseTimeout
-	}
+	return teardownRunnerConsumer(r, ctx, func(consumer driver.Consumer, epoch uint64) error {
+		return releaseConsumerSequence(r, ctx, consumer, epoch)
+	})
+}
+
+// releaseConsumerSequence is the sequence releaseRunnerConsumer claims: one
+// Release, and the epoch-keyed record a failure leaves behind for the
+// connection that still carries the consumer.
+func releaseConsumerSequence(r *Runner, ctx context.Context, consumer driver.Consumer, epoch uint64) error {
+	phaseClock, closeTimeout := consumerTeardownBudget(r)
 	err := runWithClockTimeout(ctx, phaseClock, closeTimeout, "close", consumer.Release)
 	if err != nil && !errors.Is(err, driver.ErrUnsupported) {
 		if r.client != nil {

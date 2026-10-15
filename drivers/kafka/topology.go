@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -18,6 +19,7 @@ import (
 
 type kafkaTopicSpec struct {
 	name              string
+	kind              driver.DestKind
 	partitions        int32
 	replicationFactor int16
 	err               error
@@ -56,6 +58,7 @@ func translateTopology(spec driver.TopologySpec) kafkaTopologyPlan {
 func translateDestination(spec driver.DestinationSpec) kafkaTopicSpec {
 	topic := kafkaTopicSpec{
 		name:              spec.Name,
+		kind:              spec.Kind,
 		replicationFactor: -1,
 	}
 	if spec.Partitions <= 0 {
@@ -173,6 +176,9 @@ func (a *admin) ensureTopology(ctx context.Context, spec driver.TopologySpec) (d
 		}
 	}
 	if err := a.waitForTopicState(ctx, "ensure_topology", created, topicMustExist); err != nil {
+		return driver.TopologyDiff{}, err
+	}
+	if err := a.checkDestinationCleanupPolicies(ctx, spec.Destinations); err != nil {
 		return driver.TopologyDiff{}, err
 	}
 
@@ -315,7 +321,69 @@ func (a *admin) verifyTopology(ctx context.Context, spec driver.TopologySpec) (d
 		// already verify every fact the broker has about a deferred lane.
 		// Refusing the destination fails a lane the consume path honours.
 	}
+	if err := a.checkDestinationCleanupPolicies(ctx, spec.Destinations); err != nil {
+		return driver.TopologyDiff{}, err
+	}
 	return diff, nil
+}
+
+func requiresDeletePolicy(kind driver.DestKind) bool {
+	return kind == driver.DestRetry || kind == driver.DestDLQ
+}
+
+func (a *admin) checkDestinationCleanupPolicies(ctx context.Context, destinations []driver.DestinationSpec) error {
+	var names []string
+	for _, destination := range destinations {
+		if requiresDeletePolicy(destination.Kind) && !slices.Contains(names, destination.Name) {
+			names = append(names, destination.Name)
+		}
+	}
+	if len(names) == 0 {
+		return nil
+	}
+	// Another runner can create a shared DLQ before this runner's CreateTopics
+	// returns TopicAlreadyExists, while broker metadata still cannot describe
+	// that topic. Wait for every guarded destination, not only our creations,
+	// before reading the policy that admits either runner's consumer.
+	if err := a.waitForTopicState(ctx, "ensure_topology", names, topicMustExist); err != nil {
+		return err
+	}
+	configs, err := a.describeTopicConfigs(ctx, names...)
+	if err != nil {
+		return err
+	}
+	return evaluateCleanupPolicies(names, configs)
+}
+
+func evaluateCleanupPolicies(names []string, configs kadm.ResourceConfigs) error {
+	for _, name := range names {
+		resource, err := configs.On(name, nil)
+		if err != nil {
+			return classifyAdminError("ensure_topology", err)
+		}
+		if resource.Err != nil {
+			return classifyAdminError("ensure_topology", resource.Err)
+		}
+		var policy *string
+		for _, config := range resource.Configs {
+			if config.Key == "cleanup.policy" {
+				policy = config.Value
+				break
+			}
+		}
+		if policy == nil || *policy == "" {
+			return classify("ensure_topology", driver.KindFatal, fmt.Errorf(
+				"destination %q cleanup.policy is unreadable: %w", name, errProtocolResponse))
+		}
+		for token := range strings.SplitSeq(*policy, ",") {
+			if strings.TrimSpace(token) == "compact" {
+				return classify("ensure_topology", driver.KindFatal, fmt.Errorf(
+					"destination %q has cleanup.policy=%q; retry and dead-letter topics must not compact; set cleanup.policy=delete",
+					name, *policy))
+			}
+		}
+	}
+	return nil
 }
 
 // describeTopology reports retained records, not unconsumed backlog. It has no

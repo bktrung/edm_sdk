@@ -74,7 +74,7 @@ When `Tiers` is not set, F1 works out the [retry steps](/learn/glossary#retry-ti
 
 ## Follow a failed delivery
 
-A retry or dead-letter copy is published before F1 acks the original delivery. This order means a message is never lost between the two: until the broker confirms the copy, the original is still there.
+Except for the acknowledged-without-copy cases below, a retry or dead-letter copy is published before F1 acks the original delivery. Until the broker confirms the copy, the original remains unsettled.
 
 ```mermaid
 flowchart TB
@@ -92,17 +92,45 @@ flowchart TB
     A -->|ack| B
 ```
 
-F1 waits for the broker to confirm the copy before acking the original. If a retry or dead-letter copy cannot be published within the time allowed for handing it to the broker, F1 stops the subscription, reports the runtime error through `WithErrorHandler`, releases the consumer without acknowledging the original, and records the failure for `Health`.
+Outside the deliberate-drop cases below, F1 waits for the broker to confirm the copy before acking the original. If a retry or dead-letter copy cannot be published within the time allowed for handing it to the broker, F1 stops the subscription, reports the runtime error through `WithErrorHandler`, releases the consumer without acknowledging the original, and records the failure for `Health`.
 
-A copy that can never be published is different. If the broker refuses the copy because it is too large, or its headers cannot be encoded, every redelivery would fail the same way. F1 acknowledges the original and reports the deliberate drop through `WithErrorHandler`. A retry copy that is too large is first sent through the dead-letter path; if that copy is also unpublishable, the same drop applies.
+Dead-letter containment has three acknowledged-without-copy exceptions in [`deadLetterAndSettle`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/worker.go): a poison message (`ReasonPoison`) has no dead-letter route; the broker refuses the dead-letter copy as too large; or the copy's headers cannot be encoded. To avoid the missing-route drop, create the dead-letter destinations and routes before deployment. To avoid the broker-size drop, keep message size below the broker limit minus room for retry and dead-letter headers. To avoid the encoding drop, keep headers within the effective header cap and reserve room for death metadata. F1 acknowledges the original without retaining a copy in these cases so the subscription can keep consuming. After a successful ack, F1 emits `ObserverPoisonRejected` and reports the drop through `WithErrorHandler`, or an error log when no handler is configured; `f1otel` records the [`f1.messaging.poison_dropped` counter](/advanced-topics/observability#opentelemetry-metrics), which has a [drop alert](/advanced-topics/alerts#poison-messages-dropped-without-a-retained-copy). A retry copy that is too large goes through the dead-letter path first; if that copy is also unpublishable, the same drop applies. Notifications and metrics are not retained copies.
 
 ## Dead letters and discarded events
 
 A dead-letter copy keeps the original body and envelope metadata, then adds a death reason and the last error. Automatic reasons include `terminal`, `max_attempts`, `panic`, `decode`, `expired`, `unmatched`, and `poison`.
 
-`Subscription.OnDeadLetter` receives a confirmed dead-letter outcome. `Subscription.OnDiscarded` receives an unmatched or explicitly dropped event. These callbacks are for logs, metrics, and alerts, not correctness-critical workflow steps. They run asynchronously with bounded notification contexts, so a slow or panicking callback must not stall delivery or shutdown.
+`Subscription.OnDeadLetter` receives a confirmed dead-letter outcome. `Subscription.OnDiscarded` receives an unmatched or explicitly dropped event. These callbacks are for logs, metrics, and alerts, not correctness-critical workflow steps. They run asynchronously with bounded notification contexts, so a slow or panicking callback must not stall delivery or shutdown. Their one-second deadline is measured on the runner's clock, so a client built with a test clock also decides when it expires.
 
 Use `f1.Drop` only when the event is intentionally handled without applying an effect and should not be retained. The default `UnmatchedPolicy` is `f1.Ignore`, which acknowledges an event without a matching handler and reports `DiscardUnmatched`. Use `f1.DeadLetter` when unmatched events must be retained.
+
+## Non-cooperative user code
+
+Honor the context in handlers and terminal callbacks. F1 cannot force-stop a
+user goroutine. A handler abandoned after 4x `HandlerTimeout`, or an
+`OnDeadLetter`/`OnDiscarded` callback still running when its own one-second
+deadline passes, counts as a leftover until the user function returns. Both are
+counted by the deadline they outlived, never by a cancellation: a callback whose
+context a parent cancelled, and which then returns, is not a leftover.
+
+Handlers and terminal callbacks share a failure threshold equal to the
+subscription's resolved `Concurrency`. Reaching it stops new user-work admission:
+`Run` returns an error classified as `driver.KindFatal`, and `Health` names the
+failed subscription. A later return does not resume intake. Already-admitted
+work may become leftover too, so this threshold is not a strict goroutine cap.
+
+Counting stops once the runner is draining or has stopped. A handler the drain
+itself abandons cannot fail a subscription that is already ending, so a shutdown
+with a non-cooperative handler still completes without error. Drain and Close stay
+bounded and do not wait for these goroutines.
+
+Work already handed over when the threshold is reached is not run: it is
+requeued for another consumer, never acknowledged and never dropped, until the
+runner's own generation stops.
+
+If a handler legitimately runs longer than 4x its timeout, increase
+`HandlerTimeout`; otherwise fix the blocking code before replacing the failed
+runner. Restarting a runner does not terminate goroutines left in the process.
 
 ## Make effects idempotent
 

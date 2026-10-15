@@ -3,6 +3,7 @@ package rabbitmq
 import (
 	"context"
 	"errors"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -420,5 +421,61 @@ func TestLockBeforeContextAcquiresLockReleasedDuringFinalSleep(t *testing.T) {
 		}
 	case <-wait.C:
 		t.Fatal("lockBeforeContext did not return after the final sleep")
+	}
+}
+
+// TestReestablishFailureReportsAGenerationSignalWithTheBrokerDiagnosis pins the
+// contract between a lane that ends because its replacement consumer could not
+// attach and the core: the kind is transient, which is the only consumer signal
+// the core turns into a rebuild, and the broker's own diagnosis still travels in
+// the error. A not-found or permission kind here would keep the generation alive
+// with a lane that never delivers again.
+func TestReestablishFailureReportsAGenerationSignalWithTheBrokerDiagnosis(t *testing.T) {
+	tests := []struct {
+		name        string
+		code        int
+		reason      string
+		wantMissing bool
+	}{
+		{
+			name:        "destination missing",
+			code:        404,
+			reason:      "NOT_FOUND - no queue 'orders' in vhost '/'",
+			wantMissing: true,
+		},
+		{
+			name:   "refused",
+			code:   403,
+			reason: "ACCESS_REFUSED - access to queue 'orders' refused",
+		},
+		{
+			name:   "channel failure",
+			code:   504,
+			reason: "CHANNEL_ERROR - second 'basic.consume'",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			brokerErr := &amqp.Error{Code: test.code, Server: true, Reason: test.reason}
+			err := reestablishFailure("orders", brokerErr)
+
+			kind, classified := driver.Classify(err)
+			if !classified || kind != driver.KindTransient {
+				t.Fatalf("kind = %v (classified=%t), want transient so the core rebuilds the consumer", kind, classified)
+			}
+			if got := errors.Is(err, driver.ErrDestinationMissing); got != test.wantMissing {
+				t.Fatalf("ErrDestinationMissing reachable = %t, want %t", got, test.wantMissing)
+			}
+			var amqpErr *amqp.Error
+			if !errors.As(err, &amqpErr) || amqpErr.Code != test.code {
+				t.Fatalf("error = %v, want the broker's %d reachable", err, test.code)
+			}
+			if got, want := err.Error(), "re-establishing destination \"orders\""; !strings.Contains(got, want) {
+				t.Fatalf("error = %q, want it to name the destination as %q", got, want)
+			}
+			if !strings.Contains(err.Error(), test.reason) {
+				t.Fatalf("error = %v, want the broker reason %q kept", err, test.reason)
+			}
+		})
 	}
 }

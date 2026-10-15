@@ -309,8 +309,10 @@ one lives in the code.
 - **One owner per runner**: `worker.go` (`runnerEvent` and its kinds,
   `runnerOwner`, `pumpUntil`, `handle`, `startOpen`, `awaitRebuild`,
   `releaseConsumer`, `requestDrain`, `startDrain`, `Runner.Run`, `Runner.Drain`,
-  the source goroutines' deferred reports); `reconnect.go` (the supervisor's
-  abandon); `runner_owner_test.go`.
+  the source goroutines' deferred reports, and the one consumer teardown:
+  `consumerTeardown`, `teardownRunnerConsumer`, `joinConsumerTeardown`,
+  `stopRunnerConsumer`, `releaseRunnerConsumer`); `reconnect.go` (the
+  supervisor's abandon); `runner_owner_test.go`.
 - **Retries and dead letters**: `worker.go` (`dispatchMessage`,
   `classifyRetryError`, `retryAndSettle`, `deadLetterAndSettle`, `deadLetter`,
   `startSuccessorPublish`); `internal/retry/ladder.go` (`DelayFor`,

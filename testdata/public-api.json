@@ -8,6 +8,7 @@
     "Client.Health",
     "Client.Limits",
     "Client.Publisher",
+    "Client.Ready",
     "Client.Subscribe",
     "CodecConfig",
     "Config",

@@ -39,8 +39,7 @@ for each guarantee. Broker-backed jobs remain opt-in behind `RUN_BROKER_TESTS=1`
 - **Starvation-free priority handling.** Every priority keeps a weighted share of the workers, and
   an overdue low-priority lane can jump the queue under sustained high-priority load. F1 does not
   promise a maximum wait.
-- **Poison-message safety.** A message that cannot be decoded, or a handler that panics, is
-  quarantined rather than retried forever or taken down with the process.
+- **Poison-message safety, with explicit loss exceptions.** Decode failures and handler panics go through dead-letter containment rather than retrying forever or taking down the process. F1 acknowledges without retaining a copy when a poison message has no dead-letter route, the broker refuses the dead-letter copy as too large, or its headers cannot be encoded. See [exceptions and prevention](docs/advanced-topics/failure-handling.md#follow-a-failed-delivery), the `f1otel` [`f1.messaging.poison_dropped` counter](docs/advanced-topics/observability.md#opentelemetry-metrics), and its [drop alert](docs/advanced-topics/alerts.md#poison-messages-dropped-without-a-retained-copy).
 - **Ordered execution, where declared.** A subscription requesting per-key ordering serializes
   equal-key handlers in scheduler dispatch order. Later messages can run before a delayed retry;
   F1 does not promise arrival order across priority lanes or global ordering across partitions or queues.
@@ -157,9 +156,10 @@ In terminal 2, start the consumer:
 /tmp/f1-quickstart-consumer --config examples/config.yaml
 ```
 
-When the consumer prints `consumer ready; waiting for messages`, press Enter in terminal 1. The
-publisher prints its message ID and the consumer prints `handled message: hello from publisher`.
-Press Ctrl-C in terminal 2, then stop the broker:
+When the consumer prints `consumer starting; press Ctrl+C to stop`, it is live but has not
+attached its consumer yet. Press Enter in terminal 1 once `curl -fsS localhost:8081/readyz`
+succeeds. The publisher prints its message ID and the consumer prints
+`handled message: hello from publisher`. Press Ctrl-C in terminal 2, then stop the broker:
 
 ```sh
 make broker-down
