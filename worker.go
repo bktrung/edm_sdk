@@ -133,6 +133,9 @@ const (
 	// the cause this runner asks a rebuild for, and the failure it reports if
 	// the rebuild hands one back.
 	runnerEventConsumerError
+	// runnerEventConsumerReport carries a non-fatal consumer report that is
+	// returned at shutdown only if its generation has not been replaced.
+	runnerEventConsumerReport
 	// runnerEventConsumerOpened reports the result of opening a generation's
 	// consumer. The open runs on its own goroutine, so the owner can answer a
 	// drain or an abandon while a broker call is in flight.
@@ -192,6 +195,9 @@ type runnerOwner struct {
 	outstanding int
 	// sourceErr is the first failure a source of this generation reported.
 	sourceErr error
+	// consumerReport is the first non-fatal report from the consumer. It survives
+	// failed opens and is cleared only when a replacement consumer is admitted.
+	consumerReport error
 	// successfulDelivery records that this generation completed at least one
 	// handled delivery, which is what resets a repair budget.
 	successfulDelivery bool
@@ -208,8 +214,8 @@ type runnerOwner struct {
 	// runner's consumer. It is what tells a generation that ended without a
 	// failure of its own apart from one that simply finished.
 	abandoned bool
-	// runErr is the first failure a source of this run reported. It is never
-	// cleared, so it is the error the runner reports through Drain.
+	// runErr keeps the first fatal consumer or runner-source failure across
+	// generations. Non-fatal consumer reports stay in consumerReport instead.
 	runErr error
 	// repairCycleActive means a replacement consumer has been built and the next
 	// transient consumer failure can complete a failed repair cycle.
@@ -335,6 +341,10 @@ func (o *runnerOwner) handle(event runnerEvent) {
 		}
 		if o.failureCause == nil {
 			o.failureCause = event.err
+		}
+	case runnerEventConsumerReport:
+		if o.consumerReport == nil {
+			o.consumerReport = event.err
 		}
 	case runnerEventError:
 		if o.runErr == nil {
@@ -533,10 +543,14 @@ func (r *Runner) Run(ctx context.Context) (runErr error) {
 	// hand back, including an error joined in by drainAfterRun.
 	defer func() { r.recordRunExit(ctx, runErr) }()
 	owner := &runnerOwner{runner: r, events: r.events, base: ctx, leftoverLimit: r.leftoverLimit}
-	// The owner's error is published to the runner before the runner's done
-	// channel closes, so a Drain that returns because the runner ended reads
-	// the same failure the run ended with.
+	// Publish sticky failures before done closes. A consumer report is a
+	// fallback only: source failures still reach Run and Health without becoming
+	// sticky Drain errors merely because they were the last generation's cause.
 	defer func() {
+		if owner.runErr == nil && runErr == nil {
+			owner.runErr = owner.consumerReport
+			runErr = owner.consumerReport
+		}
 		if owner.runErr != nil {
 			r.mu.Lock()
 			r.runErr = owner.runErr
@@ -710,6 +724,7 @@ func (r *Runner) Run(ctx context.Context) (runErr error) {
 		}
 
 		generation++
+		owner.consumerReport = nil
 		if repairCause != nil {
 			lastResortRunnerLogger(r).Info("f1 consumer repaired", "subscription", r.subscription.Name, "cause", repairCause)
 			repairCause = nil
@@ -1298,7 +1313,9 @@ func consumingTopicFamily(r *Runner, destination string) (string, bool) {
 }
 
 // Drain stops fetching and waits for all worker deliveries to settle. A
-// runner that has not started is already drained.
+// runner that has not started is already drained. Non-fatal consumer reports
+// from a successfully replaced generation do not make draining fail; fatal
+// consumer and runner-source failures remain reportable across generations.
 func (r *Runner) Drain(ctx context.Context) error {
 	if r == nil {
 		return errors.New("f1: runner is nil")
@@ -1498,9 +1515,9 @@ func runnerError(r *Runner) error {
 	return r.runErr
 }
 
-// reportRunnerError hands the owner the first failure a source saw. The owner
-// keeps the first one it is handed and never clears it, so the error a runner
-// reports through Drain is the first failure of the run and not the last.
+// reportRunnerError hands the owner a fatal consumer or runner-source failure.
+// The first such failure survives generation replacement and reaches Drain;
+// non-fatal consumer reports use generation-local consumerReport instead.
 func reportRunnerError(r *Runner, err error) {
 	if err == nil {
 		return
@@ -1859,7 +1876,7 @@ func consumeRunnerErrors(r *Runner, ctx context.Context) error {
 				cancel = r.cancel
 				r.mu.Unlock()
 			default:
-				reportRunnerError(r, err)
+				r.report(runnerEvent{kind: runnerEventConsumerReport, err: err})
 			}
 			// r.cancel below is about to cancel ctx, so the notification gets its
 			// own detached context: the handler's terminalNotificationTimeout
