@@ -42,7 +42,7 @@ exactly-once.
 | `broker.kafka.fetchMaxWait` | Maximum time Kafka holds an empty fetch; bounding it prevents an exhausted destination from blocking a sibling on the same broker beyond this value. | Whole-millisecond Go duration from `1ms` to `596h31m23.647s`. Any other value fails `Open`. | `50ms` | Open, and per consumer |
 | `broker.kafka.sessionTimeout` | Session timeout the member carries in its join request; the group coordinator expires the member after that much silence. | Positive Go duration, and at least as long as `lifecycle.rebalanceDrainTimeout` divided by 0.6. It must also fall within the broker's `group.min.session.timeout.ms` and `group.max.session.timeout.ms`. | `45s` | Open |
 | `broker.kafka.rebalanceTimeout` | Window the coordinator allows a member to complete a rebalance before removing it from the group. | Positive Go duration, and at least as long as `lifecycle.rebalanceDrainTimeout` divided by 0.6. | `60s` | Open |
-| `broker.kafka.staticMembership` | Adds the configured instance ID to the join request, so a member that restarts inside its session timeout rejoins without a rebalance. It changes nothing when no instance ID is configured. | Boolean, in the spellings `1`, `t`, `T`, `TRUE`, `true`, `True` and their `0`, `f`, `F`, `FALSE`, `false`, `False` counterparts. Any other value fails `Open`. | `true` | Open, and per consumer |
+| `broker.kafka.staticMembership` | Adds the configured instance ID to the join request, so a member that restarts inside its session timeout rejoins without a rebalance. It changes nothing when no instance ID is configured. A `Drain` gives up the static assignment: the consumer stops its own group loop and leaves the group by instance ID, so its partitions move to the other members at once. A crash or a kill without `Drain` keeps the assignment for the session timeout instead. | Boolean, in the spellings `1`, `t`, `T`, `TRUE`, `true`, `True` and their `0`, `f`, `F`, `FALSE`, `false`, `False` counterparts. Any other value fails `Open`. | `true` | Open, and per consumer |
 | `broker.kafka.balancer` | Group balancer protocol the consumer clients join with. | `cooperative-sticky`, `sticky`, or `range`. Any other value fails `Open`. | `cooperative-sticky` | Open |
 | `broker.kafka.maxExpectedInstances` | Partition floor: a destination with fewer partitions than this is refused, and a declaration that names no partition count gets this many instead. `0` leaves both decisions to the destination. | Non-negative integer. | `0`, no floor | Topology |
 
@@ -110,7 +110,12 @@ needs a deployment plan for ownership transfer and possible duplicate work.
 `lifecycle.rebalanceDrainTimeout` must not exceed 0.6 times the smaller of
 `broker.kafka.sessionTimeout` and `broker.kafka.rebalanceTimeout`. That leaves
 room for the final commit and rejoin. The wait is shared by a revoke callback's
-partitions, not renewed for each partition. See [rebalance ownership](/deep-dives/kafka-lane-balancer)
+partitions, not renewed for each partition. The commit that follows the wait is
+bounded too: it runs as one request for every revoked partition's settled prefix
+and gets one third of that timeout, so a whole revoke stays within 80% of the
+smaller group timeout. A commit that does not finish in its bound is reported on
+the consumer's error stream, and the partitions' next owner redelivers what the
+broker has not committed. See [rebalance ownership](/deep-dives/kafka-lane-balancer)
 for revoke versus lost assignment and late-handler consequences.
 
 ### Kafka message-size limit
@@ -143,23 +148,64 @@ are deployment sizing inputs, not a memory bound implied by prefetch.
 
 ## Topic policy and maintenance
 
-Topology verification is not a production topic-policy audit. Retention,
-compaction, replication, `min.insync.replicas`, topic-level
-`max.message.bytes`, and `message.timestamp.type` remain operator decisions.
-Connection-time broker checks do not replace them. The
+Retry and dead-letter topics must not compact. F1 preserves the application key
+on successor copies, so two independent failed messages with the same key can
+reach the same retry or dead-letter topic. Kafka's cleaner can silently remove
+the older message before it is handled or inspected.
+
+F1 creates destinations marked `DestRetry` or `DestDLQ` with an explicit
+`cleanup.policy=delete`. Declaration and verification refuse those roles when
+the effective policy contains `compact`, including `compact,delete`. The fatal
+error names the topic and its observed policy. F1 never changes an existing
+topic's settings: the operator must set `cleanup.policy=delete` before retrying
+startup. This refusal can stop a deployment that started before a patch upgrade.
+Main topics are not checked, regardless of their names.
+
+The check occurs during topology admission; for subscription retry and
+dead-letter topics it fails `Runner.Run` before a consumer is created. It is not
+a continuous policy audit. Under `TopologyNone`, F1 makes no broker requests;
+operators must provision and maintain safe retry and dead-letter policies.
+Do not enable compaction on those topics after startup.
+
+Other topic policies remain operator decisions: retention, main-topic
+compaction, replication, `min.insync.replicas`, topic-level `max.message.bytes`,
+and `message.timestamp.type`. Connection-time broker checks do not replace
+them. The
 [topology owner](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/drivers/kafka/topology.go)
 defines what startup verification covers.
 
-Retention and compaction must fit the application's replay and retry needs.
-F1's at-least-once contract is not an archive: do not expect it to recover or
-dead-letter records the broker has already removed. Producer confirmation
-also does not make a database effect atomic with a group offset commit.
+Delete-only cleanup does not mean infinite retention. Size retention for the
+application's replay and retry needs. F1's at-least-once contract is not an
+archive: do not expect it to recover or dead-letter records the broker has
+already removed. Producer confirmation also does not make a database effect
+atomic with a group offset commit.
 
 Stop publishing and consuming before `Purge` or `Prune`. A consumer can attach
 after a prune guard succeeds but before topic deletion, because the delete
 request is not conditional on that guard. The
 [maintenance owner](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/drivers/kafka/admin.go)
 defines the refusal checks; they do not close this race with other clients.
+
+### Pre-deploy topic policy checklist
+
+F1 reads one topic setting at startup; the rest are provisioned and maintained
+by the operator. Confirm these four settings on the main, retry, and
+dead-letter topic before a deploy, and read the effective value rather than only
+the topic's own overrides.
+
+| Setting | Required value | Why |
+| --- | --- | --- |
+| Replication factor | 3 on the main, retry, and dead-letter topic | One broker failure leaves two copies of every confirmed record, so the failure cannot lose the last copy. A replication factor of 1 on a single replica is a single point of loss. |
+| `min.insync.replicas` | 2 | A produce confirms after two replicas accept the record, so a confirmed record survives the loss of one broker. The broker default of 1 confirms a record that exists on one replica only. |
+| `cleanup.policy` | `delete` | Two failed records with the same application key can reach the same retry or dead-letter topic. A cleaner that compacts can remove the older one before a handler sees it. |
+| `retention.ms`, and `retention.bytes` when it is set | Longer than the longest retry delay plus the outage and replay window | A broker that removes a record before its due time drops the retry: no handler sees it and no dead-letter copy is made. Retention is also the replay window. |
+
+F1 creates retry and dead-letter topics with an explicit `cleanup.policy=delete`
+and refuses to start when one of those topics compacts, as the paragraphs above
+describe. It does not check replication, `min.insync.replicas`, or retention,
+and a topic it creates takes the broker's defaults for all three. Read the
+effective value and its source with the commands in the
+[pre-deploy step](/advanced-topics/running-in-production#kafka-topic-policy-before-deploy).
 
 ## Lag and deployment evidence
 

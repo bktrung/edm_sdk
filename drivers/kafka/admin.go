@@ -247,8 +247,10 @@ func (a *admin) pruneGuard(ctx context.Context, name string) (string, error) {
 // EnsureTopology applies the requested topology policy and returns a topology
 // diff. Kafka uses topics as destinations and does not create exchanges or
 // bindings; routing uses fanout at consume time. The driver does not advertise
-// native dead-letter queue or delay support. Under TopologyNone, it makes no
-// broker request.
+// native dead-letter queue or delay support. Retry and dead-letter topics are
+// created with cleanup.policy=delete; declaration and verification refuse those
+// roles when their effective policy includes compact. Existing topic settings
+// are never changed. Under TopologyNone, it makes no broker request.
 func (a *admin) EnsureTopology(ctx context.Context, spec driver.TopologySpec) (driver.TopologyDiff, error) {
 	release, err := a.admission(ctx, "ensure_topology")
 	if err != nil {
@@ -304,7 +306,11 @@ func (a *admin) DescribeTopology(ctx context.Context, names []string) (driver.To
 }
 
 func (a *admin) createTopic(ctx context.Context, topic kafkaTopicSpec) (kadm.CreateTopicResponse, error) {
-	responses, err := a.client.CreateTopics(ctx, topic.partitions, topic.replicationFactor, nil, topic.name)
+	var configs map[string]*string
+	if requiresDeletePolicy(topic.kind) {
+		configs = map[string]*string{"cleanup.policy": new("delete")}
+	}
+	responses, err := a.client.CreateTopics(ctx, topic.partitions, topic.replicationFactor, configs, topic.name)
 	if err != nil {
 		return kadm.CreateTopicResponse{}, classifyAdminError("ensure_topology", err)
 	}
@@ -313,6 +319,14 @@ func (a *admin) createTopic(ctx context.Context, topic kafkaTopicSpec) (kadm.Cre
 		return kadm.CreateTopicResponse{}, classify("ensure_topology", driver.KindFatal, fmt.Errorf("kafka: create topic response missing %q", topic.name))
 	}
 	return response, nil
+}
+
+func (a *admin) describeTopicConfigs(ctx context.Context, names ...string) (kadm.ResourceConfigs, error) {
+	configs, err := a.client.DescribeTopicConfigs(ctx, names...)
+	if err != nil {
+		return nil, classifyAdminError("ensure_topology", err)
+	}
+	return configs, nil
 }
 
 func (a *admin) listTopics(ctx context.Context, operation string, names ...string) (kadm.TopicDetails, error) {

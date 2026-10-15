@@ -293,6 +293,10 @@ func (o *Observer) Record(event f1.PointEvent) {
 		if o.metrics.deadLetters != nil {
 			o.metrics.deadLetters.Add(ctx, 1, metric.WithAttributes(customAttrs...))
 		}
+	case f1.ObserverPoisonRejected:
+		if o.metrics.poisonDropped != nil {
+			o.metrics.poisonDropped.Add(ctx, 1, metric.WithAttributes(customAttrs...))
+		}
 	}
 }
 
@@ -339,7 +343,7 @@ func (o *Observer) attrs(kind f1.ObserverKind, topic, consumerGroup string, prio
 	if class != "" {
 		attrs = append(attrs, attribute.String("error.type", string(normalizeErrorClass(class))))
 	}
-	if kind == f1.ObserverDeadLetterPublished && reason != "" {
+	if (kind == f1.ObserverDeadLetterPublished || kind == f1.ObserverPoisonRejected) && reason != "" {
 		attrs = append(attrs, attribute.String("reason", reason.String()))
 	}
 

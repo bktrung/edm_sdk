@@ -20,28 +20,42 @@ When `env: prod` is validated, F1 enforces these rules:
 
 Set `topology.autoCreate: false` and provision destinations before startup. Use a CA file and normal certificate verification. Keep credentials and driver-specific settings in the service configuration layer, not in handler code. See [Security](/drivers-and-capabilities#security) for the transport fields.
 
-## Use health as readiness
+## Use readiness and liveness probes
 
-Use `Client.Health` for readiness. It checks that the client still accepts work, pings the current broker connection, and then reports subscription failures. A closed-client or ping error is returned before a recorded subscription error.
+Use `Client.Ready` for readiness. It is nil only while `Client.Health` is nil and
+every registered subscription's runner has admitted a consumer, so a process that
+has not attached its consumer yet, or one rebuilding a connection, stays out of
+the traffic pool. `Client.Health` is the liveness-side check: it reports a client
+that no longer takes work and any subscription that stopped, and it pings the
+current broker connection.
 
 ```go
-func readinessHandler(client *f1.Client) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+func probeHandler(client *f1.Client) http.Handler {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/healthz", probe(client.Health))
+	mux.HandleFunc("/readyz", probe(client.Ready))
+	return mux
+}
+
+func probe(check func(context.Context) error) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
 		ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
 		defer cancel()
 
-		if err := client.Health(ctx); err != nil {
-			http.Error(w, "not ready", http.StatusServiceUnavailable)
+		if err := check(ctx); err != nil {
+			http.Error(w, err.Error(), http.StatusServiceUnavailable)
 			return
 		}
 		w.WriteHeader(http.StatusNoContent)
-	})
+	}
 }
 ```
 
-The two-second deadline is an example probe time limit, not an F1 default. Do not use `Health` for liveness. A broker outage can make readiness fail while F1 reconnects; restarting for that failure can interrupt recovery and create a restart loop.
-
-Keep liveness independent of broker reachability. It should answer whether the process and its serving loop are alive; readiness should remove the instance from traffic while F1 reconnects.
+The two-second deadline is an example probe time limit, not an F1 default.
+`Health` pings the broker, so a liveness probe wired to it restarts the process
+through a broker outage; point liveness at the process's own serving loop when a
+restart there would interrupt recovery and create a restart loop. Keep readiness
+on `Client.Ready`, which removes the instance from traffic while F1 reconnects.
 
 ## Shut down on SIGTERM
 
@@ -57,13 +71,37 @@ RabbitMQ production queues must use quorum type. F1's main and retry quorum queu
 
 The broker's delivery limit is the retry policy's `MaxAttempts` plus 5, so about `MaxAttempts + 5` consecutive crash restarts can move a message no handler saw to that queue; stop the crash loop rather than raise the limit.
 
-On a quorum queue, a graceful `Close` returns deliveries that RabbitMQ handed out but no handler had started. F1 returns each one with a requeue nack, so it counts once against the broker's delivery limit above. It does not use an F1 retry attempt.
+On a quorum queue, a graceful `Close` returns deliveries that RabbitMQ handed out but no handler had started. F1 returns each one with a requeue nack, which on RabbitMQ 4.3 advances only the broker's `x-acquired-count` and not the `x-delivery-count` the delivery limit is measured on, so it does not count against the broker's delivery limit above. It does not use an F1 retry attempt.
 
 RabbitMQ [parking queues](/learn/glossary#parking-queue) have no length cap. A parked retry leaves when its delay has passed, so a step's queue holds about its retry rate times its delay. A parking queue that keeps growing means handlers fail faster than retries drain; alert on its depth rather than expecting the broker to refuse new retries.
 
 ::: warning
 Treat a non-empty broker dead-letter queue as an operational incident. Inspect and drain it with broker tooling; it is not the normal F1 dead-letter path.
 :::
+
+## Kafka topic policy before deploy
+
+Kafka destinations carry settings F1 mostly does not check. A retry or
+dead-letter topic that compacts fails startup, but the replication factor,
+`min.insync.replicas`, retention, and the main topic's cleanup policy are
+verified by the operator. Confirm the values in the
+[Kafka topic policy checklist](/drivers/kafka#pre-deploy-topic-policy-checklist)
+on every main, retry, and dead-letter topic before deploying. Read the effective
+value and its source, because a topic takes the broker's default for any key
+nobody set:
+
+```sh
+kafka-topics.sh --bootstrap-server <bootstrap> --describe --topic <topic>
+kafka-configs.sh --bootstrap-server <bootstrap> --entity-type topics --entity-name <topic> --describe --all
+kafka-configs.sh --bootstrap-server <bootstrap> --entity-type brokers --entity-default --describe
+```
+
+The first command prints the topic's replication factor and its topic-level
+overrides. The second prints each setting's effective value with the source that
+supplied it (`TOPIC_CONFIG`, `DYNAMIC_DEFAULT_BROKER_CONFIG`, or
+`DEFAULT_CONFIG`), so an inherited default is visible rather than missing. The
+third prints the cluster default a topic inherits when neither the topic nor F1
+sets the key.
 
 ## Add observability
 
@@ -77,8 +115,9 @@ Install `f1otel` with `f1.WithObserver` and use the [observability guide](/advan
 - [ ] Confirm `broker.tls.insecureSkipVerify` is false and production SASL has TLS enabled.
 - [ ] Provision destinations before startup and leave topology auto-creation disabled.
 - [ ] Use RabbitMQ quorum queues when the RabbitMQ driver is selected.
-- [ ] Expose `Client.Health` as readiness with a short request deadline.
-- [ ] Keep liveness independent of broker reachability.
+- [ ] Confirm the Kafka topic policy on every main, retry, and dead-letter topic when the Kafka driver is selected; the [checklist](/drivers/kafka#pre-deploy-topic-policy-checklist) lists the required values.
+- [ ] Expose `Client.Ready` as readiness and `Client.Health` as the liveness-side check, each with a short request deadline.
+- [ ] Keep liveness from restarting the process for a broker outage F1 is reconnecting through.
 - [ ] Handle `SIGTERM` with a fresh shutdown context and a deadline shorter than the orchestrator grace period.
 - [ ] Set lifecycle time limits from handler and broker behavior.
 - [ ] Install `f1otel` and review its timestamp and provider shutdown requirements.

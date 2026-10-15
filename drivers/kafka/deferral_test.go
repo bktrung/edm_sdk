@@ -229,7 +229,7 @@ func TestHeadHoldTimerRearmsPastAnExpiredHold(t *testing.T) {
 
 	// An arm at the expired hold would be due at once, so the poll loop would be
 	// woken again before the second hold's due.
-	clk.Advance(time.Minute - time.Millisecond)
+	clk.Advance(now.Add(time.Minute).Sub(clk.Now()) - time.Millisecond)
 	if headHoldWoken(consumer) {
 		t.Fatal("the timer re-armed at the expired hold and woke polling before the second hold came due")
 	}

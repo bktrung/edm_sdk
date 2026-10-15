@@ -191,9 +191,11 @@ both vhosts. Leave it empty to use each endpoint's own vhost; AMQP routing never
 changes. The AMQP parser reads `amqp://host/orders` as `orders`, no path as `/`,
 and `amqp://host/%2Forders` as `/orders`; compare the decoded vhost name.
 
-Extra broker credit carries a RabbitMQ-specific risk. On a quorum queue, closing
-a consumer that holds deliveries increments the broker delivery count for each
-of them, so a crash loop can dead-letter messages that no handler ever saw.
+Extra broker credit carries a RabbitMQ-specific risk. On a quorum queue, losing
+the channel or connection with deliveries unacknowledged, a crash for example,
+increments the broker delivery count for each of them; a graceful consumer
+cancel does not. A crash loop can then dead-letter messages that no handler
+ever saw.
 Classic queues have no broker delivery count, so they do not carry that risk.
 With the option set, the deliveries held in the driver's channel are bounded by
 the option value per destination, so a subscription with several destinations

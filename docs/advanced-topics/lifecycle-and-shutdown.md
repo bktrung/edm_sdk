@@ -78,7 +78,7 @@ A timeout can leave one fact changed while another phase continues. For example,
 
 `Subscribe` and `Runner.Run` require a ready client and a live connection. Application publishes are still allowed during `Draining` while the producer and connection stand, so accepted work can finish; new subscriptions are refused. F1's own [retry and dead-letter copies](/learn/glossary#successor-publish) are still allowed during a drain for the same reason.
 
-`Health` reports connection status before recorded runner failures. It reports a retained reconnect error after the connection is given up, `f1: client is closed` after close, `f1: client is not connected` with no connection, `f1: client is reconnecting` during a rebuild, and `f1: client is closing` while shutdown is active with a connection still present.
+`Health` reports connection status before recorded runner failures. It reports a retained reconnect error after the connection is given up, which includes the retirement ceiling refusal (`f1: N retired connections failed to close`), `f1: client is closed` after close, `f1: client is not connected` with no connection, `f1: client is reconnecting` during a rebuild, and `f1: client is closing` while shutdown is active with a connection still present.
 
 ## Close in ack-last order
 

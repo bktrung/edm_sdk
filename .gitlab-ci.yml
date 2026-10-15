@@ -1,6 +1,6 @@
 # Jobs use the same Make targets as local development.
 
-image: golang:1.26.1
+image: golang:1.26.9
 
 variables:
   GOPRIVATE: fgit.zapps.vn

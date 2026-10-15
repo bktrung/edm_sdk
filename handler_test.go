@@ -6,9 +6,13 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
+
+	"golang.org/x/sync/errgroup"
 
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/codec"
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/driver"
+	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/clock"
 )
 
 func TestBuildHandlerChainRecoversPanicDirectly(t *testing.T) {
@@ -243,5 +247,70 @@ func traceMiddleware(name string, order *[]string, classify func(error) error) M
 			*order = append(*order, name+":out")
 			return err
 		})
+	}
+}
+
+func TestReturnedLeftoverReleasesBudget(t *testing.T) {
+	fake := clock.NewFake(time.Unix(0, 0))
+	client, err := New(context.Background(), testClientConfig(t),
+		WithDriver(&dispatchDriver{conn: &dispatchConn{producer: &dispatchProducer{}}}), withClock(fake))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = client.Close(context.Background()) })
+	runner := &Runner{
+		client: client, asyncGroup: new(errgroup.Group),
+		subscription: Subscription{Name: "returned-leftover", Concurrency: 2, HandlerTimeout: time.Minute},
+	}
+	t.Cleanup(func() { _ = runner.asyncGroup.Wait() })
+	abandon := func() chan struct{} {
+		t.Helper()
+		release := make(chan struct{})
+		t.Cleanup(func() { close(release) })
+		result := make(chan handlerResult, 1)
+		go func() {
+			result <- invokeHandler(runner, context.Background(), HandlerFunc(func(context.Context, *Event) error {
+				<-release
+				return nil
+			}), &Event{}, "", 0)
+		}()
+		fake.BlockUntil(1)
+		fake.Advance(2 * time.Minute)
+		fake.BlockUntil(1)
+		fake.Advance(2 * time.Minute)
+		select {
+		case got := <-result:
+			if !got.stuck {
+				t.Fatalf("abandon result = %#v", got)
+			}
+		case <-oneSecondTimer(t).C:
+			t.Fatal("handler was not abandoned")
+		}
+		return release
+	}
+	first := abandon()
+	first <- struct{}{}
+	// Joining only the released invocation establishes completion without
+	// polling the private counter or introducing a production test hook.
+	if err := runner.asyncGroup.Wait(); err != nil {
+		t.Fatal(err)
+	}
+	abandon()
+	handled := false
+	result := invokeHandler(runner, context.Background(), HandlerFunc(func(context.Context, *Event) error {
+		handled = true
+		return nil
+	}), &Event{}, "", 0)
+	if !handled || result.stuck || result.err != nil {
+		t.Fatalf("returned leftover did not restore budget: handled=%v result=%#v", handled, result)
+	}
+	abandon()
+	handled = false
+	result = invokeHandler(runner, context.Background(), HandlerFunc(func(context.Context, *Event) error {
+		handled = true
+		return nil
+	}), &Event{}, "", 0)
+	if handled || !result.stuck {
+		t.Fatalf("exhausted budget admitted another handler: handled=%v result=%#v", handled, result)
 	}
 }

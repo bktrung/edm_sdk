@@ -726,15 +726,7 @@ func (a *adminOperations) bindQueue(ctx context.Context, binding driver.BindingS
 }
 
 func (a *adminOperations) openChannel(ctx context.Context) (*amqp.Channel, error) {
-	if err := ctx.Err(); err != nil {
-		return nil, classify("ensure_topology", driver.KindTransient, err)
-	}
-	a.conn.mu.RLock()
-	defer a.conn.mu.RUnlock()
-	if a.conn.closed || a.conn.closing || a.conn.amqp.IsClosed() {
-		return nil, classify("ensure_topology", driver.KindTransient, amqp.ErrClosed)
-	}
-	channel, err := a.conn.amqp.Channel()
+	channel, err := a.conn.openChannel(ctx)
 	if err != nil {
 		return nil, classifyAMQP("ensure_topology", driver.KindTransient, err)
 	}

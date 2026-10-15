@@ -5,6 +5,10 @@ package rabbitmq
 import (
 	"context"
 	"errors"
+	"fmt"
+	"io"
+	"log/slog"
+	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -13,6 +17,7 @@ import (
 
 	amqp "github.com/rabbitmq/amqp091-go"
 
+	f1 "fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk"
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/driver"
 )
 
@@ -875,6 +880,464 @@ func waitConsumerWaitGroupDone(t *testing.T, group *sync.WaitGroup, what string)
 	case <-time.After(time.Second): //nolint:forbidigo // bound construction rollback assertions
 		t.Fatalf("%s did not finish", what)
 	}
+}
+
+// rabbitRawChannel opens the broker directly for a test that deletes or
+// declares its own queues outside the driver under test.
+func rabbitRawChannel(t *testing.T) *amqp.Channel {
+	t.Helper()
+	raw, err := amqp.Dial(defaultEndpoint)
+	if err != nil {
+		t.Fatalf("raw broker connection: %v", err)
+	}
+	t.Cleanup(func() { _ = raw.Close() })
+	channel, err := raw.Channel()
+	if err != nil {
+		t.Fatalf("raw channel: %v", err)
+	}
+	t.Cleanup(func() { _ = channel.Close() })
+	return channel
+}
+
+// rabbitActiveConsumer returns the one consumer the driver currently has open,
+// which is how a test reads the physical destinations the core resolved.
+func rabbitActiveConsumer(t *testing.T, capture *captureRabbitDriver) *consumer {
+	t.Helper()
+	for _, opened := range capture.connections() {
+		connection, ok := opened.(*conn)
+		if !ok {
+			continue
+		}
+		if live := activeRabbitConsumer(connection); live != nil {
+			return live
+		}
+	}
+	t.Fatal("no active RabbitMQ consumer")
+	return nil
+}
+
+// rabbitLaneFor returns the consumer lane whose destination names topic, so a
+// test can delete exactly the queue the core resolved for that topic and order
+// the deletion against the lane's reattach.
+func rabbitLaneFor(t *testing.T, live *consumer, topic string) *lane {
+	t.Helper()
+	destinations := make([]string, 0, len(live.lanes))
+	for _, lane := range live.lanes {
+		if strings.Contains(lane.destination, topic) {
+			return lane
+		}
+		destinations = append(destinations, lane.destination)
+	}
+	t.Fatalf("no consumer lane names topic %q; destinations = %v", topic, destinations)
+	return nil
+}
+
+// TestConsumerReattachFailureIsAGenerationEndingSignal proves what a lane reports
+// when its replacement consumer cannot attach: a transient error, which is the
+// one consumer signal the core turns into a rebuild, carrying the broker's own
+// not-found diagnosis. The lane's channel lock is held across the queue delete
+// so the reattach can only run against a queue that is already gone.
+//
+// T1 of the task's three proofs; the core's rebuild and its failure outcome are
+// proven end-to-end by the two core tests below.
+func TestConsumerReattachFailureIsAGenerationEndingSignal(t *testing.T) {
+	requireBroker(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	const queue = "f1.test.rabbitmq-driver-reattach-signal"
+	rawChannel := rabbitRawChannel(t)
+	_, _ = rawChannel.QueueDelete(queue, false, false, false)
+	t.Cleanup(func() { _, _ = rawChannel.QueueDelete(queue, false, false, false) })
+	if _, err := rawChannel.QueueDeclare(queue, true, false, false, false, amqp.Table{"x-queue-type": "quorum"}); err != nil {
+		t.Fatalf("QueueDeclare: %v", err)
+	}
+
+	connection, err := (Driver{}).Open(ctx, driver.Config{Endpoints: []string{defaultEndpoint}})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	sdkConsumer, err := connection.Consumer(ctx, driver.ConsumerConfig{Destinations: []string{queue}, Prefetch: 1})
+	if err != nil {
+		t.Fatalf("Consumer: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = sdkConsumer.Release(context.Background())
+		_ = connection.Close(context.Background())
+	})
+	built := sdkConsumer.(*consumer)
+
+	lane := built.lanes[0]
+	lane.channelMu.Lock()
+	if _, err := rawChannel.QueueDelete(queue, false, false, false); err != nil {
+		lane.channelMu.Unlock()
+		t.Fatalf("QueueDelete: %v", err)
+	}
+	// Deleting the queue makes the broker cancel the consumer, so the cancel
+	// notification is reported while the reattach is still blocked.
+	if err := receiveRabbitConsumerError(ctx, sdkConsumer); err != nil {
+		kind, classified := driver.Classify(err)
+		if !classified || kind != driver.KindNotification {
+			lane.channelMu.Unlock()
+			t.Fatalf("first report after the queue delete = %v (kind %v, classified %t), want the broker cancel notification", err, kind, classified)
+		}
+	} else {
+		lane.channelMu.Unlock()
+		t.Fatal("no consumer error after the queue delete")
+	}
+	lane.channelMu.Unlock()
+
+	// The failed reattach and the channel close it causes are both reported, in
+	// an order the two watchers do not fix, so scan the stream for the reattach
+	// report itself.
+	scanCtx, scanCancel := context.WithTimeout(ctx, 15*time.Second)
+	defer scanCancel()
+	var failure error
+	for failure == nil {
+		err := receiveRabbitConsumerError(scanCtx, sdkConsumer)
+		if err == nil {
+			t.Fatal("no reattach failure reported")
+		}
+		if strings.Contains(err.Error(), "re-establishing destination") {
+			failure = err
+		}
+	}
+	kind, classified := driver.Classify(failure)
+	if !classified || kind != driver.KindTransient {
+		t.Fatalf("reattach failure = %v (kind %v, classified %t), want a classified transient error", failure, kind, classified)
+	}
+	if !errors.Is(failure, driver.ErrDestinationMissing) {
+		t.Fatalf("reattach failure = %v, want it to reach ErrDestinationMissing", failure)
+	}
+	var amqpErr *amqp.Error
+	if !errors.As(failure, &amqpErr) || amqpErr.Code != 404 || !strings.Contains(amqpErr.Reason, "no queue") {
+		t.Fatalf("reattach failure = %v, want the broker's 404 for the missing queue reachable", failure)
+	}
+	if !strings.Contains(failure.Error(), queue) || !strings.Contains(failure.Error(), amqpErr.Reason) {
+		t.Fatalf("reattach failure = %v, want the destination %q and the broker reason %q in the text", failure, queue, amqpErr.Reason)
+	}
+	// The port keeps Messages open across a lane failure; the core, not the
+	// driver, decides what happens next.
+	select {
+	case message, ok := <-sdkConsumer.Messages():
+		if ok {
+			t.Fatalf("delivery %q after a failed reattach, want none", message.Body)
+		}
+	default:
+	}
+
+	// The reopen the core performs must work once the destination is back.
+	if _, err := rawChannel.QueueDeclare(queue, true, false, false, false, amqp.Table{"x-queue-type": "quorum"}); err != nil {
+		t.Fatalf("QueueDeclare(recreate): %v", err)
+	}
+	reopened, err := connection.Consumer(ctx, driver.ConsumerConfig{Destinations: []string{queue}, Prefetch: 1})
+	if err != nil {
+		t.Fatalf("Consumer after recreating %q: %v", queue, err)
+	}
+	t.Cleanup(func() { _ = reopened.Release(context.Background()) })
+	if err := rawChannel.PublishWithContext(ctx, "", queue, false, false, amqp.Publishing{
+		DeliveryMode: amqp.Persistent,
+		Body:         []byte("after-reattach"),
+	}); err != nil {
+		t.Fatalf("Publish: %v", err)
+	}
+	select {
+	case message := <-reopened.Messages():
+		if string(message.Body) != "after-reattach" {
+			t.Fatalf("reopened delivery = %q, want the published message", message.Body)
+		}
+	case <-time.After(10 * time.Second): //nolint:forbidigo // live broker wait
+		t.Fatal("reopened consumer delivered nothing")
+	}
+}
+
+func receiveRabbitConsumerError(ctx context.Context, sdkConsumer driver.Consumer) error {
+	select {
+	case err, ok := <-sdkConsumer.Errors():
+		if !ok {
+			return nil
+		}
+		return err
+	case <-ctx.Done():
+		return nil
+	}
+}
+
+// TestRabbitMQCoreRebuildsTheConsumerWhenAReattachedDestinationReturns proves the
+// first core outcome: a lane that ends on a failed reattach ends its generation,
+// the runner rebuilds the consumer, and the subscription consumes again from that
+// destination once the rebuild's topology declaration has recreated it, with the
+// sibling lane resumed on the same consumer.
+func TestRabbitMQCoreRebuildsTheConsumerWhenAReattachedDestinationReturns(t *testing.T) {
+	requireBroker(t)
+	sequence := rabbitReconnectSequence.Add(1)
+	deleted := fmt.Sprintf("reattach.return.%d.%d", os.Getpid(), sequence)
+	sibling := fmt.Sprintf("reattach.sibling.%d.%d", os.Getpid(), sequence)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	cfg := f1.Config{
+		Env:        "test",
+		Service:    "reattach",
+		InstanceID: fmt.Sprintf("%d", sequence),
+		Broker: f1.BrokerConfig{
+			Driver:               "rabbitmq",
+			Endpoints:            []string{defaultEndpoint},
+			ConnectTimeout:       5 * time.Second,
+			MaxReconnectAttempts: 3,
+			DefaultPrefetch:      1,
+		},
+		Topology: f1.TopologyConfig{AutoCreate: true},
+		Lifecycle: f1.LifecycleConfig{
+			DrainTimeout: 5 * time.Second,
+			HandlerGrace: 500 * time.Millisecond,
+			CloseTimeout: 5 * time.Second,
+		},
+	}
+	driverCapture := &captureRabbitDriver{base: Driver{}}
+	client, err := f1.New(context.Background(), cfg,
+		f1.WithDriver(driverCapture),
+		f1.WithLogger(slog.New(slog.NewTextHandler(io.Discard, nil))),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = client.Close(context.Background())
+		cleanupRabbitTestQueues(t, driverCapture, "f1.test."+deleted, "f1.test."+sibling)
+	})
+
+	var handledDeleted, handledSibling atomic.Int32
+	runner, err := client.Subscribe(context.Background(), f1.Subscription{
+		Name:           "reattach-return",
+		Topics:         []string{deleted, sibling},
+		Prefetch:       1,
+		HandlerTimeout: 2 * time.Second,
+		Handlers: map[string]f1.Handler{
+			deleted: f1.HandlerFunc(func(context.Context, *f1.Event) error {
+				handledDeleted.Add(1)
+				return nil
+			}),
+			sibling: f1.HandlerFunc(func(context.Context, *f1.Event) error {
+				handledSibling.Add(1)
+				return nil
+			}),
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	runDone := make(chan error, 1)
+	go func() { runDone <- runner.Run(context.Background()) }()
+	publish := func(topic string) {
+		t.Helper()
+		if _, err := client.Publisher().Publish(ctx, topic, map[string]string{"source": "reattach"}); err != nil {
+			t.Fatalf("Publish(%q): %v", topic, err)
+		}
+	}
+
+	// Positive control: both lanes are attached and consuming before the delete.
+	live := waitRabbitActiveConsumer(t, driverCapture)
+	publish(deleted)
+	publish(sibling)
+	waitRabbit(t, func() bool { return handledDeleted.Load() == 1 && handledSibling.Load() == 1 })
+
+	deletedLane := rabbitLaneFor(t, live, deleted)
+	rawChannel := rabbitRawChannel(t)
+	// Hold the lane's channel lock across the delete so the reattach can only run
+	// against a finished deletion. Released while the delete is in flight, the
+	// reattach races it and the broker reports the teardown on the lane's channel
+	// instead, a failure the core already recovers from, which would leave this
+	// test proving nothing about the reattach report.
+	deletedLane.channelMu.Lock()
+	if _, err := rawChannel.QueueDelete(deletedLane.destination, false, false, false); err != nil {
+		deletedLane.channelMu.Unlock()
+		t.Fatalf("QueueDelete(%q): %v", deletedLane.destination, err)
+	}
+	deletedLane.channelMu.Unlock()
+
+	// The reattach fails with the queue gone, the generation ends, and the
+	// rebuild replaces the consumer without replacing the connection.
+	waitRabbitConsumerReplacement(t, driverCapture, live)
+	if got := len(driverCapture.connections()); got != 1 {
+		t.Fatalf("driver Open count = %d, want 1: the repair must rebuild the consumer, not the connection", got)
+	}
+
+	publish(deleted)
+	publish(sibling)
+	waitRabbit(t, func() bool { return handledDeleted.Load() == 2 && handledSibling.Load() == 2 })
+	if err := client.Health(ctx); err != nil {
+		t.Fatalf("Health after the consumer repair = %v, want a healthy client", err)
+	}
+	// The subscription stayed up through the repair rather than ending.
+	select {
+	case err := <-runDone:
+		t.Fatalf("runner Run() = %v, want it still running after the consumer repair", err)
+	default:
+	}
+}
+
+// TestRabbitMQCoreFailsTheSubscriptionWhenTheReattachedDestinationStaysGone
+// proves the second core outcome: with the destination still missing, the rebuild
+// reaches the broker and the subscription fails with the broker's own not-found
+// text, which Health reports.
+//
+// The client runs with TopologyNone so the rebuild's own topology pass declares
+// nothing and the reopen reaches the broker; under Declare the rebuild recreates
+// the destination instead (the test above), and under Verify it fails at the
+// declaration with the driver's own message rather than the broker's.
+func TestRabbitMQCoreFailsTheSubscriptionWhenTheReattachedDestinationStaysGone(t *testing.T) {
+	requireBroker(t)
+	sequence := rabbitReconnectSequence.Add(1)
+	topic := fmt.Sprintf("reattach.gone.%d.%d", os.Getpid(), sequence)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	const subscriptionName = "reattach-gone"
+
+	newConfig := func() f1.Config {
+		return f1.Config{
+			Env:        "test",
+			Service:    "reattach",
+			InstanceID: fmt.Sprintf("%d", sequence),
+			Broker: f1.BrokerConfig{
+				Driver:               "rabbitmq",
+				Endpoints:            []string{defaultEndpoint},
+				ConnectTimeout:       5 * time.Second,
+				MaxReconnectAttempts: 3,
+				DefaultPrefetch:      1,
+			},
+			Lifecycle: f1.LifecycleConfig{
+				DrainTimeout: 5 * time.Second,
+				HandlerGrace: 500 * time.Millisecond,
+				CloseTimeout: 5 * time.Second,
+			},
+		}
+	}
+	subscription := func() f1.Subscription {
+		return f1.Subscription{
+			Name:           subscriptionName,
+			Topics:         []string{topic},
+			Prefetch:       1,
+			HandlerTimeout: 2 * time.Second,
+			Handlers: map[string]f1.Handler{
+				topic: f1.HandlerFunc(func(context.Context, *f1.Event) error { return nil }),
+			},
+		}
+	}
+
+	// A declaring client first, only to create the topology and report the
+	// physical destination the core resolves for the topic.
+	declaringCapture := &captureRabbitDriver{base: Driver{}}
+	declaringConfig := newConfig()
+	declaringConfig.Topology = f1.TopologyConfig{AutoCreate: true}
+	declaringClient, err := f1.New(context.Background(), declaringConfig,
+		f1.WithDriver(declaringCapture),
+		f1.WithLogger(slog.New(slog.NewTextHandler(io.Discard, nil))),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = declaringClient.Close(context.Background())
+		cleanupRabbitTestQueues(t, declaringCapture, "f1.test."+topic)
+	})
+	declaringRunner, err := declaringClient.Subscribe(context.Background(), subscription())
+	if err != nil {
+		t.Fatal(err)
+	}
+	declaringDone := make(chan error, 1)
+	go func() { declaringDone <- declaringRunner.Run(context.Background()) }()
+	waitRabbit(t, func() bool { return rabbitActiveConsumerOrNil(declaringCapture) != nil })
+	queue := rabbitLaneFor(t, rabbitActiveConsumer(t, declaringCapture), topic).destination
+	if err := declaringClient.Close(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	<-declaringDone
+
+	// The tested client declares nothing, so a destination that stays gone
+	// reaches the broker and decides the subscription's fate.
+	driverCapture := &captureRabbitDriver{base: Driver{}}
+	client, err := f1.New(context.Background(), newConfig(),
+		f1.WithDriver(driverCapture),
+		f1.WithTopology(driver.TopologyNone),
+		f1.WithLogger(slog.New(slog.NewTextHandler(io.Discard, nil))),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = client.Close(context.Background()) })
+
+	runner, err := client.Subscribe(ctx, subscription())
+	if err != nil {
+		t.Fatal(err)
+	}
+	runDone := make(chan error, 1)
+	go func() { runDone <- runner.Run(context.Background()) }()
+	live := waitRabbitActiveConsumer(t, driverCapture)
+	goneLane := rabbitLaneFor(t, live, topic)
+
+	rawChannel := rabbitRawChannel(t)
+	// As in the return test, the delete is ordered against the reattach so the
+	// lane's own report is what carries the deleted destination.
+	goneLane.channelMu.Lock()
+	if _, err := rawChannel.QueueDelete(queue, false, false, false); err != nil {
+		goneLane.channelMu.Unlock()
+		t.Fatalf("QueueDelete(%q): %v", queue, err)
+	}
+	goneLane.channelMu.Unlock()
+
+	var runErr error
+	select {
+	case runErr = <-runDone:
+	case <-time.After(30 * time.Second): //nolint:forbidigo // bound the rebuild that must fail a subscription
+		t.Fatal("runner Run did not return after the destination disappeared")
+	}
+	if runErr == nil {
+		t.Fatal("runner Run() = nil, want the reopen failure")
+	}
+	if kind, classified := driver.Classify(runErr); !classified || kind != driver.KindNotFound {
+		t.Fatalf("runner Run() = %v (kind %v, classified %t), want a not-found error", runErr, kind, classified)
+	}
+	if !errors.Is(runErr, driver.ErrDestinationMissing) {
+		t.Fatalf("runner Run() = %v, want it to reach ErrDestinationMissing", runErr)
+	}
+	var amqpErr *amqp.Error
+	if !errors.As(runErr, &amqpErr) || amqpErr.Code != 404 || !strings.Contains(amqpErr.Reason, "no queue") {
+		t.Fatalf("runner Run() = %v, want the broker's 404 for the missing queue reachable", runErr)
+	}
+	health := client.Health(ctx)
+	if health == nil {
+		t.Fatal("Health() = nil, want the failed subscription")
+	}
+	for _, want := range []string{subscriptionName, queue, amqpErr.Reason} {
+		if !strings.Contains(health.Error(), want) {
+			t.Fatalf("Health() = %v, want it to name %q", health, want)
+		}
+	}
+}
+
+// rabbitActiveConsumerOrNil reports the driver's active consumer without failing
+// the caller, for a wait loop.
+func rabbitActiveConsumerOrNil(capture *captureRabbitDriver) *consumer {
+	for _, opened := range capture.connections() {
+		connection, ok := opened.(*conn)
+		if !ok {
+			continue
+		}
+		if live := activeRabbitConsumer(connection); live != nil {
+			return live
+		}
+	}
+	return nil
+}
+
+// waitRabbitActiveConsumer waits for the driver to report one active consumer,
+// which is the point the core has declared the subscription topology and opened
+// its lanes.
+func waitRabbitActiveConsumer(t *testing.T, capture *captureRabbitDriver) *consumer {
+	t.Helper()
+	waitRabbit(t, func() bool { return rabbitActiveConsumerOrNil(capture) != nil })
+	return rabbitActiveConsumer(t, capture)
 }
 
 // TestReleaseRacingDrainCancellationAlwaysReturns proves that a Release whose

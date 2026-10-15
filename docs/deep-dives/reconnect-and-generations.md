@@ -84,10 +84,26 @@ If `Close` starts during reconnect, it cancels and waits for the supervisor, the
 finishes every retired teardown before current resources. Nil requires every
 retired teardown to have succeeded. Running attempts are rejoined; failed
 retirements get one new attempt per caller-issued `Close`, skipping successful
-stages. Errors and timeouts retain unfinished ownership. There is no background
-retry, timer, or backoff. Each retirement wait has its own
-`Lifecycle.CloseTimeout` bound, subject to the caller context; total shutdown can
-exceed one such bound.
+stages. Errors and timeouts retain unfinished ownership. Each retirement wait has
+its own `Lifecycle.CloseTimeout` bound, subject to the caller context; total
+shutdown can exceed one such bound.
+
+While the client runs, a failed retirement is also retried in the background. A
+retired connection and a discarded producer whose close failed are the same kind
+of entry, and the retry loop owns both: after a failure it waits
+`Lifecycle.CloseTimeout` and doubles the wait each time, capped at one minute, and
+a success removes the entry. The loop runs whichever connection state the client
+is in, including its failed state, since releasing the handles is the only thing
+that shrinks the count. It starts nothing once `Close` begins, because `Close`
+cancels the supervisor first and `Close` finishes the retirements itself.
+
+The ceiling is eight such entries, checked when a
+reconnect starts; failed discarded-producer closes between reconnects can briefly
+exceed it. A failure to close eight connections (or discarded
+producers, or some of each) refuses the next reconnect: the refusal opens no
+connection, the client moves to its failed connection state, and `Health` returns
+an error naming the count. Retries of the held entries continue, but they do not
+by themselves bring the client back; a restart is what clears the refusal.
 
 The cleanup and replacement decisions are in
 [`reconnect.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/reconnect.go);

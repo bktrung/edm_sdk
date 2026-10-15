@@ -17,6 +17,7 @@ import (
 	"github.com/twmb/franz-go/pkg/kadm"
 	"github.com/twmb/franz-go/pkg/kerr"
 	"github.com/twmb/franz-go/pkg/kgo"
+	"github.com/twmb/franz-go/pkg/kmsg"
 
 	f1 "fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk"
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/driver"
@@ -358,6 +359,203 @@ func TestEnsureTopologyPolicies(t *testing.T) {
 	}
 }
 
+func createKafkaTopicWithCleanupPolicy(t *testing.T, admin *kadm.Client, ctx context.Context, name, policy string) {
+	t.Helper()
+	response, err := admin.CreateTopic(ctx, 1, -1, map[string]*string{"cleanup.policy": new(policy)}, name)
+	if err != nil {
+		t.Fatalf("CreateTopic(%q): %v", name, err)
+	}
+	if response.Err != nil {
+		t.Fatalf("CreateTopic(%q) response: %v", name, response.Err)
+	}
+	waitKafkaTopicVisible(t, ctx, admin, name)
+}
+
+func kafkaCleanupPolicy(t *testing.T, ctx context.Context, admin *kadm.Client, topic string) kadm.Config {
+	t.Helper()
+	resources, err := admin.DescribeTopicConfigs(ctx, topic)
+	if err != nil {
+		t.Fatalf("DescribeTopicConfigs(%q): %v", topic, err)
+	}
+	for _, resource := range resources {
+		if resource.Name != topic {
+			continue
+		}
+		if resource.Err != nil {
+			t.Fatalf("DescribeTopicConfigs(%q) response: %v", topic, resource.Err)
+		}
+		for _, config := range resource.Configs {
+			if config.Key == "cleanup.policy" && config.Value != nil && *config.Value != "" {
+				return config
+			}
+		}
+	}
+	t.Fatalf("DescribeTopicConfigs(%q) omitted readable cleanup.policy", topic)
+	return kadm.Config{}
+}
+
+func requireKafkaCompactionRefusal(t *testing.T, err error, topic, policy string) {
+	t.Helper()
+	var classified *driver.Error
+	if !errors.As(err, &classified) {
+		t.Fatalf("compaction refusal = %v (%T), want *driver.Error", err, err)
+	}
+	if classified.Kind() != driver.KindFatal || classified.Driver != "kafka" || classified.Op != "ensure_topology" {
+		t.Fatalf("compaction refusal = %#v, want fatal kafka ensure_topology", classified)
+	}
+	if classified.Err == nil || !strings.Contains(classified.Err.Error(), topic) || !strings.Contains(classified.Err.Error(), policy) {
+		t.Fatalf("compaction refusal cause = %v, want topic %q and observed policy %q", classified.Err, topic, policy)
+	}
+}
+
+func TestEnsureTopologyCreatesDeleteOnlyRetryAndDLQ(t *testing.T) {
+	ctx, connection, admin := openKafkaAdminTest(t)
+	inherited := kafkaTestTopic(t, "inherited-reference")
+	main := kafkaTestTopic(t, "created-main")
+	retry := kafkaTestTopic(t, "created-retry")
+	dlq := kafkaTestTopic(t, "created-dlq")
+	cleanupKafkaTopics(t, admin, inherited, main, retry, dlq)
+	createKafkaTopic(t, admin, ctx, inherited, 1)
+	wantInherited := kafkaCleanupPolicy(t, ctx, admin, inherited)
+
+	diff, err := connection.Admin().EnsureTopology(ctx, driver.TopologySpec{
+		Policy: driver.TopologyDeclare,
+		Destinations: []driver.DestinationSpec{
+			{Name: main, Kind: driver.DestMain},
+			{Name: retry, Kind: driver.DestRetry},
+			{Name: dlq, Kind: driver.DestDLQ},
+		},
+		Effective: connection.Capabilities(),
+	})
+	if err != nil {
+		t.Fatalf("EnsureTopology: %v", err)
+	}
+	if len(diff.CreatedDestinations) != 3 || !namesContainAll(diff.CreatedDestinations, main, retry, dlq) {
+		t.Fatalf("CreatedDestinations = %v, want all three roles", diff.CreatedDestinations)
+	}
+	for _, topic := range []string{retry, dlq} {
+		got := kafkaCleanupPolicy(t, ctx, admin, topic)
+		if *got.Value != "delete" || got.Source != kmsg.ConfigSourceDynamicTopicConfig {
+			t.Errorf("%q cleanup.policy = %q (source %v), want explicit topic delete", topic, *got.Value, got.Source)
+		}
+	}
+	gotMain := kafkaCleanupPolicy(t, ctx, admin, main)
+	if *gotMain.Value != *wantInherited.Value || gotMain.Source != wantInherited.Source || gotMain.Source == kmsg.ConfigSourceDynamicTopicConfig {
+		t.Fatalf("main cleanup.policy = %q (source %v), want inherited %q (source %v)", *gotMain.Value, gotMain.Source, *wantInherited.Value, wantInherited.Source)
+	}
+}
+
+func testKafkaCompactingDestinationRefused(t *testing.T, kind driver.DestKind) {
+	t.Helper()
+	for _, policy := range []string{"compact", "compact,delete", "delete,compact"} {
+		t.Run(strings.ReplaceAll(policy, ",", "-"), func(t *testing.T) {
+			ctx, connection, admin := openKafkaAdminTest(t)
+			topic := kafkaTestTopic(t, "neutral-owned")
+			cleanupKafkaTopics(t, admin, topic)
+			createKafkaTopicWithCleanupPolicy(t, admin, ctx, topic, policy)
+			before := kafkaCleanupPolicy(t, ctx, admin, topic)
+			for _, mode := range []driver.TopologyPolicy{driver.TopologyDeclare, driver.TopologyVerify} {
+				t.Run(fmt.Sprintf("mode-%d", mode), func(t *testing.T) {
+					_, err := connection.Admin().EnsureTopology(ctx, driver.TopologySpec{
+						Policy:       mode,
+						Destinations: []driver.DestinationSpec{{Name: topic, Kind: kind}},
+						Effective:    connection.Capabilities(),
+					})
+					after := kafkaCleanupPolicy(t, ctx, admin, topic)
+					if *after.Value != *before.Value || after.Source != before.Source {
+						t.Fatalf("EnsureTopology mutated %q cleanup.policy from %q (source %v) to %q (source %v)", topic, *before.Value, before.Source, *after.Value, after.Source)
+					}
+					requireKafkaCompactionRefusal(t, err, topic, *before.Value)
+				})
+			}
+		})
+	}
+}
+
+func TestEnsureTopologyRefusesCompactingRetry(t *testing.T) {
+	testKafkaCompactingDestinationRefused(t, driver.DestRetry)
+}
+
+func TestEnsureTopologyRefusesCompactingDLQ(t *testing.T) {
+	testKafkaCompactingDestinationRefused(t, driver.DestDLQ)
+}
+
+func TestEnsureTopologyCompactionGuardUsesDestinationRole(t *testing.T) {
+	ctx, connection, admin := openKafkaAdminTest(t)
+	main := kafkaTestTopic(t, "main.retry.1.dlq")
+	retry := kafkaTestTopic(t, "neutral-lane")
+	cleanupKafkaTopics(t, admin, main, retry)
+	for _, topic := range []string{main, retry} {
+		createKafkaTopicWithCleanupPolicy(t, admin, ctx, topic, "compact")
+	}
+	for _, mode := range []driver.TopologyPolicy{driver.TopologyDeclare, driver.TopologyVerify} {
+		t.Run(fmt.Sprintf("mode-%d", mode), func(t *testing.T) {
+			t.Run("main-only", func(t *testing.T) {
+				diff, err := connection.Admin().EnsureTopology(ctx, driver.TopologySpec{
+					Policy:       mode,
+					Destinations: []driver.DestinationSpec{{Name: main, Kind: driver.DestMain}},
+					Effective:    connection.Capabilities(),
+				})
+				if err != nil {
+					t.Fatalf("compacting main-only EnsureTopology: %v", err)
+				}
+				if !namesContainAll(diff.ExistingDestinations, main) {
+					t.Fatalf("ExistingDestinations = %v, want compacting main %q", diff.ExistingDestinations, main)
+				}
+			})
+			_, err := connection.Admin().EnsureTopology(ctx, driver.TopologySpec{
+				Policy: mode,
+				Destinations: []driver.DestinationSpec{
+					{Name: main, Kind: driver.DestMain},
+					{Name: retry, Kind: driver.DestRetry},
+				},
+				Effective: connection.Capabilities(),
+			})
+			for _, topic := range []string{main, retry} {
+				if got := kafkaCleanupPolicy(t, ctx, admin, topic); *got.Value != "compact" || got.Source != kmsg.ConfigSourceDynamicTopicConfig {
+					t.Fatalf("EnsureTopology mutated %q cleanup.policy = %q (source %v)", topic, *got.Value, got.Source)
+				}
+			}
+			requireKafkaCompactionRefusal(t, err, retry, "compact")
+		})
+	}
+}
+
+func TestEnsureTopologyAdmitsDeleteRetryAndDLQWithCompactingMain(t *testing.T) {
+	ctx, connection, admin := openKafkaAdminTest(t)
+	main := kafkaTestTopic(t, "safe-main")
+	retry := kafkaTestTopic(t, "safe-retry")
+	dlq := kafkaTestTopic(t, "safe-dlq")
+	cleanupKafkaTopics(t, admin, main, retry, dlq)
+	createKafkaTopicWithCleanupPolicy(t, admin, ctx, main, "compact")
+	for _, topic := range []string{retry, dlq} {
+		createKafkaTopicWithCleanupPolicy(t, admin, ctx, topic, "delete")
+	}
+	for _, mode := range []driver.TopologyPolicy{driver.TopologyDeclare, driver.TopologyVerify} {
+		diff, err := connection.Admin().EnsureTopology(ctx, driver.TopologySpec{
+			Policy: mode,
+			Destinations: []driver.DestinationSpec{
+				{Name: main, Kind: driver.DestMain},
+				{Name: retry, Kind: driver.DestRetry},
+				{Name: dlq, Kind: driver.DestDLQ},
+			},
+			Effective: connection.Capabilities(),
+		})
+		if err != nil {
+			t.Fatalf("safe mixed EnsureTopology mode %d: %v", mode, err)
+		}
+		if len(diff.CreatedDestinations) != 0 || len(diff.ExistingDestinations) != 3 || !namesContainAll(diff.ExistingDestinations, main, retry, dlq) {
+			t.Fatalf("safe mixed topology diff = %#v, want all three existing roles", diff)
+		}
+	}
+	for topic, want := range map[string]string{main: "compact", retry: "delete", dlq: "delete"} {
+		got := kafkaCleanupPolicy(t, ctx, admin, topic)
+		if *got.Value != want || got.Source != kmsg.ConfigSourceDynamicTopicConfig {
+			t.Errorf("%q cleanup.policy = %q (source %v), want unchanged explicit %q", topic, *got.Value, got.Source, want)
+		}
+	}
+}
+
 func TestEnsureTopologyOrphanScan(t *testing.T) {
 	ctx, connection, admin := openKafkaAdminTest(t)
 	prefix := kafkaTestTopic(t, "orphan-scope")
@@ -611,4 +809,92 @@ func TestPublicSubscriptionHonoursRetryDelayUnderTopologyNone(t *testing.T) {
 	case <-runWaitCtx.Done():
 		t.Fatal("Runner.Run did not stop after Close")
 	}
+}
+
+func TestPublicSubscriptionRejectsCompactingRetryBeforeConsumption(t *testing.T) {
+	adminCtx, connection, admin := openKafkaAdminTest(t)
+	topic := kafkaTestTopic(t, "public-compacting-retry")
+	groupName := kafkaTestTopic(t, "public-compacting-retry-group")
+	// Public retry destinations embed both names, so keep the unique group short
+	// enough that the test's descriptive topic name cannot exceed Kafka's limit.
+	group := "compaction-" + groupName[len(groupName)-16:]
+	main := fmt.Sprintf("f1.test.%s.medium", topic)
+	compactingRetry := fmt.Sprintf("f1.test.%s.%s.medium.retry.1", topic, group)
+	topics := []string{
+		main,
+		fmt.Sprintf("f1.test.%s.dlq.%s", topic, group),
+		fmt.Sprintf("f1.test.unknown.dlq.%s", group),
+		compactingRetry,
+		fmt.Sprintf("f1.test.%s.%s.medium.retry.2", topic, group),
+		fmt.Sprintf("f1.test.%s.%s.medium.retry.3", topic, group),
+	}
+	// Register every default-ladder resource before startup, including resources
+	// the unguarded baseline might create if it unexpectedly accepts the retry.
+	cleanupKafkaTopics(t, admin, topics...)
+	cleanupKafkaGroups(t, admin, group)
+	for _, name := range topics {
+		policy := "delete"
+		if name == compactingRetry {
+			policy = "compact"
+		}
+		createKafkaTopicWithCleanupPolicy(t, admin, adminCtx, name, policy)
+	}
+
+	recording := &recordingKafkaDriver{created: make(chan *consumer, 8)}
+	client, err := f1.New(adminCtx, kafkaPublicTestConfig(),
+		f1.WithDriver(recording),
+		f1.WithTopology(f1.TopologyDeclare),
+		f1.WithPublishTopics(topic),
+	)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	t.Cleanup(func() { _ = client.Close(context.Background()) })
+
+	const eventType = "compaction.guard.queued.v1"
+	var handled atomic.Int32
+	runner, err := client.Subscribe(adminCtx, f1.Subscription{
+		Name:           group,
+		Topics:         []string{topic},
+		Concurrency:    1,
+		Prefetch:       4,
+		Priorities:     []f1.Priority{f1.PriorityMedium},
+		HandlerTimeout: time.Second,
+		Handlers: map[string]f1.Handler{
+			eventType: f1.HandlerFunc(func(context.Context, *f1.Event) error {
+				handled.Add(1)
+				return nil
+			}),
+		},
+	})
+	if err != nil {
+		t.Fatalf("Subscribe: %v", err)
+	}
+	if _, err := client.Publisher().Publish(adminCtx, eventType, map[string]string{"id": "queued-before-run"}, f1.WithTopic(topic)); err != nil {
+		t.Fatalf("Publish valid queued event: %v", err)
+	}
+	queued, err := connection.Admin().DescribeTopology(adminCtx, []string{main})
+	if err != nil {
+		t.Fatalf("DescribeTopology before Run: %v", err)
+	}
+	if queued.Depth[main] != 1 {
+		t.Fatalf("main depth before Run = %d, want one queued valid event", queued.Depth[main])
+	}
+
+	runCtx, cancel := context.WithTimeout(adminCtx, 3*time.Second)
+	defer cancel()
+	runErr := runner.Run(runCtx)
+	select {
+	case created := <-recording.created:
+		t.Errorf("Runner.Run created consumer %p before refusing compacted retry", created)
+	default:
+	}
+	if got := handled.Load(); got != 0 {
+		t.Errorf("handler processed %d queued events, want none before topology refusal", got)
+	}
+	after := kafkaCleanupPolicy(t, adminCtx, admin, compactingRetry)
+	if *after.Value != "compact" || after.Source != kmsg.ConfigSourceDynamicTopicConfig {
+		t.Errorf("Runner.Run mutated retry cleanup.policy to %q (source %v)", *after.Value, after.Source)
+	}
+	requireKafkaCompactionRefusal(t, runErr, compactingRetry, "compact")
 }

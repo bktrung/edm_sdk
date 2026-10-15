@@ -29,6 +29,30 @@ type laneRepairDriver struct {
 	firstPublishStarted, firstPublishRelease         chan struct{}
 	successorPublishStarted, successorPublishRelease chan struct{}
 	drainStarted, drainRelease                       chan struct{}
+	// releaseGate holds every Release the driver serves, whichever consumer it
+	// belongs to, so a test can land a concurrent teardown while the repair
+	// owns the one it started.
+	releaseGate *laneRepairReleaseGate
+}
+
+// laneRepairReleaseGate holds a driver's releases open until a test lets them
+// go. One gate serves every consumer the driver opened, because a repair and
+// the replacement it opens signal the same wait.
+type laneRepairReleaseGate struct {
+	started chan struct{}
+	held    chan struct{}
+	once    sync.Once
+}
+
+func newLaneRepairReleaseGate() *laneRepairReleaseGate {
+	return &laneRepairReleaseGate{started: make(chan struct{}), held: make(chan struct{})}
+}
+
+// enter reports the first release that reached the driver and waits until the
+// test releases the gate.
+func (g *laneRepairReleaseGate) enter() {
+	g.once.Do(func() { close(g.started) })
+	<-g.held
 }
 
 func (d *laneRepairDriver) Name() string { return "lane-repair-test" }
@@ -115,6 +139,7 @@ func (c *laneRepairConn) Consumer(_ context.Context, cfg driver.ConsumerConfig) 
 		errors:       make(chan error, 8),
 		drainStarted: c.driver.drainStarted,
 		drainRelease: c.driver.drainRelease,
+		releaseGate:  c.driver.releaseGate,
 	}
 	c.driver.created <- consumer
 	return consumer, nil
@@ -164,6 +189,12 @@ type laneRepairConsumer struct {
 	drainRelease chan struct{}
 	released     atomic.Bool
 	once         sync.Once
+	// stopCalls and releaseCalls count the teardown the driver was asked for,
+	// and releaseGate holds a release inside the driver the way drainStarted
+	// and drainRelease hold the consumer's drain.
+	stopCalls    atomic.Int32
+	releaseCalls atomic.Int32
+	releaseGate  *laneRepairReleaseGate
 }
 
 func (c *laneRepairConsumer) Messages() <-chan driver.InboundMessage { return c.messages }
@@ -184,11 +215,16 @@ func (c *laneRepairConsumer) Drain(ctx context.Context) error {
 }
 
 func (c *laneRepairConsumer) Stop(context.Context) error {
+	c.stopCalls.Add(1)
 	c.close()
 	return nil
 }
 
 func (c *laneRepairConsumer) Release(context.Context) error {
+	c.releaseCalls.Add(1)
+	if c.releaseGate != nil {
+		c.releaseGate.enter()
+	}
 	c.released.Store(true)
 	c.close()
 	return nil
@@ -608,4 +644,67 @@ func TestRunnerUsefulDeliveryRestoresTwoCycleRepairBudget(t *testing.T) {
 	}
 	fifth.sendError(transientLaneError(d))
 	waitReconnectCondition(t, func() bool { return d.openCount() >= 2 })
+}
+
+// TestRunnerDrainJoinsTheRepairReleaseInsteadOfStoppingTheReleasedConsumer pins
+// the local-repair overlap: a lane repair that is already releasing the failed
+// generation's consumer owns the teardown, so the terminal drain joins it
+// rather than stopping a consumer the repair is handing back. The driver sees
+// the repair's one Release and no Stop at all, and the drain reports the
+// repair's result.
+func TestRunnerDrainJoinsTheRepairReleaseInsteadOfStoppingTheReleasedConsumer(t *testing.T) {
+	d := &laneRepairDriver{
+		created:     make(chan *laneRepairConsumer, 16),
+		releaseGate: newLaneRepairReleaseGate(),
+	}
+	client := newLaneRepairClient(t, d)
+	var handled atomic.Int32
+	runner, _ := startLaneRunner(t, client, laneRepairSubscription("orders", &handled))
+	// Registered after the client's cleanup so LIFO opens the gate before the
+	// close, whose kept-consumer retry would otherwise block inside it.
+	var release sync.Once
+	t.Cleanup(func() { release.Do(func() { close(d.releaseGate.held) }) })
+	failed := waitLaneConsumer(t, d, "orders")
+	waitReconnectCondition(t, func() bool { return runner.lifecycle.State() == lifecycle.Ready })
+
+	// The repair branch releases the failed generation's consumer. Hold that
+	// release inside the driver, so the drain arrives while the repair owns the
+	// consumer's teardown.
+	failed.sendError(transientLaneError(d))
+	waitForSignal(t, d.releaseGate.started, "releaseStarted")
+	if got := failed.releaseCalls.Load(); got != 1 {
+		t.Fatalf("Release() calls before the drain = %d, want the repair's one", got)
+	}
+
+	drained := make(chan error, 1)
+	go func() { drained <- runner.Drain(context.Background()) }()
+	// The owner installs the settlement window while handling Drain, before it
+	// launches teardown. Waiting for it forces the drain to be handled while
+	// the repair still owns the release; releasing the gate first would let the
+	// repair continue into a new generation, whose open would then keep the
+	// terminal drain from starting at all.
+	waitReconnectCondition(t, func() bool {
+		runner.mu.Lock()
+		defer runner.mu.Unlock()
+		return runner.settleCtx != nil
+	})
+	select {
+	case err := <-drained:
+		t.Fatalf("Drain() = %v while the repair still owned the teardown", err)
+	default:
+	}
+	release.Do(func() { close(d.releaseGate.held) })
+	if err := <-drained; err != nil {
+		t.Fatalf("Drain() = %v, want the repair's result", err)
+	}
+	if got := failed.stopCalls.Load(); got != 0 {
+		t.Fatalf("Stop() calls on the released consumer = %d, want none", got)
+	}
+	if got := failed.releaseCalls.Load(); got != 1 {
+		t.Fatalf("Release() calls = %d, want the repair's one", got)
+	}
+	waitReconnectCondition(t, func() bool { return runner.lifecycle.State() == lifecycle.Closed })
+	if got := d.openCount(); got != 1 {
+		t.Fatalf("driver Open count = %d, want the repair to keep its connection", got)
+	}
 }

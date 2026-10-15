@@ -38,6 +38,18 @@ Start with any rate above zero over five minutes, then add a hold duration (`for
 
 Check the matching handler, decode, and poison-message errors. Then inspect the dead-letter destination and error handler for publication or notification failures.
 
+## Poison messages dropped without a retained copy
+
+Alert on any non-zero rate: these messages were acknowledged without a retained copy, not successfully dead-lettered.
+
+```text
+sum by (messaging_system, messaging_destination_name, messaging_consumer_group_name, f1_priority, error_type, reason) (
+  rate(f1_messaging_poison_dropped_total[5m])
+) > 0
+```
+
+Read the `reason` attribute, then check the dead-letter route and message size against broker limits. Logs and error callbacks are notification, not a retained copy.
+
 ## Retry rate high relative to consumption
 
 A high retry ratio means recovery work consumes a material share of deliveries. Group the ratio by messaging system and consumer group; use retry labels for destination and priority drilldown.

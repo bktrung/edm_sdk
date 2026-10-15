@@ -268,24 +268,31 @@ func ownerProbeMessage(t *testing.T, settler driver.Settler) driver.InboundMessa
 	}
 }
 
-func ownerStopCount(t *testing.T, consumer *ownerProbeConsumer) int {
-	t.Helper()
-	stops, _ := consumer.counts()
-	return stops
-}
-
 // TestThreeRequestsToEndLeaveOneDrain pins that a runner's teardown happens
-// once however many callers ask for it. Close's request, the supervisor's
-// abandon and the caller cancelling the run context arrive together, and once
-// the drain is under way a further request arrives while it is running. Every
-// one of them has to join the same drain: a second one would stop a consumer
-// that was already released, which is the runner taking work back from the
-// broker after handing it away.
+// once however many callers ask for it. The drain reaches the consumer first,
+// and Close's request, the supervisor's abandon and the caller cancelling the
+// run context arrive while it holds Stop open. Every one of them has to join
+// that one teardown: a second sequence would be the runner taking work back
+// from the broker after handing it away.
 func TestThreeRequestsToEndLeaveOneDrain(t *testing.T) {
 	consumer := newOwnerProbeConsumer()
 	consumer.stopStarted = make(chan struct{})
 	consumer.stopRelease = make(chan struct{})
 	run := startOwnerRunner(t, consumer)
+
+	// The drain reaches the consumer first, so it takes the one teardown. The
+	// requests below arrive while it holds Stop open: Close, the supervisor's
+	// abandon and the caller's cancel all have to join that teardown rather
+	// than start a second sequence beside it.
+	firstDone := make(chan error, 1)
+	go func() { firstDone <- run.runner.Drain(context.Background()) }()
+	timer := clock.NewReal().Timer(2 * time.Second)
+	defer timer.Stop()
+	select {
+	case <-consumer.stopStarted:
+	case <-timer.C:
+		t.Fatal("the runner never reached its drain")
+	}
 
 	closeDone := make(chan error, 1)
 	var requests sync.WaitGroup
@@ -294,15 +301,8 @@ func TestThreeRequestsToEndLeaveOneDrain(t *testing.T) {
 	go func() { defer requests.Done(); run.client.abandonRunners(context.Background()) }()
 	go func() { defer requests.Done(); run.cancel() }()
 
-	// The drain is holding its release open, so the runner is inside its
+	// The drain is holding its stop open, so the runner is inside its
 	// teardown and a further request lands while it runs.
-	timer := clock.NewReal().Timer(2 * time.Second)
-	defer timer.Stop()
-	select {
-	case <-consumer.stopStarted:
-	case <-timer.C:
-		t.Fatal("the runner never reached its drain")
-	}
 	secondDone := make(chan error, 1)
 	go func() { secondDone <- run.runner.Drain(context.Background()) }()
 
@@ -314,8 +314,8 @@ func TestThreeRequestsToEndLeaveOneDrain(t *testing.T) {
 	defer ticker.Stop()
 watch:
 	for {
-		if stops := ownerStopCount(t, consumer); stops > 1 {
-			t.Fatalf("the consumer was stopped %d times, want one drain however many callers asked for it", stops)
+		if stops, releases := consumer.counts(); stops > 1 || releases != 0 {
+			t.Fatalf("teardown calls = (%d stops, %d releases), want one drain however many callers asked for it", stops, releases)
 		}
 		select {
 		case <-settle.C:
@@ -323,15 +323,18 @@ watch:
 		case <-ticker.C:
 		}
 	}
-	if stops := ownerStopCount(t, consumer); stops != 1 {
-		t.Fatalf("the consumer was stopped %d times, want exactly one", stops)
+	if stops, releases := consumer.counts(); stops != 1 || releases != 0 {
+		t.Fatalf("teardown calls = (%d stops, %d releases), want exactly one Stop and no Release", stops, releases)
 	}
 
 	close(consumer.stopRelease)
 	requests.Wait()
-	for name, done := range map[string]<-chan error{"close": closeDone, "drain": secondDone, "run": run.runDone} {
+	for name, done := range map[string]<-chan error{"close": closeDone, "drain": secondDone, "first drain": firstDone, "run": run.runDone} {
 		select {
-		case <-done:
+		case err := <-done:
+			if err != nil {
+				t.Fatalf("%s = %v, want the drain's result", name, err)
+			}
 		case <-clock.NewReal().Timer(2 * time.Second).C:
 			t.Fatalf("%s never returned while the runner drained", name)
 		}

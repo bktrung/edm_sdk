@@ -13,6 +13,7 @@ import (
 	"golang.org/x/sync/errgroup"
 
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/driver"
+	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/clock"
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/dispatch"
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/lifecycle"
 )
@@ -29,15 +30,43 @@ type Subscription struct {
 	// configuration overrides in effect, then uses a positive broker fallback
 	// or automatic sizing from the resolved lane capacities.
 	// Broker/client transport buffering is separate from this admission cap.
-	Prefetch        int
-	Priorities      []Priority
-	Fairness        FairnessConfig
-	Retry           RetryConfig
+	Prefetch   int
+	Priorities []Priority
+	Fairness   FairnessConfig
+	Retry      RetryConfig
+	// HandlerTimeout bounds the handler context; zero uses the resolved default.
+	// A handler still running at four times this timeout counts as leftover
+	// until it returns. Terminal callbacks share this runner-lifetime count.
+	// Reaching the resolved Concurrency latches failure: no new handler or
+	// terminal callback is admitted, Run returns a fatal classified error, and
+	// Health reports the subscription as failed. Already-admitted work can
+	// exceed this threshold. Returning leftovers do not clear the failure.
+	// A runner that is already draining or has stopped counts nothing, so a
+	// subscription that only abandons handlers on the way out still stops
+	// cleanly. Drain and Close never wait for leftover user code.
 	HandlerTimeout  time.Duration
 	UnmatchedPolicy UnmatchedPolicy
-	OnDeadLetter    func(context.Context, DeadLettered)
-	OnDiscarded     func(context.Context, Discarded)
-	Handlers        map[string]Handler
+	// OnDeadLetter runs asynchronously after the dead-letter publish is
+	// confirmed, even if acknowledging the original delivery later fails.
+	// Its context has a one-second deadline and inherits parent cancellation.
+	// A callback still running when that deadline passes counts toward the
+	// shared HandlerTimeout leftover threshold until it returns, except on a
+	// runner that is already draining or has stopped. A parent cancellation
+	// alone does not count it: it counts only if it is still running when its
+	// own one-second deadline passes. After failure is latched no new callback
+	// is admitted; Drain and Close never wait for it.
+	OnDeadLetter func(context.Context, DeadLettered)
+	// OnDiscarded runs asynchronously only after acknowledging a discarded
+	// delivery succeeds. Its context has a one-second deadline and inherits
+	// parent cancellation. A callback still running when that deadline passes
+	// counts toward the shared HandlerTimeout leftover threshold until it
+	// returns, except on a runner that is already draining or has stopped. A
+	// parent cancellation alone does not count it: it counts only if it is
+	// still running when its own one-second deadline passes. Already-admitted
+	// callbacks can exceed that threshold; after failure is latched no new
+	// callback is admitted. Drain and Close never wait for it.
+	OnDiscarded func(context.Context, Discarded)
+	Handlers    map[string]Handler
 }
 
 // DeadLettered carries the message data passed to OnDeadLetter after its
@@ -94,11 +123,23 @@ type Runner struct {
 	// opened on. A failed Release keeps the consumer against that connection,
 	// because that is the one the driver still carries it on.
 	consumerEpoch uint64
-	group         *errgroup.Group
+	// teardown is the one teardown the stored consumer gets: the first of the
+	// terminal drain, a reconnect abandon, a lane-repair release and a
+	// successor-handoff release claims it, and the rest join its result. The
+	// run loop clears it when it admits a consumer, so an attempt always names
+	// the driver object whose sequence must happen once and never a consumer
+	// the runner has replaced. It is guarded by mu.
+	teardown *consumerTeardown
+	group    *errgroup.Group
 	// asyncGroup owns handler and terminal-callback goroutines. finishRunner
 	// cancels their contexts but does not wait: a non-cooperative handler or
 	// callback cannot be force-stopped, and waiting would violate drain's bound.
 	asyncGroup *errgroup.Group
+	// Leftover accounting belongs to the runner, not a consumer generation:
+	// a rebuilt consumer cannot release user goroutines from its predecessor.
+	leftoverCount  int
+	leftoverFailed bool
+	leftoverLimit  chan struct{}
 	// errorGroup owns only error-handler notifications. It is bounded and is
 	// never waited by the runner, because a non-cooperative callback cannot be
 	// force-stopped without extending shutdown.
@@ -140,6 +181,137 @@ type Runner struct {
 }
 
 const terminalNotificationTimeout = time.Second
+
+// userInvocation is guarded by Runner.mu, including after its user code returns.
+type userInvocation struct {
+	returned bool
+	leftover bool
+}
+
+// startUserInvocation admits one piece of user work and launches it on group,
+// returning the state its caller marks as abandoned or completes. It returns nil
+// once the leftover threshold has latched, so every handler and terminal
+// callback funnels its admission decision through here.
+//
+// group must be non-nil: both call sites resolve one, and a runner built without
+// Run gets its throwaway group from the caller, which is where that fallback
+// belongs. A nil is a caller bug, not a state to absorb here.
+func (r *Runner) startUserInvocation(group *errgroup.Group, run func(*userInvocation) error) *userInvocation {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.leftoverFailed {
+		return nil
+	}
+	inv := new(userInvocation)
+	// Launch under mu so admission and the failure latch have one ordering.
+	// Already-admitted work may run after the latch; no user code holds mu.
+	group.Go(func() error {
+		defer r.completeUserInvocation(inv)
+		return run(inv)
+	})
+	return inv
+}
+
+// markUserLeftover records that user code has outlived the runner's patience
+// with it: a handler abandoned at four times its timeout, or a terminal callback
+// whose context ended. It counts at most once per invocation, and it is where
+// the threshold latches.
+func (r *Runner) markUserLeftover(inv *userInvocation) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	// A timeout watcher can select expiry just as user code returns. If the
+	// user's completion acquires mu first, returned prevents a stale increment.
+	// If this watcher acquires it first, completion removes that increment.
+	if inv.returned || inv.leftover {
+		return
+	}
+	// A runner that is already stopping takes no further messages, so a
+	// leftover appearing now cannot make it consume less than it will anyway,
+	// and counting it would fail a subscription that is merely shutting down:
+	// Drain and Close abandon in-flight handlers on their own budget, and those
+	// exits must stay successful. The count that means something is the one a
+	// consuming runner accumulates. Drain sets draining under this same mutex
+	// before it cancels anything, so a mark that interleaves with the start of
+	// a drain sees either the whole count or no drain at all, never a count the
+	// drain itself caused.
+	if r.runnerStoppingLocked() {
+		return
+	}
+	inv.leftover = true
+	r.leftoverCount++
+	limit := max(r.subscription.Concurrency, 1)
+	if r.leftoverCount >= limit && !r.leftoverFailed {
+		r.leftoverFailed = true
+		if r.leftoverLimit == nil {
+			r.leftoverLimit = make(chan struct{})
+		}
+		close(r.leftoverLimit)
+	}
+}
+
+// runnerStoppingLocked reports that this runner is ending, so it will consume
+// nothing further and a leftover cannot be a reason to stop it. The caller holds
+// r.mu.
+//
+// Four ways in, and each covers a stop the others miss. Drain sets draining
+// before it cancels anything. The lifecycle reaches Draining on the runner's own
+// end-of-run drain, which the exported flag never marks, and reaches Failed when
+// the runner already has a reason to stop. Run's cancellation and the exit of
+// Run reach the two handler contexts, which is the only signal left once the
+// lifecycle has stopped moving.
+//
+// A generation that ends while the runner still expects to consume - a consumer
+// error awaiting repair, or a stream that closed - is deliberately not in this
+// set: its leftovers are exactly what the threshold exists to count.
+func (r *Runner) runnerStoppingLocked() bool {
+	if r.draining {
+		return true
+	}
+	if r.lifecycle != nil {
+		switch r.lifecycle.State() {
+		case lifecycle.Draining, lifecycle.Failed, lifecycle.Closed, lifecycle.Aborted:
+			return true
+		}
+	}
+	if r.handlerCtx != nil && r.handlerCtx.Err() != nil {
+		return true
+	}
+	return r.handlerShutdownCtx != nil && r.handlerShutdownCtx.Err() != nil
+}
+
+// completeUserInvocation records that user code actually returned. It is
+// idempotent, because both the launch wrapper and the user path call it, and it
+// releases a leftover's slot exactly once. It never clears the failure latch:
+// work that returns after the threshold does not reopen admission.
+func (r *Runner) completeUserInvocation(inv *userInvocation) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if inv.returned {
+		return
+	}
+	inv.returned = true
+	if inv.leftover {
+		r.leftoverCount--
+	}
+}
+
+// terminalCallbackContext advertises the injected-clock deadline without
+// installing a real-time context timer. The existing callback watcher expires it.
+type terminalCallbackContext struct {
+	context.Context
+	deadline time.Time
+}
+
+func (ctx terminalCallbackContext) Deadline() (time.Time, bool) {
+	return ctx.deadline, true
+}
+
+func (ctx terminalCallbackContext) Err() error {
+	if errors.Is(context.Cause(ctx.Context), context.DeadlineExceeded) {
+		return context.DeadlineExceeded
+	}
+	return ctx.Context.Err()
+}
 
 func newErrorHandlerGroup(concurrency int) *errgroup.Group {
 	if concurrency < 1 {
@@ -217,20 +389,31 @@ func runnerNotify(r *Runner, parent context.Context, callback func(context.Conte
 		r.asyncGroup = group
 	}
 	r.mu.Unlock()
-	notifyOwned(parent, callback, group, lastResortRunnerLogger(r), kind)
+	notifyOwned(r, parent, callback, group, lastResortRunnerLogger(r), kind)
 }
 
-func notifyOwned(parent context.Context, callback func(context.Context), group *errgroup.Group, logger *slog.Logger, kind string) {
-	if callback == nil {
+func notifyOwned(r *Runner, parent context.Context, callback func(context.Context), group *errgroup.Group, logger *slog.Logger, kind string) {
+	if callback == nil || group == nil || parent == nil {
 		return
 	}
-	if group == nil {
-		return
+	var clk clock.Clock = clock.Real{}
+	if r.client != nil && r.client.options.clock != nil {
+		clk = r.client.options.clock
 	}
-	ctx, cancel := context.WithTimeout(parent, terminalNotificationTimeout)
+	deadline := clk.Now().Add(terminalNotificationTimeout)
+	if parentDeadline, ok := parent.Deadline(); ok && parentDeadline.Before(deadline) {
+		deadline = parentDeadline
+	}
+	base, cancel := context.WithCancelCause(parent)
+	ctx := terminalCallbackContext{Context: base, deadline: deadline}
+	timer := clk.Timer(max(deadline.Sub(clk.Now()), 0))
 	done := make(chan struct{})
-	group.Go(func() (err error) {
+	inv := r.startUserInvocation(group, func(inv *userInvocation) (err error) {
 		defer close(done)
+		// Publish completion accounting before done: otherwise the watcher
+		// could observe expiry after callback return but before the wrapper's
+		// defer and incorrectly count a callback that has already finished.
+		defer r.completeUserInvocation(inv)
 		defer func() {
 			if recovered := recover(); recovered != nil {
 				logger.LogAttrs(parent, slog.LevelWarn, "f1 terminal notification panicked",
@@ -238,18 +421,41 @@ func notifyOwned(parent context.Context, callback func(context.Context), group *
 					slog.Any("panic", recovered))
 			}
 		}()
-		callback(ctx)
+		// terminalCallbackContext carries the runner clock's deadline, and the
+		// watcher below is its only expiry, so a fake clock drives it.
+		callback(ctx) //nolint:contextcheck // the callback context is deliberate, not derived here.
 		return nil
 	})
+	if inv == nil {
+		timer.Stop()
+		cancel(context.Canceled)
+		return
+	}
 	group.Go(func() error {
+		defer timer.Stop()
+		defer cancel(context.Canceled)
 		select {
 		case <-done:
+			return nil
+		case <-timer.C:
+			cancel(context.DeadlineExceeded)
 		case <-ctx.Done():
-			logger.LogAttrs(parent, slog.LevelWarn, "f1 terminal notification timed out",
-				slog.String("kind", kind),
-				slog.Duration("timeout", terminalNotificationTimeout))
+			// The parent ended, so the callback's context is cancelled, but the
+			// count waits for the callback's own deadline. It is the asymmetry
+			// handlers already have: a handler is counted only once it outlives
+			// its own phase timer, never for a parent cancellation. Keep
+			// waiting for the callback to return or for that deadline to pass.
+			select {
+			case <-done:
+				return nil
+			case <-timer.C:
+				cancel(context.DeadlineExceeded)
+			}
 		}
-		cancel()
+		r.markUserLeftover(inv)
+		logger.LogAttrs(parent, slog.LevelWarn, "f1 terminal notification timed out",
+			slog.String("kind", kind),
+			slog.Duration("timeout", terminalNotificationTimeout))
 		return nil
 	})
 }

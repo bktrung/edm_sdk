@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -363,5 +364,59 @@ func TestAmqpPublishingRefusesOnlyTheOversizedMessageOfABatch(t *testing.T) {
 		if kind, classified := driver.Classify(err); !classified || kind != driver.KindTooLarge {
 			t.Fatalf("the oversized message's error = %v, want classified too large", err)
 		}
+	}
+}
+
+func TestPublishSegmentBatchAllocationGrowth(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		size   int
+		unique bool
+	}{
+		{name: "id-less", size: 128},
+		{name: "unique-ID", size: 3000, unique: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			allocated := func(size int) uint64 {
+				// Reservation refuses the closed producer after real segment
+				// encoding, without an AMQP channel. Walk every segment despite
+				// that error to measure a whole batch.
+				p := &producer{conn: &conn{}, closed: true}
+				msgs := make([]driver.OutboundMessage, size)
+				if tc.unique {
+					for index := range msgs {
+						msgs[index].Headers = []driver.Header{{Key: wire.ID, Value: fmt.Appendf(nil, "id-%d", index)}}
+					}
+				}
+				failed := make(map[int]error, maxSegmentMessages)
+				runtime.GC()
+				var before, after runtime.MemStats
+				runtime.ReadMemStats(&before)
+				for base := 0; base < len(msgs); {
+					clear(failed)
+					consumed, err := p.publishSegment(context.Background(), msgs, base, failed)
+					want := 1
+					if tc.unique {
+						want = min(size-base, maxSegmentMessages)
+					}
+					if consumed != want || !errors.Is(err, amqp.ErrClosed) {
+						t.Fatalf("segment at %d = (%d, %v), want (%d, closed channel)", base, consumed, err, want)
+					}
+					base += consumed
+				}
+				runtime.ReadMemStats(&after)
+				return after.TotalAlloc - before.TotalAlloc
+			}
+			small := allocated(tc.size)
+			large := allocated(2 * tc.size)
+			t.Logf("%d messages = %d bytes, %d messages = %d bytes (%.0f bytes/message)",
+				tc.size, small, 2*tc.size, large, float64(large)/float64(2*tc.size))
+			if float64(large) >= 2.5*float64(small) {
+				t.Errorf("allocation grew %.2fx for a 2x batch, want less than 2.5x", float64(large)/float64(small))
+			}
+			if float64(large)/float64(2*tc.size) >= 2048 {
+				t.Errorf("allocation = %.0f bytes/message, want less than 2048", float64(large)/float64(2*tc.size))
+			}
+		})
 	}
 }

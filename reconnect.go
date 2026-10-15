@@ -20,6 +20,46 @@ var reconnectPolicy = retry.Config{
 	MaxInterval:     reconnectDriverMaxInterval,
 }
 
+// retirementCeiling is the number of owned retirements at which a reconnect is
+// refused. Every retired connection and every discarded producer whose teardown
+// has not succeeded is one entry, so the ceiling bounds the handles the client
+// can hold on a broker that refuses to close them. Past it the client gives up
+// the connection and stays that way until a restart, which is the trade the
+// design accepted over an unbounded leak.
+const retirementCeiling = 8
+
+// maxRetirementRetryInterval caps the doubling retry backoff. A minute keeps a
+// broker that is briefly unable to close from being hammered while still
+// releasing a handle soon after it recovers.
+const maxRetirementRetryInterval = time.Minute
+
+// errRetirementsExhausted is the reason half of the error a refused reconnect
+// retains, so a caller can test for the ceiling with errors.Is without
+// depending on the count.
+var errRetirementsExhausted = errors.New("retirement ceiling reached")
+
+// retireCeilingError is the retained error the refused reconnect leaves and
+// Health reports, for example "f1: 8 retired connections failed to close:
+// retirement ceiling reached".
+func retireCeilingError(count int) error {
+	return fmt.Errorf("f1: %d retired connections failed to close: %w", count, errRetirementsExhausted)
+}
+
+// retirementBackoff is how long after a failure the next attempt waits. retries
+// is the number of attempts that have already failed: the first retry waits one
+// Lifecycle.CloseTimeout, and each later one waits twice the last, capped at a
+// minute.
+func retirementBackoff(retries int, closeTimeout time.Duration) time.Duration {
+	d := closeTimeout
+	for range retries {
+		if d >= maxRetirementRetryInterval/2 {
+			return maxRetirementRetryInterval
+		}
+		d *= 2
+	}
+	return d
+}
+
 func (c *Client) reconnectSupervisor() {
 	defer close(c.supervisorDone)
 	// The supervisor's own exit ends whatever attempt was in flight, so the
@@ -199,6 +239,23 @@ func (c *Client) finishReconnectLocked(err error) {
 	c.wakeWaitersLocked(err)
 }
 
+// reconnectRefusedAtCeiling reports the refusal error when the client already
+// holds the ceiling's worth of failed retirements, and nil otherwise. The
+// reconnect supervisor calls it at the start of every attempt, before the
+// replacement is opened, so a broker that will not close connections cannot
+// make the client accumulate more of them. It is also what moves the client
+// into its failed connection state: the retained error is the connection axis
+// value that Health and every publish read.
+func (c *Client) reconnectRefusedAtCeiling() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if len(c.retirements) < retirementCeiling {
+		return nil
+	}
+	c.reconnectErr = retireCeilingError(len(c.retirements))
+	return c.reconnectErr
+}
+
 func (c *Client) reconnectOnce(ctx context.Context, cause error) error {
 	c.abandonRunners(ctx)
 	if err := c.publishQuiescence(ctx, nil); err != nil {
@@ -212,6 +269,12 @@ func (c *Client) reconnectOnce(ctx context.Context, cause error) error {
 	c.mu.Unlock()
 
 	for attempt := 1; ; attempt++ {
+		if err := c.reconnectRefusedAtCeiling(); err != nil {
+			if logger := configuredClientLogger(c); logger != nil {
+				logger.Error("f1 reconnect refused: retirement ceiling reached", "error", err)
+			}
+			return err
+		}
 		delay := retry.FullJitter(reconnectPolicy.DelayFor(attempt), c.reconnectSample())
 		if err := c.options.clock.Sleep(ctx, delay); err != nil {
 			return err
@@ -234,7 +297,7 @@ func (c *Client) reconnectOnce(ctx context.Context, cause error) error {
 					c.mu.Lock()
 					if c.lifecycleLocked() != lifecycle.Ready {
 						c.mu.Unlock()
-						_ = connection.Close(context.WithoutCancel(ctx))
+						c.closeOrRetain(ctx, &retiredConnection{conn: connection})
 						return errors.New("f1: client is closing")
 					}
 					// The connection and the number of its incarnation are
@@ -256,7 +319,7 @@ func (c *Client) reconnectOnce(ctx context.Context, cause error) error {
 			}
 		}
 		if connection != nil {
-			_ = connection.Close(context.WithoutCancel(ctx))
+			c.closeOrRetain(ctx, &retiredConnection{conn: connection})
 		}
 		if err == nil {
 			err = errors.New("f1: reconnect returned no connection")
@@ -498,13 +561,198 @@ func (c *Client) ensureSubscriptionTopologiesOn(ctx context.Context, conn driver
 	return failed
 }
 
-// retiredConnection stays owned until its sequential teardown succeeds. mu
-// guards progress and wait; only the running attempt advances the handles.
+// retiredConnection stays owned until its sequential teardown succeeds. c.mu
+// guards progress and the attempt; only the running attempt advances handles.
 type retiredConnection struct {
 	epoch    uint64
 	producer driver.Producer
 	conn     driver.Conn
-	wait     <-chan error
+	attempt  *retirementAttempt
+	err      error
+	// retries counts the completed attempts this entry's teardown has needed,
+	// and retryAt is when the next one may start. Both are set by
+	// completeRetirement when an attempt fails and the failure is recorded for
+	// the first time, and are read by the retry loop. A zero retryAt means no
+	// retry is scheduled, which is the state while an attempt is running or
+	// before the first failure. c.mu guards both.
+	retries int
+	retryAt time.Time
+}
+
+// retirementAttempt broadcasts actual completion, not the bounded wait's
+// outcome. A publisher can time out while its Close is still at the driver;
+// the supervisor must then observe the same result without consuming it before
+// Client.Close rejoins. c.mu guards installation and result acknowledgement.
+type retirementAttempt struct {
+	done   chan struct{}
+	err    error
+	cancel context.CancelFunc
+	// accounted records that the entry's retry state was updated for this
+	// attempt's failure. A publisher and the reaper can both acknowledge the
+	// same completion, so the update has to happen once per attempt rather
+	// than once per reader. c.mu guards it.
+	accounted bool
+}
+
+// retirementWakeLocked wakes the retirement retry loop after the list it reads
+// changed. The channel holds one pending signal, so many changes across one
+// pass collapse into the single wake that makes the loop rebuild its view. The
+// caller holds c.mu.
+func (c *Client) retirementWakeLocked() {
+	if c.retirementWake == nil {
+		c.retirementWake = make(chan struct{}, 1)
+	}
+	select {
+	case c.retirementWake <- struct{}{}:
+	default:
+	}
+}
+
+// retirementRetryLoop retries failed retirements while the client runs. It
+// owns no entry: it starts an attempt under c.mu only where attempt is nil and
+// the entry's backoff has elapsed, so Close's closeRetirements and this loop
+// cannot both start one. It exits when the supervisor context is cancelled,
+// which is the first thing Close does, so Close's closeRetirements is the only
+// retry driver once shutdown begins.
+//
+// The loop retries while the client is in its failed connection state as well
+// as while it is live: the entries are still held there, and releasing them is
+// the only thing that shrinks the count. It never clears that state; a refused
+// client stays refused until a restart.
+func (c *Client) retirementRetryLoop() {
+	defer close(c.retirementLoopDone)
+	ctx := c.supervisorCtx
+	for {
+		if ctx.Err() != nil || !c.retirementRetryShouldRun() {
+			return
+		}
+		c.reapRetirements()
+		c.startDueRetirements(ctx)
+		wait, scheduled := c.nextRetirementRetryWait()
+		if !scheduled {
+			if c.hasHeldRetirements() {
+				// Entries are held but none has a retry time yet: an attempt is
+				// already running, or one was just started. Wait for its
+				// completion to signal the wake rather than spin on the clock.
+				select {
+				case <-c.retirementWaker():
+				case <-ctx.Done():
+					return
+				}
+				continue
+			}
+			// Nothing is held: block until an entry is appended.
+			select {
+			case <-c.retirementWaker():
+			case <-ctx.Done():
+				return
+			}
+			continue
+		}
+		if wait == 0 {
+			// A retry is due now; the next pass starts it.
+			continue
+		}
+		timer := c.options.clock.Timer(wait)
+		select {
+		case <-timer.C:
+		case <-c.retirementWaker():
+		case <-ctx.Done():
+			timer.Stop()
+			return
+		}
+		timer.Stop()
+	}
+}
+
+// hasHeldRetirements reports whether the client owns any retirement.
+func (c *Client) hasHeldRetirements() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return len(c.retirements) > 0
+}
+
+// retirementRetryShouldRun reports that retries belong to a live client. It
+// reads the lifecycle and not the connection axis, because a failed connection
+// still owns its retirements and still needs them released.
+func (c *Client) retirementRetryShouldRun() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.lifecycleLocked() == lifecycle.Ready
+}
+
+// retirementWaker returns the loop's wake channel under c.mu.
+func (c *Client) retirementWaker() <-chan struct{} {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.retirementWake == nil {
+		c.retirementWake = make(chan struct{}, 1)
+	}
+	return c.retirementWake
+}
+
+// startDueRetirements starts an attempt for every entry whose retry is due. It
+// starts one per lock acquisition, so an attempt that completes while this runs
+// is reaped by the next pass rather than missed, and the retry counter advances
+// only where an attempt is actually started.
+func (c *Client) startDueRetirements(ctx context.Context) {
+	for {
+		c.mu.Lock()
+		now := c.options.clock.Now()
+		var due *retiredConnection
+		for _, entry := range c.retirements {
+			if entry.attempt != nil || entry.retryAt.IsZero() || now.Before(entry.retryAt) {
+				continue
+			}
+			due = entry
+			break
+		}
+		if due == nil {
+			c.mu.Unlock()
+			return
+		}
+		// Clear the due time in the same section that decides to start, so the
+		// next pass cannot count this attempt again.
+		due.retries++
+		due.retryAt = time.Time{}
+		c.mu.Unlock()
+		c.startRetirement(context.WithoutCancel(ctx), due)
+	}
+}
+
+// nextRetirementRetryWait is when the earliest scheduled retry may start, and
+// whether one is scheduled at all. An entry whose attempt is running has no
+// scheduled retry and is skipped: the loop is not waiting for that attempt here,
+// it is waiting for the reaping pass that follows it.
+func (c *Client) nextRetirementRetryWait() (time.Duration, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	now := c.options.clock.Now()
+	var wait time.Duration
+	scheduled := false
+	for _, entry := range c.retirements {
+		if entry.attempt != nil || entry.retryAt.IsZero() {
+			continue
+		}
+		d := max(entry.retryAt.Sub(now), 0)
+		if !scheduled || d < wait {
+			wait, scheduled = d, true
+		}
+	}
+	return wait, scheduled
+}
+
+// closeOrRetain owns one teardown of a connection or producer the client gave
+// up on and, when it fails, leaves the entry for the retry loop.
+func (c *Client) closeOrRetain(ctx context.Context, retired *retiredConnection) {
+	c.mu.Lock()
+	c.retirements = append(c.retirements, retired)
+	c.retirementWakeLocked()
+	c.mu.Unlock()
+	c.startRetirement(context.WithoutCancel(ctx), retired)
+	if err, _ := c.joinRetirement(context.WithoutCancel(ctx), retired); err != nil {
+		lastResortClientLogger(c).Warn("f1 retired teardown failed", "epoch", retired.epoch, "error", err)
+	}
 }
 
 func (c *Client) retireConnection(ctx context.Context, producer driver.Producer, oldConn driver.Conn, oldEpoch uint64) {
@@ -516,6 +764,7 @@ func (c *Client) retireConnection(ctx context.Context, producer driver.Producer,
 	}
 	retired := &retiredConnection{epoch: oldEpoch, producer: producer, conn: oldConn}
 	c.retirements = append(c.retirements, retired)
+	c.retirementWakeLocked()
 	c.mu.Unlock()
 	c.startRetirement(context.WithoutCancel(ctx), retired)
 	// The replacement is installed but publishes stay refused until reconnect
@@ -529,73 +778,156 @@ func (c *Client) retireConnection(ctx context.Context, producer driver.Producer,
 
 func (c *Client) startRetirement(ctx context.Context, retired *retiredConnection) {
 	c.mu.Lock()
-	defer c.mu.Unlock()
-	retired.wait = startPhase(ctx, func(closeCtx context.Context) error {
-		c.mu.Lock()
-		producer, conn := retired.producer, retired.conn
+	if retired.attempt != nil || !slices.Contains(c.retirements, retired) {
 		c.mu.Unlock()
-		if producer != nil {
-			if err := producer.Close(closeCtx); err != nil {
-				return err
-			}
-			c.mu.Lock()
-			retired.producer = nil
-			c.mu.Unlock()
-		}
-		if err := c.retireKeptConsumers(closeCtx, retired.epoch); err != nil {
-			return err
-		}
-		if conn != nil {
-			if err := conn.Close(closeCtx); err != nil {
-				return err
-			}
-			c.mu.Lock()
-			retired.conn = nil
-			c.mu.Unlock()
-		}
-		return nil
-	})
+		return
+	}
+	closeCtx, cancel := context.WithCancel(context.WithoutCancel(ctx))
+	attempt := &retirementAttempt{done: make(chan struct{}), cancel: cancel}
+	retired.attempt = attempt
+	c.mu.Unlock()
+	go func() {
+		err := c.teardownRetirement(closeCtx, retired)
+		cancel()
+		c.mu.Lock()
+		attempt.err = err
+		close(attempt.done)
+		// Wake the retry loop so it reaps this completion. A watcher that
+		// joined the attempt also records the result, but a retry the loop
+		// started itself has no watcher, and without this wake its entry would
+		// stay held until the next unrelated change to the list.
+		c.retirementWakeLocked()
+		c.mu.Unlock()
+	}()
 }
 
-func (c *Client) completeRetirement(retired *retiredConnection, err error) {
+func (c *Client) teardownRetirement(ctx context.Context, retired *retiredConnection) error {
+	c.mu.Lock()
+	producer, conn := retired.producer, retired.conn
+	c.mu.Unlock()
+
+	if producer != nil {
+		if err := producer.Close(ctx); err != nil {
+			return err
+		}
+		c.mu.Lock()
+		retired.producer = nil
+		c.mu.Unlock()
+	}
+	if conn == nil {
+		return nil
+	}
+	if retired.epoch != 0 {
+		// A discarded producer can finish its bounded wait while raw Close
+		// remains at the driver. If a reconnect swaps its parent in between,
+		// the old parent's teardown must join that producer before Conn.Close.
+		c.mu.Lock()
+		discarded := make([]*retiredConnection, 0)
+		for _, entry := range c.retirements {
+			if entry != retired && entry.epoch == retired.epoch && entry.conn == nil {
+				discarded = append(discarded, entry)
+			}
+		}
+		c.mu.Unlock()
+		for _, entry := range discarded {
+			c.mu.Lock()
+			unstarted := entry.attempt == nil && entry.err == nil && entry.producer != nil
+			c.mu.Unlock()
+			if unstarted {
+				c.startRetirement(ctx, entry)
+			}
+			if err, _ := c.joinRetirement(ctx, entry); err != nil {
+				return err
+			}
+		}
+		if err := c.retireKeptConsumers(ctx, retired.epoch); err != nil {
+			return err
+		}
+	}
+	if err := conn.Close(ctx); err != nil {
+		return err
+	}
+	c.mu.Lock()
+	retired.conn = nil
+	c.mu.Unlock()
+	return nil
+}
+
+func (c *Client) completeRetirement(retired *retiredConnection, attempt *retirementAttempt) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	retired.wait = nil
-	if err == nil {
-		c.retirements = slices.DeleteFunc(c.retirements, func(entry *retiredConnection) bool {
-			return entry == retired
-		})
+	// A publisher and reaper may both observe this completion. If Close has
+	// acknowledged its failure and installed a retry before the older reader
+	// arrives here, that reader must not clear the newer running attempt.
+	if retired.attempt == attempt {
+		retired.attempt = nil
+		retired.err = attempt.err
+		if attempt.err == nil {
+			retired.retryAt = time.Time{}
+			c.retirements = slices.DeleteFunc(c.retirements, func(entry *retiredConnection) bool {
+				return entry == retired
+			})
+		} else if !attempt.accounted {
+			// Record the failure once per attempt. A second reader of the same
+			// attempt must not schedule another retry, or the count of
+			// completed attempts would grow without an attempt.
+			attempt.accounted = true
+			retired.retryAt = c.options.clock.Now().Add(retirementBackoff(retired.retries, c.config.Lifecycle.CloseTimeout))
+			// Wake the loop where the retry is scheduled. The attempt's own
+			// goroutine also wakes, but only after it closes done; a watcher
+			// that acknowledges the failure in between can leave the loop
+			// blocked on a view that predates this retry.
+			c.retirementWakeLocked()
+		}
 	}
+	return attempt.err
 }
 
 func (c *Client) joinRetirement(ctx context.Context, retired *retiredConnection) (error, bool) {
 	c.mu.Lock()
-	wait := retired.wait
+	attempt := retired.attempt
+	lastErr := retired.err
 	c.mu.Unlock()
-	err, resolved := c.joinShutdownPhase(ctx, c.config.Lifecycle.CloseTimeout, "retired teardown", wait)
-	if resolved {
-		c.completeRetirement(retired, err)
+	if attempt == nil {
+		return lastErr, true
 	}
-	return err, resolved
+	// The timeout cancels the driver's detached context, but cannot declare
+	// its raw call finished. Close may arrive after this wait expires and
+	// before the driver returns; it must join done instead of starting again.
+	err := runWithClockTimeout(ctx, c.options.clock, c.config.Lifecycle.CloseTimeout, "retired teardown", func(waitCtx context.Context) error {
+		select {
+		case <-attempt.done:
+			return nil
+		case <-waitCtx.Done():
+			return waitCtx.Err()
+		}
+	})
+	attempt.cancel()
+	select {
+	case <-attempt.done:
+		return c.completeRetirement(retired, attempt), true
+	default:
+		return err, false
+	}
 }
 
-// reapRetirements runs only on the supervisor before registering another epoch.
-// When reconnect's join times out, the attempt may finish before a later swap.
-// Close is still waiting for supervisorDone, so only this reader can consume the
-// buffered result here; a pending result stays untouched for a later join.
+// reapRetirements only acknowledges actual completion. A publisher may remove
+// its completed producer while the supervisor is walking the registry, so use
+// a pointer snapshot rather than indices that shift after that removal.
 func (c *Client) reapRetirements() {
 	c.mu.Lock()
-	count := len(c.retirements)
+	retirements := slices.Clone(c.retirements)
 	c.mu.Unlock()
-	for index := count - 1; index >= 0; index-- {
+	for _, retired := range retirements {
 		c.mu.Lock()
-		retired := c.retirements[index]
-		wait := retired.wait
+		attempt := retired.attempt
 		c.mu.Unlock()
+		if attempt == nil {
+			continue
+		}
 		select {
-		case err := <-wait:
-			c.completeRetirement(retired, err)
-			if err != nil {
+		case <-attempt.done:
+			if err := c.completeRetirement(retired, attempt); err != nil {
 				lastResortClientLogger(c).Warn("f1 retired teardown failed", "epoch", retired.epoch, "error", err)
 			}
 		default:
@@ -611,7 +943,7 @@ func (c *Client) closeRetirements(ctx context.Context) error {
 			return nil
 		}
 		retired := c.retirements[0]
-		pending := retired.wait != nil
+		pending := retired.attempt != nil
 		c.mu.Unlock()
 		// The supervisor has exited, so it can no longer read this attempt's
 		// result. A timeout leaves the same attempt for the next Close; a
@@ -633,6 +965,15 @@ func (c *Client) closeRetirements(ctx context.Context) error {
 	}
 }
 
+// abandonForReconnect hands this runner's consumer back to the connection the
+// attempt is replacing, and is how a runner still on that connection is told
+// the generation is over. It reports the abandon to the owner and cancels the
+// generation before it runs the release, and the release itself is the
+// runner's one teardown: if the terminal drain, a lane repair or a handoff
+// claimed the consumer first, this joins that claim and reports its result
+// rather than releasing a consumer someone else already owns. The claim is
+// bounded by the caller's context and Lifecycle.CloseTimeout, which is what
+// keeps a driver that ignores its context from holding a reconnect open.
 func (r *Runner) abandonForReconnect(ctx context.Context) error {
 	r.mu.Lock()
 	if r.lifecycle != nil && r.lifecycle.State() == lifecycle.Failed {
@@ -683,6 +1024,11 @@ func (r *Runner) transitionToReconnecting() {
 // drainAfterRun releases a runner at the end of Run: it waits for in-flight
 // deliveries to leave the registry within DrainTimeout and then stops or
 // releases the consumer, bounding each teardown call by CloseTimeout.
+//
+// The stop is the runner's one consumer teardown. An abandon, a lane repair or
+// a handoff that claimed the consumer first owns it instead, and this joins
+// that claim and reports its result without touching the driver; a successful
+// join ends the runner Closed the way its own completed Stop would.
 //
 // The release runs even when the wait fails. A consumer left open past the
 // wait keeps redelivering work that nothing is settling, so the failure path

@@ -433,3 +433,228 @@ func newAttemptTestClient(t *testing.T, d *attemptDriver, c clock.Clock, extra .
 	t.Cleanup(func() { _ = client.Close(context.Background()) })
 	return client
 }
+
+// A discarded connection is still owned while its driver ignores cancellation.
+// Its close bound releases reconnect, not the raw Close or that ownership.
+func TestHungReplacementCloseKeepsSupervisorBounded(t *testing.T) {
+	fake := clock.NewFake(time.Unix(950, 0))
+	recorded := &recordingClock{Fake: fake, timerStarted: make(chan time.Duration, 32)}
+	openGate := &attemptGate{}
+	d := &attemptDriver{
+		reconnectTestDriver: &reconnectTestDriver{created: make(chan *reconnectTestConsumer, 1)},
+		gate:                openGate,
+		adminFor: func(open int) driver.Admin {
+			if open > 1 {
+				return lifecycleFailAdmin{}
+			}
+			return nil
+		},
+	}
+	client := newAttemptTestClient(t, d, recorded, WithPublishTopics("orders.created"))
+	client.reconnectRandom = func() float64 { return 1 }
+	openEntered, releaseOpen := openGate.armed()
+	t.Cleanup(releaseOpen)
+	client.mu.Lock()
+	epoch := client.current.epoch
+	client.mu.Unlock()
+	if err := client.requestReconnect(errors.New("transient"), epoch); err != nil {
+		t.Fatal(err)
+	}
+	advanceReconnect(t, recorded, 500*time.Millisecond, 1)
+	waitForSignal(t, openEntered, "replacement Open")
+	opened := d.opened()
+	if len(opened) != 2 {
+		t.Fatalf("opened %d connections, want 2", len(opened))
+	}
+	replacement := opened[1].raw
+	closeGate := &attemptGate{}
+	closeEntered, releaseClose := closeGate.armed()
+	t.Cleanup(releaseClose)
+	replacement.closeMu.Lock()
+	replacement.closeGate = closeGate
+	replacement.closeMu.Unlock()
+	releaseOpen()
+	waitForSignal(t, closeEntered, "replacement Close")
+	replacement.closeMu.Lock()
+	closeCtx := replacement.closeContext
+	replacement.closeMu.Unlock()
+	if closeCtx.Err() != nil {
+		t.Fatalf("replacement Close began cancelled: %v", closeCtx.Err())
+	}
+	waitReplacementCloseTimer(t, recorded, client.config.Lifecycle.CloseTimeout)
+	fake.Advance(client.config.Lifecycle.CloseTimeout)
+	waitReconnectCondition(t, func() bool { return recorded.sleepCount() >= 2 })
+	if !errors.Is(closeCtx.Err(), context.Canceled) {
+		t.Fatalf("replacement Close context after bound = %v, want cancellation", closeCtx.Err())
+	}
+	if replacement.closed.Load() {
+		t.Fatal("the hung replacement Close completed before its gate was released")
+	}
+	client.mu.Lock()
+	current, currentEpoch := client.current.conn, client.current.epoch
+	client.mu.Unlock()
+	if current != opened[0] || currentEpoch != epoch {
+		t.Fatal("the failed replacement was installed")
+	}
+
+	// Stop reconnect before shutdown so the bound below must join the pending
+	// raw Close, rather than merely time out waiting for the supervisor.
+	client.supervisorCancel()
+	waitForSignal(t, client.supervisorDone, "reconnect supervisor")
+	drainReplacementTimerSignals(recorded)
+	client.config.Lifecycle.ConsumerDrainTimeout = 0
+	closed := make(chan error, 1)
+	go func() { closed <- client.Close(context.Background()) }()
+	waitReplacementCloseTimer(t, recorded, client.config.Lifecycle.CloseTimeout)
+	// The supervisor barrier registers a bound even though it is already done;
+	// the next close-sized timer belongs to the pending replacement teardown.
+	waitReplacementCloseTimer(t, recorded, client.config.Lifecycle.CloseTimeout)
+	fake.Advance(client.config.Lifecycle.CloseTimeout)
+	if err := assertReturns(t, closed, "replacement shutdown"); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Close() with a pending replacement teardown = %v, want bounded deadline failure", err)
+	}
+	if got := replacement.closeCalls.Load(); got != 1 {
+		t.Fatalf("replacement raw Close calls = %d, want one pending call", got)
+	}
+	if got := opened[0].raw.closeCalls.Load(); got != 0 {
+		t.Fatalf("current raw Close calls = %d, want no teardown before the replacement", got)
+	}
+	releaseClose()
+	waitReconnectCondition(t, func() bool { return replacement.closed.Load() })
+	if err := client.Close(context.Background()); err != nil {
+		t.Fatalf("Close() after replacement teardown completed = %v", err)
+	}
+	if got := replacement.closeCalls.Load(); got != 1 {
+		t.Fatalf("replacement raw Close calls after rejoin = %d, want 1", got)
+	}
+	if got := opened[0].raw.closeCalls.Load(); got != 1 {
+		t.Fatalf("current raw Close calls after replacement finished = %d, want 1", got)
+	}
+}
+
+func TestFailedReplacementCloseIsRetriedByClientClose(t *testing.T) {
+	for _, exit := range []string{"topology-failure", "installation-refused"} {
+		t.Run(exit, func(t *testing.T) {
+			fake := clock.NewFake(time.Unix(960, 0))
+			recorded := &recordingClock{Fake: fake}
+			openGate := &attemptGate{}
+			d := &attemptDriver{
+				reconnectTestDriver: &reconnectTestDriver{created: make(chan *reconnectTestConsumer, 1)},
+				gate:                openGate,
+				adminFor: func(open int) driver.Admin {
+					if open > 1 && exit == "topology-failure" {
+						return lifecycleFailAdmin{}
+					}
+					return nil
+				},
+			}
+			client := newAttemptTestClient(t, d, recorded, WithPublishTopics("orders.created"))
+			client.reconnectRandom = func() float64 { return 1 }
+			entered, release := openGate.armed()
+			t.Cleanup(release)
+			client.mu.Lock()
+			epoch := client.current.epoch
+			client.mu.Unlock()
+			if err := client.requestReconnect(errors.New("transient"), epoch); err != nil {
+				t.Fatal(err)
+			}
+			advanceReconnect(t, recorded, 500*time.Millisecond, 1)
+			waitForSignal(t, entered, "replacement Open")
+			opened := d.opened()
+			if len(opened) != 2 {
+				t.Fatalf("opened %d connections, want 2", len(opened))
+			}
+			closeErr := errors.New("replacement close failed once")
+			var orderMu sync.Mutex
+			var order []string
+			for i, conn := range opened {
+				name := "current"
+				if i == 1 {
+					name = "replacement"
+				}
+				conn.raw.closeMu.Lock()
+				conn.raw.closeHook = func() {
+					orderMu.Lock()
+					order = append(order, name)
+					orderMu.Unlock()
+				}
+				conn.raw.closeMu.Unlock()
+			}
+			replacement := opened[1].raw
+			replacement.closeMu.Lock()
+			replacement.closeFailures = 1
+			replacement.closeErr = closeErr
+			replacement.closeMu.Unlock()
+			if exit == "installation-refused" {
+				// A cancelled caller leaves shutdown retryable while Open remains
+				// in the driver. The late connection must not be installed.
+				ctx, cancel := context.WithCancel(context.Background())
+				t.Cleanup(cancel)
+				closed := make(chan error, 1)
+				go func() { closed <- client.Close(ctx) }()
+				waitReconnectCondition(t, func() bool {
+					client.mu.Lock()
+					defer client.mu.Unlock()
+					return client.lifecycleLocked() != lifecycle.Ready
+				})
+				cancel()
+				if err := assertReturns(t, closed, "replacement shutdown"); err == nil {
+					t.Fatal("Close() cancelled while Open was held = nil")
+				}
+			}
+			release()
+			if exit == "topology-failure" {
+				waitReconnectCondition(t, func() bool { return recorded.sleepCount() >= 2 })
+				client.supervisorCancel()
+			}
+			waitForSignal(t, client.supervisorDone, "reconnect supervisor")
+			if got := replacement.closeCalls.Load(); got != 1 || replacement.closed.Load() {
+				t.Fatalf("replacement after rollback: Close calls = %d, closed = %t; want one failed call", got, replacement.closed.Load())
+			}
+			client.mu.Lock()
+			current, currentEpoch := client.current.conn, client.current.epoch
+			client.mu.Unlock()
+			if current != opened[0] || currentEpoch != epoch {
+				t.Fatal("the discarded replacement changed the original epoch")
+			}
+			if err := client.Close(context.Background()); err != nil {
+				t.Fatalf("Close() retrying replacement teardown = %v", err)
+			}
+			if !replacement.closed.Load() || replacement.closeCalls.Load() != 2 {
+				t.Fatalf("replacement after Client.Close: closed = %t, calls = %d; want closed after two calls", replacement.closed.Load(), replacement.closeCalls.Load())
+			}
+			orderMu.Lock()
+			gotOrder := strings.Join(order, ",")
+			orderMu.Unlock()
+			if gotOrder != "replacement,replacement,current" {
+				t.Fatalf("Close order = %q, want replacement,replacement,current", gotOrder)
+			}
+		})
+	}
+}
+
+func waitReplacementCloseTimer(t *testing.T, recorded *recordingClock, duration time.Duration) {
+	t.Helper()
+	timer := clock.NewReal().Timer(2 * time.Second)
+	defer timer.Stop()
+	for {
+		select {
+		case got := <-recorded.timerStarted:
+			if got == duration {
+				return
+			}
+		case <-timer.C:
+			t.Fatalf("replacement Close did not register its %v bound", duration)
+		}
+	}
+}
+
+func drainReplacementTimerSignals(recorded *recordingClock) {
+	for {
+		select {
+		case <-recorded.timerStarted:
+		default:
+			return
+		}
+	}
+}

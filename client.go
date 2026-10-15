@@ -8,6 +8,7 @@ import (
 	"maps"
 	"math/rand/v2"
 	"slices"
+	"strings"
 	"sync"
 	"time"
 
@@ -145,6 +146,17 @@ type Client struct {
 	// means the attempt ended and the connection state is what it is.
 	attemptEnded chan struct{}
 
+	// retirementWake is how an entry appended to retirements, or an attempt
+	// that just failed, tells the retirement retry loop to look. It is a cap-1
+	// channel used as a level trigger: a signal already pending is dropped
+	// rather than blocking a caller under mu. It is guarded by mu like the
+	// list it announces.
+	retirementWake chan struct{}
+	// retirementLoopDone is closed when the retirement retry loop returns. The
+	// loop returns as soon as the supervisor context is cancelled, which is
+	// the first thing Close does, so Close's waitForSupervisor joins it.
+	retirementLoopDone chan struct{}
+
 	// producerCloseWait holds a still-running producer Close call from a
 	// prior Close attempt that did not return within its close timeout. A
 	// retried Close rejoins this same call instead of starting a second one
@@ -164,6 +176,9 @@ type Client struct {
 // New applies opts, normalizes and validates cfg, and opens the supplied driver
 // before returning. Startup errors are returned before any publish or subscribe
 // call. Env and Service remain required for hand-built configurations.
+// If topology setup fails after Open, New waits for rollback success, failure,
+// or Lifecycle.CloseTimeout and joins the setup and rollback errors. Rollback
+// ignores caller cancellation; a timed-out driver call may still be running.
 //
 // If the configured observer implements [ObserverBinder], New binds it after
 // validation and before opening the driver. A refused binding fails New with
@@ -259,6 +274,8 @@ func New(ctx context.Context, cfg Config, opts ...Option) (*Client, error) {
 		supervisorCancel:    supervisorCancel,
 		supervisorDone:      make(chan struct{}),
 		attemptEnded:        make(chan struct{}),
+		retirementWake:      make(chan struct{}, 1),
+		retirementLoopDone:  make(chan struct{}),
 		runners:             make(map[*Runner]struct{}),
 		observerUnbind:      observerUnbind,
 	}
@@ -283,7 +300,7 @@ func New(ctx context.Context, cfg Config, opts ...Option) (*Client, error) {
 	logCapabilities(client)
 	if err := client.ensurePublisherTopology(ctx); err != nil {
 		supervisorCancel()
-		closeErr := connection.Close(ctx)
+		closeErr := runWithClockTimeout(context.WithoutCancel(ctx), options.clock, cfg.Lifecycle.CloseTimeout, "close", connection.Close)
 		return nil, errors.Join(err, closeErr)
 	}
 	if client.observer != nil {
@@ -297,6 +314,7 @@ func New(ctx context.Context, cfg Config, opts ...Option) (*Client, error) {
 		})
 	}
 	go client.reconnectSupervisor()
+	go client.retirementRetryLoop()
 	constructed = true
 	return client, nil
 }
@@ -463,6 +481,67 @@ func failedRunnerHealthLocked(c *Client) error {
 	return errors.Join(errs...)
 }
 
+// Ready reports whether the client is ready to receive traffic. It is the
+// readiness probe: Ready returns nil only when Health returns nil and every
+// registered subscription's runner has started Run and admitted a consumer.
+// Otherwise it returns an error naming the subscriptions that are not
+// consuming, joined with Health's error when the client is also unhealthy.
+// A nil Client returns an error, like Health.
+//
+// Ready is not Health. Health is the liveness probe: it answers whether the
+// client still takes work and whether a subscription has stopped, so a client
+// whose runner has not opened its consumer yet, and one whose runner is
+// reconnecting, are live. Ready is the stricter question a load balancer asks
+// before it routes traffic, and it turns not-ready again for as long as a
+// runner has no admitted consumer, a reconnect included. A client with no
+// registered subscriptions is ready as soon as Health is.
+func (c *Client) Ready(ctx context.Context) error {
+	if c == nil {
+		return fmt.Errorf("f1: client is not connected")
+	}
+	// Both answers are needed: a connection that pings says nothing about a
+	// consumer that has not attached, and a consuming runner says nothing
+	// about a connection that stopped answering. Join reports whichever
+	// failed, with the subscriptions named in the text.
+	return errors.Join(c.notConsuming(), c.Health(ctx))
+}
+
+// notConsuming returns one error per registered subscription whose runner has
+// not admitted a consumer. Names are ordered so the text does not depend on map
+// order. A runner that has not started Run has no lifecycle yet, and it is
+// reported as not started rather than as a state it never entered.
+func (c *Client) notConsuming() error {
+	type subscriptionState struct {
+		name  string
+		state string
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	pending := make([]subscriptionState, 0, len(c.runners))
+	for runner := range c.runners {
+		runner.mu.Lock()
+		life := runner.lifecycle
+		runner.mu.Unlock()
+		if life != nil && life.State() == lifecycle.Ready {
+			continue
+		}
+		state := "not started"
+		if life != nil {
+			state = life.State().String()
+		}
+		pending = append(pending, subscriptionState{name: runner.subscription.Name, state: state})
+	}
+	if len(pending) == 0 {
+		return nil
+	}
+	slices.SortFunc(pending, func(a, b subscriptionState) int { return strings.Compare(a.name, b.name) })
+	errs := make([]error, 0, len(pending))
+	for _, subscription := range pending {
+		errs = append(errs, fmt.Errorf("f1: subscription %s is not consuming (lifecycle %s)", subscription.name, subscription.state))
+	}
+	return errors.Join(errs...)
+}
+
 // recordFailedSubscription records err against the subscription name, owned by
 // the runner that observed it. A name that is already recorded has its error
 // and owner replaced in place, so the early record taken at a fatal consumer
@@ -543,6 +622,9 @@ func (c *Client) clearFailedSubscription(name string) {
 // Each wait is bounded by Lifecycle.CloseTimeout and ctx; multiple retirements
 // can make total shutdown exceed one CloseTimeout. A retirement error or timeout
 // leaves unfinished resources owned and stops shutdown before current teardown.
+// Discarded producers remain owned on failure and are retried before their
+// parent connection. A producer returned after terminal Close receives bounded
+// cleanup only; its failure is logged without reopening the closed Client.
 // A current producer-close error is returned but does not prevent current
 // connection shutdown. A current connection-close error leaves the Client
 // retryable. A concurrent call returns an error while shutdown is in progress.
@@ -579,6 +661,9 @@ func (c *Client) Close(ctx context.Context) error {
 // waitForSupervisor transfers retirement ownership to Close. If the supervisor
 // timed out joining an old teardown, it may still be running, but after this
 // barrier no reconnect waiter can consume its result or register another one.
+// The retirement retry loop is joined here too: it returns when the supervisor
+// context is cancelled, which beginClose did, so the barrier is also where its
+// ownership of the retirements ends.
 func (c *Client) waitForSupervisor(ctx context.Context) error {
 	if c.supervisorDone == nil {
 		return nil
@@ -586,6 +671,11 @@ func (c *Client) waitForSupervisor(ctx context.Context) error {
 	return runWithClockTimeout(ctx, c.options.clock, c.config.Lifecycle.CloseTimeout, "reconnect", func(waitCtx context.Context) error {
 		select {
 		case <-c.supervisorDone:
+		case <-waitCtx.Done():
+			return waitCtx.Err()
+		}
+		select {
+		case <-c.retirementLoopDone:
 			return nil
 		case <-waitCtx.Done():
 			return waitCtx.Err()
@@ -981,10 +1071,10 @@ func (c *Client) sharedProducer(ctx context.Context, kind workKind, claim uint64
 	}
 	c.mu.Unlock()
 	if loser != nil {
-		closeDiscardedProducer(c, loser, ctx)
+		closeDiscardedProducer(c, loser, epoch, ctx)
 	}
 	if err != nil {
-		closeDiscardedProducer(c, built, ctx)
+		closeDiscardedProducer(c, built, epoch, ctx)
 		return producerResult{epoch: epoch, refused: err}
 	}
 	return producerResult{producer: producer, epoch: epoch}
@@ -1014,11 +1104,30 @@ func publishMessages(c *Client, ctx context.Context, messages ...driver.Outbound
 	return err
 }
 
-func closeDiscardedProducer(c *Client, producer driver.Producer, ctx context.Context) {
+func closeDiscardedProducer(c *Client, producer driver.Producer, epoch uint64, ctx context.Context) {
 	if producer == nil {
 		return
 	}
-	if err := runWithClockTimeout(context.WithoutCancel(ctx), c.options.clock, c.config.Lifecycle.CloseTimeout, "close", producer.Close); err != nil {
+	c.mu.Lock()
+	closed := c.lifecycleLocked() == lifecycle.Closed
+	var retired *retiredConnection
+	if !closed {
+		retired = &retiredConnection{epoch: epoch, producer: producer}
+		c.retirements = append(c.retirements, retired)
+		c.retirementWakeLocked()
+	}
+	c.mu.Unlock()
+	if closed {
+		// Close can finish while an uncounted core producer build is still at
+		// the driver. Its late result has no live owner to retry it; preserve
+		// bounded cleanup and logging rather than reopening the closed client.
+		if err := runWithClockTimeout(context.WithoutCancel(ctx), c.options.clock, c.config.Lifecycle.CloseTimeout, "close", producer.Close); err != nil {
+			lastResortClientLogger(c).Warn("f1 discarded producer close failed", "error", err)
+		}
+		return
+	}
+	c.startRetirement(context.WithoutCancel(ctx), retired)
+	if err, _ := c.joinRetirement(context.WithoutCancel(ctx), retired); err != nil {
 		lastResortClientLogger(c).Warn("f1 discarded producer close failed", "error", err)
 	}
 }
