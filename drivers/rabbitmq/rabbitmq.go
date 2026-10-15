@@ -298,10 +298,11 @@ type conn struct {
 	detachMu   sync.Mutex
 	detaching  bool
 	detachDone chan struct{}
-	// detachWatch owns channel opens and closes that outlive their callers,
-	// publish watchers, and deferred confirmation releases. The latter two
-	// still register outside detachMu; they must not be assumed to obey the
-	// channel-work registration gate.
+	// A producer Close can time out and remove itself while Publish is still
+	// resolving confirmations. Conn.Close then seals registration and starts
+	// Wait; if Publish adds a release worker while the last worker calls Done,
+	// Wait can panic or return without joining it. startDetached gates every
+	// registration against that seal, including channel work and watchers.
 	detachWatch sync.WaitGroup
 }
 
@@ -342,6 +343,18 @@ func (s *blockedState) message() string {
 // would leave a healthy connection looking blocked for good.
 const blockedEventBuffer = 4
 
+// startDetached refuses work once shutdown has sealed registration. Callers
+// must either refuse their operation or finish it inline on the closed transport.
+func (c *conn) startDetached(work func()) bool {
+	c.detachMu.Lock()
+	defer c.detachMu.Unlock()
+	if c.detaching {
+		return false
+	}
+	c.detachWatch.Go(work)
+	return true
+}
+
 // startChannelClose begins closing channel on a goroutine of its own and
 // returns the channel its outcome arrives on. The close runs off the caller's
 // goroutine because amqp091's Channel.Close waits for close-ok, a round trip a
@@ -360,26 +373,17 @@ func (c *conn) startChannelClose(channel *amqp.Channel) <-chan error {
 // waiting for the detached work.
 func (c *conn) startChannelCloseWithFinish(closeFn func() error, finish func(error)) <-chan error {
 	done := make(chan error, 1)
-	c.detachMu.Lock()
-	if c.detaching {
-		c.detachMu.Unlock()
+	work := func() {
 		err := closeFn()
 		if finish != nil {
 			finish(err)
 		}
 		done <- err
-		return done
 	}
-	c.detachWatch.Add(1)
-	c.detachMu.Unlock()
-	go func() {
-		defer c.detachWatch.Done()
-		err := closeFn()
-		if finish != nil {
-			finish(err)
-		}
-		done <- err
-	}()
+	// After transport shutdown a channel close cannot wait for a broker reply.
+	if !c.startDetached(work) {
+		work()
+	}
 	return done
 }
 
@@ -435,19 +439,8 @@ func (c *conn) openChannel(ctx context.Context) (*amqp.Channel, error) {
 		return nil, err
 	}
 	raw := c.amqp
-	c.detachMu.Lock()
-	if c.detaching {
-		c.detachMu.Unlock()
-		c.mu.RUnlock()
-		return nil, amqp.ErrClosed
-	}
-	c.detachWatch.Add(1)
-	c.detachMu.Unlock()
-	c.mu.RUnlock()
-
 	result := make(chan channelOpenResult)
-	go func() {
-		defer c.detachWatch.Done()
+	started := c.startDetached(func() {
 		channel, err := raw.Channel()
 		if err == nil {
 			c.mu.RLock()
@@ -467,7 +460,12 @@ func (c *conn) openChannel(ctx context.Context) (*amqp.Channel, error) {
 				_ = channel.Close()
 			}
 		}
-	}()
+	})
+	c.mu.RUnlock()
+	// An open cannot acquire a usable channel after transport shutdown.
+	if !started {
+		return nil, amqp.ErrClosed
+	}
 
 	select {
 	case opened := <-result:
