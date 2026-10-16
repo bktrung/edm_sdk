@@ -11,12 +11,68 @@ import (
 	"net"
 	"strings"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	amqp "github.com/rabbitmq/amqp091-go"
 
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/driver"
 )
+
+func TestDetachedWorkAfterShutdownRunsInline(t *testing.T) {
+	for _, name := range []string{"channel close", "publish watcher", "confirmation release"} {
+		t.Run(name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				c := &conn{}
+				if err := c.waitDetached(context.Background()); err != nil {
+					t.Fatal(err)
+				}
+				release := make(chan struct{})
+				defer close(release)
+				returned := make(chan struct{})
+				finished := make(chan struct{})
+				go func() {
+					switch name {
+					case "channel close":
+						c.startChannelCloseWithFinish(func() error {
+							<-release
+							return nil
+						}, func(error) { close(finished) })
+					case "publish watcher":
+						returns := make(chan amqp.Return)
+						go func() {
+							<-release
+							close(returns)
+						}()
+						w := startPublishWatcher(c, returns, nil)
+						go func() {
+							<-w.done
+							close(finished)
+						}()
+					case "confirmation release":
+						w := &publishWatcher{done: make(chan struct{})}
+						close(w.done)
+						channel := &publishChannel{watcher: w}
+						channel.releaseWhenResolved(c, nil, []publishConfirmation{&fakeConfirmation{done: release}})
+						close(finished)
+					}
+					close(returned)
+				}()
+				synctest.Wait()
+				select {
+				case <-returned:
+					t.Fatal("late detached work returned before completing inline")
+				default:
+				}
+				// The deferred release lets inline cleanup and its caller finish.
+				t.Cleanup(func() {
+					<-returned
+					<-finished
+				})
+			})
+		})
+	}
+}
 
 func TestDriverCapabilities(t *testing.T) {
 	caps := Driver{}.Capabilities()

@@ -485,6 +485,103 @@ func TestCloseDrainsRunnerBeforeWaitingForPublishIdle(t *testing.T) {
 	runFinished.Store(true)
 }
 
+func TestSourceFailureTakesPrecedenceOverConsumerReport(t *testing.T) {
+	release := make(chan struct{})
+	consumer := &ownerPanicMessagesConsumer{ownerProbeConsumer: newOwnerProbeConsumer(), release: release}
+	recorder := newErrorHandlerRecorder()
+	client, err := New(context.Background(), testClientConfig(t),
+		WithDriver(&ownerProbeDriver{conn: &ownerProbeConn{consumer: consumer, producer: &dispatchProducer{}}}),
+		withClock(clock.NewFake(time.Unix(0, 0))), WithErrorHandler(recorder.handle))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = client.Close(context.Background()) })
+	runner, err := client.Subscribe(context.Background(), ownerProbeSubscription())
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	var runErr error
+	go func() {
+		runErr = runner.Run(ctx)
+		close(done)
+	}()
+	var unblock sync.Once
+	t.Cleanup(func() {
+		unblock.Do(func() { close(release) })
+		cancel()
+		select {
+		case <-done:
+		case <-clock.NewReal().Timer(2 * time.Second).C:
+			t.Error("runner did not stop")
+		}
+	})
+	waitOwnerReady(t, runner)
+	report := &driver.Error{Driver: "owner-probe", Op: "consumer", K: driver.KindNotFound, Err: errors.New("destination missing")}
+	consumer.errors <- report
+	recorder.waitForCall(t, time.Second)
+	unblock.Do(func() { close(release) })
+	select {
+	case <-done:
+	case <-clock.NewReal().Timer(2 * time.Second).C:
+		t.Fatal("source panic did not stop the runner")
+	}
+	if runErr == nil || !strings.Contains(runErr.Error(), "owner test: messages channel is not available") || errors.Is(runErr, report) {
+		t.Fatalf("Run() = %v, want the source panic rather than the consumer report", runErr)
+	}
+	if healthErr := client.Health(context.Background()); !errors.Is(healthErr, runErr) || errors.Is(healthErr, report) {
+		t.Fatalf("Health() = %v, want source failure %v without consumer report", healthErr, runErr)
+	}
+}
+
+func TestConsumerReportBelongsToGeneration(t *testing.T) {
+	for _, kind := range []driver.Kind{driver.KindNotFound, driver.KindTooLarge, driver.KindPermission} {
+		for _, ending := range []string{"live", "repaired-drain", "repaired-close"} {
+			t.Run(kind.String()+"/"+ending, func(t *testing.T) {
+				repaired := ending != "live"
+				d := &laneRepairDriver{created: make(chan *laneRepairConsumer, 8)}
+				recorder := newErrorHandlerRecorder()
+				client, err := New(context.Background(), testClientConfig(t), WithDriver(d),
+					withClock(clock.NewFake(time.Unix(940, 0))), WithErrorHandler(recorder.handle))
+				if err != nil {
+					t.Fatal(err)
+				}
+				t.Cleanup(func() { _ = client.Close(context.Background()) })
+				var handled atomic.Int32
+				runner, _ := startLaneRunner(t, client, laneRepairSubscription("orders", &handled))
+				consumer := waitLaneConsumer(t, d, "orders")
+				report := &driver.Error{Driver: d.Name(), Op: "consumer", K: kind, Err: errors.New("consumer report")}
+				consumer.sendError(report)
+				recorder.waitForCall(t, time.Second)
+				recorder.mu.Lock()
+				received := recorder.calls[0].err
+				recorder.mu.Unlock()
+				if !errors.Is(received, report) {
+					t.Fatalf("error handler received %v, want original %v", received, report)
+				}
+				if repaired {
+					consumer.sendError(transientLaneError(d))
+					replacement := waitLaneConsumer(t, d, "orders")
+					replacement.send(laneRepairMessage(t, "after-repair", "orders.created"))
+					waitAtomicCount(t, &handled, 1)
+				}
+				if ending == "repaired-close" {
+					if err := client.Close(context.Background()); err != nil {
+						t.Errorf("Close() after repair = %v", err)
+					}
+				}
+				if err := runner.Drain(context.Background()); (repaired && err != nil) || (!repaired && !errors.Is(err, report)) {
+					t.Errorf("Drain() = %v, repaired = %t", err, repaired)
+				}
+				if err := client.Close(context.Background()); err != nil {
+					t.Errorf("Close() = %v", err)
+				}
+			})
+		}
+	}
+}
+
 func TestRunnerRepairsConsumerWithoutReplacingConnection(t *testing.T) {
 	defaultOutput := captureProcessDefault(t)
 	d := &laneRepairDriver{created: make(chan *laneRepairConsumer, 16)}

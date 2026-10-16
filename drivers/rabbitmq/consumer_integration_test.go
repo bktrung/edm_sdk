@@ -8,6 +8,8 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net/http"
+	"net/url"
 	"os"
 	"strings"
 	"sync"
@@ -1376,5 +1378,157 @@ func TestReleaseRacingDrainCancellationAlwaysReturns(t *testing.T) {
 		case <-time.After(5 * time.Second): //nolint:forbidigo // bound Drain after Release
 			t.Fatalf("round %d: Drain did not return after Release", round)
 		}
+	}
+}
+
+// TestConsumerLaneCloseMeasurements records broker events separately from the
+// driver's watchers so a cancel already processed by watchCancel is not missed.
+func TestConsumerLaneCloseMeasurements(t *testing.T) {
+	requireBroker(t)
+	for _, candidate := range []string{"delete_queue", "delete_then_ack", "delete_then_qos", "revoke_read", "revoke_read_then_delete", "delete_user"} {
+		t.Run(candidate, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+			defer cancel()
+			name := fmt.Sprintf("lane-measure.%d.%d", os.Getpid(), rabbitReconnectSequence.Add(1))
+			guest, err := newManagementClient(defaultEndpoint, driver.Config{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			userPath := "/api/users/" + name
+			permissionPath := "/api/permissions/" + url.PathEscape(guest.vhost) + "/" + name
+			t.Cleanup(func() {
+				managementRequest(t, guest, http.MethodDelete, userPath, "")
+				managementRequest(t, guest, http.MethodDelete, "/api/queues/"+url.PathEscape(guest.vhost)+"/"+name, "")
+			})
+			managementRequest(t, guest, http.MethodPut, userPath, `{"password":"lane-measure","tags":""}`)
+			managementRequest(t, guest, http.MethodPut, permissionPath, `{"configure":".*","write":".*","read":".*"}`)
+			raw := rabbitRawChannel(t)
+			if _, err := raw.QueueDeclare(name, true, false, false, false, amqp.Table{"x-queue-type": "quorum"}); err != nil {
+				t.Fatal(err)
+			}
+			endpoint, err := url.Parse(defaultEndpoint)
+			if err != nil {
+				t.Fatal(err)
+			}
+			endpoint.User = url.UserPassword(name, "lane-measure")
+			connection, err := (Driver{}).Open(ctx, driver.Config{Endpoints: []string{endpoint.String()}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = connection.Close(context.Background()) })
+			sdkConsumer, err := connection.Consumer(ctx, driver.ConsumerConfig{Destinations: []string{name}, Prefetch: 1})
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = sdkConsumer.Release(context.Background()) })
+			built := sdkConsumer.(*consumer)
+			lane := built.lanes[0]
+			cancels := lane.channel.NotifyCancel(make(chan string, 1))
+			closes := lane.channel.NotifyClose(make(chan *amqp.Error, 1))
+			publish := func(body string) driver.InboundMessage {
+				t.Helper()
+				if err := raw.PublishWithContext(ctx, "", name, false, false, amqp.Publishing{Body: []byte(body)}); err != nil {
+					t.Fatal(err)
+				}
+				select {
+				case message := <-sdkConsumer.Messages():
+					if string(message.Body) != body {
+						t.Fatalf("delivery = %q, want %q", message.Body, body)
+					}
+					return message
+				case <-ctx.Done():
+					t.Fatal("lane did not deliver")
+					return driver.InboundMessage{}
+				}
+			}
+			message := publish("before")
+			// Block re-Consume until deletion and the optional settlement/Qos
+			// have finished. Otherwise its 404 can obscure those operations.
+			lane.channelMu.Lock()
+			locked := true
+			defer func() {
+				if locked {
+					lane.channelMu.Unlock()
+				}
+			}()
+			if strings.HasPrefix(candidate, "revoke_read") {
+				managementRequest(t, guest, http.MethodPut, permissionPath, `{"configure":".*","write":".*","read":"^$"}`)
+			}
+			if strings.HasPrefix(candidate, "delete_") && candidate != "delete_user" || candidate == "revoke_read_then_delete" {
+				if _, err := raw.QueueDelete(name, false, false, false); err != nil {
+					t.Fatal(err)
+				}
+			}
+			switch candidate {
+			case "delete_then_ack":
+				if err := message.Settle.Ack(ctx); err != nil {
+					t.Fatalf("Ack after deletion: %v", err)
+				}
+			case "delete_then_qos":
+				if err := lane.channel.Qos(1, 0, false); err != nil {
+					t.Fatalf("Qos after deletion: %v", err)
+				}
+			case "delete_user":
+				managementRequest(t, guest, http.MethodDelete, userPath, "")
+			case "revoke_read":
+				if err := message.Settle.Ack(ctx); err != nil {
+					t.Fatal(err)
+				}
+				if err := lane.channel.Qos(1, 0, false); err != nil {
+					t.Fatal(err)
+				}
+				if err := publish("after").Settle.Ack(ctx); err != nil {
+					t.Fatal(err)
+				}
+			}
+			lane.channelMu.Unlock()
+			locked = false
+			if candidate == "revoke_read" {
+				select {
+				case event := <-closes:
+					t.Fatalf("read revocation closed the channel: %v", event)
+				case tag := <-cancels:
+					t.Fatalf("read revocation cancelled the consumer: %q", tag)
+				case <-time.After(300 * time.Millisecond): //nolint:forbidigo // bounded live-broker observation after positive delivery control
+				}
+				t.Log("cancel_first=false close=none lane=continues delivering after read revocation; Ack and Qos succeeded")
+				return
+			}
+			var closeErr *amqp.Error
+			select {
+			case closeErr = <-closes:
+			case <-ctx.Done():
+				t.Fatal("no channel close")
+			}
+			if closeErr == nil {
+				t.Fatal("channel closed without broker diagnostic")
+			}
+			// NotifyCancel is buffered before the action. amqp091 dispatches
+			// it synchronously, so a value after NotifyClose proves the cancel
+			// was received before shutdown, independent of watcher scheduling.
+			tag, cancelled := <-cancels
+			cancelled = cancelled && tag != ""
+			wantCode := 404
+			if candidate == "delete_user" {
+				wantCode = 320
+			}
+			if closeErr.Code != wantCode || cancelled != (candidate != "delete_user") {
+				t.Fatalf("cancel_first=%t close=%v, want cancel_first=%t code=%d", cancelled, closeErr, candidate != "delete_user", wantCode)
+			}
+			var recovery error
+			for recovery == nil {
+				report := receiveRabbitConsumerError(ctx, sdkConsumer)
+				if report == nil {
+					t.Fatal("no generation-ending lane report")
+				}
+				if kind, ok := driver.Classify(report); ok && kind == driver.KindTransient {
+					recovery = report
+				}
+			}
+			if !strings.Contains(recovery.Error(), closeErr.Reason) {
+				t.Fatalf("recovery report %v lost broker text %q", recovery, closeErr.Reason)
+			}
+			t.Logf("cancel_first=%t close=%d text=%q lane=reports transient recovery: %v", cancelled, closeErr.Code, closeErr.Reason, recovery)
+		})
 	}
 }
