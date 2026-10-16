@@ -113,7 +113,10 @@ func TestRabbitMQBacklogClassicReportsHead(t *testing.T) {
 	const destination = "rabbitmq-driver-backlog-classic"
 	connection, channel := openBacklogFixture(t, queueKindClassic, destination)
 	consumer := backlogTestConsumer(connection, destination)
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	// RabbitMQ's management statistics refresh every 5 seconds by default, and
+	// head_message_timestamp can remain zero through two refreshes after publish.
+	// Three intervals leave room for that broker-side lag without hiding a real failure.
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 
 	first := time.Date(2026, time.January, 2, 3, 4, 5, 678_000_000, time.UTC)
