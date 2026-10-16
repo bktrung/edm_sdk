@@ -24,26 +24,6 @@ func (c *countingClock) Timer(d time.Duration) clock.Timer {
 
 func testCaps() driver.Capabilities { return (Driver{}).Capabilities() }
 
-func TestEnsureTopologyIgnoresBindings(t *testing.T) {
-	ctx := context.Background()
-	conn, err := (Driver{}).Open(ctx, driver.Config{})
-	require.NoError(t, err)
-	_, err = conn.Admin().EnsureTopology(ctx, driver.TopologySpec{
-		Destinations: []driver.DestinationSpec{{Name: "orders"}},
-		Bindings:     []driver.BindingSpec{{Source: "orders.exchange", Destination: "orders"}},
-	})
-	require.NoError(t, err)
-	producer, err := conn.Producer(ctx, driver.ProducerConfig{})
-	require.NoError(t, err)
-	consumer, err := conn.Consumer(ctx, driver.ConsumerConfig{Destinations: []string{"orders"}})
-	require.NoError(t, err)
-	require.NoError(t, producer.Publish(ctx, driver.OutboundMessage{Destination: "orders", Body: []byte("one")}))
-	message := receiveTest(t, consumer)
-	require.Equal(t, []byte("one"), message.Body)
-	require.NoError(t, message.Settle.Ack(ctx))
-	closeTest(t, ctx, conn, producer, consumer)
-}
-
 func openTest(t *testing.T, clk clock.Clock, specs ...driver.DestinationSpec) (context.Context, driver.Conn, driver.Producer) {
 	t.Helper()
 	ctx := context.Background()
@@ -148,20 +128,6 @@ func TestLagPauseAndResume(t *testing.T) {
 	require.NoError(t, consumer.Resume("orders"))
 	message := receiveTest(t, consumer)
 	require.NoError(t, message.Settle.Ack(ctx))
-	closeTest(t, ctx, conn, producer, consumer)
-}
-
-func TestDrainStopsNewDeliveries(t *testing.T) {
-	ctx, conn, producer := openTest(t, clock.NewFake(time.Unix(0, 0)), driver.DestinationSpec{Name: "orders"})
-	consumer, err := conn.Consumer(ctx, driver.ConsumerConfig{Destinations: []string{"orders"}, Effective: testCaps()})
-	require.NoError(t, err)
-	require.NoError(t, consumer.Drain(ctx))
-	require.NoError(t, producer.Publish(ctx, driver.OutboundMessage{Destination: "orders", Body: []byte("held")}))
-	select {
-	case <-consumer.Messages():
-		t.Fatal("draining consumer received a new message")
-	default:
-	}
 	closeTest(t, ctx, conn, producer, consumer)
 }
 

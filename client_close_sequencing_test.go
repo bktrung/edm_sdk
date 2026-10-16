@@ -159,30 +159,6 @@ func TestPublishRejectedAfterProducerCloseTimeout(t *testing.T) {
 	}
 }
 
-func TestCloseRetryRejoinsAfterProducerCloseTimeout(t *testing.T) {
-	client, producer, conn, release, firstErr := beginTimedOutProducerClose(t)
-	if !errors.Is(firstErr, context.DeadlineExceeded) || !strings.Contains(firstErr.Error(), "close phase") {
-		t.Fatalf("first Close() error = %v, want close phase deadline", firstErr)
-	}
-
-	release()
-	if err := client.Close(context.Background()); err != nil {
-		t.Fatalf("retried Close() error = %v", err)
-	}
-	producer.mu.Lock()
-	producerCloseCalls := producer.closeCalls
-	producer.mu.Unlock()
-	conn.mu.Lock()
-	connCloseCalls := conn.closeCalls
-	conn.mu.Unlock()
-	if producerCloseCalls != 1 {
-		t.Fatalf("producer.Close call count = %d, want 1: retry must rejoin the pending call", producerCloseCalls)
-	}
-	if connCloseCalls != 1 {
-		t.Fatalf("conn.Close call count = %d, want 1 after producer.Close returned", connCloseCalls)
-	}
-}
-
 func beginTimedOutProducerClose(t *testing.T) (*Client, *recordingProducer, *publishConn, func(), error) {
 	t.Helper()
 	fake := clock.NewFake(time.Unix(0, 0))

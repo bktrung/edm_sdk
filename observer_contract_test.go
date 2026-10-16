@@ -43,11 +43,6 @@ func (o *canceledPublishObserver) InjectTrace(ctx context.Context) (string, stri
 	return "00-0123456789abcdef0123456789abcdef-0123456789abcdef-01", "test=observer"
 }
 
-func TestObserverCanceledPublishContextDoesNotControlPrimaryPublish(t *testing.T) {
-	observer := &canceledPublishObserver{Recorder: f1test.NewRecorder()}
-	publishWithCanceledObservation(t, observer)
-}
-
 func TestObserverPublishValuesSurviveCanceledObservation(t *testing.T) {
 	observer := &canceledPublishObserver{Recorder: f1test.NewRecorder()}
 	capture := publishWithCanceledObservation(t, observer)

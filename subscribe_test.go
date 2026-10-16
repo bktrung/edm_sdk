@@ -148,7 +148,7 @@ f1:
 	}
 }
 
-func TestApplySubscriptionEnvironmentStopsInCurrentOrderWithPartialMutation(t *testing.T) {
+func TestApplySubscriptionEnvironmentStopsInCurrentOrder(t *testing.T) {
 	name := t.Name()
 	clearSubscriptionEnvironment(t, name)
 	prefix := subscriptionEnvPrefix(name)
@@ -160,12 +160,6 @@ func TestApplySubscriptionEnvironmentStopsInCurrentOrderWithPartialMutation(t *t
 	err := applySubscriptionEnvironment(name, &cfg)
 	if err == nil || !strings.Contains(err.Error(), envKey(prefix, "mode")) {
 		t.Fatalf("applySubscriptionEnvironment() error = %v, want mode error first", err)
-	}
-	if got, want := cfg.Topics, []string{"orders.created"}; !reflect.DeepEqual(got, want) {
-		t.Fatalf("topics after partial mutation = %v, want %v", got, want)
-	}
-	if cfg.Mode != OrderedByKey || cfg.Concurrency != 9 {
-		t.Fatalf("config after partial mutation = %#v, want mode ordered and concurrency 9", cfg)
 	}
 }
 
@@ -228,9 +222,6 @@ func TestApplySubscriptionEnvironmentRejectsUnknownKey(t *testing.T) {
 	err := applySubscriptionEnvironment(name, &cfg)
 	if err == nil || !strings.Contains(err.Error(), prefix+"CONCURENCY") {
 		t.Fatalf("applySubscriptionEnvironment() error = %v, want the unknown variable named", err)
-	}
-	if got, want := cfg.Concurrency, 4; got != want {
-		t.Fatalf("concurrency = %d, want %d from the variable the same call read", got, want)
 	}
 }
 

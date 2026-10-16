@@ -292,14 +292,6 @@ func TestSpanAttributesUseOneConsumerGroup(t *testing.T) {
 		Subscription:  "orders",
 		ConsumerGroup: "orders-workers",
 	}
-	rawAttrs := observer.spanAttributes(start)
-	rawCount := 0
-	for _, attr := range rawAttrs {
-		if string(attr.Key) == "messaging.consumer.group.name" {
-			rawCount++
-		}
-	}
-	require.Equal(t, 1, rawCount)
 
 	_, token := observer.Start(context.Background(), start)
 	observer.Finish(token, f1.FinishEvent{

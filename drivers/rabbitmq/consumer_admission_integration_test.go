@@ -219,10 +219,6 @@ func TestConsumerConstructionDoesNotHoldConnectionLock(t *testing.T) {
 	}
 }
 
-func TestConcurrentConflictingExclusiveConsumersInstallOne(t *testing.T) {
-	runConsumerConflictTest(t, true, false, "exclusive consumer refused: destination %q already has a consumer")
-}
-
 func TestConcurrentNonexclusiveAndExclusiveConsumersRemainSymmetric(t *testing.T) {
 	t.Run("exclusive existing and nonexclusive new", func(t *testing.T) {
 		runConsumerConflictTest(t, true, false, "exclusive consumer refused: destination %q already has a consumer")

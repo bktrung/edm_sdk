@@ -18,7 +18,6 @@ type successorRecordingObserver struct {
 	finishes    []FinishEvent
 	records     []PointEvent
 	order       []string
-	startCtxs   []context.Context
 	traceParent string
 	traceState  string
 	processKey  any
@@ -33,7 +32,6 @@ func (o *successorRecordingObserver) Start(ctx context.Context, event StartEvent
 	if event.Route != "" {
 		o.order[len(o.order)-1] += "/" + string(event.Route)
 	}
-	o.startCtxs = append(o.startCtxs, ctx)
 	token := Token{Kind: event.Kind, Start: event.At, Handle: uint64(len(o.starts))}
 	key, val := o.processKey, o.processVal
 	o.mu.Unlock()
@@ -231,9 +229,6 @@ func TestObserverSuccessorRetryHop(t *testing.T) {
 	}
 	if gotParent == "00-inbound-01" {
 		t.Fatal("retry traceparent equals inbound, want T2")
-	}
-	if got := headerValue(producer.messages[0].Headers, "f1id"); got != "" {
-		_ = got
 	}
 	// Message ID and correlation survive the hop on the encoded headers.
 	decoded, err := DecodeHeaders(func() map[string]string {

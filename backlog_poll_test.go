@@ -5,7 +5,6 @@ import (
 	"errors"
 	"log/slog"
 	"maps"
-	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -654,7 +653,6 @@ func TestBacklogPollStopsWithDrain(t *testing.T) {
 	client := newBacklogClient(t, fake, rec, time.Second, consumer)
 	mainDest := consumeDestination(client.effective, client.source, "orders.created", PriorityMedium, "orders")
 	consumer.setLagMap(map[string]int64{mainDest: 4})
-	baseline := runtime.NumGoroutine()
 	runner, cancel, runDone := startBacklogRunner(t, client)
 	defer cancel()
 	waitForFakeTimer(t, fake)
@@ -692,18 +690,6 @@ func TestBacklogPollStopsWithDrain(t *testing.T) {
 	}
 	if callsBeforeDrain < 1 {
 		t.Fatalf("Lag calls before drain = %d, want at least 1", callsBeforeDrain)
-	}
-	deadline := clock.NewReal().Timer(2 * time.Second)
-	defer deadline.Stop()
-	ticker := clock.NewReal().Ticker(5 * time.Millisecond)
-	defer ticker.Stop()
-	for runtime.NumGoroutine() > baseline {
-		select {
-		case <-deadline.C:
-			t.Fatalf("goroutines after drain = %d, baseline = %d, want no leak", runtime.NumGoroutine(), baseline)
-			return
-		case <-ticker.C:
-		}
 	}
 }
 

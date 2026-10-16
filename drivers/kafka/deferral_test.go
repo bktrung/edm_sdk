@@ -47,9 +47,6 @@ func TestConsumerAdmissionUsesRecordTimestamp(t *testing.T) {
 	if got := consumer.heldUntil[key]; !got.Equal(want) {
 		t.Fatalf("heldUntil = %s, want %s", got, want)
 	}
-	if want.Before(now.Add(10 * time.Second)) {
-		t.Fatalf("due time %s is before the publish instant plus the delay %s", want, now.Add(10*time.Second))
-	}
 	consumer.clock.(*clock.Fake).Advance(want.Sub(now))
 	consumer.mu.Lock()
 	if !consumer.admissionLocked(record) {

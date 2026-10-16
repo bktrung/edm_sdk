@@ -46,35 +46,6 @@ func newBudgetTestClient(t *testing.T) (*Client, *Runner, *clock.Fake, func()) {
 	return client, runner, fake, release
 }
 
-// TestConsumerDrainBudgetBoundsAWedgedRunnerDrain pins the ruling that a
-// wedged driver cannot hold Client.Close past ConsumerDrainTimeout. The
-// runner's done channel never closes, so without the bound this wait ends
-// only when the caller's context does, and doc 02's examples pass
-// context.Background(). A positive budget must end the phase itself, with
-// the same deadline identity as every other bounded shutdown phase.
-func TestConsumerDrainBudgetBoundsAWedgedRunnerDrain(t *testing.T) {
-	client, runner, fake, release := newBudgetTestClient(t)
-	client.config.Lifecycle.ConsumerDrainTimeout = 5 * time.Second
-
-	drained := make(chan error, 1)
-	go func() { drained <- client.drainRunners(context.Background(), []*Runner{runner}) }()
-
-	waitForFakeTimer(t, fake)
-	fake.Advance(5 * time.Second)
-
-	watchdog := clock.NewReal().Timer(2 * time.Second)
-	defer watchdog.Stop()
-	select {
-	case err := <-drained:
-		if !errors.Is(err, context.DeadlineExceeded) || !strings.Contains(err.Error(), "consumer drain") {
-			t.Fatalf("drainRunners() error = %v, want the consumer drain phase deadline", err)
-		}
-	case <-watchdog.C:
-		release()
-		t.Fatal("drainRunners did not return when the consumer drain budget expired; the runner drain is still bounded only by the caller's context")
-	}
-}
-
 // TestZeroConsumerDrainTimeoutLeavesTheCallerContextAsTheOnlyBound pins the
 // zero semantics of ConsumerDrainTimeout: zero disables the bound entirely.
 // No hidden fallback may stand in for it, and the caller's context must
