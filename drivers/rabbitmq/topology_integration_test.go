@@ -15,6 +15,13 @@ import (
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/driver"
 )
 
+// deleteParkQueues removes a destination and its parking queue, so a test
+// leaves the fixture as it found it.
+func deleteParkQueues(channel *amqp.Channel, destination string) {
+	_, _ = channel.QueueDelete(parkQueueName(destination), false, false, false)
+	_, _ = channel.QueueDelete(destination, false, false, false)
+}
+
 func TestEnsureTopologyDeclaresFanoutAndBinding(t *testing.T) {
 	requireBroker(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
