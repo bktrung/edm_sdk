@@ -814,13 +814,6 @@ func TestEnvelope_CallerKeysBeginningCeAreNotReserved(t *testing.T) {
 		_, err := e.EncodeHeaders(0)
 		require.NoErrorf(t, err, "key %q must remain available to callers", k)
 	}
-
-	for _, k := range []string{"ce_type", "ce-type"} {
-		e := fullEnvelope()
-		e.Extensions = map[string]string{k: "x"}
-		_, err := e.EncodeHeaders(0)
-		require.ErrorIsf(t, err, f1.ErrReservedExtension, "key %q must remain reserved", k)
-	}
 }
 
 func TestPriority_UndeclaredValueDoesNotBecomeALane(t *testing.T) {

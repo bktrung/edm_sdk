@@ -44,9 +44,10 @@ func terminalBodyMessage(t *testing.T, envelope *Envelope, headers map[string]st
 	}
 }
 
-// TestTerminalCallbackBodiesCarryExactPayload exercises all four worker.go
-// call sites that construct a DeadLettered or Discarded payload and asserts
-// the callback observes the exact body bytes the driver delivered.
+// TestTerminalCallbackBodiesCarryExactPayload covers three of the four
+// worker.go call sites that construct a DeadLettered or Discarded payload;
+// the ordinary dead-letter call site is covered by
+// TestTerminalCallbackBodyIsCopiedNotAliased.
 func TestTerminalCallbackBodiesCarryExactPayload(t *testing.T) {
 	t.Run("unmatched", func(t *testing.T) {
 		producer := &dispatchProducer{}
@@ -105,25 +106,6 @@ func TestTerminalCallbackBodiesCarryExactPayload(t *testing.T) {
 		message := terminalBodyMessage(t, nil, map[string]string{"time": "not-a-valid-time"}, body, &dispatchSettler{})
 		if !dispatchMessage(runner, context.Background(), message, &Envelope{}, new(bool), &deliveryState{}) {
 			t.Fatal("decode-failure message was not settled")
-		}
-		waitForTerminalBody(t, done, &got, body, "DeadLettered")
-	})
-
-	t.Run("ordinary dead letter", func(t *testing.T) {
-		producer := &dispatchProducer{}
-		client, runner := newRetryBridgeRunner(t, producer, "orders.runaway")
-		defer func() { _ = client.Close(context.Background()) }()
-		var got []byte
-		done := make(chan struct{})
-		runner.subscription.OnDeadLetter = func(_ context.Context, d DeadLettered) {
-			got = d.Body
-			close(done)
-		}
-		body := []byte("runaway-payload")
-		envelope := Envelope{SpecVersion: "1.0", ID: "runaway", Source: "/test/orders", Type: "orders.runaway.v1", Priority: PriorityHigh, Attempt: 15}
-		message := terminalBodyMessage(t, &envelope, nil, body, &dispatchSettler{})
-		if !dispatchMessage(runner, context.Background(), message, &Envelope{}, new(bool), &deliveryState{}) {
-			t.Fatal("runaway message was not settled")
 		}
 		waitForTerminalBody(t, done, &got, body, "DeadLettered")
 	})
