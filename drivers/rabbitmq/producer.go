@@ -510,12 +510,16 @@ func (p *producer) decide(ctx context.Context, channel *publishChannel, written,
 // goroutine ends with the channel at the latest; the connection waits for it on
 // Close with the other goroutines it owns.
 func (c *publishChannel) releaseWhenResolved(conn *conn, ids []string, confirms []publishConfirmation) {
-	conn.detachWatch.Go(func() {
+	work := func() {
 		for _, confirm := range confirms {
 			<-confirm.Done()
 		}
 		c.watcher.release(ids)
-	})
+	}
+	// Transport shutdown resolves confirmations, so a late release ends inline.
+	if !conn.startDetached(work) {
+		work()
+	}
 }
 
 // reserve picks the channel a segment runs on and registers the segment's ids

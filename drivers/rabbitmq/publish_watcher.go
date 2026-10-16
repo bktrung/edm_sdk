@@ -99,9 +99,11 @@ func startPublishWatcher(c *conn, returns <-chan amqp.Return, closes <-chan *amq
 		done:     make(chan struct{}),
 		shut:     make(chan struct{}),
 	}
-	c.detachWatch.Go(func() {
-		w.run(returns, closes)
-	})
+	work := func() { w.run(returns, closes) }
+	// A late watcher has no registrations and the closed transport ends its streams.
+	if !c.startDetached(work) {
+		work()
+	}
 	return w
 }
 
