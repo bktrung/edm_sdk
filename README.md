@@ -39,7 +39,7 @@ for each guarantee. Broker-backed jobs remain opt-in behind `RUN_BROKER_TESTS=1`
 - **Starvation-free priority handling.** Every priority keeps a weighted share of the workers, and
   an overdue low-priority lane can jump the queue under sustained high-priority load. F1 does not
   promise a maximum wait.
-- **Poison-message safety, with explicit loss exceptions.** Decode failures and handler panics go through dead-letter containment rather than retrying forever or taking down the process. F1 acknowledges without retaining a copy when a poison message has no dead-letter route, the broker refuses the dead-letter copy as too large, or its headers cannot be encoded. See [exceptions and prevention](docs/advanced-topics/failure-handling.md#follow-a-failed-delivery), the `f1otel` [`f1.messaging.poison_dropped` counter](docs/advanced-topics/observability.md#opentelemetry-metrics), and its [drop alert](docs/advanced-topics/alerts.md#poison-messages-dropped-without-a-retained-copy).
+- **Poison-message safety, with explicit loss exceptions.** Decode failures and handler panics go through dead-letter containment rather than retrying forever or taking down the process. F1 acknowledges without retaining a copy when a poison message has no dead-letter route, the broker refuses the dead-letter copy as too large, or its headers cannot be encoded.
 - **Ordered execution, where declared.** A subscription requesting per-key ordering serializes
   equal-key handlers in scheduler dispatch order. Later messages can run before a delayed retry;
   F1 does not promise arrival order across priority lanes or global ordering across partitions or queues.
@@ -51,6 +51,8 @@ for each guarantee. Broker-backed jobs remain opt-in behind `RUN_BROKER_TESTS=1`
 - **Broker agnostic.** The core depends on the `driver` port, not a broker client. Concrete drivers
   are selected by the application and import-boundary linting is enforced by `make verify-agnostic`.
 <!-- #endregion guarantees -->
+
+For poison-message loss, see [exceptions and prevention](docs/advanced-topics/failure-handling.md#follow-a-failed-delivery), the `f1otel` [`f1.messaging.poison_dropped` counter](docs/advanced-topics/observability.md#opentelemetry-metrics), and its [drop alert](docs/advanced-topics/alerts.md#poison-messages-dropped-without-a-retained-copy).
 
 ## Observability
 
