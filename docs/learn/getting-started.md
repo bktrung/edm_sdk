@@ -214,6 +214,8 @@ Each guarantee below is tested, and the repository gates exercise them.
 
 <!--@include: ../../README.md#guarantees-->
 
+For poison-message loss, see [exceptions and prevention](/advanced-topics/failure-handling#follow-a-failed-delivery), the `f1otel` [`f1.messaging.poison_dropped` counter](/advanced-topics/observability#opentelemetry-metrics), and its [drop alert](/advanced-topics/alerts#poison-messages-dropped-without-a-retained-copy).
+
 ## What F1 does not do
 
 These are out of scope for v1. Plan for them in the application or the platform rather than

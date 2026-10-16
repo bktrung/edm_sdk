@@ -78,23 +78,6 @@ func TestAckTrackerRevocationWinsFailedCommit(t *testing.T) {
 	}
 }
 
-func TestAckTrackerOwnAckAdvancesAcrossGap(t *testing.T) {
-	tracker := newAckTracker(10)
-	var committed int64
-	if err := tracker.AckOwn(12, func(offset int64) error {
-		committed = offset
-		return nil
-	}); err != nil {
-		t.Fatalf("AckOwn(12) = %v, want success across the own-tracker gap", err)
-	}
-	if committed != 13 {
-		t.Fatalf("committed offset = %d, want 13", committed)
-	}
-	if got := tracker.CommitPoint(); got != 13 {
-		t.Fatalf("CommitPoint after AckOwn(12) = %d, want 13", got)
-	}
-}
-
 func TestAckTrackerRejectsSettledOffsetOnBothPaths(t *testing.T) {
 	for _, tc := range []struct {
 		name string

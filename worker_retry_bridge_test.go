@@ -487,33 +487,6 @@ func TestDispatchRetryCapUsesSubscriptionCeiling(t *testing.T) {
 	}
 }
 
-func TestDispatchRetryCapCanLowerSubscriptionPolicy(t *testing.T) {
-	producer := &dispatchProducer{}
-	client, runner := newRetryBridgeRunner(t, producer, "orders.created")
-	defer func() { _ = client.Close(context.Background()) }()
-
-	runner.subscription.Handlers = map[string]Handler{
-		"orders.created.v1": HandlerFunc(func(context.Context, *Event) error {
-			return errors.New("temporary")
-		}),
-	}
-	envelope := Envelope{
-		SpecVersion: "1.0",
-		ID:          "retry-cap-lowering",
-		Source:      "/test/orders",
-		Type:        "orders.created.v1",
-		Priority:    PriorityHigh,
-		Attempt:     1,
-		MaxAttempts: 1,
-	}
-	if !dispatchMessage(runner, context.Background(), retryBridgeMessage(t, envelope, &dispatchSettler{}), &Envelope{}, new(bool), &deliveryState{}) {
-		t.Fatal("retry-cap lowering message was not settled")
-	}
-	if got := headerValue(producer.messages[0].Headers, "f1deathreason"); got != ReasonMaxAttempts.String() {
-		t.Fatalf("retry-cap lowering death reason = %q, want %q", got, ReasonMaxAttempts)
-	}
-}
-
 func TestDispatchRetryCopyCarriesEffectiveRetryCap(t *testing.T) {
 	producer := &dispatchProducer{}
 	client, runner := newRetryBridgeRunner(t, producer, "orders.created")

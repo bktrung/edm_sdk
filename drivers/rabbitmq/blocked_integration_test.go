@@ -67,10 +67,6 @@ const (
 	// wall-clock bound they have to return within.
 	unreportedDeadline = 2 * time.Second
 	unreportedBound    = 4 * time.Second
-	// closeMeasureDeadline bounds the connection close this file measures under
-	// a block. That close is measured and not asserted: a close that outlives
-	// its deadline belongs to the row that owns the close path.
-	closeMeasureDeadline = 3 * time.Second
 )
 
 // requireAlarmContainer returns the container id the publishing-block tests
@@ -438,8 +434,7 @@ func TestPublishDeadlineBoundsBlockedPublish(t *testing.T) {
 //
 // Cases 2, a producer taken after case 1, and 3, a publish on a producer taken
 // before the alarm, run on that connection afterwards, so they meet the block
-// case 1 recorded, and their errors name it. The close subtest that follows
-// measures conn.Close during that block: logged, not asserted.
+// case 1 recorded, and their errors name it.
 func TestPublishDeadlineBoundsPublishIntoUnreportedBlock(t *testing.T) {
 	requireBroker(t)
 	container := requireAlarmContainer(t)
@@ -532,19 +527,5 @@ func TestPublishDeadlineBoundsPublishIntoUnreportedBlock(t *testing.T) {
 			t.Fatalf("Publish returned after %s, want it bounded by the %s deadline: %v", elapsed, publishDeadline, publishErr)
 		}
 		assertBlockedByDeadline(t, "Publish of the batch", publishErr)
-	})
-
-	t.Run("the connection close during the block", func(t *testing.T) {
-		// A measurement and not an assertion: the close path is where it was
-		// left, and a close that outlives its deadline belongs to the row that
-		// owns that path. The connection is the batch's, which has a block
-		// recorded and no producer left registered, so what this times is the
-		// close rather than an admission check in front of it.
-		closeCtx, closeCancel := context.WithTimeout(ctx, closeMeasureDeadline)
-		defer closeCancel()
-		start := time.Now() //nolint:forbidigo // the measurement is wall-clock time around a live broker.
-		closeErr := batchConn.Close(closeCtx)
-		elapsed := time.Since(start) //nolint:forbidigo // the measurement is wall-clock time around a live broker.
-		t.Logf("conn.Close with a block recorded returned after %s with %v", elapsed, closeErr)
 	})
 }

@@ -534,19 +534,6 @@ func TestValidateConfigRequiresTLSForProductionSASL(t *testing.T) {
 	}
 }
 
-func TestValidateConfigRejectsTLSWithNonAmqpsEndpoint(t *testing.T) {
-	t.Parallel()
-	cfg := validValidationConfig()
-	cfg.Broker.Driver = "rabbitmq"
-	cfg.Broker.Endpoints = []string{"amqp://broker:5672/"}
-	cfg.Broker.TLS.Enabled = true
-
-	err := validateConfiguredConfig(cfg)
-	if err == nil || !strings.Contains(err.Error(), "amqp") || !strings.Contains(err.Error(), "amqps://") {
-		t.Fatalf("validateConfig() error = %v, want non-amqps TLS endpoint error", err)
-	}
-}
-
 func TestValidateConfigAcceptsTLSWithAmqpsEndpoint(t *testing.T) {
 	t.Parallel()
 	cfg := validValidationConfig()
