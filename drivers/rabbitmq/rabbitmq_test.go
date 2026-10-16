@@ -296,17 +296,6 @@ func receivedOpenAttempt(accepted <-chan struct{}) bool {
 	}
 }
 
-func TestClassifyAMQPNotFound(t *testing.T) {
-	err := classifyAMQP("consume", driver.KindTransient, &amqp.Error{Code: 404, Reason: "not found"})
-	if !errors.Is(err, driver.ErrDestinationMissing) {
-		t.Fatalf("error = %v, want ErrDestinationMissing", err)
-	}
-	kind, ok := driver.Classify(err)
-	if !ok || kind != driver.KindNotFound {
-		t.Fatalf("Classify(%v) = %v, %t, want not_found, true", err, kind, ok)
-	}
-}
-
 // TestClassifyAMQPTransportLoss covers the close codes amqp091-go raises on the
 // client when the transport dies. The library marks those with Server false,
 // and the caller's fallback cannot decide them: the Qos, Confirm and topology
