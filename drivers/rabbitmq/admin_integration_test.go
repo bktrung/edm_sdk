@@ -10,6 +10,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -1037,6 +1038,9 @@ func TestOpenStillConnectsWhenEarlierAttemptsFail(t *testing.T) {
 			conn, err := (Driver{}).Open(ctx, driver.Config{
 				Endpoints:      tc.endpoints(t),
 				ConnectTimeout: 10 * time.Second,
+				DriverOptions: map[string]string{
+					managementPortOption: strconv.Itoa(rabbitManagementPort(t)),
+				},
 			})
 			if err != nil {
 				t.Fatalf("Open() = %v, want a connection", err)
