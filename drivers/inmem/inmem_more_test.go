@@ -216,6 +216,14 @@ func TestOrphanScanWithAndWithoutScope(t *testing.T) {
 	require.Len(t, diff.Orphaned, 1)
 	require.Equal(t, "owned.old", diff.Orphaned[0].Name)
 	require.Empty(t, diff.OrphanScanError)
+	verify, err := conn.Admin().EnsureTopology(ctx, driver.TopologySpec{
+		Policy: driver.TopologyVerify,
+		Scope:  []string{"owned."},
+	})
+	require.NoError(t, err)
+	require.Len(t, verify.Orphaned, 1)
+	require.Equal(t, "owned.old", verify.Orphaned[0].Name)
+	require.Empty(t, verify.OrphanScanError)
 
 	diff, err = conn.Admin().EnsureTopology(ctx, driver.TopologySpec{})
 	require.NoError(t, err)

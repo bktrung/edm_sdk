@@ -71,6 +71,7 @@ func (a *adminOperations) EnsureTopology(ctx context.Context, spec driver.Topolo
 			diff.ExistingDestinations = append(diff.ExistingDestinations, item.Name)
 			diff.Drifted = append(diff.Drifted, destinationArgumentDrift(item, stored.spec)...)
 		}
+		a.scanOrphans(spec, &diff)
 		return diff, nil
 	}
 	for _, item := range spec.Destinations {
@@ -91,29 +92,33 @@ func (a *adminOperations) EnsureTopology(ctx context.Context, spec driver.Topolo
 		}
 		diff.CreatedDestinations = append(diff.CreatedDestinations, item.Name)
 	}
+	a.scanOrphans(spec, &diff)
+	return diff, nil
+}
+
+func (a *adminOperations) scanOrphans(spec driver.TopologySpec, diff *driver.TopologyDiff) {
 	if len(spec.Scope) == 0 {
 		diff.OrphanScanError = "TopologySpec.Scope is empty: not scanning for orphans"
-	} else {
-		wanted := make(map[string]struct{}, len(spec.Destinations))
-		for _, item := range spec.Destinations {
-			wanted[item.Name] = struct{}{}
+		return
+	}
+	wanted := make(map[string]struct{}, len(spec.Destinations))
+	for _, item := range spec.Destinations {
+		wanted[item.Name] = struct{}{}
+	}
+	names := make([]string, 0, len(a.conn.destinations))
+	for name := range a.conn.destinations {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		item := a.conn.destinations[name]
+		if !inScope(name, spec.Scope) {
+			continue
 		}
-		names := make([]string, 0, len(a.conn.destinations))
-		for name := range a.conn.destinations {
-			names = append(names, name)
-		}
-		sort.Strings(names)
-		for _, name := range names {
-			item := a.conn.destinations[name]
-			if !inScope(name, spec.Scope) {
-				continue
-			}
-			if _, ok := wanted[name]; !ok {
-				diff.Orphaned = append(diff.Orphaned, driver.OrphanedDestination{Name: name, Messages: int64(len(item.messages))})
-			}
+		if _, ok := wanted[name]; !ok {
+			diff.Orphaned = append(diff.Orphaned, driver.OrphanedDestination{Name: name, Messages: int64(len(item.messages))})
 		}
 	}
-	return diff, nil
 }
 
 func destinationArgumentDrift(want, got driver.DestinationSpec) []driver.ArgumentDrift {

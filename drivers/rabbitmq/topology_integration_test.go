@@ -166,6 +166,45 @@ func TestVerifyTopologyReportsDeletedBinding(t *testing.T) {
 	}
 }
 
+func TestVerifyTopologyReportsScopedOrphan(t *testing.T) {
+	requireBroker(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	const queue = "rabbitmq-driver-verify-orphan-queue"
+	raw, err := amqp.Dial(defaultEndpoint)
+	if err != nil {
+		t.Fatalf("Dial: %v", err)
+	}
+	t.Cleanup(func() { _ = raw.Close() })
+	channel, err := raw.Channel()
+	if err != nil {
+		t.Fatalf("Channel: %v", err)
+	}
+	t.Cleanup(func() { _ = channel.Close() })
+	_, _ = channel.QueueDelete(queue, false, false, false)
+	t.Cleanup(func() { _, _ = channel.QueueDelete(queue, false, false, false) })
+	if _, err := channel.QueueDeclare(queue, true, false, false, false, nil); err != nil {
+		t.Fatalf("QueueDeclare: %v", err)
+	}
+
+	conn, err := (Driver{}).Open(ctx, driver.Config{Endpoints: []string{defaultEndpoint}})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	t.Cleanup(func() { _ = conn.Close(ctx) })
+	diff, err := conn.Admin().EnsureTopology(ctx, driver.TopologySpec{
+		Policy: driver.TopologyVerify,
+		Scope:  []string{"rabbitmq-driver-verify-orphan-"},
+	})
+	if err != nil {
+		t.Fatalf("EnsureTopology: %v", err)
+	}
+	if diff.OrphanScanError != "" || len(diff.Orphaned) != 1 || diff.Orphaned[0].Name != queue {
+		t.Fatalf("Verify orphan result = %#v, want %q", diff, queue)
+	}
+}
+
 func TestVerifyTopologyReportsArgumentDrift(t *testing.T) {
 	requireBroker(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
