@@ -1755,6 +1755,7 @@ func retainedRecord(record *kgo.Record) *kgo.Record {
 		Offset:      record.Offset,
 		LeaderEpoch: record.LeaderEpoch,
 		Timestamp:   record.Timestamp,
+		Attrs:       record.Attrs,
 		Key:         append([]byte(nil), record.Key...),
 		Value:       append([]byte(nil), record.Value...),
 	}
