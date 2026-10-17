@@ -807,9 +807,11 @@ func TestConsumerReestablishesAfterServerCancel(t *testing.T) {
 		t.Fatal("timed out waiting for the first delivery")
 	}
 
-	// The cancel lands about a second after that delivery. It must be reported
-	// as a notification and must not be reported as a failure: a cancel that
-	// failed the runner would be a worse defect than the stall being fixed.
+	// RabbitMQ 4.3.4's quorum-queue source schedules an absolute
+	// consumer-timeout deadline. Twenty runs under two concurrent test-fast
+	// suites measured 1.000-1.011s (median 1.005s); 10x the worst is below
+	// the retained 15s floor, so the finite wait remains 15s.
+	cancelStarted := time.Now() //nolint:forbidigo // the broker notification latency is the measurement under test.
 	reportCtx, reportCancel := context.WithTimeout(ctx, 15*time.Second)
 	defer reportCancel()
 	select {
@@ -822,7 +824,7 @@ func TestConsumerReestablishesAfterServerCancel(t *testing.T) {
 			t.Fatalf("cancel notification = %q, want it to name destination %q", err, queue)
 		}
 	case <-reportCtx.Done():
-		t.Fatal("timed out waiting for the cancel notification")
+		t.Fatalf("timed out waiting for the cancel notification %s after delivery", time.Since(cancelStarted)) //nolint:forbidigo // the broker notification latency is the measurement under test.
 	}
 
 	// The re-established consumer must deliver again. The held message was
