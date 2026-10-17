@@ -55,6 +55,60 @@ func TestKafkaInboundLogAppendTimeReportsBrokerSource(t *testing.T) {
 	}
 }
 
+func TestKafkaInboundLogAppendTimeRetainsTimestampOnRequeue(t *testing.T) {
+	ctx, connection, admin := openKafkaAdminTest(t)
+	topic := kafkaTestTopic(t, "enqueue-log-append-requeue")
+	group := kafkaTestTopic(t, "enqueue-log-append-requeue-group")
+	cleanupKafkaTopics(t, admin, topic)
+	cleanupKafkaGroups(t, admin, group)
+	createKafkaTopicWithTimestampType(t, admin, ctx, topic, "LogAppendTime")
+
+	record := &kgo.Record{Topic: topic, Value: []byte("log-append-requeue")}
+	if err := connection.client.ProduceSync(ctx, record).FirstErr(); err != nil {
+		t.Fatalf("ProduceSync: %v", err)
+	}
+
+	consumer, err := connection.Consumer(ctx, driver.ConsumerConfig{
+		Group:        group,
+		Destinations: []string{topic},
+		Prefetch:     1,
+		StartAt:      driver.StartEarliest,
+		Effective:    connection.Capabilities(),
+	})
+	if err != nil {
+		t.Fatalf("Consumer: %v", err)
+	}
+	t.Cleanup(func() { _ = consumer.Release(context.Background()) })
+
+	first := receiveKafkaMessage(t, consumer)
+	if first.EnqueuedAtSource != driver.EnqueueSourceBroker {
+		t.Fatalf("first EnqueuedAtSource = %v, want broker", first.EnqueuedAtSource)
+	}
+	if err := consumer.Pause(topic); err != nil {
+		t.Fatalf("Pause: %v", err)
+	}
+	if err := first.Settle.Nack(ctx, driver.NackOptions{Requeue: true}); err != nil {
+		t.Fatalf("Nack(requeue): %v", err)
+	}
+	if err := consumer.Resume(topic); err != nil {
+		t.Fatalf("Resume: %v", err)
+	}
+
+	redelivered := receiveKafkaMessage(t, consumer)
+	if redelivered.EnqueuedAtSource != driver.EnqueueSourceBroker {
+		t.Fatalf("redelivery EnqueuedAtSource = %v, want broker", redelivered.EnqueuedAtSource)
+	}
+	if !redelivered.EnqueuedAt.Equal(first.EnqueuedAt) {
+		t.Fatalf("redelivery EnqueuedAt = %v, want %v", redelivered.EnqueuedAt, first.EnqueuedAt)
+	}
+	if err := redelivered.Settle.Ack(ctx); err != nil {
+		t.Fatalf("Ack(redelivery): %v", err)
+	}
+	if err := consumer.Stop(ctx); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+}
+
 func TestKafkaInboundCreateTimeReportsProducerSource(t *testing.T) {
 	ctx, connection, admin := openKafkaAdminTest(t)
 	topic := kafkaTestTopic(t, "enqueue-create")

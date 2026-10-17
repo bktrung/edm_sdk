@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/twmb/franz-go/pkg/kadm"
 	"github.com/twmb/franz-go/pkg/kgo"
 	"github.com/twmb/franz-go/pkg/kmsg"
 
@@ -116,6 +117,69 @@ func TestKafkaBacklogHeadSelection(t *testing.T) {
 			}
 			if gotSource != test.wantSource {
 				t.Fatalf("source = %v, want %v", gotSource, test.wantSource)
+			}
+		})
+	}
+}
+
+func TestKafkaOffsetSnapshotLagAndProbesClampsToStart(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name          string
+		start         int64
+		end           int64
+		committed     int64
+		wantLag       int64
+		wantProbe     bool
+		wantCommitted int64
+	}{
+		{
+			name:          "retained records only",
+			start:         100,
+			end:           110,
+			committed:     10,
+			wantLag:       10,
+			wantProbe:     true,
+			wantCommitted: 100,
+		},
+		{
+			name:      "fully purged partition",
+			start:     110,
+			end:       110,
+			committed: 10,
+			wantLag:   0,
+			wantProbe: false,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			snapshot := kafkaOffsetSnapshot{
+				destinations: []string{"orders"},
+				starts: kadm.ListedOffsets{
+					"orders": {0: {Offset: test.start}},
+				},
+				ends: kadm.ListedOffsets{
+					"orders": {0: {Offset: test.end}},
+				},
+				committed: kadm.OffsetResponses{
+					"orders": {0: {Offset: kadm.Offset{At: test.committed}}},
+				},
+			}
+
+			lag, probes, err := snapshot.lagAndProbes("test")
+			if err != nil {
+				t.Fatalf("lagAndProbes returned error: %v", err)
+			}
+			if got := lag["orders"]; got != test.wantLag {
+				t.Fatalf("lag = %d, want %d", got, test.wantLag)
+			}
+			if (len(probes["orders"]) > 0) != test.wantProbe {
+				t.Fatalf("probe presence = %t, want %t", len(probes["orders"]) > 0, test.wantProbe)
+			}
+			if test.wantProbe && probes["orders"][0].committed != test.wantCommitted {
+				t.Fatalf("probe committed = %d, want %d", probes["orders"][0].committed, test.wantCommitted)
 			}
 		})
 	}

@@ -84,6 +84,9 @@ func (s kafkaOffsetSnapshot) lagAndProbes(operation string) (map[string]int64, m
 					committedOffset = response.At
 				}
 			}
+			if committedOffset < start.Offset {
+				committedOffset = start.Offset
+			}
 			if end.Offset > committedOffset {
 				total += end.Offset - committedOffset
 				probes[destination] = append(probes[destination], backlogPartitionProbe{
