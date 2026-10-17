@@ -369,6 +369,7 @@ func TestBacklogPollInmemHeadAge(t *testing.T) {
 	fake := clock.NewFake(start)
 	bundle := newInmemBacklogObserverClient(t, fake, 5*time.Second)
 	runner, _, _ := startBacklogRunner(t, bundle.client)
+	waitForFakeTimer(t, fake)
 	runner.mu.Lock()
 	consumer := runner.consumer
 	runner.mu.Unlock()
