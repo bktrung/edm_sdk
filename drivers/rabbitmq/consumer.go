@@ -1188,10 +1188,12 @@ func (c *consumer) setPaused(destinations []string, paused bool) error {
 		targets = c.cfg.Destinations
 	}
 	for _, destination := range targets {
-		lane, ok := c.byName[destination]
-		if !ok {
+		if _, ok := c.byName[destination]; !ok {
 			return classify("consumer", driver.KindNotFound, driver.ErrDestinationMissing)
 		}
+	}
+	for _, destination := range targets {
+		lane := c.byName[destination]
 		lane.mu.Lock()
 		if lane.paused == paused {
 			lane.mu.Unlock()

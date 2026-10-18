@@ -1835,6 +1835,8 @@ func (c *consumer) setUserPaused(destinations []string, paused bool) error {
 		if _, ok := c.budgets[destination]; !ok {
 			return classify("consumer", driver.KindNotFound, driver.ErrDestinationMissing)
 		}
+	}
+	for _, destination := range destinations {
 		laneFaulted := !paused && c.laneFaultDestination == destination
 		if laneFaulted {
 			c.laneFaultDestination = ""

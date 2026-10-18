@@ -162,6 +162,46 @@ func runConsume(group *groupContext) {
 		group.vector.add(BehaviorEvent{ID: "prefetch-share", Outcome: "ok", FinalDestination: "consume.prefetch-share"})
 	})
 
+	group.Check("pause and resume reject mixed held destinations atomically", func(t *testing.T) {
+		producer := newProducer(t, group, profileDestination(group, "consume.pause-atomic-a"), driver.ProducerConfig{Effective: group.effective})
+		consumer := newConsumerFor(t, group, driver.ConsumerConfig{
+			Destinations: []string{"consume.pause-atomic-a"}, Prefetch: 1, Effective: group.effective,
+		})
+		if err := consumer.Pause("consume.pause-atomic-a", "consume.pause-atomic-missing"); !errors.Is(err, driver.ErrDestinationMissing) {
+			t.Fatalf("Pause(a, missing) error = %v, want ErrDestinationMissing", err)
+		}
+		if err := producer.Publish(group.ctx, driver.OutboundMessage{Destination: "consume.pause-atomic-a"}); err != nil {
+			t.Fatalf("Publish(a) after failed Pause error = %v", err)
+		}
+		ackMessage(t, group, receiveMessage(t, group, consumer))
+
+		if err := consumer.Pause("consume.pause-atomic-a"); err != nil {
+			t.Fatalf("Pause(a) error = %v", err)
+		}
+		if err := producer.Publish(group.ctx, driver.OutboundMessage{Destination: "consume.pause-atomic-a"}); err != nil {
+			t.Fatalf("Publish(a) after Pause error = %v", err)
+		}
+		if err := consumer.Resume("consume.pause-atomic-a", "consume.pause-atomic-missing"); !errors.Is(err, driver.ErrDestinationMissing) {
+			t.Fatalf("Resume(a, missing) error = %v, want ErrDestinationMissing", err)
+		}
+		waitForStable(t, group, "failed mixed Resume to keep destination paused", func() (bool, string) {
+			select {
+			case message, ok := <-consumer.Messages():
+				if !ok {
+					return false, "Messages channel closed"
+				}
+				return false, fmt.Sprintf("received message from paused destination %q", message.Destination)
+			default:
+				return true, "destination remains paused"
+			}
+		})
+		if err := consumer.Resume("consume.pause-atomic-a"); err != nil {
+			t.Fatalf("Resume(a) error = %v", err)
+		}
+		ackMessage(t, group, receiveMessage(t, group, consumer))
+		group.vector.add(BehaviorEvent{ID: "pause-resume-atomic", Outcome: "ok", FinalDestination: "consume.pause-atomic-a"})
+	})
+
 	group.Check("pause stops only the requested destination", func(t *testing.T) {
 		producerA := newProducer(t, group, profileDestination(group, "consume.pause-a"), driver.ProducerConfig{Effective: group.effective})
 		producerB := newProducer(t, group, profileDestination(group, "consume.pause-b"), driver.ProducerConfig{Effective: group.effective})

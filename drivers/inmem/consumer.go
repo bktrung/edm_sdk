@@ -70,6 +70,8 @@ func (c *consumer) setPaused(destinations []string, paused bool) error {
 		if !contains(c.destinations, name) {
 			return classify("consumer", driver.KindNotFound, driver.ErrDestinationMissing)
 		}
+	}
+	for _, name := range destinations {
 		c.paused[name] = paused
 	}
 	c.conn.dispatchLocked()
