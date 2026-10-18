@@ -579,6 +579,18 @@ func TestEnsureTopologyOrphanScan(t *testing.T) {
 	if len(diff.Orphaned) != 1 || diff.Orphaned[0].Name != orphan || diff.Orphaned[0].Messages != 3 {
 		t.Fatalf("scoped Orphaned = %#v, want %q with depth 3", diff.Orphaned, orphan)
 	}
+	verify, err := connection.Admin().EnsureTopology(ctx, driver.TopologySpec{
+		Policy:    driver.TopologyVerify,
+		Scope:     []string{prefix},
+		Effective: connection.Capabilities(),
+	})
+	if err != nil {
+		t.Fatalf("Verify scoped orphan scan with no destinations: %v", err)
+	}
+	if verify.OrphanScanError != "" || len(verify.Orphaned) != 1 ||
+		verify.Orphaned[0].Name != orphan || verify.Orphaned[0].Messages != 3 {
+		t.Fatalf("Verify zero-destination scoped result = %#v, want %q with depth 3", verify, orphan)
+	}
 
 	emptyScope, err := connection.Admin().EnsureTopology(ctx, driver.TopologySpec{
 		Effective: connection.Capabilities(),
