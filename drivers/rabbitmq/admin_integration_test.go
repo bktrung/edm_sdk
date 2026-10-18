@@ -930,6 +930,57 @@ func managementRequest(t *testing.T, client *managementClient, method, path, bod
 	}
 }
 
+func TestPruneGuardReportsMissingQueueAsDisappeared(t *testing.T) {
+	const destination = "rabbitmq-driver-prune-guard-missing"
+	ctx, _, facade := setupPruneTest(t, queueKindQuorum, driver.DestinationSpec{Name: destination, Durable: true})
+	if deleted, err := facade.operations.conn.management.deleteQueue(ctx, destination); err != nil || !deleted {
+		t.Fatalf("deleteQueue(%q) = (%t, %v), want deleted queue", destination, deleted, err)
+	}
+	reason, err := facade.operations.pruneGuard(ctx, destination, nil)
+	if err != nil {
+		t.Fatalf("pruneGuard: %v", err)
+	}
+	if reason != "destination disappeared before deletion" {
+		t.Fatalf("pruneGuard reason = %q, want disappeared reason", reason)
+	}
+}
+
+type closeAfterManagementRoundTripper struct {
+	next  http.RoundTripper
+	close func()
+	once  sync.Once
+}
+
+func (r *closeAfterManagementRoundTripper) RoundTrip(request *http.Request) (*http.Response, error) {
+	response, err := r.next.RoundTrip(request)
+	if err == nil {
+		r.once.Do(r.close)
+	}
+	return response, err
+}
+
+func TestPruneReturnsInspectionTransportError(t *testing.T) {
+	const destination = "rabbitmq-driver-prune-guard-transport"
+	ctx, rabbitConn, facade := setupPruneTest(t, queueKindQuorum, driver.DestinationSpec{Name: destination, Durable: true})
+	next := facade.operations.conn.management.client.Transport
+	if next == nil {
+		next = http.DefaultTransport
+	}
+	facade.operations.conn.management.client.Transport = &closeAfterManagementRoundTripper{
+		next:  next,
+		close: func() { _ = rabbitConn.amqp.Close() },
+	}
+	_, err := facade.Prune(ctx, []string{destination})
+	kind, classified := driver.Classify(err)
+	if !classified || kind != driver.KindTransient {
+		t.Fatalf("Prune = %v (kind %v, classified %t), want a classified transient inspection error", err, kind, classified)
+	}
+	var portErr *driver.Error
+	if !errors.As(err, &portErr) || portErr.Op != "prune" {
+		t.Fatalf("Prune = %v, want the inspection error under a prune driver error", err)
+	}
+}
+
 // TestPruneRefusesQueueDeleteWithoutConfigurePermission covers a queue delete
 // the broker answers with 403 because the connected user may not configure the
 // destination. Only the delete reports that refusal: a passive declare needs no

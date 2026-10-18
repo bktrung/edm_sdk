@@ -79,9 +79,8 @@ type TopologySpec struct {
 // TopologyState reports the current state of requested destinations.
 type TopologyState struct {
 	// Depth maps requested destination names to current message counts,
-	// including driver-internal auxiliaries. A missing destination is absent
-	// from the map rather than present with zero, so topology diff can
-	// distinguish missing from empty.
+	// including driver-internal auxiliaries. A requested destination that does
+	// not exist fails the call with ErrDestinationMissing and KindNotFound.
 	Depth map[string]int64
 }
 

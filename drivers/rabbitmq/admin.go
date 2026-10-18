@@ -211,7 +211,9 @@ func (a *adminOperations) Prune(ctx context.Context, names []string) ([]driver.P
 		}
 
 		parking := a.existingParkQueues(queues, name)
-		if reason := a.pruneGuard(ctx, name, parking); reason != "" {
+		if reason, guardErr := a.pruneGuard(ctx, name, parking); guardErr != nil {
+			return nil, classifyAMQP("prune", driver.KindTransient, guardErr)
+		} else if reason != "" {
 			result.Reason = reason
 			results = append(results, result)
 			continue
@@ -226,7 +228,9 @@ func (a *adminOperations) Prune(ctx context.Context, names []string) ([]driver.P
 				results = append(results, result)
 				continue
 			}
-			if reason := a.pruneGuard(ctx, name, parking); reason != "" {
+			if reason, guardErr := a.pruneGuard(ctx, name, parking); guardErr != nil {
+				return nil, classifyAMQP("prune", driver.KindTransient, guardErr)
+			} else if reason != "" {
 				result.Reason = reason
 				results = append(results, result)
 				continue
@@ -266,7 +270,9 @@ func (a *adminOperations) Prune(ctx context.Context, names []string) ([]driver.P
 			results = append(results, result)
 			continue
 		}
-		if reason := a.pruneGuard(ctx, name, nil); reason != "" {
+		if reason, guardErr := a.pruneGuard(ctx, name, nil); guardErr != nil {
+			return nil, classifyAMQP("prune", driver.KindTransient, guardErr)
+		} else if reason != "" {
 			result.Reason = reason
 			results = append(results, result)
 			continue
@@ -334,29 +340,35 @@ func (a *adminOperations) pruneReason(name string, mainConsumers, mainReady int6
 }
 
 // pruneGuard inspects a destination and the parking queues given and returns
-// the first reason the destination may not be deleted, or an empty string when
-// every inspected queue is there, empty and unattached. An auxiliary list that
-// is empty checks the destination alone, which is the check that runs once the
-// parking queues are gone, and a destination that has disappeared is reported
-// as such rather than as a queue that failed its guard.
-func (a *adminOperations) pruneGuard(ctx context.Context, destination string, auxiliary []string) string {
+// the first reason the destination may not be deleted, or an error when an
+// inspection failed for a reason other than a missing queue. An auxiliary list
+// that is empty checks the destination alone, which is the check that runs once
+// the parking queues are gone, and a destination that has disappeared is
+// reported as such rather than as a queue that failed its guard.
+func (a *adminOperations) pruneGuard(ctx context.Context, destination string, auxiliary []string) (string, error) {
 	mainReady, mainConsumers, err := a.inspectQueueWithConsumers(ctx, destination)
 	if err != nil {
-		return "destination disappeared before deletion"
+		if isNotFound(err) {
+			return "destination disappeared before deletion", nil
+		}
+		return "", err
 	}
 	if reason := a.pruneReason(destination, mainConsumers, mainReady, "", 0); reason != "" {
-		return reason
+		return reason, nil
 	}
 	for _, parkName := range auxiliary {
 		parkReady, parkErr := a.inspectQueue(ctx, parkName)
 		if parkErr != nil {
-			return "parking destination disappeared before deletion"
+			if isNotFound(parkErr) {
+				return "parking destination disappeared before deletion", nil
+			}
+			return "", parkErr
 		}
 		if reason := a.pruneReason(destination, mainConsumers, mainReady, parkName, parkReady); reason != "" {
-			return reason
+			return reason, nil
 		}
 	}
-	return ""
+	return "", nil
 }
 
 // existingParkQueues lists the parking queue of a destination when the broker

@@ -249,6 +249,7 @@ func (a *adminOperations) verifyTopology(ctx context.Context, spec driver.Topolo
 		}
 		diff.ExistingBindings = append(diff.ExistingBindings, binding)
 	}
+	a.scanOrphans(ctx, spec, &diff)
 	return diff, nil
 }
 

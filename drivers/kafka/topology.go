@@ -269,16 +269,16 @@ func (a *admin) waitForTopicState(ctx context.Context, operation string, names [
 
 func (a *admin) verifyTopology(ctx context.Context, spec driver.TopologySpec) (driver.TopologyDiff, error) {
 	var diff driver.TopologyDiff
-	if len(spec.Destinations) == 0 {
-		return diff, nil
-	}
 	maxExpectedInstances, err := a.maxExpectedInstances()
 	if err != nil {
 		return driver.TopologyDiff{}, classify("ensure_topology", driver.KindFatal, err)
 	}
-	topics, err := a.listTopics(ctx, "ensure_topology", destinationNames(spec.Destinations)...)
-	if err != nil {
-		return driver.TopologyDiff{}, err
+	var topics kadm.TopicDetails
+	if len(spec.Destinations) > 0 {
+		topics, err = a.listTopics(ctx, "ensure_topology", destinationNames(spec.Destinations)...)
+		if err != nil {
+			return driver.TopologyDiff{}, err
+		}
 	}
 	for _, destination := range spec.Destinations {
 		if err := ctx.Err(); err != nil {
@@ -324,6 +324,7 @@ func (a *admin) verifyTopology(ctx context.Context, spec driver.TopologySpec) (d
 	if err := a.checkDestinationCleanupPolicies(ctx, spec.Destinations); err != nil {
 		return driver.TopologyDiff{}, err
 	}
+	a.scanOrphans(ctx, spec, &diff)
 	return diff, nil
 }
 
