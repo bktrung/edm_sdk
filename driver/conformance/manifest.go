@@ -15,7 +15,7 @@ type manifestEntry struct {
 
 var groupManifest = []manifestEntry{
 	{name: "publish", declared: 15},
-	{name: "consume", declared: 22},
+	{name: "consume", declared: 23},
 	{name: "settle", declared: 16},
 	{name: "ordering", declared: 8},
 	{name: "deferred", declared: 8},

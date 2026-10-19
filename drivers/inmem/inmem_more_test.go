@@ -131,6 +131,39 @@ func TestLagPauseAndResume(t *testing.T) {
 	closeTest(t, ctx, conn, producer, consumer)
 }
 
+func TestPauseResumeRejectsMixedDestinationsAtomically(t *testing.T) {
+	ctx, conn, producer := openTest(t, clock.NewFake(time.Unix(0, 0)),
+		driver.DestinationSpec{Name: "orders"}, driver.DestinationSpec{Name: "refunds"})
+	consumer, err := conn.Consumer(ctx, driver.ConsumerConfig{
+		Destinations: []string{"orders", "refunds"}, Effective: testCaps(),
+	})
+	require.NoError(t, err)
+
+	err = consumer.Pause("orders", "missing")
+	require.ErrorIs(t, err, driver.ErrDestinationMissing)
+	require.NoError(t, producer.Publish(ctx, driver.OutboundMessage{Destination: "orders"}))
+	message := receiveTest(t, consumer)
+	require.NoError(t, message.Settle.Ack(ctx))
+
+	require.NoError(t, consumer.Pause("orders"))
+	require.NoError(t, producer.Publish(ctx, driver.OutboundMessage{Destination: "orders"}))
+	err = consumer.Resume("orders", "missing")
+	require.ErrorIs(t, err, driver.ErrDestinationMissing)
+	require.NoError(t, producer.Publish(ctx, driver.OutboundMessage{Destination: "refunds"}))
+	message = receiveTest(t, consumer)
+	require.Equal(t, "refunds", message.Destination)
+	require.NoError(t, message.Settle.Ack(ctx))
+	select {
+	case message := <-consumer.Messages():
+		t.Fatalf("mixed Resume delivered %q while orders remained paused", message.Destination)
+	default:
+	}
+	require.NoError(t, consumer.Resume("orders"))
+	message = receiveTest(t, consumer)
+	require.NoError(t, message.Settle.Ack(ctx))
+	closeTest(t, ctx, conn, producer, consumer)
+}
+
 func TestStopRejectsOutstandingUntilSettled(t *testing.T) {
 	ctx, conn, producer := openTest(t, clock.NewFake(time.Unix(0, 0)), driver.DestinationSpec{Name: "orders"})
 	consumer, err := conn.Consumer(ctx, driver.ConsumerConfig{Destinations: []string{"orders"}, Effective: testCaps()})
