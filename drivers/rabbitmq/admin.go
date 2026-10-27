@@ -397,8 +397,7 @@ func (a *adminOperations) consumerCount(destination string) int64 {
 }
 
 func pruneDeleteReason(err error, fallback string) string {
-	var guardErr *queuePruneGuardError
-	if errors.As(err, &guardErr) {
+	if guardErr, ok := errors.AsType[*queuePruneGuardError](err); ok {
 		return guardErr.reason
 	}
 	return fallback

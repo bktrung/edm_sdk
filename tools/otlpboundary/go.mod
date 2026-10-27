@@ -2,7 +2,7 @@ module otlpboundary
 
 go 1.26.0
 
-toolchain go1.26.9
+toolchain go1.27.3
 
 require (
 	fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk v0.0.0

@@ -2,7 +2,7 @@ module fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk
 
 go 1.26.0
 
-toolchain go1.26.9
+toolchain go1.27.3
 
 require (
 	github.com/rabbitmq/amqp091-go v1.13.0
