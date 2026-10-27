@@ -4,11 +4,18 @@ MODULE := fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk
 VERSION := $(shell git describe --tags --dirty --always 2>/dev/null || echo dev)
 
 # Keep the linter and formatter versions aligned with CI.
-GOLANGCI_LINT_VERSION := v2.12.2
-GOFUMPT_VERSION := v0.9.2
+GOLANGCI_LINT_VERSION := v2.14.0
+GOFUMPT_VERSION := v0.12.0
 GOVULNCHECK_VERSION ?= v1.8.0
-GOLANGCI_LINT := $(CURDIR)/.tools/bin/golangci-lint
-GOFUMPT := $(CURDIR)/.tools/bin/gofumpt
+# The linter lives in a directory keyed by its version and the Go that built it.
+# A golangci-lint built by an older Go cannot read a newer standard library's
+# export data and fails in typecheck, and a target name that never changes
+# would keep that stale binary alive.
+GO_VERSION := $(shell go env GOVERSION)
+GOLANGCI_LINT_DIR := $(CURDIR)/.tools/bin/golangci-lint-$(GOLANGCI_LINT_VERSION)-$(GO_VERSION)
+GOLANGCI_LINT := $(GOLANGCI_LINT_DIR)/golangci-lint
+GOFUMPT_DIR := $(CURDIR)/.tools/bin/gofumpt-$(GOFUMPT_VERSION)-$(GO_VERSION)
+GOFUMPT := $(GOFUMPT_DIR)/gofumpt
 export GOLANGCI_LINT_CACHE := $(CURDIR)/.cache/golangci-lint
 
 export GOPRIVATE := fgit.zapps.vn
@@ -114,10 +121,10 @@ lint: $(GOLANGCI_LINT)
 ## format-check and format use the same pinned gofumpt version as the
 ## formatter bundled by the pinned golangci-lint release.
 $(GOFUMPT):
-	GOBIN=$(CURDIR)/.tools/bin go install mvdan.cc/gofumpt@$(GOFUMPT_VERSION)
+	GOBIN=$(GOFUMPT_DIR) go install mvdan.cc/gofumpt@$(GOFUMPT_VERSION)
 
 $(GOLANGCI_LINT):
-	GOBIN=$(CURDIR)/.tools/bin go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@$(GOLANGCI_LINT_VERSION)
+	GOBIN=$(GOLANGCI_LINT_DIR) go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@$(GOLANGCI_LINT_VERSION)
 
 ## verify-agnostic: check broker import boundaries with depguard.
 verify-agnostic: $(GOLANGCI_LINT)

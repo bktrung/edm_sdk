@@ -612,8 +612,7 @@ func (c *trackedConn) reclaim(ctx context.Context, consumers []*trackedConsumer,
 		progressed := false
 		for _, destination := range pending {
 			if err := purgeAndPruneIfSupported(ctx, c.Conn, destination); err != nil {
-				var refusal *pruneRefusalError
-				if errors.As(err, &refusal) {
+				if _, ok := errors.AsType[*pruneRefusalError](err); ok {
 					next = append(next, destination)
 					refused = append(refused, err)
 					continue
