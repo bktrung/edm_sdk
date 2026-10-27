@@ -208,6 +208,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 - The Go toolchain and CI image move to Go 1.26.9, which fixes the standard-library
   vulnerabilities `govulncheck` reported. Callers may still build with any Go 1.26 release, though
   an older patch keeps those holes in their own binary.
+- The RabbitMQ driver's `github.com/rabbitmq/amqp091-go` dependency moves from v1.13.0 to v1.14.0,
+  which fixes GO-2026-6700 that `govulncheck` reported.
 
 ### Upgrade notes
 
