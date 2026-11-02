@@ -109,19 +109,16 @@ func (o *Observer) BindClient() (func(), error) {
 		return nil, errObserverBound
 	}
 	o.bound = true
-	// The once is per attachment, not per Observer. Without it a stale release
-	// clears a newer binding: Client A closes and its unbind runs, Client B
-	// binds, and then A's unbind is called a second time, setting bound false
-	// while B is still attached, so a third Client binds alongside B and
+	// The OnceFunc is per attachment, not per Observer. Without it a stale
+	// release clears a newer binding: Client A closes and its unbind runs,
+	// Client B binds, and then A's unbind is called a second time, setting bound
+	// false while B is still attached, so a third Client binds alongside B and
 	// relabels B's telemetry.
-	var once sync.Once
-	return func() {
-		once.Do(func() {
-			o.mu.Lock()
-			o.bound = false
-			o.mu.Unlock()
-		})
-	}, nil
+	return sync.OnceFunc(func() {
+		o.mu.Lock()
+		o.bound = false
+		o.mu.Unlock()
+	}), nil
 }
 
 // Start returns a token when the event starts a metric-bearing or span-bearing

@@ -26,9 +26,8 @@ func TestConsumerStopReleasesParkedForwarder(t *testing.T) {
 		destination: "stop-forwarder",
 		pending:     make(chan laneDelivery, 1),
 	}
-	lane.pending <- laneDelivery{Delivery: amqp.Delivery{DeliveryTag: 1, Body: []byte("parked")}}
-	c.forward.Add(1)
-	go c.emitMessages(lane)
+	lane.pending <- laneDelivery{DeliveryTag: 1, Body: []byte("parked")}
+	c.forward.Go(func() { c.emitMessages(lane) })
 
 	deadline := time.NewTimer(time.Second) //nolint:forbidigo // bound a direct goroutine fixture
 	defer deadline.Stop()
@@ -77,9 +76,8 @@ func TestConsumerStoppedForwarderReleasesSettler(t *testing.T) {
 		destination: "stopped-forwarder",
 		pending:     make(chan laneDelivery, 1),
 	}
-	lane.pending <- laneDelivery{Delivery: amqp.Delivery{DeliveryTag: 2, Body: []byte("stopped")}}
-	c.forward.Add(1)
-	go c.emitMessages(lane)
+	lane.pending <- laneDelivery{DeliveryTag: 2, Body: []byte("stopped")}
+	c.forward.Go(func() { c.emitMessages(lane) })
 	waitForwarderState(t, "settler registration", func() bool {
 		c.mu.Lock()
 		defer c.mu.Unlock()
@@ -106,9 +104,8 @@ func TestConsumerPausedForwarderDecrementsEmission(t *testing.T) {
 		paused:      true,
 		resume:      make(chan struct{}),
 	}
-	lane.pending <- laneDelivery{Delivery: amqp.Delivery{DeliveryTag: 3, Body: []byte("paused")}}
-	c.forward.Add(1)
-	go c.emitMessages(lane)
+	lane.pending <- laneDelivery{DeliveryTag: 3, Body: []byte("paused")}
+	c.forward.Go(func() { c.emitMessages(lane) })
 	waitForwarderState(t, "paused emission", func() bool {
 		lane.mu.Lock()
 		defer lane.mu.Unlock()
@@ -230,7 +227,7 @@ func TestConsumerAdmissionRefillsOnlyAfterSettlement(t *testing.T) {
 				c.lanes = append(c.lanes, l)
 				c.byName[destination] = l
 				for tag := range 4 {
-					l.pending <- laneDelivery{Delivery: amqp.Delivery{DeliveryTag: uint64(tag + 1), Acknowledger: admissionAcknowledger{}}}
+					l.pending <- laneDelivery{DeliveryTag: uint64(tag + 1), Acknowledger: admissionAcknowledger{}}
 				}
 			}
 			t.Cleanup(func() {
@@ -238,8 +235,7 @@ func TestConsumerAdmissionRefillsOnlyAfterSettlement(t *testing.T) {
 				waitForwarderDone(t, c)
 			})
 			for _, l := range c.lanes {
-				c.forward.Add(1)
-				go c.emitMessages(l)
+				c.forward.Go(func() { c.emitMessages(l) })
 			}
 			read := func() driver.InboundMessage {
 				select {
@@ -304,10 +300,9 @@ func TestConsumerReattachReleasesCancelledAdmission(t *testing.T) {
 		c.stopSignals()
 		waitForwarderDone(t, c)
 	})
-	c.forward.Add(1)
-	go c.emitMessages(l)
+	c.forward.Go(func() { c.emitMessages(l) })
 	push := func(tag, generation uint64) {
-		l.pending <- laneDelivery{Delivery: amqp.Delivery{DeliveryTag: tag, Acknowledger: admissionAcknowledger{}}, generation: generation}
+		l.pending <- laneDelivery{DeliveryTag: tag, Acknowledger: admissionAcknowledger{}, generation: generation}
 	}
 	read := func(what string) driver.InboundMessage {
 		t.Helper()
@@ -839,8 +834,7 @@ func TestConsumerStopResumesAfterReleaseClaimsBeforeDrain(t *testing.T) {
 		joinTeardownFixture(t, c, &calls)
 		c.readers.Wait()
 	})
-	c.readers.Add(1)
-	go c.readDeliveries(second)
+	c.readers.Go(func() { c.readDeliveries(second) })
 	stop := startTeardownCall(t, c, &calls, func() error { return c.Stop(ctx) })
 	awaitTeardownSignal(t, ctx.beforeDrain, stop, "Stop before Drain")
 	release := startTeardownCall(t, c, &calls, func() error { return c.Release(releaseCtx) })
@@ -901,8 +895,7 @@ func TestConsumerStopKeepsSuccessfulDrainCloseUnbounded(t *testing.T) {
 		joinTeardownFixture(t, c, &calls)
 		c.forward.Wait()
 	})
-	c.forward.Add(1)
-	go c.emitMessages(&lane{owner: c, pending: make(chan laneDelivery)})
+	c.forward.Go(func() { c.emitMessages(&lane{owner: c, pending: make(chan laneDelivery)}) })
 	stop := startTeardownCall(t, c, &calls, func() error { return c.Stop(ctx) })
 	awaitTeardownSignal(t, forwarderExiting, stop, "Drain stopping the forwarder")
 	// Drain closes forwarderStopC and snapshots lanes under mu. The forwarder

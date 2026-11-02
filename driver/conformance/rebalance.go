@@ -554,8 +554,8 @@ func rebalanceGroupName(group *groupContext, t *testing.T) string {
 // check name, mapped to the characters a group identifier accepts.
 func rebalanceCheckScope(t *testing.T) string {
 	name := t.Name()
-	if index := strings.LastIndexByte(name, '/'); index >= 0 {
-		name = name[index+1:]
+	if _, last, found := strings.CutLast(name, "/"); found {
+		name = last
 	}
 	return strings.Map(func(r rune) rune {
 		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '_' {

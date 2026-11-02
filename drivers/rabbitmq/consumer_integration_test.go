@@ -240,7 +240,7 @@ func TestStopReleasesReaderBlockedOnFullLane(t *testing.T) {
 		built.messages <- driver.InboundMessage{}
 	}
 	for deliveryTag := range cap(consumerLane.pending) {
-		consumerLane.pending <- laneDelivery{Delivery: amqp.Delivery{DeliveryTag: uint64(deliveryTag + 1)}, generation: 1}
+		consumerLane.pending <- laneDelivery{DeliveryTag: uint64(deliveryTag + 1), generation: 1}
 	}
 	waitForwarderState(t, "paused forwarder", func() bool {
 		consumerLane.mu.Lock()
@@ -651,13 +651,13 @@ func TestNewConsumerRollsBackAfterLateFailure(t *testing.T) {
 	for range cap(built.messages) {
 		built.messages <- driver.InboundMessage{}
 	}
-	firstLane.pending <- laneDelivery{Delivery: amqp.Delivery{DeliveryTag: 1001}, generation: 1}
+	firstLane.pending <- laneDelivery{DeliveryTag: 1001, generation: 1}
 	waitForwarderState(t, "paused first-lane forwarder", func() bool {
 		firstLane.mu.Lock()
 		defer firstLane.mu.Unlock()
 		return firstLane.emitting == 1
 	})
-	firstLane.pending <- laneDelivery{Delivery: amqp.Delivery{DeliveryTag: 1002}, generation: 1}
+	firstLane.pending <- laneDelivery{DeliveryTag: 1002, generation: 1}
 
 	raw, err := amqp.Dial(defaultEndpoint)
 	if err != nil {

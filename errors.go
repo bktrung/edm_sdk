@@ -162,9 +162,18 @@ func IsTerminal(err error) bool {
 	if err == nil {
 		return false
 	}
-	var classified *classifiedError
-	if errors.As(err, &classified) && classified.terminal {
+	// Each node is checked by its own type and its As method, not by
+	// errors.As: errors.As searches the whole subtree below the node, so
+	// calling it at every node revisits each subtree once per ancestor and a
+	// chain of depth n costs about n*n/2 Unwrap calls.
+	if classified, ok := err.(*classifiedError); ok && classified.terminal { //nolint:errorlint // this node only; errors.As here would search the subtree again
 		return true
+	}
+	if asser, ok := err.(interface{ As(any) bool }); ok {
+		var classified *classifiedError
+		if asser.As(&classified) && classified.terminal {
+			return true
+		}
 	}
 	if joined, ok := err.(interface{ Unwrap() []error }); ok {
 		return slices.ContainsFunc(joined.Unwrap(), IsTerminal)
@@ -178,6 +187,6 @@ func IsTerminal(err error) bool {
 // IsDropped reports whether the first classified error in err's error tree is
 // marked dropped.
 func IsDropped(err error) bool {
-	var classified *classifiedError
-	return errors.As(err, &classified) && classified.dropped
+	classified, ok := errors.AsType[*classifiedError](err)
+	return ok && classified.dropped
 }

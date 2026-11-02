@@ -1,6 +1,8 @@
 package sched
 
 import (
+	"errors"
+	"slices"
 	"testing"
 	"time"
 
@@ -231,6 +233,74 @@ func TestSchedulerValidationDepthPendingAndCapacity(t *testing.T) {
 	}
 	if _, _, ok := scheduler.Next(); !ok || scheduler.Pending() != 0 {
 		t.Fatal("queued item was not drained")
+	}
+}
+
+func TestLaneKeepsArrivalOrderAcrossBufferWrap(t *testing.T) {
+	scheduler, err := New([]LaneSpec{{ID: "x", Weight: 1, Capacity: 3}}, clock.NewFake(time.Unix(0, 0)), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got []int
+	next := func(count int) {
+		t.Helper()
+		for range count {
+			item, _, ok := scheduler.Next()
+			if !ok {
+				t.Fatal("scheduler unexpectedly empty")
+			}
+			got = append(got, item.Value.(int))
+		}
+	}
+	enqueue := func(values ...int) {
+		t.Helper()
+		for _, value := range values {
+			if err := scheduler.Enqueue("x", Item{Value: value}); err != nil {
+				t.Fatalf("enqueue %d: %v", value, err)
+			}
+		}
+	}
+	enqueue(1, 2)
+	next(1)
+	// Item 4 is written past the end of the buffer, into the slot item 1 vacated.
+	enqueue(3, 4)
+	if err := scheduler.Enqueue("x", Item{Value: 0}); !errors.Is(err, ErrLaneFull) {
+		t.Fatalf("enqueue into wrapped full lane = %v, want ErrLaneFull", err)
+	}
+	// Reading item 4 moves the head past the end of the buffer.
+	next(3)
+	enqueue(5, 6, 7)
+	next(3)
+	if want := []int{1, 2, 3, 4, 5, 6, 7}; !slices.Equal(got, want) {
+		t.Fatalf("dispatch order = %v, want %v", got, want)
+	}
+}
+
+func TestLaneFillAndDrainDoesNotAllocate(t *testing.T) {
+	const capacity = 8
+	start := time.Unix(0, 0)
+	scheduler, err := New([]LaneSpec{{ID: "x", Weight: 1, Capacity: capacity}}, clock.NewFake(start), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	item := Item{EnqueuedAt: start}
+	// One run fills the lane and drains it, so a queue that reallocates on refill
+	// costs at least one allocation per run rather than a fraction that
+	// AllocsPerRun would truncate to zero.
+	allocs := testing.AllocsPerRun(100, func() {
+		for range capacity {
+			if err := scheduler.Enqueue("x", item); err != nil {
+				t.Fatal(err)
+			}
+		}
+		for range capacity {
+			if _, _, ok := scheduler.Next(); !ok {
+				t.Fatal("scheduler unexpectedly empty")
+			}
+		}
+	})
+	if allocs != 0 {
+		t.Fatalf("fill and drain allocations per run = %v, want 0", allocs)
 	}
 }
 

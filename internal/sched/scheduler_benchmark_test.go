@@ -76,3 +76,39 @@ func newBenchmarkScheduler(promoteOverdue, overdue bool) (*Scheduler, int) {
 	}
 	return scheduler, slotCount * lanesPerSlot * itemsPerLane
 }
+
+// BenchmarkLaneFillDrain measures one lane filled to capacity and drained
+// through the public API per op. A whole fill and drain is one op so a
+// queue that reallocates as it refills costs at least one allocation per op
+// instead of an amortized fraction that would round to zero.
+func BenchmarkLaneFillDrain(b *testing.B) {
+	const capacity = 8
+	start := time.Unix(0, 0)
+	scheduler, err := New([]LaneSpec{{ID: "lane", Weight: 1, Capacity: capacity}}, clock.NewFake(start), false)
+	if err != nil {
+		b.Fatal(err)
+	}
+	item := Item{EnqueuedAt: start}
+	// One enqueue and pop offsets the head so every later fill crosses the end
+	// of the buffer.
+	if err := scheduler.Enqueue("lane", item); err != nil {
+		b.Fatal(err)
+	}
+	if _, _, ok := scheduler.Next(); !ok {
+		b.Fatal("scheduler unexpectedly empty")
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for range b.N {
+		for range capacity {
+			if err := scheduler.Enqueue("lane", item); err != nil {
+				b.Fatal(err)
+			}
+		}
+		for range capacity {
+			if _, _, ok := scheduler.Next(); !ok {
+				b.Fatal("scheduler unexpectedly empty")
+			}
+		}
+	}
+}

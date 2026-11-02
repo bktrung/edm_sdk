@@ -79,8 +79,8 @@ func runPublish(group *groupContext) {
 			driver.OutboundMessage{Destination: "publish.partial", Body: []byte("accepted")},
 			driver.OutboundMessage{Destination: "publish.missing", Body: []byte("rejected")},
 		)
-		var publishErr *driver.PublishError
-		if !errors.As(err, &publishErr) {
+		publishErr, ok := errors.AsType[*driver.PublishError](err)
+		if !ok {
 			t.Fatalf("Publish() error = %v, want *driver.PublishError", err)
 		}
 		if len(publishErr.Failed) != 1 {
@@ -123,8 +123,8 @@ func runPublish(group *groupContext) {
 			driver.OutboundMessage{Destination: "publish.total.missing-a"},
 			driver.OutboundMessage{Destination: "publish.total.missing-b"},
 		)
-		var publishErr *driver.PublishError
-		if !errors.As(err, &publishErr) {
+		publishErr, ok := errors.AsType[*driver.PublishError](err)
+		if !ok {
 			t.Fatalf("Publish() error = %v, want *driver.PublishError", err)
 		}
 		if len(publishErr.Failed) != 2 {
@@ -307,8 +307,8 @@ func runPublish(group *groupContext) {
 
 func assertTooLargePublish(t *testing.T, err error, index int) {
 	t.Helper()
-	var publishErr *driver.PublishError
-	if !errors.As(err, &publishErr) {
+	publishErr, ok := errors.AsType[*driver.PublishError](err)
+	if !ok {
 		t.Fatalf("Publish() error = %v, want *driver.PublishError", err)
 	}
 	failure, ok := publishErr.Failed[index]

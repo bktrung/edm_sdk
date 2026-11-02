@@ -549,8 +549,8 @@ func assertFaultError(t *testing.T, err error, wantKind driver.Kind) {
 	if err == nil {
 		t.Fatalf("error=nil, want %s", wantKind)
 	}
-	var classified driver.ClassifiedError
-	if !errors.As(err, &classified) {
+	classified, ok := errors.AsType[driver.ClassifiedError](err)
+	if !ok {
 		t.Fatalf("error %v is not classified, want %v", err, wantKind)
 	}
 	if classified.Kind() != wantKind {

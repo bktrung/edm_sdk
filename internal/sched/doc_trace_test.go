@@ -215,11 +215,11 @@ func appendDocEnqueueStep(scenario *docScenario, fake *clock.Fake, scheduler *Sc
 func appendDocAdvanceStep(t *testing.T, scenario *docScenario, fake *clock.Fake, scheduler *Scheduler, laneID string) {
 	t.Helper()
 	lane := scheduler.byID[laneID]
-	if lane == nil || len(lane.items) == 0 {
+	if lane == nil || lane.depth() == 0 {
 		t.Fatalf("advance caption lane %q has no queued item", laneID)
 	}
 	step := newDocStep(scenario, fake, scheduler, "advance", "", false)
-	wait := fake.Now().Sub(lane.items[0].EnqueuedAt)
+	wait := fake.Now().Sub(lane.oldest().EnqueuedAt)
 	step.Caption = fmt.Sprintf(
 		"The oldest %s item has waited %d ms against its %d ms wait limit.",
 		laneID,
@@ -297,7 +297,7 @@ func schedulerDocSnapshot(scheduler *Scheduler) ([]docScore, []docDepth) {
 	for _, group := range scheduler.slots {
 		scores = append(scores, docScore{Group: group.id, Score: group.deficit})
 		for _, lane := range group.lanes {
-			depths = append(depths, docDepth{Lane: lane.spec.ID, Depth: len(lane.items)})
+			depths = append(depths, docDepth{Lane: lane.spec.ID, Depth: lane.depth()})
 		}
 	}
 	return scores, depths
@@ -310,10 +310,10 @@ func schedulerDocScores(scheduler *Scheduler) []docScore {
 
 func schedulerDocLaneTiming(scheduler *Scheduler, laneID string) (time.Duration, time.Duration) {
 	lane := scheduler.byID[laneID]
-	if lane == nil || len(lane.items) == 0 {
+	if lane == nil || lane.depth() == 0 {
 		return 0, 0
 	}
-	return scheduler.clock.Now().Sub(lane.items[0].EnqueuedAt), lane.spec.Budget
+	return scheduler.clock.Now().Sub(lane.oldest().EnqueuedAt), lane.spec.Budget
 }
 
 func docScoreFor(group string, scores []docScore) int {

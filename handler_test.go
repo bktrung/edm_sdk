@@ -5,10 +5,9 @@ import (
 	"errors"
 	"reflect"
 	"strings"
+	"sync"
 	"testing"
 	"time"
-
-	"golang.org/x/sync/errgroup"
 
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/codec"
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/driver"
@@ -259,10 +258,10 @@ func TestReturnedLeftoverReleasesBudget(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = client.Close(context.Background()) })
 	runner := &Runner{
-		client: client, asyncGroup: new(errgroup.Group),
+		client: client, asyncGroup: new(sync.WaitGroup),
 		subscription: Subscription{Name: "returned-leftover", Concurrency: 2, HandlerTimeout: time.Minute},
 	}
-	t.Cleanup(func() { _ = runner.asyncGroup.Wait() })
+	t.Cleanup(func() { runner.asyncGroup.Wait() })
 	abandon := func() chan struct{} {
 		t.Helper()
 		release := make(chan struct{})
@@ -292,9 +291,7 @@ func TestReturnedLeftoverReleasesBudget(t *testing.T) {
 	first <- struct{}{}
 	// Joining only the released invocation establishes completion without
 	// polling the private counter or introducing a production test hook.
-	if err := runner.asyncGroup.Wait(); err != nil {
-		t.Fatal(err)
-	}
+	runner.asyncGroup.Wait()
 	abandon()
 	handled := false
 	result := invokeHandler(runner, context.Background(), HandlerFunc(func(context.Context, *Event) error {

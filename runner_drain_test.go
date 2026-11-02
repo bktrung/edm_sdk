@@ -560,8 +560,9 @@ func drainTestGate(t *testing.T) (chan struct{}, func()) {
 func startRebuildDrainRunner(t *testing.T, probe *drainProbeConsumer, observer Observer, open func(context.Context) (driver.Consumer, error)) (*Runner, *Client, *rebuildDrainContext, <-chan error, <-chan struct{}) {
 	t.Helper()
 	conn := &rebuildDrainConn{
-		dispatchConn: dispatchConn{producer: &dispatchProducer{}, admin: &dispatchAdmin{}},
-		open:         open,
+		producer: &dispatchProducer{},
+		admin:    &dispatchAdmin{},
+		open:     open,
 	}
 	client, err := New(context.Background(), testClientConfig(t),
 		WithDriver(&rebuildDrainDriver{conn: conn}), WithObserver(observer),
@@ -812,7 +813,7 @@ func TestRunnerDrainDuringFailedOpenRebuildWaitJoinsTheOwningTeardown(t *testing
 				// Only cleanup reads events then; it never competes with the owner.
 				joined := make(chan struct{})
 				go func() {
-					_ = runner.asyncGroup.Wait()
+					runner.asyncGroup.Wait()
 					close(joined)
 				}()
 				for {
@@ -876,9 +877,7 @@ func TestRunnerDrainDuringFailedOpenRebuildWaitJoinsTheOwningTeardown(t *testing
 			// Drain has finished registering async work. In this fixture there
 			// are no pending application callbacks; a stranded DrainDone sender
 			// is therefore detected by joining the group, not counting goroutines.
-			if err := runner.asyncGroup.Wait(); err != nil {
-				t.Fatal(err)
-			}
+			runner.asyncGroup.Wait()
 		})
 	}
 }

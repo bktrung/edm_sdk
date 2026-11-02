@@ -749,8 +749,9 @@ func TestDiscardCallbackIsSuppressedAfterRequeueFallback(t *testing.T) {
 				callbacks := 0
 				runner.subscription.OnDiscarded = func(context.Context, Discarded) { callbacks++ }
 				settler := &discardAckSettler{
-					scriptedNackSettler: scriptedNackSettler{failFirst: test.failNacks, outstanding: true},
-					failAcks:            1 + settlementRetryAttempts,
+					failFirst:   test.failNacks,
+					outstanding: true,
+					failAcks:    1 + settlementRetryAttempts,
 				}
 				envelope := Envelope{SpecVersion: "1.0", ID: "discard-requeue", Source: "/test/orders", Type: "orders.created.v1", Priority: PriorityHigh, Attempt: 1}
 				message := retryBridgeMessage(t, envelope, settler)

@@ -360,6 +360,161 @@ func TestOpenGivesUpOnlyAfterTheRefusalRepeats(t *testing.T) {
 	}
 }
 
+// vhostRefusingEndpoint starts a broker stand-in that accepts the credentials,
+// reads the client's connection.open, and answers it with the connection.close
+// a RabbitMQ broker sends for a vhost it will not open: code 530 with reason.
+// The returned function reports the dials it answered.
+func vhostRefusingEndpoint(t *testing.T, reason string) (string, func() int) {
+	t.Helper()
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var dials atomic.Int64
+	t.Cleanup(func() { _ = listener.Close() })
+	go func() {
+		for {
+			socket, acceptErr := listener.Accept()
+			if acceptErr != nil {
+				return
+			}
+			dials.Add(1)
+			go refuseConnectionOpen(socket, reason)
+		}
+	}()
+	return "amqp://guest:guest@" + listener.Addr().String() + "/missing", func() int { return int(dials.Load()) }
+}
+
+// refuseConnectionOpen runs the handshake through connection.tune, reads the
+// client's tune-ok and connection.open, and answers with connection.close.
+func refuseConnectionOpen(socket net.Conn, reason string) {
+	defer socket.Close()
+	if err := socket.SetDeadline(clock.NewReal().Now().Add(time.Second)); err != nil {
+		return
+	}
+	if _, err := io.ReadFull(socket, make([]byte, 8)); err != nil {
+		return
+	}
+	if _, err := socket.Write(connectionStartFrame()); err != nil {
+		return
+	}
+	if readFrame(socket) != nil {
+		return
+	}
+	// connection.tune: channel-max 0, frame-max 131072, heartbeat 0.
+	tune := binary.BigEndian.AppendUint32([]byte{0, 10, 0, 30, 0, 0}, 131072)
+	if _, err := socket.Write(methodFrame(append(tune, 0, 0))); err != nil {
+		return
+	}
+	// tune-ok, then connection.open.
+	for range 2 {
+		if readFrame(socket) != nil {
+			return
+		}
+	}
+	// connection.close: reply code, reply text, and connection.open (10, 40) as
+	// the method that failed.
+	closing := binary.BigEndian.AppendUint16([]byte{0, 10, 0, 50}, amqp.NotAllowed)
+	closing = append(append(closing, byte(len(reason))), reason...) //nolint:gosec // every reason is a short literal from the test table
+	if _, err := socket.Write(methodFrame(append(closing, 0, 10, 0, 40))); err != nil {
+		return
+	}
+	_ = readFrame(socket)
+}
+
+// methodFrame wraps a method payload in a frame on channel 0.
+func methodFrame(payload []byte) []byte {
+	frame := binary.BigEndian.AppendUint32([]byte{1, 0, 0}, uint32(len(payload))) //nolint:gosec // payloads are a few dozen bytes built in this file
+	frame = append(frame, payload...)
+	return append(frame, 0xce)
+}
+
+// readFrame reads and discards one frame.
+func readFrame(socket net.Conn) error {
+	header := make([]byte, 7)
+	if _, err := io.ReadFull(socket, header); err != nil {
+		return err
+	}
+	_, err := io.ReadFull(socket, make([]byte, int(binary.BigEndian.Uint32(header[3:7]))+1))
+	return err
+}
+
+// TestOpenClassifiesAVhostRefusal covers the 530 a broker answers
+// connection.open with. A vhost that does not exist or that the user may not
+// access is refused the way rejected credentials are, after the same passes and
+// well before the connect timeout. A reached connection limit shares the code
+// and stays a transient failure Open keeps retrying until that timeout. The
+// reasons are the texts the RabbitMQ fixture sends.
+func TestOpenClassifiesAVhostRefusal(t *testing.T) {
+	tests := []struct {
+		name   string
+		reason string
+		want   driver.Kind
+	}{
+		{
+			name:   "missing vhost",
+			reason: "NOT_ALLOWED - vhost missing not found",
+			want:   driver.KindPermission,
+		},
+		{
+			name:   "access refused",
+			reason: "NOT_ALLOWED - access to vhost 'missing' refused for user 'guest'",
+			want:   driver.KindPermission,
+		},
+		{
+			name:   "connection limit",
+			reason: "NOT_ALLOWED - access to vhost 'missing' refused for user 'guest': connection limit (0) is reached",
+			want:   driver.KindTransient,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			retryWait := openRetryWait
+			// Twice the refusal budget of passes run back to back, so a limit
+			// classified as a refusal would end Open on the budget. After that
+			// a still-retrying Open waits the timeout out instead of redialing
+			// in a tight loop.
+			waits := 0
+			openRetryWait = func(ctx context.Context) error {
+				waits++
+				if waits <= 40 {
+					return nil
+				}
+				<-ctx.Done()
+				return ctx.Err()
+			}
+			t.Cleanup(func() { openRetryWait = retryWait })
+			endpoint, dials := vhostRefusingEndpoint(t, test.reason)
+			_, err := (Driver{}).Open(context.Background(), driver.Config{
+				Endpoints:      []string{endpoint},
+				ConnectTimeout: 500 * time.Millisecond,
+			})
+			if kind, _ := driver.Classify(err); kind != test.want {
+				t.Fatalf("Open() error = %v (kind %v), want kind %v", err, kind, test.want)
+			}
+			amqpErr, ok := errors.AsType[*amqp.Error](err)
+			if !ok || amqpErr.Code != amqp.NotAllowed || amqpErr.Reason != test.reason {
+				t.Fatalf("Open() error = %v, want the broker's 530 %q in the chain", err, test.reason)
+			}
+			timedOut := errors.Is(err, context.DeadlineExceeded)
+			if test.want == driver.KindTransient {
+				if !timedOut {
+					t.Fatalf("Open() error = %v, want the connect timeout for a limit that may clear", err)
+				}
+				return
+			}
+			if timedOut {
+				t.Fatal("Open() waited for the connect timeout instead of giving up on the refusal")
+			}
+			// The same 20 passes a credential refusal gets, one dial per pass.
+			const wantDials = 20
+			if got := dials(); got != wantDials {
+				t.Fatalf("Open dialed %d time(s), want %d", got, wantDials)
+			}
+		})
+	}
+}
+
 // TestOpenJoinsTheBrokerRefusalIntoATimeout covers a pass in which one endpoint
 // refuses the credentials and another fails transiently. Open keeps trying for
 // the endpoint that may recover and ends on the connect timeout, and the error

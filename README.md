@@ -99,7 +99,7 @@ go get fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk@v0.1.0
 import f1 "fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk"
 ```
 
-This module requires Go 1.26 or newer. The drivers are tested against RabbitMQ 4.3.4 and Kafka 4.2.1.
+This module requires Go 1.27 or newer. The drivers are tested against RabbitMQ 4.3.4 and Kafka 4.2.1.
 
 Set `GOPRIVATE=fgit.zapps.vn` before the first `go get` of this module. `GOPRIVATE` skips the
 public proxy and checksum database but does not authenticate; `go get` also needs Git credentials

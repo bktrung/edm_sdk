@@ -2,6 +2,7 @@ package f1
 
 import (
 	"bytes"
+	"cmp"
 	"errors"
 	"fmt"
 	"math"
@@ -236,51 +237,31 @@ func resolvePrefetch(prefetch, brokerDefault int) int {
 
 func normalizeConfig(cfg Config) Config {
 	defaults := defaultConfig()
-	if cfg.Codec.Default == "" {
-		cfg.Codec.Default = defaults.Codec.Default
-	}
-	if cfg.Codec.MaxBodyBytes == 0 {
-		cfg.Codec.MaxBodyBytes = defaults.Codec.MaxBodyBytes
-	}
-	if cfg.Codec.MaxHeaderBytes == 0 {
-		cfg.Codec.MaxHeaderBytes = defaults.Codec.MaxHeaderBytes
-	}
+	cfg.Codec.Default = cmp.Or(cfg.Codec.Default, defaults.Codec.Default)
+	cfg.Codec.MaxBodyBytes = cmp.Or(cfg.Codec.MaxBodyBytes, defaults.Codec.MaxBodyBytes)
+	cfg.Codec.MaxHeaderBytes = cmp.Or(cfg.Codec.MaxHeaderBytes, defaults.Codec.MaxHeaderBytes)
 
 	if len(cfg.Topology.Priorities) == 0 {
 		cfg.Topology.Priorities = append([]Priority(nil), defaults.Topology.Priorities...)
 	}
-	if cfg.Lifecycle.DrainTimeout == 0 {
-		cfg.Lifecycle.DrainTimeout = defaults.Lifecycle.DrainTimeout
-	}
-	if cfg.Lifecycle.HandlerGrace == 0 {
-		cfg.Lifecycle.HandlerGrace = defaults.Lifecycle.HandlerGrace
-	}
-	if cfg.Lifecycle.CloseTimeout == 0 {
-		cfg.Lifecycle.CloseTimeout = defaults.Lifecycle.CloseTimeout
-	}
-	if cfg.Lifecycle.RebalanceDrainTimeout == 0 {
-		cfg.Lifecycle.RebalanceDrainTimeout = defaults.Lifecycle.RebalanceDrainTimeout
-	}
+	cfg.Lifecycle.DrainTimeout = cmp.Or(cfg.Lifecycle.DrainTimeout, defaults.Lifecycle.DrainTimeout)
+	cfg.Lifecycle.HandlerGrace = cmp.Or(cfg.Lifecycle.HandlerGrace, defaults.Lifecycle.HandlerGrace)
+	cfg.Lifecycle.CloseTimeout = cmp.Or(cfg.Lifecycle.CloseTimeout, defaults.Lifecycle.CloseTimeout)
+	cfg.Lifecycle.RebalanceDrainTimeout = cmp.Or(cfg.Lifecycle.RebalanceDrainTimeout, defaults.Lifecycle.RebalanceDrainTimeout)
 	if cfg.Subscriptions == nil {
 		return cfg
 	}
 	subscriptions := make(map[string]SubscriptionConfig, len(cfg.Subscriptions))
 	subDefaults := defaultSubscription()
 	for name, subscription := range cfg.Subscriptions {
-		if subscription.Concurrency == 0 {
-			subscription.Concurrency = subDefaults.Concurrency
-		}
+		subscription.Concurrency = cmp.Or(subscription.Concurrency, subDefaults.Concurrency)
 		if len(subscription.Priorities) == 0 {
 			subscription.Priorities = append([]Priority(nil), subDefaults.Priorities...)
 		}
-		if subscription.Retry.MaxAttempts == 0 {
-			subscription.Retry.MaxAttempts = subDefaults.Retry.MaxAttempts
-		}
+		subscription.Retry.MaxAttempts = cmp.Or(subscription.Retry.MaxAttempts, subDefaults.Retry.MaxAttempts)
 		subscription.Fairness = mergeFairness(subDefaults.Fairness, subscription.Fairness)
 		subscription.Prefetch = resolvePrefetch(subscription.Prefetch, cfg.Broker.DefaultPrefetch)
-		if subscription.HandlerTimeout == 0 {
-			subscription.HandlerTimeout = subDefaults.HandlerTimeout
-		}
+		subscription.HandlerTimeout = cmp.Or(subscription.HandlerTimeout, subDefaults.HandlerTimeout)
 		subscriptions[name] = subscription
 	}
 	cfg.Subscriptions = subscriptions

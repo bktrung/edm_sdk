@@ -735,11 +735,11 @@ func (a *adminOperations) openChannel(ctx context.Context) (*amqp.Channel, error
 }
 
 func isNotFound(err error) bool {
-	var amqpErr *amqp.Error
-	return errors.As(err, &amqpErr) && amqpErr.Code == 404
+	amqpErr, ok := errors.AsType[*amqp.Error](err)
+	return ok && amqpErr.Code == 404
 }
 
 func isPermission(err error) bool {
-	var amqpErr *amqp.Error
-	return errors.As(err, &amqpErr) && amqpErr.Code == 403
+	amqpErr, ok := errors.AsType[*amqp.Error](err)
+	return ok && amqpErr.Code == 403
 }

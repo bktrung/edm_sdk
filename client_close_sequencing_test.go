@@ -101,8 +101,9 @@ func TestClientCloseReturnsBareConnCloseErrorWhenProducerCloseSucceeds(t *testin
 	producer := &recordingProducer{}
 	connErr := errors.New("conn close failed")
 	conn := &failingCloseConn{
-		publishConn: publishConn{producer: producer, info: driver.BrokerInfo{Kind: "test", Version: "1"}},
-		closeErr:    connErr,
+		producer: producer,
+		info:     driver.BrokerInfo{Kind: "test", Version: "1"},
+		closeErr: connErr,
 	}
 	client, err := New(context.Background(), testClientConfig(t), WithDriver(&failingCloseDriver{conn: conn}))
 	if err != nil {

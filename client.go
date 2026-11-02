@@ -1,6 +1,7 @@
 package f1
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
@@ -733,14 +734,12 @@ func (c *Client) drainRunners(ctx context.Context, runners []*Runner) error {
 	return runWithClockTimeout(ctx, c.options.clock, c.config.Lifecycle.ConsumerDrainTimeout, "consumer drain", func(drainCtx context.Context) error {
 		runnerErrors := make(chan error, len(runners))
 		var drain sync.WaitGroup
-		drain.Add(len(runners))
 		for _, runner := range runners {
-			go func(runner *Runner) {
-				defer drain.Done()
+			drain.Go(func() {
 				if err := runner.Drain(drainCtx); err != nil {
 					runnerErrors <- err
 				}
-			}(runner)
+			})
 		}
 		drain.Wait()
 		close(runnerErrors)
@@ -1204,15 +1203,12 @@ func endPublish(c *Client) {
 func driverConfig(cfg Config, logger *slog.Logger) driver.Config {
 	result := driver.Config{
 		Endpoints:             append([]string(nil), cfg.Broker.Endpoints...),
-		ClientID:              cfg.InstanceID,
+		ClientID:              cmp.Or(cfg.InstanceID, cfg.Service),
 		InstanceID:            cfg.InstanceID,
 		RebalanceDrainTimeout: cfg.Lifecycle.RebalanceDrainTimeout,
 		ConnectTimeout:        cfg.Broker.ConnectTimeout,
 		Logger:                logger,
 		DriverOptions:         cloneOptions(cfg.Broker.DriverOptions),
-	}
-	if result.ClientID == "" {
-		result.ClientID = cfg.Service
 	}
 	if cfg.Broker.TLS.Enabled {
 		tls := cfg.Broker.TLS

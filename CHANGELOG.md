@@ -89,6 +89,14 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 - RabbitMQ documentation corrects how the 4.3 delivery limit counts: a graceful shutdown, which
   returns unstarted messages with a requeue nack, does not use up a message's broker retries,
   while losing the channel or connection does.
+- Direct dependencies move to their newest releases: `github.com/twmb/franz-go` v1.21.6 to
+  v1.22.2, `github.com/twmb/franz-go/pkg/kadm` v1.18.0 to v1.19.0, `github.com/twmb/franz-go/pkg/kmsg`
+  v1.13.1 to v1.15.0, `github.com/rabbitmq/amqp091-go` v1.14.0 to v1.16.0, `github.com/stretchr/testify`
+  v1.11.1 to v1.12.1, and the `go.opentelemetry.io/otel`, `otel/metric`, `otel/sdk`, `otel/sdk/metric`
+  and `otel/trace` modules v1.45.0 to v1.47.0. Indirect dependencies move too: `klauspost/compress`
+  v1.18.7 to v1.20.3, `pierrec/lz4/v4` v4.1.26 to v4.1.33, and `golang.org/x/sys` v0.47.0 to
+  v0.49.0. `golang.org/x/crypto` is no longer required.
+- The root module no longer requires `golang.org/x/sync`, so applications' go.sum files lose it.
 
 ### Removed
 
@@ -213,6 +221,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ### Upgrade notes
 
+- The module requires Go 1.27 or newer, up from Go 1.26. Builds with Go 1.26 no longer compile
+  the module, so callers on Go 1.26 must move their toolchain to 1.27 before upgrading F1.
 - RabbitMQ: the parking queues 0.1.0 declared, `<destination>.park.<rung>` and
   `<destination>.park.fixed-<N>ms`, are no longer used. Messages already in them still return to
   their destination when their delay ends. `EnsureTopology` reports those queues as orphaned,

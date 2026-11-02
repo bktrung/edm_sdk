@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"log/slog"
 	"slices"
-	"sort"
 	"strings"
 	"time"
 
@@ -297,8 +296,8 @@ func (p *Publisher) PublishBatch(ctx context.Context, messages []Message) (Batch
 
 	warnPublishError(p.client.options.logger, observeCtx, publishErr)
 	requestReconnectOnTransient(ctx, p.client, publishErr, epoch)
-	var partial *driver.PublishError
-	if errors.As(publishErr, &partial) && len(partial.Failed) > 0 && !failedIndexesInRange(partial.Failed, len(ids)) {
+	partial, ok := errors.AsType[*driver.PublishError](publishErr)
+	if ok && len(partial.Failed) > 0 && !failedIndexesInRange(partial.Failed, len(ids)) {
 		// A failure the report cannot place on a message leaves no way to tell
 		// which messages were published, so the whole batch reads as failed.
 		publishErr = fmt.Errorf("f1: the driver reported a failed message outside the batch: %w", publishErr)
@@ -312,7 +311,7 @@ func (p *Publisher) PublishBatch(ctx context.Context, messages []Message) (Batch
 		for index := range partial.Failed {
 			failed = append(failed, index)
 		}
-		sort.Ints(failed)
+		slices.Sort(failed)
 		for _, index := range failed {
 			cause := partial.Failed[index]
 			if cause == nil {
@@ -377,7 +376,7 @@ func warnPublishError(logger *slog.Logger, ctx context.Context, err error) {
 		for index := range partial.Failed {
 			indexes = append(indexes, index)
 		}
-		sort.Ints(indexes)
+		slices.Sort(indexes)
 		for _, index := range indexes {
 			warnUnclassifiedWithContext(logger, ctx, partial.Failed[index])
 		}
@@ -561,36 +560,27 @@ func buildOutbound(ctx, observeCtx context.Context, c *Client, options clientOpt
 		finish.Outcome = ObserverOutcomeOK
 		guard.finishWith(finish)
 	}
-	headers := make([]driver.Header, 0, len(headerMap))
-	keys := make([]string, 0, len(headerMap))
-	for key := range headerMap {
-		keys = append(keys, key)
-	}
-	sort.Strings(keys)
-	for _, key := range keys {
-		headers = append(headers, driver.Header{Key: key, Value: []byte(headerMap[key])})
-	}
 	return driver.OutboundMessage{
 		Destination: entryPoint,
 		EntryPoint:  isFanoutEntryPoint(effective),
 		Key:         []byte(partitionKey),
-		Headers:     headers,
+		Headers:     headerSlice(headerMap),
 		Body:        body,
 		Priority:    priorityHint(publish.priority),
 	}, id, nil
 }
 
 func topicFor(eventType string) string {
-	index := strings.LastIndex(eventType, ".v")
-	if index < 0 || index+2 == len(eventType) {
+	before, after, found := strings.CutLast(eventType, ".v")
+	if !found || after == "" {
 		return eventType
 	}
-	for _, char := range eventType[index+2:] {
+	for _, char := range after {
 		if char < '0' || char > '9' {
 			return eventType
 		}
 	}
-	return eventType[:index]
+	return before
 }
 
 func validatePublishTopic(options clientOptions, topic, topicInput string) error {

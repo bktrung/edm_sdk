@@ -243,11 +243,9 @@ func newConsumer(conn *conn, cfg driver.ConsumerConfig) (*consumer, error) {
 		c.lanes = append(c.lanes, lane)
 		c.byName[destination] = lane
 		c.mu.Unlock()
-		c.readers.Add(1)
-		c.forward.Add(1)
+		c.readers.Go(func() { c.readDeliveries(lane) })
+		c.forward.Go(func() { c.emitMessages(lane) })
 		c.events.Add(2)
-		go c.readDeliveries(lane)
-		go c.emitMessages(lane)
 		go c.watchClose(closes)
 		go c.watchCancel(lane, cancels)
 		if hook := consumerConstructionHook; hook != nil {
@@ -556,8 +554,10 @@ func (c *consumer) awaitAttachment(lane *lane, drained uint64) bool {
 // watchCancel to attach a replacement, and the forwarder and the pending
 // channel stay exactly as they were, so a recovered lane does not look like a
 // restart to the application.
+//
+// It runs under c.readers.Go, whose Done follows this return, so the close of
+// lane.pending is done before any c.readers.Wait returns.
 func (c *consumer) readDeliveries(lane *lane) {
-	defer c.readers.Done()
 	defer close(lane.pending)
 	drained := uint64(0)
 	for {
@@ -592,12 +592,14 @@ func (c *consumer) readDeliveries(lane *lane) {
 // holds before admission; stale-generation deliveries need no window place.
 // An admitted message abandoned at teardown is released locally with c.release;
 // its delivery returns to the queue when the channel closes.
+//
+// It runs under c.forward.Go, whose Done follows this return, so the exit hook
+// has run before any c.forward.Wait returns.
 func (c *consumer) emitMessages(lane *lane) {
 	defer func() {
 		if c.forwarderExitHook != nil {
 			c.forwarderExitHook()
 		}
-		c.forward.Done()
 	}()
 	for {
 		var (

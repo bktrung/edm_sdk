@@ -82,7 +82,7 @@ func (s *Scheduler) Enqueue(id string, item Item) error {
 // Depth returns the number of queued items in one lane.
 func (s *Scheduler) Depth(id string) int {
 	if lane := s.byID[id]; lane != nil {
-		return len(lane.items)
+		return lane.depth()
 	}
 	return 0
 }
@@ -95,7 +95,7 @@ func (s *Scheduler) Pending() int {
 	total := 0
 	for _, group := range s.slots {
 		for _, lane := range group.lanes {
-			total += len(lane.items)
+			total += lane.depth()
 		}
 	}
 	return total
@@ -119,7 +119,7 @@ func (s *Scheduler) Next() (Item, Promotion, bool) {
 	}
 	if s.promoteOverdue {
 		if promoted := s.mostOverdue(); promoted != nil {
-			depth := len(promoted.items)
+			depth := promoted.depth()
 			item := promoted.pop()
 			return item, Promotion{LaneID: promoted.spec.ID, Depth: depth}, true
 		}
@@ -154,14 +154,14 @@ func (s *Scheduler) mostOverdue() *lane {
 	for _, group := range s.slots {
 		groupEmpty := true
 		for _, lane := range group.lanes {
-			if len(lane.items) == 0 {
+			if lane.depth() == 0 {
 				continue
 			}
 			groupEmpty = false
 			if lane.spec.Budget <= 0 {
 				continue
 			}
-			overrun := now.Sub(lane.items[0].EnqueuedAt) - lane.spec.Budget
+			overrun := now.Sub(lane.oldest().EnqueuedAt) - lane.spec.Budget
 			if overrun < 0 || selected != nil && overrun <= selectedOverrun {
 				continue
 			}
@@ -180,7 +180,7 @@ func (s *Scheduler) mostOverdue() *lane {
 
 func (s *slot) empty() bool {
 	for _, lane := range s.lanes {
-		if len(lane.items) > 0 {
+		if lane.depth() > 0 {
 			return false
 		}
 	}
@@ -191,7 +191,7 @@ func (s *slot) pop() Item {
 	for checked := range len(s.lanes) {
 		index := (s.cursor + checked) % len(s.lanes)
 		lane := s.lanes[index]
-		if len(lane.items) == 0 {
+		if lane.depth() == 0 {
 			continue
 		}
 		s.cursor = (index + 1) % len(s.lanes)

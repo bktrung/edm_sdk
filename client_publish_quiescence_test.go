@@ -262,8 +262,8 @@ func TestPublishQuiescenceSpansLateGenerations(t *testing.T) {
 func TestFailedCloseKeepsProducerTeardownBarrierSet(t *testing.T) {
 	connErr := errors.New("conn close failed")
 	conn := &failingCloseConn{
-		publishConn: publishConn{info: driver.BrokerInfo{Kind: "test", Version: "1"}},
-		closeErr:    connErr,
+		info:     driver.BrokerInfo{Kind: "test", Version: "1"},
+		closeErr: connErr,
 	}
 	client, err := New(context.Background(), testClientConfig(t), WithDriver(&failingCloseDriver{conn: conn}))
 	if err != nil {

@@ -119,8 +119,9 @@ func (Driver) Capabilities() driver.Capabilities {
 
 // openRefusalPasses is how many consecutive passes every endpoint may refuse a
 // dial for a reason retrying cannot repair before Open returns that refusal.
-// Pinned amqp091-go answers a socket that dies during the credential or vhost
-// exchange with the same 403 it returns for a refusal it decided, so one refused
+// Pinned amqp091-go reports the broker's own connection.close when there is one:
+// 403 for rejected credentials and 530 for a refused vhost. A socket that dies
+// during either exchange instead gets a 403 the client makes up, so one refused
 // pass cannot be told from a dropped handshake during a broker restart, a
 // load-balancer reset, or a short authentication-backend outage. Counting passes
 // keeps the decision free of wall-clock calls and deterministic for tests; at
@@ -214,7 +215,7 @@ func (Driver) Open(ctx context.Context, cfg driver.Config) (driver.Conn, error) 
 				return managedConn, nil
 			}
 			lastErr = err
-			if kind, _ := driver.Classify(classifyAMQP("open", driver.KindTransient, err)); kind == driver.KindTransient {
+			if kind, _ := driver.Classify(classifyOpen(err)); kind == driver.KindTransient {
 				transient = true
 				continue
 			}
@@ -228,7 +229,7 @@ func (Driver) Open(ctx context.Context, cfg driver.Config) (driver.Conn, error) 
 		} else {
 			refusedPasses++
 			if refusedPasses >= openRefusalPasses {
-				return nil, classifyAMQP("open", driver.KindTransient, refusal)
+				return nil, classifyOpen(refusal)
 			}
 		}
 
@@ -239,6 +240,30 @@ func (Driver) Open(ctx context.Context, cfg driver.Config) (driver.Conn, error) 
 			return nil, classify("open", driver.KindTransient, errors.Join(err, openCause(refusal, lastErr)))
 		}
 	}
+}
+
+// classifyOpen classifies a failed Open dial. It differs from classifyAMQP only
+// for a 530 the broker sent in reply to connection.open, which the server code
+// alone does not decide. RabbitMQ answers a missing vhost with "NOT_ALLOWED -
+// vhost <name> not found" and a user without access to it with "NOT_ALLOWED -
+// access to vhost '<name>' refused for user '<user>'", and retrying repairs
+// neither, so both are permission refusals. It also answers a vhost whose
+// connection limit is reached with that second text followed by ": connection
+// limit (<n>) is reached", which clears once other connections close, so that
+// one stays transient. Matching the two refusal texts rather than every 530
+// keeps a 530 this driver has not seen on the retrying path, where the worst
+// case is waiting the caller's timeout out instead of giving up on a broker
+// that would have let Open in.
+func classifyOpen(err error) error {
+	if amqpErr, ok := errors.AsType[*amqp.Error](err); ok && amqpErr.Server && amqpErr.Code == amqp.NotAllowed {
+		reason := amqpErr.Reason
+		missing := strings.HasPrefix(reason, "NOT_ALLOWED - vhost ") && strings.HasSuffix(reason, " not found")
+		denied := strings.HasPrefix(reason, "NOT_ALLOWED - access to vhost ") && strings.HasSuffix(reason, "'")
+		if missing || denied {
+			return classify("open", driver.KindPermission, err)
+		}
+	}
+	return classifyAMQP("open", driver.KindTransient, err)
 }
 
 // openCause names the broker error an Open that ran out of time reports under
@@ -520,7 +545,6 @@ func (c *conn) awaitChannelClose(ctx context.Context, done <-chan error) error {
 // stalling, and it is also what ends the goroutine, so the connection owns no
 // goroutine that outlives it.
 func (c *conn) watchBlocks(events <-chan amqp.Blocking) {
-	defer c.blockWatch.Done()
 	for event := range events {
 		if event.Active {
 			c.block(event.Reason)
@@ -621,8 +645,7 @@ func newConn(amqpConn *amqp.Connection, caps driver.Capabilities, endpoint resol
 	// arrive on this channel for as long as the connection lives, and the
 	// goroutine ends with the connection that closes it.
 	blocked := amqpConn.NotifyBlocked(make(chan amqp.Blocking, blockedEventBuffer))
-	connection.blockWatch.Add(1)
-	go connection.watchBlocks(blocked)
+	connection.blockWatch.Go(func() { connection.watchBlocks(blocked) })
 	return connection, nil
 }
 
@@ -990,7 +1013,7 @@ func dial(ctx context.Context, endpoint string, amqpConfig amqp.Config, connectT
 			select {
 			case connection := <-result:
 				_ = connection.Close()
-			case <-errResult:
+			case <-errResult: //nolint:errcheck // the handshake was abandoned, so its late error has no caller
 			}
 		}()
 		return nil, handshakeCtx.Err()
@@ -1239,12 +1262,12 @@ func sizeRefusalLimit(err error) (int, bool) {
 		!strings.Contains(amqpErr.Reason, "larger than") {
 		return 0, false
 	}
-	index := strings.LastIndex(amqpErr.Reason, sizeLimitPrefix)
-	if index < 0 {
+	_, rest, found := strings.CutLast(amqpErr.Reason, sizeLimitPrefix)
+	if !found {
 		return 0, false
 	}
 	var limit int
-	if _, scanErr := fmt.Sscanf(amqpErr.Reason[index+len(sizeLimitPrefix):], "%d", &limit); scanErr != nil {
+	if _, scanErr := fmt.Sscanf(rest, "%d", &limit); scanErr != nil {
 		return 0, false
 	}
 	return limit, true

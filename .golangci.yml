@@ -260,6 +260,12 @@ linters:
         linters:
           - forbidigo
         text: "use structured logging, not a print function"
+      # Tests receive from an error channel to wait for a goroutine; this covers channel receives only.
+      - path: _test\.go
+        linters:
+          - errcheck
+        text: "^Error return value is not checked$"
+        source: '^\s*(case\s+)?<-'
 
 formatters:
   enable:

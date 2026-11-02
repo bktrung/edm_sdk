@@ -3,13 +3,13 @@ package f1
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
-
-	"golang.org/x/sync/errgroup"
 
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/driver"
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/clock"
@@ -91,7 +91,7 @@ func newErrorHandlerRunner(t *testing.T, producer driver.Producer, consumer *dis
 			Retry:      RetryConfig{MaxAttempts: 3, Tiers: []time.Duration{time.Second}},
 		},
 		consumer:   consumer,
-		asyncGroup: new(errgroup.Group),
+		asyncGroup: new(sync.WaitGroup),
 	}
 	return client, runner
 }
@@ -374,6 +374,60 @@ func TestErrorHandlerNotificationsAreBoundedAndDroppable(t *testing.T) {
 		}
 		timer.Stop()
 	}
+}
+
+// slotProbe is the cause a slot test notifies with: its handler blocks on
+// release, then returns or panics.
+type slotProbe struct {
+	release chan struct{}
+	panics  bool
+}
+
+func (*slotProbe) Error() string { return "slot probe" }
+
+// TestErrorHandlerSlotFreesAfterHandlerReturns fills the error-handler bound,
+// releases it, and checks one more notification runs instead of being
+// dropped: once after handlers that return and once after handlers that
+// panic and are recovered.
+func TestErrorHandlerSlotFreesAfterHandlerReturns(t *testing.T) {
+	t.Parallel()
+	var started atomic.Int32
+	client, runner := newLoggerHandoffRunner(t, slog.New(slog.DiscardHandler), func(_ context.Context, _ *Event, cause error) {
+		started.Add(1)
+		probe, _ := errors.AsType[*slotProbe](cause)
+		<-probe.release
+		if probe.panics {
+			panic("error handler panic")
+		}
+	})
+	defer func() { _ = client.Close(context.Background()) }()
+	runner.subscription.Concurrency = 2
+
+	synctest.Test(t, func(t *testing.T) {
+		for _, round := range []struct {
+			name   string
+			panics bool
+		}{{name: "return"}, {name: "panic", panics: true}} {
+			before := started.Load()
+			fill := &slotProbe{release: make(chan struct{}), panics: round.panics}
+			runnerNotifyError(runner, context.Background(), nil, fill)
+			runnerNotifyError(runner, context.Background(), nil, fill)
+			synctest.Wait()
+			if got := started.Load() - before; got != 2 {
+				t.Fatalf("%s: handlers started = %d, want 2 to fill the bound", round.name, got)
+			}
+
+			close(fill.release)
+			synctest.Wait()
+			next := &slotProbe{release: make(chan struct{})}
+			close(next.release)
+			runnerNotifyError(runner, context.Background(), nil, next)
+			synctest.Wait()
+			if got := started.Load() - before; got != 3 {
+				t.Fatalf("%s: handlers started = %d, want 3: a released slot was not freed", round.name, got)
+			}
+		}
+	})
 }
 
 // TestFailedReleaseAfterAHandoffFailureEndsTheGeneration pins what happens when

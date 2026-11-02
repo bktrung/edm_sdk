@@ -675,8 +675,7 @@ func closeBlame(closeErr error) (blamed func(outboundMessage) bool, named bool) 
 	if limit, refused := sizeRefusalLimit(closeErr); refused {
 		return func(message outboundMessage) bool { return len(message.publishing.Body) > limit }, true
 	}
-	var amqpErr *amqp.Error
-	if errors.As(closeErr, &amqpErr) && amqpErr.Code == amqp.NotFound && strings.HasPrefix(amqpErr.Reason, missingExchangePrefix) {
+	if amqpErr, ok := errors.AsType[*amqp.Error](closeErr); ok && amqpErr.Code == amqp.NotFound && strings.HasPrefix(amqpErr.Reason, missingExchangePrefix) {
 		return func(message outboundMessage) bool {
 			return message.exchange != "" && strings.HasPrefix(amqpErr.Reason, missingExchangePrefix+message.exchange+"' in vhost '")
 		}, true

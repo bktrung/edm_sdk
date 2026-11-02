@@ -4,9 +4,9 @@ MODULE := fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk
 VERSION := $(shell git describe --tags --dirty --always 2>/dev/null || echo dev)
 
 # Keep the linter and formatter versions aligned with CI.
-GOLANGCI_LINT_VERSION := v2.14.0
+GOLANGCI_LINT_VERSION := v2.15.0
 GOFUMPT_VERSION := v0.12.0
-GOVULNCHECK_VERSION ?= v1.8.0
+GOVULNCHECK_VERSION ?= v1.9.0
 # The linter lives in a directory keyed by its version and the Go that built it.
 # A golangci-lint built by an older Go cannot read a newer standard library's
 # export data and fails in typecheck, and a target name that never changes
@@ -152,7 +152,7 @@ verify-self-contained:
 		exit 1; \
 	fi; \
 	process_pattern='(^|[^[:alnum:]_-])(phase[[:space:]]+[0-9]+[[:alpha:]]?|owner[[:space:]]+(approval|$$)|without[[:space:]]+owner[[:space:]]*$$|draft[[:space:]]+(API|$$)|is[[:space:]]+a[[:space:]]+draft[[:space:]]*$$)($$|[^[:alnum:]_-])'; \
-	process_matches=$$(git grep -nIE "$$process_pattern" -- . ':!Makefile' ':!docs/development/api-compatibility.md' ':!observer_publish_test.go'); \
+	process_matches=$$(git grep -nIE "$$process_pattern" -- . ':!Makefile' ':!slide/' ':!docs/development/api-compatibility.md' ':!observer_publish_test.go'); \
 	process_status=$$?; \
 	if [ "$$process_status" -gt 1 ]; then \
 		exit "$$process_status"; \

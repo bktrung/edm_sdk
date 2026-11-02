@@ -1,17 +1,17 @@
 package f1
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
 	"log/slog"
 	"runtime/debug"
-	"sort"
+	"slices"
 	"strings"
+	"sync"
 	"time"
 	"unicode/utf8"
-
-	"golang.org/x/sync/errgroup"
 
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/driver"
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/clock"
@@ -379,10 +379,9 @@ func (o *runnerOwner) startOpen(waitCtx context.Context, prefetch int) {
 	o.opened = false
 	o.openConsumer, o.openEpoch, o.openErr = nil, 0, nil
 	runCtx := o.base
-	o.runner.asyncGroup.Go(func() error {
+	o.runner.asyncGroup.Go(func() {
 		consumer, epoch, err := openRunnerConsumerWith(o.runner, waitCtx, runCtx, prefetch)
 		o.events <- runnerEvent{kind: runnerEventConsumerOpened, consumer: consumer, epoch: epoch, err: err}
-		return nil
 	})
 }
 
@@ -392,10 +391,9 @@ func (o *runnerOwner) startOpen(waitCtx context.Context, prefetch int) {
 func (o *runnerOwner) awaitRebuild(ctx context.Context, cause error, epoch uint64) (draining bool, err error) {
 	o.rebuilt = false
 	o.rebuiltErr = nil
-	o.runner.asyncGroup.Go(func() error {
+	o.runner.asyncGroup.Go(func() {
 		err := o.runner.client.awaitRebuild(ctx, cause, epoch, o.runner.drainStarted)
 		o.events <- runnerEvent{kind: runnerEventRebuilt, err: err}
-		return nil
 	})
 	o.pumpUntil(func() bool { return o.rebuilt })
 	return errors.Is(o.rebuiltErr, errRunnerDraining), o.rebuiltErr
@@ -407,9 +405,8 @@ func (o *runnerOwner) awaitRebuild(ctx context.Context, cause error, epoch uint6
 func (o *runnerOwner) releaseConsumer(ctx context.Context) error {
 	o.released = false
 	o.releaseErr = nil
-	o.runner.asyncGroup.Go(func() error {
+	o.runner.asyncGroup.Go(func() {
 		o.events <- runnerEvent{kind: runnerEventReleased, err: releaseRunnerConsumer(o.runner, ctx)}
-		return nil
 	})
 	o.pumpUntil(func() bool { return o.released })
 	return o.releaseErr
@@ -467,9 +464,8 @@ func (o *runnerOwner) startDrain(base context.Context) {
 	// A drain event can start teardown while the owner still awaits a rebuild.
 	// If the rebuild reports before this goroutine runs, drain rewrites o.base
 	// while joining teardown. The argument captures it before that interleaving.
-	o.runner.asyncGroup.Go(func() error {
+	o.runner.asyncGroup.Go(func() {
 		o.events <- runnerEvent{kind: runnerEventDrainDone, err: o.runner.drainAfterRun(base)}
-		return nil
 	})
 }
 
@@ -527,8 +523,8 @@ func (r *Runner) Run(ctx context.Context) (runErr error) {
 	r.handlerCtx, r.handlerCancel = handlerCtx, handlerCancel
 	handlerShutdownCtx, handlerShutdownCancel := context.WithCancel(context.Background())
 	r.handlerShutdownCtx, r.handlerShutdownCancel = handlerShutdownCtx, handlerShutdownCancel
-	r.asyncGroup = new(errgroup.Group)
-	r.errorGroup = newErrorHandlerGroup(r.subscription.Concurrency)
+	r.asyncGroup = new(sync.WaitGroup)
+	r.errorSlots = newErrorHandlerSlots(r.subscription.Concurrency)
 	r.events = make(chan runnerEvent)
 	if r.leftoverLimit == nil {
 		r.leftoverLimit = make(chan struct{})
@@ -764,7 +760,8 @@ func (r *Runner) Run(ctx context.Context) (runErr error) {
 		// instead of stranding the owner on an event that never arrives.
 		startSource := func(run func() error) {
 			owner.outstanding++
-			group.Go(func() (err error) {
+			group.Go(func() {
+				var err error
 				defer func() {
 					if recovered := recover(); recovered != nil {
 						// The generation is shared: the sources hand each other
@@ -779,7 +776,7 @@ func (r *Runner) Run(ctx context.Context) (runErr error) {
 					}
 					r.report(runnerEvent{kind: runnerEventSourceDone, err: err})
 				}()
-				return runPipeline(run)
+				err = runPipeline(run)
 			})
 		}
 		startSource(func() error { return fetchRunner(r, runCtx, deliveries) })
@@ -929,10 +926,10 @@ var errRunnerDraining = errors.New("f1: runner is draining")
 // its sources and the group that owns them. It resets nothing else. The
 // settlement window is deliberately not part of it: the window belongs to the
 // drain, and starting a generation is not the drain.
-func beginRunnerGeneration(r *Runner, cancel context.CancelFunc) *errgroup.Group {
+func beginRunnerGeneration(r *Runner, cancel context.CancelFunc) *sync.WaitGroup {
 	r.mu.Lock()
 	r.cancel = cancel
-	group := new(errgroup.Group)
+	group := new(sync.WaitGroup)
 	r.group = group
 	r.mu.Unlock()
 	return group
@@ -1179,7 +1176,7 @@ func runnerLanePlanFor(r *Runner, effective driver.Capabilities, source string) 
 	for id := range meta {
 		ids = append(ids, id)
 	}
-	sort.Strings(ids)
+	slices.Sort(ids)
 	plan := make([]runnerLane, 0, len(ids))
 	for _, id := range ids {
 		lane := meta[id]
@@ -1425,7 +1422,7 @@ func (r *Runner) Drain(ctx context.Context) error {
 					handlerShutdownCancel()
 				}
 			} else {
-				group.Go(func() error {
+				group.Go(func() {
 					timer := r.client.options.clock.Timer(delay)
 					defer timer.Stop()
 					select {
@@ -1442,7 +1439,6 @@ func (r *Runner) Drain(ctx context.Context) error {
 						}
 					case <-done:
 					}
-					return nil
 				})
 			}
 		}
@@ -2406,10 +2402,10 @@ func invokeHandlerMessage(r *Runner, parent context.Context, handler Handler, ev
 		group = r.group
 	}
 	if group == nil {
-		group = new(errgroup.Group)
+		group = new(sync.WaitGroup)
 	}
 	r.mu.Unlock()
-	invocation := r.startUserInvocation(group, func(inv *userInvocation) error {
+	invocation := r.startUserInvocation(group, func(inv *userInvocation) {
 		result := handlerResult{}
 		func() {
 			defer func() {
@@ -2425,7 +2421,6 @@ func invokeHandlerMessage(r *Runner, parent context.Context, handler Handler, ev
 		}
 		r.completeUserInvocation(inv)
 		done <- result
-		return nil
 	})
 	if invocation == nil {
 		return handlerResult{stuck: true}
@@ -2844,7 +2839,7 @@ func deadLetter(r *Runner, ctx context.Context, message driver.InboundMessage, e
 		details, discarded := collectDeathDetails(lastErr)
 		death.DeathDetails = details
 		if len(discarded) > 0 {
-			sort.Strings(discarded)
+			slices.Sort(discarded)
 			logged := discarded
 			if len(logged) > maxLoggedDeathDetailKeys {
 				logged = logged[:maxLoggedDeathDetailKeys]
@@ -2889,7 +2884,7 @@ func deadLetter(r *Runner, ctx context.Context, message driver.InboundMessage, e
 	for key, value := range encoded {
 		out.Headers = append(out.Headers, driver.Header{Key: key, Value: []byte(value)})
 	}
-	sort.Slice(out.Headers, func(i, j int) bool { return out.Headers[i].Key < out.Headers[j].Key })
+	slices.SortFunc(out.Headers, func(a, b driver.Header) int { return strings.Compare(a.Key, b.Key) })
 	if err := publishSuccessor(r, runnerSettlementContext(r, ctx), out); err != nil {
 		if observed {
 			finishObservationFromError(&publishGuard, publishBase, err)
@@ -3194,7 +3189,7 @@ func retryAndSettle(r *Runner, ctx context.Context, message driver.InboundMessag
 	for key, value := range encoded {
 		out.Headers = append(out.Headers, driver.Header{Key: key, Value: []byte(value)})
 	}
-	sort.Slice(out.Headers, func(i, j int) bool { return out.Headers[i].Key < out.Headers[j].Key })
+	slices.SortFunc(out.Headers, func(a, b driver.Header) int { return strings.Compare(a.Key, b.Key) })
 	if err := publishSuccessor(r, runnerSettlementContext(r, ctx), out); err != nil {
 		if observed {
 			finishObservationFromError(&publishGuard, publishBase, err)
@@ -3441,7 +3436,7 @@ func headerSlice(headers map[string]string) []driver.Header {
 	for key := range headers {
 		keys = append(keys, key)
 	}
-	sort.Strings(keys)
+	slices.Sort(keys)
 	result := make([]driver.Header, 0, len(keys))
 	for _, key := range keys {
 		result = append(result, driver.Header{Key: key, Value: []byte(headers[key])})
@@ -3523,7 +3518,7 @@ func subscriptionDestinations(effective driver.Capabilities, source string, sub 
 	for name := range set {
 		result = append(result, name)
 	}
-	sort.Strings(result)
+	slices.Sort(result)
 	return result
 }
 
@@ -3539,7 +3534,7 @@ func destinationScope(source string, sub Subscription) []string {
 	for scope := range set {
 		result = append(result, scope)
 	}
-	sort.Strings(result)
+	slices.Sort(result)
 	return result
 }
 
@@ -3600,13 +3595,10 @@ func subscriptionTopologySpecs(effective driver.Capabilities, source string, sub
 	// Decode failures may not yield an event type, so keep a stable DLQ for
 	// malformed messages whose topic cannot be recovered from the envelope.
 	add(driver.DestinationSpec{Name: deadLetterDestinationFor(source, "unknown", sub.Name), Kind: driver.DestDLQ, Durable: true})
-	sort.Slice(result.Destinations, func(i, j int) bool { return result.Destinations[i].Name < result.Destinations[j].Name })
-	sort.Slice(result.Exchanges, func(i, j int) bool { return result.Exchanges[i].Name < result.Exchanges[j].Name })
-	sort.Slice(result.Bindings, func(i, j int) bool {
-		if result.Bindings[i].Source == result.Bindings[j].Source {
-			return result.Bindings[i].Destination < result.Bindings[j].Destination
-		}
-		return result.Bindings[i].Source < result.Bindings[j].Source
+	slices.SortFunc(result.Destinations, func(a, b driver.DestinationSpec) int { return cmp.Compare(a.Name, b.Name) })
+	slices.SortFunc(result.Exchanges, func(a, b driver.ExchangeSpec) int { return cmp.Compare(a.Name, b.Name) })
+	slices.SortFunc(result.Bindings, func(a, b driver.BindingSpec) int {
+		return cmp.Or(cmp.Compare(a.Source, b.Source), cmp.Compare(a.Destination, b.Destination))
 	})
 	return result
 }

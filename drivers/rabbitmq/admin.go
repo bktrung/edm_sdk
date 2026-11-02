@@ -469,8 +469,8 @@ func (a *adminOperations) deleteQueue(ctx context.Context, name string, auxiliar
 }
 
 func isPreconditionFailed(err error) bool {
-	var amqpErr *amqp.Error
-	return errors.As(err, &amqpErr) && amqpErr.Code == 406
+	amqpErr, ok := errors.AsType[*amqp.Error](err)
+	return ok && amqpErr.Code == 406
 }
 
 func (a *adminOperations) inspectQueue(ctx context.Context, name string) (int64, error) {

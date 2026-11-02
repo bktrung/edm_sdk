@@ -13,8 +13,6 @@ import (
 
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/driver"
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/clock"
-
-	"golang.org/x/sync/errgroup"
 )
 
 // TestPendingDeliveryKeepsItsChannelEnqueueStamp proves a delivery's
@@ -239,7 +237,7 @@ func TestTerminalNotificationsCannotBlockSettlement(t *testing.T) {
 					t.Fatal(err)
 				}
 				t.Cleanup(func() { _ = client.Close(context.Background()) })
-				runner := &Runner{client: client, asyncGroup: new(errgroup.Group), subscription: Subscription{
+				runner := &Runner{client: client, asyncGroup: new(sync.WaitGroup), subscription: Subscription{
 					Name:         "orders",
 					OnDeadLetter: func(ctx context.Context, _ DeadLettered) { callback(ctx) },
 				}}
@@ -257,7 +255,7 @@ func TestTerminalNotificationsCannotBlockSettlement(t *testing.T) {
 					t.Fatal(err)
 				}
 				t.Cleanup(func() { _ = client.Close(context.Background()) })
-				runner := &Runner{client: client, asyncGroup: new(errgroup.Group), subscription: Subscription{
+				runner := &Runner{client: client, asyncGroup: new(sync.WaitGroup), subscription: Subscription{
 					Name:        "orders",
 					OnDiscarded: func(ctx context.Context, _ Discarded) { callback(ctx) },
 				}}
@@ -352,7 +350,7 @@ func TestInvokeHandlerReturnsStuckForCancelledParent(t *testing.T) {
 	handled := false
 	runner := &Runner{
 		client:       client,
-		group:        new(errgroup.Group),
+		group:        new(sync.WaitGroup),
 		subscription: Subscription{Name: "orders", HandlerTimeout: time.Second},
 	}
 	parent, cancel := context.WithCancel(context.Background())
@@ -362,9 +360,7 @@ func TestInvokeHandlerReturnsStuckForCancelledParent(t *testing.T) {
 		handled = true
 		return ctx.Err()
 	}), &Event{}, "", 0)
-	if err := runner.group.Wait(); err != nil {
-		t.Fatalf("handler group wait = %v", err)
-	}
+	runner.group.Wait()
 	if !result.stuck {
 		t.Fatalf("invokeHandler() = %#v, want stuck result for a cancelled parent", result)
 	}

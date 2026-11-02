@@ -7,8 +7,6 @@ import (
 	"hash/fnv"
 	"sync"
 	"unsafe"
-
-	"golang.org/x/sync/errgroup"
 )
 
 // Work is one handler invocation. Run must include the complete settlement
@@ -35,7 +33,7 @@ type Pool struct {
 	queues     []chan Work
 	ctx        context.Context
 	cancel     context.CancelFunc
-	group      *errgroup.Group
+	workers    sync.WaitGroup
 	mu         sync.Mutex
 	closed     bool
 	closing    chan struct{}
@@ -89,7 +87,7 @@ func NewPool(parent context.Context, concurrency int, ordered bool, queueSize in
 		parent = context.Background()
 	}
 	ctx, cancel := context.WithCancel(parent)
-	p := &Pool{ordered: ordered, queueDepth: queueSize, ctx: ctx, cancel: cancel, group: new(errgroup.Group), closing: make(chan struct{}), idle: make(chan struct{}), free: make(chan struct{}, 1)}
+	p := &Pool{ordered: ordered, queueDepth: queueSize, ctx: ctx, cancel: cancel, closing: make(chan struct{}), idle: make(chan struct{}), free: make(chan struct{}, 1)}
 	if ordered {
 		p.queues = make([]chan Work, concurrency)
 		p.unfinished = make([]int, concurrency)
@@ -218,7 +216,7 @@ func (p *Pool) Close() {
 	idle := p.idle
 	p.mu.Unlock()
 	<-idle
-	_ = p.group.Wait()
+	p.workers.Wait()
 	p.cancel()
 }
 
@@ -258,7 +256,7 @@ func (p *Pool) release(worker int) {
 }
 
 func (p *Pool) start(worker int, queue <-chan Work) {
-	p.group.Go(func() error {
+	p.workers.Go(func() {
 		for {
 			select {
 			case work := <-queue:
@@ -272,7 +270,7 @@ func (p *Pool) start(worker int, queue <-chan Work) {
 						work.Run(p.ctx)
 						p.release(worker)
 					default:
-						return nil
+						return
 					}
 				}
 			}

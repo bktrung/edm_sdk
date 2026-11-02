@@ -812,8 +812,8 @@ func validateFaultInjector(t *testing.T, ctx context.Context, conn driver.Conn, 
 		t.Fatalf("conformance: inject %s: %v", FaultFatalPublish, err)
 	}
 	fatalErr := fatalProducer.Publish(ctx, driver.OutboundMessage{Destination: fatalDestination})
-	var fatalClassified driver.ClassifiedError
-	if fatalErr == nil || !errors.As(fatalErr, &fatalClassified) || fatalClassified.Kind() != driver.KindFatal {
+	fatalClassified, ok := errors.AsType[driver.ClassifiedError](fatalErr)
+	if fatalErr == nil || !ok || fatalClassified.Kind() != driver.KindFatal {
 		t.Fatalf("conformance: fault injector %s was not observed as fatal non-retryable publish failure: %v", FaultFatalPublish, fatalErr)
 	}
 }
@@ -1197,8 +1197,8 @@ func pruneProfileDestination(ctx context.Context, maintenance driver.Maintenance
 }
 
 func transientPruneError(err error) bool {
-	var classified *driver.Error
-	return errors.As(err, &classified) && classified.Retryable()
+	classified, ok := errors.AsType[*driver.Error](err)
+	return ok && classified.Retryable()
 }
 
 func waitForPruneRetry(ctx context.Context, destination string, attempt int) error {

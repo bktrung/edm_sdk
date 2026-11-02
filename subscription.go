@@ -10,8 +10,6 @@ import (
 	"sync"
 	"time"
 
-	"golang.org/x/sync/errgroup"
-
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/driver"
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/clock"
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/dispatch"
@@ -130,20 +128,21 @@ type Runner struct {
 	// the driver object whose sequence must happen once and never a consumer
 	// the runner has replaced. It is guarded by mu.
 	teardown *consumerTeardown
-	group    *errgroup.Group
+	group    *sync.WaitGroup
 	// asyncGroup owns handler and terminal-callback goroutines. finishRunner
 	// cancels their contexts but does not wait: a non-cooperative handler or
 	// callback cannot be force-stopped, and waiting would violate drain's bound.
-	asyncGroup *errgroup.Group
+	asyncGroup *sync.WaitGroup
 	// Leftover accounting belongs to the runner, not a consumer generation:
 	// a rebuilt consumer cannot release user goroutines from its predecessor.
 	leftoverCount  int
 	leftoverFailed bool
 	leftoverLimit  chan struct{}
-	// errorGroup owns only error-handler notifications. It is bounded and is
-	// never waited by the runner, because a non-cooperative callback cannot be
-	// force-stopped without extending shutdown.
-	errorGroup            *errgroup.Group
+	// errorSlots bounds error-handler notifications: a notification holds one
+	// slot while its handler runs. Nothing waits for the slots to empty, because
+	// a non-cooperative callback cannot be force-stopped without extending
+	// shutdown.
+	errorSlots            chan struct{}
 	handlerCtx            context.Context
 	handlerCancel         context.CancelFunc
 	handlerShutdownCtx    context.Context
@@ -196,7 +195,7 @@ type userInvocation struct {
 // group must be non-nil: both call sites resolve one, and a runner built without
 // Run gets its throwaway group from the caller, which is where that fallback
 // belongs. A nil is a caller bug, not a state to absorb here.
-func (r *Runner) startUserInvocation(group *errgroup.Group, run func(*userInvocation) error) *userInvocation {
+func (r *Runner) startUserInvocation(group *sync.WaitGroup, run func(*userInvocation)) *userInvocation {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if r.leftoverFailed {
@@ -205,9 +204,9 @@ func (r *Runner) startUserInvocation(group *errgroup.Group, run func(*userInvoca
 	inv := new(userInvocation)
 	// Launch under mu so admission and the failure latch have one ordering.
 	// Already-admitted work may run after the latch; no user code holds mu.
-	group.Go(func() error {
+	group.Go(func() {
 		defer r.completeUserInvocation(inv)
-		return run(inv)
+		run(inv)
 	})
 	return inv
 }
@@ -313,13 +312,10 @@ func (ctx terminalCallbackContext) Err() error {
 	return ctx.Context.Err()
 }
 
-func newErrorHandlerGroup(concurrency int) *errgroup.Group {
-	if concurrency < 1 {
-		concurrency = 1
-	}
-	group := new(errgroup.Group)
-	group.SetLimit(concurrency)
-	return group
+// newErrorHandlerSlots is a semaphore rather than a WaitGroup with a counter:
+// a non-blocking send is the whole try-acquire, and nobody ever waits on it.
+func newErrorHandlerSlots(concurrency int) chan struct{} {
+	return make(chan struct{}, max(concurrency, 1))
 }
 
 func runnerNotifyDeadLetter(r *Runner, parent context.Context, payload DeadLettered) {
@@ -343,24 +339,36 @@ func runnerNotifyDiscarded(r *Runner, parent context.Context, payload Discarded)
 // Unlike runnerNotify above, this call never waits on the handler: one of
 // its two call sites is failSuccessorHandoff, on the synchronous
 // delivery/settlement path, so waiting even briefly here would let a slow
-// handler stall a delivery. The handler runs on r.errorGroup, on its own
-// goroutine, with panic recovery and a terminalNotificationTimeout deadline
-// passed through its context; the deadline is advisory (Go cannot force-stop
-// a goroutine that ignores ctx), but the caller itself never blocks on it.
+// handler stall a delivery. The handler holds one of r.errorSlots and runs on
+// its own goroutine, with panic recovery and a terminalNotificationTimeout
+// deadline passed through its context; the deadline is advisory (Go cannot
+// force-stop a goroutine that ignores ctx), but the caller itself never blocks
+// on it.
 func runnerNotifyError(r *Runner, parent context.Context, event *Event, cause error) {
 	if r == nil || r.client == nil || r.client.options.errorHandler == nil || cause == nil || parent == nil {
 		return
 	}
 	handler := r.client.options.errorHandler
 	r.mu.Lock()
-	group := r.errorGroup
-	if group == nil {
-		group = newErrorHandlerGroup(r.subscription.Concurrency)
-		r.errorGroup = group
+	slots := r.errorSlots
+	if slots == nil {
+		slots = newErrorHandlerSlots(r.subscription.Concurrency)
+		r.errorSlots = slots
 	}
 	r.mu.Unlock()
 	logger := lastResortRunnerLogger(r)
-	if !group.TryGo(func() (err error) {
+	select {
+	case slots <- struct{}{}:
+	default:
+		logger.LogAttrs(parent, slog.LevelError, "f1 error handler notification dropped",
+			slog.String("subscription", r.subscription.Name),
+			slog.Any("cause", cause))
+		return
+	}
+	go func() {
+		// Deferred first so it runs last: the slot frees after the recover
+		// below, whether the handler returned or panicked.
+		defer func() { <-slots }()
 		defer func() {
 			if recovered := recover(); recovered != nil {
 				logger.LogAttrs(parent, slog.LevelWarn, "f1 error handler panicked",
@@ -370,12 +378,7 @@ func runnerNotifyError(r *Runner, parent context.Context, event *Event, cause er
 		ctx, cancel := context.WithTimeout(parent, terminalNotificationTimeout)
 		defer cancel()
 		handler(ctx, event, cause)
-		return nil
-	}) {
-		logger.LogAttrs(parent, slog.LevelError, "f1 error handler notification dropped",
-			slog.String("subscription", r.subscription.Name),
-			slog.Any("cause", cause))
-	}
+	}()
 }
 
 func runnerNotify(r *Runner, parent context.Context, callback func(context.Context), kind string) {
@@ -385,14 +388,14 @@ func runnerNotify(r *Runner, parent context.Context, callback func(context.Conte
 	r.mu.Lock()
 	group := r.asyncGroup
 	if group == nil {
-		group = new(errgroup.Group)
+		group = new(sync.WaitGroup)
 		r.asyncGroup = group
 	}
 	r.mu.Unlock()
 	notifyOwned(r, parent, callback, group, lastResortRunnerLogger(r), kind)
 }
 
-func notifyOwned(r *Runner, parent context.Context, callback func(context.Context), group *errgroup.Group, logger *slog.Logger, kind string) {
+func notifyOwned(r *Runner, parent context.Context, callback func(context.Context), group *sync.WaitGroup, logger *slog.Logger, kind string) {
 	if callback == nil || group == nil || parent == nil {
 		return
 	}
@@ -408,7 +411,7 @@ func notifyOwned(r *Runner, parent context.Context, callback func(context.Contex
 	ctx := terminalCallbackContext{Context: base, deadline: deadline}
 	timer := clk.Timer(max(deadline.Sub(clk.Now()), 0))
 	done := make(chan struct{})
-	inv := r.startUserInvocation(group, func(inv *userInvocation) (err error) {
+	inv := r.startUserInvocation(group, func(inv *userInvocation) {
 		defer close(done)
 		// Publish completion accounting before done: otherwise the watcher
 		// could observe expiry after callback return but before the wrapper's
@@ -424,19 +427,18 @@ func notifyOwned(r *Runner, parent context.Context, callback func(context.Contex
 		// terminalCallbackContext carries the runner clock's deadline, and the
 		// watcher below is its only expiry, so a fake clock drives it.
 		callback(ctx) //nolint:contextcheck // the callback context is deliberate, not derived here.
-		return nil
 	})
 	if inv == nil {
 		timer.Stop()
 		cancel(context.Canceled)
 		return
 	}
-	group.Go(func() error {
+	group.Go(func() {
 		defer timer.Stop()
 		defer cancel(context.Canceled)
 		select {
 		case <-done:
-			return nil
+			return
 		case <-timer.C:
 			cancel(context.DeadlineExceeded)
 		case <-ctx.Done():
@@ -447,7 +449,7 @@ func notifyOwned(r *Runner, parent context.Context, callback func(context.Contex
 			// waiting for the callback to return or for that deadline to pass.
 			select {
 			case <-done:
-				return nil
+				return
 			case <-timer.C:
 				cancel(context.DeadlineExceeded)
 			}
@@ -456,7 +458,6 @@ func notifyOwned(r *Runner, parent context.Context, callback func(context.Contex
 		logger.LogAttrs(parent, slog.LevelWarn, "f1 terminal notification timed out",
 			slog.String("kind", kind),
 			slog.Duration("timeout", terminalNotificationTimeout))
-		return nil
 	})
 }
 

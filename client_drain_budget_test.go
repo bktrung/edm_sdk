@@ -7,6 +7,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/clock"
@@ -206,4 +207,53 @@ func TestCloseConsumerDrainBudgetIsThePublicContract(t *testing.T) {
 	if !finished {
 		t.Fatal("the completed retry left the client open")
 	}
+}
+
+// TestDrainRunnersWaitsForEveryRunner pins the join over several runners:
+// drainRunners must drain each runner it is handed and return only once all
+// of them have drained. The absence check after the first release would
+// prove nothing if a wrong drainRunners were merely slow to return, so it
+// runs after synctest.Wait: every goroutine in the bubble is durably blocked
+// by then, and one that skipped the second runner or the join would already
+// have sent its result.
+func TestDrainRunnersWaitsForEveryRunner(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		client, first, _, releaseFirst := newBudgetTestClient(t)
+		second := &Runner{
+			client: client,
+			subscription: Subscription{
+				Name:       "payments",
+				Topics:     []string{"payments.created"},
+				Priorities: []Priority{PriorityHigh},
+			},
+			inflight: newInflightRegistry(),
+			started:  true,
+			done:     make(chan struct{}),
+		}
+		var releaseSecondOnce sync.Once
+		releaseSecond := func() { releaseSecondOnce.Do(func() { close(second.done) }) }
+		t.Cleanup(releaseSecond)
+
+		drained := make(chan error, 1)
+		go func() { drained <- client.drainRunners(context.Background(), []*Runner{first, second}) }()
+
+		releaseFirst()
+		synctest.Wait()
+		select {
+		case err := <-drained:
+			t.Fatalf("drainRunners returned %v while the second runner was still draining", err)
+		default:
+		}
+
+		releaseSecond()
+		synctest.Wait()
+		select {
+		case err := <-drained:
+			if err != nil {
+				t.Fatalf("drainRunners() error = %v, want nil once every runner drained", err)
+			}
+		default:
+			t.Fatal("drainRunners did not return after every runner drained")
+		}
+	})
 }

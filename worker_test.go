@@ -8,6 +8,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"testing/synctest"
 	"time"
 	"unicode/utf8"
 
@@ -869,7 +870,7 @@ func TestCallbackBurstStopsNewUserWorkAtThreshold(t *testing.T) {
 		&Envelope{}, new(bool), &deliveryState{})
 	joined := make(chan struct{})
 	go func() {
-		_ = fixture.runner.asyncGroup.Wait()
+		fixture.runner.asyncGroup.Wait()
 		close(joined)
 	}()
 	waitLeftoverSignal(t, joined, "late user work completion")
@@ -1126,4 +1127,55 @@ func TestRunnerOwnDrainDoesNotCountCallbackAtItsDeadline(t *testing.T) {
 	if err := fixture.client.Health(context.Background()); err != nil {
 		t.Fatalf("Health() = %v, want nil", err)
 	}
+}
+
+// TestUserInvocationJoinsTheGroupItIsGiven pins that startUserInvocation
+// launches on the group it is handed. A Wait on that group is how a caller
+// joins user code it started, so a launch the group does not count lets Wait
+// return while the invocation is still running.
+func TestUserInvocationJoinsTheGroupItIsGiven(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		runner := &Runner{}
+		group := new(sync.WaitGroup)
+		release := make(chan struct{})
+		defer close(release)
+		if inv := runner.startUserInvocation(group, func(*userInvocation) { <-release }); inv == nil {
+			t.Fatal("startUserInvocation refused work on a runner with no leftovers")
+		}
+		joined := make(chan struct{})
+		go func() {
+			group.Wait()
+			close(joined)
+		}()
+		synctest.Wait()
+		select {
+		case <-joined:
+			t.Fatal("group Wait returned while the invocation it launched was still running")
+		default:
+		}
+	})
+}
+
+// TestGenerationGroupIsFreshPerGeneration pins that every generation installs
+// its own group. A goroutine still running from the previous generation must
+// not hold up a Wait on the next one, which it would if the group were reused.
+func TestGenerationGroupIsFreshPerGeneration(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		runner := &Runner{}
+		release := make(chan struct{})
+		defer close(release)
+		beginRunnerGeneration(runner, func() {}).Go(func() { <-release })
+		next := beginRunnerGeneration(runner, func() {})
+		joined := make(chan struct{})
+		go func() {
+			next.Wait()
+			close(joined)
+		}()
+		synctest.Wait()
+		select {
+		case <-joined:
+		default:
+			t.Fatal("the new generation's group waits on a goroutine from the previous generation")
+		}
+	})
 }

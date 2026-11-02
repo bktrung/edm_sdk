@@ -23,9 +23,14 @@ type Item struct {
 	EnqueuedAt time.Time
 }
 
+// lane is a fixed circular buffer of spec.Capacity items. The buffer is
+// allocated once so a bounded lane never reallocates as it fills and drains;
+// it does not grow, because Capacity is already the admission bound.
 type lane struct {
 	spec  LaneSpec
-	items []Item
+	ring  []Item
+	head  int
+	count int
 }
 
 func newLane(spec LaneSpec) (*lane, error) {
@@ -38,20 +43,40 @@ func newLane(spec LaneSpec) (*lane, error) {
 	if spec.Capacity < 1 {
 		spec.Capacity = 1
 	}
-	return &lane{spec: spec}, nil
+	return &lane{spec: spec, ring: make([]Item, spec.Capacity)}, nil
+}
+
+func (l *lane) depth() int {
+	return l.count
+}
+
+// oldest returns the head item. The lane must not be empty.
+func (l *lane) oldest() Item {
+	return l.ring[l.head]
 }
 
 func (l *lane) enqueue(item Item) error {
-	if len(l.items) >= l.spec.Capacity {
+	if l.count == len(l.ring) {
 		return ErrLaneFull
 	}
-	l.items = append(l.items, item)
+	tail := l.head + l.count
+	if tail >= len(l.ring) {
+		tail -= len(l.ring)
+	}
+	l.ring[tail] = item
+	l.count++
 	return nil
 }
 
 func (l *lane) pop() Item {
-	item := l.items[0]
-	l.items[0] = Item{}
-	l.items = l.items[1:]
+	item := l.ring[l.head]
+	// Clear the vacated slot so the buffer does not keep the popped Value
+	// reachable until the slot is overwritten.
+	l.ring[l.head] = Item{}
+	l.head++
+	if l.head == len(l.ring) {
+		l.head = 0
+	}
+	l.count--
 	return item
 }

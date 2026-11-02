@@ -1234,6 +1234,36 @@ func TestNormalizeConfigPreservesVerifyOnStartFalse(t *testing.T) {
 	}
 }
 
+func TestNormalizeConfigKeepsEverySetValue(t *testing.T) {
+	t.Parallel()
+	cfg := normalizeConfig(Config{
+		Codec: CodecConfig{Default: "proto", MaxHeaderBytes: 4096, MaxBodyBytes: 2048},
+		Lifecycle: LifecycleConfig{
+			DrainTimeout:          7 * time.Second,
+			HandlerGrace:          3 * time.Second,
+			CloseTimeout:          9 * time.Second,
+			RebalanceDrainTimeout: 11 * time.Second,
+		},
+		Subscriptions: map[string]SubscriptionConfig{
+			"orders": {
+				Concurrency:    3,
+				Retry:          RetryConfig{MaxAttempts: 2},
+				HandlerTimeout: 13 * time.Second,
+			},
+		},
+	})
+	if got, want := cfg.Codec, (CodecConfig{Default: "proto", MaxHeaderBytes: 4096, MaxBodyBytes: 2048}); got != want {
+		t.Fatalf("Codec = %#v, want %#v", got, want)
+	}
+	if got, want := cfg.Lifecycle, (LifecycleConfig{DrainTimeout: 7 * time.Second, HandlerGrace: 3 * time.Second, CloseTimeout: 9 * time.Second, RebalanceDrainTimeout: 11 * time.Second}); got != want {
+		t.Fatalf("Lifecycle = %#v, want %#v", got, want)
+	}
+	sub := cfg.Subscriptions["orders"]
+	if sub.Concurrency != 3 || sub.Retry.MaxAttempts != 2 || sub.HandlerTimeout != 13*time.Second {
+		t.Fatalf("subscription = concurrency %d maxAttempts %d handlerTimeout %s, want 3, 2, 13s", sub.Concurrency, sub.Retry.MaxAttempts, sub.HandlerTimeout)
+	}
+}
+
 func TestLoadConfigNormalizationIsNoOp(t *testing.T) {
 	t.Parallel()
 	path := writeConfig(t, "f1:\n  env: test\n  service: orders\n  broker:\n    driver: inmem\n  subscriptions:\n    orders:\n      topics: [orders.created]\n")

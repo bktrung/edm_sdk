@@ -156,3 +156,49 @@ func TestClassify_ErrorTrees(t *testing.T) {
 	)
 	require.True(t, f1.IsTerminal(threeDeep))
 }
+
+// asTerminalError is classified only through its As method; it has no
+// classifiedError in its own type or its Unwrap chain.
+type asTerminalError struct{}
+
+func (asTerminalError) Error() string { return "as terminal" }
+
+func (asTerminalError) As(target any) bool {
+	return errors.As(f1.Terminal(errors.New("classified")), target)
+}
+
+func TestClassify_TerminalFromAsMethod(t *testing.T) {
+	t.Parallel()
+
+	err := fmt.Errorf("outer: %w", asTerminalError{})
+	require.True(t, f1.IsTerminal(err))
+	require.False(t, f1.IsDropped(err))
+}
+
+// countingUnwrapError counts its Unwrap calls so a test can bound how many
+// times a walk visits each node.
+type countingUnwrapError struct {
+	next  error
+	calls *int
+}
+
+func (e *countingUnwrapError) Error() string { return "link" }
+
+func (e *countingUnwrapError) Unwrap() error {
+	*e.calls++
+	return e.next
+}
+
+func TestIsTerminal_WalksChainOnce(t *testing.T) {
+	t.Parallel()
+
+	const depth = 1000
+	var unwraps int
+	var err error
+	err = errors.New("leaf")
+	for range depth {
+		err = &countingUnwrapError{next: err, calls: &unwraps}
+	}
+	require.False(t, f1.IsTerminal(err))
+	require.LessOrEqual(t, unwraps, 2*depth)
+}
