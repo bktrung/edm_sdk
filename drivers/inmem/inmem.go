@@ -172,6 +172,56 @@ func (c *sharedConn) Close(ctx context.Context) error {
 	return nil
 }
 
+// isClosed reports whether this handle has been closed. It takes only the handle
+// lock because Close takes handle.mu before conn.mu. A check that held conn.mu
+// first would invert that order when a concurrent Close waits on the connection.
+func (c *sharedConn) isClosed() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.closed
+}
+
+// Admin returns the topology administration surface for this handle. Its
+// operations refuse once this handle closes, even while the shared connection
+// stays open for other handles.
+func (c *sharedConn) Admin() driver.Admin {
+	return &admin{operations: &adminOperations{conn: c.Conn.(*conn), handle: c}}
+}
+
+// Producer refuses on a closed handle with the error a closed connection returns.
+func (c *sharedConn) Producer(ctx context.Context, cfg driver.ProducerConfig) (driver.Producer, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, classify("producer", driver.KindTransient, err)
+	}
+	if c.isClosed() {
+		return nil, classify("producer", driver.KindFatal, driver.ErrResourcesOutstanding)
+	}
+	return c.Conn.Producer(ctx, cfg)
+}
+
+// Consumer refuses on a closed handle with the error a closed connection returns.
+func (c *sharedConn) Consumer(ctx context.Context, cfg driver.ConsumerConfig) (driver.Consumer, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, classify("consumer", driver.KindTransient, err)
+	}
+	if c.isClosed() {
+		return nil, classify("consumer", driver.KindFatal, driver.ErrResourcesOutstanding)
+	}
+	return c.Conn.Consumer(ctx, cfg)
+}
+
+// Ping reports a closed handle as a closed connection, even while the shared
+// connection stays open for other handles.
+func (c *sharedConn) Ping(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return classify("ping", driver.KindTransient, err)
+	}
+	if c.isClosed() {
+		return classify("ping", driver.KindTransient, errors.New("connection closed"))
+	}
+	return c.Conn.Ping(ctx)
+}
+
 type conn struct {
 	mu sync.Mutex
 
@@ -386,6 +436,12 @@ func (c *conn) replayHistoryLocked(group string, destinations []string, startAft
 				}
 				deliveredGroups[existing] = existing != group
 			}
+			// The anonymous group has no groupState, so the loop above never
+			// sets it. Replay runs only for a newly created named group, so the
+			// anonymous group has no claim on the copy. Leaving its entry false
+			// would make messageComplete hold the copy for an attached ungrouped
+			// consumer that was already offered the original.
+			deliveredGroups[""] = true
 			dest.messages = append(dest.messages, &queuedMessage{
 				message:         cloneOutbound(original.message),
 				enqueuedAt:      original.enqueuedAt,
@@ -521,12 +577,28 @@ func (c *conn) pump() {
 	}
 }
 
+// nextDueLocked returns the earliest time the pump has work to do. A past-due
+// message no group can take is left out: its due time never clears, so counting
+// it would arm a zero-length timer on every pass for as long as it waits. That
+// is safe only because every change that can make it takeable (attach, resume,
+// settle, stop, release, requeue and the injected fault) dispatches and calls
+// signalWake under c.mu, and ack-deadline expiry runs in the pump itself.
+//
+// A message takingGroup accepts but whose consumer channel is full stays
+// counted, and the pump keeps polling it. The application drains Messages()
+// directly, so nothing would wake the pump when space appears.
 func (c *conn) nextDueLocked() (time.Time, bool) {
+	now := c.clock.Now()
 	var next time.Time
 	for _, dest := range c.destinations {
 		for _, message := range dest.messages {
 			if message.due.IsZero() {
 				continue
+			}
+			if !now.Before(message.due) {
+				if _, holder, members := dest.takingGroup(message); holder == nil && members == 0 {
+					continue
+				}
 			}
 			if next.IsZero() || message.due.Before(next) {
 				next = message.due
@@ -777,16 +849,43 @@ func (c *conn) destinationNamesLocked() []string {
 }
 
 // pickConsumer selects the consumer that takes message next, or nil when no
-// group can take it now. Groups are considered one at a time, in the order
-// their consumers attached, and each group is considered once per selection,
-// at the first consumer that still represents it. A group that already holds
-// the message has nothing to take. A group with an affinity consumer for the
-// key uses it, and is skipped for now when that consumer cannot take the
-// message, so one group's holder never withholds the message from the groups
-// behind it. A group with no affinity for the key round-robins among its own
-// eligible consumers, so one group's keys never select another group's
-// consumer.
+// group can take it now. The group comes from takingGroup. A group with an
+// affinity consumer for the key uses it. A group with no affinity for the key
+// round-robins among its own eligible consumers, so one group's keys never
+// select another group's consumer.
 func (d *destination) pickConsumer(message *queuedMessage) *consumer {
+	group, holder, members := d.takingGroup(message)
+	if holder != nil {
+		return holder
+	}
+	if members == 0 {
+		return nil
+	}
+	next := d.next[group] % members
+	d.next[group] = next + 1
+	for _, candidate := range d.order {
+		if candidate.cfg.Group != group || !candidate.eligibleFor(message, d.spec.Name) {
+			continue
+		}
+		if next == 0 {
+			return candidate
+		}
+		next--
+	}
+	return nil
+}
+
+// takingGroup finds the group that takes message next, without changing any
+// dispatch state, so the pump's deadline asks the same question pickConsumer
+// does. Groups are considered one at a time, in the order their consumers
+// attached, and each group is considered once per selection, at the first
+// consumer that still represents it. A group that already holds the message has
+// nothing to take. A group with an affinity consumer for the key returns it as
+// the holder, and is skipped for now when that consumer cannot take the
+// message, so one group's holder never withholds the message from the groups
+// behind it. Otherwise the count is the group's eligible consumers. A nil
+// holder with a zero count means no group can take the message now.
+func (d *destination) takingGroup(message *queuedMessage) (string, *consumer, int) {
 	key := message.key
 	for index, cs := range d.order {
 		group := cs.cfg.Group
@@ -802,7 +901,7 @@ func (d *destination) pickConsumer(message *queuedMessage) *consumer {
 		if key != "" {
 			if holder := d.affinity[affinityKey{group: group, key: key}]; holder != nil {
 				if holder.eligibleFor(message, d.spec.Name) {
-					return holder
+					return group, holder, 0
 				}
 				continue
 			}
@@ -813,22 +912,11 @@ func (d *destination) pickConsumer(message *queuedMessage) *consumer {
 				count++
 			}
 		}
-		if count == 0 {
-			continue
-		}
-		next := d.next[group] % count
-		d.next[group] = next + 1
-		for _, candidate := range d.order {
-			if candidate.cfg.Group != group || !candidate.eligibleFor(message, d.spec.Name) {
-				continue
-			}
-			if next == 0 {
-				return candidate
-			}
-			next--
+		if count > 0 {
+			return group, nil, count
 		}
 	}
-	return nil
+	return "", nil, 0
 }
 
 // representedEarlier reports whether a consumer attached before the one being
@@ -932,7 +1020,13 @@ func (c *consumer) Backlog(ctx context.Context) (map[string]driver.BacklogSample
 	c.conn.dispatchLocked()
 	out := make(map[string]driver.BacklogSample, len(c.destinations))
 	for _, name := range c.destinations {
-		messages := c.conn.destinations[name].messages
+		// Same stopped-consumer case as Lag: a destination pruned after Stop is
+		// gone from the connection while its name remains on this consumer.
+		destination, ok := c.conn.destinations[name]
+		if !ok {
+			return nil, classify("backlog", driver.KindNotFound, driver.ErrDestinationMissing)
+		}
+		messages := destination.messages
 		sample := driver.BacklogSample{Lag: int64(len(messages))}
 		for _, message := range messages {
 			if message.enqueuedAt.IsZero() {

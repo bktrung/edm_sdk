@@ -177,7 +177,13 @@ func (c *consumer) Lag(ctx context.Context) (map[string]int64, error) {
 	c.conn.dispatchLocked()
 	out := make(map[string]int64, len(c.destinations))
 	for _, name := range c.destinations {
-		out[name] = int64(len(c.conn.destinations[name].messages))
+		// Stop keeps the names this consumer was attached to, so a Prune after
+		// Stop can have deleted one of them. Look it up rather than assume it.
+		destination, ok := c.conn.destinations[name]
+		if !ok {
+			return nil, classify("lag", driver.KindNotFound, driver.ErrDestinationMissing)
+		}
+		out[name] = int64(len(destination.messages))
 	}
 	return out, nil
 }

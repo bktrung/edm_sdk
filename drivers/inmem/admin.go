@@ -9,7 +9,12 @@ import (
 	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/driver"
 )
 
-type adminOperations struct{ conn *conn }
+type adminOperations struct {
+	conn *conn
+	// handle is the shared handle this surface came from, or nil for an isolated
+	// connection. Its closed state gates operations the shared connection would still admit.
+	handle *sharedConn
+}
 
 type admin struct{ operations *adminOperations }
 
@@ -43,6 +48,10 @@ func (a *admin) Prune(ctx context.Context, names []string) ([]driver.PruneResult
 func (a *adminOperations) begin(ctx context.Context, operation string) error {
 	if err := ctx.Err(); err != nil {
 		return classify(operation, driver.KindTransient, err)
+	}
+	// Checked before conn.mu is taken, for the lock order in sharedConn.isClosed.
+	if a.handle != nil && a.handle.isClosed() {
+		return classify(operation, driver.KindTransient, errors.New("connection closed"))
 	}
 	a.conn.mu.Lock()
 	if a.conn.closed || a.conn.closing {
