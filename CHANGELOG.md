@@ -7,6 +7,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-11-03
+
 ### Added
 
 - `Client.Ready` reports readiness only once the client is healthy and every registered
@@ -21,6 +23,9 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ### Changed
 
+- The module path is now `github.com/bktrung/edm_sdk`, replacing
+  `fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk`. The module is public, so `GOPRIVATE`
+  and Git credentials are no longer needed to download it.
 - RabbitMQ `Open` refuses a `broker.rabbitmq.vhost` that differs from any endpoint's
   parsed vhost, and SASL credentials set without a mechanism, with a fatal error before dialing.
 - Documentation qualifies shutdown, scheduling, ordering, and retry timing guarantees,
@@ -221,6 +226,10 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ### Upgrade notes
 
+- Replace every import of `fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk` with
+  `github.com/bktrung/edm_sdk`, including its `driver`, `drivers/...`, `codec`, `f1test` and `f1otel`
+  subpackages, then run `go get github.com/bktrung/edm_sdk@v0.3.0` and `go mod tidy`. The old path is
+  not redirected.
 - The module requires Go 1.27 or newer, up from Go 1.26. Builds with Go 1.26 no longer compile
   the module, so callers on Go 1.26 must move their toolchain to 1.27 before upgrading F1.
 - RabbitMQ: the parking queues 0.1.0 declared, `<destination>.park.<rung>` and
@@ -373,4 +382,6 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 - A dead-letter or discarded callback that ignores its context keeps its goroutine and the event until it returns; the number of such goroutines is not capped.
 - RabbitMQ `Purge` and `DescribeTopology` cover only the current parking queues; copies parked under an earlier retry step or delay shape return to the destination when their delay ends.
 
+[Unreleased]: https://github.com/bktrung/edm_sdk/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/bktrung/edm_sdk/compare/v0.1.0...v0.3.0
 [0.1.0]: https://github.com/bktrung/edm_sdk/tree/v0.1.0
