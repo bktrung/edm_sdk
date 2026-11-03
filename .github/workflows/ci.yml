@@ -1,0 +1,109 @@
+# Jobs use the same Make targets as local development, so a red job reproduces
+# with the command in its name.
+
+name: ci
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  gates:
+    name: ${{ matrix.run }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        run:
+          - make build
+          - go vet ./...
+          - test -z "$(gofmt -l .)"
+          - make format-check
+          - make lint
+          - make vulncheck
+          - make verify-agnostic
+          - make verify-self-contained
+          - make check-doc-source-links
+          - make check-observer-events
+          - make check-api-surface
+          - make check-api-surface-f1otel
+          - make check-api-diff
+          - make otlp-boundary
+          - make test-fast
+          - make test
+    steps:
+      - uses: actions/checkout@v7
+      - id: go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      # The linter, formatter and API tools are built into .tools by the
+      # Makefile; the linter's own analysis cache lives in .cache.
+      - uses: actions/cache@v6
+        with:
+          path: |
+            .tools
+            .cache/golangci-lint
+          key: tools-${{ runner.os }}-${{ steps.go.outputs.go-version }}-${{ hashFiles('Makefile', 'tools/**/go.sum') }}
+      - run: ${{ matrix.run }}
+      - if: matrix.run == 'make test-fast'
+        uses: actions/upload-artifact@v7
+        with:
+          name: coverage
+          path: coverage.out
+          retention-days: 7
+
+  # Fixtures come from docker/docker-compose.yml, as they do locally. On a hosted
+  # runner the published ports land on localhost, which is the only plaintext
+  # host the drivers accept.
+  brokers:
+    name: make ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - test-kafka
+          - test-rabbitmq-driver
+          - test-rabbitmq-conformance
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      # kafka-up does not wait for the broker, so wait on the compose
+      # healthcheck here. The RabbitMQ targets wait through broker-smoke.
+      - if: matrix.target == 'test-kafka'
+        run: docker compose --project-name docker -f docker/docker-compose.yml up -d --wait kafka
+      - run: make ${{ matrix.target }}
+
+  # New `// TENTATIVE` markers must include an issue link.
+  tentative-check:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - env:
+          BASE: ${{ github.base_ref }}
+        run: |
+          added=$(git diff "origin/${BASE}...HEAD" -- '*.go' | grep -E '^\+.*// ?TENTATIVE' || true)
+          bad=$(printf '%s\n' "$added" | grep -vE '(#[0-9]+|issues?/[0-9]+)' | grep -v '^\s*$' || true)
+          if [ -n "$bad" ]; then
+            echo "New TENTATIVE marker(s) added with no linked issue:"
+            echo "$bad"
+            exit 1
+          fi

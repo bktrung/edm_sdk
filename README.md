@@ -20,9 +20,9 @@ deliberately does not do. For the code tour, start with [`docs/`](docs/index.md)
 
 ## Guarantees
 
-Each of these is testable. A GitLab pipeline is defined in [`.gitlab-ci.yml`](.gitlab-ci.yml),
-but no runner executes it yet. The gates run locally from the [Makefile](Makefile) are the evidence
-for each guarantee. Broker-backed jobs remain opt-in behind `RUN_BROKER_TESTS=1`.
+Each of these is testable. The GitHub Actions workflow in
+[`.github/workflows/ci.yml`](.github/workflows/ci.yml) runs every gate and both broker-backed suites on
+each push to `main` and each pull request, through the same [Makefile](Makefile) targets you run locally.
 
 <!-- #region guarantees -->
 - **At-least-once delivery, with a stable message identity.** Transport redelivers during failures

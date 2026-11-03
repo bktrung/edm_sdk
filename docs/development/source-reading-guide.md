@@ -188,7 +188,7 @@ Finish by reading the checks that protect the repository boundaries:
    normalization for API baselines.
 4. [`Makefile`](https://github.com/bktrung/edm_sdk/blob/main/Makefile) - build, unit, lint, API-surface, API-diff,
    import-boundary, self-contained, and broker-backed verification targets.
-5. [`.gitlab-ci.yml`](https://github.com/bktrung/edm_sdk/blob/main/.gitlab-ci.yml) - the CI composition that makes
+5. [`.github/workflows/ci.yml`](https://github.com/bktrung/edm_sdk/blob/main/.github/workflows/ci.yml) - the CI composition that makes
    the local gates meaningful.
 
 The goal is to know what evidence a change must provide. A driver change needs

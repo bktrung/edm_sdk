@@ -341,7 +341,7 @@ with verbose output.
 When changing a port contract or adapter lifecycle, run the shared harness,
 the in-memory conformance, and the affected broker-backed suite. The repository
 CI definition shows the required Kafka conformance job in
-[`.gitlab-ci.yml`](https://github.com/bktrung/edm_sdk/blob/main/.gitlab-ci.yml).
+[`.github/workflows/ci.yml`](https://github.com/bktrung/edm_sdk/blob/main/.github/workflows/ci.yml).
 
 ## Maintainer reading order
 

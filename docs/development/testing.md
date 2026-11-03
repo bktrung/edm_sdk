@@ -631,7 +631,7 @@ and [Consume flow](/development/consume-flow) for runtime paths, then
 explains where to place and how to shape the tests that protect those paths.
 
 The [Makefile](https://github.com/bktrung/edm_sdk/blob/main/Makefile), test source, API fixtures, and CI definition in
-[`.gitlab-ci.yml`](https://github.com/bktrung/edm_sdk/blob/main/.gitlab-ci.yml) own the current commands and gate
+[`.github/workflows/ci.yml`](https://github.com/bktrung/edm_sdk/blob/main/.github/workflows/ci.yml) own the current commands and gate
 composition. This page records the strategy and decision rules, not a second
 copy of those command implementations.
 

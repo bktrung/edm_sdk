@@ -4,9 +4,9 @@
 
 F1 is a broker-agnostic event-driven messaging SDK. Read [README.md](README.md), then [ARCHITECTURE.md](ARCHITECTURE.md), then [the source-reading guide](docs/development/source-reading-guide.md), and finally [AGENTS.md](AGENTS.md).
 
-## Before you open a merge request
+## Before you open a pull request
 
-Run this minimum local gate set before you open a merge request:
+Run this minimum local gate set before you open a pull request:
 
 ```sh
 make build
@@ -26,7 +26,7 @@ make otlp-boundary
 make test-fast
 ```
 
-No CI runner executes the pipeline, so these local runs are the evidence a reviewer will ask for. See [Testing strategy](docs/development/testing.md) for broker-backed runs and port variables.
+CI runs the same gates and the broker-backed suites on every pull request; running them locally first keeps the review loop short. See [Testing strategy](docs/development/testing.md) for broker-backed runs and port variables.
 
 ## Public API changes
 
