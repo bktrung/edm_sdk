@@ -26,7 +26,7 @@ undecided earlier one, even when the next uses another channel. Bounded
 segments also avoid encoding an entire large batch at once. Concurrent calls
 have no relative ordering guarantee.
 
-The [producer](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/drivers/rabbitmq/producer.go)
+The [producer](https://github.com/bktrung/edm_sdk/blob/main/drivers/rabbitmq/producer.go)
 is the executable owner for channel selection, segment bounds, confirmation
 decisions, and recovery. These bounds are implementation choices, not
 deployment settings.
@@ -40,7 +40,7 @@ channel. Retry and dead-letter copies preserve identity, so concurrent
 redeliveries can publish copies with the same ID. An ID reservation keeps
 each return associated with one unresolved publish on that channel.
 
-The [return watcher](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/drivers/rabbitmq/publish_watcher.go)
+The [return watcher](https://github.com/bktrung/edm_sdk/blob/main/drivers/rabbitmq/publish_watcher.go)
 owns matching and reservations. The design relies on the broker/client
 return-before-confirm contract; this is a design basis, not a live measurement
 reported here. That ordering alone is not enough: a return can still be

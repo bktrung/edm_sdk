@@ -5,7 +5,7 @@ import (
 	"strings"
 	"testing"
 
-	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/driver"
+	"github.com/bktrung/edm_sdk/driver"
 )
 
 // reportedLimits connects a client to a fake driver declaring caps and returns

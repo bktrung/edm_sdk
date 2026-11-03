@@ -8,7 +8,7 @@ A handler can still be running when Kafka gives its partition to another member.
 
 A cooperative assignment keeps partitions that do not need to move. An eager assignment revokes the whole assignment before distributing it again. Keeping unaffected partitions avoids restarting their work from the stored group position, which is why cooperative-sticky is F1's default.
 
-Protocol choice is a group-wide deployment decision: every member must advertise a compatible strategy. Switching to an eager protocol broadens the revoke and therefore the duplicate window. The [Kafka driver guide](/drivers/kafka#kafka-rebalancing) owns the supported settings; the [balancer selection source](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/drivers/kafka/balancer.go) owns their mapping.
+Protocol choice is a group-wide deployment decision: every member must advertise a compatible strategy. Switching to an eager protocol broadens the revoke and therefore the duplicate window. The [Kafka driver guide](/drivers/kafka#kafka-rebalancing) owns the supported settings; the [balancer selection source](https://github.com/bktrung/edm_sdk/blob/main/drivers/kafka/balancer.go) owns their mapping.
 
 ## One wait limit for the revoke
 
@@ -31,9 +31,9 @@ A handler may outlive the wait. If another member owns the partition, the late a
 
 ## Revoke is not lost ownership
 
-A revoke offers time to finish work before ownership transfer. A lost assignment means that opportunity has already ended, so waiting would not preserve the old member's right to commit. F1 drops lost ownership without a wait or a final commit. The [consumer ownership source](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/drivers/kafka/consumer.go) owns both paths, including the separate handling of a consumer already shutting down.
+A revoke offers time to finish work before ownership transfer. A lost assignment means that opportunity has already ended, so waiting would not preserve the old member's right to commit. F1 drops lost ownership without a wait or a final commit. The [consumer ownership source](https://github.com/bktrung/edm_sdk/blob/main/drivers/kafka/consumer.go) owns both paths, including the separate handling of a consumer already shutting down.
 
-The revoke wait must leave room for the final commit and rejoin in both the session and rebalance windows. Fitting only the rebalance window is insufficient. The [Kafka timeout rule](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/internal/kafka/drain.go) is the executable constraint; [driver configuration](/drivers/kafka#kafka-rebalancing) points to the operator settings.
+The revoke wait must leave room for the final commit and rejoin in both the session and rebalance windows. Fitting only the rebalance window is insufficient. The [Kafka timeout rule](https://github.com/bktrung/edm_sdk/blob/main/internal/kafka/drain.go) is the executable constraint; [driver configuration](/drivers/kafka#kafka-rebalancing) points to the operator settings.
 
 ## A warning can precede the final assignment
 

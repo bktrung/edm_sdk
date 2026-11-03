@@ -41,16 +41,13 @@ sequenceDiagram
 
 ## Install
 
-The module lives on the project's private Go module host. Set `GOPRIVATE` before the first
-download so the Go tool does not query the public proxy or checksum database, which cannot see that
-host:
+Add the module to your application:
 
 ```sh
-go env -w GOPRIVATE=fgit.zapps.vn
-go get fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk
+go get github.com/bktrung/edm_sdk
 ```
 
-Use the Go version declared in [`go.mod`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/go.mod),
+Use the Go version declared in [`go.mod`](https://github.com/bktrung/edm_sdk/blob/main/go.mod),
 and keep endpoints, credentials, and driver settings in the application's configuration rather than
 in handler code. [Quickstart](/learn/quickstart) runs a complete program with no broker at all.
 
@@ -71,9 +68,9 @@ changes, and keep the old handler until its events are retired.
 
 ## Connect the client
 
-F1 needs a resolved [`f1.Config`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/config.go),
+F1 needs a resolved [`f1.Config`](https://github.com/bktrung/edm_sdk/blob/main/config.go),
 normally loaded with `f1.LoadConfig`, and the concrete
-[`driver.Driver`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/driver/driver.go)
+[`driver.Driver`](https://github.com/bktrung/edm_sdk/blob/main/driver/driver.go)
 your composition layer selected:
 
 ```go

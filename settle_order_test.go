@@ -7,7 +7,7 @@ import (
 	"testing"
 	"testing/synctest"
 
-	f1 "fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk"
+	f1 "github.com/bktrung/edm_sdk"
 )
 
 // settleOrderMessageKey is the partition key the message these tests publish

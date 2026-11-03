@@ -3,7 +3,7 @@ package f1
 import (
 	"time"
 
-	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/sched"
+	"github.com/bktrung/edm_sdk/internal/sched"
 )
 
 // deadlinePromotionWindow bounds deadline_promoted to one event per lane per

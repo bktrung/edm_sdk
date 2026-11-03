@@ -10,10 +10,10 @@ import (
 	"sync"
 	"time"
 
-	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/driver"
-	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/clock"
-	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/dispatch"
-	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/lifecycle"
+	"github.com/bktrung/edm_sdk/driver"
+	"github.com/bktrung/edm_sdk/internal/clock"
+	"github.com/bktrung/edm_sdk/internal/dispatch"
+	"github.com/bktrung/edm_sdk/internal/lifecycle"
 )
 
 // Subscription declares one consumer group, its topics and delivery policy,

@@ -30,11 +30,11 @@ import (
 	"github.com/twmb/franz-go/pkg/kerr"
 	"github.com/twmb/franz-go/pkg/kgo"
 
-	f1 "fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk"
-	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/driver"
+	f1 "github.com/bktrung/edm_sdk"
+	"github.com/bktrung/edm_sdk/driver"
 
-	kafka "fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/drivers/kafka"
-	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/clock"
+	kafka "github.com/bktrung/edm_sdk/drivers/kafka"
+	"github.com/bktrung/edm_sdk/internal/clock"
 )
 
 const (

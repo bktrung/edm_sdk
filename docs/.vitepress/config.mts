@@ -128,7 +128,7 @@ export default defineConfig({
       },
     ],
     editLink: {
-      pattern: 'https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/edit/main/docs/:path',
+      pattern: 'https://github.com/bktrung/edm_sdk/edit/main/docs/:path',
       text: 'Edit this page',
     },
     footer: {

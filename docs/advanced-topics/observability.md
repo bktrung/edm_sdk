@@ -12,8 +12,8 @@ Create providers in the application and pass the observer to `f1.New`.
 import (
 	"context"
 
-	f1 "fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk"
-	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/f1otel"
+	f1 "github.com/bktrung/edm_sdk"
+	"github.com/bktrung/edm_sdk/f1otel"
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 )
 
@@ -177,8 +177,8 @@ Configure an application-owned tracer provider and propagator when creating the 
 import (
 	"context"
 
-	f1 "fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk"
-	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/f1otel"
+	f1 "github.com/bktrung/edm_sdk"
+	"github.com/bktrung/edm_sdk/f1otel"
 	"go.opentelemetry.io/otel/propagation"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 )

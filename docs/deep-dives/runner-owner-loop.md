@@ -64,7 +64,7 @@ that fail before finishing a message also escalate to connection replacement.
 The distinction is about the failed transport, not the handler's retry policy.
 
 The executable decisions are in
-[`worker.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/worker.go);
+[`worker.go`](https://github.com/bktrung/edm_sdk/blob/main/worker.go);
 [Consume flow](/development/consume-flow) maps the error reader and owner loop.
 
 Handling an event records a fact and, at most, starts work: canceling the context the runner's goroutines run on, or a helper goroutine that reports back with another event. The owner never waits inside an event.

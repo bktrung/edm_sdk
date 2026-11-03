@@ -12,7 +12,7 @@ import (
 	"github.com/twmb/franz-go/pkg/kadm"
 	"github.com/twmb/franz-go/pkg/kgo"
 
-	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/driver"
+	"github.com/bktrung/edm_sdk/driver"
 )
 
 func TestKafkaBacklogReportsLagHeadAndPreservesGroup(t *testing.T) {

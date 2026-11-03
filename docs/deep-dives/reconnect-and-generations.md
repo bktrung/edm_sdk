@@ -106,8 +106,8 @@ an error naming the count. Retries of the held entries continue, but they do not
 by themselves bring the client back; a restart is what clears the refusal.
 
 The cleanup and replacement decisions are in
-[`reconnect.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/reconnect.go);
-[`client.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/client.go)
+[`reconnect.go`](https://github.com/bktrung/edm_sdk/blob/main/reconnect.go);
+[`client.go`](https://github.com/bktrung/edm_sdk/blob/main/client.go)
 owns the shutdown wait.
 
 ## Who owns what
@@ -176,7 +176,7 @@ separate from the attempt limit for handler failures.
 zero allows recovery to keep trying until cancellation or shutdown. Jittered
 backoff avoids synchronized reconnects across clients. The retry schedule and
 classification of open or topology failures belong to the
-[reconnect source](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/reconnect.go),
+[reconnect source](https://github.com/bktrung/edm_sdk/blob/main/reconnect.go),
 not the handler retry policy.
 
 F1 does not resend an application publish after a connection error. The broker may have accepted the message before the error showed up, so a resend could duplicate it. The caller decides whether to send again and should set an [idempotency key](/learn/glossary#idempotency-key) with `WithIdempotencyKey` and check it in the handler, or use another way to make a duplicate harmless.

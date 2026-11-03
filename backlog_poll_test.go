@@ -10,11 +10,11 @@ import (
 	"testing"
 	"time"
 
-	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/driver"
+	"github.com/bktrung/edm_sdk/driver"
 	//nolint:depguard // backlog panic test drives deliveries through the in-memory driver.
-	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/drivers/inmem"
-	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/clock"
-	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/testhook"
+	"github.com/bktrung/edm_sdk/drivers/inmem"
+	"github.com/bktrung/edm_sdk/internal/clock"
+	"github.com/bktrung/edm_sdk/internal/testhook"
 )
 
 // backlogRecordingObserver keeps only point events. Start and Finish satisfy

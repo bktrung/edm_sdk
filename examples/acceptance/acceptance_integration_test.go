@@ -13,10 +13,10 @@ import (
 	"testing"
 	"time"
 
-	f1 "fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk"
-	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/codec"
-	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/driver"
-	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/drivers/kafka"
+	f1 "github.com/bktrung/edm_sdk"
+	"github.com/bktrung/edm_sdk/codec"
+	"github.com/bktrung/edm_sdk/driver"
+	"github.com/bktrung/edm_sdk/drivers/kafka"
 )
 
 func TestAcceptanceAgainstKafka(t *testing.T) {

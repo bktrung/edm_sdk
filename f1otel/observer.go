@@ -6,8 +6,8 @@ import (
 	"sync"
 	"sync/atomic"
 
-	f1 "fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk"
-	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/version"
+	f1 "github.com/bktrung/edm_sdk"
+	"github.com/bktrung/edm_sdk/internal/version"
 
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/metric"
@@ -63,7 +63,7 @@ type startState struct {
 }
 
 // instrumentationName names the meter and tracer this package creates.
-const instrumentationName = "fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/f1otel"
+const instrumentationName = "github.com/bktrung/edm_sdk/f1otel"
 
 // New returns an Observer configured with application-owned providers. New
 // creates no exporter, never reads a global provider, and reports instrument

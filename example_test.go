@@ -7,9 +7,9 @@ import (
 	"log/slog"
 	"time"
 
-	f1 "fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk"
+	f1 "github.com/bktrung/edm_sdk"
 	//nolint:depguard // the example runs the client on the in-memory driver, which needs no broker.
-	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/drivers/inmem"
+	"github.com/bktrung/edm_sdk/drivers/inmem"
 )
 
 func Example() {

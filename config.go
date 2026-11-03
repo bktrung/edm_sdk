@@ -13,8 +13,8 @@ import (
 
 	"go.yaml.in/yaml/v3"
 
-	kafkarules "fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/kafka"
-	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/retry"
+	kafkarules "github.com/bktrung/edm_sdk/internal/kafka"
+	"github.com/bktrung/edm_sdk/internal/retry"
 )
 
 // maxPrefetch is the largest value the AMQP 0-9-1 basic.qos prefetch-count

@@ -10,7 +10,7 @@ import (
 	"strings"
 	"testing"
 
-	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/driver"
+	"github.com/bktrung/edm_sdk/driver"
 )
 
 // reclaimGroupRunners is the one group these tests run: a single check that

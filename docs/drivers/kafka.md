@@ -10,7 +10,7 @@ The Kafka adapter uses consumer groups and franz-go. Its feature list shows that
 [F1 does](/learn/glossary#emulated) delay, priority, delivery count, and dead-letter handling itself where Kafka has no
 built-in equivalent.
 
-Start with the [Kafka adapter](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/drivers/kafka/kafka.go)
+Start with the [Kafka adapter](https://github.com/bktrung/edm_sdk/blob/main/drivers/kafka/kafka.go)
 for connection policy and the [source-reading guide](/development/source-reading-guide)
 for the producer, consumer, topology, and observation boundaries.
 
@@ -83,7 +83,7 @@ explains the diagnostic trade-off.
 ### Kafka retry timing
 
 The retry step's configured delay is added to the record timestamp by the
-consumer, not enforced as a broker topic policy. The [eligibility source](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/drivers/kafka/deferral.go)
+consumer, not enforced as a broker topic policy. The [eligibility source](https://github.com/bktrung/edm_sdk/blob/main/drivers/kafka/deferral.go)
 owns the timestamp precision adjustment and delay check.
 
 The record timestamp is the producer's `CreateTime` when the topic uses the
@@ -140,7 +140,7 @@ Kafka fetch buffering is separate from the [SDK admission total and destination
 windows](/advanced-topics/configuration#prefetch-resolution); poll results are not
 evidence of admitted unsettled work. For buffer bounds, partition pauses, and
 admission accounting, read the consumer in
-[`drivers/kafka/consumer.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/drivers/kafka/consumer.go).
+[`drivers/kafka/consumer.go`](https://github.com/bktrung/edm_sdk/blob/main/drivers/kafka/consumer.go).
 
 Memory planning must include client fetch buffers and driver read-ahead as well
 as work already delivered to F1. Large records and many held partition heads
@@ -171,7 +171,7 @@ Other topic policies remain operator decisions: retention, main-topic
 compaction, replication, `min.insync.replicas`, topic-level `max.message.bytes`,
 and `message.timestamp.type`. Connection-time broker checks do not replace
 them. The
-[topology owner](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/drivers/kafka/topology.go)
+[topology owner](https://github.com/bktrung/edm_sdk/blob/main/drivers/kafka/topology.go)
 defines what startup verification covers.
 
 Delete-only cleanup does not mean infinite retention. Size retention for the
@@ -183,7 +183,7 @@ atomic with a group offset commit.
 Stop publishing and consuming before `Purge` or `Prune`. A consumer can attach
 after a prune guard succeeds but before topic deletion, because the delete
 request is not conditional on that guard. The
-[maintenance owner](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/drivers/kafka/admin.go)
+[maintenance owner](https://github.com/bktrung/edm_sdk/blob/main/drivers/kafka/admin.go)
 defines the refusal checks; they do not close this race with other clients.
 
 ### Pre-deploy topic policy checklist
@@ -213,10 +213,10 @@ Use lag as a trend signal, not an exact count of records or this member's
 share. Offset gaps and group-wide sampling make those interpretations unsafe.
 Backlog-head observation requires additional fetches and can be unknown;
 unknown is not evidence of an empty backlog. The
-[backlog owner](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/drivers/kafka/backlog.go)
+[backlog owner](https://github.com/bktrung/edm_sdk/blob/main/drivers/kafka/backlog.go)
 defines the offset snapshot and head-probe boundary.
 
-The [local fixture](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/docker/docker-compose.yml)
+The [local fixture](https://github.com/bktrung/edm_sdk/blob/main/docker/docker-compose.yml)
 has one Kafka broker. Passing fixture tests does not establish multi-replica
 failure behavior, physical fsync, or exactly-once effects. Use the
 [testing guide](/development/testing) to select repository evidence.

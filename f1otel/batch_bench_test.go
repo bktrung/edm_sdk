@@ -5,8 +5,8 @@ import (
 	"testing"
 	"time"
 
-	f1 "fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk"
-	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/drivers/inmem"
+	f1 "github.com/bktrung/edm_sdk"
+	"github.com/bktrung/edm_sdk/drivers/inmem"
 
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"

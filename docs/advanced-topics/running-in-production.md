@@ -2,7 +2,7 @@
 
 A production service should use a real broker driver, provision topology separately, expose readiness, and shut down through `Client.Close`.
 
-For a runnable composition, see [`examples/consumer/main.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/examples/consumer/main.go).
+For a runnable composition, see [`examples/consumer/main.go`](https://github.com/bktrung/edm_sdk/blob/main/examples/consumer/main.go).
 
 ## Set production configuration
 

@@ -4,7 +4,7 @@ import (
 	"context"
 	"fmt"
 
-	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/driver"
+	"github.com/bktrung/edm_sdk/driver"
 )
 
 // observeStart invokes Start on the client's observer and falls back to the

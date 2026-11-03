@@ -7,9 +7,9 @@ import (
 	"testing"
 	"time"
 
-	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/driver"
-	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/clock"
-	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/lifecycle"
+	"github.com/bktrung/edm_sdk/driver"
+	"github.com/bktrung/edm_sdk/internal/clock"
+	"github.com/bktrung/edm_sdk/internal/lifecycle"
 )
 
 // ownerProbeConsumer records how a running runner let it go, and can hold the

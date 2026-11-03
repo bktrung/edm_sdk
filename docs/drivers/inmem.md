@@ -7,7 +7,7 @@ For shared configuration and security, see [Drivers and capabilities](/drivers-a
 ## How the driver works
 
 The in-memory adapter is the deterministic reference implementation used by
-integration tests and [`f1test`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/tree/main/f1test). It supports isolated or shared
+integration tests and [`f1test`](https://github.com/bktrung/edm_sdk/tree/main/f1test). It supports isolated or shared
 state, delayed delivery on a fake clock, [consumer groups](/learn/glossary#consumer-group),
 delivery counters, redelivery, topology administration, and injectable test
 failures. Messages with the same key go to the same consumer within a group.
@@ -18,15 +18,15 @@ bounded, evicting the oldest entries at the cap. The last consumer detaching
 from a destination clears that destination's history, so a later earliest-start
 group cannot rely on replaying messages from before it went idle.
 
-[`inmem.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/drivers/inmem/inmem.go),
+[`inmem.go`](https://github.com/bktrung/edm_sdk/blob/main/drivers/inmem/inmem.go),
 at `maxDestinationHistory`, `recordHistoryLocked`, and `replayHistoryLocked`,
 owns the replay cap and selection.
-[`consumer.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/drivers/inmem/consumer.go),
+[`consumer.go`](https://github.com/bktrung/edm_sdk/blob/main/drivers/inmem/consumer.go),
 at `detachLocked`, owns idle-history clearing. These rules apply to replay
 history; they are not a promise to purge pending deliveries when a consumer
 leaves.
 
-Start with [`drivers/inmem/inmem.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/drivers/inmem/inmem.go), then read its
+Start with [`drivers/inmem/inmem.go`](https://github.com/bktrung/edm_sdk/blob/main/drivers/inmem/inmem.go), then read its
 producer, consumer, admin, ack, and conformance tests. It is the best
 adapter to read when diagnosing a port or core semantic before introducing
 broker-specific timing or management behavior.

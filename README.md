@@ -92,23 +92,14 @@ attributes, enqueue-time sources, and broker settings.
 ## Install
 
 ```
-go get fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk@v0.1.0
+go get github.com/bktrung/edm_sdk
 ```
 
 ```go
-import f1 "fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk"
+import f1 "github.com/bktrung/edm_sdk"
 ```
 
 This module requires Go 1.27 or newer. The drivers are tested against RabbitMQ 4.3.4 and Kafka 4.2.1.
-
-Set `GOPRIVATE=fgit.zapps.vn` before the first `go get` of this module. `GOPRIVATE` skips the
-public proxy and checksum database but does not authenticate; `go get` also needs Git credentials
-for `fgit.zapps.vn`.
-Provide credentials with a `~/.netrc` entry or configure Git to rewrite HTTPS module URLs to SSH:
-
-```sh
-git config --global url."git@fgit.zapps.vn:".insteadOf "https://fgit.zapps.vn/"
-```
 
 ## Local documentation site
 

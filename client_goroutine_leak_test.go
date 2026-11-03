@@ -8,12 +8,12 @@ import (
 	"testing"
 	"time"
 
-	f1 "fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk"
-	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/f1otel"
+	f1 "github.com/bktrung/edm_sdk"
+	"github.com/bktrung/edm_sdk/f1otel"
 
 	//nolint:depguard // the lifecycle test exercises the public client through the in-memory driver.
-	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/drivers/inmem"
-	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/clock"
+	"github.com/bktrung/edm_sdk/drivers/inmem"
+	"github.com/bktrung/edm_sdk/internal/clock"
 
 	//nolint:depguard // provider construction is part of the f1otel lifecycle check.
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"

@@ -1,7 +1,7 @@
 package f1
 
 import (
-	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/lifecycle"
+	"github.com/bktrung/edm_sdk/internal/lifecycle"
 )
 
 // This file builds the client lifecycle state a fixture means, so a test that

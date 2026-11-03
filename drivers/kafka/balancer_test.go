@@ -8,7 +8,7 @@ import (
 
 	"github.com/twmb/franz-go/pkg/kgo"
 
-	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/driver"
+	"github.com/bktrung/edm_sdk/driver"
 )
 
 // TestResolveBalancerProtocols pins the protocol name and the cooperative flag

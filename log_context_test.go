@@ -8,10 +8,10 @@ import (
 	"testing"
 	"time"
 
-	f1 "fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk"
+	f1 "github.com/bktrung/edm_sdk"
 	//nolint:depguard // the log context test exercises the public client through the in-memory driver.
-	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/drivers/inmem"
-	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/f1otel"
+	"github.com/bktrung/edm_sdk/drivers/inmem"
+	"github.com/bktrung/edm_sdk/f1otel"
 
 	//nolint:depguard // provider construction is part of the log context test.
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"

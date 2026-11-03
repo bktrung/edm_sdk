@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/dispatch"
+	"github.com/bktrung/edm_sdk/internal/dispatch"
 )
 
 func TestLoadConfigUnknownKeyIsStartupError(t *testing.T) {

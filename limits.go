@@ -1,7 +1,7 @@
 package f1
 
 import (
-	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/driver"
+	"github.com/bktrung/edm_sdk/driver"
 )
 
 // Limits describes the selected driver's capabilities and the mode used for

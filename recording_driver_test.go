@@ -11,11 +11,11 @@ import (
 	"testing"
 	"time"
 
-	f1 "fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk"
-	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/driver"
+	f1 "github.com/bktrung/edm_sdk"
+	"github.com/bktrung/edm_sdk/driver"
 
 	//nolint:depguard // this wrapper delegates to the in-memory driver, the only adapter that needs no broker, and importing it here is what keeps these tests outside package f1.
-	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/drivers/inmem"
+	"github.com/bktrung/edm_sdk/drivers/inmem"
 )
 
 // recordingWaitTimeout bounds every wait these tests do on the wrapper. The

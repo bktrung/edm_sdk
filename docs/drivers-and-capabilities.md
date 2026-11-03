@@ -175,7 +175,7 @@ refusal names the key.
 For the two duration keys, a value that does not parse as a duration is refused
 by these checks too, before the driver would refuse it at `Open`. The accepted
 key list and its error are implemented in
-[`broker_config.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/broker_config.go).
+[`broker_config.go`](https://github.com/bktrung/edm_sdk/blob/main/broker_config.go).
 
 ## Provider boundary
 
@@ -199,7 +199,7 @@ defines how these sources affect broker wait and oldest-age metrics:
 
 ## Capability report
 
-Inspect [`Client.Limits()`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/limits.go)
+Inspect [`Client.Limits()`](https://github.com/bktrung/edm_sdk/blob/main/limits.go)
 after connecting when service behavior depends on a broker feature. Each
 entry is a `FeatureStatus`
 with a mode and, where declared, a detail string. The mode `native` means

@@ -11,9 +11,9 @@ import (
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 	metricdata "go.opentelemetry.io/otel/sdk/metric/metricdata"
 
-	f1 "fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk"
-	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/drivers/inmem"
-	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/f1otel"
+	f1 "github.com/bktrung/edm_sdk"
+	"github.com/bktrung/edm_sdk/drivers/inmem"
+	"github.com/bktrung/edm_sdk/f1otel"
 )
 
 func ExampleNew() {

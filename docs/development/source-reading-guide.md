@@ -36,16 +36,16 @@ Use [Writing style](/development/writing-style) when adding or revising document
 
 Read the public nouns and guarantees before reading orchestration:
 
-1. [`doc.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/doc.go) - package purpose and public boundary.
-2. [`event.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/event.go) - event identity, payload, and handler-facing
+1. [`doc.go`](https://github.com/bktrung/edm_sdk/blob/main/doc.go) - package purpose and public boundary.
+2. [`event.go`](https://github.com/bktrung/edm_sdk/blob/main/event.go) - event identity, payload, and handler-facing
    values.
-3. [`envelope.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/envelope.go) - wire metadata, headers, identity, and
+3. [`envelope.go`](https://github.com/bktrung/edm_sdk/blob/main/envelope.go) - wire metadata, headers, identity, and
    encoding limits.
-4. [`errors.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/errors.go) - public error wrappers and caller-visible
+4. [`errors.go`](https://github.com/bktrung/edm_sdk/blob/main/errors.go) - public error wrappers and caller-visible
    classification.
-5. [`priority.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/priority.go) - priority values and their public
+5. [`priority.go`](https://github.com/bktrung/edm_sdk/blob/main/priority.go) - priority values and their public
    ordering meaning.
-6. [`observer.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/observer.go) - observer lifecycle events, pairing, ordering, and trace injection.
+6. [`observer.go`](https://github.com/bktrung/edm_sdk/blob/main/observer.go) - observer lifecycle events, pairing, ordering, and trace injection.
 
 Then read the public package comments and the nearest focused tests. The goal
 is to understand what a service author can observe: event identity, headers,
@@ -58,15 +58,15 @@ rules begin in the driver port.
 
 Read the port before any adapter or worker implementation:
 
-1. [`driver/driver.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/driver/driver.go) - `Driver`, `Conn`, `Admin`,
+1. [`driver/driver.go`](https://github.com/bktrung/edm_sdk/blob/main/driver/driver.go) - `Driver`, `Conn`, `Admin`,
    `Producer`, `Consumer`, and their lifecycle contracts.
-2. [`driver/message.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/driver/message.go) - inbound and outbound
+2. [`driver/message.go`](https://github.com/bktrung/edm_sdk/blob/main/driver/message.go) - inbound and outbound
    messages, headers, broker references, and settlement.
-3. [`driver/capability.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/driver/capability.go) - native capability
+3. [`driver/capability.go`](https://github.com/bktrung/edm_sdk/blob/main/driver/capability.go) - native capability
    declarations, physical limits, and strict portability.
-4. [`driver/topology.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/driver/topology.go) - topology specifications,
+4. [`driver/topology.go`](https://github.com/bktrung/edm_sdk/blob/main/driver/topology.go) - topology specifications,
    policies, scopes, diffs, and state inspection.
-5. [`driver/errors.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/driver/errors.go) - sentinel errors, error kinds,
+5. [`driver/errors.go`](https://github.com/bktrung/edm_sdk/blob/main/driver/errors.go) - sentinel errors, error kinds,
    classified errors, and partial publish errors.
 
 The goal is to know which behavior belongs in every adapter and which behavior
@@ -84,17 +84,17 @@ contract before changing an import boundary.
 Trace how an application becomes a connected client and a durable outbound
 message:
 
-1. [`config.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/config.go) - user configuration and resolved defaults.
-2. [`broker_config.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/broker_config.go) - broker connection and driver
+1. [`config.go`](https://github.com/bktrung/edm_sdk/blob/main/config.go) - user configuration and resolved defaults.
+2. [`broker_config.go`](https://github.com/bktrung/edm_sdk/blob/main/broker_config.go) - broker connection and driver
    configuration.
-3. [`internal/kafka/drain.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/internal/kafka/drain.go) - the standard-library-only Kafka timeout rule shared by core validation and Kafka consumer admission.
-4. [`options.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/options.go) - functional options and runtime option
+3. [`internal/kafka/drain.go`](https://github.com/bktrung/edm_sdk/blob/main/internal/kafka/drain.go) - the standard-library-only Kafka timeout rule shared by core validation and Kafka consumer admission.
+4. [`options.go`](https://github.com/bktrung/edm_sdk/blob/main/options.go) - functional options and runtime option
    resolution.
-5. [`client.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/client.go) - driver opening, topology initialization,
+5. [`client.go`](https://github.com/bktrung/edm_sdk/blob/main/client.go) - driver opening, topology initialization,
    shared producer admission, reconnect ownership, and client close.
-6. [`publisher.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/publisher.go) - publish validation, codec selection,
+6. [`publisher.go`](https://github.com/bktrung/edm_sdk/blob/main/publisher.go) - publish validation, codec selection,
    envelope construction, topic routing, and durable publication.
-7. [`envelope.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/envelope.go) again at `EncodeHeaders` - the wire
+7. [`envelope.go`](https://github.com/bktrung/edm_sdk/blob/main/envelope.go) again at `EncodeHeaders` - the wire
    boundary between core metadata and driver headers.
 
 The goal is to understand which work happens before driver publication and
@@ -105,15 +105,15 @@ which work is the driver's durability responsibility. Follow
 
 Read the small, portable mechanisms before the worker that composes them:
 
-1. [`internal/clock/`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/tree/main/internal/clock) - real and manually advanced
+1. [`internal/clock/`](https://github.com/bktrung/edm_sdk/tree/main/internal/clock) - real and manually advanced
    clocks used by retries, delays, deadlines, and tests.
-2. [`internal/retry/`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/tree/main/internal/retry) - backoff tiers and delay
+2. [`internal/retry/`](https://github.com/bktrung/edm_sdk/tree/main/internal/retry) - backoff tiers and delay
    resolution.
-3. [`internal/sched/`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/tree/main/internal/sched) - bounded weighted lanes,
+3. [`internal/sched/`](https://github.com/bktrung/edm_sdk/tree/main/internal/sched) - bounded weighted lanes,
    priority, deadline promotion, and fairness.
-4. [`internal/dispatch/`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/tree/main/internal/dispatch) - worker pool,
+4. [`internal/dispatch/`](https://github.com/bktrung/edm_sdk/tree/main/internal/dispatch) - worker pool,
    ordered-key routing, and in-flight registry behavior.
-5. [`internal/lifecycle/`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/tree/main/internal/lifecycle) - runner state and
+5. [`internal/lifecycle/`](https://github.com/bktrung/edm_sdk/tree/main/internal/lifecycle) - runner state and
    drain transitions.
 
 The goal is to recognize an algorithmic invariant when it appears in a higher
@@ -124,14 +124,14 @@ than reconstructing the invariant from the worker.
 
 Only after the contracts and primitives are clear, read the orchestration:
 
-1. [`subscription.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/subscription.go) - subscription resolution,
+1. [`subscription.go`](https://github.com/bktrung/edm_sdk/blob/main/subscription.go) - subscription resolution,
    handler registration, topology inputs, and runner construction.
-2. [`worker.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/worker.go) - runner generations, fetch, dispatch,
+2. [`worker.go`](https://github.com/bktrung/edm_sdk/blob/main/worker.go) - runner generations, fetch, dispatch,
    handler invocation, retry/dead-letter routing, settlement, and drain.
-3. [`reconnect.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/reconnect.go) - connection replacement and runner
+3. [`reconnect.go`](https://github.com/bktrung/edm_sdk/blob/main/reconnect.go) - connection replacement and runner
    re-entry after transient driver failure.
-4. [`observer_call.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/observer_call.go) - synchronous observer calls, panic containment, finish guards, and trace injection.
-5. [`backlog_poll.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/backlog_poll.go) - backlog sampling and observer backlog point events.
+4. [`observer_call.go`](https://github.com/bktrung/edm_sdk/blob/main/observer_call.go) - synchronous observer calls, panic containment, finish guards, and trace injection.
+5. [`backlog_poll.go`](https://github.com/bktrung/edm_sdk/blob/main/backlog_poll.go) - backlog sampling and observer backlog point events.
 
 Use the function map in [Consume flow](/development/consume-flow) while reading
 `worker.go`. Start at `Runner.Run`, then jump to the fetch, dispatch,
@@ -146,22 +146,22 @@ packages own scheduling, dispatch, and lifecycle state.
 
 Read adapters in this order:
 
-1. [`drivers/inmem/`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/tree/main/drivers/inmem) - the deterministic reference
+1. [`drivers/inmem/`](https://github.com/bktrung/edm_sdk/tree/main/drivers/inmem) - the deterministic reference
    adapter and the easiest place to see topology, delivery, settlement,
    deferred work, and fault behavior.
-2. [`f1test/`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/tree/main/f1test) - the handler-facing deterministic test client
+2. [`f1test/`](https://github.com/bktrung/edm_sdk/tree/main/f1test) - the handler-facing deterministic test client
    built on the in-memory adapter and fake clock.
-3. [`drivers/rabbitmq/`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/tree/main/drivers/rabbitmq) - AMQP translation,
+3. [`drivers/rabbitmq/`](https://github.com/bktrung/edm_sdk/tree/main/drivers/rabbitmq) - AMQP translation,
    management inspection, queue/exchange behavior, reconnect, and settlement.
-4. [`drivers/kafka/`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/tree/main/drivers/kafka) - classic consumer groups,
+4. [`drivers/kafka/`](https://github.com/bktrung/edm_sdk/tree/main/drivers/kafka) - classic consumer groups,
    partition-bound scaling, offsets, deferral, lag, and rebalance ownership.
 
 For Kafka operations, follow
-[`topology.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/drivers/kafka/topology.go)
+[`topology.go`](https://github.com/bktrung/edm_sdk/blob/main/drivers/kafka/topology.go)
 for declaration, verification, and partition floors;
-[`admin.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/drivers/kafka/admin.go)
+[`admin.go`](https://github.com/bktrung/edm_sdk/blob/main/drivers/kafka/admin.go)
 for purge/prune ownership guards; and
-[`backlog.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/drivers/kafka/backlog.go)
+[`backlog.go`](https://github.com/bktrung/edm_sdk/blob/main/drivers/kafka/backlog.go)
 for offset snapshots and optional head probes. The
 [Kafka driver guide](/drivers/kafka) explains the operator-owned topic-policy
 and maintenance boundaries.
@@ -180,15 +180,15 @@ and the provider notes in
 
 Finish by reading the checks that protect the repository boundaries:
 
-1. [`driver/conformance/`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/tree/main/driver/conformance) - the broker-independent
+1. [`driver/conformance/`](https://github.com/bktrung/edm_sdk/tree/main/driver/conformance) - the broker-independent
    driver contract suite, profiles, behavior vectors, and provider fixtures.
-2. [`tools/apisurface/`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/tree/main/tools/apisurface) - exported-symbol checks
+2. [`tools/apisurface/`](https://github.com/bktrung/edm_sdk/tree/main/tools/apisurface) - exported-symbol checks
    against committed public API fixtures.
-3. [`tools/apidiff/`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/tree/main/tools/apidiff) - compatibility comparison and
+3. [`tools/apidiff/`](https://github.com/bktrung/edm_sdk/tree/main/tools/apidiff) - compatibility comparison and
    normalization for API baselines.
-4. [`Makefile`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/Makefile) - build, unit, lint, API-surface, API-diff,
+4. [`Makefile`](https://github.com/bktrung/edm_sdk/blob/main/Makefile) - build, unit, lint, API-surface, API-diff,
    import-boundary, self-contained, and broker-backed verification targets.
-5. [`.gitlab-ci.yml`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/.gitlab-ci.yml) - the CI composition that makes
+5. [`.gitlab-ci.yml`](https://github.com/bktrung/edm_sdk/blob/main/.gitlab-ci.yml) - the CI composition that makes
    the local gates meaningful.
 
 The goal is to know what evidence a change must provide. A driver change needs
@@ -211,10 +211,10 @@ Publisher.Publish
   -> driver.Producer.Publish
 ```
 
-Start at [`Publisher.Publish`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/publisher.go), which delegates to
+Start at [`Publisher.Publish`](https://github.com/bktrung/edm_sdk/blob/main/publisher.go), which delegates to
 `PublishBatch`. Then follow `buildOutbound` in the same file for codec
 selection, event identity, envelope fields, routing, allowlists, and headers.
-Follow `sharedProducer` in [`client.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/client.go)
+Follow `sharedProducer` in [`client.go`](https://github.com/bktrung/edm_sdk/blob/main/client.go)
 for shared-producer admission and the close barrier. The final durable
 publication contract is the `driver.Producer` implementation in the selected
 adapter.
@@ -254,7 +254,7 @@ handler under its lifecycle context. The final branch publishes a retry or
 dead-letter successor before settling the original, or acknowledges/discards
 it directly.
 
-The named owners are in [`worker.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/worker.go):
+The named owners are in [`worker.go`](https://github.com/bktrung/edm_sdk/blob/main/worker.go):
 
 - `Runner.Run` near the public runner API;
 - `fetchRunner` and `fetchRunnerAfterCancel` in intake and cancellation;
@@ -271,22 +271,22 @@ keys, priorities, delays, concurrency, drain, shutdown, and reconnect.
 After tracing a flow, read the tests that guard its boundary rather than every
 test in the repository. Good first stops are:
 
-- [`publish_test.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/publish_test.go),
-  [`publish_close_barrier_test.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/publish_close_barrier_test.go), and
-  [`worker_retry_bridge_test.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/worker_retry_bridge_test.go) for
+- [`publish_test.go`](https://github.com/bktrung/edm_sdk/blob/main/publish_test.go),
+  [`publish_close_barrier_test.go`](https://github.com/bktrung/edm_sdk/blob/main/publish_close_barrier_test.go), and
+  [`worker_retry_bridge_test.go`](https://github.com/bktrung/edm_sdk/blob/main/worker_retry_bridge_test.go) for
   publication and successor ordering;
-- [`dispatch_test.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/dispatch_test.go),
-  [`worker_ordering_test.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/worker_ordering_test.go), and
-  [`settlement_state_test.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/settlement_state_test.go) for dispatch,
+- [`dispatch_test.go`](https://github.com/bktrung/edm_sdk/blob/main/dispatch_test.go),
+  [`worker_ordering_test.go`](https://github.com/bktrung/edm_sdk/blob/main/worker_ordering_test.go), and
+  [`settlement_state_test.go`](https://github.com/bktrung/edm_sdk/blob/main/settlement_state_test.go) for dispatch,
   ordering, and settlement;
-- [`client_close_sequencing_test.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/client_close_sequencing_test.go),
-  [`client_drain_budget_test.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/client_drain_budget_test.go), and
-  [`worker_settlement_test.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/worker_settlement_test.go) for shutdown;
-- [`reconnection_test.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/reconnection_test.go) and
-  [`lane_repair_test.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/lane_repair_test.go) for recovery; and
-- [`f1test/f1test_test.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/f1test/f1test_test.go),
-  [`f1test/fanout_test.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/f1test/fanout_test.go), and
-  [`f1test/ordered_test.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/f1test/ordered_test.go) for handler-facing
+- [`client_close_sequencing_test.go`](https://github.com/bktrung/edm_sdk/blob/main/client_close_sequencing_test.go),
+  [`client_drain_budget_test.go`](https://github.com/bktrung/edm_sdk/blob/main/client_drain_budget_test.go), and
+  [`worker_settlement_test.go`](https://github.com/bktrung/edm_sdk/blob/main/worker_settlement_test.go) for shutdown;
+- [`reconnection_test.go`](https://github.com/bktrung/edm_sdk/blob/main/reconnection_test.go) and
+  [`lane_repair_test.go`](https://github.com/bktrung/edm_sdk/blob/main/lane_repair_test.go) for recovery; and
+- [`f1test/f1test_test.go`](https://github.com/bktrung/edm_sdk/blob/main/f1test/f1test_test.go),
+  [`f1test/fanout_test.go`](https://github.com/bktrung/edm_sdk/blob/main/f1test/fanout_test.go), and
+  [`f1test/ordered_test.go`](https://github.com/bktrung/edm_sdk/blob/main/f1test/ordered_test.go) for handler-facing
   behavior.
 
 When a test fails, use the lowest owning layer to diagnose it: a primitive

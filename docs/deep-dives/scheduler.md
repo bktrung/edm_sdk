@@ -62,8 +62,8 @@ fetch buffers may retain work that has not been SDK-admitted. Raising
 Read the [RabbitMQ options](/drivers/rabbitmq#rabbitmq-options) and
 [Kafka delayed records](/drivers/kafka#kafka-delayed-records) for transport
 constraints; the admission owners are the consumers in
-[`drivers/rabbitmq`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/tree/main/drivers/rabbitmq)
-and [`drivers/kafka`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/tree/main/drivers/kafka).
+[`drivers/rabbitmq`](https://github.com/bktrung/edm_sdk/tree/main/drivers/rabbitmq)
+and [`drivers/kafka`](https://github.com/bktrung/edm_sdk/tree/main/drivers/kafka).
 
 The [fallback lane](/learn/glossary#lane) takes a delivery whose destination F1 cannot map to a lane; it is the main lane of the subscription's first topic and priority. F1 then holds the one delivery that did not fit, outside any lane, and stops reading new deliveries for the whole subscription until a worker frees a slot in that lane. It never holds more than one.
 

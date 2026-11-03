@@ -8,10 +8,10 @@ import (
 	"testing"
 	"time"
 
-	f1 "fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk"
-	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/driver"
-	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/drivers/inmem"
-	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/f1test"
+	f1 "github.com/bktrung/edm_sdk"
+	"github.com/bktrung/edm_sdk/driver"
+	"github.com/bktrung/edm_sdk/drivers/inmem"
+	"github.com/bktrung/edm_sdk/f1test"
 
 	"github.com/stretchr/testify/require"
 	"go.opentelemetry.io/otel/attribute"

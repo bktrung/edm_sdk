@@ -37,7 +37,7 @@ Required identity, routing, ordering, retry, and death metadata stays.
 Shedding those fields would make a smaller copy mean something different from
 the original. If the required headers alone exceed the cap, encoding fails
 with `ErrEnvelopeTooLarge`. The wire boundary is
-[`Envelope.EncodeHeaders`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/envelope.go).
+[`Envelope.EncodeHeaders`](https://github.com/bktrung/edm_sdk/blob/main/envelope.go).
 
 ## The opening example, in numbers
 

@@ -6,7 +6,7 @@ import (
 	"strings"
 	"testing"
 
-	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/driver"
+	"github.com/bktrung/edm_sdk/driver"
 )
 
 func init() {

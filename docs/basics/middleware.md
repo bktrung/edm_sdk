@@ -1,6 +1,6 @@
 # Middleware
 
-F1 middleware wraps an [`f1.Handler`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/handler.go) with behavior that is
+F1 middleware wraps an [`f1.Handler`](https://github.com/bktrung/edm_sdk/blob/main/handler.go) with behavior that is
 useful across handlers but should not be part of one handler's business logic.
 Typical examples are structured logging, timing, tracing, and application-level
 metrics.
@@ -222,4 +222,4 @@ implementation.
   classification helpers;
 - [Consume flow](/development/consume-flow) - dispatch, classification, and
   ack internals; and
-- [`Middleware`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/handler.go) - the executable type and composition owner.
+- [`Middleware`](https://github.com/bktrung/edm_sdk/blob/main/handler.go) - the executable type and composition owner.

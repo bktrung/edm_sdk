@@ -5,7 +5,7 @@ import (
 	"testing"
 	"time"
 
-	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/clock"
+	"github.com/bktrung/edm_sdk/internal/clock"
 )
 
 // TestHooksPanicWhenNoPackageRegistered pins the diagnostic a caller gets when

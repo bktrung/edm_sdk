@@ -10,8 +10,8 @@ import (
 	"testing/synctest"
 	"time"
 
-	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/clock"
-	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/lifecycle"
+	"github.com/bktrung/edm_sdk/internal/clock"
+	"github.com/bktrung/edm_sdk/internal/lifecycle"
 )
 
 // newBudgetTestClient builds a client on a fake clock with a runner whose

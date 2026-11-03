@@ -8,7 +8,7 @@ import (
 	"testing"
 
 	//nolint:depguard // subscription error-path tests use the deterministic in-memory driver.
-	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/drivers/inmem"
+	"github.com/bktrung/edm_sdk/drivers/inmem"
 )
 
 func TestSubscribeRejectsMalformedEnvironmentValues(t *testing.T) {

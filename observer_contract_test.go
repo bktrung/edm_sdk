@@ -8,8 +8,8 @@ import (
 	"testing"
 	"time"
 
-	f1 "fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk"
-	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/f1test"
+	f1 "github.com/bktrung/edm_sdk"
+	"github.com/bktrung/edm_sdk/f1test"
 )
 
 type observerScenario struct {

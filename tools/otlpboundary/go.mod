@@ -5,7 +5,7 @@ go 1.27.0
 toolchain go1.27.3
 
 require (
-	fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk v0.0.0
+	github.com/bktrung/edm_sdk v0.0.0
 	go.opentelemetry.io/otel/exporters/otlp/otlpmetric/otlpmetrichttp v1.47.0
 	go.opentelemetry.io/otel/sdk v1.47.0
 	go.opentelemetry.io/otel/sdk/metric v1.47.0
@@ -35,4 +35,4 @@ require (
 	google.golang.org/grpc v1.84.0 // indirect
 )
 
-replace fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk => ../..
+replace github.com/bktrung/edm_sdk => ../..

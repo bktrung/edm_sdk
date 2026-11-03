@@ -8,7 +8,7 @@ import (
 
 	"github.com/twmb/franz-go/pkg/kgo"
 
-	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/driver"
+	"github.com/bktrung/edm_sdk/driver"
 )
 
 // newTwoPartitionConsumer is a hold-rule consumer that owns partitions 0 and 1

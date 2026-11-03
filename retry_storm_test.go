@@ -4,8 +4,8 @@ import (
 	"testing"
 	"time"
 
-	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/clock"
-	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/sched"
+	"github.com/bktrung/edm_sdk/internal/clock"
+	"github.com/bktrung/edm_sdk/internal/sched"
 )
 
 const (

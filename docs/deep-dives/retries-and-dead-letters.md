@@ -93,7 +93,7 @@ endless redelivery loop. A corrupted attempt counter is also a poison case,
 not an ordinary handler that has exhausted its attempts.
 
 Destination derivation, poison detection, and the copy/drop decisions are in
-[`worker.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/worker.go).
+[`worker.go`](https://github.com/bktrung/edm_sdk/blob/main/worker.go).
 Use [Failure handling](/advanced-topics/failure-handling) for public policy
 and death reasons, and [Consume flow](/development/consume-flow) for the source
 map rather than a second destination or reason inventory here.

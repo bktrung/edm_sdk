@@ -209,11 +209,11 @@ total. A positive total above the lane-capacity sum is effectively lower; it
 does not enlarge lanes or let a hot lane borrow another lane's capacity.
 
 The executable owners are `resolvePrefetch` and subscription validation in
-[`config.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/config.go),
+[`config.go`](https://github.com/bktrung/edm_sdk/blob/main/config.go),
 `resolveSubscription` in
-[`subscription.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/subscription.go),
+[`subscription.go`](https://github.com/bktrung/edm_sdk/blob/main/subscription.go),
 and `runnerLanePlan` / `runnerConsumerPrefetch` in
-[`worker.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/worker.go).
+[`worker.go`](https://github.com/bktrung/edm_sdk/blob/main/worker.go).
 Resolved automatic sizing remains subject to prefetch and ordered-buffer
 validation. This admission contract does not change acknowledgement timing or
 ordered-key behavior.

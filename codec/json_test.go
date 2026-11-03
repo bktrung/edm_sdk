@@ -5,8 +5,8 @@ import (
 
 	"github.com/stretchr/testify/require"
 
-	f1 "fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk"
-	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/codec"
+	f1 "github.com/bktrung/edm_sdk"
+	"github.com/bktrung/edm_sdk/codec"
 )
 
 func TestJSON_RoundTripsThroughAnyAndTypedStruct(t *testing.T) {

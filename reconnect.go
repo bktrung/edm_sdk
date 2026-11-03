@@ -9,9 +9,9 @@ import (
 	"sync"
 	"time"
 
-	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/driver"
-	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/lifecycle"
-	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/retry"
+	"github.com/bktrung/edm_sdk/driver"
+	"github.com/bktrung/edm_sdk/internal/lifecycle"
+	"github.com/bktrung/edm_sdk/internal/retry"
 )
 
 var reconnectPolicy = retry.Config{

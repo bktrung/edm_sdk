@@ -46,7 +46,7 @@ The timeline compares copies A and B parked at the same moment with illustrative
 
 A parking queue dead-letters expired copies to the retry destination, not the original topic queue. The extra queue lets the broker hold the copy without tying up a handler or keeping the original delivery unacked for the entire delay.
 
-The [RabbitMQ driver reference](/drivers/rabbitmq#delayed-and-retried-messages-need-per-destination-parking-queues) owns provisioning policy, durability, expiration rounding, limits, and queue settings. The executable owners are [topology construction](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/drivers/rabbitmq/topology.go) and [publish routing](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/drivers/rabbitmq/producer.go).
+The [RabbitMQ driver reference](/drivers/rabbitmq#delayed-and-retried-messages-need-per-destination-parking-queues) owns provisioning policy, durability, expiration rounding, limits, and queue settings. The executable owners are [topology construction](https://github.com/bktrung/edm_sdk/blob/main/drivers/rabbitmq/topology.go) and [publish routing](https://github.com/bktrung/edm_sdk/blob/main/drivers/rabbitmq/producer.go).
 
 ## One retry, step by step
 

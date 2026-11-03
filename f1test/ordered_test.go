@@ -10,7 +10,7 @@ import (
 
 	"github.com/stretchr/testify/require"
 
-	f1 "fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk"
+	f1 "github.com/bktrung/edm_sdk"
 )
 
 // orderedSaturation publishes messagesPerKey copies of each of two keys, key-0

@@ -7,9 +7,9 @@ import (
 	"testing"
 	"time"
 
-	f1 "fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk"
-	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/driver"
-	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/drivers/inmem" //nolint:depguard // benchmark measures the in-memory driver through the public client.
+	f1 "github.com/bktrung/edm_sdk"
+	"github.com/bktrung/edm_sdk/driver"
+	"github.com/bktrung/edm_sdk/drivers/inmem" //nolint:depguard // benchmark measures the in-memory driver through the public client.
 )
 
 func BenchmarkObserverConsume(b *testing.B) {

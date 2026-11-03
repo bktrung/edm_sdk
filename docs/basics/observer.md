@@ -12,7 +12,7 @@ model underneath it.
 
 ## Three methods, three event shapes
 
-The [`Observer`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/observer.go)
+The [`Observer`](https://github.com/bktrung/edm_sdk/blob/main/observer.go)
 interface is three methods:
 
 ```go
@@ -250,7 +250,7 @@ Inbound trace context arrives on `StartEvent` as `TraceParent` and `TraceState`,
 so reading it needs no extra hook.
 
 Writing it out does. An observer that also implements
-[`TraceInjector`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/observer.go)
+[`TraceInjector`](https://github.com/bktrung/edm_sdk/blob/main/observer.go)
 is asked to serialize the current trace context, and F1 writes the result into
 the outgoing envelope:
 
@@ -275,7 +275,7 @@ travels on the message, not on a context.
 Most observers can be shared by any number of clients. One that keeps
 per-client state, such as the broker endpoint it labels telemetry with, cannot,
 and it says so by also implementing
-[`ObserverBinder`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/observer.go):
+[`ObserverBinder`](https://github.com/bktrung/edm_sdk/blob/main/observer.go):
 
 ```go
 type ObserverBinder interface {

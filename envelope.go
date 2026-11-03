@@ -8,7 +8,7 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/wire"
+	"github.com/bktrung/edm_sdk/internal/wire"
 )
 
 // Envelope carries the CloudEvents and F1 metadata serialized as message

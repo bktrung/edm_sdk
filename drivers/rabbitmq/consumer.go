@@ -13,9 +13,9 @@ import (
 
 	amqp "github.com/rabbitmq/amqp091-go"
 
-	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/driver"
-	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/clock"
-	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/wire"
+	"github.com/bktrung/edm_sdk/driver"
+	"github.com/bktrung/edm_sdk/internal/clock"
+	"github.com/bktrung/edm_sdk/internal/wire"
 )
 
 // partitionKeyHeader carries OutboundMessage.Key across the wire. A fanout

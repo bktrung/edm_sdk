@@ -11,9 +11,9 @@ import (
 	"github.com/twmb/franz-go/pkg/kadm"
 	"github.com/twmb/franz-go/pkg/kerr"
 
-	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/driver"
-	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/driver/conformance"
-	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/clock"
+	"github.com/bktrung/edm_sdk/driver"
+	"github.com/bktrung/edm_sdk/driver/conformance"
+	"github.com/bktrung/edm_sdk/internal/clock"
 )
 
 // deadlineFixture models a Kafka consumer that dies before committing. Kafka has

@@ -9,7 +9,7 @@ import (
 )
 
 // modulePath is the SDK module whose version is reported.
-const modulePath = "fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk"
+const modulePath = "github.com/bktrung/edm_sdk"
 
 // devel is reported when the build carries no module version, such as a test
 // binary or a build from a working tree.

@@ -1,5 +1,5 @@
 SHELL := /bin/bash
-MODULE := fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk
+MODULE := github.com/bktrung/edm_sdk
 
 VERSION := $(shell git describe --tags --dirty --always 2>/dev/null || echo dev)
 
@@ -17,8 +17,6 @@ GOLANGCI_LINT := $(GOLANGCI_LINT_DIR)/golangci-lint
 GOFUMPT_DIR := $(CURDIR)/.tools/bin/gofumpt-$(GOFUMPT_VERSION)-$(GO_VERSION)
 GOFUMPT := $(GOFUMPT_DIR)/gofumpt
 export GOLANGCI_LINT_CACHE := $(CURDIR)/.cache/golangci-lint
-
-export GOPRIVATE := fgit.zapps.vn
 
 APISURFACE := $(CURDIR)/.tools/bin/apisurface
 APIDIFF := $(CURDIR)/.tools/bin/apidiff

@@ -64,7 +64,7 @@ linters:
             - "!**/examples/**"
             - "!**/f1otel/**"
           deny:
-            - pkg: fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/drivers
+            - pkg: github.com/bktrung/edm_sdk/drivers
               desc: "core must not import drivers"
             - pkg: github.com/twmb/franz-go
               desc: "core must not import a broker client directly"
@@ -89,10 +89,10 @@ linters:
             - "**/driver/conformance/**"
           allow:
             - $gostd
-            - fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/driver
+            - github.com/bktrung/edm_sdk/driver
             - github.com/stretchr/testify
           deny:
-            - pkg: fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/drivers
+            - pkg: github.com/bktrung/edm_sdk/drivers
               desc: "the conformance suite must not import a driver"
             - pkg: $all
               desc: "the conformance suite may import only the port and testify"
@@ -131,11 +131,11 @@ linters:
           allow:
             - $gostd
             - github.com/stretchr/testify
-            - fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk
-            - fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/driver
-            - fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/drivers/inmem
-            - fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/clock
-            - fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/testhook
+            - github.com/bktrung/edm_sdk
+            - github.com/bktrung/edm_sdk/driver
+            - github.com/bktrung/edm_sdk/drivers/inmem
+            - github.com/bktrung/edm_sdk/internal/clock
+            - github.com/bktrung/edm_sdk/internal/testhook
           deny:
             - pkg: $all
               desc: "f1test may import only the SDK, in-memory driver, clock, test hook, test assertions, and metric reader"
@@ -150,12 +150,12 @@ linters:
           allow:
             - $gostd
             - github.com/twmb/franz-go
-            - fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/driver
-            - fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/clock
-            - fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/kafka
-            - fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/version
+            - github.com/bktrung/edm_sdk/driver
+            - github.com/bktrung/edm_sdk/internal/clock
+            - github.com/bktrung/edm_sdk/internal/kafka
+            - github.com/bktrung/edm_sdk/internal/version
           deny:
-            - pkg: fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/drivers
+            - pkg: github.com/bktrung/edm_sdk/drivers
               desc: "a driver must not import another driver"
             - pkg: $all
               desc: "a driver may import the standard library, its own broker client, and shared SDK support packages"
@@ -165,9 +165,9 @@ linters:
           files:
             - "**/drivers/kafka/*_test.go"
           allow:
-            - fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/drivers/kafka
+            - github.com/bktrung/edm_sdk/drivers/kafka
           deny:
-            - pkg: fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/drivers
+            - pkg: github.com/bktrung/edm_sdk/drivers
               desc: "a Kafka test must not import another driver"
 
         drivers-rabbitmq:
@@ -177,11 +177,11 @@ linters:
           allow:
             - $gostd
             - github.com/rabbitmq/amqp091-go
-            - fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/driver
-            - fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/clock
-            - fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/wire
+            - github.com/bktrung/edm_sdk/driver
+            - github.com/bktrung/edm_sdk/internal/clock
+            - github.com/bktrung/edm_sdk/internal/wire
           deny:
-            - pkg: fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/drivers
+            - pkg: github.com/bktrung/edm_sdk/drivers
               desc: "a driver must not import another driver"
             - pkg: $all
               desc: "a driver may import the standard library, its own broker client, the shared clock, and the wire header names"
@@ -191,9 +191,9 @@ linters:
           files:
             - "**/drivers/rabbitmq/*_test.go"
           allow:
-            - fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/drivers/rabbitmq
+            - github.com/bktrung/edm_sdk/drivers/rabbitmq
           deny:
-            - pkg: fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/drivers
+            - pkg: github.com/bktrung/edm_sdk/drivers
               desc: "a RabbitMQ test must not import another driver"
 
         drivers-inmem:
@@ -202,12 +202,12 @@ linters:
             - "!$test"
           allow:
             - $gostd
-            - fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/driver
-            - fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/clock
-            - fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/testhook
+            - github.com/bktrung/edm_sdk/driver
+            - github.com/bktrung/edm_sdk/internal/clock
+            - github.com/bktrung/edm_sdk/internal/testhook
             - github.com/stretchr/testify
           deny:
-            - pkg: fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/drivers
+            - pkg: github.com/bktrung/edm_sdk/drivers
               desc: "a driver must not import another driver"
             - pkg: $all
               desc: "the in-memory driver may import only the standard library, port, clock, test hook, and test assertions"
@@ -217,9 +217,9 @@ linters:
           files:
             - "**/drivers/inmem/*_test.go"
           allow:
-            - fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/drivers/inmem
+            - github.com/bktrung/edm_sdk/drivers/inmem
           deny:
-            - pkg: fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/drivers
+            - pkg: github.com/bktrung/edm_sdk/drivers
               desc: "an in-memory test must not import another driver"
 
     # The forbidden list replaces the defaults, so list every blocked API.
@@ -274,4 +274,4 @@ formatters:
   settings:
     goimports:
       local-prefixes:
-        - fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk
+        - github.com/bktrung/edm_sdk

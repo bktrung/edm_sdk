@@ -4,7 +4,7 @@ import (
 	"context"
 	"sync"
 
-	f1 "fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk"
+	f1 "github.com/bktrung/edm_sdk"
 )
 
 // Recorder is a concurrency-safe f1.Observer that keeps every call in call order.

@@ -13,13 +13,13 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/driver"
-	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/clock"
-	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/dispatch"
-	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/lifecycle"
-	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/retry"
-	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/sched"
-	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/wire"
+	"github.com/bktrung/edm_sdk/driver"
+	"github.com/bktrung/edm_sdk/internal/clock"
+	"github.com/bktrung/edm_sdk/internal/dispatch"
+	"github.com/bktrung/edm_sdk/internal/lifecycle"
+	"github.com/bktrung/edm_sdk/internal/retry"
+	"github.com/bktrung/edm_sdk/internal/sched"
+	"github.com/bktrung/edm_sdk/internal/wire"
 )
 
 const (

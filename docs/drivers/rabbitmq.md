@@ -8,7 +8,7 @@ For shared configuration and security, see [Drivers and capabilities](/drivers-a
 
 The RabbitMQ adapter translates the port into AMQP and management operations.
 The provider-specific ownership is split across these files in
-[`drivers/rabbitmq`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/tree/main/drivers/rabbitmq):
+[`drivers/rabbitmq`](https://github.com/bktrung/edm_sdk/tree/main/drivers/rabbitmq):
 
 - `rabbitmq.go` for connection, TLS/SASL,
   and the feature list;
@@ -33,7 +33,7 @@ Application publishes, retry copies, and dead-letter copies share the producer's
 confirm-mode channels. A call waits for its own per-message confirmations
 without exclusively holding a channel through that wait.
 
-[`producer.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/drivers/rabbitmq/producer.go)
+[`producer.go`](https://github.com/bktrung/edm_sdk/blob/main/drivers/rabbitmq/producer.go)
 owns the channel count, bounded batch segments, ID reservations, cancellation,
 and channel-failure recovery. Order is preserved within each call; later
 segments can use other channels after the earlier segment's outcomes are
@@ -211,11 +211,11 @@ handler invocations, and the number of business side effects. A delivery held
 by broker prefetch can contribute to that history when the consumer is
 released even if no handler ran.
 
-[`consumer.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/drivers/rabbitmq/consumer.go),
+[`consumer.go`](https://github.com/bktrung/edm_sdk/blob/main/drivers/rabbitmq/consumer.go),
 at `deliveryCount`, owns the mapping from broker metadata, including the
 priority of `x-acquired-count` over `x-delivery-count` and the unavailable-count
 sentinel. The
-[broker-prefetch integration scenario](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/drivers/rabbitmq/broker_prefetch_integration_test.go)
+[broker-prefetch integration scenario](https://github.com/bktrung/edm_sdk/blob/main/drivers/rabbitmq/broker_prefetch_integration_test.go)
 is the evidence owner for held-delivery redelivery.
 
 

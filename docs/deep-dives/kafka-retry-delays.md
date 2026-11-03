@@ -6,7 +6,7 @@ A retry delay gives a failed dependency time to recover. RabbitMQ can [park a re
 
 ## Background
 
-Kafka partitions preserve offset order, not timestamp order. Keeping a delayed retry at the head preserves the order in which F1 [finishes records](/learn/glossary#settlement), at the cost of holding records behind it. Other partitions can continue independently. The [consumer-side delay source](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/drivers/kafka/deferral.go) owns eligibility and the independent reasons a partition stays paused.
+Kafka partitions preserve offset order, not timestamp order. Keeping a delayed retry at the head preserves the order in which F1 [finishes records](/learn/glossary#settlement), at the cost of holding records behind it. Other partitions can continue independently. The [consumer-side delay source](https://github.com/bktrung/edm_sdk/blob/main/drivers/kafka/deferral.go) owns eligibility and the independent reasons a partition stays paused.
 
 ## Eligibility and ordering
 

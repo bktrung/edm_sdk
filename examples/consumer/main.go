@@ -12,9 +12,9 @@ import (
 	"syscall"
 	"time"
 
-	f1 "fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk"
-	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/drivers/rabbitmq"
-	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/f1otel"
+	f1 "github.com/bktrung/edm_sdk"
+	"github.com/bktrung/edm_sdk/drivers/rabbitmq"
+	"github.com/bktrung/edm_sdk/f1otel"
 
 	//nolint:depguard // application-owned providers are configured in this composition root.
 	"go.opentelemetry.io/otel/propagation"

@@ -28,14 +28,14 @@ flowchart TB
 
 The main executable path is split across:
 
-- [`Publisher.Publish`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/publisher.go) and
-  [`Publisher.PublishBatch`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/publisher.go) for the public entry points;
-- [`buildOutbound`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/publisher.go) for one message's portable outbound
+- [`Publisher.Publish`](https://github.com/bktrung/edm_sdk/blob/main/publisher.go) and
+  [`Publisher.PublishBatch`](https://github.com/bktrung/edm_sdk/blob/main/publisher.go) for the public entry points;
+- [`buildOutbound`](https://github.com/bktrung/edm_sdk/blob/main/publisher.go) for one message's portable outbound
   representation;
-- [`Client.New`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/client.go) and
-  [`ensurePublisherTopology`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/client.go) for startup topology;
-- [`publishMessages`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/client.go) for core-generated successor messages;
-- [`driver.Producer`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/driver/driver.go) for the broker-independent
+- [`Client.New`](https://github.com/bktrung/edm_sdk/blob/main/client.go) and
+  [`ensurePublisherTopology`](https://github.com/bktrung/edm_sdk/blob/main/client.go) for startup topology;
+- [`publishMessages`](https://github.com/bktrung/edm_sdk/blob/main/client.go) for core-generated successor messages;
+- [`driver.Producer`](https://github.com/bktrung/edm_sdk/blob/main/driver/driver.go) for the broker-independent
   publication contract.
 
 ## Observer call sites
@@ -74,9 +74,9 @@ before any outbound message is built.
 That early admission is deliberate: caller-supplied codec work can take time,
 and `Client.Close` must be able to wait for an already-admitted publish rather
 than close the producer underneath it. The entry-point implementation is in
-[`publisher.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/publisher.go); the tests for admission and for waiting until active publishes finish are
-in [`client_producer_admission_test.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/client_producer_admission_test.go)
-and [`client_publish_quiescence_test.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/client_publish_quiescence_test.go).
+[`publisher.go`](https://github.com/bktrung/edm_sdk/blob/main/publisher.go); the tests for admission and for waiting until active publishes finish are
+in [`client_producer_admission_test.go`](https://github.com/bktrung/edm_sdk/blob/main/client_producer_admission_test.go)
+and [`client_publish_quiescence_test.go`](https://github.com/bktrung/edm_sdk/blob/main/client_publish_quiescence_test.go).
 
 ## Build one outbound message
 
@@ -88,7 +88,7 @@ and an event ID. Its decisions are intentionally broker-independent.
 The function checks the caller context, requires a non-empty event type, rejects
 nil publish options, applies each option, and validates the resulting priority.
 Option behavior is defined beside the option constructors in
-[`publisher.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/publisher.go). `WithMaxAttempts` validates its own
+[`publisher.go`](https://github.com/bktrung/edm_sdk/blob/main/publisher.go). `WithMaxAttempts` validates its own
 per-event attempt cap while the subscription policy remains the consumer-side
 ceiling.
 
@@ -118,8 +118,8 @@ Encoding failure stops the batch before the driver is called.
 Codec selection is configured on the client. The default is the public JSON
 codec; additional codecs are registered through client options and selected by
 the client configuration. The codec boundary is defined in
-[`codec/codec.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/codec/codec.go), with the JSON implementation in
-[`codec/json.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/codec/json.go).
+[`codec/codec.go`](https://github.com/bktrung/edm_sdk/blob/main/codec/codec.go), with the JSON implementation in
+[`codec/json.go`](https://github.com/bktrung/edm_sdk/blob/main/codec/json.go).
 
 The publish-side body limit is checked after encoding. It is an application
 publish guardrail, so an oversized body fails before producer publication. The
@@ -130,7 +130,7 @@ caller-only guard again.
 ### Logical topic and allowlist
 
 The logical topic is derived from `WithTopic`, when present, or from the event
-type. [`topicFor`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/publisher.go) removes a trailing numeric `.v<N>`
+type. [`topicFor`](https://github.com/bktrung/edm_sdk/blob/main/publisher.go) removes a trailing numeric `.v<N>`
 segment, so versioned event types can share a canonical physical entry point
 while retaining their original type in the envelope.
 
@@ -142,11 +142,11 @@ list.
 
 This means the allowlist decision occurs before a producer is called, and a
 versioned input is checked against its canonical topic. The behavior is pinned
-by [`publisher_topology_test.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/publisher_topology_test.go).
+by [`publisher_topology_test.go`](https://github.com/bktrung/edm_sdk/blob/main/publisher_topology_test.go).
 
 ### Envelope and headers
 
-`buildOutbound` creates the public [`Envelope`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/envelope.go) with the
+`buildOutbound` creates the public [`Envelope`](https://github.com/bktrung/edm_sdk/blob/main/envelope.go) with the
 CloudEvents fields and F1 fields required on the wire, including:
 
 - specification version, event ID, source, original event type, timestamp,
@@ -158,7 +158,7 @@ CloudEvents fields and F1 fields required on the wire, including:
 Root events use their own ID as the default correlation identity. `WithCausedBy`
 can inherit correlation and trace context while recording the cause.
 
-[`Envelope.EncodeHeaders`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/envelope.go) validates priorities and reserved
+[`Envelope.EncodeHeaders`](https://github.com/bktrung/edm_sdk/blob/main/envelope.go) validates priorities and reserved
 extension names, serializes the canonical header map, and applies the effective
 header limit. Optional headers may be shed under pressure; mandatory protocol
 headers are preserved, and an envelope that still cannot fit returns an error.
@@ -175,14 +175,14 @@ the core:
 f1.<environment>.<canonical-topic>.<priority>
 ```
 
-The exact naming helper is [`publishEntryPoint`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/publisher.go). The core
+The exact naming helper is [`publishEntryPoint`](https://github.com/bktrung/edm_sdk/blob/main/publisher.go). The core
 also sets `EntryPoint` from the effective fanout capability. A driver receives
 this physical destination and the portable message fields; it does not rebuild
 F1 topic names or infer application routing policy.
 
 The logical-to-physical split is part of the repository architecture. See
 [`architecture.md`](/development/architecture) and the port types in
-[`driver/topology.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/driver/topology.go).
+[`driver/topology.go`](https://github.com/bktrung/edm_sdk/blob/main/driver/topology.go).
 
 ## Publisher topology initialization
 
@@ -204,10 +204,10 @@ publish. Initialization follows this sequence:
 performs no topology round trip and assumes the physical entry points already
 exist.
 
-The startup owner is [`Client.New`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/client.go), with topology construction
-in [`publisherTopologySpec`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/publisher.go). The shared topology port is
-[`driver.Admin`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/driver/driver.go) and the policy types are in
-[`driver/topology.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/driver/topology.go).
+The startup owner is [`Client.New`](https://github.com/bktrung/edm_sdk/blob/main/client.go), with topology construction
+in [`publisherTopologySpec`](https://github.com/bktrung/edm_sdk/blob/main/publisher.go). The shared topology port is
+[`driver.Admin`](https://github.com/bktrung/edm_sdk/blob/main/driver/driver.go) and the policy types are in
+[`driver/topology.go`](https://github.com/bktrung/edm_sdk/blob/main/driver/topology.go).
 
 ## Producer admission and close barriers
 
@@ -235,12 +235,12 @@ producer and connection.
 The entry gate is what refuses a new application publish; the successor handoff
 keeps using the same producer, and the same count, until the producer itself is
 closed. The close path is owned by
-[`Client.Close`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/client.go), with focused coverage in
-[`client_publish_quiescence_test.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/client_publish_quiescence_test.go)
-and [`publish_test.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/publish_test.go).
+[`Client.Close`](https://github.com/bktrung/edm_sdk/blob/main/client.go), with focused coverage in
+[`client_publish_quiescence_test.go`](https://github.com/bktrung/edm_sdk/blob/main/client_publish_quiescence_test.go)
+and [`publish_test.go`](https://github.com/bktrung/edm_sdk/blob/main/publish_test.go).
 
 Core-generated retry and dead-letter successors go through
-[`publishMessages`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/client.go), which builds the shared producer with the same
+[`publishMessages`](https://github.com/bktrung/edm_sdk/blob/main/client.go), which builds the shared producer with the same
 `workPublish` admission and the same constructor an application publish uses.
 
 What differs is the entry gate: `Publisher.Publish` first requires a `Ready`
@@ -263,22 +263,22 @@ The port contract is intentionally small:
   makes on the producer, once no application publish is still in flight;
 - implementations must be safe for concurrent use.
 
-The contract is defined in [`driver/driver.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/driver/driver.go), and
+The contract is defined in [`driver/driver.go`](https://github.com/bktrung/edm_sdk/blob/main/driver/driver.go), and
 error classification plus partial results are defined in
-[`driver/errors.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/driver/errors.go).
+[`driver/errors.go`](https://github.com/bktrung/edm_sdk/blob/main/driver/errors.go).
 
 Concrete producers translate the same boundary into provider operations:
 
-- [`drivers/inmem/producer.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/drivers/inmem/producer.go) provides the
+- [`drivers/inmem/producer.go`](https://github.com/bktrung/edm_sdk/blob/main/drivers/inmem/producer.go) provides the
   deterministic reference behavior;
-- [`drivers/rabbitmq/producer.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/drivers/rabbitmq/producer.go) owns
+- [`drivers/rabbitmq/producer.go`](https://github.com/bktrung/edm_sdk/blob/main/drivers/rabbitmq/producer.go) owns
   AMQP publication, confirms, and returned-message handling;
-- [`drivers/kafka/producer.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/drivers/kafka/producer.go) owns Kafka
+- [`drivers/kafka/producer.go`](https://github.com/bktrung/edm_sdk/blob/main/drivers/kafka/producer.go) owns Kafka
   record construction and synchronous broker results.
 
 The core must not depend on those provider details. Driver behavior is checked
 through the shared publication contract in
-[`driver/conformance/publish.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/driver/conformance/publish.go), while
+[`driver/conformance/publish.go`](https://github.com/bktrung/edm_sdk/blob/main/driver/conformance/publish.go), while
 provider-specific tests remain beside each producer.
 
 ## Durable result and batch mapping
@@ -305,8 +305,8 @@ Transient classification requests client reconnection, but replaying an
 application call is the caller's responsibility because the broker may already
 have accepted a message before the transport error became visible.
 
-The mapping is exercised by [`publish_test.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/publish_test.go), the
-driver error tests in [`driver/errors_test.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/driver/errors_test.go),
+The mapping is exercised by [`publish_test.go`](https://github.com/bktrung/edm_sdk/blob/main/publish_test.go), the
+driver error tests in [`driver/errors_test.go`](https://github.com/bktrung/edm_sdk/blob/main/driver/errors_test.go),
 and the shared conformance publication checks.
 
 ## Reconnection interaction
@@ -316,7 +316,7 @@ the client reconnect supervisor. A publish that arrives while reconnect is in
 progress is rejected with the reconnecting state rather than sent through an
 old connection.
 
-The reconnect path in [`reconnect.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/reconnect.go):
+The reconnect path in [`reconnect.go`](https://github.com/bktrung/edm_sdk/blob/main/reconnect.go):
 
 1. abandons active runners according to the consumer handoff rules;
 2. waits for the current publish generation to become idle;
@@ -339,16 +339,16 @@ idempotency policy.
 
 When changing publishing behavior, trace the complete ownership chain:
 
-1. Public entry point and option validation in [`publisher.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/publisher.go).
-2. Payload and envelope behavior in [`codec/codec.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/codec/codec.go) and
-   [`envelope.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/envelope.go).
+1. Public entry point and option validation in [`publisher.go`](https://github.com/bktrung/edm_sdk/blob/main/publisher.go).
+2. Payload and envelope behavior in [`codec/codec.go`](https://github.com/bktrung/edm_sdk/blob/main/codec/codec.go) and
+   [`envelope.go`](https://github.com/bktrung/edm_sdk/blob/main/envelope.go).
 3. Client admission, shared producer, topology, and close behavior in
-   [`client.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/client.go).
-4. Connection replacement in [`reconnect.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/reconnect.go).
-5. Portable producer contract in [`driver/driver.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/driver/driver.go)
-   and [`driver/errors.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/driver/errors.go).
+   [`client.go`](https://github.com/bktrung/edm_sdk/blob/main/client.go).
+4. Connection replacement in [`reconnect.go`](https://github.com/bktrung/edm_sdk/blob/main/reconnect.go).
+5. Portable producer contract in [`driver/driver.go`](https://github.com/bktrung/edm_sdk/blob/main/driver/driver.go)
+   and [`driver/errors.go`](https://github.com/bktrung/edm_sdk/blob/main/driver/errors.go).
 6. Reference and provider implementations under
-   [`drivers/inmem/producer.go`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/drivers/inmem/producer.go) and the
+   [`drivers/inmem/producer.go`](https://github.com/bktrung/edm_sdk/blob/main/drivers/inmem/producer.go) and the
    provider producer links above.
 7. Root, driver, conformance, and provider tests before changing a contract.
 

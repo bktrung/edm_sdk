@@ -12,7 +12,7 @@ One delivery at a time per partition makes that rule simple, at the cost of lett
 
 ## The committed offset
 
-Ownership matters as much as offset order. A delivery from the current assignment can commit past offsets Kafka skipped. An old delivery cannot use that permission after the partition is lost and regained: it must match the offset the current ownership owes. Otherwise a late ack could pass a different record that the new assignment has not finished. The [offset tracker](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/drivers/kafka/acktracker.go) and the [consumer's ownership boundary](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/drivers/kafka/consumer.go) are the executable owners.
+Ownership matters as much as offset order. A delivery from the current assignment can commit past offsets Kafka skipped. An old delivery cannot use that permission after the partition is lost and regained: it must match the offset the current ownership owes. Otherwise a late ack could pass a different record that the new assignment has not finished. The [offset tracker](https://github.com/bktrung/edm_sdk/blob/main/drivers/kafka/acktracker.go) and the [consumer's ownership boundary](https://github.com/bktrung/edm_sdk/blob/main/drivers/kafka/consumer.go) are the executable owners.
 
 The figure traces why a stale ack for any offset other than the current one is refused. The refused acks in it come from a delivery whose ownership has ended; a delivery of the current ownership never sends them.
 
@@ -58,7 +58,7 @@ sequenceDiagram
     K-->>B: committed
 ```
 
-Serialization must cover the whole move-and-commit, not just the local offset update. Releasing it before the broker call finishes would admit the out-of-order sequence above. Batching points from different partitions does not remove this requirement; the [commit batching owner](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/drivers/kafka/committer.go) preserves the confirmation boundary.
+Serialization must cover the whole move-and-commit, not just the local offset update. Releasing it before the broker call finishes would admit the out-of-order sequence above. Batching points from different partitions does not remove this requirement; the [commit batching owner](https://github.com/bktrung/edm_sdk/blob/main/drivers/kafka/committer.go) preserves the confirmation boundary.
 
 A failed commit restores the local offset while the partition is still owned. An ambiguous error does not prove whether Kafka stored the request: later commits or a restart can produce duplicate work, and the outcome is not limited to repeating the same offset. Rollback favors replay over skipping work.
 

@@ -3,7 +3,6 @@
 image: golang:1.27.3
 
 variables:
-  GOPRIVATE: fgit.zapps.vn
   GOPATH: "$CI_PROJECT_DIR/.go"
   # Keep broker-backed checks opt-in while CI runs on a developer laptop.
   # Set RUN_BROKER_TESTS=1 when starting a pipeline to run them.

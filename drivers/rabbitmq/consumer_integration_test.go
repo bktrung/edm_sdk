@@ -19,8 +19,8 @@ import (
 
 	amqp "github.com/rabbitmq/amqp091-go"
 
-	f1 "fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk"
-	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/driver"
+	f1 "github.com/bktrung/edm_sdk"
+	"github.com/bktrung/edm_sdk/driver"
 )
 
 func TestConsumerPauseResume(t *testing.T) {

@@ -7,8 +7,8 @@ import (
 	"errors"
 	"testing"
 
-	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/driver"
-	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/driver/conformance"
+	"github.com/bktrung/edm_sdk/driver"
+	"github.com/bktrung/edm_sdk/driver/conformance"
 )
 
 func TestConformance(t *testing.T) {

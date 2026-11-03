@@ -373,4 +373,4 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 - A dead-letter or discarded callback that ignores its context keeps its goroutine and the event until it returns; the number of such goroutines is not capped.
 - RabbitMQ `Purge` and `DescribeTopology` cover only the current parking queues; copies parked under an earlier retry step or delay shape return to the destination when their delay ends.
 
-[0.1.0]: https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/tags/v0.1.0
+[0.1.0]: https://github.com/bktrung/edm_sdk/tree/v0.1.0

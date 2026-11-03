@@ -13,10 +13,10 @@ import (
 	"syscall"
 	"time"
 
-	f1 "fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk"
-	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/codec"
-	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/drivers/kafka"
-	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/drivers/rabbitmq"
+	f1 "github.com/bktrung/edm_sdk"
+	"github.com/bktrung/edm_sdk/codec"
+	"github.com/bktrung/edm_sdk/drivers/kafka"
+	"github.com/bktrung/edm_sdk/drivers/rabbitmq"
 )
 
 const eventType = "acceptance.message.v1"

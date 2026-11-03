@@ -5,7 +5,7 @@ import (
 	"maps"
 	"slices"
 
-	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/internal/wire"
+	"github.com/bktrung/edm_sdk/internal/wire"
 )
 
 // classifiedError carries one handler outcome through wrapped error chains.

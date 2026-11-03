@@ -5,7 +5,7 @@ import (
 	"strings"
 )
 
-const modulePath = "fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk"
+const modulePath = "github.com/bktrung/edm_sdk"
 
 // ModuleGoroutineStacks returns the stacks of live goroutines running this
 // module's non-test code, or "<none>". The goroutine leak checks in both test

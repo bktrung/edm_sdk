@@ -117,7 +117,7 @@ mental model does not.
 - Source links are rare: at most a few per page, to a file or package, never a
   line number or a `#L` range. Use the full repository URL form with no line
   anchor:
-  `https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/<path>`.
+  `https://github.com/bktrung/edm_sdk/blob/main/<path>`.
 
 `development/` pages are the exception: their job is to map the code, so they
 name functions, tests and files. They still never cite a line number.

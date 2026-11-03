@@ -3,7 +3,7 @@ package codec_test
 import (
 	"testing"
 
-	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/codec"
+	"github.com/bktrung/edm_sdk/codec"
 )
 
 func FuzzJSONDecode(f *testing.F) {

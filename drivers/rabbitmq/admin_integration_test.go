@@ -18,7 +18,7 @@ import (
 
 	amqp "github.com/rabbitmq/amqp091-go"
 
-	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/driver"
+	"github.com/bktrung/edm_sdk/driver"
 )
 
 // deleteQueue removes one queue through the management API, leaving a queue

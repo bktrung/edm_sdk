@@ -14,11 +14,11 @@ surface is split into a client, a publisher, a subscription, and a runner:
 
 | Responsibility | F1 entry point | What it owns |
 | --- | --- | --- |
-| Connect to the selected transport | [`f1.New`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/client.go) with `f1.WithDriver` | Driver connection and client resources |
+| Connect to the selected transport | [`f1.New`](https://github.com/bktrung/edm_sdk/blob/main/client.go) with `f1.WithDriver` | Driver connection and client resources |
 | Publish events | `Client.Publisher` | Encoding, envelope construction, and durable publish acknowledgement |
-| Declare consumption | [`Client.Subscribe`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/subscription.go) | Subscription validation, topics, handlers, and delivery policy |
-| Run consumption | [`Runner.Run`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/worker.go) | Fetching, dispatch, retries, [the final ack or nack](/learn/glossary#settlement), and reconnect behavior |
-| Stop consumption | [`Runner.Drain`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/worker.go) or [`Client.Close`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/client.go) | Stop fetching, finish in-flight work, and release resources |
+| Declare consumption | [`Client.Subscribe`](https://github.com/bktrung/edm_sdk/blob/main/subscription.go) | Subscription validation, topics, handlers, and delivery policy |
+| Run consumption | [`Runner.Run`](https://github.com/bktrung/edm_sdk/blob/main/worker.go) | Fetching, dispatch, retries, [the final ack or nack](/learn/glossary#settlement), and reconnect behavior |
+| Stop consumption | [`Runner.Drain`](https://github.com/bktrung/edm_sdk/blob/main/worker.go) or [`Client.Close`](https://github.com/bktrung/edm_sdk/blob/main/client.go) | Stop fetching, finish in-flight work, and release resources |
 
 The application-facing code stays on the F1 side of this boundary. A concrete
 driver is selected in composition code and passed through `WithDriver`; handler

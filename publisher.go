@@ -11,7 +11,7 @@ import (
 	"strings"
 	"time"
 
-	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/driver"
+	"github.com/bktrung/edm_sdk/driver"
 )
 
 // Publisher publishes encoded events through a Client's connected driver. A

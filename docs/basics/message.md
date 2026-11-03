@@ -23,10 +23,10 @@ F1 has several types with "message" in their role. They are not interchangeable:
 
 | You need to... | Use | Owned by |
 | --- | --- | --- |
-| Handle one delivered event | [`f1.Event`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/event.go) | Application handler |
-| Describe one item in a publish batch | [`f1.Message`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/publisher.go) | Publisher API |
-| Carry canonical metadata | [`f1.Envelope`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/envelope.go) | F1 wire contract |
-| Adapt to a transport | [`driver.InboundMessage`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/driver/message.go) and `driver.OutboundMessage` | Driver implementation |
+| Handle one delivered event | [`f1.Event`](https://github.com/bktrung/edm_sdk/blob/main/event.go) | Application handler |
+| Describe one item in a publish batch | [`f1.Message`](https://github.com/bktrung/edm_sdk/blob/main/publisher.go) | Publisher API |
+| Carry canonical metadata | [`f1.Envelope`](https://github.com/bktrung/edm_sdk/blob/main/envelope.go) | F1 wire contract |
+| Adapt to a transport | [`driver.InboundMessage`](https://github.com/bktrung/edm_sdk/blob/main/driver/message.go) and `driver.OutboundMessage` | Driver implementation |
 
 The usual application path is:
 
@@ -89,7 +89,7 @@ The most common metadata options are:
 - `WithExpiry` and `WithMaxAttempts` - constrain delivery lifetime and retry
   attempts.
 
-See [`PublishOption`](https://fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/-/blob/main/publisher.go) for the complete option contract.
+See [`PublishOption`](https://github.com/bktrung/edm_sdk/blob/main/publisher.go) for the complete option contract.
 
 Headers have a size cap: `codec.maxHeaderBytes`, 8 KiB by default, or less when
 the broker allows less. When the encoded envelope is over the cap, F1 drops

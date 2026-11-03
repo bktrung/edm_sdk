@@ -16,9 +16,9 @@ import (
 	"testing"
 	"time"
 
-	f1 "fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk"
-	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/f1otel"
-	"fgit.zapps.vn/zatf2026-be-t3/event-driven-messaging-sdk/f1test"
+	f1 "github.com/bktrung/edm_sdk"
+	"github.com/bktrung/edm_sdk/f1otel"
+	"github.com/bktrung/edm_sdk/f1test"
 	"go.opentelemetry.io/otel/exporters/otlp/otlpmetric/otlpmetrichttp"
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
